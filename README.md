@@ -205,6 +205,8 @@ Please keep changes small and direct:
 - Preserve offline-first behavior.
 - Do not add new dependencies unless they are clearly necessary.
 
+GitHub Actions runs pull-request checks for formatting, linting, type checking, tests, the web build, dependency review, CodeQL scanning, and an Android debug build. PRs that touch native behavior should also be verified locally on the relevant platform when possible.
+
 Before opening a pull request, run:
 
 ```bash
