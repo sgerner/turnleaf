@@ -1,9 +1,11 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
   import { onMount } from 'svelte';
+  import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
+  import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
   import {
     getPreference,
     getServer,
@@ -23,8 +25,10 @@
   let apiKey = $state<string | null>(null);
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
+  let releaseBanner = $state<ReleaseBanner | null>(null);
 
   onMount(async () => {
+    void checkForRelease();
     try {
       const saved = await getServer();
       const savedTheme = await getPreference(themePreferenceKey);
@@ -41,6 +45,11 @@
       booting = false;
     }
   });
+
+  async function checkForRelease(): Promise<void> {
+    const latest = await fetchLatestGithubRelease(__APP_VERSION__);
+    if (latest) releaseBanner = latest;
+  }
 
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
@@ -60,6 +69,51 @@
   </div>
 
   <div class="app-stage">
+    {#if releaseBanner}
+      <div class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
+        <div
+          class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div class="min-w-0">
+            <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
+            <p class="mt-1 font-medium text-surface-950-50">
+              Turnleaf {releaseBanner.version}{releaseBanner.title
+                ? ` · ${releaseBanner.title}`
+                : ''}
+            </p>
+            <p class="text-sm text-surface-700-300">A newer GitHub release was found at startup.</p>
+          </div>
+            <div class="flex flex-wrap items-center gap-2">
+            {#if releaseBanner.downloadUrl}
+              <a
+                class="btn btn-sm preset-filled-success-500 !text-sm"
+                href={releaseBanner.downloadUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Download APK
+              </a>
+            {/if}
+            <a
+              class="btn btn-sm preset-filled-tertiary-500 !text-sm"
+              href={releaseBanner.releaseUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Release notes
+            </a>
+            <button
+              class="btn btn-sm preset-tonal-error !text-sm"
+              type="button"
+              onclick={() => (releaseBanner = null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
     {#if booting}
       <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
