@@ -1,11 +1,14 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const messagePath = process.argv[2];
+const [mode, value] = process.argv.slice(2);
 
-if (!messagePath) process.exit(0);
-
-const rawMessage = readFileSync(messagePath, 'utf8').trim();
-const subject = rawMessage.split(/\r?\n/, 1)[0].trim();
+let subject = '';
+if (mode === '--subject') {
+  subject = value ?? '';
+} else if (mode) {
+  const rawMessage = readFileSync(mode, 'utf8').trim();
+  subject = rawMessage.split(/\r?\n/, 1)[0].trim();
+}
 
 if (!subject || /^merge\b/i.test(subject)) process.exit(0);
 
@@ -15,7 +18,7 @@ const lines = source.split(/\r?\n/);
 let headingIndex = lines.findIndex((line) => line.trim() === '## Unreleased');
 
 if (headingIndex < 0) {
-  lines.splice(1, 0, '', '## Unreleased', '', `- ${subject}`);
+  lines.unshift('# Release Notes', '', '## Unreleased', '', `- ${subject}`);
   writeFileSync(notesUrl, `${lines.join('\n').trimEnd()}\n`);
   process.exit(0);
 }
@@ -29,8 +32,7 @@ if (sectionLines.some((line) => line.trim() === `- ${subject}`)) process.exit(0)
 let insertionIndex = headingIndex + 1;
 if (lines[insertionIndex]?.trim() !== '') {
   lines.splice(insertionIndex, 0, '');
-  insertionIndex += 1;
 }
-lines.splice(insertionIndex, 0, `- ${subject}`);
+lines.splice(insertionIndex + 1, 0, `- ${subject}`);
 
 writeFileSync(notesUrl, `${lines.join('\n').trimEnd()}\n`);

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Switch release notes to post-commit amend
+- Add release note commit hook
+
 - GitHub Android release builds now publish versioned APK tags and version codes so the in-app update banner can detect them.
 - Library "Mark as read" now queues a Kavita progress update instead of only changing local state.
 - Reader safe-area layout now keeps EPUB text clear of the camera notch and status bar.

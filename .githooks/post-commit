@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+SUBJECT="$(git -C "$ROOT" log -1 --format=%s HEAD)"
+
+case "$SUBJECT" in
+  ""|Merge\ *)
+    exit 0
+    ;;
+esac
+
+BEFORE="$(git -C "$ROOT" hash-object RELEASE_NOTES.md)"
+node "$ROOT/scripts/update-release-notes.mjs" --subject "$SUBJECT"
+AFTER="$(git -C "$ROOT" hash-object RELEASE_NOTES.md)"
+
+if [ "$BEFORE" = "$AFTER" ]; then
+  exit 0
+fi
+
+git -C "$ROOT" add RELEASE_NOTES.md
+git -C "$ROOT" commit --amend --no-edit --no-verify
