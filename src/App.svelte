@@ -61,7 +61,7 @@
 
   <div class="app-stage">
     {#if booting}
-      <main class="grid min-h-dvh place-items-center" aria-label="Opening Turnleaf">
+      <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
           <TurnleafLogo size={104} />
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
@@ -94,8 +94,8 @@
 
 <style>
   .app-shell {
-    position: relative;
-    min-height: 100dvh;
+    position: fixed;
+    inset: 0;
     isolation: isolate;
     overflow: hidden;
     background-color: color-mix(
@@ -244,6 +244,10 @@
 
   .app-stage {
     position: relative;
+    height: 100%;
+    overflow: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
     z-index: 1;
   }
 

@@ -434,7 +434,7 @@
   />
 {:else}
   <main
-    class="mx-auto min-h-dvh max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
+    class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
   >
     <header class="flex items-center justify-between gap-4">
       <div class="flex min-w-0 items-center gap-3">
@@ -655,47 +655,86 @@
         aria-label="Books"
       >
         {#each visibleBooks as book (book.id)}
-          <button class="group text-left" type="button" onclick={() => (selected = book)}>
-            <div
-              class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+          <article class="text-left">
+            <button
+              class="group block w-full text-left"
+              type="button"
+              onclick={() => (selected = book)}
             >
-              <img
-                class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                src={covers[book.seriesId] ?? client.coverUrl(book.seriesId)}
-                loading="lazy"
-                decoding="async"
-                alt=""
-              />
-              {#if book.downloadPath}
-                <span
-                  class="badge-icon preset-filled-success-500 absolute right-2 top-2 h-7 w-7 p-0 shadow-md"
-                  title="Available offline"
-                  aria-label="Available offline"
-                >
-                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                    <path
-                      fill="currentColor"
-                      d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
-                    />
-                  </svg>
-                </span>
-              {/if}
-              {#if progressOf(book) > 0}
-                <div class="absolute inset-x-0 bottom-0 h-1.5">
-                  <div
-                    class="h-full preset-filled-primary-600-400"
-                    style:width={`${progressOf(book)}%`}
-                  ></div>
-                </div>
-              {/if}
-            </div>
-            <h2 class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50">
-              {book.title}
-            </h2>
-            <p class="mt-1 truncate text-sm text-surface-700-300">
-              {book.author ?? 'Unknown author'}
-            </p>
-          </button>
+              <div
+                class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+              >
+                <img
+                  class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                  src={covers[book.seriesId] ?? client.coverUrl(book.seriesId)}
+                  loading="lazy"
+                  decoding="async"
+                  alt=""
+                />
+                {#if book.downloadPath}
+                  <span
+                    class="badge-icon preset-filled-success-500 absolute right-2 top-2 h-7 w-7 p-0 shadow-md"
+                    title="Available offline"
+                    aria-label="Available offline"
+                  >
+                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                      <path
+                        fill="currentColor"
+                        d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
+                      />
+                    </svg>
+                  </span>
+                {/if}
+                {#if progressOf(book) > 0}
+                  <div class="absolute inset-x-0 bottom-0 h-1.5">
+                    <div
+                      class="h-full preset-filled-primary-600-400"
+                      style:width={`${progressOf(book)}%`}
+                    ></div>
+                  </div>
+                {/if}
+              </div>
+              <div class="mt-1 flex flex-wrap gap-1">
+                {#if book.downloadPath}
+                  <button
+                    class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
+                    type="button"
+                    disabled={!nativePlatform}
+                    onclick={() => open(book!)}
+                  >
+                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+                      <path fill="currentColor" d="M8 5v14l11-7z" />
+                    </svg>
+                    Read
+                  </button>
+                  <button
+                    class="btn !px-2 !py-1 preset-outlined-error-500 !text-sm"
+                    type="button"
+                    disabled={!nativePlatform}
+                    onclick={() => remove(book!)}>Remove download</button
+                  >
+                {:else}
+                  <button
+                    class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
+                    type="button"
+                    disabled={!nativePlatform}
+                    onclick={() => download(book!)}
+                  >
+                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-3 w-3">
+                      <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+                    </svg>
+                    Download
+                  </button>
+                {/if}
+              </div>
+              <h2 class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50">
+                {book.title}
+              </h2>
+              <p class="mt-1 truncate text-sm text-surface-700-300">
+                {book.author ?? 'Unknown author'}
+              </p>
+            </button>
+          </article>
         {/each}
       </section>
     {/if}
@@ -710,7 +749,7 @@
     onclick={(event) => event.target === event.currentTarget && (selected = null)}
   >
     <article
-      class="card preset-filled-surface-50-950 relative w-full max-w-lg max-h-[88dvh] overflow-auto p-6"
+      class="card preset-filled-surface-50-950 relative w-full max-w-lg overflow-auto p-6"
       aria-label={selected.title}
       transition:fly={{ y: 16, duration: 150 }}
     >
@@ -760,13 +799,7 @@
         </div>
       </div>
 
-      {#if selected.descriptionHtml}
-        <p class="mt-6 whitespace-pre-line text-sm leading-relaxed text-surface-800-200">
-          {descriptionText(selected.descriptionHtml)}
-        </p>
-      {/if}
-
-      <div class="mt-7 flex flex-wrap gap-3">
+      <div class="mt-2 flex flex-wrap gap-3">
         {#if selected.downloadPath}
           <button
             class="btn preset-filled-primary-700-300"
@@ -795,13 +828,14 @@
             <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
               <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
             </svg>
-            Download EPUB
+            Download
           </button>
         {/if}
       </div>
-      {#if !nativePlatform}
-        <p class="mt-4 text-xs text-surface-600-400">
-          Reading and downloads are available in the Turnleaf app.
+
+      {#if selected.descriptionHtml}
+        <p class="mt-6 whitespace-pre-line text-sm leading-relaxed text-surface-800-200">
+          {descriptionText(selected.descriptionHtml)}
         </p>
       {/if}
     </article>

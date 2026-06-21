@@ -9,3 +9,4 @@ android/capacitor-cordova-android-plugins/build/
 ios/App/App/public/
 ios/App/App/capacitor.config.json
 package-lock.json
+.swarm/

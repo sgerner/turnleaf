@@ -71,7 +71,7 @@
 </script>
 
 <main
-  class="mx-auto flex min-h-dvh max-w-lg flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))]"
+  class="mx-auto flex min-h-full max-w-lg flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))]"
 >
   <header class="mb-10" in:fly={{ y: 10, duration: 220 }}>
     <TurnleafLogo size={128} />
