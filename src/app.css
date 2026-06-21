@@ -27,7 +27,10 @@
 @custom-variant dark (&:where([data-mode='dark'], [data-mode='dark'] *));
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+  @variant dark {
+    color-scheme: dark;
+  }
   font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -49,6 +52,10 @@ body {
   min-width: 320px;
   background: var(--body-background-color);
   color: var(--base-font-color);
+  @variant dark {
+    background: var(--body-background-color-dark);
+    color: var(--base-font-color-dark);
+  }
 }
 
 button,
