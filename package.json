@@ -59,7 +59,7 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.34.1",
     "vite": "^7.2.4",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.9"
   },
   "overrides": {
     "epubjs": {
