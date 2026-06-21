@@ -456,6 +456,11 @@
     await setPreference('uiMode', next);
   }
 
+  function handleRelocated(location: ReaderLocation): void {
+    if (!reading) return;
+    void relocated(reading.book, location);
+  }
+
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     settingsError = '';
@@ -517,7 +522,7 @@
     initialCfi={reading.cfi}
     initialXPath={reading.xpath}
     onBack={() => (reading = null)}
-    onRelocated={(location) => relocated(reading!.book, location)}
+    onRelocated={handleRelocated}
   />
 {:else}
   <main

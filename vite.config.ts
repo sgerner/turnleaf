@@ -1,5 +1,6 @@
 import tailwindcss from '@tailwindcss/vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
+import type { IncomingMessage } from 'http';
 import { defineConfig, type Plugin } from 'vite';
 
 function kavitaDevProxy(): Plugin {
@@ -54,7 +55,7 @@ function kavitaDevProxy(): Plugin {
   };
 }
 
-async function readBody(req: import('http').IncomingMessage): Promise<Buffer | undefined> {
+async function readBody(req: IncomingMessage): Promise<Buffer | undefined> {
   if (!req.method || req.method === 'GET' || req.method === 'HEAD') return undefined;
   const chunks: Buffer[] = [];
   for await (const chunk of req) {

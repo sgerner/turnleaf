@@ -135,9 +135,6 @@ export class ReaderSession {
       html: {
         background: `${this.resolveToken(colors.background)} !important`,
         'box-sizing': 'border-box',
-        overflow: 'hidden !important',
-        width: '100% !important',
-        height: '100% !important',
       },
       body: {
         color: `${this.resolveToken(colors.text)} !important`,
@@ -147,9 +144,6 @@ export class ReaderSession {
         'line-height': `${value.lineHeight} !important`,
         padding: `0 ${value.margin}px !important`,
         'box-sizing': 'border-box',
-        width: '100% !important',
-        height: '100% !important',
-        overflow: 'hidden !important',
       },
       p: {
         'margin-bottom': `${value.paragraphSpacing}em !important`,

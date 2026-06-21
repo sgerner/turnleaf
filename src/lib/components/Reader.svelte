@@ -373,21 +373,8 @@
     overflow: hidden !important;
   }
 
-  .reader-viewport :global(.epub-view) {
-    width: 100% !important;
-    height: 100% !important;
-    max-width: 100% !important;
-    overflow: hidden !important;
-  }
-
   .reader-viewport :global(iframe) {
-    position: absolute !important;
-    inset: 0 !important;
     display: block;
-    width: 100% !important;
-    max-width: 100% !important;
-    min-width: 0 !important;
-    height: 100% !important;
     border: 0 !important;
   }
 
