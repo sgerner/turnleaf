@@ -72,11 +72,11 @@ export class KavitaClient {
   }
 
   async getCover(seriesId: number, signal?: AbortSignal): Promise<Blob> {
+    const url = this.coverUrl(seriesId);
     if (Capacitor.isNativePlatform()) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const response = await CapacitorHttp.get({
-        url: `${this.baseUrl}/api/Image/series-cover?seriesId=${seriesId}`,
-        headers: { 'x-api-key': this.apiKey },
+        url,
         responseType: 'blob',
         connectTimeout: REQUEST_TIMEOUT_MS,
         readTimeout: REQUEST_TIMEOUT_MS,
@@ -91,10 +91,7 @@ export class KavitaClient {
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
     try {
       const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
-      const response = await fetch(`${this.baseUrl}/api/Image/series-cover?seriesId=${seriesId}`, {
-        headers: { 'x-api-key': this.apiKey },
-        signal: combined,
-      });
+      const response = await fetch(url, { signal: combined });
       if (!response.ok) throw new KavitaError('The book cover could not be loaded.', 'server');
       return await response.blob();
     } finally {

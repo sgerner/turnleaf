@@ -311,16 +311,13 @@
         {#each visibleBooks as book (book.id)}
           <button class="group text-left" type="button" onclick={() => (selected = book)}>
             <div class="aspect-[2/3] overflow-hidden rounded-lg bg-surface-200 shadow-md">
-              {#if covers[book.seriesId]}<img
-                  class="h-full w-full object-cover"
-                  src={covers[book.seriesId]}
-                  alt=""
-                />
-              {:else}<div
-                  class="grid h-full place-items-center p-4 text-center font-serif text-surface-600"
-                >
-                  {book.title}
-                </div>{/if}
+              <img
+                class="h-full w-full object-cover"
+                src={covers[book.seriesId] ?? client.coverUrl(book.seriesId)}
+                loading="lazy"
+                decoding="async"
+                alt=""
+              />
             </div>
             <h2 class="mt-3 line-clamp-2 font-serif text-lg leading-tight">{book.title}</h2>
             <p class="mt-1 truncate text-sm text-surface-500">{book.author ?? 'Unknown author'}</p>
