@@ -28,6 +28,7 @@
   import type { ReaderLocation } from '../reader/session';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
+  import TurnleafLogo from './TurnleafLogo.svelte';
 
   let { server, apiKey }: { server: ServerConfig; apiKey: string } = $props();
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
@@ -261,36 +262,59 @@
 {:else}
   <main class="mx-auto min-h-dvh max-w-6xl px-5 pb-12 pt-[max(2rem,env(safe-area-inset-top))]">
     <header class="flex items-end justify-between gap-4">
-      <div>
-        <p class="text-xs font-semibold uppercase tracking-[0.24em] text-primary-700-300">
-          {server.displayName}
-        </p>
-        <h1 class="mt-2 font-serif text-4xl text-surface-950-50">Your library</h1>
+      <div class="flex items-center gap-4">
+        <TurnleafLogo size={64} wordmark={false} />
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-primary-700-300">
+            {server.displayName}
+          </p>
+          <h1 class="mt-2 font-serif text-4xl text-primary-700-300">Turnleaf</h1>
+        </div>
       </div>
       <div class="flex gap-2">
-        <button class="btn preset-tonal-surface min-h-12" type="button" onclick={openSettings}
-          >Settings</button
-        >
         <button
-          class="btn preset-tonal-primary min-h-12"
+          class="btn btn-sm preset-tonal-surface"
+          type="button"
+          onclick={openSettings}
+          aria-label="Open settings"
+          title="Settings"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.63l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.4 7.4 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.43h-3.84a.5.5 0 0 0-.5.43l-.36 2.54c-.57.23-1.11.54-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.77 8.85a.5.5 0 0 0 .12.63l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94L2.89 14.52a.5.5 0 0 0-.12.63l1.92 3.32c.12.21.37.3.6.22l2.39-.96c.51.4 1.06.72 1.63.94l.36 2.54c.04.24.25.43.5.43h3.84c.25 0 .46-.19.5-.43l.36-2.54c.57-.23 1.11-.54 1.63-.94l2.39.96c.23.08.48-.01.6-.22l1.92-3.32a.5.5 0 0 0-.12-.63l-2.03-1.58ZM12 15.2a3.2 3.2 0 1 1 0-6.4 3.2 3.2 0 0 1 0 6.4Z"
+            />
+          </svg>
+        </button>
+        <button
+          class="btn btn-sm preset-tonal-primary"
           type="button"
           onclick={refresh}
-          disabled={refreshing}>Refresh</button
+          disabled={refreshing}
+          aria-label="Refresh library"
+          title="Refresh"
         >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M17.65 6.35A7.95 7.95 0 0 0 12 4c-4.41 0-8 3.59-8 8H2l3.89 3.89.07.14L10 12H7a5 5 0 1 1 1.46 3.54l-1.42 1.42A7 7 0 1 0 17.65 6.35Z"
+            />
+          </svg>
+        </button>
       </div>
     </header>
     <div class="mt-6 flex gap-3">
       <label class="grow">
         <span class="sr-only">Search your library</span>
         <input
-          class="input"
+          class="input preset-tonal-surface"
           type="search"
           placeholder="Search books or authors"
           bind:value={query}
         />
       </label>
       <button
-        class="btn preset-tonal-surface min-h-12"
+        class="btn btn-sm preset-tonal-surface"
         class:preset-filled-primary-700={downloadedOnly}
         type="button"
         aria-pressed={downloadedOnly}
@@ -463,7 +487,6 @@
         >Remove all downloaded books</button
       >
     </div>
-    <h3 class="mt-7 font-semibold">Redacted diagnostics</h3>
     <pre class="mt-2 max-h-48 overflow-auto rounded bg-surface-100-900 p-3 text-xs">
       {diagnostics}
     </pre>

@@ -5,6 +5,7 @@
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
   import { saveApiKey } from '../native/credentials';
+  import TurnleafLogo from './TurnleafLogo.svelte';
 
   let { onConnected }: { onConnected: (server: ServerConfig) => void } = $props();
 
@@ -73,9 +74,7 @@
   class="mx-auto flex min-h-dvh max-w-lg flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))]"
 >
   <header class="mb-10" in:fly={{ y: 10, duration: 220 }}>
-    <p class="mb-4 text-xs font-semibold uppercase tracking-[0.28em] text-primary-700-300">
-      Turnleaf
-    </p>
+    <TurnleafLogo size={128} />
     <h1 class="font-serif text-5xl leading-[1.04] tracking-tight text-surface-950-50">
       Your books,<br />quietly at hand.
     </h1>

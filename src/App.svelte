@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
+  import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
   import { getServer, type ServerConfig } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
 
@@ -38,7 +39,10 @@
   <div class="app-stage">
     {#if booting}
       <main class="grid min-h-dvh place-items-center" aria-label="Opening Turnleaf">
-        <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
+        <div class="grid justify-items-center gap-4">
+          <TurnleafLogo size={104} />
+          <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
+        </div>
       </main>
     {:else if server && apiKey}
       <Library {server} {apiKey} />
