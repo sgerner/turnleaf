@@ -461,7 +461,8 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    await markBookCompleted(book);
+    const readingState = await getReadingState(book.id);
+    await markBookCompleted(book, readingState);
     books = books.map((item) =>
       item.id === book.id
         ? {
@@ -471,6 +472,7 @@
           }
         : item,
     );
+    void flushProgress(client).catch(() => {});
     message = `${book.title} marked as read.`;
     actionMenuBook = null;
   }

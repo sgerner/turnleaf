@@ -282,6 +282,15 @@ export interface StoredReadingState {
   pendingSync: boolean;
 }
 
+export interface PendingProgressPayload {
+  libraryId: number;
+  seriesId: number;
+  volumeId: number;
+  chapterId: number;
+  pageNum: number;
+  bookScrollId?: string | null;
+}
+
 export async function getReadingState(bookId: string): Promise<StoredReadingState | null> {
   if (!Capacitor.isNativePlatform()) {
     return readBrowserState().readingState[bookId] ?? null;
@@ -374,8 +383,19 @@ export async function saveLocalProgress(
   ]);
 }
 
-export async function markBookCompleted(book: BookRecord): Promise<void> {
+export async function markBookCompleted(
+  book: BookRecord,
+  readingState: StoredReadingState | null = null,
+): Promise<void> {
   const now = new Date().toISOString();
+  const payload: PendingProgressPayload = {
+    libraryId: book.libraryId,
+    seriesId: book.seriesId,
+    volumeId: book.volumeId,
+    chapterId: book.chapterId,
+    pageNum: book.pages,
+    bookScrollId: readingState?.xpath ?? null,
+  };
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
     state.books = state.books.map((item) =>
@@ -387,6 +407,23 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
           }
         : item,
     );
+    if (readingState) {
+      state.readingState[book.id] = {
+        ...readingState,
+        percentage: 1,
+        localUpdatedAt: now,
+        pendingSync: true,
+      };
+    }
+    state.syncQueue[book.id] = {
+      bookId: book.id,
+      payloadJson: JSON.stringify(payload),
+      attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
+      lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
+      lastError: state.syncQueue[book.id]?.lastError ?? null,
+      createdAt: state.syncQueue[book.id]?.createdAt ?? now,
+      updatedAt: now,
+    };
     writeBrowserState(state);
     return;
   }
@@ -396,6 +433,21 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
     now,
     book.id,
   ]);
+  if (readingState) {
+    await db.run(
+      `INSERT INTO reading_state (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync)
+      VALUES (?,?,?,?,?,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
+      kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
+      local_updated_at=excluded.local_updated_at,pending_sync=1`,
+      [book.id, readingState.cfi, readingState.xpath, 1, now],
+    );
+  }
+  await db.run(
+    `INSERT INTO sync_queue (book_id,payload_json,created_at,updated_at) VALUES (?,?,?,?)
+    ON CONFLICT(book_id) DO UPDATE SET payload_json=excluded.payload_json,
+    updated_at=excluded.updated_at`,
+    [book.id, JSON.stringify(payload), now, now],
+  );
 }
 
 export async function getPendingSync(): Promise<Array<{ bookId: string; payload: string }>> {
