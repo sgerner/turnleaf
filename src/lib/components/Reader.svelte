@@ -309,17 +309,31 @@
     position: fixed;
     inset: 0;
     overflow: hidden;
-    background: #f6f0e5;
+    background: var(--reader-background);
+    color: var(--reader-text);
     touch-action: pan-y;
     user-select: none;
+    --reader-background: var(--color-surface-50);
+    --reader-text: var(--color-surface-950);
+    --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
+    --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
+    --reader-bar-text: var(--color-surface-950);
   }
 
   .reader-shell[data-mode='grayscale'] {
-    background: #e8e8e5;
+    --reader-background: var(--color-surface-100);
+    --reader-text: var(--color-surface-900);
+    --reader-overlay-top: color-mix(in oklab, var(--reader-text) 30%, transparent);
+    --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 24%, transparent);
+    --reader-bar-text: var(--color-surface-900);
   }
 
   .reader-shell[data-mode='dark'] {
-    background: #171816;
+    --reader-background: var(--color-surface-950);
+    --reader-text: var(--color-surface-50);
+    --reader-overlay-top: color-mix(in oklab, var(--reader-text) 38%, transparent);
+    --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 32%, transparent);
+    --reader-bar-text: var(--color-surface-50);
   }
 
   .reader-overlay {
@@ -328,10 +342,10 @@
     pointer-events: none;
     background: linear-gradient(
       to bottom,
-      rgb(20 22 19 / 38%),
+      var(--reader-overlay-top),
       transparent 18%,
       transparent 78%,
-      rgb(20 22 19 / 32%)
+      var(--reader-overlay-bottom)
     );
   }
 
@@ -366,7 +380,7 @@
     align-items: center;
     gap: 0.75rem;
     padding-inline: max(1rem, env(safe-area-inset-left));
-    color: #f6f2e9;
+    color: var(--reader-bar-text);
   }
 
   .reader-top {

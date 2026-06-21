@@ -1,29 +1,41 @@
 @import 'tailwindcss';
 @import '@skeletonlabs/skeleton';
 @import '@skeletonlabs/skeleton-svelte';
+@import '@skeletonlabs/skeleton/themes/catppuccin';
+@import '@skeletonlabs/skeleton/themes/cerberus';
+@import '@skeletonlabs/skeleton/themes/concord';
+@import '@skeletonlabs/skeleton/themes/crimson';
+@import '@skeletonlabs/skeleton/themes/fennec';
+@import '@skeletonlabs/skeleton/themes/hamlindigo';
+@import '@skeletonlabs/skeleton/themes/legacy';
+@import '@skeletonlabs/skeleton/themes/mint';
+@import '@skeletonlabs/skeleton/themes/modern';
+@import '@skeletonlabs/skeleton/themes/mona';
+@import '@skeletonlabs/skeleton/themes/nosh';
+@import '@skeletonlabs/skeleton/themes/nouveau';
+@import '@skeletonlabs/skeleton/themes/pine';
+@import '@skeletonlabs/skeleton/themes/reign';
+@import '@skeletonlabs/skeleton/themes/rocket';
+@import '@skeletonlabs/skeleton/themes/rose';
+@import '@skeletonlabs/skeleton/themes/sahara';
+@import '@skeletonlabs/skeleton/themes/seafoam';
+@import '@skeletonlabs/skeleton/themes/terminus';
 @import '@skeletonlabs/skeleton/themes/vintage';
+@import '@skeletonlabs/skeleton/themes/vox';
+@import '@skeletonlabs/skeleton/themes/wintry';
 
 @custom-variant dark (&:where([data-mode='dark'], [data-mode='dark'] *));
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
   font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
-  background: #f3eee4;
-  color: #282721;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
 
-[data-theme='turnleaf'] {
-  --base-font-color: #282721;
-  --base-font-color-dark: #eee9df;
+[data-theme='vintage'] {
   --base-font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
   --heading-font-family: Iowan Old Style, Palatino Linotype, Book Antiqua, Georgia, serif;
-  --anchor-font-color: #48634c;
-  --anchor-font-color-dark: #aac3aa;
-  --color-primary-500: oklch(49% 0.07 145deg);
-  --color-secondary-500: oklch(61% 0.07 68deg);
-  --color-tertiary-500: oklch(52% 0.045 235deg);
 }
 
 html,
@@ -35,7 +47,8 @@ body,
 
 body {
   min-width: 320px;
-  background: radial-gradient(circle at 85% 6%, rgb(197 183 151 / 18%), transparent 30rem), #f3eee4;
+  background: var(--body-background-color);
+  color: var(--base-font-color);
 }
 
 button,
@@ -44,7 +57,7 @@ input {
 }
 
 :focus-visible {
-  outline: 3px solid #637e67;
+  outline: 3px solid var(--color-primary-700-300);
   outline-offset: 3px;
 }
 

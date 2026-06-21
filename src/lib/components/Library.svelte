@@ -262,10 +262,10 @@
   <main class="mx-auto min-h-dvh max-w-6xl px-5 pb-12 pt-[max(2rem,env(safe-area-inset-top))]">
     <header class="flex items-end justify-between gap-4">
       <div>
-        <p class="text-xs font-semibold uppercase tracking-[0.24em] text-primary-700">
+        <p class="text-xs font-semibold uppercase tracking-[0.24em] text-primary-700-300">
           {server.displayName}
         </p>
-        <h1 class="mt-2 font-serif text-4xl text-surface-950">Your library</h1>
+        <h1 class="mt-2 font-serif text-4xl text-surface-950-50">Your library</h1>
       </div>
       <div class="flex gap-2">
         <button class="btn preset-tonal-surface min-h-12" type="button" onclick={openSettings}
@@ -303,8 +303,8 @@
     {#if message}<div class="alert preset-tonal-surface mt-4" role="status" transition:fade>
         {message}
       </div>{/if}
-    {#if loading}<p class="mt-16 text-center text-surface-500">Opening your saved library...</p>
-    {:else if books.length === 0}<p class="mt-16 text-center text-surface-500">
+    {#if loading}<p class="mt-16 text-center text-surface-700-300">Opening your saved library...</p>
+    {:else if books.length === 0}<p class="mt-16 text-center text-surface-700-300">
         No EPUB books found.
       </p>
     {:else}<section
@@ -313,7 +313,7 @@
       >
         {#each visibleBooks as book (book.id)}
           <button class="group text-left" type="button" onclick={() => (selected = book)}>
-            <div class="aspect-[2/3] overflow-hidden rounded-lg bg-surface-200 shadow-md">
+            <div class="aspect-[2/3] overflow-hidden rounded-lg bg-surface-200-800 shadow-md">
               <img
                 class="h-full w-full object-cover"
                 src={covers[book.seriesId] ?? client.coverUrl(book.seriesId)}
@@ -323,10 +323,12 @@
               />
             </div>
             <h2 class="mt-3 line-clamp-2 font-serif text-lg leading-tight">{book.title}</h2>
-            <p class="mt-1 truncate text-sm text-surface-500">{book.author ?? 'Unknown author'}</p>
-            <div class="mt-2 h-1 overflow-hidden rounded-full bg-surface-200">
+            <p class="mt-1 truncate text-sm text-surface-700-300">
+              {book.author ?? 'Unknown author'}
+            </p>
+            <div class="mt-2 h-1 overflow-hidden rounded-full bg-surface-200-800">
               <div
-                class="h-full bg-primary-600"
+                class="h-full bg-primary-600-400"
                 style:width={`${book.pages ? (book.pagesRead / book.pages) * 100 : 0}%`}
               ></div>
             </div>
@@ -355,7 +357,7 @@
         onclick={() => (selected = null)}>Close</button
       >
       <h2 class="pr-20 font-serif text-3xl">{selected.title}</h2>
-      <p class="mt-2 text-surface-500">{selected.author}</p>
+      <p class="mt-2 text-surface-700-300">{selected.author}</p>
       {#if selected.descriptionHtml}<p class="mt-5 whitespace-pre-line leading-relaxed">
           {descriptionText(selected.descriptionHtml)}
         </p>{/if}
@@ -391,7 +393,9 @@
   >
     <div class="card preset-filled-surface-50-950 max-w-sm p-6">
       <h2 class="font-serif text-2xl">Choose where to continue</h2>
-      <p class="mt-3 text-surface-600">This device and Kavita both moved since the last sync.</p>
+      <p class="mt-3 text-surface-600-400">
+        This device and Kavita both moved since the last sync.
+      </p>
       <div class="mt-6 grid gap-3">
         <button
           class="btn preset-filled-primary-700"
@@ -438,11 +442,11 @@
     <h2 class="font-serif text-3xl">Settings</h2>
     <dl class="mt-6 space-y-3 text-sm">
       <div>
-        <dt class="text-surface-500">Server</dt>
+        <dt class="text-surface-700-300">Server</dt>
         <dd>{server.baseUrl}</dd>
       </div>
       <div>
-        <dt class="text-surface-500">Downloaded storage</dt>
+        <dt class="text-surface-700-300">Downloaded storage</dt>
         <dd>
           {(
             books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
@@ -460,7 +464,9 @@
       >
     </div>
     <h3 class="mt-7 font-semibold">Redacted diagnostics</h3>
-    <pre class="mt-2 max-h-48 overflow-auto rounded bg-surface-100 p-3 text-xs">{diagnostics}</pre>
+    <pre class="mt-2 max-h-48 overflow-auto rounded bg-surface-100-900 p-3 text-xs">
+      {diagnostics}
+    </pre>
     <button
       class="btn preset-tonal-primary mt-3"
       type="button"

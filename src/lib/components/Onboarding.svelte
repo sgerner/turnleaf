@@ -73,11 +73,13 @@
   class="mx-auto flex min-h-dvh max-w-lg flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))]"
 >
   <header class="mb-10" in:fly={{ y: 10, duration: 220 }}>
-    <p class="mb-4 text-xs font-semibold uppercase tracking-[0.28em] text-primary-700">Turnleaf</p>
-    <h1 class="font-serif text-5xl leading-[1.04] tracking-tight text-surface-950">
+    <p class="mb-4 text-xs font-semibold uppercase tracking-[0.28em] text-primary-700-300">
+      Turnleaf
+    </p>
+    <h1 class="font-serif text-5xl leading-[1.04] tracking-tight text-surface-950-50">
       Your books,<br />quietly at hand.
     </h1>
-    <p class="mt-5 max-w-sm text-base leading-relaxed text-surface-600">
+    <p class="mt-5 max-w-sm text-base leading-relaxed text-surface-700-300">
       Connect directly to Kavita. Download EPUB books and keep your place across devices.
     </p>
   </header>
@@ -97,7 +99,7 @@
     </label>
 
     {#if serverUrl.trim().toLowerCase().startsWith('http://')}
-      <label class="flex min-h-12 items-start gap-3 text-sm text-warning-900" transition:fade>
+      <label class="flex min-h-12 items-start gap-3 text-sm text-warning-900-100" transition:fade>
         <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
         <span
           >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic.</span
@@ -115,13 +117,14 @@
         bind:value={apiKey}
         required
       />
-      <span class="label-text text-xs text-surface-500">
+      <span class="label-text text-xs text-surface-700-300">
         Create this in Kavita for a dedicated non-administrator account.
       </span>
     </label>
 
     <label class="label">
-      <span class="label-text">Library name <span class="text-surface-400">Optional</span></span>
+      <span class="label-text">Library name <span class="text-surface-600-400">Optional</span></span
+      >
       <input class="input" autocomplete="organization" bind:value={displayName} />
     </label>
 
@@ -134,7 +137,7 @@
     </button>
   </form>
 
-  <p class="mt-auto pt-8 text-center text-xs leading-relaxed text-surface-500">
+  <p class="mt-auto pt-8 text-center text-xs leading-relaxed text-surface-700-300">
     {#if Capacitor.isNativePlatform()}
       Credentials are stored in your device's secure Keychain or Keystore.
     {:else}

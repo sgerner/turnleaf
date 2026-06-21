@@ -22,9 +22,24 @@ interface SpineSection {
 }
 
 const MODE_COLORS = {
-  light: { background: '#f6f0e5', text: '#292721', link: '#365c44', selection: '#c9d9bd' },
-  grayscale: { background: '#e8e8e5', text: '#292a2a', link: '#3f5558', selection: '#c4cece' },
-  dark: { background: '#171816', text: '#dedbd2', link: '#9ebca4', selection: '#44584a' },
+  light: {
+    background: '--color-surface-50',
+    text: '--color-surface-950',
+    link: '--color-primary-700',
+    selection: '--color-primary-200',
+  },
+  grayscale: {
+    background: '--color-surface-100',
+    text: '--color-surface-900',
+    link: '--color-surface-700',
+    selection: '--color-surface-300',
+  },
+  dark: {
+    background: '--color-surface-950',
+    text: '--color-surface-50',
+    link: '--color-primary-300',
+    selection: '--color-primary-800',
+  },
 } as const;
 
 export class ReaderSession {
@@ -124,8 +139,8 @@ export class ReaderSession {
           : 'Avenir Next, Segoe UI, sans-serif';
     this.rendition.themes.register('turnleaf', {
       body: {
-        color: `${colors.text} !important`,
-        background: `${colors.background} !important`,
+        color: `${this.resolveToken(colors.text)} !important`,
+        background: `${this.resolveToken(colors.background)} !important`,
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
@@ -136,8 +151,8 @@ export class ReaderSession {
         'text-align': `${value.alignment} !important`,
         hyphens: value.hyphenation ? 'auto' : 'none',
       },
-      a: { color: `${colors.link} !important` },
-      '::selection': { background: `${colors.selection} !important` },
+      a: { color: `${this.resolveToken(colors.link)} !important` },
+      '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
     });
     this.rendition.themes.select('turnleaf');
   }
@@ -220,5 +235,9 @@ export class ReaderSession {
     if (typeof page === 'number') return Math.max(0, page - 1);
     const runtimePage = page as unknown as { index?: number };
     return Math.max(0, runtimePage.index ?? 0);
+  }
+
+  private resolveToken(token: string): string {
+    return getComputedStyle(document.documentElement).getPropertyValue(token).trim() || token;
   }
 }

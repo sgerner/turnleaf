@@ -12,7 +12,6 @@
   let apiKey = $state<string | null>(null);
 
   onMount(async () => {
-    if (!Capacitor.isNativePlatform()) return;
     try {
       const saved = await getServer();
       if (saved) {
@@ -29,7 +28,7 @@
 
 {#if booting}
   <main class="grid min-h-dvh place-items-center" aria-label="Opening Turnleaf">
-    <p class="text-sm tracking-wide text-surface-500">Opening your library...</p>
+    <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
   </main>
 {:else if server && apiKey}
   <Library {server} {apiKey} />
