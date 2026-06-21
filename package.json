@@ -14,12 +14,14 @@
     "test:watch": "vitest",
     "build": "npm run check && vite build",
     "release:notes": "node scripts/release-notes.mjs",
+    "setup:hooks": "node scripts/install-githooks.mjs",
     "cap:sync": "npm run build && cap sync",
     "android:open": "export $(grep -v '^#' .env | xargs) && cap open android",
     "android:debug": "npm run cap:sync && cd android && ./gradlew assembleDebug",
     "android:release": "npm run build && npx cap sync android && cd android && ./gradlew assembleRelease",
     "ios:sync": "npm run build && cap sync ios",
-    "ios:open": "cap open ios"
+    "ios:open": "cap open ios",
+    "postinstall": "node scripts/install-githooks.mjs"
   },
   "dependencies": {
     "@aparajita/capacitor-secure-storage": "^8.0.0",
