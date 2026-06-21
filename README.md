@@ -6,6 +6,12 @@ The goal is simple: connect to Kavita, download books, read them as paginated pa
 
 Latest release: [GitHub Releases](https://github.com/sgerner/turnleaf/releases/latest)
 
+## Recent release notes
+
+- Reader mode now hides the native status bar on supported devices.
+- Android reader mode now supports hardware volume buttons for page turns.
+- iOS has matching scaffolding for the same reader hardware-button behavior where the platform allows it.
+
 ## Screenshots
 
 ### Library
