@@ -14,7 +14,7 @@
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
-  const defaultTheme = 'vintage';
+  const defaultTheme = 'fennec';
   const defaultMode = 'dark';
 
   let server = $state<ServerConfig | null>(null);
@@ -170,7 +170,7 @@
   .orb {
     position: absolute;
     border-radius: 9999px;
-    opacity: 0.72;
+    opacity: 0.66;
     transform: translate3d(0, 0, 0);
     will-change: transform;
   }
@@ -228,8 +228,8 @@
     background-size:
       100% 100%,
       100% 100%;
-    opacity: 0.16;
-    mask-image: radial-gradient(circle at center, black 38%, transparent 100%);
+    opacity: 0.12;
+    mask-image: radial-gradient(circle at center, black 44%, transparent 100%);
   }
 
   .vignette {
@@ -237,8 +237,8 @@
     inset: 0;
     background: radial-gradient(
       circle at center,
-      transparent 34%,
-      color-mix(in oklab, var(--color-surface-50-950) 56%, transparent) 100%
+      transparent 42%,
+      color-mix(in oklab, var(--color-surface-50-950) 48%, transparent) 100%
     );
   }
 
@@ -248,7 +248,7 @@
   }
 
   :global([data-mode='dark']) .orb {
-    opacity: 0.92;
+    opacity: 0.84;
   }
 
   :global([data-mode='dark']) .orb-primary {
@@ -276,15 +276,15 @@
   }
 
   :global([data-mode='dark']) .mesh {
-    opacity: 0.08;
-    mask-image: radial-gradient(circle at center, black 40%, transparent 100%);
+    opacity: 0.06;
+    mask-image: radial-gradient(circle at center, black 46%, transparent 100%);
   }
 
   :global([data-mode='dark']) .vignette {
     background: radial-gradient(
       circle at center,
-      transparent 28%,
-      color-mix(in oklab, var(--color-surface-950) 84%, transparent) 100%
+      transparent 38%,
+      color-mix(in oklab, var(--color-surface-950) 74%, transparent) 100%
     );
   }
 

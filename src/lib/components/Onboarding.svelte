@@ -131,7 +131,7 @@
       <div class="alert preset-tonal-error" role="alert" transition:fade>{error}</div>
     {/if}
 
-    <button class="btn preset-filled-primary-700 w-full" type="submit" disabled={busy}>
+    <button class="btn preset-filled-primary-700-300 w-full" type="submit" disabled={busy}>
       {busy ? 'Testing connection...' : 'Connect to Kavita'}
     </button>
   </form>

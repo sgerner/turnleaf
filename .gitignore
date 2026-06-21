@@ -14,3 +14,4 @@ ios/App/DerivedData/
 *.keystore
 keystore.properties
 .env
+.opencode/plugins/emdash-notifications.js
