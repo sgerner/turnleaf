@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Align Vite 8 and Svelte plugin
 - Align ESLint 10 packages
 - Switch release notes to post-commit amend
 - Add release note commit hook
