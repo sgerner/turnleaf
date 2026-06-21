@@ -1,0 +1,11 @@
+node_modules/
+dist/
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/app/build/
+android/build/
+android/capacitor-cordova-android-plugins/build/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+package-lock.json
