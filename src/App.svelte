@@ -83,7 +83,7 @@
             </p>
             <p class="text-sm text-surface-700-300">A newer GitHub release was found at startup.</p>
           </div>
-            <div class="flex flex-wrap items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2">
             {#if releaseBanner.downloadUrl}
               <a
                 class="btn btn-sm preset-filled-success-500 !text-sm"
