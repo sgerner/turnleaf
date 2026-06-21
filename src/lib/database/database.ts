@@ -38,10 +38,65 @@ export interface BookRecord {
 
 let connection: SQLiteDBConnection | null = null;
 
+interface BrowserDatabaseState {
+  serverConfig: ServerConfig | null;
+  books: BookRecord[];
+  readingState: Record<string, StoredReadingState>;
+  syncQueue: Record<
+    string,
+    {
+      bookId: string;
+      payloadJson: string;
+      attemptCount: number;
+      lastAttemptAt: string | null;
+      lastError: string | null;
+      createdAt: string;
+      updatedAt: string;
+    }
+  >;
+  preferences: Record<string, string>;
+}
+
+const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
+
+function createBrowserState(): BrowserDatabaseState {
+  return {
+    serverConfig: null,
+    books: [],
+    readingState: {},
+    syncQueue: {},
+    preferences: {},
+  };
+}
+
+function readBrowserState(): BrowserDatabaseState {
+  if (typeof window === 'undefined') return createBrowserState();
+  const raw = window.localStorage.getItem(BROWSER_STORAGE_KEY);
+  if (!raw) return createBrowserState();
+  try {
+    const parsed = JSON.parse(raw) as Partial<BrowserDatabaseState>;
+    return {
+      serverConfig: parsed.serverConfig ?? null,
+      books: Array.isArray(parsed.books) ? (parsed.books as BookRecord[]) : [],
+      readingState: parsed.readingState ?? {},
+      syncQueue: parsed.syncQueue ?? {},
+      preferences: parsed.preferences ?? {},
+    };
+  } catch {
+    return createBrowserState();
+  }
+}
+
+function writeBrowserState(state: BrowserDatabaseState): void {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
+}
+
 export async function openDatabase(): Promise<SQLiteDBConnection> {
+  if (!Capacitor.isNativePlatform()) {
+    throw new Error('Browser preview uses localStorage-backed storage.');
+  }
   if (connection) return connection;
-  if (!Capacitor.isNativePlatform())
-    throw new Error('Native database unavailable in browser preview.');
 
   const sqlite = new SQLiteConnection(CapacitorSQLite);
   const consistency = await sqlite.checkConnectionsConsistency();
@@ -66,6 +121,12 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
 }
 
 export async function saveServer(config: ServerConfig): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    state.serverConfig = config;
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   await db.run(
     `INSERT OR REPLACE INTO server_config
@@ -83,6 +144,9 @@ export async function saveServer(config: ServerConfig): Promise<void> {
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
+  if (!Capacitor.isNativePlatform()) {
+    return readBrowserState().serverConfig;
+  }
   const db = await openDatabase();
   const result = await db.query(
     `SELECT id, display_name, base_url, credential_ref, kavita_version, last_connected_at
@@ -101,6 +165,12 @@ export async function getServer(): Promise<ServerConfig | null> {
 }
 
 export async function replaceBooks(serverId: string, books: BookRecord[]): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    state.books = books.map((book) => ({ ...book, serverId }));
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   for (const book of books) {
     await db.run(
@@ -140,6 +210,9 @@ export async function replaceBooks(serverId: string, books: BookRecord[]): Promi
 }
 
 export async function getBooks(serverId: string): Promise<BookRecord[]> {
+  if (!Capacitor.isNativePlatform()) {
+    return readBrowserState().books.filter((book) => book.serverId === serverId);
+  }
   const db = await openDatabase();
   const result = await db.query('SELECT * FROM books WHERE server_id = ? ORDER BY title', [
     serverId,
@@ -167,6 +240,16 @@ export async function getBooks(serverId: string): Promise<BookRecord[]> {
 }
 
 export async function markDownloaded(bookId: string, path: string, size: number): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    state.books = state.books.map((book) =>
+      book.id === bookId
+        ? { ...book, downloadPath: path, downloadStatus: 'available', fileSize: size }
+        : book,
+    );
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   await db.run(
     "UPDATE books SET download_path=?, download_status='available', file_size=? WHERE id=?",
@@ -184,6 +267,9 @@ export interface StoredReadingState {
 }
 
 export async function getReadingState(bookId: string): Promise<StoredReadingState | null> {
+  if (!Capacitor.isNativePlatform()) {
+    return readBrowserState().readingState[bookId] ?? null;
+  }
   const db = await openDatabase();
   const row = (await db.query('SELECT * FROM reading_state WHERE book_id=?', [bookId])).values?.[0];
   if (!row) return null;
@@ -203,6 +289,36 @@ export async function saveLocalProgress(
   xpath: string | null,
   percentage: number,
 ): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const now = new Date().toISOString();
+    state.readingState[book.id] = {
+      cfi,
+      xpath,
+      percentage,
+      localUpdatedAt: now,
+      serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
+      pendingSync: true,
+    };
+    state.syncQueue[book.id] = {
+      bookId: book.id,
+      payloadJson: JSON.stringify({
+        libraryId: book.libraryId,
+        seriesId: book.seriesId,
+        volumeId: book.volumeId,
+        chapterId: book.chapterId,
+        pageNum: Math.min(book.pages, Math.max(0, Math.round(percentage * book.pages))),
+        bookScrollId: xpath,
+      }),
+      attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
+      lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
+      lastError: state.syncQueue[book.id]?.lastError ?? null,
+      createdAt: state.syncQueue[book.id]?.createdAt ?? now,
+      updatedAt: now,
+    };
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   const now = new Date().toISOString();
   const payload = {
@@ -229,6 +345,11 @@ export async function saveLocalProgress(
 }
 
 export async function getPendingSync(): Promise<Array<{ bookId: string; payload: string }>> {
+  if (!Capacitor.isNativePlatform()) {
+    return Object.values(readBrowserState().syncQueue)
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+      .map((row) => ({ bookId: row.bookId, payload: row.payloadJson }));
+  }
   const db = await openDatabase();
   const result = await db.query('SELECT book_id,payload_json FROM sync_queue ORDER BY updated_at');
   return (result.values ?? []).map((row) => ({
@@ -238,6 +359,19 @@ export async function getPendingSync(): Promise<Array<{ bookId: string; payload:
 }
 
 export async function confirmSync(bookId: string, serverUpdatedAt: string): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    delete state.syncQueue[bookId];
+    if (state.readingState[bookId]) {
+      state.readingState[bookId] = {
+        ...state.readingState[bookId],
+        pendingSync: false,
+        serverUpdatedAt,
+      };
+    }
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   await db.run('DELETE FROM sync_queue WHERE book_id=?', [bookId]);
   await db.run(
@@ -248,6 +382,17 @@ export async function confirmSync(bookId: string, serverUpdatedAt: string): Prom
 }
 
 export async function markSyncFailure(bookId: string, error: string): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const row = state.syncQueue[bookId];
+    if (row) {
+      row.attemptCount += 1;
+      row.lastAttemptAt = new Date().toISOString();
+      row.lastError = error.slice(0, 240);
+      writeBrowserState(state);
+    }
+    return;
+  }
   const db = await openDatabase();
   await db.run(
     `UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=?
@@ -257,6 +402,16 @@ export async function markSyncFailure(bookId: string, error: string): Promise<vo
 }
 
 export async function removeDownload(bookId: string): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    state.books = state.books.map((book) =>
+      book.id === bookId
+        ? { ...book, downloadPath: null, downloadStatus: 'none', fileSize: null }
+        : book,
+    );
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   await db.run(
     "UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id=?",
@@ -265,12 +420,21 @@ export async function removeDownload(bookId: string): Promise<void> {
 }
 
 export async function getPreference(key: string): Promise<string | null> {
+  if (!Capacitor.isNativePlatform()) {
+    return readBrowserState().preferences[key] ?? null;
+  }
   const db = await openDatabase();
   const row = (await db.query('SELECT value FROM preferences WHERE key=?', [key])).values?.[0];
   return row ? String(row.value) : null;
 }
 
 export async function setPreference(key: string, value: string): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    state.preferences[key] = value;
+    writeBrowserState(state);
+    return;
+  }
   const db = await openDatabase();
   await db.run(
     `INSERT INTO preferences (key,value,updated_at) VALUES (?,?,?)

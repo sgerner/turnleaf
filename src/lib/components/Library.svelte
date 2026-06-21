@@ -1,5 +1,6 @@
 <script lang="ts">
   import { App } from '@capacitor/app';
+  import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
   import DOMPurify from 'dompurify';
   import { onDestroy, onMount } from 'svelte';
@@ -63,6 +64,7 @@
   let diagnostics = $state('');
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
+  const nativePlatform = Capacitor.isNativePlatform();
 
   onMount(async () => {
     books = await getBooks(server.id);
@@ -134,6 +136,7 @@
   }
 
   async function loadCovers(items: BookRecord[]): Promise<void> {
+    if (!nativePlatform) return;
     for (const book of items) {
       if (covers[book.seriesId]) continue;
       try {
@@ -360,16 +363,19 @@
         {#if selected.downloadPath}<button
             class="btn preset-filled-primary-700"
             type="button"
+            disabled={!nativePlatform}
             onclick={() => open(selected!)}>Read</button
           >
           <button
             class="btn preset-outlined-error-500"
             type="button"
+            disabled={!nativePlatform}
             onclick={() => remove(selected!)}>Remove download</button
           >
         {:else}<button
             class="btn preset-filled-primary-700"
             type="button"
+            disabled={!nativePlatform}
             onclick={() => download(selected!)}>Download EPUB</button
           >{/if}
       </div>

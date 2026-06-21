@@ -1,3 +1,4 @@
+import { Capacitor, CapacitorHttp, type HttpOptions } from '@capacitor/core';
 import type {
   ConnectedServer,
   KavitaLibrary,
@@ -8,6 +9,7 @@ import type {
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
+const BROWSER_PROXY_PREFIX = '/__kavita__/';
 
 export class KavitaError extends Error {
   constructor(
@@ -64,11 +66,13 @@ export class KavitaClient {
   }
 
   downloadUrl(chapterId: number): string {
-    return `${this.baseUrl}/api/Download/chapter?chapterId=${chapterId}`;
+    return this.resolveUrl(`/api/Download/chapter?chapterId=${chapterId}`);
   }
 
   coverUrl(seriesId: number): string {
-    return `${this.baseUrl}/api/Image/series-cover?seriesId=${seriesId}&apiKey=${encodeURIComponent(this.apiKey)}`;
+    return this.resolveUrl(
+      `/api/Image/series-cover?seriesId=${seriesId}&apiKey=${encodeURIComponent(this.apiKey)}`,
+    );
   }
 
   async getCover(seriesId: number, signal?: AbortSignal): Promise<Blob> {
@@ -122,7 +126,7 @@ export class KavitaClient {
     const signal = init.signal ? AbortSignal.any([init.signal, timeout.signal]) : timeout.signal;
 
     try {
-      const response = await fetch(`${this.baseUrl}${path}`, {
+      const response = await fetch(this.resolveUrl(path), {
         ...init,
         signal,
         headers: {
@@ -195,5 +199,16 @@ export class KavitaClient {
       throw new KavitaError(`Kavita returned an error (${status}).`, 'server', status);
     }
   }
+
+  private resolveUrl(path: string): string {
+    const absolute = new URL(path, this.baseUrl).toString();
+    if (
+      !Capacitor.isNativePlatform() &&
+      import.meta.env.DEV &&
+      import.meta.env.MODE === 'development'
+    ) {
+      return `${BROWSER_PROXY_PREFIX}${encodeURIComponent(absolute)}`;
+    }
+    return absolute;
+  }
 }
-import { Capacitor, CapacitorHttp, type HttpOptions } from '@capacitor/core';

@@ -8,6 +8,8 @@ Only conventional text-based EPUB books are in scope. Manga, comics, PDFs, magaz
 
 The application includes secure onboarding, books-only Kavita browsing, cached metadata, atomic app-private EPUB downloads, paginated EPUB.js reading, CFI restoration, appearance controls, a coalesced offline sync queue, conflict handling, diagnostics, and Android/iOS Capacitor projects.
 
+`npm run dev` also supports a browser preview for live Kavita browsing. In that mode, credentials and cached library state are stored locally in that browser only, and the Vite dev server proxies Kavita API requests to avoid CORS limitations. Native downloads and offline file handling still require Android or iOS.
+
 Android API 36 emulator tests covered authenticated library mapping and download, page turns, force-stop persistence, airplane-mode library access, and offline CFI reopen. The supplied test key later began returning HTTP 401, so final server acknowledgement of the queued progress update could not be re-verified. iOS is scaffolded and synchronized but cannot be compiled on Linux.
 
 ## Commands

@@ -21,9 +21,6 @@
     busy = true;
 
     try {
-      if (!Capacitor.isNativePlatform()) {
-        throw new Error('Open the Android or iOS application to save credentials securely.');
-      }
       const normalized = normalizeServerUrl(serverUrl);
       if (normalized.insecure && !allowHttp) {
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
@@ -138,6 +135,10 @@
   </form>
 
   <p class="mt-auto pt-8 text-center text-xs leading-relaxed text-surface-500">
-    Credentials are stored in your device's secure Keychain or Keystore, never in browser storage.
+    {#if Capacitor.isNativePlatform()}
+      Credentials are stored in your device's secure Keychain or Keystore.
+    {:else}
+      Browser preview stores credentials locally in this browser only. Use it for development.
+    {/if}
   </p>
 </main>

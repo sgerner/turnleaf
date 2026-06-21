@@ -29,6 +29,8 @@
     "@capacitor/network": "^8.0.1",
     "dompurify": "^3.2.6",
     "epubjs": "^0.3.93",
+    "jeep-sqlite": "^2.8.0",
+    "sql.js": "^1.14.1",
     "svelte": "^5.56.3"
   },
   "devDependencies": {
