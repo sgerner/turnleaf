@@ -66,7 +66,9 @@ export class KavitaClient {
   }
 
   downloadUrl(chapterId: number): string {
-    return this.resolveUrl(`/api/Download/chapter?chapterId=${chapterId}`);
+    return this.resolveUrl(
+      `/api/Download/chapter?chapterId=${chapterId}&apiKey=${encodeURIComponent(this.apiKey)}`,
+    );
   }
 
   coverUrl(seriesId: number): string {

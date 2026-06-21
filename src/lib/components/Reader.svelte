@@ -109,7 +109,7 @@
 </script>
 
 <div class="reader-shell" data-mode={appearance.mode}>
-  <div class="h-full w-full" bind:this={viewport}></div>
+  <div class="reader-viewport" bind:this={viewport}></div>
 
   <nav class="tap-zones" aria-label="Page navigation">
     <button type="button" aria-label="Previous page" onclick={() => turn('previous')}></button>
@@ -120,6 +120,15 @@
     ></button>
     <button type="button" aria-label="Next page" onclick={() => turn('next')}></button>
   </nav>
+
+  {#if !controlsVisible}
+    <button
+      type="button"
+      class="reader-top-reveal"
+      aria-label="Show reading controls"
+      onclick={showControls}
+    ></button>
+  {/if}
 
   {#if error}
     <div class="absolute inset-0 grid place-items-center p-8" role="alert">
@@ -320,6 +329,44 @@
     --reader-bar-text: var(--color-surface-950);
   }
 
+  .reader-viewport {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    max-width: 100%;
+    contain: layout paint;
+  }
+
+  .reader-viewport :global(.epub-container) {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    max-width: 100% !important;
+    overflow: hidden !important;
+  }
+
+  .reader-viewport :global(.epub-view) {
+    width: 100% !important;
+    height: 100% !important;
+    max-width: 100% !important;
+    overflow: hidden !important;
+  }
+
+  .reader-viewport :global(iframe) {
+    position: absolute !important;
+    inset: 0 !important;
+    display: block;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    height: 100% !important;
+    border: 0 !important;
+  }
+
   .reader-shell[data-mode='dark'] {
     --reader-background: var(--color-surface-950);
     --reader-text: var(--color-surface-50);
@@ -347,6 +394,18 @@
     inset: 0;
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
+  }
+
+  .reader-top-reveal {
+    position: absolute;
+    z-index: 11;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    border: 0;
+    background: transparent;
+    -webkit-tap-highlight-color: transparent;
   }
 
   .tap-zones button {

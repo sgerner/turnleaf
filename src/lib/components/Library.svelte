@@ -2,7 +2,6 @@
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
-  import DOMPurify from 'dompurify';
   import { onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import {
@@ -213,7 +212,6 @@
       )
       .sort((a, b) => (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? ''))[0] ?? null,
   );
-  let selected = $state<BookRecord | null>(null);
   let reading = $state<{
     book: BookRecord;
     url: string;
@@ -229,6 +227,7 @@
   let covers = $state<Record<number, string>>({});
   let loading = $state(true);
   let refreshing = $state(false);
+  let downloadingBookId = $state<string | null>(null);
   let offline = $state(false);
   let message = $state('');
   let settingsVisible = $state(false);
@@ -273,7 +272,6 @@
       (
         await App.addListener('backButton', () => {
           if (reading) reading = null;
-          else if (selected) selected = null;
           else if (settingsVisible) settingsVisible = false;
           else void App.exitApp();
         })
@@ -330,7 +328,9 @@
     }
   }
 
-  async function download(book: BookRecord): Promise<void> {
+  async function download(book: BookRecord): Promise<BookRecord | null> {
+    if (downloadingBookId) return null;
+    downloadingBookId = book.id;
     message = `Downloading ${book.title}...`;
     try {
       const file = await downloadEpub(
@@ -339,31 +339,58 @@
         book.id.replaceAll(':', '-'),
       );
       await markDownloaded(book.id, file.relativePath, file.size);
-      await reloadSelection(book.id);
+      const refreshed = {
+        ...book,
+        downloadPath: file.relativePath,
+        downloadStatus: 'downloaded',
+        fileSize: file.size,
+      };
+      books = books.map((item) => (item.id === book.id ? refreshed : item));
       message = `${book.title} is ready offline.`;
-    } catch {
+      return refreshed;
+    } catch (error) {
+      const detail =
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : typeof error === 'object' && error !== null
+            ? String('code' in error ? error.code : 'native error')
+            : String(error);
+      console.error(`EPUB download failed: ${detail}`);
       message = 'The download was interrupted. Try again when Kavita is available.';
+      return null;
+    } finally {
+      downloadingBookId = null;
     }
   }
 
   async function remove(book: BookRecord): Promise<void> {
     if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath).catch(() => {});
     await removeDownload(book.id);
-    await reloadSelection(book.id);
-  }
-
-  async function reloadSelection(bookId: string): Promise<void> {
-    books = await getBooks(server.id);
-    selected = books.find((item) => item.id === bookId) ?? null;
+    books = books.map((item) =>
+      item.id === book.id
+        ? {
+            ...item,
+            downloadPath: null,
+            downloadStatus: 'missing',
+            fileSize: null,
+          }
+        : item,
+    );
   }
 
   async function open(book: BookRecord): Promise<void> {
-    if (!book.downloadPath) return;
+    if (!book.downloadPath) {
+      const refreshed = await download(book);
+      if (refreshed) await open(refreshed);
+      return;
+    }
     const file = await verifyDownloadedEpub(book.downloadPath);
     if (!file) {
       await removeDownload(book.id);
       message = 'The downloaded file is missing. Download it again.';
       books = await getBooks(server.id);
+      const refreshed = books.find((item) => item.id === book.id) ?? null;
+      if (refreshed) await open(refreshed);
       return;
     }
     const local = await getReadingState(book.id);
@@ -390,11 +417,6 @@
     await saveLocalProgress(book, location.cfi, location.xpath, location.percentage);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
-  }
-
-  function descriptionText(html: string): string {
-    const clean = DOMPurify.sanitize(html);
-    return new DOMParser().parseFromString(clean, 'text/html').body.textContent ?? '';
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -534,7 +556,7 @@
       </section>
     {/if}
 
-    <div class="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
+    <div class="mt-5 flex flex-col sm:flex-row sm:items-center">
       <label class="relative grow">
         <span class="sr-only">Search your library</span>
         <svg
@@ -548,7 +570,7 @@
           />
         </svg>
         <input
-          class="input preset-tonal-surface pl-10 pr-10"
+          class="input preset-tonal-surface h-10 pl-10 pr-10 text-sm"
           type="search"
           placeholder="Search books or authors"
           bind:value={query}
@@ -570,9 +592,11 @@
           </button>
         {/if}
       </label>
-      <div class="flex flex-wrap gap-2">
+      <div class="grid grid-cols-2">
         <button
-          class="chip {downloadedOnly ? 'preset-filled-primary-700-300' : 'preset-tonal-surface'}"
+          class="h-8 !px-2 !py-0 btn btn-sm !text-sm rounded-none {downloadedOnly
+            ? 'preset-filled-primary-700-300'
+            : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
           onclick={() => (downloadedOnly = !downloadedOnly)}
@@ -581,10 +605,12 @@
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
           </svg>
-          <span>Downloaded</span>
+          <span>Downloaded Only</span>
         </button>
         <button
-          class="chip {hideCompleted ? 'preset-filled-primary-700-300' : 'preset-tonal-surface'}"
+          class="h-8 !px-2 !py-0 btn btn-sm !text-sm rounded-none {hideCompleted
+            ? 'preset-filled-secondary-100-900'
+            : 'preset-filled-primary-700-300'}"
           type="button"
           aria-pressed={hideCompleted}
           onclick={() => (hideCompleted = !hideCompleted)}
@@ -655,11 +681,12 @@
         aria-label="Books"
       >
         {#each visibleBooks as book (book.id)}
-          <article class="text-left">
+          <article class="relative text-left">
             <button
               class="group block w-full text-left"
               type="button"
-              onclick={() => (selected = book)}
+              onclick={() => void open(book)}
+              disabled={downloadingBookId === book.id}
             >
               <div
                 class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
@@ -671,16 +698,16 @@
                   decoding="async"
                   alt=""
                 />
-                {#if book.downloadPath}
+                {#if downloadingBookId === book.id}
                   <span
-                    class="badge-icon preset-filled-success-500 absolute right-2 top-2 h-7 w-7 p-0 shadow-md"
-                    title="Available offline"
-                    aria-label="Available offline"
+                    class="badge-icon preset-filled-primary-600-400 absolute right-2 top-2 h-7 w-7 p-0 shadow-md"
+                    title="Downloading"
+                    aria-label="Downloading"
                   >
-                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
                       <path
                         fill="currentColor"
-                        d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
+                        d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
                       />
                     </svg>
                   </span>
@@ -701,139 +728,29 @@
                 {book.author ?? 'Unknown author'}
               </p>
             </button>
-            <div class="mt-1 flex flex-wrap gap-1">
-              {#if book.downloadPath}
-                <button
-                  class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
-                  type="button"
-                  disabled={!nativePlatform}
-                  onclick={() => open(book!)}
-                >
-                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-                    <path fill="currentColor" d="M8 5v14l11-7z" />
-                  </svg>
-                  Read
-                </button>
-              {:else}
-                <button
-                  class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
-                  type="button"
-                  disabled={!nativePlatform}
-                  onclick={() => download(book!)}
-                >
-                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-3 w-3">
-                    <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
-                  </svg>
-                  Download
-                </button>
-              {/if}
-            </div>
+            {#if book.downloadPath}
+              <button
+                class="btn btn-sm absolute right-2 top-2 z-10 h-7 gap-1 !px-2 shadow-md preset-tonal-error"
+                type="button"
+                disabled={!nativePlatform}
+                onclick={() => void remove(book)}
+                aria-label={`Remove offline download for ${book.title}`}
+                title="Remove offline download"
+              >
+                <svg aria-hidden="true" viewBox="0 0 24 24" class="h-3.5 w-3.5">
+                  <path
+                    fill="currentColor"
+                    d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+                  />
+                </svg>
+                <span class="text-xs">Remove</span>
+              </button>
+            {/if}
           </article>
         {/each}
       </section>
     {/if}
   </main>
-{/if}
-
-{#if selected && !reading}
-  <div
-    class="fixed inset-0 z-30 grid place-items-center bg-black/55 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && (selected = null)}
-  >
-    <article
-      class="card preset-filled-surface-50-950 relative w-full max-w-lg overflow-auto p-6"
-      aria-label={selected.title}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <button
-        class="btn btn-sm preset-tonal-surface absolute right-4 top-4 h-9 w-9 p-0"
-        type="button"
-        onclick={() => (selected = null)}
-        aria-label="Close"
-      >
-        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-          <path
-            fill="currentColor"
-            d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-          />
-        </svg>
-      </button>
-
-      <div class="flex flex-col gap-5 sm:flex-row">
-        <img
-          class="mx-auto h-44 w-28 shrink-0 rounded-lg object-cover shadow-lg sm:mx-0 sm:h-52 sm:w-36"
-          src={covers[selected.seriesId] ?? client.coverUrl(selected.seriesId)}
-          loading="lazy"
-          decoding="async"
-          alt=""
-        />
-        <div class="min-w-0 flex-1 pr-8 sm:pr-0">
-          <h2 class="font-serif text-2xl leading-tight text-surface-950-50 sm:text-3xl">
-            {selected.title}
-          </h2>
-          <p class="mt-2 text-surface-700-300">{selected.author ?? 'Unknown author'}</p>
-          {#if selected.series}
-            <p class="mt-1 text-sm text-surface-600-400">{selected.series}</p>
-          {/if}
-          {#if selected.pages > 0}
-            <div class="mt-4 flex items-center gap-2">
-              <div class="h-1.5 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800">
-                <div
-                  class="h-full preset-filled-primary-600-400"
-                  style:width={`${progressOf(selected)}%`}
-                ></div>
-              </div>
-              <span class="text-xs tabular-nums text-surface-700-300"
-                >{Math.round(progressOf(selected))}%</span
-              >
-            </div>
-          {/if}
-        </div>
-      </div>
-
-      <div class="mt-2 flex flex-wrap gap-3">
-        {#if selected.downloadPath}
-          <button
-            class="btn preset-filled-primary-700-300"
-            type="button"
-            disabled={!nativePlatform}
-            onclick={() => open(selected!)}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path fill="currentColor" d="M8 5v14l11-7z" />
-            </svg>
-            Read
-          </button>
-          <button
-            class="btn preset-outlined-error-500"
-            type="button"
-            disabled={!nativePlatform}
-            onclick={() => remove(selected!)}>Remove download</button
-          >
-        {:else}
-          <button
-            class="btn preset-filled-primary-700-300"
-            type="button"
-            disabled={!nativePlatform}
-            onclick={() => download(selected!)}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
-            </svg>
-            Download
-          </button>
-        {/if}
-      </div>
-
-      {#if selected.descriptionHtml}
-        <p class="mt-6 whitespace-pre-line text-sm leading-relaxed text-surface-800-200">
-          {descriptionText(selected.descriptionHtml)}
-        </p>
-      {/if}
-    </article>
-  </div>
 {/if}
 
 {#if conflict}

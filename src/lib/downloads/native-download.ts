@@ -11,6 +11,12 @@ export interface DownloadedBookFile {
   size: number;
 }
 
+async function ensureDataDirectory(path: string): Promise<void> {
+  const existing = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
+  if (existing?.type === 'directory') return;
+  await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true });
+}
+
 export async function downloadEpub(
   downloadUrl: string,
   apiKey: string,
@@ -19,7 +25,7 @@ export async function downloadEpub(
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
 
-  await Filesystem.mkdir({ path: BOOK_DIRECTORY, directory: Directory.Data, recursive: true });
+  await ensureDataDirectory(BOOK_DIRECTORY);
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}.partial`;
   const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
@@ -81,7 +87,7 @@ export async function cacheCover(
 ): Promise<string> {
   const directory = 'covers';
   const path = `${directory}/${seriesId}.img`;
-  await Filesystem.mkdir({ path: directory, directory: Directory.Data, recursive: true });
+  await ensureDataDirectory(directory);
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.size === 0) {

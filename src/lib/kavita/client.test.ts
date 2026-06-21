@@ -30,6 +30,13 @@ it('builds authenticated cover URLs with the api key query parameter', () => {
   );
 });
 
+it('builds authenticated download URLs with the api key query parameter', () => {
+  const client = new KavitaClient('https://books.example.com', 'key with spaces');
+  expect(client.downloadUrl(42)).toBe(
+    'https://books.example.com/api/Download/chapter?chapterId=42&apiKey=key%20with%20spaces',
+  );
+});
+
 it('requests the Kavita series list with POST', async () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
 

@@ -28,12 +28,6 @@ const MODE_COLORS = {
     link: '--color-primary-700',
     selection: '--color-primary-200',
   },
-  grayscale: {
-    background: '--color-surface-100',
-    text: '--color-surface-900',
-    link: '--color-surface-700',
-    selection: '--color-surface-300',
-  },
   dark: {
     background: '--color-surface-950',
     text: '--color-surface-50',
@@ -141,6 +135,9 @@ export class ReaderSession {
       html: {
         background: `${this.resolveToken(colors.background)} !important`,
         'box-sizing': 'border-box',
+        overflow: 'hidden !important',
+        width: '100% !important',
+        height: '100% !important',
       },
       body: {
         color: `${this.resolveToken(colors.text)} !important`,
@@ -152,14 +149,17 @@ export class ReaderSession {
         'box-sizing': 'border-box',
         width: '100% !important',
         height: '100% !important',
+        overflow: 'hidden !important',
       },
       p: {
         'margin-bottom': `${value.paragraphSpacing}em !important`,
         'text-align': `${value.alignment} !important`,
         hyphens: value.hyphenation ? 'auto' : 'none',
       },
-      img: {
+      'img, svg, video, canvas, table, pre, blockquote': {
         'max-width': '100% !important',
+      },
+      img: {
         height: 'auto !important',
       },
       a: { color: `${this.resolveToken(colors.link)} !important` },
