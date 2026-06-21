@@ -48,6 +48,9 @@ jobs:
       - name: Build web assets
         run: npm run build
 
+      - name: Prepare release notes
+        run: npm run release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
+
       - name: Sync Android project
         run: npx cap sync android
 
@@ -93,5 +96,5 @@ jobs:
           APK="android/app/build/outputs/apk/release/app-release.apk"
           gh release create "$TURNLEAF_RELEASE_TAG" "$APK" \
             --title "Turnleaf $TURNLEAF_VERSION_NAME" \
-            --notes "Automated Android APK build for $TURNLEAF_VERSION_NAME from commit ${{ github.sha }}" \
+            --notes-file "$RUNNER_TEMP/turnleaf-release-notes.md" \
             --target "${{ github.sha }}"
