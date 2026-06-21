@@ -32,3 +32,10 @@ export function detectProgressConflict(
   if (serverChanged) return { kind: 'server' };
   return { kind: 'same' };
 }
+
+export function chooseFurthestProgress(
+  localPercentage: number,
+  remotePercentage: number,
+): 'local' | 'remote' {
+  return remotePercentage > localPercentage ? 'remote' : 'local';
+}

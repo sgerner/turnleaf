@@ -305,9 +305,10 @@ export async function saveLocalProgress(
   xpath: string | null,
   percentage: number,
 ): Promise<void> {
+  const pagesRead = Math.min(book.pages, Math.max(0, Math.round(percentage * book.pages)));
+  const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    const now = new Date().toISOString();
     state.readingState[book.id] = {
       cfi,
       xpath,
@@ -332,11 +333,19 @@ export async function saveLocalProgress(
       createdAt: state.syncQueue[book.id]?.createdAt ?? now,
       updatedAt: now,
     };
+    state.books = state.books.map((item) =>
+      item.id === book.id
+        ? {
+            ...item,
+            pagesRead,
+            lastReadAt: now,
+          }
+        : item,
+    );
     writeBrowserState(state);
     return;
   }
   const db = await openDatabase();
-  const now = new Date().toISOString();
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -358,6 +367,35 @@ export async function saveLocalProgress(
     updated_at=excluded.updated_at`,
     [book.id, JSON.stringify(payload), now, now],
   );
+  await db.run('UPDATE books SET pages_read=?, last_read_at=? WHERE id=?', [
+    pagesRead,
+    now,
+    book.id,
+  ]);
+}
+
+export async function markBookCompleted(book: BookRecord): Promise<void> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    state.books = state.books.map((item) =>
+      item.id === book.id
+        ? {
+            ...item,
+            pagesRead: book.pages,
+            lastReadAt: now,
+          }
+        : item,
+    );
+    writeBrowserState(state);
+    return;
+  }
+  const db = await openDatabase();
+  await db.run('UPDATE books SET pages_read=?, last_read_at=? WHERE id=?', [
+    book.pages,
+    now,
+    book.id,
+  ]);
 }
 
 export async function getPendingSync(): Promise<Array<{ bookId: string; payload: string }>> {

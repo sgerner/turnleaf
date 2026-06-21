@@ -193,9 +193,23 @@
 
       {#if settingsVisible}
         <section
-          class="reader-settings card preset-filled-surface-50-950"
+          class="reader-settings card preset-filled-surface-50-950 relative"
           transition:fly={{ y: 12, duration: 150 }}
         >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-8 w-8 p-0"
+            type="button"
+            onclick={() => (settingsVisible = false)}
+            aria-label="Close reading appearance"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
           <h2 class="font-serif text-xl">Reading appearance</h2>
           <div class="mt-4 grid grid-cols-2 gap-2" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
@@ -309,10 +323,24 @@
 
       {#if tocVisible}
         <nav
-          class="reader-settings card preset-filled-surface-50-950"
+          class="reader-settings card preset-filled-surface-50-950 relative"
           aria-label="Table of contents"
           transition:fly={{ y: 12, duration: 150 }}
         >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-8 w-8 p-0"
+            type="button"
+            onclick={() => (tocVisible = false)}
+            aria-label="Close table of contents"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
           <h2 class="font-serif text-xl">Contents</h2>
           <div class="mt-3 max-h-[55dvh] overflow-auto">
             {#each toc as item (item.href)}

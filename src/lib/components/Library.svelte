@@ -9,6 +9,7 @@
     getReadingState,
     getPreference,
     markDownloaded,
+    markBookCompleted,
     removeDownload,
     removeServer,
     replaceBooks,
@@ -30,6 +31,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { chooseFurthestProgress } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -240,11 +242,13 @@
   let settingsVisible = $state(false);
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
+  let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
   let settingsError = $state('');
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
+  let actionMenuBook = $state<BookRecord | null>(null);
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const nativePlatform = Capacitor.isNativePlatform();
@@ -256,8 +260,10 @@
   onMount(async () => {
     const savedTheme = await getPreference('uiTheme');
     const savedMode = await getPreference('uiMode');
+    const savedAutoSync = await getPreference('syncFurthest');
     pendingTheme = (savedTheme as SkeletonTheme | null) ?? (theme as SkeletonTheme);
     pendingMode = savedMode === 'light' ? 'light' : mode;
+    pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
     books = await getBooks(server.id);
     loading = false;
     offline = !(await Network.getStatus()).connected;
@@ -283,7 +289,8 @@
     cleanups.push(
       (
         await App.addListener('backButton', () => {
-          if (reading) reading = null;
+          if (actionMenuBook) actionMenuBook = null;
+          else if (reading) reading = null;
           else if (settingsVisible) settingsVisible = false;
           else void App.exitApp();
         })
@@ -390,10 +397,10 @@
     );
   }
 
-  async function open(book: BookRecord): Promise<void> {
+  async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
     if (!book.downloadPath) {
       const refreshed = await download(book);
-      if (refreshed) await open(refreshed);
+      if (refreshed) await open(refreshed, options);
       return;
     }
     const file = await verifyDownloadedEpub(book.downloadPath);
@@ -407,6 +414,28 @@
     }
     const local = await getReadingState(book.id);
     const remote = offline ? null : await client.getProgress(book.chapterId).catch(() => null);
+    const preferFurthest = options.preferFurthest ?? pendingAutoSync;
+    const localPercentage = local?.percentage ?? 0;
+    const remotePercentage = remote ? (book.pages ? remote.pageNum / book.pages : 0) : 0;
+    if (preferFurthest && local && remote) {
+      if (chooseFurthestProgress(localPercentage, remotePercentage) === 'remote') {
+        reading = {
+          book,
+          url: file.webViewUrl,
+          cfi: null,
+          xpath: remote.bookScrollId ?? null,
+        };
+        return;
+      }
+      reading = {
+        book,
+        url: file.webViewUrl,
+        cfi: local.cfi,
+        xpath: null,
+      };
+      void flushProgress(client).catch(() => {});
+      return;
+    }
     const remoteChanged = Boolean(
       local?.pendingSync &&
       remote?.lastModifiedUtc &&
@@ -429,6 +458,34 @@
     await saveLocalProgress(book, location.cfi, location.xpath, location.percentage);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
+  }
+
+  async function markDone(book: BookRecord): Promise<void> {
+    await markBookCompleted(book);
+    books = books.map((item) =>
+      item.id === book.id
+        ? {
+            ...item,
+            pagesRead: book.pages,
+            lastReadAt: new Date().toISOString(),
+          }
+        : item,
+    );
+    message = `${book.title} marked as read.`;
+    actionMenuBook = null;
+  }
+
+  async function syncFurthest(book: BookRecord): Promise<void> {
+    actionMenuBook = null;
+    await open(book, { preferFurthest: true });
+  }
+
+  function openMenu(book: BookRecord): void {
+    actionMenuBook = book;
+  }
+
+  function closeMenu(): void {
+    actionMenuBook = null;
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -454,6 +511,11 @@
     pendingMode = next;
     onModeChange(next);
     await setPreference('uiMode', next);
+  }
+
+  async function updateAutoSync(next: boolean): Promise<void> {
+    pendingAutoSync = next;
+    await setPreference('syncFurthest', String(next));
   }
 
   function handleRelocated(location: ReaderLocation): void {
@@ -582,7 +644,7 @@
         <button
           class="preset-tonal-surface overflow-hidden rounded-lg shadow-md"
           type="button"
-          onclick={() => open(continueBook!)}
+          onclick={() => void open(continueBook!, { preferFurthest: pendingAutoSync })}
           aria-label={`Continue reading ${continueBook.title}`}
         >
           <img
@@ -616,7 +678,7 @@
         <button
           class="btn preset-filled-primary-700-300 shrink-0"
           type="button"
-          onclick={() => open(continueBook!)}
+          onclick={() => void open(continueBook!, { preferFurthest: pendingAutoSync })}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
             <path fill="currentColor" d="M8 5v14l11-7z" />
@@ -755,7 +817,11 @@
             <button
               class="group block w-full text-left"
               type="button"
-              onclick={() => void open(book)}
+              onclick={() => void open(book, { preferFurthest: pendingAutoSync })}
+              oncontextmenu={(event) => {
+                event.preventDefault();
+                openMenu(book);
+              }}
               disabled={downloadingBookId === book.id}
             >
               <div
@@ -770,7 +836,7 @@
                 />
                 {#if downloadingBookId === book.id}
                   <span
-                    class="badge-icon preset-filled-primary-600-400 absolute right-2 top-2 h-7 w-7 p-0 shadow-md"
+                    class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                     title="Downloading"
                     aria-label="Downloading"
                   >
@@ -798,29 +864,132 @@
                 {book.author ?? 'Unknown author'}
               </p>
             </button>
-            {#if book.downloadPath}
-              <button
-                class="btn btn-sm absolute right-2 top-2 z-10 h-7 gap-1 !px-2 shadow-md preset-tonal-error"
-                type="button"
-                disabled={!nativePlatform}
-                onclick={() => void remove(book)}
-                aria-label={`Remove offline download for ${book.title}`}
-                title="Remove offline download"
-              >
-                <svg aria-hidden="true" viewBox="0 0 24 24" class="h-3.5 w-3.5">
-                  <path
-                    fill="currentColor"
-                    d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-                  />
-                </svg>
-                <span class="text-xs">Remove</span>
-              </button>
-            {/if}
+            <button
+              class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-7 w-7 !p-0 shadow-md"
+              type="button"
+              onclick={() => openMenu(book)}
+              aria-label={`Book actions for ${book.title}`}
+              title="More actions"
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                <path
+                  fill="currentColor"
+                  d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                />
+              </svg>
+            </button>
           </article>
         {/each}
       </section>
     {/if}
   </main>
+{/if}
+
+{#if actionMenuBook}
+  <div
+    class="fixed inset-0 z-40 grid place-items-center bg-black/45 p-4"
+    role="presentation"
+    transition:fade
+    onclick={(event) => event.target === event.currentTarget && closeMenu()}
+  >
+    <section
+      class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
+      transition:fly={{ y: 16, duration: 150 }}
+    >
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <p class="text-xs uppercase tracking-wider text-surface-700-300">Book actions</p>
+          <h2 class="mt-1 truncate font-serif text-2xl text-surface-950-50">
+            {actionMenuBook.title}
+          </h2>
+          <p class="truncate text-sm text-surface-700-300">
+            {actionMenuBook.author ?? 'Unknown author'}
+          </p>
+        </div>
+        <button
+          class="btn btn-sm h-8 w-8 !p-0"
+          type="button"
+          onclick={closeMenu}
+          aria-label="Close book actions"
+          title="Close"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <div class="mt-4 grid gap-2">
+        <button
+          class="btn preset-filled-primary-700-300 justify-start"
+          type="button"
+          onclick={() => {
+            const book = actionMenuBook;
+            closeMenu();
+            if (book) void open(book, { preferFurthest: pendingAutoSync });
+          }}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M8 5v14l11-7z" />
+          </svg>
+          <span>{actionMenuBook.downloadPath ? 'Open book' : 'Download and open'}</span>
+        </button>
+        <button
+          class="btn preset-tonal-primary justify-start"
+          type="button"
+          onclick={() => {
+            const book = actionMenuBook;
+            closeMenu();
+            if (book) void syncFurthest(book);
+          }}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+            />
+          </svg>
+          <span>Sync furthest read</span>
+        </button>
+        <button
+          class="btn preset-tonal-tertiary justify-start"
+          type="button"
+          onclick={() => {
+            const book = actionMenuBook;
+            closeMenu();
+            if (book) void markDone(book);
+          }}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M9 16.17 4.83 12l-1.42 1.41L9 19l12-12-1.41-1.41z" />
+          </svg>
+          <span>Mark as read</span>
+        </button>
+        {#if actionMenuBook.downloadPath}
+          <button
+            class="btn preset-outlined-error-500 justify-start"
+            type="button"
+            onclick={() => {
+              const book = actionMenuBook;
+              closeMenu();
+              if (book) void remove(book);
+            }}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+            <span>Remove download</span>
+          </button>
+        {/if}
+      </div>
+    </section>
+  </div>
 {/if}
 
 {#if conflict}
@@ -898,7 +1067,6 @@
       <h2 class="font-serif text-3xl">Settings</h2>
 
       <div class="mt-6">
-        <p class="text-xs uppercase tracking-wider text-surface-700-300">Appearance</p>
         <div class="mt-3 grid grid-cols-2 gap-2">
           <button
             class="btn {pendingMode === 'light'
@@ -956,9 +1124,28 @@
             </button>
           {/each}
         </div>
+
+        <div
+          class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
+        >
+          <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span
+          >
+          <button
+            class={`switch-track ${
+              pendingAutoSync ? 'preset-filled-primary-700-300' : 'preset-filled-secondary-700-300'
+            }`}
+            type="button"
+            role="switch"
+            aria-checked={pendingAutoSync}
+            aria-label="Auto-sync furthest read"
+            onclick={() => void updateAutoSync(!pendingAutoSync)}
+          >
+            <span class="switch-thumb preset-filled-tertiary-100-900" aria-hidden="true"></span>
+          </button>
+        </div>
       </div>
 
-      <div class="mt-7">
+      <div class="mt-2">
         <p class="text-xs uppercase tracking-wider text-surface-700-300">Connection</p>
         <dl class="mt-3 space-y-2 text-sm">
           <div class="flex items-center justify-between gap-3">
@@ -969,31 +1156,29 @@
             <dt class="text-surface-700-300">Address</dt>
             <dd class="truncate text-right">{server.baseUrl}</dd>
           </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Downloaded storage</dt>
-            <dd class="tabular-nums">
-              {(
-                books.reduce(
-                  (sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0),
-                  0,
-                ) / 1_048_576
-              ).toFixed(1)} MB
-            </dd>
-          </div>
         </dl>
 
         <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
           <label class="label">
             <span class="label-text">Replace API key</span>
-            <input
-              class="input"
-              type="password"
-              spellcheck="false"
-              autocomplete="off"
-              bind:value={replacementApiKey}
-              placeholder="Enter a new Kavita key"
-              required
-            />
+            <span class="flex">
+              <input
+                class="input min-w-0 flex-1 max-w-96"
+                type="password"
+                spellcheck="false"
+                autocomplete="off"
+                bind:value={replacementApiKey}
+                placeholder="Enter a new Kavita key"
+                required
+              />
+              <button
+                class="btn preset-filled-primary-700-300 shrink-0"
+                type="submit"
+                disabled={replacingApiKey}
+              >
+                {replacingApiKey ? 'Testing...' : 'Save'}
+              </button>
+            </span>
             <span class="label-text text-xs text-surface-700-300">
               The new key is tested before it is saved.
             </span>
@@ -1001,36 +1186,36 @@
           {#if settingsError}
             <div class="alert preset-tonal-error" role="alert" transition:fade>{settingsError}</div>
           {/if}
-          <div class="grid gap-2">
-            <button
-              class="btn preset-filled-primary-700-300"
-              type="submit"
-              disabled={replacingApiKey}
-            >
-              {replacingApiKey ? 'Testing key...' : 'Save new API key'}
-            </button>
-            <button
-              class="btn preset-outlined-error-500"
-              type="button"
-              onclick={() => (confirmDeleteServer = true)}
-              disabled={deletingServer}
-            >
-              Delete server
-            </button>
-          </div>
+          <button
+            class="btn preset-tonal-error"
+            type="button"
+            onclick={() => (confirmDeleteServer = true)}
+            disabled={deletingServer}
+          >
+            Delete server
+          </button>
         </form>
       </div>
 
       <div class="mt-7">
         <p class="text-xs uppercase tracking-wider text-surface-700-300">Maintenance</p>
         <div class="mt-3 grid gap-2">
-          <button class="btn preset-tonal-primary" type="button" onclick={clearCache}
+          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
             >Clear cover cache</button
           >
-          <button class="btn preset-outlined-error-500" type="button" onclick={removeAllDownloads}
+          <button class="btn preset-tonal-error" type="button" onclick={removeAllDownloads}
             >Remove all downloaded books</button
           >
         </div>
+      </div>
+      <div class="flex items-center justify-between gap-3">
+        <dt class="text-surface-700-300">Downloaded storage</dt>
+        <dd class="tabular-nums">
+          {(
+            books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
+            1_048_576
+          ).toFixed(1)} MB
+        </dd>
       </div>
       {#if confirmDeleteServer}
         <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
@@ -1062,3 +1247,48 @@
     </section>
   </div>
 {/if}
+
+<style>
+  .switch-track {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    width: 3rem;
+    height: 1.75rem;
+    flex: none;
+    border-radius: 9999px;
+    border: 1px solid hsl(var(--color-primary-900) / 0.35);
+    padding: 0.2rem;
+    box-shadow:
+      inset 0 1px 1px hsl(0 0% 100% / 0.08),
+      0 1px 4px hsl(0 0% 0% / 0.2);
+    cursor: pointer;
+    transition:
+      background-color 160ms ease,
+      border-color 160ms ease,
+      box-shadow 160ms ease;
+  }
+
+  .switch-thumb {
+    width: 1.35rem;
+    height: 1.35rem;
+    border-radius: 9999px;
+    box-shadow:
+      inset 0 1px 1px hsl(0 0% 100% / 0.3),
+      0 1px 2px hsl(0 0% 0% / 0.28);
+    transform: translateX(0);
+    transition: transform 160ms ease;
+  }
+
+  .switch-track[aria-checked='true'] .switch-thumb {
+    transform: translateX(1.2rem);
+  }
+
+  .switch-track:focus-visible {
+    outline: 0;
+    box-shadow:
+      0 0 0 3px hsl(var(--color-primary-500) / 0.35),
+      inset 0 1px 1px hsl(0 0% 100% / 0.08),
+      0 1px 4px hsl(0 0% 0% / 0.2);
+  }
+</style>

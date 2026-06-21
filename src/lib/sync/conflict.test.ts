@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectProgressConflict, type ProgressSnapshot } from './conflict';
+import { chooseFurthestProgress, detectProgressConflict, type ProgressSnapshot } from './conflict';
 import { coalesceSyncItem } from './queue';
 
 const snapshot = (xpath: string, percentage: number): ProgressSnapshot => ({
@@ -39,5 +39,13 @@ describe('sync queue coalescing', () => {
       createdAt: 'one',
       updatedAt: 'two',
     });
+  });
+});
+
+describe('furthest progress selection', () => {
+  it('prefers the greater percentage and keeps ties local', () => {
+    expect(chooseFurthestProgress(0.2, 0.8)).toBe('remote');
+    expect(chooseFurthestProgress(0.8, 0.2)).toBe('local');
+    expect(chooseFurthestProgress(0.4, 0.4)).toBe('local');
   });
 });
