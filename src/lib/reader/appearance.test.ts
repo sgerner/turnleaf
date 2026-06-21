@@ -13,4 +13,9 @@ describe('appearance serialization', () => {
       lineHeight: 1.2,
     });
   });
+
+  it('defaults the progress bar on', () => {
+    expect(parseAppearance('{}').progressBar).toBe(true);
+    expect(parseAppearance('{"progressBar":false}').progressBar).toBe(false);
+  });
 });

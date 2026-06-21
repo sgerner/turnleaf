@@ -121,6 +121,17 @@
     <button type="button" aria-label="Next page" onclick={() => turn('next')}></button>
   </nav>
 
+  {#if appearance.progressBar}
+    <div class="reader-progress" aria-hidden="true">
+      <div class="reader-progress-track">
+        <div
+          class="reader-progress-fill"
+          style:width={`${Math.round((location?.percentage ?? 0) * 100)}%`}
+        ></div>
+      </div>
+    </div>
+  {/if}
+
   {#if !controlsVisible}
     <button
       type="button"
@@ -143,37 +154,41 @@
   {#if controlsVisible}
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
       <header class="reader-bar reader-top" transition:fly={{ y: -8, duration: 140 }}>
-        <button
-          class="btn preset-tonal-surface min-h-12"
-          type="button"
-          onclick={onBack}
-          aria-label="Back to library"
-        >
-          Back
-        </button>
-        <p class="min-w-0 flex-1 truncate text-center text-sm font-medium">{title}</p>
-        <button
-          class="btn preset-tonal-surface min-h-12"
-          type="button"
-          onclick={() => {
-            tocVisible = !tocVisible;
-            settingsVisible = false;
-          }}
-          aria-expanded={tocVisible}
-        >
-          Contents
-        </button>
-        <button
-          class="btn preset-tonal-surface min-h-12"
-          type="button"
-          onclick={() => {
-            settingsVisible = !settingsVisible;
-            tocVisible = false;
-          }}
-          aria-expanded={settingsVisible}
-        >
-          Text
-        </button>
+        <div class="grid w-full grid-cols-3 gap-2">
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
+            onclick={onBack}
+            aria-label="Back to library"
+          >
+            Back
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
+            onclick={() => {
+              tocVisible = !tocVisible;
+              settingsVisible = false;
+            }}
+            aria-expanded={tocVisible}
+          >
+            Contents
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
+            onclick={() => {
+              settingsVisible = !settingsVisible;
+              tocVisible = false;
+            }}
+            aria-expanded={settingsVisible}
+          >
+            Text
+          </button>
+        </div>
+        <p class="min-w-0 flex-1 truncate text-center text-sm font-bold text-primary-500">
+          {title}
+        </p>
       </header>
 
       {#if settingsVisible}
@@ -279,6 +294,15 @@
               onchange={(event) => updateAppearance({ hyphenation: event.currentTarget.checked })}
             />
             Hyphenation
+          </label>
+          <label class="mt-4 flex min-h-12 items-center gap-3">
+            <input
+              class="checkbox"
+              type="checkbox"
+              checked={appearance.progressBar}
+              onchange={(event) => updateAppearance({ progressBar: event.currentTarget.checked })}
+            />
+            Progress bar
           </label>
         </section>
       {/if}
@@ -443,6 +467,29 @@
     bottom: 0;
     justify-content: space-between;
     padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+
+  .reader-progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 18;
+    pointer-events: none;
+  }
+
+  .reader-progress-track {
+    height: 0.25rem;
+    overflow: hidden;
+    border-radius: 9999px;
+    background: color-mix(in oklab, var(--reader-text) 12%, transparent);
+  }
+
+  .reader-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--reader-text);
+    transition: width 120ms linear;
   }
 
   .reader-settings {

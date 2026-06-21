@@ -10,6 +10,7 @@ export interface Appearance {
   alignment: 'start' | 'justify';
   publisherStyles: boolean;
   hyphenation: boolean;
+  progressBar: boolean;
 }
 
 export const defaultAppearance: Appearance = {
@@ -22,6 +23,7 @@ export const defaultAppearance: Appearance = {
   alignment: 'start',
   publisherStyles: true,
   hyphenation: false,
+  progressBar: true,
 };
 
 export function serializeAppearance(value: Appearance): string {
@@ -40,5 +42,6 @@ export function parseAppearance(value: string): Appearance {
       2,
       Math.max(1.2, Number(parsed.lineHeight ?? defaultAppearance.lineHeight)),
     ),
+    progressBar: parsed.progressBar !== false,
   };
 }
