@@ -36,6 +36,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Derive release version
+        run: |
+          set -eu
+          BASE_VERSION="$(node -p "require('./package.json').version")"
+          RELEASE_VERSION="${BASE_VERSION}+${GITHUB_RUN_NUMBER}"
+          echo "TURNLEAF_VERSION_NAME=${RELEASE_VERSION}" >> "$GITHUB_ENV"
+          echo "TURNLEAF_VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          echo "TURNLEAF_RELEASE_TAG=v${RELEASE_VERSION}" >> "$GITHUB_ENV"
+
       - name: Build web assets
         run: npm run build
 
@@ -81,9 +90,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="android-${{ github.run_id }}"
           APK="android/app/build/outputs/apk/release/app-release.apk"
-          gh release create "$TAG" "$APK" \
-            --title "Android APK ${{ github.run_id }}" \
-            --notes "Automated Android APK build from commit ${{ github.sha }}" \
+          gh release create "$TURNLEAF_RELEASE_TAG" "$APK" \
+            --title "Turnleaf $TURNLEAF_VERSION_NAME" \
+            --notes "Automated Android APK build for $TURNLEAF_VERSION_NAME from commit ${{ github.sha }}" \
             --target "${{ github.sha }}"

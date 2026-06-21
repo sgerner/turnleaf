@@ -7,6 +7,7 @@ import { defineConfig, type Plugin } from 'vite';
 const packageJson = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
   version: string;
 };
+const appVersion = process.env.TURNLEAF_VERSION_NAME ?? packageJson.version;
 
 function kavitaDevProxy(): Plugin {
   return {
@@ -72,7 +73,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer | undefined> {
 export default defineConfig({
   plugins: [tailwindcss(), svelte(), kavitaDevProxy()],
   define: {
-    __APP_VERSION__: JSON.stringify(packageJson.version),
+    __APP_VERSION__: JSON.stringify(appVersion),
   },
   build: {
     target: 'es2022',

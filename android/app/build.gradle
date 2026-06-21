@@ -15,6 +15,8 @@ def releaseKeyAlias = keystoreProperties.getProperty('TURNLEAF_KEY_ALIAS') ?: Sy
 def releaseKeyPassword = keystoreProperties.getProperty('TURNLEAF_KEY_PASSWORD') ?: System.getenv('TURNLEAF_KEY_PASSWORD')
 def releaseSigningConfigured = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
 def releaseStorePath = releaseSigningConfigured ? rootProject.file(releaseStoreFile) : null
+def turnleafVersionName = System.getenv('TURNLEAF_VERSION_NAME') ?: '1.0'
+def turnleafVersionCode = (System.getenv('TURNLEAF_VERSION_CODE') ?: '1') as Integer
 
 android {
     namespace = "app.turnleaf.reader"
@@ -23,8 +25,8 @@ android {
         applicationId "app.turnleaf.reader"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode turnleafVersionCode
+        versionName turnleafVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
