@@ -77,6 +77,7 @@ export async function verifyDownloadedEpub(
 }
 
 export async function deleteDownloadedEpub(relativePath: string): Promise<void> {
+  if (!Capacitor.isNativePlatform()) return;
   await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data });
 }
 
@@ -101,6 +102,7 @@ export async function cacheCover(
 }
 
 export async function clearCoverCache(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) return;
   await Filesystem.rmdir({ path: 'covers', directory: Directory.Data, recursive: true }).catch(
     () => {},
   );

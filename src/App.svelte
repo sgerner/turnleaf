@@ -75,6 +75,11 @@
         mode={uiMode}
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
+        onApiKeyChange={(value) => (apiKey = value)}
+        onServerDeleted={() => {
+          server = null;
+          apiKey = null;
+        }}
       />
     {:else}
       {#if startupError}

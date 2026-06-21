@@ -143,6 +143,22 @@ export async function saveServer(config: ServerConfig): Promise<void> {
   );
 }
 
+export async function removeServer(serverId: string): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    if (state.serverConfig?.id === serverId) {
+      state.serverConfig = null;
+      state.books = [];
+      state.readingState = {};
+      state.syncQueue = {};
+      writeBrowserState(state);
+    }
+    return;
+  }
+  const db = await openDatabase();
+  await db.run('DELETE FROM server_config WHERE id=?', [serverId]);
+}
+
 export async function getServer(): Promise<ServerConfig | null> {
   if (!Capacitor.isNativePlatform()) {
     return readBrowserState().serverConfig;

@@ -10,8 +10,10 @@
     getPreference,
     markDownloaded,
     removeDownload,
+    removeServer,
     replaceBooks,
     saveLocalProgress,
+    saveServer,
     setPreference,
     type BookRecord,
     type ServerConfig,
@@ -27,6 +29,7 @@
   import { mapSeriesToBook } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
+  import { removeApiKey, saveApiKey } from '../native/credentials';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -177,6 +180,8 @@
     mode,
     onThemeChange,
     onModeChange,
+    onApiKeyChange,
+    onServerDeleted,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -184,6 +189,8 @@
     mode: 'light' | 'dark';
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
+    onApiKeyChange: (apiKey: string) => void;
+    onServerDeleted: () => void;
   } = $props();
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   let books = $state<BookRecord[]>([]);
@@ -233,6 +240,11 @@
   let settingsVisible = $state(false);
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
+  let replacementApiKey = $state('');
+  let settingsError = $state('');
+  let replacingApiKey = $state(false);
+  let deletingServer = $state(false);
+  let confirmDeleteServer = $state(false);
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const nativePlatform = Capacitor.isNativePlatform();
@@ -442,6 +454,59 @@
     pendingMode = next;
     onModeChange(next);
     await setPreference('uiMode', next);
+  }
+
+  async function updateApiKey(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    settingsError = '';
+    replacingApiKey = true;
+    try {
+      const nextKey = replacementApiKey.trim();
+      if (!nextKey) throw new Error('Enter a new Kavita auth key.');
+
+      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
+      if (result.bookLibraries.length === 0) {
+        throw new Error('This account has no book libraries. Only book libraries are supported.');
+      }
+
+      const updatedServer: ServerConfig = {
+        ...server,
+        kavitaVersion: result.version,
+        lastConnectedAt: new Date().toISOString(),
+      };
+      await saveApiKey(server.credentialRef, nextKey);
+      await saveServer(updatedServer);
+      onApiKeyChange(nextKey);
+      replacementApiKey = '';
+      message = 'API key updated.';
+      settingsVisible = false;
+    } catch (cause) {
+      settingsError =
+        cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
+    } finally {
+      replacingApiKey = false;
+    }
+  }
+
+  async function deleteServer(): Promise<void> {
+    settingsError = '';
+    deletingServer = true;
+    try {
+      for (const book of books.filter((item) => item.downloadPath)) await remove(book);
+      await clearCoverCache().catch(() => {});
+      covers = {};
+      await removeApiKey(server.credentialRef).catch(() => {});
+      await removeServer(server.id);
+      onServerDeleted();
+      message = 'Server removed. Add it again to browse the library.';
+      settingsVisible = false;
+    } catch (cause) {
+      settingsError =
+        cause instanceof Error ? cause.message : 'Turnleaf could not remove the server.';
+    } finally {
+      deletingServer = false;
+      confirmDeleteServer = false;
+    }
   }
 </script>
 
@@ -889,10 +954,14 @@
       </div>
 
       <div class="mt-7">
-        <p class="text-xs uppercase tracking-wider text-surface-700-300">Library</p>
+        <p class="text-xs uppercase tracking-wider text-surface-700-300">Connection</p>
         <dl class="mt-3 space-y-2 text-sm">
           <div class="flex items-center justify-between gap-3">
             <dt class="text-surface-700-300">Server</dt>
+            <dd class="truncate text-right">{server.displayName}</dd>
+          </div>
+          <div class="flex items-center justify-between gap-3">
+            <dt class="text-surface-700-300">Address</dt>
             <dd class="truncate text-right">{server.baseUrl}</dd>
           </div>
           <div class="flex items-center justify-between gap-3">
@@ -907,6 +976,44 @@
             </dd>
           </div>
         </dl>
+
+        <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
+          <label class="label">
+            <span class="label-text">Replace API key</span>
+            <input
+              class="input"
+              type="password"
+              spellcheck="false"
+              autocomplete="off"
+              bind:value={replacementApiKey}
+              placeholder="Enter a new Kavita key"
+              required
+            />
+            <span class="label-text text-xs text-surface-700-300">
+              The new key is tested before it is saved.
+            </span>
+          </label>
+          {#if settingsError}
+            <div class="alert preset-tonal-error" role="alert" transition:fade>{settingsError}</div>
+          {/if}
+          <div class="grid gap-2">
+            <button
+              class="btn preset-filled-primary-700-300"
+              type="submit"
+              disabled={replacingApiKey}
+            >
+              {replacingApiKey ? 'Testing key...' : 'Save new API key'}
+            </button>
+            <button
+              class="btn preset-outlined-error-500"
+              type="button"
+              onclick={() => (confirmDeleteServer = true)}
+              disabled={deletingServer}
+            >
+              Delete server
+            </button>
+          </div>
+        </form>
       </div>
 
       <div class="mt-7">
@@ -920,6 +1027,33 @@
           >
         </div>
       </div>
+      {#if confirmDeleteServer}
+        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
+          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
+          <p class="mt-2 text-sm text-surface-700-300">
+            This removes the server connection, downloaded books, cached covers, and local progress
+            from this device.
+          </p>
+          <div class="mt-4 flex gap-2">
+            <button
+              class="btn preset-outlined-error-500"
+              type="button"
+              onclick={() => void deleteServer()}
+              disabled={deletingServer}
+            >
+              {deletingServer ? 'Deleting...' : 'Delete now'}
+            </button>
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              onclick={() => (confirmDeleteServer = false)}
+              disabled={deletingServer}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      {/if}
     </section>
   </div>
 {/if}
