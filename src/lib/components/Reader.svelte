@@ -3,6 +3,7 @@
   import { onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { getPreference, setPreference } from '../database/database';
+  import { VolumeButtons } from '../native/volume-buttons';
   import {
     defaultAppearance,
     parseAppearance,
@@ -62,6 +63,7 @@
           } else void turn(zone);
         },
       );
+      if (Capacitor.isNativePlatform()) await VolumeButtons.setEnabled({ enabled: true });
       toc = session.tableOfContents();
     } catch {
       error = 'This EPUB could not be opened. The download may be incomplete or corrupted.';
@@ -72,6 +74,7 @@
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     void setPreference('appearance', serializeAppearance(appearance));
+    if (Capacitor.isNativePlatform()) void VolumeButtons.setEnabled({ enabled: false });
     void ReaderSession.showStatusBar();
     session?.destroy();
   });
@@ -109,6 +112,24 @@
           : 'This page could not be displayed. Try reopening the book.';
     }
   }
+
+  function handleVolumeButton(event: Event): void {
+    const detail = (event as CustomEvent<{ direction?: string }>).detail;
+    if (detail?.direction === 'next' || detail?.direction === 'previous') {
+      void turn(detail.direction);
+      showControls();
+    }
+  }
+
+  if (Capacitor.isNativePlatform()) {
+    window.addEventListener('turnleafVolumeButton', handleVolumeButton);
+  }
+
+  onDestroy(() => {
+    if (Capacitor.isNativePlatform()) {
+      window.removeEventListener('turnleafVolumeButton', handleVolumeButton);
+    }
+  });
 </script>
 
 <div class="reader-shell" data-mode={appearance.mode}>
