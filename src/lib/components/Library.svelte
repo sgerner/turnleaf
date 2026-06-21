@@ -8,10 +8,12 @@
   import {
     getBooks,
     getReadingState,
+    getPreference,
     markDownloaded,
     removeDownload,
     replaceBooks,
     saveLocalProgress,
+    setPreference,
     type BookRecord,
     type ServerConfig,
   } from '../database/database';
@@ -30,17 +32,63 @@
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
-  let { server, apiKey }: { server: ServerConfig; apiKey: string } = $props();
+  const skeletonThemes = [
+    'catppuccin',
+    'cerberus',
+    'concord',
+    'crimson',
+    'fennec',
+    'hamlindigo',
+    'legacy',
+    'mint',
+    'modern',
+    'mona',
+    'nosh',
+    'nouveau',
+    'pine',
+    'reign',
+    'rocket',
+    'rose',
+    'sahara',
+    'seafoam',
+    'terminus',
+    'vintage',
+    'vox',
+    'wintry',
+  ] as const;
+  type SkeletonTheme = (typeof skeletonThemes)[number];
+
+  let {
+    server,
+    apiKey,
+    theme,
+    mode,
+    onThemeChange,
+    onModeChange,
+  }: {
+    server: ServerConfig;
+    apiKey: string;
+    theme: string;
+    mode: 'light' | 'dark';
+    onThemeChange: (theme: SkeletonTheme) => void;
+    onModeChange: (mode: 'light' | 'dark') => void;
+  } = $props();
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   let books = $state<BookRecord[]>([]);
   let query = $state('');
   let downloadedOnly = $state(false);
+  let hideCompleted = $state(true);
   let visibleBooks = $derived(
     books.filter((book) => {
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
         .toLowerCase()
         .includes(query.trim().toLowerCase());
-      return matchesQuery && (!downloadedOnly || Boolean(book.downloadPath));
+      const completed = book.pages > 0 && book.pagesRead >= book.pages;
+      return (
+        matchesQuery &&
+        (!downloadedOnly || Boolean(book.downloadPath)) &&
+        (!hideCompleted || !completed)
+      );
     }),
   );
   let selected = $state<BookRecord | null>(null);
@@ -63,11 +111,17 @@
   let message = $state('');
   let settingsVisible = $state(false);
   let diagnostics = $state('');
+  let pendingTheme = $state<SkeletonTheme>('vintage');
+  let pendingMode = $state<'light' | 'dark'>('dark');
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const nativePlatform = Capacitor.isNativePlatform();
 
   onMount(async () => {
+    const savedTheme = await getPreference('uiTheme');
+    const savedMode = await getPreference('uiMode');
+    pendingTheme = (savedTheme as SkeletonTheme | null) ?? (theme as SkeletonTheme);
+    pendingMode = savedMode === 'light' ? 'light' : mode;
     books = await getBooks(server.id);
     loading = false;
     offline = !(await Network.getStatus()).connected;
@@ -248,6 +302,18 @@
     message = 'Cover cache cleared.';
     settingsVisible = false;
   }
+
+  async function updateTheme(next: SkeletonTheme): Promise<void> {
+    pendingTheme = next;
+    onThemeChange(next);
+    await setPreference('uiTheme', next);
+  }
+
+  async function updateMode(next: 'light' | 'dark'): Promise<void> {
+    pendingMode = next;
+    onModeChange(next);
+    await setPreference('uiMode', next);
+  }
 </script>
 
 {#if reading}
@@ -261,13 +327,10 @@
   />
 {:else}
   <main class="mx-auto min-h-dvh max-w-6xl px-5 pb-12 pt-[max(2rem,env(safe-area-inset-top))]">
-    <header class="flex items-end justify-between gap-4">
+    <header class="flex items-start justify-between gap-4">
       <div class="flex items-center gap-4">
         <TurnleafLogo size={64} wordmark={false} />
         <div>
-          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-primary-700-300">
-            {server.displayName}
-          </p>
           <h1 class="mt-2 font-serif text-4xl text-primary-700-300">Turnleaf</h1>
         </div>
       </div>
@@ -320,6 +383,13 @@
         aria-pressed={downloadedOnly}
         onclick={() => (downloadedOnly = !downloadedOnly)}>Downloaded</button
       >
+      <button
+        class="btn btn-sm preset-tonal-surface"
+        class:preset-filled-primary-700={hideCompleted}
+        type="button"
+        aria-pressed={hideCompleted}
+        onclick={() => (hideCompleted = !hideCompleted)}>Hide completed</button
+      >
     </div>
     {#if offline}<div class="alert preset-tonal-warning mt-5" role="status" transition:fade>
         Offline. Saved books remain available.
@@ -337,7 +407,9 @@
       >
         {#each visibleBooks as book (book.id)}
           <button class="group text-left" type="button" onclick={() => (selected = book)}>
-            <div class="aspect-[2/3] overflow-hidden rounded-lg bg-surface-200-800 shadow-md">
+            <div
+              class="relative aspect-[2/3] overflow-hidden rounded-lg bg-surface-200-800 shadow-md"
+            >
               <img
                 class="h-full w-full object-cover"
                 src={covers[book.seriesId] ?? client.coverUrl(book.seriesId)}
@@ -345,17 +417,21 @@
                 decoding="async"
                 alt=""
               />
+              <div
+                class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 via-black/35 to-transparent p-2"
+              >
+                <div class="h-1 overflow-hidden rounded-full bg-black/35">
+                  <div
+                    class="h-full bg-primary-600-400"
+                    style:width={`${book.pages ? (book.pagesRead / book.pages) * 100 : 0}%`}
+                  ></div>
+                </div>
+              </div>
             </div>
             <h2 class="mt-3 line-clamp-2 font-serif text-lg leading-tight">{book.title}</h2>
             <p class="mt-1 truncate text-sm text-surface-700-300">
               {book.author ?? 'Unknown author'}
             </p>
-            <div class="mt-2 h-1 overflow-hidden rounded-full bg-surface-200-800">
-              <div
-                class="h-full bg-primary-600-400"
-                style:width={`${book.pages ? (book.pagesRead / book.pages) * 100 : 0}%`}
-              ></div>
-            </div>
           </button>
         {/each}
       </section>{/if}
@@ -455,15 +531,40 @@
 {#if settingsVisible}
   <dialog
     open
-    class="card preset-filled-surface-50-950 fixed inset-4 z-40 m-auto max-h-[85dvh] max-w-lg overflow-auto p-6"
+    class="card preset-filled-surface-50-950 fixed top-4 z-40 mx-auto overflow-auto p-6"
     aria-label="Settings and diagnostics"
   >
     <button
-      class="btn preset-tonal-surface float-right"
+      class="btn preset-filled-error-500 float-right"
       type="button"
-      onclick={() => (settingsVisible = false)}>Close</button
+      onclick={() => (settingsVisible = false)}>X</button
     >
     <h2 class="font-serif text-3xl">Settings</h2>
+    <div class="mt-6 grid gap-4">
+      <label class="label">
+        <span class="label-text">Theme</span>
+        <select
+          class="select"
+          value={pendingTheme}
+          onchange={(event) => void updateTheme(event.currentTarget.value as SkeletonTheme)}
+        >
+          {#each skeletonThemes as option}
+            <option value={option}>{option}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="label">
+        <span class="label-text">Mode</span>
+        <select
+          class="select"
+          value={pendingMode}
+          onchange={(event) => void updateMode(event.currentTarget.value as 'light' | 'dark')}
+        >
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+    </div>
     <dl class="mt-6 space-y-3 text-sm">
       <div>
         <dt class="text-surface-700-300">Server</dt>
@@ -480,20 +581,12 @@
       </div>
     </dl>
     <div class="mt-6 grid gap-3">
-      <button class="btn preset-tonal-surface" type="button" onclick={clearCache}
+      <button class="btn preset-tonal-primary" type="button" onclick={clearCache}
         >Clear cover cache</button
       >
       <button class="btn preset-outlined-error-500" type="button" onclick={removeAllDownloads}
         >Remove all downloaded books</button
       >
     </div>
-    <pre class="mt-2 max-h-48 overflow-auto rounded bg-surface-100-900 p-3 text-xs">
-      {diagnostics}
-    </pre>
-    <button
-      class="btn preset-tonal-primary mt-3"
-      type="button"
-      onclick={() => navigator.clipboard.writeText(diagnostics)}>Copy diagnostics</button
-    >
   </dialog>
 {/if}

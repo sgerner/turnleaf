@@ -4,17 +4,33 @@
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
-  import { getServer, type ServerConfig } from './lib/database/database';
+  import {
+    getPreference,
+    getServer,
+    setPreference,
+    type ServerConfig,
+  } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+
+  const themePreferenceKey = 'uiTheme';
+  const modePreferenceKey = 'uiMode';
+  const defaultTheme = 'vintage';
+  const defaultMode = 'dark';
 
   let server = $state<ServerConfig | null>(null);
   let booting = $state(Capacitor.isNativePlatform());
   let startupError = $state('');
   let apiKey = $state<string | null>(null);
+  let uiTheme = $state(defaultTheme);
+  let uiMode = $state<'light' | 'dark'>(defaultMode);
 
   onMount(async () => {
     try {
       const saved = await getServer();
+      const savedTheme = await getPreference(themePreferenceKey);
+      const savedMode = await getPreference(modePreferenceKey);
+      uiTheme = savedTheme ?? defaultTheme;
+      uiMode = savedMode === 'light' ? 'light' : 'dark';
       if (saved) {
         apiKey = await getApiKey(saved.credentialRef);
         if (apiKey) server = saved;
@@ -24,6 +40,13 @@
     } finally {
       booting = false;
     }
+  });
+
+  $effect(() => {
+    document.documentElement.dataset.theme = uiTheme;
+    document.documentElement.dataset.mode = uiMode;
+    void setPreference(themePreferenceKey, uiTheme);
+    void setPreference(modePreferenceKey, uiMode);
   });
 </script>
 
@@ -45,7 +68,14 @@
         </div>
       </main>
     {:else if server && apiKey}
-      <Library {server} {apiKey} />
+      <Library
+        {server}
+        {apiKey}
+        theme={uiTheme}
+        mode={uiMode}
+        onThemeChange={(value) => (uiTheme = value)}
+        onModeChange={(value) => (uiMode = value)}
+      />
     {:else}
       {#if startupError}
         <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg" role="alert">
