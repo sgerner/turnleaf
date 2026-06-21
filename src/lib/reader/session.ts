@@ -1,4 +1,6 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
+import { Capacitor } from '@capacitor/core';
+import { Animation, StatusBar } from '@capacitor/status-bar';
 import type { Appearance } from './appearance';
 
 export interface ReaderLocation {
@@ -142,7 +144,7 @@ export class ReaderSession {
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
-        padding: `max(1rem, env(safe-area-inset-top)) max(${value.margin}px, env(safe-area-inset-right)) max(1rem, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
+        padding: `max(1.5rem, calc(env(safe-area-inset-top) + 0.75rem)) max(${value.margin}px, env(safe-area-inset-right)) max(1rem, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
         'box-sizing': 'border-box',
       },
       p: {
@@ -171,6 +173,24 @@ export class ReaderSession {
     this.contentClick = null;
     this.current = null;
     this.book.destroy();
+  }
+
+  static async hideStatusBar(): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      await StatusBar.hide({ animation: Animation.None });
+    } catch {
+      // The reader still works if the platform refuses to hide the bar.
+    }
+  }
+
+  static async showStatusBar(): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      await StatusBar.show({ animation: Animation.None });
+    } catch {
+      // The reader still works if the platform refuses to show the bar.
+    }
   }
 
   private harden(contents: Contents): void {

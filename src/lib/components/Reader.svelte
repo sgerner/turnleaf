@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Capacitor } from '@capacitor/core';
   import { onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { getPreference, setPreference } from '../database/database';
@@ -42,6 +43,7 @@
   onMount(async () => {
     const saved = await getPreference('appearance');
     if (saved) appearance = parseAppearance(saved);
+    if (Capacitor.isNativePlatform()) await ReaderSession.hideStatusBar();
     session = new ReaderSession(bookUrl);
     try {
       await session.open(
@@ -70,6 +72,7 @@
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     void setPreference('appearance', serializeAppearance(appearance));
+    void ReaderSession.showStatusBar();
     session?.destroy();
   });
 

@@ -28,6 +28,7 @@
     "@capacitor/file-transfer": "^2.0.4",
     "@capacitor/filesystem": "^8.1.2",
     "@capacitor/network": "^8.0.1",
+    "@capacitor/status-bar": "^8.0.2",
     "dompurify": "^3.2.6",
     "epubjs": "^0.3.93",
     "jeep-sqlite": "^2.8.0",
