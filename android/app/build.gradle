@@ -14,6 +14,7 @@ def releaseStorePassword = keystoreProperties.getProperty('TURNLEAF_STORE_PASSWO
 def releaseKeyAlias = keystoreProperties.getProperty('TURNLEAF_KEY_ALIAS') ?: System.getenv('TURNLEAF_KEY_ALIAS')
 def releaseKeyPassword = keystoreProperties.getProperty('TURNLEAF_KEY_PASSWORD') ?: System.getenv('TURNLEAF_KEY_PASSWORD')
 def releaseSigningConfigured = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+def releaseStorePath = releaseSigningConfigured ? rootProject.file(releaseStoreFile) : null
 
 android {
     namespace = "app.turnleaf.reader"
@@ -34,7 +35,7 @@ android {
     signingConfigs {
         release {
             if (releaseSigningConfigured) {
-                storeFile file(releaseStoreFile)
+                storeFile releaseStorePath
                 storePassword releaseStorePassword
                 keyAlias releaseKeyAlias
                 keyPassword releaseKeyPassword
