@@ -32,7 +32,10 @@ type ParsedVersion = {
 };
 
 function parseVersion(raw: string): ParsedVersion | null {
-  const match = raw.trim().replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?/);
+  const match = raw
+    .trim()
+    .replace(/^v/i, '')
+    .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?/);
   if (!match) return null;
   return {
     major: Number(match[1]),

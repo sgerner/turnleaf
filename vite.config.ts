@@ -4,7 +4,9 @@ import { readFileSync } from 'node:fs';
 import type { IncomingMessage } from 'http';
 import { defineConfig, type Plugin } from 'vite';
 
-const packageJson = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
+const packageJson = JSON.parse(
+  readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
+) as {
   version: string;
 };
 const appVersion = process.env.TURNLEAF_VERSION_NAME ?? packageJson.version;

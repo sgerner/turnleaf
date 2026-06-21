@@ -23,7 +23,9 @@ if (headingIndex < 0) {
   process.exit(0);
 }
 
-const nextHeadingIndex = lines.findIndex((line, index) => index > headingIndex && line.startsWith('## '));
+const nextHeadingIndex = lines.findIndex(
+  (line, index) => index > headingIndex && line.startsWith('## '),
+);
 const sectionEnd = nextHeadingIndex === -1 ? lines.length : nextHeadingIndex;
 const sectionLines = lines.slice(headingIndex + 1, sectionEnd);
 

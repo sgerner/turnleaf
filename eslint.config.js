@@ -18,7 +18,11 @@ export default tseslint.config(
   },
   {
     languageOptions: {
-      globals: { ...globals.browser, ...globals.node },
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+        __APP_VERSION__: 'readonly',
+      },
     },
     rules: {
       '@typescript-eslint/consistent-type-imports': 'error',
