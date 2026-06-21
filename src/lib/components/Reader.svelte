@@ -63,10 +63,18 @@
           } else void turn(zone);
         },
       );
-      if (Capacitor.isNativePlatform()) await VolumeButtons.setEnabled({ enabled: true });
       toc = session.tableOfContents();
     } catch {
       error = 'This EPUB could not be opened. The download may be incomplete or corrupted.';
+      return;
+    }
+
+    if (Capacitor.isNativePlatform()) {
+      try {
+        await VolumeButtons.setEnabled({ enabled: true });
+      } catch {
+        // Volume-button paging is optional; the reader itself should keep working.
+      }
     }
   });
 
