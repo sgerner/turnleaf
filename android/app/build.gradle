@@ -1,4 +1,19 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 apply plugin: 'com.android.application'
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+def releaseStoreFile = keystoreProperties.getProperty('TURNLEAF_STORE_FILE') ?: System.getenv('TURNLEAF_STORE_FILE')
+def releaseStorePassword = keystoreProperties.getProperty('TURNLEAF_STORE_PASSWORD') ?: System.getenv('TURNLEAF_STORE_PASSWORD')
+def releaseKeyAlias = keystoreProperties.getProperty('TURNLEAF_KEY_ALIAS') ?: System.getenv('TURNLEAF_KEY_ALIAS')
+def releaseKeyPassword = keystoreProperties.getProperty('TURNLEAF_KEY_PASSWORD') ?: System.getenv('TURNLEAF_KEY_PASSWORD')
+def releaseSigningConfigured = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
 
 android {
     namespace = "app.turnleaf.reader"
@@ -16,11 +31,30 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (releaseSigningConfigured) {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
     buildTypes {
         release {
+            if (releaseSigningConfigured) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+    }
+}
+
+gradle.taskGraph.whenReady { graph ->
+    if (graph.allTasks.any { it.name.toLowerCase().contains('release') } && !releaseSigningConfigured) {
+        throw new GradleException('Release signing is not configured. Create android/keystore.properties or set TURNLEAF_* environment variables.')
     }
 }
 

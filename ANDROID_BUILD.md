@@ -29,7 +29,14 @@ keytool -genkeypair -v -keystore turnleaf-release.jks -alias turnleaf -keyalg RS
 npm run android:release
 ```
 
-Configure the signing secret outside Git in `~/.gradle/gradle.properties` or a CI secret before distributing the generated AAB. The current release script verifies compilation but cannot produce a distributable signed artifact without owner signing credentials.
+Configure the signing secret outside Git in `android/keystore.properties` or a CI secret before distributing the generated APK. The repo includes `android/keystore.properties.example` as a template. GitHub Actions expects these secrets:
+
+- `ANDROID_KEYSTORE_BASE64`
+- `ANDROID_KEYSTORE_PASSWORD`
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
+
+The current release script produces a signed APK when those values are present and fails loudly if release signing is missing.
 
 Device commands used:
 

@@ -1,0 +1,89 @@
+name: Android APK Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web assets
+        run: npm run build
+
+      - name: Sync Android project
+        run: npx cap sync android
+
+      - name: Restore signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "Missing ANDROID_KEYSTORE_BASE64 secret" >&2
+            exit 1
+          fi
+          if [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
+            echo "Missing ANDROID_KEYSTORE_PASSWORD secret" >&2
+            exit 1
+          fi
+          if [ -z "${ANDROID_KEY_ALIAS:-}" ]; then
+            echo "Missing ANDROID_KEY_ALIAS secret" >&2
+            exit 1
+          fi
+          if [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
+            echo "Missing ANDROID_KEY_PASSWORD secret" >&2
+            exit 1
+          fi
+          base64 --decode <<<"$ANDROID_KEYSTORE_BASE64" > android/turnleaf-release.jks
+          cat > android/keystore.properties <<EOF
+          TURNLEAF_STORE_FILE=turnleaf-release.jks
+          TURNLEAF_STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD
+          TURNLEAF_KEY_ALIAS=$ANDROID_KEY_ALIAS
+          TURNLEAF_KEY_PASSWORD=$ANDROID_KEY_PASSWORD
+          EOF
+
+      - name: Build signed release APK
+        run: cd android && ./gradlew assembleRelease
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="android-${{ github.run_id }}"
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          gh release create "$TAG" "$APK" \
+            --title "Android APK ${{ github.run_id }}" \
+            --notes "Automated Android APK build from commit ${{ github.sha }}" \
+            --target "${{ github.sha }}"

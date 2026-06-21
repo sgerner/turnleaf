@@ -16,7 +16,7 @@
     "cap:sync": "npm run build && cap sync",
     "android:open": "export $(grep -v '^#' .env | xargs) && cap open android",
     "android:debug": "npm run cap:sync && cd android && ./gradlew assembleDebug",
-    "android:release": "npm run cap:sync && cd android && ./gradlew bundleRelease",
+    "android:release": "npm run build && npx cap sync android && cd android && ./gradlew assembleRelease",
     "ios:sync": "npm run build && cap sync ios",
     "ios:open": "cap open ios"
   },
