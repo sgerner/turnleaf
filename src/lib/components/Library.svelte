@@ -694,39 +694,6 @@
                   </div>
                 {/if}
               </div>
-              <div class="mt-1 flex flex-wrap gap-1">
-                {#if book.downloadPath}
-                  <button
-                    class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
-                    type="button"
-                    disabled={!nativePlatform}
-                    onclick={() => open(book!)}
-                  >
-                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-                      <path fill="currentColor" d="M8 5v14l11-7z" />
-                    </svg>
-                    Read
-                  </button>
-                  <button
-                    class="btn !px-2 !py-1 preset-outlined-error-500 !text-sm"
-                    type="button"
-                    disabled={!nativePlatform}
-                    onclick={() => remove(book!)}>Remove download</button
-                  >
-                {:else}
-                  <button
-                    class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
-                    type="button"
-                    disabled={!nativePlatform}
-                    onclick={() => download(book!)}
-                  >
-                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-3 w-3">
-                      <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
-                    </svg>
-                    Download
-                  </button>
-                {/if}
-              </div>
               <h2 class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50">
                 {book.title}
               </h2>
@@ -734,6 +701,33 @@
                 {book.author ?? 'Unknown author'}
               </p>
             </button>
+            <div class="mt-1 flex flex-wrap gap-1">
+              {#if book.downloadPath}
+                <button
+                  class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
+                  type="button"
+                  disabled={!nativePlatform}
+                  onclick={() => open(book!)}
+                >
+                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+                    <path fill="currentColor" d="M8 5v14l11-7z" />
+                  </svg>
+                  Read
+                </button>
+              {:else}
+                <button
+                  class="btn !px-2 !py-1 preset-filled-primary-700-300 !text-sm"
+                  type="button"
+                  disabled={!nativePlatform}
+                  onclick={() => download(book!)}
+                >
+                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-3 w-3">
+                    <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+                  </svg>
+                  Download
+                </button>
+              {/if}
+            </div>
           </article>
         {/each}
       </section>

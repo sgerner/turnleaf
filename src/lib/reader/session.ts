@@ -138,6 +138,10 @@ export class ReaderSession {
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
     this.rendition.themes.register('turnleaf', {
+      html: {
+        background: `${this.resolveToken(colors.background)} !important`,
+        'box-sizing': 'border-box',
+      },
       body: {
         color: `${this.resolveToken(colors.text)} !important`,
         background: `${this.resolveToken(colors.background)} !important`,
@@ -145,11 +149,18 @@ export class ReaderSession {
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
         padding: `0 ${value.margin}px !important`,
+        'box-sizing': 'border-box',
+        width: '100% !important',
+        height: '100% !important',
       },
       p: {
         'margin-bottom': `${value.paragraphSpacing}em !important`,
         'text-align': `${value.alignment} !important`,
         hyphens: value.hyphenation ? 'auto' : 'none',
+      },
+      img: {
+        'max-width': '100% !important',
+        height: 'auto !important',
       },
       a: { color: `${this.resolveToken(colors.link)} !important` },
       '::selection': { background: `${this.resolveToken(colors.selection)} !important` },

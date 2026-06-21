@@ -173,8 +173,8 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <h2 class="font-serif text-xl">Reading appearance</h2>
-          <div class="mt-4 grid grid-cols-3 gap-2" aria-label="Reading color mode">
-            {#each ['light', 'grayscale', 'dark'] as mode (mode)}
+          <div class="mt-4 grid grid-cols-2 gap-2" aria-label="Reading color mode">
+            {#each ['light', 'dark'] as mode (mode)}
               <button
                 class:active-mode={appearance.mode === mode}
                 class="btn preset-outlined-surface-300-700 capitalize"
@@ -318,14 +318,6 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
-  }
-
-  .reader-shell[data-mode='grayscale'] {
-    --reader-background: var(--color-surface-100);
-    --reader-text: var(--color-surface-900);
-    --reader-overlay-top: color-mix(in oklab, var(--reader-text) 30%, transparent);
-    --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 24%, transparent);
-    --reader-bar-text: var(--color-surface-900);
   }
 
   .reader-shell[data-mode='dark'] {

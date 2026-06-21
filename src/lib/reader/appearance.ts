@@ -1,4 +1,4 @@
-export type ReadingMode = 'light' | 'grayscale' | 'dark';
+export type ReadingMode = 'light' | 'dark';
 
 export interface Appearance {
   mode: ReadingMode;
@@ -21,7 +21,7 @@ export const defaultAppearance: Appearance = {
   margin: 24,
   alignment: 'start',
   publisherStyles: true,
-  hyphenation: true,
+  hyphenation: false,
 };
 
 export function serializeAppearance(value: Appearance): string {
@@ -30,9 +30,11 @@ export function serializeAppearance(value: Appearance): string {
 
 export function parseAppearance(value: string): Appearance {
   const parsed = JSON.parse(value) as Partial<Appearance>;
+  const mode = parsed.mode === 'dark' ? 'dark' : 'light';
   return {
     ...defaultAppearance,
     ...parsed,
+    mode,
     fontSize: Math.min(34, Math.max(14, Number(parsed.fontSize ?? defaultAppearance.fontSize))),
     lineHeight: Math.min(
       2,
