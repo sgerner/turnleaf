@@ -411,11 +411,13 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
+    --reader-safe-top: max(1.5rem, calc(env(safe-area-inset-top) + 1rem));
+    --reader-safe-bottom: max(1rem, env(safe-area-inset-bottom));
   }
 
   .reader-viewport {
     position: absolute;
-    inset: 0;
+    inset: var(--reader-safe-top) 0 var(--reader-safe-bottom) 0;
     overflow: hidden;
     width: 100%;
     height: 100%;
