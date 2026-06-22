@@ -2,12 +2,13 @@
 
 ## Unreleased
 
-- Bump version to 0.1.5
+- Fix Android volume key paging
 ## 0.1.5
 
 - Restore reader status bar hiding on Android and add a native reader chrome toggle.
 - Reapply Android reader immersive mode on resume and window focus so the gesture bar stays hidden more reliably.
 - Add a small extra bottom EPUB padding to clear the gesture navigation area.
+- Fix Android volume buttons so reader paging consumes the key events instead of changing system volume.
 - Fix versioned release notes
 
 ## 0.1.4

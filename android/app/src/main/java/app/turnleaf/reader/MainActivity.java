@@ -46,29 +46,54 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
-    public boolean dispatchKeyEvent(KeyEvent event) {
-        if (
-            event.getAction() == KeyEvent.ACTION_DOWN &&
-            event.getRepeatCount() == 0 &&
-            VolumeButtonsPlugin.enabled &&
-            getBridge() != null
-        ) {
-            String direction = null;
-            if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP) {
-                direction = "previous";
-            } else if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
-                direction = "next";
-            }
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (handleVolumeKey(keyCode, event, true)) {
+            return true;
+        }
 
-            if (direction != null) {
-                getBridge().triggerWindowJSEvent(
-                    "turnleafVolumeButton",
-                    "{\"direction\":\"" + direction + "\"}"
-                );
-                return true;
-            }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (handleVolumeKey(keyCode, event, false)) {
+            return true;
+        }
+
+        return super.onKeyUp(keyCode, event);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (handleVolumeKey(event.getKeyCode(), event, event.getAction() == KeyEvent.ACTION_DOWN)) {
+            return true;
         }
 
         return super.dispatchKeyEvent(event);
+    }
+
+    private boolean handleVolumeKey(int keyCode, KeyEvent event, boolean down) {
+        if (!VolumeButtonsPlugin.enabled || getBridge() == null) {
+            return false;
+        }
+
+        if (keyCode != KeyEvent.KEYCODE_VOLUME_UP && keyCode != KeyEvent.KEYCODE_VOLUME_DOWN) {
+            return false;
+        }
+
+        if (!down) {
+            return true;
+        }
+
+        if (event.getRepeatCount() != 0) {
+            return true;
+        }
+
+        String direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP ? "previous" : "next";
+        getBridge().triggerWindowJSEvent(
+            "turnleafVolumeButton",
+            "{\"direction\":\"" + direction + "\"}"
+        );
+        return true;
     }
 }
