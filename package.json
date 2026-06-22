@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "npm run check && vite build",
+    "release:finalize": "node scripts/finalize-release-notes.mjs",
     "release:notes": "node scripts/release-notes.mjs",
     "setup:hooks": "node scripts/install-githooks.mjs",
     "cap:sync": "npm run build && cap sync",

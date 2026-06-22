@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix versioned release notes
+## 0.1.4
+
 - Mount reader footer independently
 - Tighten reader safe areas
 - Align prettier plugin 4

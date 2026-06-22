@@ -8,15 +8,23 @@ Latest release: [GitHub Releases](https://github.com/sgerner/turnleaf/releases/l
 
 Tracked release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
+GitHub release bodies are generated from the matching versioned section in `RELEASE_NOTES.md`, while `## Unreleased` stays empty until the next development cycle.
+
 ## Recent release notes
 
+### 0.1.4
+
+- Mount reader footer independently.
+- Tighten reader safe areas.
+- Align prettier plugin 4.
+- Align Vite 8 and Svelte plugin.
+- Align ESLint 10 packages.
+- Switch release notes to post-commit amend.
+- Add release note commit hook.
 - GitHub Android release builds now publish versioned APK tags and version codes so the in-app update banner can detect them.
 - Library "Mark as read" now queues a Kavita progress update instead of only changing local state.
 - Reader safe-area layout now keeps EPUB text clear of the camera notch and status bar.
 - Optional native reader helpers no longer block EPUBs from opening if they fail.
-- Reader mode now hides the native status bar on supported devices.
-- Android reader mode now supports hardware volume buttons for page turns.
-- iOS has matching scaffolding for the same reader hardware-button behavior where the platform allows it.
 
 ## Screenshots
 

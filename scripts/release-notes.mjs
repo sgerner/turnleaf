@@ -1,11 +1,13 @@
 import { readFileSync } from 'node:fs';
 
+const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const version = packageJson.version;
 const source = readFileSync(new URL('../RELEASE_NOTES.md', import.meta.url), 'utf8');
 const lines = source.split(/\r?\n/);
-const start = lines.findIndex((line) => line.trim() === '## Unreleased');
+const start = lines.findIndex((line) => line.trim() === `## ${version}`);
 
 if (start < 0) {
-  throw new Error('Could not find an Unreleased section in RELEASE_NOTES.md');
+  throw new Error(`Could not find a ## ${version} section in RELEASE_NOTES.md`);
 }
 
 const output = [];

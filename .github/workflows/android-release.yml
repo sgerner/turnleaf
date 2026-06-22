@@ -48,6 +48,9 @@ jobs:
       - name: Build web assets
         run: npm run build
 
+      - name: Finalize release notes
+        run: npm run release:finalize
+
       - name: Prepare release notes
         run: npm run release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
 
