@@ -39,6 +39,8 @@
   let location = $state<ReaderLocation | null>(null);
   let error = $state('');
   let hideTimer: number | null = null;
+  let footerVisible = $state(false);
+  let bottomSwipeStart: { id: number; x: number; y: number } | null = null;
   let saveTimer: number | null = null;
 
   onMount(async () => {
@@ -89,11 +91,21 @@
 
   function showControls(): void {
     controlsVisible = true;
+    scheduleChromeHide();
+  }
+
+  function showFooter(): void {
+    footerVisible = true;
+    scheduleChromeHide();
+  }
+
+  function scheduleChromeHide(): void {
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
       controlsVisible = false;
       settingsVisible = false;
       tocVisible = false;
+      footerVisible = false;
     }, 5_000);
   }
 
@@ -127,6 +139,25 @@
       void turn(detail.direction);
       showControls();
     }
+  }
+
+  function handleBottomSwipeStart(event: PointerEvent): void {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    bottomSwipeStart = { id: event.pointerId, x: event.clientX, y: event.clientY };
+  }
+
+  function handleBottomSwipeMove(event: PointerEvent): void {
+    if (!bottomSwipeStart || bottomSwipeStart.id !== event.pointerId) return;
+    const deltaX = event.clientX - bottomSwipeStart.x;
+    const deltaY = event.clientY - bottomSwipeStart.y;
+    if (deltaY < -24 && Math.abs(deltaY) > Math.abs(deltaX)) {
+      bottomSwipeStart = null;
+      showFooter();
+    }
+  }
+
+  function handleBottomSwipeEnd(event: PointerEvent): void {
+    if (bottomSwipeStart?.id === event.pointerId) bottomSwipeStart = null;
   }
 
   if (Capacitor.isNativePlatform()) {
@@ -388,13 +419,24 @@
           </div>
         </nav>
       {/if}
-
-      <footer class="reader-bar reader-bottom">
-        <span class="truncate text-xs">{location?.href ?? 'Opening book...'}</span>
-        <span class="text-xs tabular-nums">{Math.round((location?.percentage ?? 0) * 100)}%</span>
-      </footer>
     </div>
   {/if}
+
+  {#if footerVisible}
+    <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
+      <span class="truncate text-xs">{location?.href ?? 'Opening book...'}</span>
+      <span class="text-xs tabular-nums">{Math.round((location?.percentage ?? 0) * 100)}%</span>
+    </footer>
+  {/if}
+
+  <div
+    class="reader-bottom-reveal"
+    aria-hidden="true"
+    onpointerdown={handleBottomSwipeStart}
+    onpointermove={handleBottomSwipeMove}
+    onpointerup={handleBottomSwipeEnd}
+    onpointercancel={handleBottomSwipeEnd}
+  ></div>
 </div>
 
 <style>
@@ -411,8 +453,9 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(1.5rem, calc(env(safe-area-inset-top) + 1rem));
+    --reader-safe-top: max(0.5rem, env(safe-area-inset-top));
     --reader-safe-bottom: max(1rem, env(safe-area-inset-bottom));
+    --reader-progress-height: 0.25rem;
   }
 
   .reader-viewport {
@@ -481,6 +524,19 @@
     -webkit-tap-highlight-color: transparent;
   }
 
+  .reader-bottom-reveal {
+    position: absolute;
+    z-index: 11;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    border: 0;
+    background: transparent;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+  }
+
   .tap-zones button {
     border: 0;
     background: transparent;
@@ -509,13 +565,13 @@
 
   .reader-top {
     top: 0;
-    padding-top: max(0.75rem, env(safe-area-inset-top));
+    padding-top: max(0.5rem, env(safe-area-inset-top));
   }
 
   .reader-bottom {
-    bottom: 0;
+    bottom: calc(var(--reader-progress-height) + max(0.75rem, env(safe-area-inset-bottom)));
     justify-content: space-between;
-    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+    padding-bottom: 0;
   }
 
   .reader-progress {
@@ -528,7 +584,7 @@
   }
 
   .reader-progress-track {
-    height: 0.25rem;
+    height: var(--reader-progress-height);
     overflow: hidden;
     border-radius: 9999px;
     background: color-mix(in oklab, var(--reader-text) 12%, transparent);
