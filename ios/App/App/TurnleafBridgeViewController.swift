@@ -10,6 +10,21 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         if bridge?.plugin(withName: "VolumeButtons") == nil {
             bridge?.registerPluginInstance(TurnleafVolumeButtonsPlugin())
         }
+        if bridge?.plugin(withName: "ReaderChrome") == nil {
+            bridge?.registerPluginInstance(TurnleafReaderChromePlugin())
+        }
+    }
+
+    override var prefersStatusBarHidden: Bool {
+        TurnleafReaderChromeController.shared.enabled
+    }
+
+    override var prefersHomeIndicatorAutoHidden: Bool {
+        TurnleafReaderChromeController.shared.enabled
+    }
+
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
+        TurnleafReaderChromeController.shared.enabled ? [.bottom] : []
     }
 }
 
@@ -32,6 +47,25 @@ public final class TurnleafVolumeButtonsPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 }
 
+@objc(TurnleafReaderChromePlugin)
+public final class TurnleafReaderChromePlugin: CAPPlugin, CAPBridgedPlugin {
+    public let identifier = "TurnleafReaderChromePlugin"
+    public let jsName = "ReaderChrome"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "setEnabled", returnType: CAPPluginReturnPromise),
+    ]
+
+    override public func load() {
+        TurnleafReaderChromeController.shared.attach(to: bridge)
+    }
+
+    @objc func setEnabled(_ call: CAPPluginCall) {
+        TurnleafReaderChromeController.shared.attach(to: bridge)
+        TurnleafReaderChromeController.shared.setEnabled(call.getBool("enabled", false))
+        call.resolve()
+    }
+}
+
 final class TurnleafVolumeButtonsController {
     static let shared = TurnleafVolumeButtonsController()
 
@@ -39,7 +73,7 @@ final class TurnleafVolumeButtonsController {
     private weak var volumeView: MPVolumeView?
     private var volumeObservation: NSKeyValueObservation?
     private var lastVolume: Float = AVAudioSession.sharedInstance().outputVolume
-    private var enabled = false
+    fileprivate var enabled = false
     private var suppressing = false
 
     func attach(to bridge: CAPBridgeProtocol?) {
@@ -137,5 +171,37 @@ final class TurnleafVolumeButtonsController {
 
     private var volumeSlider: UISlider? {
         volumeView?.subviews.compactMap { $0 as? UISlider }.first
+    }
+}
+
+final class TurnleafReaderChromeController {
+    static let shared = TurnleafReaderChromeController()
+
+    private weak var bridge: CAPBridgeProtocol?
+    private var enabled = false
+
+    func attach(to bridge: CAPBridgeProtocol?) {
+        self.bridge = bridge
+        refresh()
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        self.enabled = enabled
+        refresh()
+    }
+
+    private func refresh() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let bridge = self.bridge, let viewController = bridge.viewController else {
+                return
+            }
+            viewController.setNeedsStatusBarAppearanceUpdate()
+            if #available(iOS 11.0, *) {
+                viewController.setNeedsUpdateOfHomeIndicatorAutoHidden()
+            }
+            if #available(iOS 13.0, *) {
+                viewController.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+            }
+        }
     }
 }

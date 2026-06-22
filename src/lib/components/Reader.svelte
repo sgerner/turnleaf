@@ -2,7 +2,9 @@
   import { Capacitor } from '@capacitor/core';
   import { onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
+  import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreference, setPreference } from '../database/database';
+  import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
   import {
     defaultAppearance,
@@ -46,7 +48,6 @@
   onMount(async () => {
     const saved = await getPreference('appearance');
     if (saved) appearance = parseAppearance(saved);
-    if (Capacitor.isNativePlatform()) await ReaderSession.hideStatusBar();
     session = new ReaderSession(bookUrl);
     try {
       await session.open(
@@ -73,6 +74,16 @@
 
     if (Capacitor.isNativePlatform()) {
       try {
+        await StatusBar.hide({ animation: Animation.None });
+      } catch {
+        // The reader still works if the platform refuses to hide the bar.
+      }
+      try {
+        await ReaderChrome.setEnabled({ enabled: true });
+      } catch {
+        // The reader still works if the platform cannot hide system bars.
+      }
+      try {
         await VolumeButtons.setEnabled({ enabled: true });
       } catch {
         // Volume-button paging is optional; the reader itself should keep working.
@@ -84,8 +95,9 @@
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     void setPreference('appearance', serializeAppearance(appearance));
+    if (Capacitor.isNativePlatform()) void StatusBar.show({ animation: Animation.None });
+    if (Capacitor.isNativePlatform()) void ReaderChrome.setEnabled({ enabled: false });
     if (Capacitor.isNativePlatform()) void VolumeButtons.setEnabled({ enabled: false });
-    void ReaderSession.showStatusBar();
     session?.destroy();
   });
 
@@ -565,7 +577,7 @@
 
   .reader-top {
     top: 0;
-    padding-top: max(0.5rem, env(safe-area-inset-top));
+    padding-top: env(safe-area-inset-top);
   }
 
   .reader-bottom {
