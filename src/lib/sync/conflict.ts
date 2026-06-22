@@ -39,3 +39,7 @@ export function chooseFurthestProgress(
 ): 'local' | 'remote' {
   return remotePercentage > localPercentage ? 'remote' : 'local';
 }
+
+export function shouldPreferFurthest(autoSync: boolean, manualRequest?: boolean): boolean {
+  return autoSync || manualRequest === true;
+}

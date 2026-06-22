@@ -117,7 +117,6 @@ export async function resetLocalDatabase(): Promise<void> {
     return;
   }
 
-  const sqlite = new SQLiteConnection(CapacitorSQLite);
   try {
     if (connection) {
       try {
@@ -129,7 +128,7 @@ export async function resetLocalDatabase(): Promise<void> {
     connection = null;
     await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
   } catch (error) {
-    throw new Error(`Could not reset local storage: ${String(error)}`);
+    throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
   }
 }
 

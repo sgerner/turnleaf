@@ -12,7 +12,7 @@ GitHub release bodies are generated from the matching versioned section in `RELE
 
 ## Recent release notes
 
-### 0.1.5
+### 0.1.6
 
 - Restore reader status bar hiding on Android and add a native reader chrome toggle.
 - Reapply Android reader immersive mode on resume and window focus so the gesture bar stays hidden more reliably.

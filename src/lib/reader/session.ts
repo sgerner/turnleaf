@@ -16,6 +16,30 @@ export interface TocItem {
   href: string;
 }
 
+interface KavitaXPathTarget {
+  spineIndex: number;
+  contentXPath: string;
+}
+
+export function parseKavitaXPath(xpath: string): KavitaXPathTarget | null {
+  const match = xpath.match(/^\/{1,2}body\/DocFragment\[(\d+)]\/body(?<content>\/.*)?$/i);
+  if (!match) return null;
+  const fragment = Number(match[1]);
+  if (!Number.isInteger(fragment) || fragment < 1) return null;
+  return {
+    spineIndex: fragment - 1,
+    contentXPath: `/html/body${match.groups?.content ?? ''}`,
+  };
+}
+
+export function toKavitaXPath(contentXPath: string, spineIndex: number): string | null {
+  if (!Number.isInteger(spineIndex) || spineIndex < 0) return null;
+  const content = contentXPath
+    .replace(/^\/?html(?:\[1])?\/body(?:\[1])?/i, '')
+    .replace(/^\/?body(?:\[1])?/i, '');
+  return `//body/DocFragment[${spineIndex + 1}]/body${content.startsWith('/') ? content : `/${content}`}`;
+}
+
 interface SpineSection {
   href: string;
   index: number;
@@ -42,6 +66,8 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private current: Location | null = null;
+  private restoring = false;
+  private onLocation: ((location: ReaderLocation) => void) | null = null;
 
   constructor(private readonly bookUrl: string) {
     this.book = ePub(bookUrl);
@@ -64,30 +90,11 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    this.onLocation = onLocation;
+    this.restoring = true;
     this.relocated = (location) => {
       this.current = location;
-      const start = location.start;
-      const sections = this.spineSections();
-      const sectionCount = Math.max(1, sections.length);
-      const sectionIndex = Math.max(
-        0,
-        sections.findIndex((section) => section.href === start.href),
-      );
-      const pageIndex = this.pageIndex(start.displayed.page);
-      const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
-      const reportedPercentage = Number.isFinite(start.percentage) ? start.percentage : null;
-      const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
-      onLocation({
-        ...start,
-        percentage:
-          reportedPercentage !== null && reportedPercentage > 0
-            ? reportedPercentage
-            : semanticPercentage,
-        spineIndex: start.index,
-        pageIndex,
-        pageCount: start.displayed.total,
-        xpath: this.cfiToXPath(start.cfi),
-      });
+      if (!this.restoring) this.reportLocation(location);
     };
     this.rendition.on('relocated', this.relocated);
     this.contentClick = (event, contents) => {
@@ -96,8 +103,45 @@ export class ReaderSession {
     };
     this.rendition.on('click', this.contentClick);
     this.applyAppearance(appearance);
-    await this.rendition.display(cfi ?? undefined);
-    if (!cfi && serverXPath) await this.displayXPath(serverXPath);
+    try {
+      if (cfi) {
+        await this.rendition.display(cfi);
+      } else if (serverXPath) {
+        const restored = await this.displayXPath(serverXPath);
+        if (!restored) await this.rendition.display();
+      } else {
+        await this.rendition.display();
+      }
+    } finally {
+      this.restoring = false;
+    }
+    if (this.current) this.reportLocation(this.current);
+  }
+
+  private reportLocation(location: Location): void {
+    if (!this.onLocation) return;
+    const start = location.start;
+    const sections = this.spineSections();
+    const sectionCount = Math.max(1, sections.length);
+    const sectionIndex = Math.max(
+      0,
+      sections.findIndex((section) => section.href === start.href),
+    );
+    const pageIndex = this.pageIndex(start.displayed.page);
+    const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
+    const reportedPercentage = Number.isFinite(start.percentage) ? start.percentage : null;
+    const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
+    this.onLocation({
+      ...start,
+      percentage:
+        reportedPercentage !== null && reportedPercentage > 0
+          ? reportedPercentage
+          : semanticPercentage,
+      spineIndex: start.index,
+      pageIndex,
+      pageCount: start.displayed.total,
+      xpath: this.cfiToXPath(start.cfi, start.index),
+    });
   }
 
   async next(): Promise<void> {
@@ -169,6 +213,7 @@ export class ReaderSession {
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
+    this.onLocation = null;
     this.current = null;
     this.book.destroy();
   }
@@ -183,7 +228,7 @@ export class ReaderSession {
     });
   }
 
-  private cfiToXPath(cfi: string): string | null {
+  private cfiToXPath(cfi: string, spineIndex: number): string | null {
     try {
       if (!this.rendition) return null;
       const range = this.rendition.getRange(cfi);
@@ -193,27 +238,31 @@ export class ReaderSession {
           : range.startContainer.parentElement;
       if (!element) return null;
       const parts: string[] = [];
-      while (element) {
+      while (element && element.localName !== 'body' && element.localName !== 'html') {
         const tag = element.localName;
         const siblings = element.parentElement
           ? [...element.parentElement.children].filter((child) => child.localName === tag)
           : [];
         parts.unshift(`${tag}[${Math.max(1, siblings.indexOf(element) + 1)}]`);
-        if (element.localName === 'html') break;
         element = element.parentElement;
       }
-      return `/${parts.join('/')}`;
+      return toKavitaXPath(`/${parts.join('/')}`, spineIndex);
     } catch {
       return null;
     }
   }
 
-  private async displayXPath(xpath: string): Promise<void> {
-    if (!this.rendition) return;
+  private async displayXPath(xpath: string): Promise<boolean> {
+    if (!this.rendition) return false;
+    const target = parseKavitaXPath(xpath);
+    if (!target) return false;
+    const section = this.spineSections()[target.spineIndex];
+    if (!section) return false;
+    await this.rendition.display(section.href);
     for (const contents of this.rendition.getContents() as unknown as Contents[]) {
       try {
         const node = contents.document.evaluate(
-          xpath,
+          target.contentXPath,
           contents.document,
           null,
           XPathResult.FIRST_ORDERED_NODE_TYPE,
@@ -223,11 +272,12 @@ export class ReaderSession {
         const range = contents.document.createRange();
         range.selectNodeContents(node);
         await this.rendition.display(contents.cfiFromRange(range));
-        return;
+        return true;
       } catch {
         // A server XPath from a changed EPUB is not safe to guess around.
       }
     }
+    return false;
   }
 
   private spineSections(): SpineSection[] {

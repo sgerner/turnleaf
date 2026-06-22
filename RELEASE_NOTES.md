@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- chore: release 0.1.6
+## 0.1.6
+
+- Preserve and restore Kavita EPUB progress at the correct spine section and nearby text location across devices.
+- Prevent the reader's initial page-one event from overwriting saved progress while a location is restoring.
+- Resume from newer Kavita progress when the current device has no unsynced reading changes.
+- Make the auto-sync furthest setting authoritative for every normal book open.
 - Reset visible release versions
 - Add local data reset recovery
 - Fix Android volume key paging

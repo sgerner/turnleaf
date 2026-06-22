@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { chooseFurthestProgress, detectProgressConflict, type ProgressSnapshot } from './conflict';
+import {
+  chooseFurthestProgress,
+  detectProgressConflict,
+  shouldPreferFurthest,
+  type ProgressSnapshot,
+} from './conflict';
 import { coalesceSyncItem } from './queue';
 
 const snapshot = (xpath: string, percentage: number): ProgressSnapshot => ({
@@ -47,5 +52,15 @@ describe('furthest progress selection', () => {
     expect(chooseFurthestProgress(0.2, 0.8)).toBe('remote');
     expect(chooseFurthestProgress(0.8, 0.2)).toBe('local');
     expect(chooseFurthestProgress(0.4, 0.4)).toBe('local');
+  });
+
+  it('keeps automatic furthest selection authoritative for every open', () => {
+    expect(shouldPreferFurthest(true, false)).toBe(true);
+    expect(shouldPreferFurthest(true)).toBe(true);
+  });
+
+  it('supports a one-time manual request when automatic selection is disabled', () => {
+    expect(shouldPreferFurthest(false, true)).toBe(true);
+    expect(shouldPreferFurthest(false)).toBe(false);
   });
 });

@@ -31,7 +31,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { chooseFurthestProgress } from '../sync/conflict';
+  import { chooseFurthestProgress, shouldPreferFurthest } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -409,12 +409,12 @@
       message = 'The downloaded file is missing. Download it again.';
       books = await getBooks(server.id);
       const refreshed = books.find((item) => item.id === book.id) ?? null;
-      if (refreshed) await open(refreshed);
+      if (refreshed) await open(refreshed, options);
       return;
     }
     const local = await getReadingState(book.id);
     const remote = offline ? null : await client.getProgress(book.chapterId).catch(() => null);
-    const preferFurthest = options.preferFurthest ?? pendingAutoSync;
+    const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
     const localPercentage = local?.percentage ?? 0;
     const remotePercentage = remote ? (book.pages ? remote.pageNum / book.pages : 0) : 0;
     if (preferFurthest && local && remote) {
@@ -434,6 +434,22 @@
         xpath: null,
       };
       void flushProgress(client).catch(() => {});
+      return;
+    }
+    const remoteIsNewer = Boolean(
+      local &&
+      remote?.bookScrollId &&
+      remote.lastModifiedUtc &&
+      (!local.serverUpdatedAt ||
+        Date.parse(remote.lastModifiedUtc) > Date.parse(local.serverUpdatedAt)),
+    );
+    if (local && !local.pendingSync && remoteIsNewer) {
+      reading = {
+        book,
+        url: file.webViewUrl,
+        cfi: null,
+        xpath: remote?.bookScrollId ?? null,
+      };
       return;
     }
     const remoteChanged = Boolean(
@@ -646,7 +662,7 @@
         <button
           class="preset-tonal-surface overflow-hidden rounded-lg shadow-md"
           type="button"
-          onclick={() => void open(continueBook!, { preferFurthest: pendingAutoSync })}
+          onclick={() => void open(continueBook!)}
           aria-label={`Continue reading ${continueBook.title}`}
         >
           <img
@@ -680,7 +696,7 @@
         <button
           class="btn preset-filled-primary-700-300 shrink-0"
           type="button"
-          onclick={() => void open(continueBook!, { preferFurthest: pendingAutoSync })}
+          onclick={() => void open(continueBook!)}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
             <path fill="currentColor" d="M8 5v14l11-7z" />
@@ -819,7 +835,7 @@
             <button
               class="group block w-full text-left"
               type="button"
-              onclick={() => void open(book, { preferFurthest: pendingAutoSync })}
+              onclick={() => void open(book)}
               oncontextmenu={(event) => {
                 event.preventDefault();
                 openMenu(book);
@@ -931,7 +947,7 @@
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
-            if (book) void open(book, { preferFurthest: pendingAutoSync });
+            if (book) void open(book);
           }}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
