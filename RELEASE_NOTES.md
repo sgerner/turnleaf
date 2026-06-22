@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+- Add local data reset recovery
 - Fix Android volume key paging
+
+- Add a startup reset path that clears corrupted local SQLite state without deleting downloaded EPUB files.
+
 ## 0.1.5
 
 - Restore reader status bar hiding on Android and add a native reader chrome toggle.

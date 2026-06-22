@@ -9,6 +9,7 @@
   import {
     getPreference,
     getServer,
+    resetLocalDatabase,
     setPreference,
     type ServerConfig,
   } from './lib/database/database';
@@ -22,6 +23,7 @@
   let server = $state<ServerConfig | null>(null);
   let booting = $state(Capacitor.isNativePlatform());
   let startupError = $state('');
+  let repairing = $state(false);
   let apiKey = $state<string | null>(null);
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
@@ -45,6 +47,19 @@
       booting = false;
     }
   });
+
+  async function repairLocalData(): Promise<void> {
+    repairing = true;
+    startupError = '';
+    try {
+      await resetLocalDatabase();
+    } catch {
+      startupError = 'Local data could not be reset. Try reinstalling the app.';
+      return;
+    } finally {
+      repairing = false;
+    }
+  }
 
   async function checkForRelease(): Promise<void> {
     const latest = await fetchLatestGithubRelease(__APP_VERSION__);
@@ -137,8 +152,21 @@
       />
     {:else}
       {#if startupError}
-        <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg" role="alert">
-          {startupError}
+        <div
+          class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3"
+          role="alert"
+        >
+          <p>{startupError}</p>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn btn-sm preset-filled-error-500 !text-sm"
+              type="button"
+              disabled={repairing}
+              onclick={repairLocalData}
+            >
+              {repairing ? 'Resetting...' : 'Reset local data'}
+            </button>
+          </div>
         </div>
       {/if}
       <Onboarding

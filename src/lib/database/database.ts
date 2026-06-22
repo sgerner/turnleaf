@@ -111,6 +111,28 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
   return connection;
 }
 
+export async function resetLocalDatabase(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    writeBrowserState(createBrowserState());
+    return;
+  }
+
+  const sqlite = new SQLiteConnection(CapacitorSQLite);
+  try {
+    if (connection) {
+      try {
+        await connection.close();
+      } catch {
+        // Best effort only; a broken connection can still be removed.
+      }
+    }
+    connection = null;
+    await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+  } catch (error) {
+    throw new Error(`Could not reset local storage: ${String(error)}`);
+  }
+}
+
 async function migrate(db: SQLiteDBConnection): Promise<void> {
   const current = await db.getVersion();
   for (const migration of migrations) {
