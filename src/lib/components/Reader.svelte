@@ -419,14 +419,14 @@
           </div>
         </nav>
       {/if}
-
-      {#if footerVisible}
-        <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
-          <span class="truncate text-xs">{location?.href ?? 'Opening book...'}</span>
-          <span class="text-xs tabular-nums">{Math.round((location?.percentage ?? 0) * 100)}%</span>
-        </footer>
-      {/if}
     </div>
+  {/if}
+
+  {#if footerVisible}
+    <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
+      <span class="truncate text-xs">{location?.href ?? 'Opening book...'}</span>
+      <span class="text-xs tabular-nums">{Math.round((location?.percentage ?? 0) * 100)}%</span>
+    </footer>
   {/if}
 
   <div
