@@ -41,7 +41,7 @@ jobs:
           set -eu
           BASE_VERSION="$(node -p "require('./package.json').version")"
           RELEASE_VERSION="${BASE_VERSION}+${GITHUB_RUN_NUMBER}"
-          echo "TURNLEAF_VERSION_NAME=${RELEASE_VERSION}" >> "$GITHUB_ENV"
+          echo "TURNLEAF_VERSION_NAME=${BASE_VERSION}" >> "$GITHUB_ENV"
           echo "TURNLEAF_VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "TURNLEAF_RELEASE_TAG=v${RELEASE_VERSION}" >> "$GITHUB_ENV"
 

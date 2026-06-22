@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reset visible release versions
 - Add local data reset recovery
 - Fix Android volume key paging
 

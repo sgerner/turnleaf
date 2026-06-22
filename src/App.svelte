@@ -66,6 +66,10 @@
     if (latest) releaseBanner = latest;
   }
 
+  function displayVersion(version: string): string {
+    return version.split('+', 1)[0] ?? version;
+  }
+
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
@@ -92,7 +96,7 @@
           <div class="min-w-0">
             <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
             <p class="mt-1 font-medium text-surface-950-50">
-              Turnleaf {releaseBanner.version}{releaseBanner.title
+              Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
                 ? ` · ${releaseBanner.title}`
                 : ''}
             </p>
