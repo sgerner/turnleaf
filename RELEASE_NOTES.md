@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: align release versioning
+- Release APKs now embed the full `x.y.z+build` version so the update banner does not falsely appear on the latest installed release.
 - chore: release 0.1.6
 ## 0.1.6
 
