@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  chooseOpenProgress,
   chooseFurthestProgress,
   detectProgressConflict,
   shouldPreferFurthest,
@@ -62,5 +63,32 @@ describe('furthest progress selection', () => {
   it('supports a one-time manual request when automatic selection is disabled', () => {
     expect(shouldPreferFurthest(false, true)).toBe(true);
     expect(shouldPreferFurthest(false)).toBe(false);
+  });
+});
+
+describe('reader open progress selection', () => {
+  const local = {
+    percentage: 0.25,
+    pendingSync: false,
+    xpath: '//body/DocFragment[1]/body/p[1]',
+  };
+  const remote = {
+    pageNum: 80,
+    bookScrollId: '//body/DocFragment[2]/body/p[4]',
+  };
+
+  it('uses Kavita progress when local state has already synced', () => {
+    expect(chooseOpenProgress(local, remote, 100, false)).toBe('remote');
+  });
+
+  it('uses furthest progress when requested', () => {
+    expect(chooseOpenProgress({ ...local, percentage: 0.9 }, remote, 100, true)).toBe('local');
+    expect(chooseOpenProgress(local, remote, 100, true)).toBe('remote');
+  });
+
+  it('does not silently discard pending local progress', () => {
+    expect(chooseOpenProgress({ ...local, pendingSync: true }, remote, 100, false)).toBe(
+      'conflict',
+    );
   });
 });

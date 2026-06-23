@@ -31,7 +31,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { chooseFurthestProgress, shouldPreferFurthest } from '../sync/conflict';
+  import { chooseOpenProgress, shouldPreferFurthest } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -415,35 +415,8 @@
     const local = await getReadingState(book.id);
     const remote = offline ? null : await client.getProgress(book.chapterId).catch(() => null);
     const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
-    const localPercentage = local?.percentage ?? 0;
-    const remotePercentage = remote ? (book.pages ? remote.pageNum / book.pages : 0) : 0;
-    if (preferFurthest && local && remote) {
-      if (chooseFurthestProgress(localPercentage, remotePercentage) === 'remote') {
-        reading = {
-          book,
-          url: file.webViewUrl,
-          cfi: null,
-          xpath: remote.bookScrollId ?? null,
-        };
-        return;
-      }
-      reading = {
-        book,
-        url: file.webViewUrl,
-        cfi: local.cfi,
-        xpath: null,
-      };
-      void flushProgress(client).catch(() => {});
-      return;
-    }
-    const remoteIsNewer = Boolean(
-      local &&
-      remote?.bookScrollId &&
-      remote.lastModifiedUtc &&
-      (!local.serverUpdatedAt ||
-        Date.parse(remote.lastModifiedUtc) > Date.parse(local.serverUpdatedAt)),
-    );
-    if (local && !local.pendingSync && remoteIsNewer) {
+    const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
+    if (openProgress === 'remote') {
       reading = {
         book,
         url: file.webViewUrl,
@@ -452,13 +425,17 @@
       };
       return;
     }
-    const remoteChanged = Boolean(
-      local?.pendingSync &&
-      remote?.lastModifiedUtc &&
-      local.serverUpdatedAt &&
-      Date.parse(remote.lastModifiedUtc) > Date.parse(local.serverUpdatedAt),
-    );
-    if (local && remote && remoteChanged && remote.bookScrollId !== local.xpath) {
+    if (openProgress === 'local') {
+      reading = {
+        book,
+        url: file.webViewUrl,
+        cfi: local?.cfi ?? null,
+        xpath: null,
+      };
+      if (preferFurthest) void flushProgress(client).catch(() => {});
+      return;
+    }
+    if (openProgress === 'conflict' && local && remote) {
       conflict = { book, url: file.webViewUrl, localCfi: local.cfi, remote };
       return;
     }
@@ -474,6 +451,12 @@
     await saveLocalProgress(book, location.cfi, location.xpath, location.percentage);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
+  }
+
+  async function syncLatestForReader(book: BookRecord): Promise<string | null> {
+    if (offline) return null;
+    const remote = await client.getProgress(book.chapterId).catch(() => null);
+    return remote?.bookScrollId ?? null;
   }
 
   async function markDone(book: BookRecord): Promise<void> {
@@ -603,6 +586,7 @@
     initialXPath={reading.xpath}
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
+    onSyncLatest={() => syncLatestForReader(reading!.book)}
   />
 {:else}
   <main

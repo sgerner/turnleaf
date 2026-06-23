@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: sync reader with kavita on open
+- Prefer Kavita's saved EPUB location on book open when this device has no unsent local progress.
 - Slightly increase the reader bottom margin to clear the gesture navigation bar
 - fix: update android launcher icon
 ## 0.1.7

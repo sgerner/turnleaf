@@ -43,3 +43,39 @@ export function chooseFurthestProgress(
 export function shouldPreferFurthest(autoSync: boolean, manualRequest?: boolean): boolean {
   return autoSync || manualRequest === true;
 }
+
+export interface OpenLocalProgress {
+  percentage: number;
+  pendingSync: boolean;
+  xpath: string | null;
+}
+
+export interface OpenRemoteProgress {
+  pageNum: number;
+  bookScrollId?: string | null;
+}
+
+export type OpenProgressDecision = 'local' | 'remote' | 'conflict' | 'none';
+
+export function chooseOpenProgress(
+  local: OpenLocalProgress | null,
+  remote: OpenRemoteProgress | null,
+  bookPages: number,
+  preferFurthest: boolean,
+): OpenProgressDecision {
+  const hasRemoteLocation = Boolean(remote?.bookScrollId);
+  if (!local && hasRemoteLocation) return 'remote';
+  if (!local) return 'none';
+  if (!hasRemoteLocation) return 'local';
+
+  if (local.pendingSync) {
+    return remote?.bookScrollId !== local.xpath ? 'conflict' : 'local';
+  }
+
+  if (preferFurthest && remote) {
+    const remotePercentage = bookPages ? remote.pageNum / bookPages : 0;
+    return chooseFurthestProgress(local.percentage, remotePercentage);
+  }
+
+  return 'remote';
+}

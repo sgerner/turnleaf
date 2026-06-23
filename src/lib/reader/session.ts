@@ -166,6 +166,10 @@ export class ReaderSession {
     return this.rendition.display(href);
   }
 
+  displayServerLocation(xpath: string): Promise<boolean> {
+    return this.displayXPath(xpath);
+  }
+
   applyAppearance(value: Appearance): void {
     if (!this.rendition) return;
     const colors = MODE_COLORS[value.mode];

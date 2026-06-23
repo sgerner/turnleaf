@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Capacitor } from '@capacitor/core';
+  import { App } from '@capacitor/app';
+  import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
@@ -22,6 +23,7 @@
     initialXPath = null,
     onBack,
     onRelocated,
+    onSyncLatest,
   }: {
     bookUrl: string;
     title: string;
@@ -29,6 +31,7 @@
     initialXPath?: string | null;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
+    onSyncLatest?: () => Promise<string | null>;
   } = $props();
 
   let viewport: HTMLDivElement;
@@ -44,6 +47,8 @@
   let footerVisible = $state(false);
   let bottomSwipeStart: { id: number; x: number; y: number } | null = null;
   let saveTimer: number | null = null;
+  let resumeHandle: PluginListenerHandle | null = null;
+  let syncingLatest = $state(false);
 
   onMount(async () => {
     const saved = await getPreference('appearance');
@@ -88,12 +93,16 @@
       } catch {
         // Volume-button paging is optional; the reader itself should keep working.
       }
+      resumeHandle = await App.addListener('appStateChange', ({ isActive }) => {
+        if (isActive) void syncLatestLocation(false);
+      });
     }
   });
 
   onDestroy(() => {
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
+    void resumeHandle?.remove();
     void setPreference('appearance', serializeAppearance(appearance));
     if (Capacitor.isNativePlatform()) void StatusBar.show({ animation: Animation.None });
     if (Capacitor.isNativePlatform()) void ReaderChrome.setEnabled({ enabled: false });
@@ -142,6 +151,20 @@
         cause instanceof Error
           ? cause.message
           : 'This page could not be displayed. Try reopening the book.';
+    }
+  }
+
+  async function syncLatestLocation(showFeedback = true): Promise<void> {
+    if (!session || !onSyncLatest || syncingLatest) return;
+    syncingLatest = true;
+    try {
+      const xpath = await onSyncLatest();
+      if (xpath) await session.displayServerLocation(xpath);
+      if (showFeedback) showControls();
+    } catch {
+      // Opening the reader should stay quiet when the device is offline.
+    } finally {
+      syncingLatest = false;
     }
   }
 
@@ -229,7 +252,7 @@
   {#if controlsVisible}
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
       <header class="reader-bar reader-top" transition:fly={{ y: -8, duration: 140 }}>
-        <div class="grid w-full grid-cols-3 gap-2">
+        <div class="grid w-full grid-cols-4 gap-2">
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
@@ -259,6 +282,26 @@
             aria-expanded={settingsVisible}
           >
             Text
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
+            onclick={() => syncLatestLocation()}
+            aria-label="Sync latest reading position"
+            title="Sync latest reading position"
+            disabled={syncingLatest}
+          >
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              class:animate-spin={syncingLatest}
+              class="h-5 w-5"
+            >
+              <path
+                fill="currentColor"
+                d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
+              />
+            </svg>
           </button>
         </div>
         <p class="min-w-0 flex-1 truncate text-center text-sm font-bold text-primary-500">
@@ -577,11 +620,11 @@
 
   .reader-top {
     top: 0;
-    padding-top: env(safe-area-inset-top) - 1rem;
+    padding-top: env(safe-area-inset-top);
   }
 
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(2rem, env(safe-area-inset-bottom) + 1.5rem));
+    bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
     justify-content: space-between;
     padding-bottom: 0;
   }
