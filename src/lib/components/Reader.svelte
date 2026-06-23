@@ -577,11 +577,11 @@
 
   .reader-top {
     top: 0;
-    padding-top: env(safe-area-inset-top);
+    padding-top: env(safe-area-inset-top) - 0.5rem;
   }
 
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(0.75rem, env(safe-area-inset-bottom)));
+    bottom: calc(var(--reader-progress-height) + max(1.25rem, env(safe-area-inset-bottom)));
     justify-content: space-between;
     padding-bottom: 0;
   }
