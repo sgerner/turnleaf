@@ -638,25 +638,20 @@
     </header>
 
     {#if continueBook}
-      <section
-        class="card preset-tonal-surface mt-6 flex items-center gap-4 p-3 sm:gap-5 sm:p-4"
-        aria-label="Continue reading"
+      <button
+        class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
+        type="button"
+        aria-label={`Continue reading ${continueBook.title}`}
+        onclick={() => void open(continueBook!)}
         transition:fade
       >
-        <button
-          class="preset-tonal-surface overflow-hidden rounded-lg shadow-md"
-          type="button"
-          onclick={() => void open(continueBook!)}
-          aria-label={`Continue reading ${continueBook.title}`}
-        >
-          <img
-            class="h-24 w-16 shrink-0 object-cover sm:h-28 sm:w-20"
-            src={covers[continueBook.seriesId] ?? client.coverUrl(continueBook.seriesId)}
-            loading="lazy"
-            decoding="async"
-            alt=""
-          />
-        </button>
+        <img
+          class="h-24 w-16 shrink-0 rounded-lg object-cover shadow-md sm:h-28 sm:w-20"
+          src={covers[continueBook.seriesId] ?? client.coverUrl(continueBook.seriesId)}
+          loading="lazy"
+          decoding="async"
+          alt=""
+        />
         <div class="min-w-0 flex-1">
           <p class="text-xs uppercase tracking-wider text-surface-700-300">Continue reading</p>
           <h2 class="mt-0.5 truncate font-serif text-xl leading-tight text-surface-950-50">
@@ -677,17 +672,7 @@
             >
           </div>
         </div>
-        <button
-          class="btn preset-filled-primary-700-300 shrink-0"
-          type="button"
-          onclick={() => void open(continueBook!)}
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path fill="currentColor" d="M8 5v14l11-7z" />
-          </svg>
-          <span class="hidden sm:inline">Read</span>
-        </button>
-      </section>
+      </button>
     {/if}
 
     <div class="mt-5 flex flex-col sm:flex-row sm:items-center">

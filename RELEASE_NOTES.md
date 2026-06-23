@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: make continue card clickable
+- Make the entire Continue Reading card open the current book.
 - fix: sync reader with kavita on open
 - Prefer Kavita's saved EPUB location on book open when this device has no unsent local progress.
 - Slightly increase the reader bottom margin to clear the gesture navigation bar
