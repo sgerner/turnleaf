@@ -581,9 +581,7 @@
   }
 
   .reader-bottom {
-    bottom: calc(
-      var(--reader-progress-height) + max(0.75rem, env(safe-area-inset-bottom) + 1.5rem)
-    );
+    bottom: calc(var(--reader-progress-height) + max(2rem, env(safe-area-inset-bottom) + 1.5rem));
     justify-content: space-between;
     padding-bottom: 0;
   }

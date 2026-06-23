@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Slightly increase the reader bottom margin to clear the gesture navigation bar
 - fix: update android launcher icon
 ## 0.1.7
 
