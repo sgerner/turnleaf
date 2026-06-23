@@ -2,10 +2,12 @@
 
 ## Unreleased
 
+- Improve onboarding style and layout
 - Improve reader margin
 - fix: align release versioning
 - Release APKs now embed the full `x.y.z+build` version so the update banner does not falsely appear on the latest installed release.
 - chore: release 0.1.6
+
 ## 0.1.6
 
 - Preserve and restore Kavita EPUB progress at the correct spine section and nearby text location across devices.

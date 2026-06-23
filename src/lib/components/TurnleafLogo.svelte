@@ -17,7 +17,7 @@
   <img class="turnleaf-image" src="/logo.png" alt="" decoding="async" loading="eager" />
 
   {#if wordmark}
-    <span class="turnleaf-wordmark">Turnleaf</span>
+    <span class="text-tertiary-700-300 turnleaf-wordmark">Turnleaf</span>
   {/if}
 </span>
 
@@ -39,7 +39,7 @@
 
   .turnleaf-wordmark {
     font-family: var(--heading-font-family);
-    font-size: calc(var(--turnleaf-logo-size) * 0.44);
+    font-size: calc(var(--turnleaf-logo-size) * 0.65);
     line-height: 1;
     letter-spacing: 0.02em;
   }
