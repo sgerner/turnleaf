@@ -21,6 +21,7 @@
     title,
     initialCfi = null,
     initialXPath = null,
+    initialPercentage = null,
     onBack,
     onRelocated,
     onSyncLatest,
@@ -29,9 +30,10 @@
     title: string;
     initialCfi?: string | null;
     initialXPath?: string | null;
+    initialPercentage?: number | null;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
-    onSyncLatest?: () => Promise<string | null>;
+    onSyncLatest?: () => Promise<{ xpath: string | null; percentage: number | null } | null>;
   } = $props();
 
   let viewport: HTMLDivElement;
@@ -59,6 +61,7 @@
         viewport,
         initialCfi,
         initialXPath,
+        initialPercentage,
         appearance,
         (next) => {
           location = next;
@@ -159,7 +162,8 @@
     syncingLatest = true;
     try {
       const xpath = await onSyncLatest();
-      if (xpath) await session.displayServerLocation(xpath);
+      if (xpath?.xpath) await session.displayServerLocation(xpath.xpath);
+      else if (xpath?.percentage) await session.displayServerPercentage(xpath.percentage);
       if (showFeedback) showControls();
     } catch {
       // Opening the reader should stay quiet when the device is offline.

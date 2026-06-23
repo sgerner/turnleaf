@@ -63,7 +63,7 @@ export function chooseOpenProgress(
   bookPages: number,
   preferFurthest: boolean,
 ): OpenProgressDecision {
-  const hasRemoteLocation = Boolean(remote?.bookScrollId);
+  const hasRemoteLocation = Boolean(remote?.bookScrollId || (remote && remote.pageNum > 0));
   if (!local && hasRemoteLocation) return 'remote';
   if (!local) return 'none';
   if (!hasRemoteLocation) return 'local';

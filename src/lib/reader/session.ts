@@ -77,6 +77,7 @@ export class ReaderSession {
     target: HTMLElement,
     cfi: string | null,
     serverXPath: string | null,
+    serverPercentage: number | null,
     appearance: Appearance,
     onLocation: (location: ReaderLocation) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
@@ -108,6 +109,9 @@ export class ReaderSession {
         await this.rendition.display(cfi);
       } else if (serverXPath) {
         const restored = await this.displayXPath(serverXPath);
+        if (!restored) await this.rendition.display();
+      } else if (serverPercentage && serverPercentage > 0) {
+        const restored = await this.displayPercentage(serverPercentage);
         if (!restored) await this.rendition.display();
       } else {
         await this.rendition.display();
@@ -168,6 +172,10 @@ export class ReaderSession {
 
   displayServerLocation(xpath: string): Promise<boolean> {
     return this.displayXPath(xpath);
+  }
+
+  displayServerPercentage(percentage: number): Promise<boolean> {
+    return this.displayPercentage(percentage);
   }
 
   applyAppearance(value: Appearance): void {
@@ -282,6 +290,17 @@ export class ReaderSession {
       }
     }
     return false;
+  }
+
+  private async displayPercentage(percentage: number): Promise<boolean> {
+    if (!this.rendition) return false;
+    try {
+      if (!this.book.locations.length()) await this.book.locations.generate(1600);
+      await this.rendition.display(Math.max(0, Math.min(0.999, percentage)));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private spineSections(): SpineSection[] {

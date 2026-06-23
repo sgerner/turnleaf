@@ -73,6 +73,7 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
+    if (booting) return;
     void setPreference(themePreferenceKey, uiTheme);
     void setPreference(modePreferenceKey, uiMode);
   });

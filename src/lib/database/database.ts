@@ -37,6 +37,7 @@ export interface BookRecord {
 }
 
 let connection: SQLiteDBConnection | null = null;
+let opening: Promise<SQLiteDBConnection> | null = null;
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -98,17 +99,28 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
   }
   if (connection) return connection;
 
+  if (opening) return opening;
+  opening = openNativeDatabase();
+  try {
+    connection = await opening;
+    return connection;
+  } finally {
+    opening = null;
+  }
+}
+
+async function openNativeDatabase(): Promise<SQLiteDBConnection> {
   const sqlite = new SQLiteConnection(CapacitorSQLite);
   const consistency = await sqlite.checkConnectionsConsistency();
   const existing = (await sqlite.isConnection('turnleaf', false)).result;
-  connection =
+  const db =
     consistency.result && existing
       ? await sqlite.retrieveConnection('turnleaf', false)
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
-  await connection.open();
-  await connection.execute('PRAGMA foreign_keys = ON;');
-  await migrate(connection);
-  return connection;
+  await db.open();
+  await db.execute('PRAGMA foreign_keys = ON;');
+  await migrate(db);
+  return db;
 }
 
 export async function resetLocalDatabase(): Promise<void> {
@@ -126,6 +138,7 @@ export async function resetLocalDatabase(): Promise<void> {
       }
     }
     connection = null;
+    opening = null;
     await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });

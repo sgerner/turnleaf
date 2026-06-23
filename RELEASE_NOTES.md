@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: handle fresh install startup and kavita resume
+- Serialize native SQLite startup and avoid preference writes during boot so fresh installs do not begin with inaccessible local data.
+- Parse native Android Kavita JSON responses and fall back to Kavita page progress when no EPUB XPath is available.
 - fix: make continue card clickable
 - Make the entire Continue Reading card open the current book.
 - fix: sync reader with kavita on open

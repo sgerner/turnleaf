@@ -81,6 +81,11 @@ describe('reader open progress selection', () => {
     expect(chooseOpenProgress(local, remote, 100, false)).toBe('remote');
   });
 
+  it('uses Kavita page progress when no XPath was saved', () => {
+    expect(chooseOpenProgress(null, { pageNum: 40 }, 100, false)).toBe('remote');
+    expect(chooseOpenProgress(local, { pageNum: 40 }, 100, false)).toBe('remote');
+  });
+
   it('uses furthest progress when requested', () => {
     expect(chooseOpenProgress({ ...local, percentage: 0.9 }, remote, 100, true)).toBe('local');
     expect(chooseOpenProgress(local, remote, 100, true)).toBe('remote');

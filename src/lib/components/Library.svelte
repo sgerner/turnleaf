@@ -226,6 +226,7 @@
     url: string;
     cfi: string | null;
     xpath: string | null;
+    percentage: number | null;
   } | null>(null);
   let conflict = $state<{
     book: BookRecord;
@@ -422,6 +423,7 @@
         url: file.webViewUrl,
         cfi: null,
         xpath: remote?.bookScrollId ?? null,
+        percentage: remote ? remotePercentage(remote, book) : null,
       };
       return;
     }
@@ -431,6 +433,7 @@
         url: file.webViewUrl,
         cfi: local?.cfi ?? null,
         xpath: null,
+        percentage: null,
       };
       if (preferFurthest) void flushProgress(client).catch(() => {});
       return;
@@ -444,7 +447,13 @@
       url: file.webViewUrl,
       cfi: local?.cfi ?? null,
       xpath: local ? null : (remote?.bookScrollId ?? null),
+      percentage: !local && remote ? remotePercentage(remote, book) : null,
     };
+  }
+
+  function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
+    if (!book.pages || remote.pageNum <= 0) return null;
+    return Math.max(0, Math.min(0.999, remote.pageNum / book.pages));
   }
 
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
@@ -453,10 +462,16 @@
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
   }
 
-  async function syncLatestForReader(book: BookRecord): Promise<string | null> {
+  async function syncLatestForReader(
+    book: BookRecord,
+  ): Promise<{ xpath: string | null; percentage: number | null } | null> {
     if (offline) return null;
     const remote = await client.getProgress(book.chapterId).catch(() => null);
-    return remote?.bookScrollId ?? null;
+    if (!remote) return null;
+    return {
+      xpath: remote.bookScrollId ?? null,
+      percentage: remotePercentage(remote, book),
+    };
   }
 
   async function markDone(book: BookRecord): Promise<void> {
@@ -584,6 +599,7 @@
     title={reading.book.title}
     initialCfi={reading.cfi}
     initialXPath={reading.xpath}
+    initialPercentage={reading.percentage}
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
     onSyncLatest={() => syncLatestForReader(reading!.book)}
@@ -1003,6 +1019,7 @@
               url: conflict!.url,
               cfi: conflict!.localCfi,
               xpath: null,
+              percentage: null,
             };
             conflict = null;
           }}>Continue from this device</button
@@ -1016,6 +1033,7 @@
               url: conflict!.url,
               cfi: null,
               xpath: conflict!.remote.bookScrollId ?? null,
+              percentage: remotePercentage(conflict!.remote, conflict!.book),
             };
             conflict = null;
           }}>Continue from Kavita</button

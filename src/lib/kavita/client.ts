@@ -183,6 +183,10 @@ export class KavitaClient {
       const response = await CapacitorHttp.request(options);
       this.assertStatus(response.status);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (typeof response.data === 'string') {
+        if (!response.data.trim()) return undefined as T;
+        return JSON.parse(response.data) as T;
+      }
       return response.data as T;
     } catch (error) {
       if (error instanceof KavitaError || error instanceof DOMException) throw error;
