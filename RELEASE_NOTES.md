@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: update android launcher icon
+## 0.1.7
+
 - Improve onboarding style and layout
 - Improve reader margin
 - fix: align release versioning
