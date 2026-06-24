@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Improve progress sync across edge cases
+- Restore Kavita reading positions without immediately writing transient page-one locations back to the server.
+- Restore from Kavita's global book progress first, with its EPUB XPath as a fallback.
+- Calculate Kavita progress from the EPUB spine and page instead of EPUB.js's chapter-local percentage.
+- Prevent ordinary reader navigation and manual sync from accidentally marking books as completed.
+- Retry a failed Kavita progress read once and fall back to cached library progress instead of page one.
+
 - fix: restore kavita epub locations
 - Restore Kavita EPUB locations through namespaced XHTML and fall back to server page progress when an exact locator cannot be resolved.
 - fix: handle fresh install startup and kavita resume
@@ -13,6 +20,7 @@
 - Prefer Kavita's saved EPUB location on book open when this device has no unsent local progress.
 - Slightly increase the reader bottom margin to clear the gesture navigation bar
 - fix: update android launcher icon
+
 ## 0.1.7
 
 - Improve onboarding style and layout

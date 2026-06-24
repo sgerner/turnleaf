@@ -447,7 +447,12 @@
       url: file.webViewUrl,
       cfi: local?.cfi ?? null,
       xpath: local ? null : (remote?.bookScrollId ?? null),
-      percentage: !local && remote ? remotePercentage(remote, book) : null,
+      percentage:
+        !local && remote
+          ? remotePercentage(remote, book)
+          : !local
+            ? metadataPercentage(book)
+            : null,
     };
   }
 
@@ -456,8 +461,19 @@
     return Math.max(0, Math.min(0.999, remote.pageNum / book.pages));
   }
 
+  function metadataPercentage(book: BookRecord): number | null {
+    if (!book.pages || book.pagesRead <= 0) return null;
+    return Math.max(0, Math.min(0.999, book.pagesRead / book.pages));
+  }
+
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
-    await saveLocalProgress(book, location.cfi, location.xpath, location.percentage);
+    await saveLocalProgress(
+      book,
+      location.cfi,
+      location.xpath,
+      location.percentage,
+      location.spineIndex,
+    );
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
   }

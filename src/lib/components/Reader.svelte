@@ -63,9 +63,9 @@
         initialXPath,
         initialPercentage,
         appearance,
-        (next) => {
+        (next, origin) => {
           location = next;
-          onRelocated(next);
+          if (origin === 'navigation') onRelocated(next);
         },
         (zone) => {
           if (zone === 'center') {
@@ -161,9 +161,12 @@
     if (!session || !onSyncLatest || syncingLatest) return;
     syncingLatest = true;
     try {
-      const xpath = await onSyncLatest();
-      if (xpath?.xpath) await session.displayServerLocation(xpath.xpath);
-      else if (xpath?.percentage) await session.displayServerPercentage(xpath.percentage);
+      const progress = await onSyncLatest();
+      if (progress?.percentage && progress.percentage > 0) {
+        await session.displayServerPercentage(progress.percentage);
+      } else if (progress?.xpath) {
+        await session.displayServerLocation(progress.xpath);
+      }
       if (showFeedback) showControls();
     } catch {
       // Opening the reader should stay quiet when the device is offline.

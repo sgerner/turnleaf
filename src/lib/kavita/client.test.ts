@@ -53,3 +53,25 @@ it('requests the Kavita series list with POST', async () => {
     }),
   );
 });
+
+it('retries a failed progress read once', async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({ chapterId: 7, pageNum: 9 }),
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const progress = await new KavitaClient('https://books.example.com', 'abc123').getProgress(7);
+
+  expect(progress.pageNum).toBe(9);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+});

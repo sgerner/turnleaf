@@ -105,11 +105,15 @@ export class KavitaClient {
     }
   }
 
-  getProgress(chapterId: number, signal?: AbortSignal): Promise<KavitaProgress> {
-    return this.request(
-      `/api/Reader/get-progress?chapterId=${chapterId}`,
-      signal ? { signal } : {},
-    );
+  async getProgress(chapterId: number, signal?: AbortSignal): Promise<KavitaProgress> {
+    const path = `/api/Reader/get-progress?chapterId=${chapterId}`;
+    const options = signal ? { signal } : {};
+    try {
+      return await this.request(path, options);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return this.request(path, options);
+    }
   }
 
   saveProgress(progress: KavitaProgress, signal?: AbortSignal): Promise<void> {

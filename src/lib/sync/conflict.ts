@@ -44,6 +44,19 @@ export function shouldPreferFurthest(autoSync: boolean, manualRequest?: boolean)
   return autoSync || manualRequest === true;
 }
 
+export function toKavitaPageNumber(
+  percentage: number,
+  totalPages: number,
+  spineIndex?: number,
+): number {
+  if (!Number.isFinite(percentage) || totalPages <= 0) return 0;
+  const nearestPage =
+    Number.isInteger(spineIndex) && spineIndex !== undefined && spineIndex >= 0
+      ? spineIndex + 1
+      : Math.round(Math.max(0, percentage) * totalPages);
+  return Math.min(Math.max(0, totalPages - 1), nearestPage);
+}
+
 export interface OpenLocalProgress {
   percentage: number;
   pendingSync: boolean;

@@ -4,6 +4,7 @@ import {
   chooseFurthestProgress,
   detectProgressConflict,
   shouldPreferFurthest,
+  toKavitaPageNumber,
   type ProgressSnapshot,
 } from './conflict';
 import { coalesceSyncItem } from './queue';
@@ -95,5 +96,22 @@ describe('reader open progress selection', () => {
     expect(chooseOpenProgress({ ...local, pendingSync: true }, remote, 100, false)).toBe(
       'conflict',
     );
+  });
+});
+
+describe('Kavita page updates', () => {
+  it('does not mark ordinary reader navigation as completed', () => {
+    expect(toKavitaPageNumber(0.999, 16)).toBe(15);
+    expect(toKavitaPageNumber(1, 16)).toBe(15);
+  });
+
+  it('keeps normal reading progress near the reported page', () => {
+    expect(toKavitaPageNumber(0, 16)).toBe(0);
+    expect(toKavitaPageNumber(0.56, 16)).toBe(9);
+  });
+
+  it('uses the EPUB spine for Kavita page progress when available', () => {
+    expect(toKavitaPageNumber(0.94, 16, 8)).toBe(9);
+    expect(toKavitaPageNumber(0.1, 16, 15)).toBe(15);
   });
 });

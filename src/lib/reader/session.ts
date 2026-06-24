@@ -11,6 +11,8 @@ export interface ReaderLocation {
   pageCount: number;
 }
 
+export type ReaderLocationOrigin = 'navigation' | 'restore';
+
 export interface TocItem {
   label: string;
   href: string;
@@ -92,8 +94,9 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private current: Location | null = null;
-  private restoring = false;
-  private onLocation: ((location: ReaderLocation) => void) | null = null;
+  private userNavigationPending = false;
+  private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
+    null;
 
   constructor(private readonly bookUrl: string) {
     this.book = ePub(bookUrl);
@@ -105,7 +108,7 @@ export class ReaderSession {
     serverXPath: string | null,
     serverPercentage: number | null,
     appearance: Appearance,
-    onLocation: (location: ReaderLocation) => void,
+    onLocation: (location: ReaderLocation, origin: ReaderLocationOrigin) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
   ): Promise<void> {
     this.rendition = this.book.renderTo(target, {
@@ -118,10 +121,11 @@ export class ReaderSession {
     });
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     this.onLocation = onLocation;
-    this.restoring = true;
     this.relocated = (location) => {
       this.current = location;
-      if (!this.restoring) this.reportLocation(location);
+      const origin = this.userNavigationPending ? 'navigation' : 'restore';
+      this.userNavigationPending = false;
+      this.reportLocation(location, origin);
     };
     this.rendition.on('relocated', this.relocated);
     this.contentClick = (event, contents) => {
@@ -130,29 +134,22 @@ export class ReaderSession {
     };
     this.rendition.on('click', this.contentClick);
     this.applyAppearance(appearance);
-    try {
-      if (cfi) {
-        await this.rendition.display(cfi);
-      } else if (serverXPath) {
-        const restored = await this.displayXPath(serverXPath);
-        const restoredByPercentage =
-          !restored && serverPercentage && serverPercentage > 0
-            ? await this.displayPercentage(serverPercentage)
-            : false;
-        if (!restored && !restoredByPercentage) await this.rendition.display();
-      } else if (serverPercentage && serverPercentage > 0) {
-        const restored = await this.displayPercentage(serverPercentage);
-        if (!restored) await this.rendition.display();
-      } else {
-        await this.rendition.display();
-      }
-    } finally {
-      this.restoring = false;
+    if (cfi) {
+      await this.rendition.display(cfi);
+    } else if (serverPercentage && serverPercentage > 0) {
+      const restored = await this.displayPercentage(serverPercentage);
+      const restoredByXPath =
+        !restored && serverXPath ? await this.displayXPath(serverXPath) : false;
+      if (!restored && !restoredByXPath) await this.rendition.display();
+    } else if (serverXPath) {
+      const restored = await this.displayXPath(serverXPath);
+      if (!restored) await this.rendition.display();
+    } else {
+      await this.rendition.display();
     }
-    if (this.current) this.reportLocation(this.current);
   }
 
-  private reportLocation(location: Location): void {
+  private reportLocation(location: Location, origin: ReaderLocationOrigin): void {
     if (!this.onLocation) return;
     const start = location.start;
     const sections = this.spineSections();
@@ -163,29 +160,28 @@ export class ReaderSession {
     );
     const pageIndex = this.pageIndex(start.displayed.page);
     const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
-    const reportedPercentage = Number.isFinite(start.percentage) ? start.percentage : null;
     const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
-    this.onLocation({
-      ...start,
-      percentage:
-        reportedPercentage !== null && reportedPercentage > 0
-          ? reportedPercentage
-          : semanticPercentage,
-      spineIndex: start.index,
-      pageIndex,
-      pageCount: start.displayed.total,
-      xpath: this.cfiToXPath(start.cfi, start.index),
-    });
+    this.onLocation(
+      {
+        ...start,
+        percentage: semanticPercentage,
+        spineIndex: start.index,
+        pageIndex,
+        pageCount: start.displayed.total,
+        xpath: this.cfiToXPath(start.cfi, start.index),
+      },
+      origin,
+    );
   }
 
   async next(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.rendition.next();
+    await this.navigate(() => this.rendition!.next());
   }
 
   async previous(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.rendition.prev();
+    await this.navigate(() => this.rendition!.prev());
   }
 
   tableOfContents(): TocItem[] {
@@ -195,16 +191,18 @@ export class ReaderSession {
     }));
   }
 
-  display(href: string): Promise<void> {
+  async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    return this.rendition.display(href);
+    await this.navigate(() => this.rendition!.display(href));
   }
 
   displayServerLocation(xpath: string): Promise<boolean> {
+    this.userNavigationPending = false;
     return this.displayXPath(xpath);
   }
 
   displayServerPercentage(percentage: number): Promise<boolean> {
+    this.userNavigationPending = false;
     return this.displayPercentage(percentage);
   }
 
@@ -301,17 +299,19 @@ export class ReaderSession {
     const section = this.spineSections()[target.spineIndex];
     if (!section) return false;
     await this.rendition.display(section.href);
-    for (const contents of this.rendition.getContents() as unknown as Contents[]) {
-      try {
+    await this.nextFrame();
+    await this.nextFrame();
+    try {
+      for (const contents of this.rendition.getContents() as unknown as Contents[]) {
         const node = resolveContentXPath(contents.document, target.contentXPath);
         if (!node) continue;
         const range = contents.document.createRange();
         range.selectNodeContents(node);
         await this.rendition.display(contents.cfiFromRange(range));
         return true;
-      } catch {
-        // A server XPath from a changed EPUB is not safe to guess around.
       }
+    } catch {
+      // A server XPath from a changed EPUB is not safe to guess around.
     }
     return false;
   }
@@ -325,6 +325,20 @@ export class ReaderSession {
     } catch {
       return false;
     }
+  }
+
+  private async navigate(display: () => Promise<unknown>): Promise<void> {
+    this.userNavigationPending = true;
+    try {
+      await display();
+    } catch (error) {
+      this.userNavigationPending = false;
+      throw error;
+    }
+  }
+
+  private nextFrame(): Promise<void> {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
 
   private spineSections(): SpineSection[] {

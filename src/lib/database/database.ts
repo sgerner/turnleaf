@@ -4,6 +4,7 @@ import {
   SQLiteConnection,
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
+import { toKavitaPageNumber } from '../sync/conflict';
 import { migrations } from './schema';
 
 export interface ServerConfig {
@@ -347,8 +348,9 @@ export async function saveLocalProgress(
   cfi: string,
   xpath: string | null,
   percentage: number,
+  spineIndex?: number,
 ): Promise<void> {
-  const pagesRead = Math.min(book.pages, Math.max(0, Math.round(percentage * book.pages)));
+  const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
@@ -367,7 +369,7 @@ export async function saveLocalProgress(
         seriesId: book.seriesId,
         volumeId: book.volumeId,
         chapterId: book.chapterId,
-        pageNum: Math.min(book.pages, Math.max(0, Math.round(percentage * book.pages))),
+        pageNum: pagesRead,
         bookScrollId: xpath,
       }),
       attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
@@ -394,7 +396,7 @@ export async function saveLocalProgress(
     seriesId: book.seriesId,
     volumeId: book.volumeId,
     chapterId: book.chapterId,
-    pageNum: Math.min(book.pages, Math.max(0, Math.round(percentage * book.pages))),
+    pageNum: pagesRead,
     bookScrollId: xpath,
   };
   await db.run(
