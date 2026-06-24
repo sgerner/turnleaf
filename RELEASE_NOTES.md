@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: restore kavita epub locations
+- Restore Kavita EPUB locations through namespaced XHTML and fall back to server page progress when an exact locator cannot be resolved.
 - fix: handle fresh install startup and kavita resume
 - Serialize native SQLite startup and avoid preference writes during boot so fresh installs do not begin with inaccessible local data.
 - Parse native Android Kavita JSON responses and fall back to Kavita page progress when no EPUB XPath is available.

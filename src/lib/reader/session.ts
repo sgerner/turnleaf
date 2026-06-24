@@ -26,9 +26,10 @@ export function parseKavitaXPath(xpath: string): KavitaXPathTarget | null {
   if (!match) return null;
   const fragment = Number(match[1]);
   if (!Number.isInteger(fragment) || fragment < 1) return null;
+  const content = match.groups?.content?.replace(/\/+$/, '') ?? '';
   return {
     spineIndex: fragment - 1,
-    contentXPath: `/html/body${match.groups?.content ?? ''}`,
+    contentXPath: `/html/body${content}`,
   };
 }
 
@@ -38,6 +39,31 @@ export function toKavitaXPath(contentXPath: string, spineIndex: number): string 
     .replace(/^\/?html(?:\[1])?\/body(?:\[1])?/i, '')
     .replace(/^\/?body(?:\[1])?/i, '');
   return `//body/DocFragment[${spineIndex + 1}]/body${content.startsWith('/') ? content : `/${content}`}`;
+}
+
+export function resolveContentXPath(document: Document, xpath: string): Element | null {
+  const parts = xpath
+    .replace(/^\/html(?:\[1])?\/body(?:\[1])?/i, '')
+    .split('/')
+    .filter(Boolean);
+  let current: Element | null =
+    [...document.documentElement.children].find((element) => element.localName === 'body') ?? null;
+  if (!current) return null;
+
+  for (const part of parts) {
+    const match = part.match(/^([A-Za-z0-9:_-]+)\[(\d+)]$/);
+    if (!match) return null;
+    const [, rawName, rawIndex] = match;
+    if (!rawName || !rawIndex) return null;
+    const name = rawName.toLowerCase();
+    const index = Number(rawIndex) - 1;
+    const matches: Element[] = [...current.children].filter(
+      (element) => element.localName.toLowerCase() === name,
+    );
+    current = matches[index] ?? null;
+    if (!current) return null;
+  }
+  return current;
 }
 
 interface SpineSection {
@@ -109,7 +135,11 @@ export class ReaderSession {
         await this.rendition.display(cfi);
       } else if (serverXPath) {
         const restored = await this.displayXPath(serverXPath);
-        if (!restored) await this.rendition.display();
+        const restoredByPercentage =
+          !restored && serverPercentage && serverPercentage > 0
+            ? await this.displayPercentage(serverPercentage)
+            : false;
+        if (!restored && !restoredByPercentage) await this.rendition.display();
       } else if (serverPercentage && serverPercentage > 0) {
         const restored = await this.displayPercentage(serverPercentage);
         if (!restored) await this.rendition.display();
@@ -273,13 +303,7 @@ export class ReaderSession {
     await this.rendition.display(section.href);
     for (const contents of this.rendition.getContents() as unknown as Contents[]) {
       try {
-        const node = contents.document.evaluate(
-          target.contentXPath,
-          contents.document,
-          null,
-          XPathResult.FIRST_ORDERED_NODE_TYPE,
-          null,
-        ).singleNodeValue;
+        const node = resolveContentXPath(contents.document, target.contentXPath);
         if (!node) continue;
         const range = contents.document.createRange();
         range.selectNodeContents(node);

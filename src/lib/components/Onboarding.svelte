@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { Capacitor } from '@capacitor/core';
   import { fade, fly } from 'svelte/transition';
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
