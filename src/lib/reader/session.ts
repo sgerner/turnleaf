@@ -68,9 +68,29 @@ export function resolveContentXPath(document: Document, xpath: string): Element 
   return current;
 }
 
+export function kavitaXPathToCfi(xpath: string, cfiBase: string): string | null {
+  const target = parseKavitaXPath(xpath);
+  if (!target) return null;
+  const parts = target.contentXPath
+    .replace(/^\/html(?:\[1])?\/body(?:\[1])?/i, '')
+    .split('/')
+    .filter(Boolean);
+  const steps: number[] = [];
+  for (const part of parts) {
+    const match = part.match(/^[A-Za-z0-9:_-]+\[(\d+)]$/);
+    if (!match) return null;
+    const index = Number(match[1]);
+    if (!Number.isInteger(index) || index < 1) return null;
+    steps.push(index * 2);
+  }
+  const elementPath = `/4${steps.map((step) => `/${step}`).join('')}`;
+  return `epubcfi(${cfiBase}!${elementPath},/1:0,/1:1)`;
+}
+
 interface SpineSection {
   href: string;
   index: number;
+  cfiBase: string;
 }
 
 const MODE_COLORS = {
@@ -134,15 +154,18 @@ export class ReaderSession {
     };
     this.rendition.on('click', this.contentClick);
     this.applyAppearance(appearance);
+    await this.rendition.started;
     if (cfi) {
       await this.rendition.display(cfi);
-    } else if (serverPercentage && serverPercentage > 0) {
-      const restored = await this.displayPercentage(serverPercentage);
-      const restoredByXPath =
-        !restored && serverXPath ? await this.displayXPath(serverXPath) : false;
-      if (!restored && !restoredByXPath) await this.rendition.display();
     } else if (serverXPath) {
       const restored = await this.displayXPath(serverXPath);
+      const restoredByPercentage =
+        !restored && serverPercentage && serverPercentage > 0
+          ? await this.displayPercentage(serverPercentage)
+          : false;
+      if (!restored && !restoredByPercentage) await this.rendition.display();
+    } else if (serverPercentage && serverPercentage > 0) {
+      const restored = await this.displayPercentage(serverPercentage);
       if (!restored) await this.rendition.display();
     } else {
       await this.rendition.display();
@@ -298,22 +321,24 @@ export class ReaderSession {
     if (!target) return false;
     const section = this.spineSections()[target.spineIndex];
     if (!section) return false;
-    await this.rendition.display(section.href);
-    await this.nextFrame();
-    await this.nextFrame();
     try {
-      for (const contents of this.rendition.getContents() as unknown as Contents[]) {
-        const node = resolveContentXPath(contents.document, target.contentXPath);
-        if (!node) continue;
-        const range = contents.document.createRange();
-        range.selectNodeContents(node);
-        await this.rendition.display(contents.cfiFromRange(range));
-        return true;
-      }
+      const cfi = kavitaXPathToCfi(xpath, section.cfiBase);
+      if (!cfi) return false;
+      await this.rendition.display(cfi);
+      const contents = (this.rendition.getContents() as unknown as Contents[]).find(
+        (item) => item.sectionIndex === target.spineIndex,
+      );
+      if (!contents) return true;
+      const node = resolveContentXPath(contents.document, target.contentXPath);
+      if (!node) return true;
+      const range = contents.document.createRange();
+      range.selectNodeContents(node);
+      await this.rendition.display(contents.cfiFromRange(range));
+      return true;
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
+      return false;
     }
-    return false;
   }
 
   private async displayPercentage(percentage: number): Promise<boolean> {
@@ -335,10 +360,6 @@ export class ReaderSession {
       this.userNavigationPending = false;
       throw error;
     }
-  }
-
-  private nextFrame(): Promise<void> {
-    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
 
   private spineSections(): SpineSection[] {

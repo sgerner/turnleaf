@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   chooseOpenProgress,
   chooseFurthestProgress,
+  compareKavitaLocations,
   detectProgressConflict,
   shouldPreferFurthest,
   toKavitaPageNumber,
@@ -65,6 +66,24 @@ describe('furthest progress selection', () => {
     expect(shouldPreferFurthest(false, true)).toBe(true);
     expect(shouldPreferFurthest(false)).toBe(false);
   });
+
+  it('orders precise Kavita EPUB paths within the same fragment', () => {
+    expect(
+      compareKavitaLocations(
+        '//body/DocFragment[9]/body/section[1]/p[165]/span[1]',
+        '//body/DocFragment[9]/body/section[1]/p[165]/span[14]',
+      ),
+    ).toBe('remote');
+  });
+
+  it('orders Kavita EPUB paths by fragment before content position', () => {
+    expect(
+      compareKavitaLocations(
+        '//body/DocFragment[10]/body/section[1]/p[1]',
+        '//body/DocFragment[9]/body/section[1]/p[999]',
+      ),
+    ).toBe('local');
+  });
 });
 
 describe('reader open progress selection', () => {
@@ -88,8 +107,28 @@ describe('reader open progress selection', () => {
   });
 
   it('uses furthest progress when requested', () => {
-    expect(chooseOpenProgress({ ...local, percentage: 0.9 }, remote, 100, true)).toBe('local');
+    expect(chooseOpenProgress({ ...local, percentage: 0.9, xpath: null }, remote, 100, true)).toBe(
+      'local',
+    );
     expect(chooseOpenProgress(local, remote, 100, true)).toBe('remote');
+  });
+
+  it('uses precise Kavita paths instead of incomparable percentages', () => {
+    expect(
+      chooseOpenProgress(
+        {
+          ...local,
+          percentage: 0.95,
+          xpath: '//body/DocFragment[2]/body/section[1]/p[1]',
+        },
+        {
+          pageNum: 2,
+          bookScrollId: '//body/DocFragment[2]/body/section[1]/p[20]',
+        },
+        100,
+        true,
+      ),
+    ).toBe('remote');
   });
 
   it('does not silently discard pending local progress', () => {

@@ -162,10 +162,13 @@
     syncingLatest = true;
     try {
       const progress = await onSyncLatest();
-      if (progress?.percentage && progress.percentage > 0) {
+      if (progress?.xpath) {
+        const restored = await session.displayServerLocation(progress.xpath);
+        if (!restored && progress.percentage && progress.percentage > 0) {
+          await session.displayServerPercentage(progress.percentage);
+        }
+      } else if (progress?.percentage && progress.percentage > 0) {
         await session.displayServerPercentage(progress.percentage);
-      } else if (progress?.xpath) {
-        await session.displayServerLocation(progress.xpath);
       }
       if (showFeedback) showControls();
     } catch {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './session';
+import { kavitaXPathToCfi, parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './session';
 
 describe('Kavita EPUB locations', () => {
   it('adds the one-based Kavita spine fragment to an EPUB content path', () => {
@@ -40,5 +40,11 @@ describe('Kavita EPUB locations', () => {
     );
     expect(resolveContentXPath(document, '/html/body/section[1]/p[2]')?.textContent).toBe('two');
     expect(resolveContentXPath(document, '/html/body')?.localName).toBe('body');
+  });
+
+  it('converts a Kavita element path directly to an EPUB CFI', () => {
+    expect(kavitaXPathToCfi('//body/DocFragment[9]/body/section[1]/p[165]/span[1]', '/6/18')).toBe(
+      'epubcfi(/6/18!/4/2/330/2,/1:0,/1:1)',
+    );
   });
 });

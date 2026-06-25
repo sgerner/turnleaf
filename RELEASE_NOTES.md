@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Restore cross-device reading from Kavita's precise EPUB XPath instead of its coarse page ratio.
+- Convert Kavita EPUB paths into canonical CFIs so first-open restores land on the saved semantic location.
+
 - Improve progress sync across edge cases
 - Restore Kavita reading positions without immediately writing transient page-one locations back to the server.
 - Restore from Kavita's global book progress first, with its EPUB XPath as a fallback.
