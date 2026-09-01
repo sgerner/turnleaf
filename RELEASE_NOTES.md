@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add pure black/white "eink" theme for e-paper readers
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.

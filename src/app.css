@@ -5,6 +5,7 @@
 @import '@skeletonlabs/skeleton/themes/cerberus';
 @import '@skeletonlabs/skeleton/themes/concord';
 @import '@skeletonlabs/skeleton/themes/crimson';
+@import './lib/themes/eink.css';
 @import '@skeletonlabs/skeleton/themes/fennec';
 @import '@skeletonlabs/skeleton/themes/hamlindigo';
 @import '@skeletonlabs/skeleton/themes/legacy';
