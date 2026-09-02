@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a setting to keep the screen awake while reading
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.

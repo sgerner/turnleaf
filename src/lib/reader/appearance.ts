@@ -11,6 +11,7 @@ export interface Appearance {
   publisherStyles: boolean;
   hyphenation: boolean;
   progressBar: boolean;
+  keepAwake: boolean;
 }
 
 export const defaultAppearance: Appearance = {
@@ -24,6 +25,7 @@ export const defaultAppearance: Appearance = {
   publisherStyles: true,
   hyphenation: false,
   progressBar: true,
+  keepAwake: false,
 };
 
 export function serializeAppearance(value: Appearance): string {

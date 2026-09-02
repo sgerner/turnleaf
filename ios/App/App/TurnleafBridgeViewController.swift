@@ -13,6 +13,9 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         if bridge?.plugin(withName: "ReaderChrome") == nil {
             bridge?.registerPluginInstance(TurnleafReaderChromePlugin())
         }
+        if bridge?.plugin(withName: "KeepAwake") == nil {
+            bridge?.registerPluginInstance(TurnleafKeepAwakePlugin())
+        }
     }
 
     override var prefersStatusBarHidden: Bool {
@@ -171,6 +174,23 @@ final class TurnleafVolumeButtonsController {
 
     private var volumeSlider: UISlider? {
         volumeView?.subviews.compactMap { $0 as? UISlider }.first
+    }
+}
+
+@objc(TurnleafKeepAwakePlugin)
+public final class TurnleafKeepAwakePlugin: CAPPlugin, CAPBridgedPlugin {
+    public let identifier = "TurnleafKeepAwakePlugin"
+    public let jsName = "KeepAwake"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "setEnabled", returnType: CAPPluginReturnPromise),
+    ]
+
+    @objc func setEnabled(_ call: CAPPluginCall) {
+        let enabled = call.getBool("enabled", false)
+        DispatchQueue.main.async {
+            UIApplication.shared.isIdleTimerDisabled = enabled
+        }
+        call.resolve()
     }
 }
 

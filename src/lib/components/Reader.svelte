@@ -5,6 +5,7 @@
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreference, setPreference } from '../database/database';
+  import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
   import {
@@ -96,6 +97,11 @@
       } catch {
         // Volume-button paging is optional; the reader itself should keep working.
       }
+      try {
+        await KeepAwake.setEnabled({ enabled: appearance.keepAwake });
+      } catch {
+        // Keeping the screen awake is optional; the reader itself should keep working.
+      }
       resumeHandle = await App.addListener('appStateChange', ({ isActive }) => {
         if (isActive) void syncLatestLocation(false);
       });
@@ -110,6 +116,7 @@
     if (Capacitor.isNativePlatform()) void StatusBar.show({ animation: Animation.None });
     if (Capacitor.isNativePlatform()) void ReaderChrome.setEnabled({ enabled: false });
     if (Capacitor.isNativePlatform()) void VolumeButtons.setEnabled({ enabled: false });
+    if (Capacitor.isNativePlatform()) void KeepAwake.setEnabled({ enabled: false });
     session?.destroy();
   });
 
@@ -136,6 +143,11 @@
   function updateAppearance(patch: Partial<Appearance>): void {
     appearance = { ...appearance, ...patch };
     session?.applyAppearance(appearance);
+    if (patch.keepAwake !== undefined && Capacitor.isNativePlatform()) {
+      void KeepAwake.setEnabled({ enabled: patch.keepAwake }).catch(() => {
+        // Keeping the screen awake is optional; the reader itself should keep working.
+      });
+    }
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(
       () => void setPreference('appearance', serializeAppearance(appearance)),
@@ -445,6 +457,15 @@
               onchange={(event) => updateAppearance({ progressBar: event.currentTarget.checked })}
             />
             Progress bar
+          </label>
+          <label class="mt-4 flex min-h-12 items-center gap-3">
+            <input
+              class="checkbox"
+              type="checkbox"
+              checked={appearance.keepAwake}
+              onchange={(event) => updateAppearance({ keepAwake: event.currentTarget.checked })}
+            />
+            Keep screen on while reading
           </label>
         </section>
       {/if}
