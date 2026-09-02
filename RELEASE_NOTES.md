@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix reader chrome, volume-button paging, and keep-awake not working on Android by registering their native plugins with the Capacitor bridge
 - Add a setting to keep the screen awake while reading
 
 ## 0.2.0

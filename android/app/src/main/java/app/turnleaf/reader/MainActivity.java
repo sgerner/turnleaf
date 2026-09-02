@@ -1,6 +1,7 @@
 package app.turnleaf.reader;
 
 import com.getcapacitor.BridgeActivity;
+import android.os.Bundle;
 import android.view.KeyEvent;
 import android.view.Window;
 import androidx.core.view.WindowCompat;
@@ -8,6 +9,14 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 public class MainActivity extends BridgeActivity {
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        registerPlugin(ReaderChromePlugin.class);
+        registerPlugin(VolumeButtonsPlugin.class);
+        registerPlugin(KeepAwakePlugin.class);
+        super.onCreate(savedInstanceState);
+    }
+
     @Override
     public void onResume() {
         super.onResume();
