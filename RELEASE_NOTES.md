@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Refresh library progress from local storage after reader navigation, including when returning with Android Back or the reader Back button.
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
