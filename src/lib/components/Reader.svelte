@@ -54,6 +54,7 @@
   let resumeHandle: PluginListenerHandle | null = null;
   let syncingLatest = $state(false);
   let destroyed = false;
+  let appearanceLoaded = false;
   const nativeFeatures = Capacitor.isNativePlatform()
     ? createReaderNativeFeatures({
         hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
@@ -68,6 +69,7 @@
     const saved = await getPreference('appearance');
     if (destroyed) return;
     if (saved) appearance = parseAppearance(saved);
+    appearanceLoaded = true;
     session = new ReaderSession(bookUrl);
     try {
       await session.open(
@@ -123,7 +125,7 @@
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
-    void setPreference('appearance', serializeAppearance(appearance));
+    if (appearanceLoaded) void setPreference('appearance', serializeAppearance(appearance));
     void nativeFeatures?.disable();
     session?.destroy();
   });

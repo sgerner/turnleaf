@@ -16,6 +16,37 @@ function actions(overrides: Partial<ReaderNativeFeatureActions> = {}): ReaderNat
 }
 
 describe('reader native features', () => {
+  it('finishes an old reader teardown before enabling a newly opened reader', async () => {
+    let releaseOldRequest!: () => void;
+    const calls: string[] = [];
+    const oldReader = createReaderNativeFeatures(
+      actions({
+        setKeepAwake: async (enabled) => {
+          calls.push(`old:${enabled}`);
+          if (enabled) {
+            await new Promise<void>((resolve) => (releaseOldRequest = resolve));
+          }
+        },
+      }),
+    );
+    const newReader = createReaderNativeFeatures(
+      actions({
+        setKeepAwake: async (enabled) => {
+          calls.push(`new:${enabled}`);
+        },
+      }),
+    );
+    const oldSetup = oldReader.enable(true);
+    await vi.waitFor(() => expect(calls).toEqual(['old:true']));
+    const oldTeardown = oldReader.disable();
+    const newSetup = newReader.enable(true);
+    releaseOldRequest();
+    await Promise.all([oldSetup, oldTeardown, newSetup]);
+
+    expect(calls).toEqual(['old:true', 'old:false', 'new:true']);
+    await newReader.disable();
+  });
+
   it('queues teardown after an in-flight enable and skips stale setup', async () => {
     let releaseHide!: () => void;
     const hideStatusBar = vi.fn(

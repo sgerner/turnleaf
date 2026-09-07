@@ -12,12 +12,14 @@ export interface ReaderNativeFeatures {
   disable: () => Promise<void>;
 }
 
+// Native controls belong to the app window, so an old reader's teardown must
+// finish before a newly opened reader enables them.
+let queue = Promise.resolve();
+
 export function createReaderNativeFeatures(
   actions: ReaderNativeFeatureActions,
 ): ReaderNativeFeatures {
   let active = true;
-  let generation = 0;
-  let queue = Promise.resolve();
 
   function enqueue(operation: () => Promise<void>): Promise<void> {
     const next = queue.then(operation, operation);
@@ -34,24 +36,22 @@ export function createReaderNativeFeatures(
   }
 
   function enable(keepAwake: boolean): Promise<void> {
-    const requestedGeneration = generation;
     return enqueue(async () => {
-      if (!active || requestedGeneration !== generation) return;
+      if (!active) return;
 
       await attempt(actions.hideStatusBar);
-      if (!active || requestedGeneration !== generation) return;
+      if (!active) return;
       await attempt(() => actions.setReaderChrome(true));
-      if (!active || requestedGeneration !== generation) return;
+      if (!active) return;
       await attempt(() => actions.setVolumeButtons(true));
-      if (!active || requestedGeneration !== generation) return;
+      if (!active) return;
       await attempt(() => actions.setKeepAwake(keepAwake));
     });
   }
 
   function setKeepAwake(enabled: boolean): Promise<void> {
-    const requestedGeneration = generation;
     return enqueue(async () => {
-      if (!active || requestedGeneration !== generation) return;
+      if (!active) return;
       await attempt(() => actions.setKeepAwake(enabled));
     });
   }
@@ -59,7 +59,6 @@ export function createReaderNativeFeatures(
   function disable(): Promise<void> {
     if (!active) return queue;
     active = false;
-    generation += 1;
     return enqueue(async () => {
       await attempt(actions.showStatusBar);
       await attempt(() => actions.setReaderChrome(false));
