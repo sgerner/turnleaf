@@ -109,7 +109,8 @@
         >
           <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
           <span
-            >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic.</span
+            >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
+            and auth key.</span
           >
         </label>
       {/if}
@@ -125,7 +126,8 @@
           required
         />
         <span class="label-text text-xs text-surface-800-200">
-          Create this in Kavita for a dedicated non-administrator account.
+          Create this in Kavita for a dedicated non-administrator account with access only to the
+          book libraries you want on this device.
         </span>
       </label>
 

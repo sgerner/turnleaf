@@ -12,12 +12,12 @@ GitHub release bodies are generated from the matching versioned section in `RELE
 
 ## Recent release notes
 
-### 0.1.7
+### 0.2.0
 
-- Restore reader status bar hiding on Android and add a native reader chrome toggle.
-- Reapply Android reader immersive mode on resume and window focus so the gesture bar stays hidden more reliably.
-- Add a small extra bottom EPUB padding to clear the gesture navigation area.
-- Fix versioned release notes.
+- Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
+- Disable Android app-data backup and narrow the Android FileProvider path used by the app.
+- Show a persistent warning when a saved Kavita server uses plain HTTP.
+- Add diagnostic redaction helpers and tests for common secret fields and auth query parameters.
 
 ## Screenshots
 

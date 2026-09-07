@@ -2,16 +2,21 @@
 
 ## Unreleased
 
+## 0.2.0
+
+- Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
+- Disable Android app-data backup and narrow the Android FileProvider path used by the app.
+- Show a persistent warning when a saved Kavita server uses plain HTTP.
+- Add diagnostic redaction helpers and tests for common secret fields and auth query parameters.
+- Add production dependency audit to pull-request CI.
 - Restore cross-device reading from Kavita's precise EPUB XPath instead of its coarse page ratio.
 - Convert Kavita EPUB paths into canonical CFIs so first-open restores land on the saved semantic location.
-
 - Improve progress sync across edge cases
 - Restore Kavita reading positions without immediately writing transient page-one locations back to the server.
 - Restore from Kavita's global book progress first, with its EPUB XPath as a fallback.
 - Calculate Kavita progress from the EPUB spine and page instead of EPUB.js's chapter-local percentage.
 - Prevent ordinary reader navigation and manual sync from accidentally marking books as completed.
 - Retry a failed Kavita progress read once and fall back to cached library progress instead of page one.
-
 - fix: restore kavita epub locations
 - Restore Kavita EPUB locations through namespaced XHTML and fall back to server page progress when an exact locator cannot be resolved.
 - fix: handle fresh install startup and kavita resume
