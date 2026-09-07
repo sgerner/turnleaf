@@ -3,16 +3,38 @@ import type { KavitaChapter, KavitaSeries, KavitaSeriesDetail } from './types';
 
 const EMPTY_DATE = '0001-01-01T00:00:00';
 
-export function mapSeriesToBook(
+export function mapSeriesToBooks(
   serverId: string,
   series: KavitaSeries,
   detail: KavitaSeriesDetail,
-): BookRecord | null {
-  const chapters = [...detail.chapters, ...detail.specials, ...detail.storylineChapters];
-  const chapter = chapters.find(isEpubChapter);
-  if (!chapter) return null;
+): BookRecord[] {
+  // Preserve the existing order before appending volume chapters. This keeps the
+  // old first-book id stable for records already stored locally, while still
+  // discovering books that Kavita nests under volumes.
+  const chapters = [
+    ...detail.chapters,
+    ...detail.specials,
+    ...detail.storylineChapters,
+    ...detail.volumes.flatMap((volume) => volume.chapters),
+  ];
+  const seen = new Set<number>();
+  return chapters
+    .filter(isEpubChapter)
+    .filter((chapter) => {
+      if (seen.has(chapter.id)) return false;
+      seen.add(chapter.id);
+      return true;
+    })
+    .map((chapter) => mapChapterToBook(serverId, series, chapter));
+}
+
+function mapChapterToBook(
+  serverId: string,
+  series: KavitaSeries,
+  chapter: KavitaChapter,
+): BookRecord {
   const file = chapter.files.find((item) => item.extension.toLowerCase() === '.epub');
-  if (!file) return null;
+  if (!file) throw new Error('An EPUB chapter did not include an EPUB file.');
   return {
     id: `${serverId}:${series.id}:${chapter.id}`,
     serverId,

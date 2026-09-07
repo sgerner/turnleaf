@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Include EPUBs nested in Kavita series volumes while preserving existing local book records.
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.

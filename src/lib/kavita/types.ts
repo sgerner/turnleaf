@@ -63,8 +63,14 @@ export interface KavitaChapter {
   lastReadingProgressUtc: string;
 }
 
+export interface KavitaVolume {
+  id: number;
+  chapters: KavitaChapter[];
+}
+
 export interface KavitaSeriesDetail {
   chapters: KavitaChapter[];
   specials: KavitaChapter[];
+  volumes: KavitaVolume[];
   storylineChapters: KavitaChapter[];
 }

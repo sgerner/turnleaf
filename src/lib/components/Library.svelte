@@ -27,7 +27,7 @@
     verifyDownloadedEpub,
   } from '../downloads/native-download';
   import { KavitaClient } from '../kavita/client';
-  import { mapSeriesToBook } from '../kavita/mapper';
+  import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
@@ -318,15 +318,14 @@
     message = '';
     try {
       const series = await client.getBookSeries();
-      const mapped = await Promise.all(
-        series.map(async (item) =>
-          mapSeriesToBook(server.id, item, await client.getSeriesDetail(item.id)),
-        ),
-      );
-      await replaceBooks(
-        server.id,
-        mapped.filter((item): item is BookRecord => item !== null),
-      );
+      const mapped = (
+        await Promise.all(
+          series.map(async (item) =>
+            mapSeriesToBooks(server.id, item, await client.getSeriesDetail(item.id)),
+          ),
+        )
+      ).flat();
+      await replaceBooks(server.id, mapped);
       books = await getBooks(server.id);
       void loadCovers(books);
       offline = false;
