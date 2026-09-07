@@ -35,8 +35,21 @@ Run Turnleaf's dev server (`npm run dev`) and use the onboarding form:
 
 ## Stop / reset
 
+To stop Kavita and keep its saved configuration and book files, run:
+
 ```bash
-docker compose -f dev/docker-compose.yml down       # stop, keep data
-docker compose -f dev/docker-compose.yml down -v     # stop, drop the named volume (none used here)
-rm -rf dev/kavita/config                             # wipe Kavita's config/db to start clean
+docker compose -f dev/docker-compose.yml down
 ```
+
+This Compose setup uses bind mounts, so stopping the container preserves both
+`dev/kavita/config/` and `dev/kavita/data/`.
+
+To intentionally reset Kavita after stopping it, remove only the config directory:
+
+```bash
+rm -rf dev/kavita/config
+```
+
+This clears Kavita's account, settings, library configuration, and database while keeping
+the sample and any other book files in `dev/kavita/data/`. Start Compose again and repeat the
+first-time setup.
