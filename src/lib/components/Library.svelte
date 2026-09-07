@@ -258,6 +258,10 @@
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
   }
 
+  function insecureServer(): boolean {
+    return server.baseUrl.toLowerCase().startsWith('http://');
+  }
+
   onMount(async () => {
     const savedTheme = await getPreference('uiTheme');
     const savedMode = await getPreference('uiMode');
@@ -266,6 +270,7 @@
     pendingMode = savedMode === 'light' ? 'light' : mode;
     pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
     books = await getBooks(server.id);
+    void loadCovers(books);
     loading = false;
     offline = !(await Network.getStatus()).connected;
     if (!offline) await refresh();
@@ -301,7 +306,9 @@
 
   onDestroy(() => {
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    Object.values(covers).forEach(URL.revokeObjectURL);
+    Object.values(covers)
+      .filter((cover) => cover.startsWith('blob:'))
+      .forEach(URL.revokeObjectURL);
     cleanups.forEach((remove) => void remove());
   });
 
@@ -334,13 +341,15 @@
   }
 
   async function loadCovers(items: BookRecord[]): Promise<void> {
-    if (!nativePlatform) return;
     for (const book of items) {
       if (covers[book.seriesId]) continue;
       try {
+        const cover = nativePlatform
+          ? await cacheCover(client.coverUrl(book.seriesId), apiKey, book.seriesId)
+          : URL.createObjectURL(await client.getCover(book.seriesId));
         covers = {
           ...covers,
-          [book.seriesId]: await cacheCover(client.coverUrl(book.seriesId), apiKey, book.seriesId),
+          [book.seriesId]: cover,
         };
       } catch {
         /* Metadata remains useful without decorative covers. */
@@ -677,13 +686,20 @@
         onclick={() => void open(continueBook!)}
         transition:fade
       >
-        <img
-          class="h-24 w-16 shrink-0 rounded-lg object-cover shadow-md sm:h-28 sm:w-20"
-          src={covers[continueBook.seriesId] ?? client.coverUrl(continueBook.seriesId)}
-          loading="lazy"
-          decoding="async"
-          alt=""
-        />
+        {#if covers[continueBook.seriesId]}
+          <img
+            class="h-24 w-16 shrink-0 rounded-lg object-cover shadow-md sm:h-28 sm:w-20"
+            src={covers[continueBook.seriesId]}
+            loading="lazy"
+            decoding="async"
+            alt=""
+          />
+        {:else}
+          <div
+            class="h-24 w-16 shrink-0 rounded-lg shadow-md preset-filled-surface-200-800 sm:h-28 sm:w-20"
+            aria-hidden="true"
+          ></div>
+        {/if}
         <div class="min-w-0 flex-1">
           <p class="text-xs uppercase tracking-wider text-surface-700-300">Continue reading</p>
           <h2 class="mt-0.5 truncate font-serif text-xl leading-tight text-surface-950-50">
@@ -846,13 +862,15 @@
               <div
                 class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
               >
-                <img
-                  class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                  src={covers[book.seriesId] ?? client.coverUrl(book.seriesId)}
-                  loading="lazy"
-                  decoding="async"
-                  alt=""
-                />
+                {#if covers[book.seriesId]}
+                  <img
+                    class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                    src={covers[book.seriesId]}
+                    loading="lazy"
+                    decoding="async"
+                    alt=""
+                  />
+                {/if}
                 {#if downloadingBookId === book.id}
                   <span
                     class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
@@ -1178,6 +1196,12 @@
             <dd class="truncate text-right">{server.baseUrl}</dd>
           </div>
         </dl>
+        {#if insecureServer()}
+          <div class="alert preset-tonal-warning mt-4" role="alert">
+            Plain HTTP is enabled. Anyone on this network may be able to observe your reading
+            traffic and Kavita auth key. HTTPS is strongly recommended.
+          </div>
+        {/if}
 
         <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
           <label class="label">
