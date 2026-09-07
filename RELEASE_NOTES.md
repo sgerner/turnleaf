@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update DOMPurify and the EPUB XML parser to patched releases so production dependency audits pass.
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
