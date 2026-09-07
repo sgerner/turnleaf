@@ -23,17 +23,30 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 });
 
-it('builds authenticated cover URLs with the api key query parameter', () => {
+it('builds cover URLs without putting the api key in the query string', () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
-  expect(client.coverUrl(4)).toBe(
-    'https://books.example.com/api/Image/series-cover?seriesId=4&apiKey=abc123',
+  expect(client.coverUrl(4)).toBe('https://books.example.com/api/Image/series-cover?seriesId=4');
+});
+
+it('builds download URLs without putting the api key in the query string', () => {
+  const client = new KavitaClient('https://books.example.com', 'key with spaces');
+  expect(client.downloadUrl(42)).toBe(
+    'https://books.example.com/api/Download/chapter?chapterId=42',
   );
 });
 
-it('builds authenticated download URLs with the api key query parameter', () => {
-  const client = new KavitaClient('https://books.example.com', 'key with spaces');
-  expect(client.downloadUrl(42)).toBe(
-    'https://books.example.com/api/Download/chapter?chapterId=42&apiKey=key%20with%20spaces',
+it('loads covers with the api key header', async () => {
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await client.getCover(4);
+
+  expect(fetch).toHaveBeenCalledWith(
+    'https://books.example.com/api/Image/series-cover?seriesId=4',
+    expect.objectContaining({
+      headers: expect.objectContaining({
+        'x-api-key': 'abc123',
+      }),
+    }),
   );
 });
 

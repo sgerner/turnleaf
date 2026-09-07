@@ -66,15 +66,11 @@ export class KavitaClient {
   }
 
   downloadUrl(chapterId: number): string {
-    return this.resolveUrl(
-      `/api/Download/chapter?chapterId=${chapterId}&apiKey=${encodeURIComponent(this.apiKey)}`,
-    );
+    return this.resolveUrl(`/api/Download/chapter?chapterId=${chapterId}`);
   }
 
   coverUrl(seriesId: number): string {
-    return this.resolveUrl(
-      `/api/Image/series-cover?seriesId=${seriesId}&apiKey=${encodeURIComponent(this.apiKey)}`,
-    );
+    return this.resolveUrl(`/api/Image/series-cover?seriesId=${seriesId}`);
   }
 
   async getCover(seriesId: number, signal?: AbortSignal): Promise<Blob> {
@@ -83,6 +79,7 @@ export class KavitaClient {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const response = await CapacitorHttp.get({
         url,
+        headers: { 'x-api-key': this.apiKey },
         responseType: 'blob',
         connectTimeout: REQUEST_TIMEOUT_MS,
         readTimeout: REQUEST_TIMEOUT_MS,
@@ -97,7 +94,10 @@ export class KavitaClient {
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
     try {
       const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
-      const response = await fetch(url, { signal: combined });
+      const response = await fetch(url, {
+        signal: combined,
+        headers: { 'x-api-key': this.apiKey },
+      });
       if (!response.ok) throw new KavitaError('The book cover could not be loaded.', 'server');
       return await response.blob();
     } finally {
