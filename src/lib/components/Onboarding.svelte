@@ -29,7 +29,9 @@
 
       const result = await new KavitaClient(normalized.baseUrl, apiKey.trim()).testConnection();
       if (result.bookLibraries.length === 0) {
-        throw new Error('This account has no book libraries. Other media types are not supported.');
+        throw new Error(
+          'This account has no book or light novel libraries. Other media types are not supported.',
+        );
       }
 
       const id = 'primary';
@@ -127,7 +129,7 @@
         />
         <span class="label-text text-xs text-surface-800-200">
           Create this in Kavita for a dedicated non-administrator account with access only to the
-          book libraries you want on this device.
+          book or light novel libraries you want on this device.
         </span>
       </label>
 

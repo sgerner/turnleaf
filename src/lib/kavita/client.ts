@@ -9,6 +9,7 @@ import type {
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
+const LIGHT_NOVEL_LIBRARY_TYPE = 4;
 const BROWSER_PROXY_PREFIX = '/__kavita__/';
 
 export class KavitaError extends Error {
@@ -39,7 +40,10 @@ export class KavitaClient {
     );
     return {
       version: health?.version ?? null,
-      bookLibraries: libraries.filter((library) => library.type === BOOK_LIBRARY_TYPE),
+      bookLibraries: libraries.filter(
+        (library) =>
+          library.type === BOOK_LIBRARY_TYPE || library.type === LIGHT_NOVEL_LIBRARY_TYPE,
+      ),
     };
   }
 

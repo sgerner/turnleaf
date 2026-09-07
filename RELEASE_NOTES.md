@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Allow EPUB accounts with Kavita Light Novel libraries to connect, including illustrated light novels.
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.

@@ -74,7 +74,7 @@ Turnleaf is intentionally narrow in scope.
 
 Supported:
 
-- EPUB books
+- EPUB books in Kavita Book and Light Novel libraries, including books with illustrations
 - Text-first novels and long-form prose
 
 Not supported:

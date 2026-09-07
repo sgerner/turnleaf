@@ -574,7 +574,9 @@
 
       const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
       if (result.bookLibraries.length === 0) {
-        throw new Error('This account has no book libraries. Only book libraries are supported.');
+        throw new Error(
+          'This account has no book or light novel libraries. Only EPUB books are supported.',
+        );
       }
 
       const updatedServer: ServerConfig = {
