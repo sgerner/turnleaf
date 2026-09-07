@@ -55,12 +55,12 @@ export interface KavitaChapter {
   titleName: string;
   volumeId: number;
   pages: number;
-  pagesRead: number;
+  pagesRead?: number;
   summary: string;
   format: number;
   files: KavitaFile[];
   writers: KavitaPerson[];
-  lastReadingProgressUtc: string;
+  lastReadingProgressUtc?: string | null;
 }
 
 export interface KavitaVolume {
@@ -71,6 +71,6 @@ export interface KavitaVolume {
 export interface KavitaSeriesDetail {
   chapters: KavitaChapter[];
   specials: KavitaChapter[];
-  volumes: KavitaVolume[];
+  volumes?: KavitaVolume[];
   storylineChapters: KavitaChapter[];
 }
