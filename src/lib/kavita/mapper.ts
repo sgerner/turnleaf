@@ -8,14 +8,14 @@ export function mapSeriesToBooks(
   series: KavitaSeries,
   detail: KavitaSeriesDetail,
 ): BookRecord[] {
-  // Preserve the existing order before appending volume chapters. This keeps the
-  // old first-book id stable for records already stored locally, while still
-  // discovering books that Kavita nests under volumes.
+  // Keep flat arrays first so their representation wins if Kavita exposes the
+  // same chapter both flat and nested. IDs include the chapter ID, so existing
+  // local records remain matched regardless of this ordering.
   const chapters = [
     ...detail.chapters,
     ...detail.specials,
     ...detail.storylineChapters,
-    ...detail.volumes.flatMap((volume) => volume.chapters),
+    ...(detail.volumes ?? []).flatMap((volume) => volume.chapters),
   ];
   const seen = new Set<number>();
   return chapters
@@ -48,13 +48,18 @@ function mapChapterToBook(
     descriptionHtml: chapter.summary || null,
     format: 'epub',
     pages: chapter.pages || series.pages,
-    pagesRead: chapter.pagesRead || series.pagesRead,
+    pagesRead: chapter.pagesRead ?? series.pagesRead,
     createdAt: series.created,
-    lastReadAt: series.latestReadDate.startsWith(EMPTY_DATE) ? null : series.latestReadDate,
+    lastReadAt: lastReadAt(chapter, series),
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
   };
+}
+
+function lastReadAt(chapter: KavitaChapter, series: KavitaSeries): string | null {
+  const value = chapter.lastReadingProgressUtc ?? series.latestReadDate;
+  return !value || value.startsWith(EMPTY_DATE) ? null : value;
 }
 
 function isEpubChapter(chapter: KavitaChapter): boolean {

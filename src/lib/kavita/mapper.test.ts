@@ -140,3 +140,84 @@ it('maps the minimized volume-only payload reported in issue #51', () => {
     mapSeriesToBooks('primary', series, issue51VolumeDetail).map((book) => book.chapterId),
   ).toEqual([1406, 1407, 1409, 1408]);
 });
+
+it('keeps chapter progress and dates separate from series aggregates', () => {
+  const series = {
+    id: 12,
+    name: 'Mixed Progress',
+    libraryId: 1,
+    format: 3,
+    pages: 20,
+    pagesRead: 12,
+    created: '2026-09-05',
+    latestReadDate: '2026-09-06T10:00:00',
+    coverImage: 'cover.png',
+  } satisfies KavitaSeries;
+  const chapter = (
+    id: number,
+    pagesRead: number,
+    lastReadingProgressUtc: string,
+  ): KavitaSeriesDetail['chapters'][number] => ({
+    id,
+    title: `Book ${id}`,
+    titleName: `Book ${id}`,
+    volumeId: id,
+    pages: 20,
+    pagesRead,
+    summary: '',
+    format: 3,
+    files: [{ id, bytes: 1000, extension: '.epub', format: 3 }],
+    writers: [],
+    lastReadingProgressUtc,
+  });
+  const detail = {
+    chapters: [],
+    specials: [],
+    volumes: [
+      { id: 12, chapters: [chapter(120, 12, '2026-09-04T10:00:00')] },
+      { id: 13, chapters: [chapter(121, 0, '0001-01-01T00:00:00')] },
+    ],
+    storylineChapters: [],
+  } satisfies KavitaSeriesDetail;
+
+  expect(mapSeriesToBooks('primary', series, detail)).toMatchObject([
+    { chapterId: 120, pagesRead: 12, lastReadAt: '2026-09-04T10:00:00' },
+    { chapterId: 121, pagesRead: 0, lastReadAt: null },
+  ]);
+});
+
+it('falls back to aggregate progress only when chapter progress is absent', () => {
+  const series = {
+    id: 13,
+    name: 'Missing Progress',
+    libraryId: 1,
+    format: 3,
+    pages: 20,
+    pagesRead: 12,
+    created: '2026-09-05',
+    latestReadDate: '2026-09-06T10:00:00',
+    coverImage: 'cover.png',
+  } satisfies KavitaSeries;
+  const chapter = {
+    id: 130,
+    title: 'Book 130',
+    titleName: 'Book 130',
+    volumeId: 13,
+    pages: 20,
+    format: 3,
+    files: [{ id: 130, bytes: 1000, extension: '.epub', format: 3 }],
+    writers: [],
+    summary: '',
+  };
+  const detail = {
+    chapters: [],
+    specials: [],
+    volumes: [{ id: 13, chapters: [chapter] }],
+    storylineChapters: [],
+  } satisfies KavitaSeriesDetail;
+
+  expect(mapSeriesToBooks('primary', series, detail)[0]).toMatchObject({
+    pagesRead: 12,
+    lastReadAt: '2026-09-06T10:00:00',
+  });
+});
