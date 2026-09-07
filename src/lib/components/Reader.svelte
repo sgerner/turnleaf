@@ -8,6 +8,7 @@
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
+  import { createReaderNativeFeatures } from '../native/reader-native-features';
   import {
     defaultAppearance,
     parseAppearance,
@@ -52,9 +53,20 @@
   let saveTimer: number | null = null;
   let resumeHandle: PluginListenerHandle | null = null;
   let syncingLatest = $state(false);
+  let destroyed = false;
+  const nativeFeatures = Capacitor.isNativePlatform()
+    ? createReaderNativeFeatures({
+        hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
+        showStatusBar: () => StatusBar.show({ animation: Animation.None }),
+        setReaderChrome: (enabled) => ReaderChrome.setEnabled({ enabled }),
+        setVolumeButtons: (enabled) => VolumeButtons.setEnabled({ enabled }),
+        setKeepAwake: (enabled) => KeepAwake.setEnabled({ enabled }),
+      })
+    : null;
 
   onMount(async () => {
     const saved = await getPreference('appearance');
+    if (destroyed) return;
     if (saved) appearance = parseAppearance(saved);
     session = new ReaderSession(bookUrl);
     try {
@@ -65,58 +77,54 @@
         initialPercentage,
         appearance,
         (next, origin) => {
+          if (destroyed) return;
           location = next;
           if (origin === 'navigation') onRelocated(next);
         },
         (zone) => {
+          if (destroyed) return;
           if (zone === 'center') {
             if (controlsVisible) controlsVisible = false;
             else showControls();
           } else void turn(zone);
         },
       );
+      if (destroyed) return;
       toc = session.tableOfContents();
     } catch {
+      if (destroyed) return;
       error = 'This EPUB could not be opened. The download may be incomplete or corrupted.';
       return;
     }
 
-    if (Capacitor.isNativePlatform()) {
+    if (nativeFeatures) {
+      await nativeFeatures.enable(appearance.keepAwake);
+      if (destroyed) return;
+
       try {
-        await StatusBar.hide({ animation: Animation.None });
+        const handle = await App.addListener('appStateChange', ({ isActive }) => {
+          if (!destroyed && isActive) void syncLatestLocation(false);
+        });
+        if (destroyed) {
+          await handle.remove();
+          return;
+        }
+        resumeHandle = handle;
       } catch {
-        // The reader still works if the platform refuses to hide the bar.
+        // Resume syncing is optional; the reader itself should keep working.
       }
-      try {
-        await ReaderChrome.setEnabled({ enabled: true });
-      } catch {
-        // The reader still works if the platform cannot hide system bars.
-      }
-      try {
-        await VolumeButtons.setEnabled({ enabled: true });
-      } catch {
-        // Volume-button paging is optional; the reader itself should keep working.
-      }
-      try {
-        await KeepAwake.setEnabled({ enabled: appearance.keepAwake });
-      } catch {
-        // Keeping the screen awake is optional; the reader itself should keep working.
-      }
-      resumeHandle = await App.addListener('appStateChange', ({ isActive }) => {
-        if (isActive) void syncLatestLocation(false);
-      });
     }
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
-    void resumeHandle?.remove();
+    const handle = resumeHandle;
+    resumeHandle = null;
+    void handle?.remove();
     void setPreference('appearance', serializeAppearance(appearance));
-    if (Capacitor.isNativePlatform()) void StatusBar.show({ animation: Animation.None });
-    if (Capacitor.isNativePlatform()) void ReaderChrome.setEnabled({ enabled: false });
-    if (Capacitor.isNativePlatform()) void VolumeButtons.setEnabled({ enabled: false });
-    if (Capacitor.isNativePlatform()) void KeepAwake.setEnabled({ enabled: false });
+    void nativeFeatures?.disable();
     session?.destroy();
   });
 
@@ -143,10 +151,8 @@
   function updateAppearance(patch: Partial<Appearance>): void {
     appearance = { ...appearance, ...patch };
     session?.applyAppearance(appearance);
-    if (patch.keepAwake !== undefined && Capacitor.isNativePlatform()) {
-      void KeepAwake.setEnabled({ enabled: patch.keepAwake }).catch(() => {
-        // Keeping the screen awake is optional; the reader itself should keep working.
-      });
+    if (patch.keepAwake !== undefined) {
+      void nativeFeatures?.setKeepAwake(patch.keepAwake);
     }
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(
