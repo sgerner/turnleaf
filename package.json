@@ -1,13 +1,14 @@
 {
   "name": "turnleaf",
   "private": true,
-  "version": "0.1.7",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "check": "svelte-check --tsconfig ./tsconfig.app.json",
     "lint": "eslint .",
+    "security:audit": "npm audit --omit=dev",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
