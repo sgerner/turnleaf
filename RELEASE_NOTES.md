@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Size the reader viewport between its safe-area insets so Android navigation bars and the bottom margin do not cover book text.
+
 ## 0.2.0
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
