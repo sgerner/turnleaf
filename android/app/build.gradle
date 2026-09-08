@@ -1,5 +1,6 @@
 import java.io.FileInputStream
 import java.util.Properties
+import groovy.json.JsonSlurper
 
 apply plugin: 'com.android.application'
 
@@ -15,7 +16,8 @@ def releaseKeyAlias = keystoreProperties.getProperty('TURNLEAF_KEY_ALIAS') ?: Sy
 def releaseKeyPassword = keystoreProperties.getProperty('TURNLEAF_KEY_PASSWORD') ?: System.getenv('TURNLEAF_KEY_PASSWORD')
 def releaseSigningConfigured = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
 def releaseStorePath = releaseSigningConfigured ? rootProject.file(releaseStoreFile) : null
-def turnleafVersionName = System.getenv('TURNLEAF_VERSION_NAME') ?: '1.0'
+def packageVersion = new JsonSlurper().parse(rootProject.file('../package.json')).version
+def turnleafVersionName = System.getenv('TURNLEAF_VERSION_NAME') ?: packageVersion
 def turnleafVersionCode = (System.getenv('TURNLEAF_VERSION_CODE') ?: '1') as Integer
 
 android {

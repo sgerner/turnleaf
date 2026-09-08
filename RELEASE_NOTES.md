@@ -2,16 +2,19 @@
 
 ## Unreleased
 
-- Update DOMPurify and the EPUB XML parser to patched releases so production dependency audits pass.
-- Add pure black/white "eink" theme for e-paper readers
-- Add local Kavita dev environment via Docker Compose
-- Prevent reader native controls from being re-enabled after the reader is closed during startup.
-- Fix reader chrome, volume-button paging, and keep-awake not working on Android by registering their native plugins with the Capacitor bridge
-- Add a setting to keep the screen awake while reading
-- Refresh library progress from local storage after reader navigation, including when returning with Android Back or the reader Back button.
-- Size the reader viewport between its safe-area insets so Android navigation bars and the bottom margin do not cover book text.
-- Include EPUBs nested in Kavita series volumes while preserving existing local book records.
-- Allow EPUB accounts with Kavita Light Novel libraries to connect, including illustrated light novels.
+## 0.3.0
+
+- Add a monochrome e-ink theme with light and dark reading modes.
+- Add a setting to keep the screen awake while reading, with native controls restored when a book closes or another book opens.
+- Register Android reader plugins so immersive mode and volume-button paging work reliably.
+- Keep book text inside Android safe-area insets and preserve the reader bottom margin.
+- Refresh library progress and Continue Reading after page turns, including when returning from the reader offline.
+- Discover every EPUB in numbered Kavita series volumes and avoid duplicate entries without changing existing local book IDs.
+- Keep each volume's reading progress separate so unread volumes do not inherit series progress.
+- Support Kavita Light Novel libraries, including illustrated EPUBs.
+- Add a local Kavita Docker Compose environment and sample EPUB for development.
+- Update DOMPurify and the EPUB XML parser to patched releases.
+- Update Svelte, Vite, linting and formatting tools, GitHub Actions, and the Android Gradle toolchain.
 
 ## 0.2.0
 

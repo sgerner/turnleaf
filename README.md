@@ -12,12 +12,13 @@ GitHub release bodies are generated from the matching versioned section in `RELE
 
 ## Recent release notes
 
-### 0.2.0
+### 0.3.0
 
-- Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
-- Disable Android app-data backup and narrow the Android FileProvider path used by the app.
-- Show a persistent warning when a saved Kavita server uses plain HTTP.
-- Add diagnostic redaction helpers and tests for common secret fields and auth query parameters.
+- Read with a monochrome e-ink theme and an optional keep-awake setting.
+- Discover EPUBs in numbered series volumes and Light Novel libraries.
+- Keep reader text clear of Android navigation bars and refresh progress when returning to the library.
+- Develop against a local Kavita Docker Compose instance.
+- Include patched production dependencies and updated Android tooling.
 
 ## Screenshots
 
