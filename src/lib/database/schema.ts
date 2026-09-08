@@ -84,4 +84,10 @@ export const migrations = [
       ALTER TABLE books ADD COLUMN remote_available INTEGER NOT NULL DEFAULT 1;
     `,
   },
+  {
+    version: 5,
+    statements: `
+      CREATE INDEX IF NOT EXISTS books_server_title_idx ON books(server_id, title, id);
+    `,
+  },
 ] as const;

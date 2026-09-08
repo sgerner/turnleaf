@@ -250,6 +250,8 @@ Please keep changes small and direct:
 
 GitHub Actions runs pull-request checks for formatting, linting, type checking, tests, the web build, dependency review, CodeQL scanning, and an Android debug build. PRs that touch native behavior should also be verified locally on the relevant platform when possible.
 
+Use [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md) for the Android accessibility, network-isolation, and offline-reopen acceptance pass. CI also runs an emulator startup smoke test; that smoke test does not replace TalkBack or network-trace validation.
+
 Before opening a pull request, run:
 
 ```bash
