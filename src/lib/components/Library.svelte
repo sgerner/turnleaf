@@ -32,7 +32,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { chooseOpenProgress, shouldPreferFurthest } from '../sync/conflict';
+  import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -205,11 +205,12 @@
   let query = $state('');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
+  let normalizedQuery = $derived(query.trim().toLowerCase());
   let visibleBooks = $derived(
     books.filter((book) => {
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
         .toLowerCase()
-        .includes(query.trim().toLowerCase());
+        .includes(normalizedQuery);
       const retainedOffline = book.remoteAvailable === false && Boolean(book.downloadPath);
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
       return (
@@ -221,14 +222,15 @@
     }),
   );
   // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
-  let continueBook = $derived(
-    books
-      .filter(
-        (book) =>
-          book.downloadPath && book.pages > 0 && book.pagesRead < book.pages && book.lastReadAt,
-      )
-      .sort((a, b) => (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? ''))[0] ?? null,
-  );
+  let continueBook = $derived.by(() => {
+    let latest: BookRecord | null = null;
+    for (const book of books) {
+      if (!book.downloadPath || book.pages <= 0 || book.pagesRead >= book.pages || !book.lastReadAt)
+        continue;
+      if (!latest || book.lastReadAt.localeCompare(latest.lastReadAt ?? '') > 0) latest = book;
+    }
+    return latest;
+  });
   let reading = $state<{
     book: BookRecord;
     url: string;
@@ -616,9 +618,15 @@
     }
   }
 
-  async function remove(book: BookRecord): Promise<void> {
-    if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath).catch(() => {});
-    await removeDownload(book.id);
+  async function remove(book: BookRecord): Promise<boolean> {
+    try {
+      if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath);
+      await removeDownload(book.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'storage error';
+      message = `Could not remove ${book.title}: ${detail}`;
+      return false;
+    }
     books = books.map((item) =>
       item.id === book.id
         ? {
@@ -629,6 +637,7 @@
           }
         : item,
     );
+    return true;
   }
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
@@ -707,7 +716,9 @@
       location.percentage,
       location.spineIndex,
     );
-    books = await getBooks(server.id);
+    const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
+    const lastReadAt = new Date().toISOString();
+    books = books.map((item) => (item.id === book.id ? { ...item, pagesRead, lastReadAt } : item));
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
   }
@@ -786,8 +797,20 @@
   }
 
   async function removeAllDownloads(): Promise<void> {
-    for (const book of books.filter((item) => item.downloadPath)) await remove(book);
-    message = 'Downloaded books removed. Kavita was not changed.';
+    const candidates = books.filter((item) => item.downloadPath);
+    const failed: string[] = [];
+    for (const book of candidates) {
+      if (!(await remove(book))) failed.push(book.title);
+    }
+    if (failed.length === 0) {
+      message = candidates.length
+        ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
+        : 'No downloaded books to remove.';
+    } else {
+      const succeeded = candidates.length - failed.length;
+      const names = failed.slice(0, 2).join(', ');
+      message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
+    }
     closeSettings();
   }
 
