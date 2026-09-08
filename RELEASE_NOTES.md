@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Harden release link validation and provenance
+- Validate GitHub update links and publish Android releases from tested revisions with least-privilege workflow permissions.
 - docs: add future implementation work plan
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.
