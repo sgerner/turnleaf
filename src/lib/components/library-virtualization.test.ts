@@ -51,4 +51,15 @@ describe('calculateVirtualWindow', () => {
       totalHeight: 3,
     });
   });
+
+  it('keeps a valid final row when scrolling past the end', () => {
+    expect(calculateVirtualWindow(5, 2, 100, 50_000, 800, 2)).toEqual({
+      firstRow: 0,
+      lastRow: 2,
+      startIndex: 0,
+      endIndex: 5,
+      totalRows: 3,
+      totalHeight: 300,
+    });
+  });
 });
