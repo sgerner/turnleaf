@@ -159,6 +159,21 @@ npm run dev
 
 Use this for fast UI iteration and browser-based testing of the Svelte app. Native storage, downloads, and secure credential storage require Capacitor builds.
 
+When running the browser app against Kavita, the development proxy accepts
+loopback `http://` and `https://` targets such as `http://localhost:5000`. It
+rejects remote targets by default. To use a remote server, explicitly allow its
+HTTPS origin before starting Vite:
+
+```bash
+TURNLEAF_DEV_PROXY_ORIGINS="https://books.example.com:5000" npm run dev
+```
+
+The proxy accepts only HTTP(S), rejects URL credentials, forwards only the
+Kavita API headers it needs, limits request bodies to 1 MiB, and stops upstream
+requests after 12 seconds. It does not follow redirects or forward cookies,
+authorization, or forwarding headers. Plain HTTP is intentionally limited to
+loopback development servers.
+
 ### Quality checks
 
 ```bash
