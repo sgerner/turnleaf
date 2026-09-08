@@ -12,6 +12,10 @@ GitHub release bodies are generated from the matching versioned section in `RELE
 
 ## Recent release notes
 
+### 0.3.2
+
+- Generate clean GitHub release notes without npm command output.
+
 ### 0.3.1
 
 - Guard library startup teardown and limit concurrent Kavita detail requests for large libraries.

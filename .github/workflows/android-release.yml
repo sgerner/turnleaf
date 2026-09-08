@@ -53,7 +53,7 @@ jobs:
         run: npm run release:finalize
 
       - name: Prepare release notes
-        run: npm run release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
+        run: npm run --silent release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
 
       - name: Sync Android project
         run: npx cap sync android
