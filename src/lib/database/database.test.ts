@@ -1,6 +1,36 @@
 import { expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
-import { replaceBooksInTransaction, type BookRecord } from './database';
+import { confirmSync, replaceBooksInTransaction, type BookRecord } from './database';
+
+const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
+
+class MemoryStorage implements Storage {
+  private readonly values = new Map<string, string>();
+
+  get length(): number {
+    return this.values.size;
+  }
+
+  clear(): void {
+    this.values.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return [...this.values.keys()][index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
 
 const existingBook: BookRecord = {
   id: 'server:1:10',
@@ -143,4 +173,42 @@ it('skips the native transaction when there is no metadata to refresh', async ()
 
   expect(database.executeTransaction).not.toHaveBeenCalled();
   expect(database.rows()).toEqual([]);
+});
+
+it('does not acknowledge a queue item that was replaced while it uploaded', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const state = {
+    serverConfig: null,
+    books: [],
+    readingState: {
+      'book-1': {
+        cfi: 'cfi',
+        xpath: null,
+        percentage: 0.5,
+        localUpdatedAt: '2026-09-07T00:00:01.000Z',
+        serverUpdatedAt: null,
+        pendingSync: true,
+      },
+    },
+    syncQueue: {
+      'book-1': {
+        bookId: 'book-1',
+        payloadJson: '{"pageNum":2}',
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
+        createdAt: '2026-09-07T00:00:01.000Z',
+        updatedAt: '2026-09-07T00:00:01.000Z',
+      },
+    },
+    preferences: {},
+  };
+  localStorage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
+
+  await confirmSync('book-1', '2026-09-07T00:00:02.000Z', '2026-09-07T00:00:00.000Z');
+
+  expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toEqual(state);
 });
