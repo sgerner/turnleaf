@@ -17,10 +17,20 @@
     type ReadingMode,
   } from '../reader/appearance';
   import { ReaderSession, type ReaderLocation, type TocItem } from '../reader/session';
+  import {
+    parseBookmarks,
+    parseLocationHistory,
+    recordLocation,
+    removeBookmark,
+    renameBookmark,
+    toggleBookmark,
+    type StoredReaderLocation,
+  } from '../reader/bookmarks';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   let {
     bookUrl,
+    bookId,
     title,
     initialCfi = null,
     initialXPath = null,
@@ -30,6 +40,7 @@
     onSyncLatest,
   }: {
     bookUrl: string;
+    bookId: string;
     title: string;
     initialCfi?: string | null;
     initialXPath?: string | null;
@@ -44,11 +55,18 @@
   let controlsVisible = $state(false);
   let settingsVisible = $state(false);
   let tocVisible = $state(false);
+  let bookmarksVisible = $state(false);
   let settingsPanel = $state<HTMLElement | null>(null);
   let tocPanel = $state<HTMLElement | null>(null);
+  let bookmarksPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
+  let bookmarksOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
+  let bookmarks = $state<StoredReaderLocation[]>([]);
+  let locationHistory = $state<StoredReaderLocation[]>([]);
+  let editingBookmarkId = $state<string | null>(null);
+  let bookmarkDraft = $state('');
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let error = $state('');
@@ -75,6 +93,12 @@
     const saved = await getPreference('appearance');
     if (destroyed) return;
     if (saved) appearance = parseAppearance(saved);
+    const savedBookmarks = await getPreference(`readerBookmarks:${bookId}`);
+    if (destroyed) return;
+    const savedHistory = await getPreference(`readerHistory:${bookId}`);
+    if (destroyed) return;
+    bookmarks = parseBookmarks(savedBookmarks);
+    locationHistory = parseLocationHistory(savedHistory);
     appearanceLoaded = true;
     session = new ReaderSession(bookUrl);
     try {
@@ -87,7 +111,11 @@
         (next, origin) => {
           if (destroyed) return;
           location = next;
-          if (origin === 'navigation') onRelocated(next);
+          if (origin === 'navigation') {
+            onRelocated(next);
+            locationHistory = recordLocation(locationHistory, next);
+            void persistReaderLocations();
+          }
         },
         (zone) => {
           if (destroyed) return;
@@ -156,7 +184,9 @@
     settingsOpener = activeElement();
     settingsVisible = true;
     tocVisible = false;
+    bookmarksVisible = false;
     tocOpener = null;
+    bookmarksOpener = null;
     focusPanel(() => settingsPanel);
   }
 
@@ -171,7 +201,9 @@
     tocOpener = activeElement();
     tocVisible = true;
     settingsVisible = false;
+    bookmarksVisible = false;
     settingsOpener = null;
+    bookmarksOpener = null;
     focusPanel(() => tocPanel);
   }
 
@@ -179,6 +211,24 @@
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openBookmarks(): void {
+    bookmarksOpener = activeElement();
+    bookmarksVisible = true;
+    settingsVisible = false;
+    tocVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    focusPanel(() => bookmarksPanel);
+  }
+
+  function closeBookmarks(): void {
+    bookmarksVisible = false;
+    editingBookmarkId = null;
+    const opener = bookmarksOpener;
+    bookmarksOpener = null;
     restoreFocus(opener);
   }
 
@@ -193,6 +243,7 @@
       controlsVisible = false;
       closeSettings();
       closeToc();
+      closeBookmarks();
       footerVisible = false;
     }, 5_000);
   }
@@ -209,6 +260,71 @@
       500,
     );
     showControls();
+  }
+
+  function readerLocation(
+    next: ReaderLocation,
+  ): Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'> {
+    return {
+      cfi: next.cfi,
+      href: next.href,
+      percentage: next.percentage,
+    };
+  }
+
+  let locationWrite: Promise<void> = Promise.resolve();
+
+  function persistReaderLocations(): void {
+    locationWrite = locationWrite
+      .then(async () => {
+        await setPreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+        await setPreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+      })
+      .catch(() => {
+        // The reader remains usable when a preference write is temporarily unavailable.
+      });
+  }
+
+  function currentBookmark(): StoredReaderLocation | null {
+    if (!location) return null;
+    const id = `${location.cfi}|${location.href}`;
+    return bookmarks.find((bookmark) => bookmark.id === id) ?? null;
+  }
+
+  function toggleCurrentBookmark(): void {
+    if (!location) return;
+    bookmarks = toggleBookmark(bookmarks, readerLocation(location));
+    persistReaderLocations();
+    showControls();
+  }
+
+  function startBookmarkEdit(bookmark: StoredReaderLocation): void {
+    editingBookmarkId = bookmark.id;
+    bookmarkDraft = bookmark.label;
+  }
+
+  function saveBookmarkName(bookmark: StoredReaderLocation): void {
+    bookmarks = renameBookmark(bookmarks, bookmark.id, bookmarkDraft);
+    editingBookmarkId = null;
+    persistReaderLocations();
+  }
+
+  function deleteBookmark(bookmark: StoredReaderLocation): void {
+    bookmarks = removeBookmark(bookmarks, bookmark.id);
+    if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
+    persistReaderLocations();
+  }
+
+  async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
+    if (!session) return;
+    try {
+      const restored = await session.displayCfi(saved.cfi);
+      if (!restored && saved.href) await session.display(saved.href);
+      closeBookmarks();
+      showControls();
+    } catch {
+      error = 'This saved location is no longer available in the current EPUB.';
+    }
   }
 
   async function turn(direction: 'next' | 'previous'): Promise<void> {
@@ -274,10 +390,11 @@
       showControls();
       return;
     }
-    if (event.key === 'Escape' && (settingsVisible || tocVisible)) {
+    if (event.key === 'Escape' && (settingsVisible || tocVisible || bookmarksVisible)) {
       event.preventDefault();
-      settingsVisible = false;
-      tocVisible = false;
+      closeSettings();
+      closeToc();
+      closeBookmarks();
       showControls();
     }
   }
@@ -323,7 +440,7 @@
   <nav
     class="tap-zones"
     aria-label="Page navigation"
-    inert={Boolean(settingsVisible || tocVisible)}
+    inert={Boolean(settingsVisible || tocVisible || bookmarksVisible)}
   >
     <button
       type="button"
@@ -387,10 +504,10 @@
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
       <header
         class="reader-bar reader-top"
-        inert={Boolean(settingsVisible || tocVisible)}
+        inert={Boolean(settingsVisible || tocVisible || bookmarksVisible)}
         transition:fly={{ y: -8, duration: 140 }}
       >
-        <div class="grid w-full grid-cols-4 gap-2">
+        <div class="grid w-full grid-cols-5 gap-2">
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
@@ -420,6 +537,17 @@
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
+            onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
+            aria-label="Open bookmarks and history"
+            aria-expanded={bookmarksVisible}
+            aria-controls="reader-bookmarks"
+          >
+            <span class="sr-only sm:not-sr-only">Marks</span>
+            <span class="sm:sr-only" aria-hidden="true">★</span>
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
             onclick={() => syncLatestLocation()}
             aria-label="Sync latest reading position"
             title="Sync latest reading position"
@@ -443,13 +571,14 @@
         </p>
       </header>
 
-      {#if settingsVisible || tocVisible}
+      {#if settingsVisible || tocVisible || bookmarksVisible}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
-          onclick={() => (settingsVisible ? closeSettings() : closeToc())}
+          onclick={() =>
+            settingsVisible ? closeSettings() : tocVisible ? closeToc() : closeBookmarks()}
         ></button>
       {/if}
 
@@ -639,6 +768,135 @@
               >
             {/each}
           </div>
+        </div>
+      {/if}
+
+      {#if bookmarksVisible}
+        <div
+          bind:this={bookmarksPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          id="reader-bookmarks"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-bookmarks-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, bookmarksPanel!, closeBookmarks)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            type="button"
+            onclick={closeBookmarks}
+            aria-label="Close bookmarks and history"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+          <h2 id="reader-bookmarks-title" class="font-serif text-xl">Bookmarks and history</h2>
+          <p class="mt-2 text-sm text-surface-700-300">
+            Saved on this device with EPUB locations. They are not sent to Kavita.
+          </p>
+          {#if location}
+            <button
+              class="btn mt-4 w-full preset-tonal-primary"
+              type="button"
+              onclick={toggleCurrentBookmark}
+            >
+              {currentBookmark() ? 'Remove bookmark at this page' : 'Bookmark this page'}
+            </button>
+          {/if}
+
+          <section class="mt-5" aria-labelledby="reader-bookmark-list-title">
+            <h3
+              id="reader-bookmark-list-title"
+              class="text-sm font-semibold uppercase tracking-wide"
+            >
+              Bookmarks
+            </h3>
+            {#if bookmarks.length === 0}
+              <p class="mt-2 text-sm text-surface-700-300">No bookmarks yet.</p>
+            {:else}
+              <div class="mt-2 grid gap-2">
+                {#each bookmarks as bookmark (bookmark.id)}
+                  <div class="rounded-lg preset-tonal-surface p-2">
+                    {#if editingBookmarkId === bookmark.id}
+                      <form
+                        class="flex gap-2"
+                        onsubmit={(event) => {
+                          event.preventDefault();
+                          saveBookmarkName(bookmark);
+                        }}
+                      >
+                        <input
+                          class="input min-w-0 flex-1"
+                          aria-label="Bookmark name"
+                          bind:value={bookmarkDraft}
+                        />
+                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit"
+                          >Save</button
+                        >
+                      </form>
+                    {:else}
+                      <div class="flex items-center gap-2">
+                        <button
+                          class="min-w-0 flex-1 truncate text-left text-sm font-medium"
+                          type="button"
+                          onclick={() => void returnToLocation(bookmark)}
+                        >
+                          {bookmark.label}
+                        </button>
+                        <button
+                          class="btn btn-sm preset-tonal-surface h-10 w-10 p-0"
+                          type="button"
+                          aria-label={`Rename ${bookmark.label}`}
+                          onclick={() => startBookmarkEdit(bookmark)}
+                        >
+                          <span aria-hidden="true">✎</span>
+                        </button>
+                        <button
+                          class="btn btn-sm preset-tonal-error h-10 w-10 p-0"
+                          type="button"
+                          aria-label={`Delete ${bookmark.label}`}
+                          onclick={() => deleteBookmark(bookmark)}
+                        >
+                          <span aria-hidden="true">×</span>
+                        </button>
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </section>
+
+          <section class="mt-5" aria-labelledby="reader-history-list-title">
+            <h3
+              id="reader-history-list-title"
+              class="text-sm font-semibold uppercase tracking-wide"
+            >
+              Recent locations
+            </h3>
+            {#if locationHistory.length === 0}
+              <p class="mt-2 text-sm text-surface-700-300">Recent page turns will appear here.</p>
+            {:else}
+              <div class="mt-2 grid gap-1">
+                {#each locationHistory as entry (entry.id + entry.savedAt)}
+                  <button
+                    class="btn w-full justify-start text-left text-sm"
+                    type="button"
+                    onclick={() => void returnToLocation(entry)}
+                  >
+                    {entry.label}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </section>
         </div>
       {/if}
     </div>
