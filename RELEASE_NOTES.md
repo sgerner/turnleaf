@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add an Android SDK preflight that explains missing local SDK configuration before Gradle builds.
 - Virtualize large library grids while preserving stable book ordering and touch scrolling.
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.

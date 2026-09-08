@@ -2,7 +2,7 @@
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
-  import { onDestroy, onMount } from 'svelte';
+  import { tick, onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import {
     getBooks,
@@ -37,6 +37,7 @@
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
+  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   const skeletonThemes = [
     'catppuccin',
@@ -255,6 +256,12 @@
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
   let actionMenuBook = $state<BookRecord | null>(null);
+  let actionMenuDialog = $state<HTMLElement | null>(null);
+  let conflictDialog = $state<HTMLElement | null>(null);
+  let settingsDialog = $state<HTMLElement | null>(null);
+  let actionMenuOpener: HTMLElement | null = null;
+  let conflictOpener: HTMLElement | null = null;
+  let settingsOpener: HTMLElement | null = null;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
@@ -277,6 +284,16 @@
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
+  }
+
+  function activeElement(): HTMLElement | null {
+    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  }
+
+  function focusModal(getDialog: () => HTMLElement | null): void {
+    void tick().then(() => focusFirstElement(getDialog()));
   }
 
   function insecureServer(): boolean {
@@ -404,9 +421,9 @@
       await registerListener(
         await App.addListener('backButton', () => {
           if (destroyed) return;
-          if (actionMenuBook) actionMenuBook = null;
+          if (actionMenuBook) closeMenu();
           else if (reading) reading = null;
-          else if (settingsVisible) settingsVisible = false;
+          else if (settingsVisible) closeSettings();
           else void App.exitApp();
         }),
       ),
@@ -627,7 +644,7 @@
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
-      conflict = { book, url: file.webViewUrl, localCfi: local.cfi, remote };
+      openConflict({ book, url: file.webViewUrl, localCfi: local.cfi, remote });
       return;
     }
     reading = {
@@ -693,26 +710,57 @@
     );
     void flushProgress(client).catch(() => {});
     message = `${book.title} marked as read.`;
-    actionMenuBook = null;
+    closeMenu();
   }
 
   async function syncFurthest(book: BookRecord): Promise<void> {
-    actionMenuBook = null;
+    closeMenu();
     await open(book, { preferFurthest: true });
   }
 
   function openMenu(book: BookRecord): void {
+    actionMenuOpener = activeElement();
     actionMenuBook = book;
+    focusModal(() => actionMenuDialog);
   }
 
   function closeMenu(): void {
     actionMenuBook = null;
+    const opener = actionMenuOpener;
+    actionMenuOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openConflict(next: NonNullable<typeof conflict>): void {
+    conflictOpener = activeElement();
+    conflict = next;
+    focusModal(() => conflictDialog);
+  }
+
+  function closeConflict(): void {
+    conflict = null;
+    const opener = conflictOpener;
+    conflictOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openSettings(): void {
+    settingsOpener = activeElement();
+    settingsVisible = true;
+    focusModal(() => settingsDialog);
+  }
+
+  function closeSettings(): void {
+    settingsVisible = false;
+    const opener = settingsOpener;
+    settingsOpener = null;
+    restoreFocus(opener);
   }
 
   async function removeAllDownloads(): Promise<void> {
     for (const book of books.filter((item) => item.downloadPath)) await remove(book);
     message = 'Downloaded books removed. Kavita was not changed.';
-    settingsVisible = false;
+    closeSettings();
   }
 
   async function clearCache(): Promise<void> {
@@ -722,7 +770,7 @@
     clearCovers();
     void loadCovers(books);
     message = 'Cover cache cleared.';
-    settingsVisible = false;
+    closeSettings();
   }
 
   async function updateTheme(next: SkeletonTheme): Promise<void> {
@@ -772,7 +820,7 @@
       onApiKeyChange(nextKey);
       replacementApiKey = '';
       message = 'API key updated.';
-      settingsVisible = false;
+      closeSettings();
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -793,7 +841,7 @@
       await removeServer(server.id);
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
-      settingsVisible = false;
+      closeSettings();
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not remove the server.';
@@ -819,6 +867,7 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
+    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
   >
     <header class="flex items-center justify-between gap-4">
       <div class="flex min-w-0 items-center gap-3">
@@ -831,7 +880,7 @@
         <button
           class="btn btn-sm preset-tonal-surface h-8 w-8 !p-0"
           type="button"
-          onclick={() => (settingsVisible = true)}
+          onclick={openSettings}
           aria-label="Open settings"
           title="Settings"
         >
@@ -1130,14 +1179,20 @@
     transition:fade
     onclick={(event) => event.target === event.currentTarget && closeMenu()}
   >
-    <section
+    <div
+      bind:this={actionMenuDialog}
       class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="book-actions-title"
+      tabindex="-1"
+      onkeydown={(event) => trapModalKeydown(event, actionMenuDialog!, closeMenu)}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <div class="flex items-start justify-between gap-4">
         <div class="min-w-0">
           <p class="text-xs uppercase tracking-wider text-surface-700-300">Book actions</p>
-          <h2 class="mt-1 truncate font-serif text-2xl text-surface-950-50">
+          <h2 id="book-actions-title" class="mt-1 truncate font-serif text-2xl text-surface-950-50">
             {actionMenuBook.title}
           </h2>
           <p class="truncate text-sm text-surface-700-300">
@@ -1226,7 +1281,7 @@
           </button>
         {/if}
       </div>
-    </section>
+    </div>
   </div>
 {/if}
 
@@ -1235,12 +1290,19 @@
     class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-5"
     role="presentation"
     transition:fade
+    onclick={(event) => event.target === event.currentTarget && closeConflict()}
   >
     <div
+      bind:this={conflictDialog}
       class="card preset-filled-surface-50-950 w-full max-w-sm p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="sync-conflict-title"
+      tabindex="-1"
+      onkeydown={(event) => trapModalKeydown(event, conflictDialog!, closeConflict)}
       transition:fly={{ y: 16, duration: 150 }}
     >
-      <h2 class="font-serif text-2xl">Choose where to continue</h2>
+      <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
       <p class="mt-3 text-surface-600-400">
         This device and Kavita both moved since the last sync.
       </p>
@@ -1256,7 +1318,7 @@
               xpath: null,
               percentage: null,
             };
-            conflict = null;
+            closeConflict();
           }}>Continue from this device</button
         >
         <button
@@ -1270,7 +1332,7 @@
               xpath: conflict!.remote.bookScrollId ?? null,
               percentage: remotePercentage(conflict!.remote, conflict!.book),
             };
-            conflict = null;
+            closeConflict();
           }}>Continue from Kavita</button
         >
       </div>
@@ -1283,17 +1345,22 @@
     class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
     role="presentation"
     transition:fade
-    onclick={(event) => event.target === event.currentTarget && (settingsVisible = false)}
+    onclick={(event) => event.target === event.currentTarget && closeSettings()}
   >
-    <section
+    <div
+      bind:this={settingsDialog}
       class="card preset-filled-surface-50-950 relative w-full max-w-md max-h-[88dvh] overflow-auto p-6"
-      aria-label="Settings"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="library-settings-title"
+      tabindex="-1"
+      onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <button
         class="btn btn-sm preset-tonal-surface absolute right-4 top-4 h-9 w-9 p-0"
         type="button"
-        onclick={() => (settingsVisible = false)}
+        onclick={closeSettings}
         aria-label="Close settings"
       >
         <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -1304,7 +1371,7 @@
         </svg>
       </button>
 
-      <h2 class="font-serif text-3xl">Settings</h2>
+      <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
 
       <div class="mt-6">
         <div class="mt-3 grid grid-cols-2 gap-2">
@@ -1490,7 +1557,7 @@
           </div>
         </div>
       {/if}
-    </section>
+    </div>
   </div>
 {/if}
 
