@@ -34,7 +34,7 @@
     "@capacitor/filesystem": "^8.1.2",
     "@capacitor/network": "^8.0.1",
     "@capacitor/status-bar": "^8.0.2",
-    "dompurify": "^3.2.6",
+    "dompurify": "^3.4.15",
     "epubjs": "^0.3.93",
     "jeep-sqlite": "^2.8.0",
     "sql.js": "^1.14.1",
@@ -65,7 +65,7 @@
   },
   "overrides": {
     "epubjs": {
-      "@xmldom/xmldom": "0.9.10"
+      "@xmldom/xmldom": "0.9.12"
     }
   }
 }
