@@ -49,7 +49,7 @@
     "@skeletonlabs/skeleton-svelte": "^4.15.2",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tailwindcss/vite": "^4.3.2",
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.1.0",
     "eslint": "^10.6.0",
     "eslint-plugin-svelte": "^3.20.0",
     "globals": "^17.7.0",
