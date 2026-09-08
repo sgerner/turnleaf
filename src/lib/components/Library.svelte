@@ -41,6 +41,7 @@
     'cerberus',
     'concord',
     'crimson',
+    'eink',
     'fennec',
     'hamlindigo',
     'legacy',
@@ -62,10 +63,11 @@
   ] as const;
   type SkeletonTheme = (typeof skeletonThemes)[number];
 
-  // Primary/secondary/tertiary-500 colors for each Skeleton theme, extracted from
-  // node_modules/@skeletonlabs/skeleton/src/themes/*.css. Hardcoded because Skeleton v4
-  // switches theme variables globally; arbitrary child elements with data-theme do not
-  // inherit a different theme's palette.
+  // Primary/secondary/tertiary-500 colors for each Skeleton theme (extracted from
+  // node_modules/@skeletonlabs/skeleton/src/themes/*.css and src/lib/themes/*.css
+  // - for locally authored themes). Hardcoded because Skeleton v4 switches theme
+  // variables globally; arbitrary child elements with data-theme do not inherit a
+  // different theme's palette.
   const themeColors: Record<SkeletonTheme, [string, string, string]> = {
     catppuccin: [
       'oklch(66.37% 0.18 273.14deg)',
@@ -83,6 +85,7 @@
       'oklch(59.26% 0.09 239.95deg)',
       'oklch(78.4% 0.01 31.17deg)',
     ],
+    eink: ['oklch(0.5 0 0)', 'oklch(0.5 0 0)', 'oklch(0.5 0 0)'],
     fennec: [
       'oklch(65.88% 0.21 38.25deg)',
       'oklch(87.53% 0.1 74.15deg)',

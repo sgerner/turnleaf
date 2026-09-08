@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Update DOMPurify and the EPUB XML parser to patched releases so production dependency audits pass.
+- Add pure black/white "eink" theme for e-paper readers
 
 ## 0.2.0
 
