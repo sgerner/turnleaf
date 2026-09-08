@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make native library metadata refreshes transactional so failed updates leave the saved library unchanged.
+
 ## 0.3.2
 
 - Generate clean GitHub release notes without npm command output.
