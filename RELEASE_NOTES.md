@@ -3,6 +3,7 @@
 ## Unreleased
 
 - docs: add future implementation work plan
+- Update the changed book in memory after reader progress saves instead of reloading the full library.
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.
 - Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.

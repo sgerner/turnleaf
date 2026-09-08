@@ -32,7 +32,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { chooseOpenProgress, shouldPreferFurthest } from '../sync/conflict';
+  import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -702,7 +702,9 @@
       location.percentage,
       location.spineIndex,
     );
-    books = await getBooks(server.id);
+    const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
+    const lastReadAt = new Date().toISOString();
+    books = books.map((item) => (item.id === book.id ? { ...item, pagesRead, lastReadAt } : item));
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
   }
