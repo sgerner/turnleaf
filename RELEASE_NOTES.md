@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Isolate rendered EPUB content from remote resources and unsafe navigation while preserving internal links and local assets.
 - Add an Android SDK preflight that explains missing local SDK configuration before Gradle builds.
 - Virtualize large library grids while preserving stable book ordering and touch scrolling.
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.
