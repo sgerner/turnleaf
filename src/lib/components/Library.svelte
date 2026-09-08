@@ -205,11 +205,12 @@
   let query = $state('');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
+  let normalizedQuery = $derived(query.trim().toLowerCase());
   let visibleBooks = $derived(
     books.filter((book) => {
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
         .toLowerCase()
-        .includes(query.trim().toLowerCase());
+        .includes(normalizedQuery);
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
       return (
         matchesQuery &&
@@ -219,14 +220,15 @@
     }),
   );
   // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
-  let continueBook = $derived(
-    books
-      .filter(
-        (book) =>
-          book.downloadPath && book.pages > 0 && book.pagesRead < book.pages && book.lastReadAt,
-      )
-      .sort((a, b) => (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? ''))[0] ?? null,
-  );
+  let continueBook = $derived.by(() => {
+    let latest: BookRecord | null = null;
+    for (const book of books) {
+      if (!book.downloadPath || book.pages <= 0 || book.pagesRead >= book.pages || !book.lastReadAt)
+        continue;
+      if (!latest || book.lastReadAt.localeCompare(latest.lastReadAt ?? '') > 0) latest = book;
+    }
+    return latest;
+  });
   let reading = $state<{
     book: BookRecord;
     url: string;
