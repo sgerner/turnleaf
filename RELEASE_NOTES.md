@@ -3,12 +3,14 @@
 ## Unreleased
 
 - docs: add future implementation work plan
+- Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.
+- Preserve newer local reading progress when an older sync upload completes.
 - Add an Android SDK preflight that explains missing local SDK configuration before Gradle builds.
 - Virtualize large library grids while preserving stable book ordering and touch scrolling.
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.
 - Make native library metadata refreshes transactional so failed updates leave the saved library unchanged.
 - Add a retry-first local-data recovery path with an explicit reset warning that preserves downloaded EPUB files.
-- Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.
+- Make native reading progress, completion, sync acknowledgement, and migrations transactional.
 
 ## 0.3.2
 
