@@ -6,13 +6,13 @@ Turnleaf is a local Capacitor application for text-based EPUB books on Kavita. I
 
 ## Shape
 
-The app uses plain Svelte 5 and Vite. A small in-memory navigator switches among onboarding, library, book details, reader, and settings. Durable state lives in SQLite; credentials live only in native secure storage; downloaded EPUBs live in Capacitor's app-private data directory.
+The app uses plain Svelte 5 and Vite. A small in-memory navigator switches among onboarding, library, book details, reader, and settings. Durable state lives in SQLite; native credentials live in secure storage while the browser preview deliberately uses localStorage; downloaded EPUBs live in Capacitor's app-private data directory.
 
 Domain modules are intentionally direct:
 
 - `kavita`: one typed HTTP client and response mappers.
 - `database`: ordered SQL migrations and explicit queries.
-- `credentials`: a native Keychain/Keystore adapter with no production web fallback.
+- `credentials`: a native Keychain/Keystore adapter plus an explicitly development-only browser preview fallback.
 - `downloads`: native file transfer plus atomic status updates.
 - `reader`: one epub-js book/rendition owner, appearance, and semantic location conversion.
 - `sync`: local-first writes, a coalesced queue, and event-driven reconciliation.
@@ -21,7 +21,7 @@ Svelte components call these modules directly. There is no repository layer, dep
 
 ## Data flow
 
-1. Authenticate with a Kavita auth key and retain the returned JWT only in secure storage.
+1. Authenticate with a Kavita auth key sent in the `x-api-key` header; Turnleaf does not retain or manage a Kavita JWT.
 2. Fetch book-library metadata through the typed client and transactionally refresh the SQLite cache.
 3. Render library screens from SQLite so startup and browsing remain useful offline.
 4. Download an EPUB directly to a temporary app-private file, verify it, rename it, then mark it available in SQLite.
