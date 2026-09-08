@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 3;
+  let databaseVersion = 4;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 3;
+      databaseVersion = 4;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -151,16 +151,18 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(3);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(4);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
     expect.stringContaining('ALTER TABLE books ADD COLUMN pages'),
     expect.stringContaining('CREATE TABLE preferences'),
+    expect.stringContaining('CREATE INDEX IF NOT EXISTS idx_books_server_title'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
     'PRAGMA user_version = 2;',
     'PRAGMA user_version = 3;',
+    'PRAGMA user_version = 4;',
   ]);
 });
