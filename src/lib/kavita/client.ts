@@ -65,6 +65,9 @@ export class KavitaClient {
         `/api/Series/v2?PageNumber=${pageNumber}&PageSize=${SERIES_PAGE_SIZE}`,
         options,
       );
+      if (!Array.isArray(page)) {
+        throw new KavitaError('Kavita returned an unexpected series response.', 'invalid-response');
+      }
       series.push(...page);
       if (page.length < SERIES_PAGE_SIZE) break;
     }

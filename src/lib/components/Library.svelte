@@ -12,7 +12,7 @@
     markBookCompleted,
     removeDownload,
     removeServer,
-    replaceBooks,
+    reconcileBooks,
     saveLocalProgress,
     saveServer,
     setPreference,
@@ -32,7 +32,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { chooseOpenProgress, shouldPreferFurthest } from '../sync/conflict';
+  import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -206,15 +206,18 @@
   let query = $state('');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
+  let normalizedQuery = $derived(query.trim().toLowerCase());
   let sortOrder = $state<LibrarySortOrder>('title');
   let visibleBooks = $derived.by(() => {
     const filtered = books.filter((book) => {
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
         .toLowerCase()
-        .includes(query.trim().toLowerCase());
+        .includes(normalizedQuery);
+      const retainedOffline = book.remoteAvailable === false && Boolean(book.downloadPath);
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
       return (
         matchesQuery &&
+        (book.remoteAvailable !== false || retainedOffline) &&
         (!downloadedOnly || Boolean(book.downloadPath)) &&
         (!hideCompleted || !completed)
       );
@@ -237,14 +240,15 @@
     });
   });
   // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
-  let continueBook = $derived(
-    books
-      .filter(
-        (book) =>
-          book.downloadPath && book.pages > 0 && book.pagesRead < book.pages && book.lastReadAt,
-      )
-      .sort((a, b) => (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? ''))[0] ?? null,
-  );
+  let continueBook = $derived.by(() => {
+    let latest: BookRecord | null = null;
+    for (const book of books) {
+      if (!book.downloadPath || book.pages <= 0 || book.pagesRead >= book.pages || !book.lastReadAt)
+        continue;
+      if (!latest || book.lastReadAt.localeCompare(latest.lastReadAt ?? '') > 0) latest = book;
+    }
+    return latest;
+  });
   let reading = $state<{
     book: BookRecord;
     url: string;
@@ -273,6 +277,7 @@
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
+  let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
@@ -535,7 +540,9 @@
         );
       }
       if (destroyed) return;
-      await replaceBooks(server.id, mapped);
+      // Reconcile only after every series page and detail batch completed.
+      // Errors and lifecycle cancellation leave the last known local library intact.
+      await reconcileBooks(server.id, mapped);
       if (destroyed) return;
       books = await getBooks(server.id);
       retainCoversFor(books);
@@ -650,9 +657,15 @@
     }
   }
 
-  async function remove(book: BookRecord): Promise<void> {
-    if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath).catch(() => {});
-    await removeDownload(book.id);
+  async function remove(book: BookRecord): Promise<boolean> {
+    try {
+      if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath);
+      await removeDownload(book.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'storage error';
+      message = `Could not remove ${book.title}: ${detail}`;
+      return false;
+    }
     books = books.map((item) =>
       item.id === book.id
         ? {
@@ -663,6 +676,7 @@
           }
         : item,
     );
+    return true;
   }
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
@@ -741,7 +755,9 @@
       location.percentage,
       location.spineIndex,
     );
-    books = await getBooks(server.id);
+    const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
+    const lastReadAt = new Date().toISOString();
+    books = books.map((item) => (item.id === book.id ? { ...item, pagesRead, lastReadAt } : item));
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
   }
@@ -820,8 +836,20 @@
   }
 
   async function removeAllDownloads(): Promise<void> {
-    for (const book of books.filter((item) => item.downloadPath)) await remove(book);
-    message = 'Downloaded books removed. Kavita was not changed.';
+    const candidates = books.filter((item) => item.downloadPath);
+    const failed: string[] = [];
+    for (const book of candidates) {
+      if (!(await remove(book))) failed.push(book.title);
+    }
+    if (failed.length === 0) {
+      message = candidates.length
+        ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
+        : 'No downloaded books to remove.';
+    } else {
+      const succeeded = candidates.length - failed.length;
+      const names = failed.slice(0, 2).join(', ');
+      message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
+    }
     closeSettings();
   }
 
@@ -899,14 +927,20 @@
       cancelCoverLoading();
       await clearCoverCache().catch(() => {});
       clearCovers();
-      await removeApiKey(server.credentialRef).catch(() => {});
+      if (!credentialCleanupComplete) {
+        await removeApiKey(server.credentialRef);
+        credentialCleanupComplete = true;
+      }
       await removeServer(server.id);
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
       closeSettings();
     } catch (cause) {
-      settingsError =
-        cause instanceof Error ? cause.message : 'Turnleaf could not remove the server.';
+      settingsError = credentialCleanupComplete
+        ? 'The auth key was removed, but the local server configuration could not be cleared. Retry Delete server to finish cleanup.'
+        : cause instanceof Error
+          ? `Could not remove the server safely: ${cause.message} The connection was left in place; retry Delete server.`
+          : 'Could not remove the server safely. The connection was left in place; retry Delete server.';
     } finally {
       deletingServer = false;
       confirmDeleteServer = false;
@@ -1209,6 +1243,20 @@
                         decoding="async"
                         alt=""
                       />
+                    {/if}
+                    {#if book.remoteAvailable === false && book.downloadPath}
+                      <span
+                        class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                        title="Saved offline; no longer available on Kavita"
+                        aria-label="Saved offline; no longer available on Kavita"
+                      >
+                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                          <path
+                            fill="currentColor"
+                            d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                          />
+                        </svg>
+                      </span>
                     {/if}
                     {#if downloadingBookId === book.id}
                       <span
