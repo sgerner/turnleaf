@@ -1412,7 +1412,13 @@
 
       <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
 
-      <div class="mt-6">
+      <div class="mt-6" aria-labelledby="library-settings-appearance-title">
+        <h3 id="library-settings-appearance-title" class="text-lg font-medium">
+          Reading appearance
+        </h3>
+        <p class="mt-1 text-sm text-surface-700-300">
+          Choose the colors and theme that make reading comfortable. Changes apply immediately.
+        </p>
         <div class="mt-3 grid grid-cols-2 gap-2">
           <button
             class="btn {pendingMode === 'light'
@@ -1448,7 +1454,7 @@
           </button>
         </div>
 
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme</p>
+        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
         <div class="mt-3 flex flex-wrap gap-2">
           {#each skeletonThemes as option (option)}
             <button
@@ -1471,6 +1477,11 @@
           {/each}
         </div>
 
+        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
+        <p class="mt-1 text-sm text-surface-700-300">
+          Turnleaf always saves your latest position on this device. Auto-sync furthest read also
+          lets a newer local position replace an older Kavita position when progress is uploaded.
+        </p>
         <div
           class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
         >
@@ -1491,8 +1502,11 @@
         </div>
       </div>
 
-      <div class="mt-2">
-        <p class="text-xs uppercase tracking-wider text-surface-700-300">Connection</p>
+      <div class="mt-7" aria-labelledby="library-settings-connection-title">
+        <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
+        <p class="mt-1 text-sm text-surface-700-300">
+          Update the server address or replace the key used to access this library.
+        </p>
         <dl class="mt-3 space-y-2 text-sm">
           <div class="flex items-center justify-between gap-3">
             <dt class="text-surface-700-300">Server</dt>
@@ -1549,8 +1563,14 @@
         </form>
       </div>
 
-      <div class="mt-7">
-        <p class="text-xs uppercase tracking-wider text-surface-700-300">Maintenance</p>
+      <div class="mt-7" aria-labelledby="library-settings-storage-title">
+        <h3 id="library-settings-storage-title" class="text-lg font-medium">
+          Storage and maintenance
+        </h3>
+        <p class="mt-1 text-sm text-surface-700-300">
+          Downloads and reading progress stay on this device. Clearing covers is safe; removing
+          downloads deletes local EPUB files but does not change Kavita.
+        </p>
         <div class="mt-3 grid gap-2">
           <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
             >Clear cover cache</button
