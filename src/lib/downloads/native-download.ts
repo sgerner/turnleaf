@@ -1,8 +1,48 @@
 import { Capacitor } from '@capacitor/core';
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
+import { validateEpubArchive } from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
+
+function decodeNativeBytes(data: string | Blob): Uint8Array {
+  if (typeof data !== 'string') throw new Error('The native EPUB could not be inspected.');
+  const binary = atob(data);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function readNativeRange(path: string, offset: number, length: number): Promise<Uint8Array> {
+  const result = await Filesystem.readFile({
+    path,
+    directory: Directory.Data,
+    offset,
+    length,
+  });
+  return decodeNativeBytes(result.data);
+}
+
+function assertSafeBookId(bookId: string): void {
+  if (!bookId || bookId === '.' || bookId === '..' || /[\\/\0]/.test(bookId)) {
+    throw new Error('Invalid EPUB file name.');
+  }
+}
+
+function assertSafeBookPath(path: string): void {
+  const segments = path.split('/');
+  if (
+    !path.startsWith(`${BOOK_DIRECTORY}/`) ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..') ||
+    path.includes('\\') ||
+    segments.at(-1)?.toLowerCase().endsWith('.epub') !== true
+  ) {
+    throw new Error('Invalid downloaded EPUB path.');
+  }
+}
+
+function safeCoverNamespace(value: string): string {
+  const normalized = value.replace(/[^a-z0-9_-]+/gi, '_').replace(/^\.+|\.+$/g, '');
+  return normalized.slice(0, 80) || 'default';
+}
 
 export interface DownloadedBookFile {
   relativePath: string;
@@ -24,11 +64,13 @@ export async function downloadEpub(
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
+  assertSafeBookId(bookId);
 
   await ensureDataDirectory(BOOK_DIRECTORY);
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}.partial`;
   const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+  let renamed = false;
 
   try {
     await FileTransfer.downloadFile({
@@ -38,13 +80,16 @@ export async function downloadEpub(
       progress: true,
     });
     const stat = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
-    if (stat.type !== 'file' || stat.size < 22)
-      throw new Error('Kavita returned an empty EPUB file.');
+    if (stat.type !== 'file') throw new Error('Kavita did not return an EPUB file.');
+    await validateEpubArchive(stat.size, (offset, length) =>
+      readNativeRange(temporaryPath, offset, length),
+    );
     await Filesystem.rename({
       from: temporaryPath,
       to: finalPath,
       directory: Directory.Data,
     });
+    renamed = true;
     const final = await Filesystem.getUri({ path: finalPath, directory: Directory.Data });
     return {
       relativePath: finalPath,
@@ -54,6 +99,8 @@ export async function downloadEpub(
     };
   } catch (error) {
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
+    if (renamed)
+      await Filesystem.deleteFile({ path: finalPath, directory: Directory.Data }).catch(() => {});
     throw error;
   }
 }
@@ -62,8 +109,16 @@ export async function verifyDownloadedEpub(
   relativePath: string,
 ): Promise<DownloadedBookFile | null> {
   try {
+    assertSafeBookPath(relativePath);
+  } catch {
+    return null;
+  }
+  try {
     const stat = await Filesystem.stat({ path: relativePath, directory: Directory.Data });
-    if (stat.type !== 'file' || stat.size < 22) return null;
+    if (stat.type !== 'file') return null;
+    await validateEpubArchive(stat.size, (offset, length) =>
+      readNativeRange(relativePath, offset, length),
+    );
     const uri = await Filesystem.getUri({ path: relativePath, directory: Directory.Data });
     return {
       relativePath,
@@ -72,12 +127,14 @@ export async function verifyDownloadedEpub(
       size: stat.size,
     };
   } catch {
+    await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data }).catch(() => {});
     return null;
   }
 }
 
 export async function deleteDownloadedEpub(relativePath: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
+  assertSafeBookPath(relativePath);
   await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data });
 }
 
@@ -86,21 +143,42 @@ export async function cacheCover(
   apiKey: string,
   seriesId: number,
   signal?: AbortSignal,
+  cacheNamespace = 'default',
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const directory = 'covers';
-  const path = `${directory}/${seriesId}.img`;
+  const namespace = safeCoverNamespace(cacheNamespace);
+  const path = `${directory}/${namespace}/${seriesId}.img`;
+  const temporaryPath = `${path}.partial`;
   await ensureDataDirectory(directory);
+  await ensureDataDirectory(`${directory}/${namespace}`);
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
-  if (!valid || valid.size === 0) {
+  if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    await FileTransfer.downloadFile({
-      url: downloadUrl,
-      path: existing.uri,
-      headers: { 'x-api-key': apiKey },
-    });
+    await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
+    const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    try {
+      await FileTransfer.downloadFile({
+        url: downloadUrl,
+        path: temporary.uri,
+        headers: { 'x-api-key': apiKey },
+      });
+      const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
+      if (downloaded.type !== 'file' || downloaded.size === 0)
+        throw new Error('Kavita returned an empty cover.');
+      await Filesystem.rename({
+        from: temporaryPath,
+        to: path,
+        directory: Directory.Data,
+      });
+    } catch (error) {
+      await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
+        () => {},
+      );
+      throw error;
+    }
   }
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   return Capacitor.convertFileSrc(existing.uri);
