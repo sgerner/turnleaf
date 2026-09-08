@@ -1,6 +1,12 @@
 import { expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
-import { confirmSync, replaceBooksInTransaction, type BookRecord } from './database';
+import {
+  confirmSync,
+  reconcileBooks,
+  reconcileBooksInTransaction,
+  replaceBooksInTransaction,
+  type BookRecord,
+} from './database';
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
 
@@ -138,7 +144,7 @@ it('commits metadata while preserving downloaded file state on existing books', 
   expect(tasks).toHaveLength(2);
   expect(tasks[0]?.statement).not.toContain('download_path=excluded');
   expect(tasks[0]?.statement).not.toContain('server_id=excluded');
-  expect(tasks[0]?.statement).not.toContain('reading_state');
+  expect(tasks[0]?.statement).toContain('pending_sync');
   expect(database.rows()[0]).toMatchObject({
     id: existingBook.id,
     title: 'New title',
@@ -211,4 +217,84 @@ it('does not acknowledge a queue item that was replaced while it uploaded', asyn
   await confirmSync('book-1', '2026-09-07T00:00:02.000Z', '2026-09-07T00:00:00.000Z');
 
   expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toEqual(state);
+});
+
+it('reconciles removed browser books while retaining downloads and pending progress', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const pendingBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:pending',
+    title: 'Pending book',
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  const forgottenBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:forgotten',
+    title: 'Forgotten book',
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [existingBook, pendingBook, forgottenBook],
+      readingState: {
+        [pendingBook.id]: {
+          cfi: 'cfi',
+          xpath: null,
+          percentage: 0.5,
+          localUpdatedAt: '2026-09-07T00:00:01.000Z',
+          serverUpdatedAt: null,
+          pendingSync: true,
+        },
+      },
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await reconcileBooks('server', [
+    { ...forgottenBook, id: 'server:1:new', title: 'New book', remoteAvailable: true },
+  ]);
+
+  const saved = JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    books: BookRecord[];
+  };
+  expect(saved.books.map((book) => book.id)).toEqual([
+    'server:1:new',
+    existingBook.id,
+    pendingBook.id,
+  ]);
+  expect(saved.books.find((book) => book.id === existingBook.id)).toMatchObject({
+    remoteAvailable: false,
+    downloadPath: existingBook.downloadPath,
+  });
+  expect(saved.books.find((book) => book.id === pendingBook.id)).toMatchObject({
+    remoteAvailable: false,
+  });
+});
+
+it('reconciles an empty native snapshot without deleting retained rows', async () => {
+  const executeTransaction = vi.fn(async (_tasks: capTask[]) => ({ changes: { changes: 0 } }));
+
+  await reconcileBooksInTransaction(
+    { executeTransaction },
+    'server',
+    [],
+    '2026-09-07T00:00:00.000Z',
+  );
+
+  const [tasks] = executeTransaction.mock.calls[0] ?? [];
+  expect(tasks).toHaveLength(2);
+  expect(tasks?.[0]?.statement).toContain('remote_available=0');
+  expect(tasks?.[0]?.statement).toContain('download_path IS NOT NULL');
+  expect(tasks?.[1]?.statement).toContain('DELETE FROM books');
+  expect(tasks?.[1]?.statement).toContain('NOT (');
 });
