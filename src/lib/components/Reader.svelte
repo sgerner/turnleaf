@@ -297,7 +297,15 @@
   </nav>
 
   {#if appearance.progressBar}
-    <div class="reader-progress" aria-hidden="true">
+    <div
+      class="reader-progress"
+      role="progressbar"
+      aria-label="Book reading progress"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      aria-valuenow={Math.round((location?.percentage ?? 0) * 100)}
+      aria-valuetext={`${Math.round((location?.percentage ?? 0) * 100)}% complete`}
+    >
       <div class="reader-progress-track">
         <div
           class="reader-progress-fill"
@@ -392,7 +400,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-8 w-8 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
             type="button"
             onclick={() => (settingsVisible = false)}
             aria-label="Close reading appearance"
@@ -412,6 +420,7 @@
                 class:active-mode={appearance.mode === mode}
                 class="btn preset-outlined-surface-300-700 capitalize"
                 type="button"
+                aria-pressed={appearance.mode === mode}
                 onclick={() => updateAppearance({ mode: mode as ReadingMode })}>{mode}</button
               >
             {/each}
@@ -532,7 +541,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-8 w-8 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
             type="button"
             onclick={() => (tocVisible = false)}
             aria-label="Close table of contents"
