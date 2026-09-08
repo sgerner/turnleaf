@@ -20,4 +20,13 @@ Flush triggers are connectivity restoration, app backgrounding, chapter change, 
 
 Reconciliation compares local and server locations with the last shared state. If both changed, reading pauses for an explicit choice. The furthest percentage never wins automatically.
 
+## Metadata refresh rule
+
+Only a fully fetched, successfully mapped Kavita metadata snapshot reconciles
+the local book rows. A missing remote book is removed when it has no local
+download and no pending progress; a downloaded book is kept and marked
+unavailable remotely so it remains readable offline. Pending progress is also
+retained and remains queued for retry. Empty, partial, failed, or cancelled
+fetches leave the previous local library unchanged.
+
 Kavita's `bookScrollId` is currently a content XPath. Turnleaf keeps CFI locally and sends a compatible XPath only after device/server validation confirms conversion for that EPUB.
