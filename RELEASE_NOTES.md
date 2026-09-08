@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- test: update migration coverage for library index
+- perf: index native library title reads
+- Add a server-scoped native library title index with migration and query-plan coverage.
 - docs: record remaining work implementation status
 - docs: add Android device validation checklist
 - test: run sqlite integration in node
