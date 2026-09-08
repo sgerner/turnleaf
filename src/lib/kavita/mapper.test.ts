@@ -1,4 +1,5 @@
 import { expect, it } from 'vitest';
+import { issue51VolumeDetail } from './fixtures/issue-51-volume-detail';
 import { mapSeriesToBooks } from './mapper';
 import type { KavitaSeries, KavitaSeriesDetail } from './types';
 
@@ -120,6 +121,24 @@ it('deduplicates a chapter exposed both flat and inside its volume', () => {
   } satisfies KavitaSeriesDetail;
 
   expect(mapSeriesToBooks('primary', series, detail)).toHaveLength(1);
+});
+
+it('maps the minimized volume-only payload reported in issue #51', () => {
+  const series = {
+    id: 82,
+    name: 'The Seven Great Monarchies Of The Ancient Eastern World',
+    libraryId: 1,
+    format: 3,
+    pages: 44,
+    pagesRead: 0,
+    created: '2026-09-05',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: 'cover.png',
+  } satisfies KavitaSeries;
+
+  expect(
+    mapSeriesToBooks('primary', series, issue51VolumeDetail).map((book) => book.chapterId),
+  ).toEqual([1406, 1407, 1409, 1408]);
 });
 
 it('keeps chapter progress and dates separate from series aggregates', () => {
