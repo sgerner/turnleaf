@@ -1,5 +1,10 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
+import {
+  clipReaderSearchExcerpt,
+  normalizeReaderSearchQuery,
+  type ReaderSearchResult,
+} from './search';
 
 export interface ReaderLocation {
   cfi: string;
@@ -91,6 +96,8 @@ interface SpineSection {
   href: string;
   index: number;
   cfiBase: string;
+  load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
+  unload: () => void;
 }
 
 const MODE_COLORS = {
@@ -431,6 +438,41 @@ export class ReaderSession {
       label: item.label,
       href: item.href,
     }));
+  }
+
+  async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
+    const normalizedQuery = normalizeReaderSearchQuery(query);
+    if (!normalizedQuery) return [];
+    const results: ReaderSearchResult[] = [];
+    const sections = this.spineSections();
+    const request = this.book.request as (url: string) => Promise<Document>;
+
+    for (const section of sections) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const wasLoaded = Boolean((section as unknown as { contents?: unknown }).contents);
+      try {
+        await section.load(request);
+        const matches = (
+          section as unknown as {
+            search: (value: string) => Array<{ cfi: string; excerpt: string }>;
+          }
+        ).search(normalizedQuery);
+        for (const match of matches) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          if (!match.cfi) continue;
+          results.push({
+            cfi: match.cfi,
+            excerpt: clipReaderSearchExcerpt(match.excerpt),
+            href: section.href,
+            spineIndex: section.index,
+          });
+          if (results.length >= limit) return results;
+        }
+      } finally {
+        if (!wasLoaded) section.unload();
+      }
+    }
+    return results;
   }
 
   async display(href: string): Promise<void> {
