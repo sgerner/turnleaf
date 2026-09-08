@@ -3,6 +3,7 @@
 ## Unreleased
 
 - docs: add future implementation work plan
+- Prioritize visible covers and share bounded requests across refresh generations, with server-scoped native cache files and safe partial transfers.
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.
 - Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.

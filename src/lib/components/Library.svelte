@@ -3,6 +3,7 @@
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
   import { tick, onDestroy, onMount } from 'svelte';
+  import { SvelteSet } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import {
     getBooks,
@@ -26,7 +27,11 @@
     downloadEpub,
     verifyDownloadedEpub,
   } from '../downloads/native-download';
-  import { loadCoversWithConcurrency } from '../downloads/cover-loader';
+  import {
+    createSharedCoverLoader,
+    loadCoversWithConcurrency,
+    type CoverLoadItem,
+  } from '../downloads/cover-loader';
   import { KavitaClient } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
@@ -201,6 +206,14 @@
     onServerDeleted: () => void;
   } = $props();
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  const sharedCoverLoader = createSharedCoverLoader<string>(async (seriesId, signal) => {
+    if (Capacitor.isNativePlatform()) {
+      return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id);
+    }
+    const blob = await client.getCover(seriesId, signal);
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    return URL.createObjectURL(blob);
+  });
   let books = $state<BookRecord[]>([]);
   let query = $state('');
   let downloadedOnly = $state(false);
@@ -271,7 +284,6 @@
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
-  const nativePlatform = Capacitor.isNativePlatform();
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const GRID_GAP_PX = 16;
@@ -471,6 +483,7 @@
     window.removeEventListener('resize', scheduleVirtualWindow);
     cancelCoverLoading();
     clearCovers();
+    sharedCoverLoader.cancel();
     cleanups.forEach((remove) => void remove());
   });
 
@@ -544,19 +557,29 @@
     const controller = new AbortController();
     const generation = coverLoadGeneration;
     coverLoadController = controller;
+    const priority: BookRecord[] = [];
+    if (continueBook) priority.push(continueBook);
+    const firstVisibleIndex =
+      virtualWindow.endIndex > virtualWindow.startIndex ? virtualWindow.startIndex : 0;
+    const visibleEndIndex =
+      virtualWindow.endIndex > virtualWindow.startIndex
+        ? virtualWindow.endIndex
+        : Math.min(visibleBooks.length, gridColumns * 3);
+    priority.push(...visibleBooks.slice(firstVisibleIndex, visibleEndIndex));
+    const ordered = [...priority, ...items];
+    const prioritizedItems: CoverLoadItem[] = [];
+    const seenSeries = new SvelteSet<number>();
+    for (const book of ordered) {
+      if (seenSeries.has(book.seriesId)) continue;
+      seenSeries.add(book.seriesId);
+      prioritizedItems.push({ seriesId: book.seriesId });
+    }
     try {
-      await loadCoversWithConcurrency(items, {
+      await loadCoversWithConcurrency(prioritizedItems, {
         signal: controller.signal,
         concurrency: COVER_LOAD_CONCURRENCY,
         hasCover: (seriesId) => Boolean(covers[seriesId]),
-        load: async (seriesId, signal) => {
-          if (nativePlatform) {
-            return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal);
-          }
-          const blob = await client.getCover(seriesId, signal);
-          if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-          return URL.createObjectURL(blob);
-        },
+        load: (seriesId) => sharedCoverLoader.load(seriesId),
         dispose: revokeBrowserCover,
         onLoaded: (seriesId, cover) => {
           if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
@@ -788,6 +811,8 @@
 
   async function clearCache(): Promise<void> {
     cancelCoverLoading();
+    await sharedCoverLoader.waitForIdle();
+    if (destroyed) return;
     await clearCoverCache();
     if (destroyed) return;
     clearCovers();

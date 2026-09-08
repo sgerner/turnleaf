@@ -4,6 +4,11 @@ import { Directory, Filesystem } from '@capacitor/filesystem';
 
 const BOOK_DIRECTORY = 'books';
 
+function safeCoverNamespace(value: string): string {
+  const normalized = value.replace(/[^a-z0-9_-]+/gi, '_').replace(/^\.+|\.+$/g, '');
+  return normalized.slice(0, 80) || 'default';
+}
+
 export interface DownloadedBookFile {
   relativePath: string;
   nativeUri: string;
@@ -86,21 +91,42 @@ export async function cacheCover(
   apiKey: string,
   seriesId: number,
   signal?: AbortSignal,
+  cacheNamespace = 'default',
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const directory = 'covers';
-  const path = `${directory}/${seriesId}.img`;
+  const namespace = safeCoverNamespace(cacheNamespace);
+  const path = `${directory}/${namespace}/${seriesId}.img`;
+  const temporaryPath = `${path}.partial`;
   await ensureDataDirectory(directory);
+  await ensureDataDirectory(`${directory}/${namespace}`);
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
-  if (!valid || valid.size === 0) {
+  if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    await FileTransfer.downloadFile({
-      url: downloadUrl,
-      path: existing.uri,
-      headers: { 'x-api-key': apiKey },
-    });
+    await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
+    const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    try {
+      await FileTransfer.downloadFile({
+        url: downloadUrl,
+        path: temporary.uri,
+        headers: { 'x-api-key': apiKey },
+      });
+      const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
+      if (downloaded.type !== 'file' || downloaded.size === 0)
+        throw new Error('Kavita returned an empty cover.');
+      await Filesystem.rename({
+        from: temporaryPath,
+        to: path,
+        directory: Directory.Data,
+      });
+    } catch (error) {
+      await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
+        () => {},
+      );
+      throw error;
+    }
   }
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   return Capacitor.convertFileSrc(existing.uri);
