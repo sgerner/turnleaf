@@ -547,8 +547,12 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(0.5rem, env(safe-area-inset-top));
-    --reader-safe-bottom: max(1rem, env(safe-area-inset-bottom));
+    --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+    --reader-safe-bottom: max(
+      1rem,
+      env(safe-area-inset-bottom, 0px),
+      var(--safe-area-inset-bottom, 0px)
+    );
     --reader-progress-height: 0.25rem;
   }
 
@@ -557,7 +561,7 @@
     inset: var(--reader-safe-top) 0 var(--reader-safe-bottom) 0;
     overflow: hidden;
     width: 100%;
-    height: 100%;
+    height: auto;
     min-width: 0;
     max-width: 100%;
     contain: layout paint;
