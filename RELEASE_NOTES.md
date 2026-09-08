@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Validate downloaded EPUB ZIP containers with bounded range reads and reject malformed or unsafe archives before making them available; validate Kavita library, series, detail, progress, and paginated response shapes without replacing saved offline data after a failed refresh.
 - Reconcile removed books and clean up credentials
 - Reconcile complete Kavita metadata snapshots without purging cached books after partial or failed fetches; retain downloaded books and pending local progress when Kavita removes them.
 - Report credential and server-configuration cleanup failures accurately and compensate failed onboarding saves so orphaned auth keys remain recoverable.
