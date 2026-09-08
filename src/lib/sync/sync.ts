@@ -14,7 +14,7 @@ async function run(client: KavitaClient): Promise<void> {
   for (const item of await getPendingSync()) {
     try {
       await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
-      await confirmSync(item.bookId, new Date().toISOString());
+      await confirmSync(item.bookId, new Date().toISOString(), item.updatedAt);
     } catch (error) {
       await markSyncFailure(item.bookId, error instanceof Error ? error.message : 'Sync failed');
       throw error;
