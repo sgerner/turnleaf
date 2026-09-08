@@ -3,6 +3,7 @@
 ## Unreleased
 
 - docs: add future implementation work plan
+- Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.
 - Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.
 - Keep virtualized library windows valid at the end of long lists and preserve focused books while scrolling.
 - Harden the browser development proxy with loopback and HTTPS origin controls, bounded requests, filtered credentials, and safe upstream failure handling.
