@@ -21,4 +21,4 @@ Use a dedicated non-administrator Kavita user for Turnleaf. Grant that user acce
 
 Pull requests run formatting, linting, type checking, unit tests, production build, Android debug build, production dependency audit, dependency review, and CodeQL JavaScript/TypeScript analysis.
 
-EPUB.js's transitive `@xmldom/xmldom` dependency is overridden to patched release 0.9.10. Run `npm audit --omit=dev` for the current report.
+EPUB.js's transitive `@xmldom/xmldom` dependency is overridden to patched release 0.9.12. Run `npm audit --omit=dev` for the current report; this production-only report does not cover development dependencies.

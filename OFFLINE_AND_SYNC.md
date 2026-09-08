@@ -6,7 +6,7 @@
 - EPUB files: `Directory.Data/books/<book-id>.epub`.
 - Incomplete files: the same path with `.partial`; deleted on failure.
 - Credentials: Android Keystore-backed encrypted SharedPreferences or iOS Keychain, under the `turnleaf_` prefix.
-- Covers: planned app-private cache; not browser cache.
+- Covers: server-scoped app-private cache under `Directory.Data/covers`; browser previews use revocable object URLs.
 
 ## Download rule
 
@@ -18,7 +18,7 @@ Every meaningful relocation is saved locally first using EPUB CFI, percentage, s
 
 Flush triggers are connectivity restoration, app backgrounding, chapter change, and one rescheduled idle deadline. There is no interval, poll, WebSocket, or background service.
 
-Reconciliation compares local and server locations with the last shared state. If both changed, reading pauses for an explicit choice. The furthest percentage never wins automatically.
+Reconciliation compares local and server locations with the last shared state. If both changed, reading pauses for an explicit choice. The optional **Auto-sync furthest read** setting (and the explicit reader action) may choose the furthest compatible location by Kavita XPath or percentage; with that setting off, a non-conflicting server position is preferred.
 
 ## Metadata refresh rule
 
