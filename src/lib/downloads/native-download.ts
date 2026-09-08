@@ -85,19 +85,24 @@ export async function cacheCover(
   downloadUrl: string,
   apiKey: string,
   seriesId: number,
+  signal?: AbortSignal,
 ): Promise<string> {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const directory = 'covers';
   const path = `${directory}/${seriesId}.img`;
   await ensureDataDirectory(directory);
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.size === 0) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     await FileTransfer.downloadFile({
       url: downloadUrl,
       path: existing.uri,
       headers: { 'x-api-key': apiKey },
     });
   }
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   return Capacitor.convertFileSrc(existing.uri);
 }
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.
+
 ## 0.3.2
 
 - Generate clean GitHub release notes without npm command output.

@@ -26,6 +26,7 @@
     downloadEpub,
     verifyDownloadedEpub,
   } from '../downloads/native-download';
+  import { loadCoversWithConcurrency } from '../downloads/cover-loader';
   import { KavitaClient } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
@@ -257,7 +258,10 @@
   const cleanups: Array<() => Promise<void>> = [];
   const nativePlatform = Capacitor.isNativePlatform();
   const SERIES_DETAIL_BATCH_SIZE = 8;
+  const COVER_LOAD_CONCURRENCY = 6;
   let destroyed = false;
+  let coverLoadController: AbortController | null = null;
+  let coverLoadGeneration = 0;
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
@@ -279,6 +283,7 @@
     pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
     books = await getBooks(server.id);
     if (destroyed) return;
+    retainCoversFor(books);
     void loadCovers(books);
     loading = false;
     offline = !(await Network.getStatus()).connected;
@@ -330,15 +335,15 @@
   onDestroy(() => {
     destroyed = true;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    Object.values(covers)
-      .filter((cover) => cover.startsWith('blob:'))
-      .forEach(URL.revokeObjectURL);
+    cancelCoverLoading();
+    clearCovers();
     cleanups.forEach((remove) => void remove());
   });
 
   async function refresh(): Promise<void> {
     if (destroyed || refreshing) return;
     refreshing = true;
+    cancelCoverLoading();
     message = '';
     try {
       const series = await client.getBookSeries();
@@ -360,6 +365,7 @@
       await replaceBooks(server.id, mapped);
       if (destroyed) return;
       books = await getBooks(server.id);
+      retainCoversFor(books);
       void loadCovers(books);
       offline = false;
     } catch {
@@ -372,20 +378,66 @@
     }
   }
 
+  function cancelCoverLoading(): void {
+    coverLoadController?.abort();
+    coverLoadController = null;
+    coverLoadGeneration += 1;
+  }
+
+  function revokeBrowserCover(cover: string): void {
+    if (cover.startsWith('blob:')) URL.revokeObjectURL(cover);
+  }
+
+  function clearCovers(): void {
+    for (const cover of Object.values(covers)) revokeBrowserCover(cover);
+    covers = {};
+  }
+
+  function retainCoversFor(items: BookRecord[]): void {
+    const seriesIds = new Set(items.map((item) => item.seriesId));
+    const retained = Object.fromEntries(
+      Object.entries(covers).filter(([seriesId]) => seriesIds.has(Number(seriesId))),
+    );
+    for (const [seriesId, cover] of Object.entries(covers)) {
+      if (!seriesIds.has(Number(seriesId))) revokeBrowserCover(cover);
+    }
+    covers = retained;
+  }
+
   async function loadCovers(items: BookRecord[]): Promise<void> {
-    for (const book of items) {
-      if (covers[book.seriesId]) continue;
-      try {
-        const cover = nativePlatform
-          ? await cacheCover(client.coverUrl(book.seriesId), apiKey, book.seriesId)
-          : URL.createObjectURL(await client.getCover(book.seriesId));
-        covers = {
-          ...covers,
-          [book.seriesId]: cover,
-        };
-      } catch {
-        /* Metadata remains useful without decorative covers. */
-      }
+    if (destroyed) return;
+    cancelCoverLoading();
+    const controller = new AbortController();
+    const generation = coverLoadGeneration;
+    coverLoadController = controller;
+    try {
+      await loadCoversWithConcurrency(items, {
+        signal: controller.signal,
+        concurrency: COVER_LOAD_CONCURRENCY,
+        hasCover: (seriesId) => Boolean(covers[seriesId]),
+        load: async (seriesId, signal) => {
+          if (nativePlatform) {
+            return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal);
+          }
+          const blob = await client.getCover(seriesId, signal);
+          if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+          return URL.createObjectURL(blob);
+        },
+        onLoaded: (seriesId, cover) => {
+          if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
+            revokeBrowserCover(cover);
+            return;
+          }
+          const previous = covers[seriesId];
+          if (previous && previous !== cover) revokeBrowserCover(previous);
+          covers = {
+            ...covers,
+            [seriesId]: cover,
+          };
+        },
+      });
+    } finally {
+      if (coverLoadController === controller) coverLoadController = null;
     }
   }
 
@@ -569,8 +621,11 @@
   }
 
   async function clearCache(): Promise<void> {
+    cancelCoverLoading();
     await clearCoverCache();
-    covers = {};
+    if (destroyed) return;
+    clearCovers();
+    void loadCovers(books);
     message = 'Cover cache cleared.';
     settingsVisible = false;
   }
@@ -636,8 +691,9 @@
     deletingServer = true;
     try {
       for (const book of books.filter((item) => item.downloadPath)) await remove(book);
+      cancelCoverLoading();
       await clearCoverCache().catch(() => {});
-      covers = {};
+      clearCovers();
       await removeApiKey(server.credentialRef).catch(() => {});
       await removeServer(server.id);
       onServerDeleted();
