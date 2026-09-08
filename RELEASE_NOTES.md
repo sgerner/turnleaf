@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- ci: use software-compatible Android smoke image
 - ci: make emulator smoke startup deterministic
 - ci: add Android emulator startup smoke test
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
