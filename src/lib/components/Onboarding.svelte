@@ -3,7 +3,7 @@
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
-  import { saveApiKey } from '../native/credentials';
+  import { removeApiKey, saveApiKey } from '../native/credentials';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
   let { onConnected }: { onConnected: (server: ServerConfig) => void } = $props();
@@ -49,9 +49,20 @@
       try {
         await saveServer(server);
       } catch (storageError) {
-        throw new Error('The connection worked, but local setup could not be saved.', {
-          cause: storageError,
-        });
+        try {
+          await removeApiKey(credentialRef);
+        } catch (cleanupError) {
+          throw new Error(
+            'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
+            { cause: cleanupError },
+          );
+        }
+        throw new Error(
+          'The connection worked, but local setup could not be saved. No auth key was retained; try again.',
+          {
+            cause: storageError,
+          },
+        );
       }
       apiKey = '';
       onConnected(server);
@@ -161,5 +172,21 @@
         {/if}
       </button>
     </form>
+
+    <aside class="card preset-tonal-surface p-5" aria-labelledby="getting-started-title">
+      <h2 id="getting-started-title" class="font-serif text-xl">Getting started</h2>
+      <ol class="mt-3 grid gap-3 text-sm text-surface-800-200">
+        <li>
+          <strong>1. Connect.</strong> Turnleaf checks the address and key before saving them.
+        </li>
+        <li>
+          <strong>2. Download.</strong> Use a book's download action to keep an EPUB available offline.
+        </li>
+        <li>
+          <strong>3. Resume.</strong> Your reading position is saved locally and can sync when Kavita
+          is reachable.
+        </li>
+      </ol>
+    </aside>
   </div>
 </main>

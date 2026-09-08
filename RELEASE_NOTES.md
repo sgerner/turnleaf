@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
+- Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
+- Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
+- Document the iOS readiness matrix and keep platform support explicitly unverified until macOS and device checks pass.
+- Group library settings by appearance, sync, connection, and storage, and add concise first-run guidance.
+- Prioritize visible covers and share bounded requests across refresh generations, with server-scoped native cache files and safe partial transfers.
+- Validate downloaded EPUB ZIP containers with bounded range reads and reject malformed or unsafe archives before making them available; validate Kavita library, series, detail, progress, and paginated response shapes without replacing saved offline data after a failed refresh.
+- Reconcile removed books and clean up credentials
+- Reconcile complete Kavita metadata snapshots without purging cached books after partial or failed fetches; retain downloaded books and pending local progress when Kavita removes them.
+- Report credential and server-configuration cleanup failures accurately and compensate failed onboarding saves so orphaned auth keys remain recoverable.
+- Document offline metadata retention and retry behavior.
+- Harden release link validation and provenance
+- Validate GitHub update links and publish Android releases from tested revisions with least-privilege workflow permissions.
+- Continue syncing later progress items when an earlier item fails, while recording the failed item for retry.
+- Report individual and bulk download-removal failures instead of claiming storage was cleared.
+- Update the changed book in memory after reader progress saves instead of reloading the full library.
 - docs: add future implementation work plan
 - Show queued and failed reading-progress sync state with an explicit retry action.
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.

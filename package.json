@@ -13,6 +13,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "benchmark:library": "vitest bench src/lib/components/library-virtualization.bench.ts",
     "build": "npm run check && vite build",
     "release:finalize": "node scripts/finalize-release-notes.mjs",
     "release:notes": "node scripts/release-notes.mjs",

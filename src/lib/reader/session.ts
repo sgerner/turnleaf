@@ -438,6 +438,16 @@ export class ReaderSession {
     await this.navigate(() => this.rendition!.display(href));
   }
 
+  async displayCfi(cfi: string): Promise<boolean> {
+    if (!this.rendition) return false;
+    try {
+      await this.navigate(() => this.rendition!.display(cfi));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   displayServerLocation(xpath: string): Promise<boolean> {
     this.userNavigationPending = false;
     return this.displayXPath(xpath);

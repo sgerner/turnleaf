@@ -51,5 +51,9 @@ export async function removeApiKey(reference: string): Promise<void> {
     return;
   }
   await prepare();
-  await SecureStorage.remove(reference);
+  try {
+    await SecureStorage.remove(reference);
+  } catch (error) {
+    throw new Error('Could not remove the saved Kavita auth key.', { cause: error });
+  }
 }

@@ -138,7 +138,7 @@ it('commits metadata while preserving downloaded file state on existing books', 
   expect(tasks).toHaveLength(2);
   expect(tasks[0]?.statement).not.toContain('download_path=excluded');
   expect(tasks[0]?.statement).not.toContain('server_id=excluded');
-  expect(tasks[0]?.statement).not.toContain('reading_state');
+  expect(tasks[0]?.statement).toContain('pending_sync');
   expect(database.rows()[0]).toMatchObject({
     id: existingBook.id,
     title: 'New title',
