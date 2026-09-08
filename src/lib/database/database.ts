@@ -2,6 +2,7 @@ import { Capacitor } from '@capacitor/core';
 import {
   CapacitorSQLite,
   SQLiteConnection,
+  type capTask,
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
@@ -222,42 +223,59 @@ export async function replaceBooks(serverId: string, books: BookRecord[]): Promi
     writeBrowserState(state);
     return;
   }
-  const db = await openDatabase();
-  for (const book of books) {
-    await db.run(
-      `INSERT INTO books
-       (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
-        description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
-        pages, pages_read, created_at, last_read_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-        title=excluded.title, author=excluded.author, series=excluded.series,
-        description_html=excluded.description_html, format=excluded.format,
-        metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
-        pages_read=excluded.pages_read, created_at=excluded.created_at, last_read_at=excluded.last_read_at`,
-      [
-        book.id,
-        serverId,
-        book.libraryId,
-        book.seriesId,
-        book.volumeId,
-        book.chapterId,
-        book.title,
-        book.author,
-        book.series,
-        book.descriptionHtml,
-        book.format,
-        new Date().toISOString(),
-        book.downloadPath,
-        book.downloadStatus,
-        book.fileSize,
-        book.pages,
-        book.pagesRead,
-        book.createdAt,
-        book.lastReadAt,
-      ],
-    );
-  }
+  await replaceBooksInTransaction(await openDatabase(), serverId, books);
+}
+
+const replaceBookStatement = `INSERT INTO books
+  (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+   description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
+   pages, pages_read, created_at, last_read_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+   title=excluded.title, author=excluded.author, series=excluded.series,
+   description_html=excluded.description_html, format=excluded.format,
+   metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
+   pages_read=excluded.pages_read, created_at=excluded.created_at, last_read_at=excluded.last_read_at`;
+
+function replaceBookTask(serverId: string, book: BookRecord, refreshedAt: string): capTask {
+  return {
+    statement: replaceBookStatement,
+    values: [
+      book.id,
+      serverId,
+      book.libraryId,
+      book.seriesId,
+      book.volumeId,
+      book.chapterId,
+      book.title,
+      book.author,
+      book.series,
+      book.descriptionHtml,
+      book.format,
+      refreshedAt,
+      book.downloadPath,
+      book.downloadStatus,
+      book.fileSize,
+      book.pages,
+      book.pagesRead,
+      book.createdAt,
+      book.lastReadAt,
+    ],
+  };
+}
+
+/**
+ * Apply a native library refresh as one SQLite transaction. The UPSERT only
+ * changes metadata and progress columns on existing rows, leaving downloaded
+ * file columns and related reading/sync rows intact.
+ */
+export async function replaceBooksInTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  serverId: string,
+  books: BookRecord[],
+  refreshedAt = new Date().toISOString(),
+): Promise<void> {
+  await db.executeTransaction(books.map((book) => replaceBookTask(serverId, book, refreshedAt)));
 }
 
 export async function getBooks(serverId: string): Promise<BookRecord[]> {
