@@ -2,7 +2,9 @@
 
 ## Unreleased
 
+- ci: add Android emulator startup smoke test
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
+- Add an Android emulator CI smoke test that installs the debug APK and verifies app startup.
 - Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
 - Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
 - Document the iOS readiness matrix and keep platform support explicitly unverified until macOS and device checks pass.
