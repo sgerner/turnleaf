@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Validate downloaded EPUB ZIP containers with bounded range reads and reject malformed or unsafe archives before making them available; validate Kavita library, series, detail, progress, and paginated response shapes without replacing saved offline data after a failed refresh.
 - docs: add future implementation work plan
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.

@@ -91,7 +91,7 @@ it('loads every series page for large libraries', async () => {
       ok: true,
       status: 200,
       headers: { get: () => null },
-      json: async () => [page[0]],
+      json: async () => [{ ...page[0], id: 500, name: 'Book 500' }],
     });
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
@@ -103,6 +103,56 @@ it('loads every series page for large libraries', async () => {
     'https://books.example.com/api/Series/v2?PageNumber=2&PageSize=500',
     expect.objectContaining({ method: 'POST' }),
   );
+});
+
+it('rejects malformed series payloads at the response boundary', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => ({ unexpected: true }),
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'invalid-response',
+  });
+});
+
+it('rejects a repeated series across pagination pages', async () => {
+  const page = Array.from({ length: 500 }, (_, id) => ({
+    id,
+    name: `Book ${id}`,
+    libraryId: 1,
+    format: 3,
+    pages: 1,
+    pagesRead: 0,
+    created: '2026-01-01',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: '',
+  }));
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => page,
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [page[0]],
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'invalid-response',
+  });
 });
 
 it.each([[[2, 4]], [[4]]])(
@@ -133,6 +183,51 @@ it.each([[[2, 4]], [[4]]])(
   },
 );
 
+it('rejects malformed library elements without inventing a server connection', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => [{ id: 1, name: 'Books', type: '2' }],
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').testConnection(),
+  ).rejects.toMatchObject({
+    kind: 'invalid-response',
+  });
+});
+
+it('rejects malformed series details before callers map them', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => ({ chapters: [] }),
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getSeriesDetail(4),
+  ).rejects.toMatchObject({ kind: 'invalid-response' });
+});
+
+it('classifies malformed JSON as an invalid response', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => {
+      throw new SyntaxError('Unexpected token');
+    },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'invalid-response',
+  });
+});
+
 it('retries a failed progress read once', async () => {
   const fetchMock = vi
     .fn()
@@ -145,7 +240,13 @@ it('retries a failed progress read once', async () => {
       ok: true,
       status: 200,
       headers: { get: () => null },
-      json: async () => ({ chapterId: 7, pageNum: 9 }),
+      json: async () => ({
+        libraryId: 1,
+        seriesId: 2,
+        volumeId: 3,
+        chapterId: 7,
+        pageNum: 9,
+      }),
     });
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
