@@ -36,6 +36,7 @@
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
+  import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
 
   const skeletonThemes = [
     'catppuccin',
@@ -254,10 +255,21 @@
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
   let actionMenuBook = $state<BookRecord | null>(null);
+  let libraryMain = $state<HTMLElement | null>(null);
+  let virtualGrid = $state<HTMLElement | null>(null);
+  let gridColumns = $state(2);
+  let rowHeight = $state(400);
+  let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
+  let scrollTarget: HTMLElement | Window | null = null;
+  let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const nativePlatform = Capacitor.isNativePlatform();
   const SERIES_DETAIL_BATCH_SIZE = 8;
+  const VIRTUALIZATION_OVERSCAN_ROWS = 2;
+  const GRID_GAP_PX = 16;
+  const GRID_ROW_GAP_PX = 32;
+  const CARD_TEXT_HEIGHT_PX = 80;
   const COVER_LOAD_CONCURRENCY = 6;
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
@@ -271,7 +283,86 @@
     return server.baseUrl.toLowerCase().startsWith('http://');
   }
 
+  function columnsForWidth(width: number): number {
+    if (width >= 1024) return 5;
+    if (width >= 768) return 4;
+    if (width >= 640) return 3;
+    return 2;
+  }
+
+  function rowHeightFor(width: number, columns: number): number {
+    const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
+    return Math.max(1, Math.ceil(cardWidth * 1.5 + CARD_TEXT_HEIGHT_PX + GRID_ROW_GAP_PX));
+  }
+
+  function scheduleVirtualWindow(): void {
+    if (
+      destroyed ||
+      typeof window === 'undefined' ||
+      typeof window.requestAnimationFrame !== 'function' ||
+      virtualizationFrame !== null
+    ) {
+      return;
+    }
+    virtualizationFrame = window.requestAnimationFrame(() => {
+      virtualizationFrame = null;
+      updateVirtualWindow();
+    });
+  }
+
+  function updateVirtualWindow(): void {
+    if (destroyed || !virtualGrid) return;
+    const width = virtualGrid.clientWidth;
+    const nextColumns = width > 0 ? columnsForWidth(width) : gridColumns;
+    const nextRowHeight = width > 0 ? rowHeightFor(width, nextColumns) : rowHeight;
+    if (gridColumns !== nextColumns) gridColumns = nextColumns;
+    if (rowHeight !== nextRowHeight) rowHeight = nextRowHeight;
+
+    const gridRect = virtualGrid.getBoundingClientRect();
+    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
+    if (scrollContainer) {
+      const containerRect = scrollContainer.getBoundingClientRect();
+      const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
+      virtualWindow = calculateVirtualWindow(
+        visibleBooks.length,
+        nextColumns,
+        nextRowHeight,
+        scrollContainer.scrollTop - listTop,
+        scrollContainer.clientHeight,
+        VIRTUALIZATION_OVERSCAN_ROWS,
+      );
+      return;
+    }
+    if (typeof window === 'undefined') return;
+    virtualWindow = calculateVirtualWindow(
+      visibleBooks.length,
+      nextColumns,
+      nextRowHeight,
+      -gridRect.top,
+      window.innerHeight,
+      VIRTUALIZATION_OVERSCAN_ROWS,
+    );
+  }
+
+  $effect(() => {
+    if (visibleBooks.length > 0) scheduleVirtualWindow();
+  });
+
+  $effect(() => {
+    if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => scheduleVirtualWindow());
+    observer.observe(virtualGrid);
+    scheduleVirtualWindow();
+    return () => observer.disconnect();
+  });
+
   onMount(async () => {
+    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
+    scrollTarget = scrollContainer ?? window;
+    scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
+    window.addEventListener('resize', scheduleVirtualWindow);
+    scheduleVirtualWindow();
+
     const savedTheme = await getPreference('uiTheme');
     if (destroyed) return;
     const savedMode = await getPreference('uiMode');
@@ -335,6 +426,9 @@
   onDestroy(() => {
     destroyed = true;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
+    if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
+    scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
+    window.removeEventListener('resize', scheduleVirtualWindow);
     cancelCoverLoading();
     clearCovers();
     cleanups.forEach((remove) => void remove());
@@ -723,6 +817,7 @@
   />
 {:else}
   <main
+    bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
   >
     <header class="flex items-center justify-between gap-4">
@@ -936,78 +1031,92 @@
       </div>
     {:else}
       <section
-        class="mt-8 grid grid-cols-2 gap-x-4 gap-y-8 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5"
+        bind:this={virtualGrid}
+        class="relative mt-8"
+        style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
         aria-label="Books"
       >
-        {#each visibleBooks as book (book.id)}
-          <article class="relative text-left">
-            <button
-              class="group block w-full text-left"
-              type="button"
-              onclick={() => void open(book)}
-              oncontextmenu={(event) => {
-                event.preventDefault();
-                openMenu(book);
-              }}
-              disabled={downloadingBookId === book.id}
-            >
-              <div
-                class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
-              >
-                {#if covers[book.seriesId]}
-                  <img
-                    class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                    src={covers[book.seriesId]}
-                    loading="lazy"
-                    decoding="async"
-                    alt=""
-                  />
-                {/if}
-                {#if downloadingBookId === book.id}
-                  <span
-                    class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                    title="Downloading"
-                    aria-label="Downloading"
+        {#each Array.from( { length: virtualWindow.lastRow - virtualWindow.firstRow + 1 } ) as _, rowOffset (rowOffset)}
+          {@const rowIndex = virtualWindow.firstRow + rowOffset}
+          {@const rowStart = rowIndex * gridColumns}
+          {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
+          <div
+            class="absolute inset-x-0 grid gap-x-4"
+            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
+          >
+            {#each visibleBooks.slice(rowStart, rowEnd) as book (book.id)}
+              <article class="relative text-left">
+                <button
+                  class="group block w-full text-left"
+                  type="button"
+                  onclick={() => void open(book)}
+                  oncontextmenu={(event) => {
+                    event.preventDefault();
+                    openMenu(book);
+                  }}
+                  disabled={downloadingBookId === book.id}
+                >
+                  <div
+                    class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                   >
-                    <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
-                      <path
-                        fill="currentColor"
-                        d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+                    {#if covers[book.seriesId]}
+                      <img
+                        class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                        src={covers[book.seriesId]}
+                        loading="lazy"
+                        decoding="async"
+                        alt=""
                       />
-                    </svg>
-                  </span>
-                {/if}
-                {#if progressOf(book) > 0}
-                  <div class="absolute inset-x-0 bottom-0 h-1.5">
-                    <div
-                      class="h-full preset-filled-primary-600-400"
-                      style:width={`${progressOf(book)}%`}
-                    ></div>
+                    {/if}
+                    {#if downloadingBookId === book.id}
+                      <span
+                        class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                        title="Downloading"
+                        aria-label="Downloading"
+                      >
+                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
+                          <path
+                            fill="currentColor"
+                            d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+                          />
+                        </svg>
+                      </span>
+                    {/if}
+                    {#if progressOf(book) > 0}
+                      <div class="absolute inset-x-0 bottom-0 h-1.5">
+                        <div
+                          class="h-full preset-filled-primary-600-400"
+                          style:width={`${progressOf(book)}%`}
+                        ></div>
+                      </div>
+                    {/if}
                   </div>
-                {/if}
-              </div>
-              <h2 class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50">
-                {book.title}
-              </h2>
-              <p class="mt-1 truncate text-sm text-surface-700-300">
-                {book.author ?? 'Unknown author'}
-              </p>
-            </button>
-            <button
-              class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-7 w-7 !p-0 shadow-md"
-              type="button"
-              onclick={() => openMenu(book)}
-              aria-label={`Book actions for ${book.title}`}
-              title="More actions"
-            >
-              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                <path
-                  fill="currentColor"
-                  d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
-                />
-              </svg>
-            </button>
-          </article>
+                  <h2
+                    class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                  >
+                    {book.title}
+                  </h2>
+                  <p class="mt-1 truncate text-sm text-surface-700-300">
+                    {book.author ?? 'Unknown author'}
+                  </p>
+                </button>
+                <button
+                  class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-7 w-7 !p-0 shadow-md"
+                  type="button"
+                  onclick={() => openMenu(book)}
+                  aria-label={`Book actions for ${book.title}`}
+                  title="More actions"
+                >
+                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                    <path
+                      fill="currentColor"
+                      d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                    />
+                  </svg>
+                </button>
+              </article>
+            {/each}
+          </div>
         {/each}
       </section>
     {/if}

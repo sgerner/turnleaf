@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Virtualize large library grids while preserving stable book ordering and touch scrolling.
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.
 - Make native library metadata refreshes transactional so failed updates leave the saved library unchanged.
 
