@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Virtualize large library grids while preserving stable book ordering and touch scrolling.
+
 ## 0.3.2
 
 - Generate clean GitHub release notes without npm command output.
