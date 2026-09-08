@@ -256,6 +256,8 @@
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const nativePlatform = Capacitor.isNativePlatform();
+  const SERIES_DETAIL_BATCH_SIZE = 8;
+  let destroyed = false;
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
@@ -267,47 +269,66 @@
 
   onMount(async () => {
     const savedTheme = await getPreference('uiTheme');
+    if (destroyed) return;
     const savedMode = await getPreference('uiMode');
+    if (destroyed) return;
     const savedAutoSync = await getPreference('syncFurthest');
+    if (destroyed) return;
     pendingTheme = (savedTheme as SkeletonTheme | null) ?? (theme as SkeletonTheme);
     pendingMode = savedMode === 'light' ? 'light' : mode;
     pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
     books = await getBooks(server.id);
+    if (destroyed) return;
     void loadCovers(books);
     loading = false;
     offline = !(await Network.getStatus()).connected;
+    if (destroyed) return;
     if (!offline) await refresh();
+    if (destroyed) return;
     cleanups.push(
-      (
+      await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
+          if (destroyed) return;
           offline = !connected;
           if (connected)
             void flushProgress(client)
               .then(refresh)
               .catch(() => {});
-        })
-      ).remove,
+        }),
+      ),
     );
     cleanups.push(
-      (
+      await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
-          if (!isActive) void flushProgress(client).catch(() => {});
-        })
-      ).remove,
+          if (!destroyed && !isActive) void flushProgress(client).catch(() => {});
+        }),
+      ),
     );
     cleanups.push(
-      (
+      await registerListener(
         await App.addListener('backButton', () => {
+          if (destroyed) return;
           if (actionMenuBook) actionMenuBook = null;
           else if (reading) reading = null;
           else if (settingsVisible) settingsVisible = false;
           else void App.exitApp();
-        })
-      ).remove,
+        }),
+      ),
     );
   });
 
+  async function registerListener(handle: {
+    remove: () => Promise<void>;
+  }): Promise<() => Promise<void>> {
+    if (destroyed) {
+      await handle.remove();
+      return async () => {};
+    }
+    return handle.remove;
+  }
+
   onDestroy(() => {
+    destroyed = true;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     Object.values(covers)
       .filter((cover) => cover.startsWith('blob:'))
@@ -316,19 +337,28 @@
   });
 
   async function refresh(): Promise<void> {
-    if (refreshing) return;
+    if (destroyed || refreshing) return;
     refreshing = true;
     message = '';
     try {
       const series = await client.getBookSeries();
-      const mapped = (
-        await Promise.all(
-          series.map(async (item) =>
-            mapSeriesToBooks(server.id, item, await client.getSeriesDetail(item.id)),
-          ),
-        )
-      ).flat();
+      const mapped: BookRecord[] = [];
+      for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
+        if (destroyed) return;
+        const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
+        mapped.push(
+          ...(
+            await Promise.all(
+              batch.map(async (item) =>
+                mapSeriesToBooks(server.id, item, await client.getSeriesDetail(item.id)),
+              ),
+            )
+          ).flat(),
+        );
+      }
+      if (destroyed) return;
       await replaceBooks(server.id, mapped);
+      if (destroyed) return;
       books = await getBooks(server.id);
       void loadCovers(books);
       offline = false;

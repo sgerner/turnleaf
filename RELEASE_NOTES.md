@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.1
+
+- Guard library startup teardown and limit concurrent Kavita detail requests for large libraries.
+
 ## 0.3.0
 
 - Add a monochrome e-ink theme with light and dark reading modes.
@@ -18,7 +22,6 @@
 - Load all Kavita series pages so large libraries do not silently omit books after the first 500 series.
 
 ## 0.2.0
-
 
 - Keep Kavita auth keys out of cover and download URLs by using authenticated headers for those requests.
 - Disable Android app-data backup and narrow the Android FileProvider path used by the app.
@@ -45,9 +48,7 @@
 - Slightly increase the reader bottom margin to clear the gesture navigation bar
 - fix: update android launcher icon
 
-
 ## 0.1.7
-
 
 - Improve onboarding style and layout
 - Improve reader margin
@@ -55,9 +56,7 @@
 - Release APKs now embed the full `x.y.z+build` version so the update banner does not falsely appear on the latest installed release.
 - chore: release 0.1.6
 
-
 ## 0.1.6
-
 
 - Preserve and restore Kavita EPUB progress at the correct spine section and nearby text location across devices.
 - Prevent the reader's initial page-one event from overwriting saved progress while a location is restoring.
@@ -69,9 +68,7 @@
 
 - Add a startup reset path that clears corrupted local SQLite state without deleting downloaded EPUB files.
 
-
 ## 0.1.5
-
 
 - Restore reader status bar hiding on Android and add a native reader chrome toggle.
 - Reapply Android reader immersive mode on resume and window focus so the gesture bar stays hidden more reliably.
@@ -79,9 +76,7 @@
 - Fix Android volume buttons so reader paging consumes the key events instead of changing system volume.
 - Fix versioned release notes
 
-
 ## 0.1.4
-
 
 - Mount reader footer independently
 - Tighten reader safe areas
@@ -96,9 +91,7 @@
 - Reader safe-area layout now keeps EPUB text clear of the camera notch and status bar.
 - Optional native reader helpers no longer block EPUBs from opening if they fail.
 
-
 ## 0.1.3
-
 
 - Reader mode now hides the native status bar on supported devices.
 - Android reader mode now supports hardware volume buttons for page turns.
