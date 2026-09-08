@@ -2,9 +2,11 @@
 
 ## Unreleased
 
+- security: reject unexpected Kavita redirects
 - feat: add library filters and compact list view
 - Add persisted author and series filters plus a compact list view for large-library discovery.
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
+- Reject unexpected Kavita HTTP redirects in browser and native requests.
 - Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
 - Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
 - Document the iOS readiness matrix and keep platform support explicitly unverified until macOS and device checks pass.
