@@ -1,0 +1,14 @@
+services:
+  kavita:
+    image: lscr.io/linuxserver/kavita:latest
+    container_name: turnleaf-dev-kavita
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    ports:
+      - '5000:5000'
+    restart: unless-stopped
+    volumes:
+      - ./kavita/config:/config
+      - ./kavita/data:/data

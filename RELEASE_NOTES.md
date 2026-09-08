@@ -4,6 +4,7 @@
 
 - Update DOMPurify and the EPUB XML parser to patched releases so production dependency audits pass.
 - Add pure black/white "eink" theme for e-paper readers
+- Add local Kavita dev environment via Docker Compose
 
 ## 0.2.0
 

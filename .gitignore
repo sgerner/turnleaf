@@ -15,3 +15,9 @@ ios/App/DerivedData/
 keystore.properties
 .env
 .opencode/plugins/emdash-notifications.js
+dev/kavita/config/*
+!dev/kavita/config/.gitkeep
+dev/kavita/data/*
+!dev/kavita/data/Books/
+dev/kavita/data/Books/*
+!dev/kavita/data/Books/lorem-ipsum.epub
