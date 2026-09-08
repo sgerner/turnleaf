@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Report individual and bulk download-removal failures instead of claiming storage was cleared.
 - Update the changed book in memory after reader progress saves instead of reloading the full library.
 - docs: add future implementation work plan
 - Add a native library index for server-scoped title queries.
