@@ -10,6 +10,7 @@
 - Add a setting to keep the screen awake while reading
 - Refresh library progress from local storage after reader navigation, including when returning with Android Back or the reader Back button.
 - Size the reader viewport between its safe-area insets so Android navigation bars and the bottom margin do not cover book text.
+- Include EPUBs nested in Kavita series volumes while preserving existing local book records.
 
 ## 0.2.0
 

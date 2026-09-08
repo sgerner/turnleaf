@@ -3,16 +3,38 @@ import type { KavitaChapter, KavitaSeries, KavitaSeriesDetail } from './types';
 
 const EMPTY_DATE = '0001-01-01T00:00:00';
 
-export function mapSeriesToBook(
+export function mapSeriesToBooks(
   serverId: string,
   series: KavitaSeries,
   detail: KavitaSeriesDetail,
-): BookRecord | null {
-  const chapters = [...detail.chapters, ...detail.specials, ...detail.storylineChapters];
-  const chapter = chapters.find(isEpubChapter);
-  if (!chapter) return null;
+): BookRecord[] {
+  // Keep flat arrays first so their representation wins if Kavita exposes the
+  // same chapter both flat and nested. IDs include the chapter ID, so existing
+  // local records remain matched regardless of this ordering.
+  const chapters = [
+    ...detail.chapters,
+    ...detail.specials,
+    ...detail.storylineChapters,
+    ...(detail.volumes ?? []).flatMap((volume) => volume.chapters),
+  ];
+  const seen = new Set<number>();
+  return chapters
+    .filter(isEpubChapter)
+    .filter((chapter) => {
+      if (seen.has(chapter.id)) return false;
+      seen.add(chapter.id);
+      return true;
+    })
+    .map((chapter) => mapChapterToBook(serverId, series, chapter));
+}
+
+function mapChapterToBook(
+  serverId: string,
+  series: KavitaSeries,
+  chapter: KavitaChapter,
+): BookRecord {
   const file = chapter.files.find((item) => item.extension.toLowerCase() === '.epub');
-  if (!file) return null;
+  if (!file) throw new Error('An EPUB chapter did not include an EPUB file.');
   return {
     id: `${serverId}:${series.id}:${chapter.id}`,
     serverId,
@@ -26,13 +48,18 @@ export function mapSeriesToBook(
     descriptionHtml: chapter.summary || null,
     format: 'epub',
     pages: chapter.pages || series.pages,
-    pagesRead: chapter.pagesRead || series.pagesRead,
+    pagesRead: chapter.pagesRead ?? series.pagesRead,
     createdAt: series.created,
-    lastReadAt: series.latestReadDate.startsWith(EMPTY_DATE) ? null : series.latestReadDate,
+    lastReadAt: lastReadAt(chapter, series),
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
   };
+}
+
+function lastReadAt(chapter: KavitaChapter, series: KavitaSeries): string | null {
+  const value = chapter.lastReadingProgressUtc ?? series.latestReadDate;
+  return !value || value.startsWith(EMPTY_DATE) ? null : value;
 }
 
 function isEpubChapter(chapter: KavitaChapter): boolean {
