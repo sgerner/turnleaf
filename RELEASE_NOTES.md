@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- test: run sqlite integration in node
+- test: cover metadata refresh with real sqlite
+- Exercise native metadata refresh and removal reconciliation against real in-memory SQLite transactions.
 - feat: add local reader highlights and notes
 - feat: add cancellable in-book search
 - Add cancellable in-book search with exact EPUB CFI result navigation.
