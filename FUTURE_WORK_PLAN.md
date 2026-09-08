@@ -261,6 +261,19 @@ Reconcile claims with code and validated behavior, especially sync triggers, res
 
 Acceptance: documentation walkthrough from clean install to offline reading matches the app; referenced package versions agree with the lockfile; release notes distinguish implementation from device verification; a release checklist records remaining platform limitations.
 
+## Implementation status
+
+The remaining implementable items from this plan are split into focused pull requests:
+
+- F1 residual discovery controls: [#89](https://github.com/sgerner/turnleaf/pull/89).
+- F3 in-book search: [#90](https://github.com/sgerner/turnleaf/pull/90); local highlights, notes, and Markdown export: [#91](https://github.com/sgerner/turnleaf/pull/91).
+- S2 authenticated redirect hardening: [#92](https://github.com/sgerner/turnleaf/pull/92).
+- T2 real SQLite transaction coverage: [#93](https://github.com/sgerner/turnleaf/pull/93); Android emulator startup smoke: [#94](https://github.com/sgerner/turnleaf/pull/94).
+- Android accessibility, network-isolation, and offline-reopen procedure: [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md) and [#95](https://github.com/sgerner/turnleaf/pull/95).
+- P4 native library query index and query-plan coverage: [#96](https://github.com/sgerner/turnleaf/pull/96).
+
+Automated checks cover the code paths available in this environment. TalkBack behavior, WebView network traces, and named-device performance measurements still require an Android device or a completed emulator acceptance run; record those results with the checklist. iOS readiness and the deferred product decisions remain intentionally outside this implementation batch.
+
 ## Deferred product decisions
 
 - Multi-server profiles: onboarding currently uses a fixed `primary` identity. Validate demand before expanding it; first require server-scoped queues, cache keys, credentials, and offline data isolation.

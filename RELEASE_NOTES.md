@@ -5,6 +5,8 @@
 - test: update migration coverage for library index
 - perf: index native library title reads
 - Add a server-scoped native library title index with migration and query-plan coverage.
+- docs: record remaining work implementation status
+- docs: add Android device validation checklist
 - test: run sqlite integration in node
 - test: cover metadata refresh with real sqlite
 - Exercise native metadata refresh and removal reconciliation against real in-memory SQLite transactions.
