@@ -2,8 +2,10 @@
 
 ## Unreleased
 
+- test: cover metadata refresh with real sqlite
 - security: reject unexpected Kavita redirects
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
+- Exercise native metadata refresh and removal reconciliation against real in-memory SQLite transactions.
 - Reject unexpected Kavita HTTP redirects in browser and native requests.
 - Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
 - Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
