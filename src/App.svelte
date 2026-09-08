@@ -29,7 +29,9 @@
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
 
-  onMount(async () => {
+  async function loadLocalData(): Promise<void> {
+    booting = true;
+    startupError = '';
     void checkForRelease();
     try {
       const saved = await getServer();
@@ -42,10 +44,15 @@
         if (apiKey) server = saved;
       }
     } catch {
-      startupError = 'Local data could not be opened. Your downloaded books were not changed.';
+      startupError =
+        'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
       booting = false;
     }
+  }
+
+  onMount(() => {
+    void loadLocalData();
   });
 
   async function repairLocalData(): Promise<void> {
@@ -53,8 +60,10 @@
     startupError = '';
     try {
       await resetLocalDatabase();
+      startupError = '';
     } catch {
-      startupError = 'Local data could not be reset. Try reinstalling the app.';
+      startupError =
+        'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
       return;
     } finally {
       repairing = false;
@@ -166,8 +175,24 @@
             <button
               class="btn btn-sm preset-filled-error-500 !text-sm"
               type="button"
+              onclick={() => void loadLocalData()}
               disabled={repairing}
-              onclick={repairLocalData}
+            >
+              Retry
+            </button>
+            <button
+              class="btn btn-sm preset-tonal-error !text-sm"
+              type="button"
+              disabled={repairing}
+              onclick={() => {
+                if (
+                  window.confirm(
+                    'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
+                  )
+                ) {
+                  void repairLocalData();
+                }
+              }}
             >
               {repairing ? 'Resetting...' : 'Reset local data'}
             </button>

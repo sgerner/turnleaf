@@ -151,8 +151,10 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
   const current = await db.getVersion();
   for (const migration of migrations) {
     if (migration.version <= (current.version ?? 0)) continue;
-    await db.execute(migration.statements, true);
-    await db.execute(`PRAGMA user_version = ${migration.version};`);
+    await db.executeTransaction([
+      { statement: migration.statements },
+      { statement: `PRAGMA user_version = ${migration.version};` },
+    ]);
   }
 }
 
@@ -345,6 +347,41 @@ export interface PendingProgressPayload {
   bookScrollId?: string | null;
 }
 
+const readingStateUpsertStatement = `INSERT INTO reading_state
+  (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync)
+  VALUES (?,?,?,?,?,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
+  kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
+  local_updated_at=excluded.local_updated_at,pending_sync=1`;
+
+const syncQueueUpsertStatement = `INSERT INTO sync_queue
+  (book_id,payload_json,created_at,updated_at) VALUES (?,?,?,?)
+  ON CONFLICT(book_id) DO UPDATE SET payload_json=excluded.payload_json,
+  updated_at=excluded.updated_at`;
+
+function createReadingStateTask(
+  bookId: string,
+  cfi: string,
+  xpath: string | null,
+  percentage: number,
+  updatedAt: string,
+): capTask {
+  return {
+    statement: readingStateUpsertStatement,
+    values: [bookId, cfi, xpath, percentage, updatedAt],
+  };
+}
+
+function createSyncQueueTask(
+  bookId: string,
+  payload: PendingProgressPayload,
+  updatedAt: string,
+): capTask {
+  return {
+    statement: syncQueueUpsertStatement,
+    values: [bookId, JSON.stringify(payload), updatedAt, updatedAt],
+  };
+}
+
 export async function getReadingState(bookId: string): Promise<StoredReadingState | null> {
   if (!Capacitor.isNativePlatform()) {
     return readBrowserState().readingState[bookId] ?? null;
@@ -418,23 +455,13 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await db.run(
-    `INSERT INTO reading_state (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync)
-    VALUES (?,?,?,?,?,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
-    kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
-    local_updated_at=excluded.local_updated_at,pending_sync=1`,
-    [book.id, cfi, xpath, percentage, now],
-  );
-  await db.run(
-    `INSERT INTO sync_queue (book_id,payload_json,created_at,updated_at) VALUES (?,?,?,?)
-    ON CONFLICT(book_id) DO UPDATE SET payload_json=excluded.payload_json,
-    updated_at=excluded.updated_at`,
-    [book.id, JSON.stringify(payload), now, now],
-  );
-  await db.run('UPDATE books SET pages_read=?, last_read_at=? WHERE id=?', [
-    pagesRead,
-    now,
-    book.id,
+  await db.executeTransaction([
+    createReadingStateTask(book.id, cfi, xpath, percentage, now),
+    createSyncQueueTask(book.id, payload, now),
+    {
+      statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+      values: [pagesRead, now, book.id],
+    },
   ]);
 }
 
@@ -483,26 +510,17 @@ export async function markBookCompleted(
     return;
   }
   const db = await openDatabase();
-  await db.run('UPDATE books SET pages_read=?, last_read_at=? WHERE id=?', [
-    book.pages,
-    now,
-    book.id,
-  ]);
+  const tasks: capTask[] = [
+    {
+      statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+      values: [book.pages, now, book.id],
+    },
+  ];
   if (readingState) {
-    await db.run(
-      `INSERT INTO reading_state (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync)
-      VALUES (?,?,?,?,?,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
-      kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
-      local_updated_at=excluded.local_updated_at,pending_sync=1`,
-      [book.id, readingState.cfi, readingState.xpath, 1, now],
-    );
+    tasks.push(createReadingStateTask(book.id, readingState.cfi, readingState.xpath, 1, now));
   }
-  await db.run(
-    `INSERT INTO sync_queue (book_id,payload_json,created_at,updated_at) VALUES (?,?,?,?)
-    ON CONFLICT(book_id) DO UPDATE SET payload_json=excluded.payload_json,
-    updated_at=excluded.updated_at`,
-    [book.id, JSON.stringify(payload), now, now],
-  );
+  tasks.push(createSyncQueueTask(book.id, payload, now));
+  await db.executeTransaction(tasks);
 }
 
 export interface PendingSyncItem {
