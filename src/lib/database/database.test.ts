@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
-import { confirmSync, replaceBooksInTransaction, type BookRecord } from './database';
+import { confirmSync, getSyncStatus, replaceBooksInTransaction, type BookRecord } from './database';
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
 
@@ -211,4 +211,47 @@ it('does not acknowledge a queue item that was replaced while it uploaded', asyn
   await confirmSync('book-1', '2026-09-07T00:00:02.000Z', '2026-09-07T00:00:00.000Z');
 
   expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toEqual(state);
+});
+
+it('reports pending and failed browser sync work for recovery UI', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [],
+      readingState: {},
+      syncQueue: {
+        'book-1': {
+          bookId: 'book-1',
+          payloadJson: '{}',
+          attemptCount: 1,
+          lastAttemptAt: '2026-09-07T00:00:01.000Z',
+          lastError: 'Kavita rejected this auth key.',
+          createdAt: '2026-09-07T00:00:00.000Z',
+          updatedAt: '2026-09-07T00:00:01.000Z',
+        },
+        'book-2': {
+          bookId: 'book-2',
+          payloadJson: '{}',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: '2026-09-07T00:00:02.000Z',
+          updatedAt: '2026-09-07T00:00:02.000Z',
+        },
+      },
+      preferences: {},
+    }),
+  );
+
+  await expect(getSyncStatus()).resolves.toEqual({
+    pendingCount: 2,
+    failedCount: 1,
+    lastError: 'Kavita rejected this auth key.',
+    lastUpdatedAt: '2026-09-07T00:00:02.000Z',
+  });
 });
