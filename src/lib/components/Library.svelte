@@ -323,25 +323,48 @@
     if (scrollContainer) {
       const containerRect = scrollContainer.getBoundingClientRect();
       const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
-      virtualWindow = calculateVirtualWindow(
-        visibleBooks.length,
-        nextColumns,
-        nextRowHeight,
-        scrollContainer.scrollTop - listTop,
-        scrollContainer.clientHeight,
-        VIRTUALIZATION_OVERSCAN_ROWS,
+      virtualWindow = preserveFocusedRow(
+        calculateVirtualWindow(
+          visibleBooks.length,
+          nextColumns,
+          nextRowHeight,
+          scrollContainer.scrollTop - listTop,
+          scrollContainer.clientHeight,
+          VIRTUALIZATION_OVERSCAN_ROWS,
+        ),
       );
       return;
     }
     if (typeof window === 'undefined') return;
-    virtualWindow = calculateVirtualWindow(
-      visibleBooks.length,
-      nextColumns,
-      nextRowHeight,
-      -gridRect.top,
-      window.innerHeight,
-      VIRTUALIZATION_OVERSCAN_ROWS,
+    virtualWindow = preserveFocusedRow(
+      calculateVirtualWindow(
+        visibleBooks.length,
+        nextColumns,
+        nextRowHeight,
+        -gridRect.top,
+        window.innerHeight,
+        VIRTUALIZATION_OVERSCAN_ROWS,
+      ),
     );
+  }
+
+  function preserveFocusedRow(next: VirtualWindow): VirtualWindow {
+    if (next.totalRows === 0 || typeof document === 'undefined') return next;
+    const activeBookId =
+      document.activeElement?.closest<HTMLElement>('[data-book-id]')?.dataset.bookId;
+    if (!activeBookId) return next;
+    const bookIndex = visibleBooks.findIndex((book) => book.id === activeBookId);
+    if (bookIndex < 0) return next;
+    const focusedRow = Math.floor(bookIndex / gridColumns);
+    const firstRow = Math.min(next.firstRow, focusedRow);
+    const lastRow = Math.max(next.lastRow, focusedRow);
+    return {
+      ...next,
+      firstRow,
+      lastRow,
+      startIndex: firstRow * gridColumns,
+      endIndex: Math.min(visibleBooks.length, (lastRow + 1) * gridColumns),
+    };
   }
 
   $effect(() => {
@@ -1053,7 +1076,7 @@
             style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book (book.id)}
-              <article class="relative text-left">
+              <article class="relative text-left" data-book-id={book.id}>
                 <button
                   class="group block w-full text-left"
                   type="button"
