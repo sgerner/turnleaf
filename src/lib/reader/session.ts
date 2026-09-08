@@ -1,5 +1,10 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
+import {
+  clipReaderSearchExcerpt,
+  normalizeReaderSearchQuery,
+  type ReaderSearchResult,
+} from './search';
 
 export interface ReaderLocation {
   cfi: string;
@@ -12,6 +17,11 @@ export interface ReaderLocation {
 }
 
 export type ReaderLocationOrigin = 'navigation' | 'restore';
+
+export interface ReaderSelection {
+  cfi: string;
+  text: string;
+}
 
 export interface TocItem {
   label: string;
@@ -91,6 +101,8 @@ interface SpineSection {
   href: string;
   index: number;
   cfiBase: string;
+  load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
+  unload: () => void;
 }
 
 const MODE_COLORS = {
@@ -332,6 +344,7 @@ export class ReaderSession {
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
+  private selectionListeners: Array<() => void> = [];
   private current: Location | null = null;
   private userNavigationPending = false;
   private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
@@ -349,6 +362,7 @@ export class ReaderSession {
     appearance: Appearance,
     onLocation: (location: ReaderLocation, origin: ReaderLocationOrigin) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
+    onSelection?: (selection: ReaderSelection) => void,
   ): Promise<void> {
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -359,6 +373,25 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    if (onSelection) {
+      this.rendition.hooks.content.register((contents: Contents) => {
+        const handler = () => {
+          const selection = contents.window.getSelection();
+          if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+          const text = selection.toString().replace(/\s+/g, ' ').trim();
+          if (!text) return;
+          try {
+            onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
+          } catch {
+            // Selection can change while a section is being replaced.
+          }
+        };
+        contents.document.addEventListener('selectionchange', handler);
+        this.selectionListeners.push(() =>
+          contents.document.removeEventListener('selectionchange', handler),
+        );
+      });
+    }
     this.onLocation = onLocation;
     this.relocated = (location) => {
       this.current = location;
@@ -433,6 +466,41 @@ export class ReaderSession {
     }));
   }
 
+  async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
+    const normalizedQuery = normalizeReaderSearchQuery(query);
+    if (!normalizedQuery) return [];
+    const results: ReaderSearchResult[] = [];
+    const sections = this.spineSections();
+    const request = this.book.request as (url: string) => Promise<Document>;
+
+    for (const section of sections) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const wasLoaded = Boolean((section as unknown as { contents?: unknown }).contents);
+      try {
+        await section.load(request);
+        const matches = (
+          section as unknown as {
+            search: (value: string) => Array<{ cfi: string; excerpt: string }>;
+          }
+        ).search(normalizedQuery);
+        for (const match of matches) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          if (!match.cfi) continue;
+          results.push({
+            cfi: match.cfi,
+            excerpt: clipReaderSearchExcerpt(match.excerpt),
+            href: section.href,
+            spineIndex: section.index,
+          });
+          if (results.length >= limit) return results;
+        }
+      } finally {
+        if (!wasLoaded) section.unload();
+      }
+    }
+    return results;
+  }
+
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     await this.navigate(() => this.rendition!.display(href));
@@ -502,6 +570,8 @@ export class ReaderSession {
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     this.rendition?.destroy();
+    this.selectionListeners.forEach((remove) => remove());
+    this.selectionListeners = [];
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;

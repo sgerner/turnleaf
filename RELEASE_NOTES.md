@@ -4,10 +4,16 @@
 
 - test: run sqlite integration in node
 - test: cover metadata refresh with real sqlite
-- security: reject unexpected Kavita redirects
-- Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
 - Exercise native metadata refresh and removal reconciliation against real in-memory SQLite transactions.
+- feat: add local reader highlights and notes
+- feat: add cancellable in-book search
+- Add cancellable in-book search with exact EPUB CFI result navigation.
+- feat: add library filters and compact list view
+- Add persisted author and series filters plus a compact list view for large-library discovery.
+- security: reject unexpected Kavita redirects
 - Reject unexpected Kavita HTTP redirects in browser and native requests.
+- Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
+- Add local EPUB highlights and notes with restart persistence, CFI navigation, and Markdown export.
 - Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
 - Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
 - Document the iOS readiness matrix and keep platform support explicitly unverified until macOS and device checks pass.
