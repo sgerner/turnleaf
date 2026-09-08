@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test: run sqlite integration in node
 - test: cover metadata refresh with real sqlite
 - security: reject unexpected Kavita redirects
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.

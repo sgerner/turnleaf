@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue } from 'node:sqlite';
 import type { capTask } from '@capacitor-community/sqlite';
