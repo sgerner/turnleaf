@@ -131,15 +131,15 @@ it('groups completion and acknowledgement writes separately', async () => {
   const { confirmSync, markBookCompleted } = await import('./database');
 
   await markBookCompleted(book, readingState);
-  await confirmSync(book.id, '2026-01-02T00:00:00.000Z');
+  await confirmSync(book.id, '2026-01-02T00:00:00.000Z', readingState.localUpdatedAt);
 
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
   const [completionTasks, acknowledgementTasks] = mocks.executeTransaction.mock.calls;
   expect(completionTasks?.[0]).toHaveLength(3);
   expect(acknowledgementTasks?.[0]).toHaveLength(2);
   expect(acknowledgementTasks?.[0]?.map((task) => task.statement)).toEqual([
-    expect.stringContaining('DELETE FROM sync_queue'),
     expect.stringContaining('UPDATE reading_state'),
+    expect.stringContaining('DELETE FROM sync_queue'),
   ]);
 });
 

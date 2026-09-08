@@ -3,6 +3,7 @@
 ## Unreleased
 
 - docs: add future implementation work plan
+- Preserve newer local reading progress when an older sync upload completes.
 - Add an Android SDK preflight that explains missing local SDK configuration before Gradle builds.
 - Virtualize large library grids while preserving stable book ordering and touch scrolling.
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.

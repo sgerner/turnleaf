@@ -523,23 +523,37 @@ export async function markBookCompleted(
   await db.executeTransaction(tasks);
 }
 
-export async function getPendingSync(): Promise<Array<{ bookId: string; payload: string }>> {
+export interface PendingSyncItem {
+  bookId: string;
+  payload: string;
+  updatedAt: string;
+}
+
+export async function getPendingSync(): Promise<PendingSyncItem[]> {
   if (!Capacitor.isNativePlatform()) {
     return Object.values(readBrowserState().syncQueue)
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
-      .map((row) => ({ bookId: row.bookId, payload: row.payloadJson }));
+      .map((row) => ({ bookId: row.bookId, payload: row.payloadJson, updatedAt: row.updatedAt }));
   }
   const db = await openDatabase();
-  const result = await db.query('SELECT book_id,payload_json FROM sync_queue ORDER BY updated_at');
+  const result = await db.query(
+    'SELECT book_id,payload_json,updated_at FROM sync_queue ORDER BY updated_at',
+  );
   return (result.values ?? []).map((row) => ({
     bookId: String(row.book_id),
     payload: String(row.payload_json),
+    updatedAt: String(row.updated_at),
   }));
 }
 
-export async function confirmSync(bookId: string, serverUpdatedAt: string): Promise<void> {
+export async function confirmSync(
+  bookId: string,
+  serverUpdatedAt: string,
+  expectedUpdatedAt: string,
+): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
+    if (state.syncQueue[bookId]?.updatedAt !== expectedUpdatedAt) return;
     delete state.syncQueue[bookId];
     if (state.readingState[bookId]) {
       state.readingState[bookId] = {
@@ -553,11 +567,15 @@ export async function confirmSync(bookId: string, serverUpdatedAt: string): Prom
   }
   const db = await openDatabase();
   await db.executeTransaction([
-    { statement: 'DELETE FROM sync_queue WHERE book_id=?', values: [bookId] },
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=local_updated_at,
-      server_updated_at=? WHERE book_id=?`,
-      values: [serverUpdatedAt, bookId],
+        server_updated_at=? WHERE book_id=? AND local_updated_at=?
+        AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=?)`,
+      values: [serverUpdatedAt, bookId, expectedUpdatedAt, bookId, expectedUpdatedAt],
+    },
+    {
+      statement: 'DELETE FROM sync_queue WHERE book_id=? AND updated_at=?',
+      values: [bookId, expectedUpdatedAt],
     },
   ]);
 }
