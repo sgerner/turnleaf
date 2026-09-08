@@ -611,9 +611,15 @@
     }
   }
 
-  async function remove(book: BookRecord): Promise<void> {
-    if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath).catch(() => {});
-    await removeDownload(book.id);
+  async function remove(book: BookRecord): Promise<boolean> {
+    try {
+      if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath);
+      await removeDownload(book.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'storage error';
+      message = `Could not remove ${book.title}: ${detail}`;
+      return false;
+    }
     books = books.map((item) =>
       item.id === book.id
         ? {
@@ -624,6 +630,7 @@
           }
         : item,
     );
+    return true;
   }
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
@@ -781,8 +788,20 @@
   }
 
   async function removeAllDownloads(): Promise<void> {
-    for (const book of books.filter((item) => item.downloadPath)) await remove(book);
-    message = 'Downloaded books removed. Kavita was not changed.';
+    const candidates = books.filter((item) => item.downloadPath);
+    const failed: string[] = [];
+    for (const book of candidates) {
+      if (!(await remove(book))) failed.push(book.title);
+    }
+    if (failed.length === 0) {
+      message = candidates.length
+        ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
+        : 'No downloaded books to remove.';
+    } else {
+      const succeeded = candidates.length - failed.length;
+      const names = failed.slice(0, 2).join(', ');
+      message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
+    }
     closeSettings();
   }
 
