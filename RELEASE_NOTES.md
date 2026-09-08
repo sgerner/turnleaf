@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- ci: use software-compatible Android smoke image
+- ci: make emulator smoke startup deterministic
+- ci: add Android emulator startup smoke test
+- Add an Android emulator CI smoke test that installs the debug APK and verifies app startup.
 - test: update migration coverage for library index
 - perf: index native library title reads
 - Add a server-scoped native library title index with migration and query-plan coverage.
