@@ -78,4 +78,10 @@ export const migrations = [
       );
     `,
   },
+  {
+    version: 4,
+    statements: `
+      ALTER TABLE books ADD COLUMN remote_available INTEGER NOT NULL DEFAULT 1;
+    `,
+  },
 ] as const;

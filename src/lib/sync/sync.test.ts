@@ -87,3 +87,39 @@ it('keeps a newer local queue item when an older upload completes', async () => 
   expect(saved.syncQueue['book-1']).toEqual(second.syncQueue['book-1']);
   expect(saved.readingState['book-1']?.pendingSync).toBe(true);
 });
+
+it('continues syncing later items when an earlier item fails', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const saveProgress = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('first item failed'))
+    .mockResolvedValueOnce(undefined);
+
+  await expect(flushProgress({ saveProgress } as never)).rejects.toThrow(
+    '1 reading progress item failed to sync.',
+  );
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']?.lastError).toBe('first item failed');
+  expect(saved.syncQueue['book-2']).toBeUndefined();
+  expect(saved.readingState['book-2']?.pendingSync).toBe(false);
+});
