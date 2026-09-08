@@ -2,11 +2,21 @@
 
 ## Unreleased
 
+- docs: add future implementation work plan
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
+- Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.
+- Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.
+- Keep virtualized library windows valid at the end of long lists and preserve focused books while scrolling.
+- Harden the browser development proxy with loopback and HTTPS origin controls, bounded requests, filtered credentials, and safe upstream failure handling.
+- Isolate rendered EPUB content from remote resources and unsafe navigation while preserving internal links and local assets.
+- Preserve newer local reading progress when an older sync upload completes.
 - Add an Android SDK preflight that explains missing local SDK configuration before Gradle builds.
 - Virtualize large library grids while preserving stable book ordering and touch scrolling.
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.
 - Make native library metadata refreshes transactional so failed updates leave the saved library unchanged.
+- Add a retry-first local-data recovery path with an explicit reset warning that preserves downloaded EPUB files.
+- Propagate the resolved Android SDK to Capacitor and Gradle builds, validate installed packages and Java compatibility, and report actionable preflight failures.
+- Make native reading progress, completion, sync acknowledgement, and migrations transactional.
 
 ## 0.3.2
 

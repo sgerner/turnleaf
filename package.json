@@ -20,8 +20,8 @@
     "cap:sync": "npm run build && cap sync",
     "android:open": "export $(grep -v '^#' .env | xargs) && cap open android",
     "android:doctor": "node scripts/check-android-sdk.mjs",
-    "android:debug": "npm run android:doctor && npm run cap:sync && cd android && ./gradlew assembleDebug",
-    "android:release": "npm run android:doctor && npm run build && npx cap sync android && cd android && ./gradlew assembleRelease",
+    "android:debug": "node scripts/android-build.mjs debug",
+    "android:release": "node scripts/android-build.mjs release",
     "ios:sync": "npm run build && cap sync ios",
     "ios:open": "cap open ios",
     "postinstall": "node scripts/install-githooks.mjs"

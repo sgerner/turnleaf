@@ -71,6 +71,7 @@
     : null;
 
   onMount(async () => {
+    window.addEventListener('keydown', handleKeyboardNavigation);
     const saved = await getPreference('appearance');
     if (destroyed) return;
     if (saved) appearance = parseAppearance(saved);
@@ -125,6 +126,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    window.removeEventListener('keydown', handleKeyboardNavigation);
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     const handle = resumeHandle;
@@ -251,6 +253,35 @@
     }
   }
 
+  function handleKeyboardNavigation(event: KeyboardEvent): void {
+    if (destroyed || event.defaultPrevented) return;
+    const target = event.target;
+    if (
+      target instanceof HTMLElement &&
+      target.closest('button, a, input, select, textarea, [contenteditable="true"]')
+    ) {
+      return;
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+      event.preventDefault();
+      void turn('previous');
+      showControls();
+      return;
+    }
+    if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+      event.preventDefault();
+      void turn('next');
+      showControls();
+      return;
+    }
+    if (event.key === 'Escape' && (settingsVisible || tocVisible)) {
+      event.preventDefault();
+      settingsVisible = false;
+      tocVisible = false;
+      showControls();
+    }
+  }
+
   function handleBottomSwipeStart(event: PointerEvent): void {
     if (event.pointerType === 'mouse' && event.button !== 0) return;
     bottomSwipeStart = { id: event.pointerId, x: event.clientX, y: event.clientY };
@@ -281,25 +312,49 @@
   });
 </script>
 
-<div class="reader-shell" data-mode={appearance.mode}>
+<div class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
   <div class="reader-viewport" bind:this={viewport}></div>
+
+  <p id="reader-keyboard-help" class="sr-only">
+    Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
+    Press Escape to close an open reader panel.
+  </p>
 
   <nav
     class="tap-zones"
     aria-label="Page navigation"
     inert={Boolean(settingsVisible || tocVisible)}
   >
-    <button type="button" aria-label="Previous page" onclick={() => turn('previous')}></button>
+    <button
+      type="button"
+      aria-label="Previous page"
+      aria-keyshortcuts="ArrowLeft PageUp"
+      onclick={() => turn('previous')}
+    ></button>
     <button
       type="button"
       aria-label={controlsVisible ? 'Hide reading controls' : 'Show reading controls'}
+      aria-keyshortcuts="Escape"
       onclick={() => (controlsVisible ? (controlsVisible = false) : showControls())}
     ></button>
-    <button type="button" aria-label="Next page" onclick={() => turn('next')}></button>
+    <button
+      type="button"
+      aria-label="Next page"
+      aria-keyshortcuts="ArrowRight PageDown Space"
+      onclick={() => turn('next')}
+    ></button>
   </nav>
 
   {#if appearance.progressBar}
-    <div class="reader-progress" aria-hidden="true">
+    <div
+      class="reader-progress"
+      role="progressbar"
+      aria-label="Book reading progress"
+      aria-valuemin="0"
+      aria-valuemax="100"
+      aria-valuenow={Math.round((location?.percentage ?? 0) * 100)}
+      aria-valuetext={`${Math.round((location?.percentage ?? 0) * 100)}% complete`}
+    >
       <div class="reader-progress-track">
         <div
           class="reader-progress-fill"
@@ -411,7 +466,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-8 w-8 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
             type="button"
             onclick={closeSettings}
             aria-label="Close reading appearance"
@@ -431,6 +486,7 @@
                 class:active-mode={appearance.mode === mode}
                 class="btn preset-outlined-surface-300-700 capitalize"
                 type="button"
+                aria-pressed={appearance.mode === mode}
                 onclick={() => updateAppearance({ mode: mode as ReadingMode })}>{mode}</button
               >
             {/each}
@@ -557,7 +613,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-8 w-8 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
             type="button"
             onclick={closeToc}
             aria-label="Close table of contents"

@@ -159,6 +159,21 @@ npm run dev
 
 Use this for fast UI iteration and browser-based testing of the Svelte app. Native storage, downloads, and secure credential storage require Capacitor builds.
 
+When running the browser app against Kavita, the development proxy accepts
+loopback `http://` and `https://` targets such as `http://localhost:5000`. It
+rejects remote targets by default. To use a remote server, explicitly allow its
+HTTPS origin before starting Vite:
+
+```bash
+TURNLEAF_DEV_PROXY_ORIGINS="https://books.example.com:5000" npm run dev
+```
+
+The proxy accepts only HTTP(S), rejects URL credentials, forwards only the
+Kavita API headers it needs, limits request bodies to 1 MiB, and stops upstream
+requests after 12 seconds. It does not follow redirects or forward cookies,
+authorization, or forwarding headers. Plain HTTP is intentionally limited to
+loopback development servers.
+
 ### Quality checks
 
 ```bash
@@ -178,13 +193,14 @@ Turnleaf has been tested on Android. The repo includes the Capacitor Android pro
 export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
 npm run android:doctor
-npm run cap:sync
 npm run android:debug
 ```
 
-`android:doctor` checks the SDK path, API 36, and Android Build Tools before a
-Gradle build. If the SDK is installed somewhere else, set `ANDROID_HOME` or
-create the ignored `android/local.properties` file with its absolute path.
+`android:doctor` checks the SDK path, API 36, Android Build Tools, and Java 17+
+before a Gradle build. `android:debug` and `android:release` repeat that check,
+then pass the selected SDK path to both Capacitor sync and Gradle. If the SDK is
+installed somewhere else, set `ANDROID_HOME` or create the ignored
+`android/local.properties` file with its absolute path.
 
 Useful follow-up commands:
 

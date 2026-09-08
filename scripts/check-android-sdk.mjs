@@ -1,9 +1,13 @@
+import { spawnSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const ANDROID_PLATFORM = 'android-36';
+export const MIN_JAVA_MAJOR = 17;
+
+const BUILD_TOOLS_VERSION = /^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*$/;
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(scriptDirectory);
@@ -90,12 +94,35 @@ function defaultReadDirectory(path) {
   }
 }
 
+export function buildToolsVersions(
+  sdkPath,
+  { isDirectory = defaultIsDirectory, readDirectory = defaultReadDirectory } = {},
+) {
+  const buildToolsPath = join(sdkPath, 'build-tools');
+  if (!isDirectory(buildToolsPath)) return [];
+
+  return readDirectory(buildToolsPath).filter(
+    (entry) => BUILD_TOOLS_VERSION.test(entry) && isDirectory(join(buildToolsPath, entry)),
+  );
+}
+
+function missingPackages(sdkPath, { isDirectory, readDirectory }) {
+  const missing = [];
+  if (!isDirectory(join(sdkPath, 'platforms', ANDROID_PLATFORM))) {
+    missing.push(`Android SDK Platform ${ANDROID_PLATFORM.slice('android-'.length)}`);
+  }
+  if (buildToolsVersions(sdkPath, { isDirectory, readDirectory }).length === 0) {
+    missing.push('Android SDK Build Tools');
+  }
+  return missing;
+}
+
 export function validateAndroidSdk(
   candidates,
   { isDirectory = defaultIsDirectory, readDirectory = defaultReadDirectory } = {},
 ) {
-  const sdk = candidates.find((candidate) => isDirectory(candidate.path)) ?? null;
-  if (!sdk) {
+  const existingCandidates = candidates.filter((candidate) => isDirectory(candidate.path));
+  if (existingCandidates.length === 0) {
     return {
       ok: false,
       sdk: null,
@@ -104,20 +131,55 @@ export function validateAndroidSdk(
     };
   }
 
-  const missing = [];
-  if (!isDirectory(join(sdk.path, 'platforms', ANDROID_PLATFORM))) {
-    missing.push(`Android SDK Platform ${ANDROID_PLATFORM.slice('android-'.length)}`);
+  const packageOptions = { isDirectory, readDirectory };
+  const sdk = existingCandidates.find(
+    (candidate) => missingPackages(candidate.path, packageOptions).length === 0,
+  );
+  if (sdk) {
+    return {
+      ok: true,
+      sdk,
+      missing: [],
+      candidates,
+    };
   }
-  const buildToolsPath = join(sdk.path, 'build-tools');
-  if (!isDirectory(buildToolsPath) || readDirectory(buildToolsPath).length === 0) {
-    missing.push('Android SDK Build Tools');
-  }
+
+  const firstExisting = existingCandidates[0];
+  const missing = missingPackages(firstExisting.path, packageOptions);
 
   return {
     ok: missing.length === 0,
-    sdk,
+    sdk: firstExisting,
     missing,
     candidates,
+  };
+}
+
+export function parseJavaMajor(versionOutput) {
+  const version = /version\s+"([^"]+)"/.exec(versionOutput)?.[1];
+  if (!version) return null;
+
+  const parts = version.split(/[._-]/).map(Number);
+  if (!Number.isInteger(parts[0])) return null;
+  return parts[0] === 1 ? (parts[1] ?? null) : parts[0];
+}
+
+export function validateJavaCompatibility(javaMajor, minimum = MIN_JAVA_MAJOR) {
+  return {
+    ok: Number.isInteger(javaMajor) && javaMajor >= minimum,
+    major: javaMajor,
+    minimum,
+  };
+}
+
+export function detectJavaCompatibility({ run = spawnSync } = {}) {
+  const result = run('java', ['-version'], { encoding: 'utf8' });
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  const major = parseJavaMajor(output);
+  return {
+    ...validateJavaCompatibility(major),
+    output,
+    error: result.error ?? null,
   };
 }
 
@@ -145,6 +207,22 @@ export function formatFailure(result) {
   return lines.join('\n');
 }
 
+export function formatJavaFailure(result) {
+  if (result.major === null) {
+    return [
+      'Java setup is incomplete or could not be detected.',
+      'Android builds require a working Java installation (JDK 17 or newer).',
+      'Install a supported JDK and ensure `java` is available on PATH.',
+    ].join('\n');
+  }
+
+  return [
+    `Java ${result.major} is too old for the Android Gradle plugin.`,
+    `Android builds require Java ${result.minimum} or newer.`,
+    'Install a supported JDK and ensure `java` is available on PATH.',
+  ].join('\n');
+}
+
 export function main() {
   const result = validateAndroidSdk(sdkCandidates());
   if (!result.ok) {
@@ -152,7 +230,19 @@ export function main() {
     process.exitCode = 1;
     return;
   }
-  console.log(`Android SDK ready at ${result.sdk.path} (${result.sdk.source}).`);
+
+  const java = detectJavaCompatibility();
+  if (!java.ok) {
+    console.error(formatJavaFailure(java));
+    process.exitCode = 1;
+    return;
+  }
+
+  const versions = buildToolsVersions(result.sdk.path);
+  console.log(
+    `Android SDK ready at ${result.sdk.path} (${result.sdk.source}); ` +
+      `platform ${ANDROID_PLATFORM}, build tools ${versions.join(', ')}, Java ${java.major}.`,
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
