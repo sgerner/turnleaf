@@ -976,6 +976,7 @@
 {#if reading}
   <Reader
     bookUrl={reading.url}
+    bookId={reading.book.id}
     title={reading.book.title}
     initialCfi={reading.cfi}
     initialXPath={reading.xpath}
