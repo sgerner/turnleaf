@@ -22,6 +22,7 @@ export type ReleaseBanner = {
 };
 
 const githubReleasesUrl = 'https://api.github.com/repos/sgerner/turnleaf/releases/latest';
+const githubRepositoryPath = '/sgerner/turnleaf';
 
 type ParsedVersion = {
   major: number;
@@ -35,7 +36,7 @@ function parseVersion(raw: string): ParsedVersion | null {
   const match = raw
     .trim()
     .replace(/^v/i, '')
-    .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?/);
+    .match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/);
   if (!match) return null;
   return {
     major: Number(match[1]),
@@ -89,20 +90,67 @@ export function compareVersions(left: string, right: string): number {
   return compareSegments(a.build, b.build);
 }
 
-function pickDownloadUrl(release: GithubRelease): string | null {
-  const apkAsset = release.assets.find((asset) => asset.name.toLowerCase().endsWith('.apk'));
+function isTrustedGithubUrl(rawUrl: string, expectedPath: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname.toLowerCase() !== 'github.com' ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      return false;
+    }
+
+    return decodeURIComponent(url.pathname) === expectedPath;
+  } catch {
+    return false;
+  }
+}
+
+function isSafeAssetName(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$/i.test(name);
+}
+
+function pickDownloadUrl(release: GithubRelease, tagName: string): string | null {
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const apkAsset = assets.find((asset) => {
+    if (
+      !asset ||
+      typeof asset !== 'object' ||
+      typeof asset.name !== 'string' ||
+      typeof asset.browser_download_url !== 'string'
+    ) {
+      return false;
+    }
+    if (!isSafeAssetName(asset.name)) return false;
+
+    return isTrustedGithubUrl(
+      asset.browser_download_url,
+      `${githubRepositoryPath}/releases/download/${tagName}/${asset.name}`,
+    );
+  });
   return apkAsset?.browser_download_url ?? null;
 }
 
 function buildBanner(release: GithubRelease, currentVersion: string): ReleaseBanner | null {
-  const latestVersion = release.tag_name.trim().replace(/^v/i, '');
+  if (typeof release.tag_name !== 'string' || typeof release.html_url !== 'string') return null;
+
+  const tagName = release.tag_name.trim();
+  const latestVersion = tagName.replace(/^v/i, '');
   if (!parseVersion(latestVersion)) return null;
   if (compareVersions(latestVersion, currentVersion) <= 0) return null;
+  if (!isTrustedGithubUrl(release.html_url, `${githubRepositoryPath}/releases/tag/${tagName}`)) {
+    return null;
+  }
 
   return {
     version: latestVersion,
     releaseUrl: release.html_url,
-    downloadUrl: pickDownloadUrl(release),
+    downloadUrl: pickDownloadUrl(release, tagName),
     publishedAt: release.published_at,
     title: release.name,
   };

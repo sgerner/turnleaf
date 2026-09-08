@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { loadCoversWithConcurrency } from './cover-loader';
+import { createSharedCoverLoader, loadCoversWithConcurrency } from './cover-loader';
 
 describe('loadCoversWithConcurrency', () => {
   it('deduplicates series and limits active loads', async () => {
@@ -67,5 +67,62 @@ describe('loadCoversWithConcurrency', () => {
     });
 
     expect(requested).toEqual([2]);
+  });
+});
+
+describe('createSharedCoverLoader', () => {
+  it('shares a request and caps physical work across refresh generations', async () => {
+    const pending: Array<() => void> = [];
+    let active = 0;
+    let maximumActive = 0;
+    let calls = 0;
+    const shared = createSharedCoverLoader<number>(async (seriesId) => {
+      calls += 1;
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => pending.push(resolve));
+      active -= 1;
+      return seriesId;
+    }, 2);
+
+    const first = shared.load(1);
+    const replacement = shared.load(1);
+    const second = shared.load(2);
+    const queued = shared.load(3);
+
+    expect(replacement).toBe(first);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(2);
+    expect(maximumActive).toBe(2);
+
+    pending.shift()?.();
+    pending.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(3);
+    pending.shift()?.();
+
+    await expect(Promise.all([first, replacement, second, queued])).resolves.toEqual([1, 1, 2, 3]);
+    expect(maximumActive).toBe(2);
+  });
+
+  it('cancels active and queued requests', async () => {
+    let aborted = false;
+    const shared = createSharedCoverLoader<number>(async (_seriesId, signal) => {
+      await new Promise<void>((resolve) => {
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          resolve();
+        });
+      });
+      throw new DOMException('Aborted', 'AbortError');
+    }, 1);
+    const active = shared.load(1);
+    const queued = shared.load(2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    shared.cancel();
+
+    await expect(active).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(queued).rejects.toMatchObject({ name: 'AbortError' });
+    expect(aborted).toBe(true);
   });
 });
