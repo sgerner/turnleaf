@@ -95,10 +95,13 @@ export class KavitaClient {
         readTimeout: REQUEST_TIMEOUT_MS,
       });
       this.assertStatus(response.status);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const encoded = String(response.data);
       const binary = atob(encoded.includes(',') ? (encoded.split(',').pop() ?? '') : encoded);
       const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-      return new Blob([bytes]);
+      const blob = new Blob([bytes]);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      return blob;
     }
     const timeout = new AbortController();
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
