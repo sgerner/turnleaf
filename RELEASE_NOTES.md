@@ -4,6 +4,7 @@
 
 - docs: add future implementation work plan
 - Keep virtualized library windows valid at the end of long lists and preserve focused books while scrolling.
+- Harden the browser development proxy with loopback and HTTPS origin controls, bounded requests, filtered credentials, and safe upstream failure handling.
 - Isolate rendered EPUB content from remote resources and unsafe navigation while preserving internal links and local assets.
 - Preserve newer local reading progress when an older sync upload completes.
 - Add an Android SDK preflight that explains missing local SDK configuration before Gradle builds.
