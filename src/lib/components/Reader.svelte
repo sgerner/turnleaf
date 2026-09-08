@@ -17,6 +17,7 @@
     type ReadingMode,
   } from '../reader/appearance';
   import { ReaderSession, type ReaderLocation, type TocItem } from '../reader/session';
+  import type { ReaderSearchResult } from '../reader/search';
   import {
     parseBookmarks,
     parseLocationHistory,
@@ -56,17 +57,25 @@
   let settingsVisible = $state(false);
   let tocVisible = $state(false);
   let bookmarksVisible = $state(false);
+  let searchVisible = $state(false);
   let settingsPanel = $state<HTMLElement | null>(null);
   let tocPanel = $state<HTMLElement | null>(null);
   let bookmarksPanel = $state<HTMLElement | null>(null);
+  let searchPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
   let bookmarksOpener: HTMLElement | null = null;
+  let searchOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
   let bookmarks = $state<StoredReaderLocation[]>([]);
   let locationHistory = $state<StoredReaderLocation[]>([]);
   let editingBookmarkId = $state<string | null>(null);
   let bookmarkDraft = $state('');
+  let searchQuery = $state('');
+  let searchResults = $state<ReaderSearchResult[]>([]);
+  let searching = $state(false);
+  let searchError = $state('');
+  let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let error = $state('');
@@ -157,6 +166,7 @@
     window.removeEventListener('keydown', handleKeyboardNavigation);
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
+    searchController?.abort();
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
@@ -185,8 +195,10 @@
     settingsVisible = true;
     tocVisible = false;
     bookmarksVisible = false;
+    searchVisible = false;
     tocOpener = null;
     bookmarksOpener = null;
+    searchOpener = null;
     focusPanel(() => settingsPanel);
   }
 
@@ -202,8 +214,10 @@
     tocVisible = true;
     settingsVisible = false;
     bookmarksVisible = false;
+    searchVisible = false;
     settingsOpener = null;
     bookmarksOpener = null;
+    searchOpener = null;
     focusPanel(() => tocPanel);
   }
 
@@ -219,8 +233,10 @@
     bookmarksVisible = true;
     settingsVisible = false;
     tocVisible = false;
+    searchVisible = false;
     settingsOpener = null;
     tocOpener = null;
+    searchOpener = null;
     focusPanel(() => bookmarksPanel);
   }
 
@@ -229,6 +245,28 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openSearch(): void {
+    searchOpener = activeElement();
+    searchVisible = true;
+    settingsVisible = false;
+    tocVisible = false;
+    bookmarksVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    searchError = '';
+    focusPanel(() => searchPanel);
+  }
+
+  function closeSearch(): void {
+    searchVisible = false;
+    searchController?.abort();
+    searchController = null;
+    const opener = searchOpener;
+    searchOpener = null;
     restoreFocus(opener);
   }
 
@@ -244,6 +282,7 @@
       closeSettings();
       closeToc();
       closeBookmarks();
+      closeSearch();
       footerVisible = false;
     }, 5_000);
   }
@@ -327,6 +366,43 @@
     }
   }
 
+  async function runSearch(): Promise<void> {
+    if (!session || !searchQuery.trim()) {
+      searchResults = [];
+      searchError = searchQuery.trim() ? 'The reader is still opening.' : '';
+      return;
+    }
+    searchController?.abort();
+    const controller = new AbortController();
+    searchController = controller;
+    searching = true;
+    searchError = '';
+    try {
+      searchResults = await session.search(searchQuery, controller.signal);
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        searchResults = [];
+        searchError = cause instanceof Error ? cause.message : 'Search could not be completed.';
+      }
+    } finally {
+      if (searchController === controller) {
+        searching = false;
+        searchController = null;
+      }
+    }
+  }
+
+  async function openSearchResult(result: ReaderSearchResult): Promise<void> {
+    if (!session) return;
+    try {
+      await session.displayCfi(result.cfi);
+      closeSearch();
+      showControls();
+    } catch {
+      searchError = 'This search result is no longer available in the current EPUB.';
+    }
+  }
+
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     try {
       if (!session) throw new Error('Reader session is unavailable.');
@@ -390,11 +466,15 @@
       showControls();
       return;
     }
-    if (event.key === 'Escape' && (settingsVisible || tocVisible || bookmarksVisible)) {
+    if (
+      event.key === 'Escape' &&
+      (settingsVisible || tocVisible || bookmarksVisible || searchVisible)
+    ) {
       event.preventDefault();
       closeSettings();
       closeToc();
       closeBookmarks();
+      closeSearch();
       showControls();
     }
   }
@@ -440,7 +520,7 @@
   <nav
     class="tap-zones"
     aria-label="Page navigation"
-    inert={Boolean(settingsVisible || tocVisible || bookmarksVisible)}
+    inert={Boolean(settingsVisible || tocVisible || bookmarksVisible || searchVisible)}
   >
     <button
       type="button"
@@ -504,10 +584,10 @@
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
       <header
         class="reader-bar reader-top"
-        inert={Boolean(settingsVisible || tocVisible || bookmarksVisible)}
+        inert={Boolean(settingsVisible || tocVisible || bookmarksVisible || searchVisible)}
         transition:fly={{ y: -8, duration: 140 }}
       >
-        <div class="grid w-full grid-cols-5 gap-2">
+        <div class="grid w-full grid-cols-6 gap-2">
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
@@ -548,6 +628,15 @@
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
+            onclick={() => (searchVisible ? closeSearch() : openSearch())}
+            aria-expanded={searchVisible}
+            aria-controls="reader-search"
+          >
+            Search
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
             onclick={() => syncLatestLocation()}
             aria-label="Sync latest reading position"
             title="Sync latest reading position"
@@ -571,14 +660,20 @@
         </p>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible}
+      {#if settingsVisible || tocVisible || bookmarksVisible || searchVisible}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
           onclick={() =>
-            settingsVisible ? closeSettings() : tocVisible ? closeToc() : closeBookmarks()}
+            settingsVisible
+              ? closeSettings()
+              : tocVisible
+                ? closeToc()
+                : bookmarksVisible
+                  ? closeBookmarks()
+                  : closeSearch()}
         ></button>
       {/if}
 
@@ -768,6 +863,77 @@
               >
             {/each}
           </div>
+        </div>
+      {/if}
+
+      {#if searchVisible}
+        <div
+          bind:this={searchPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          id="reader-search"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-search-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            type="button"
+            onclick={closeSearch}
+            aria-label="Close book search"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+          <h2 id="reader-search-title" class="font-serif text-xl">Search this book</h2>
+          <form
+            class="mt-4 flex gap-2"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void runSearch();
+            }}
+          >
+            <label class="sr-only" for="reader-search-query">Search this book</label>
+            <input
+              id="reader-search-query"
+              class="input min-w-0 flex-1"
+              type="search"
+              bind:value={searchQuery}
+              placeholder="Find a word or phrase"
+              autocomplete="off"
+            />
+            <button class="btn preset-filled-primary-700-300" type="submit" disabled={searching}>
+              {searching ? 'Searching…' : 'Search'}
+            </button>
+          </form>
+          {#if searchError}
+            <p class="mt-3 text-sm text-error-700-300" role="alert">{searchError}</p>
+          {:else if !searching && searchQuery.trim() && searchResults.length === 0}
+            <p class="mt-3 text-sm text-surface-700-300" role="status">No matches found.</p>
+          {/if}
+          {#if searchResults.length > 0}
+            <ol class="mt-4 grid gap-2" aria-label="Search results">
+              {#each searchResults as result, index (result.cfi)}
+                <li>
+                  <button
+                    class="btn w-full justify-start text-left"
+                    type="button"
+                    onclick={() => void openSearchResult(result)}
+                  >
+                    <span class="mr-2 text-xs text-surface-700-300">{index + 1}</span>
+                    <span class="line-clamp-3">{result.excerpt}</span>
+                  </button>
+                </li>
+              {/each}
+            </ol>
+          {/if}
         </div>
       {/if}
 

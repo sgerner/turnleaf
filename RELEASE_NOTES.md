@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- feat: add cancellable in-book search
+- Add cancellable in-book search with exact EPUB CFI result navigation.
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
 - Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
 - Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
