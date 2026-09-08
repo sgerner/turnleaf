@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reconcile removed books and clean up credentials
+- Reconcile complete Kavita metadata snapshots without purging cached books after partial or failed fetches; retain downloaded books and pending local progress when Kavita removes them.
+- Report credential and server-configuration cleanup failures accurately and compensate failed onboarding saves so orphaned auth keys remain recoverable.
+- Document offline metadata retention and retry behavior.
 - docs: add future implementation work plan
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.

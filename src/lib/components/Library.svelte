@@ -12,7 +12,7 @@
     markBookCompleted,
     removeDownload,
     removeServer,
-    replaceBooks,
+    reconcileBooks,
     saveLocalProgress,
     saveServer,
     setPreference,
@@ -210,9 +210,11 @@
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
         .toLowerCase()
         .includes(query.trim().toLowerCase());
+      const retainedOffline = book.remoteAvailable === false && Boolean(book.downloadPath);
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
       return (
         matchesQuery &&
+        (book.remoteAvailable !== false || retainedOffline) &&
         (!downloadedOnly || Boolean(book.downloadPath)) &&
         (!hideCompleted || !completed)
       );
@@ -255,6 +257,7 @@
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
+  let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
@@ -496,7 +499,9 @@
         );
       }
       if (destroyed) return;
-      await replaceBooks(server.id, mapped);
+      // Reconcile only after every series page and detail batch completed.
+      // Errors and lifecycle cancellation leave the last known local library intact.
+      await reconcileBooks(server.id, mapped);
       if (destroyed) return;
       books = await getBooks(server.id);
       retainCoversFor(books);
@@ -860,14 +865,20 @@
       cancelCoverLoading();
       await clearCoverCache().catch(() => {});
       clearCovers();
-      await removeApiKey(server.credentialRef).catch(() => {});
+      if (!credentialCleanupComplete) {
+        await removeApiKey(server.credentialRef);
+        credentialCleanupComplete = true;
+      }
       await removeServer(server.id);
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
       closeSettings();
     } catch (cause) {
-      settingsError =
-        cause instanceof Error ? cause.message : 'Turnleaf could not remove the server.';
+      settingsError = credentialCleanupComplete
+        ? 'The auth key was removed, but the local server configuration could not be cleared. Retry Delete server to finish cleanup.'
+        : cause instanceof Error
+          ? `Could not remove the server safely: ${cause.message} The connection was left in place; retry Delete server.`
+          : 'Could not remove the server safely. The connection was left in place; retry Delete server.';
     } finally {
       deletingServer = false;
       confirmDeleteServer = false;
@@ -1147,6 +1158,20 @@
                         decoding="async"
                         alt=""
                       />
+                    {/if}
+                    {#if book.remoteAvailable === false && book.downloadPath}
+                      <span
+                        class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                        title="Saved offline; no longer available on Kavita"
+                        aria-label="Saved offline; no longer available on Kavita"
+                      >
+                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                          <path
+                            fill="currentColor"
+                            d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                          />
+                        </svg>
+                      </span>
                     {/if}
                     {#if downloadingBookId === book.id}
                       <span

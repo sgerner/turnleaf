@@ -54,6 +54,7 @@ function mapChapterToBook(
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
+    remoteAvailable: true,
   };
 }
 

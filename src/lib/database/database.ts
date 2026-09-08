@@ -36,6 +36,8 @@ export interface BookRecord {
   downloadPath: string | null;
   downloadStatus: string;
   fileSize: number | null;
+  /** False means Kavita no longer advertises the book; local retention may keep it. */
+  remoteAvailable?: boolean;
 }
 
 let connection: SQLiteDBConnection | null = null;
@@ -80,7 +82,12 @@ function readBrowserState(): BrowserDatabaseState {
     const parsed = JSON.parse(raw) as Partial<BrowserDatabaseState>;
     return {
       serverConfig: parsed.serverConfig ?? null,
-      books: Array.isArray(parsed.books) ? (parsed.books as BookRecord[]) : [],
+      books: Array.isArray(parsed.books)
+        ? (parsed.books as BookRecord[]).map((book) => ({
+            ...book,
+            remoteAvailable: book.remoteAvailable !== false,
+          }))
+        : [],
       readingState: parsed.readingState ?? {},
       syncQueue: parsed.syncQueue ?? {},
       preferences: parsed.preferences ?? {},
@@ -218,26 +225,79 @@ export async function getServer(): Promise<ServerConfig | null> {
   };
 }
 
-export async function replaceBooks(serverId: string, books: BookRecord[]): Promise<void> {
+/**
+ * Reconcile a complete, successful Kavita metadata snapshot. Books that are
+ * gone remotely are removed unless they have a retained download or pending
+ * local progress; retained rows are marked unavailable until Kavita advertises
+ * them again. Callers must not invoke this for partial or failed snapshots.
+ */
+export async function reconcileBooks(serverId: string, books: BookRecord[]): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    state.books = books.map((book) => ({ ...book, serverId }));
+    const incoming = new Map(books.map((book) => [book.id, { ...book, serverId }]));
+    const existing = state.books.filter((book) => book.serverId === serverId);
+    const retained = existing
+      .filter(
+        (book) =>
+          !incoming.has(book.id) &&
+          (Boolean(book.downloadPath) ||
+            book.downloadStatus === 'available' ||
+            Boolean(state.syncQueue[book.id]) ||
+            state.readingState[book.id]?.pendingSync === true),
+      )
+      .map((book) => ({ ...book, remoteAvailable: false }));
+    const merged = [...incoming.values()].map((book) => {
+      const previous = existing.find((item) => item.id === book.id);
+      if (!previous) return { ...book, remoteAvailable: true };
+      const pending =
+        Boolean(state.syncQueue[book.id]) || state.readingState[book.id]?.pendingSync === true;
+      return {
+        ...previous,
+        ...book,
+        serverId,
+        remoteAvailable: true,
+        downloadPath: previous.downloadPath,
+        downloadStatus: previous.downloadStatus,
+        fileSize: previous.fileSize,
+        pagesRead: pending ? previous.pagesRead : book.pagesRead,
+        lastReadAt: pending ? previous.lastReadAt : book.lastReadAt,
+      };
+    });
+    state.books = [
+      ...state.books.filter((book) => book.serverId !== serverId),
+      ...merged,
+      ...retained,
+    ];
     writeBrowserState(state);
     return;
   }
-  await replaceBooksInTransaction(await openDatabase(), serverId, books);
+  await reconcileBooksInTransaction(await openDatabase(), serverId, books);
 }
+
+/** Backward-compatible name for callers that already pass a complete snapshot. */
+export const replaceBooks = reconcileBooks;
 
 const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
    description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
-   pages, pages_read, created_at, last_read_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   pages, pages_read, created_at, last_read_at, remote_available)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
    title=excluded.title, author=excluded.author, series=excluded.series,
    description_html=excluded.description_html, format=excluded.format,
    metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
-   pages_read=excluded.pages_read, created_at=excluded.created_at, last_read_at=excluded.last_read_at`;
+   pages_read=CASE WHEN EXISTS (
+     SELECT 1 FROM reading_state WHERE book_id=excluded.id AND pending_sync=1
+   ) OR EXISTS (
+     SELECT 1 FROM sync_queue WHERE book_id=excluded.id
+   ) THEN books.pages_read ELSE excluded.pages_read END,
+   created_at=excluded.created_at,
+   last_read_at=CASE WHEN EXISTS (
+     SELECT 1 FROM reading_state WHERE book_id=excluded.id AND pending_sync=1
+   ) OR EXISTS (
+     SELECT 1 FROM sync_queue WHERE book_id=excluded.id
+   ) THEN books.last_read_at ELSE excluded.last_read_at END,
+   remote_available=excluded.remote_available`;
 
 function replaceBookTask(serverId: string, book: BookRecord, refreshedAt: string): capTask {
   return {
@@ -262,6 +322,7 @@ function replaceBookTask(serverId: string, book: BookRecord, refreshedAt: string
       book.pagesRead,
       book.createdAt,
       book.lastReadAt,
+      book.remoteAvailable !== false ? 1 : 0,
     ],
   };
 }
@@ -279,6 +340,36 @@ export async function replaceBooksInTransaction(
 ): Promise<void> {
   if (books.length === 0) return;
   await db.executeTransaction(books.map((book) => replaceBookTask(serverId, book, refreshedAt)));
+}
+
+const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
+  OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id
+    AND reading_state.pending_sync=1)
+  OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
+
+/** Apply metadata and removal reconciliation atomically on native SQLite. */
+export async function reconcileBooksInTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  serverId: string,
+  books: BookRecord[],
+  refreshedAt = new Date().toISOString(),
+): Promise<void> {
+  const ids = books.map((book) => book.id);
+  const absent = ids.length ? `id NOT IN (${ids.map(() => '?').join(',')})` : '1=1';
+  const values = [serverId, ...ids];
+  await db.executeTransaction([
+    ...books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
+    {
+      statement: `UPDATE books SET remote_available=0 WHERE server_id=? AND ${absent}
+        AND ${retainedBookCondition}`,
+      values,
+    },
+    {
+      statement: `DELETE FROM books WHERE server_id=? AND ${absent}
+        AND NOT ${retainedBookCondition}`,
+      values,
+    },
+  ]);
 }
 
 export async function getBooks(serverId: string): Promise<BookRecord[]> {
@@ -308,6 +399,7 @@ export async function getBooks(serverId: string): Promise<BookRecord[]> {
     downloadPath: row.download_path ? String(row.download_path) : null,
     downloadStatus: String(row.download_status),
     fileSize: row.file_size == null ? null : Number(row.file_size),
+    remoteAvailable: Number(row.remote_available ?? 1) !== 0,
   }));
 }
 
