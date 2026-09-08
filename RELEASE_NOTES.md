@@ -8,6 +8,7 @@
 - Prevent reader native controls from being re-enabled after the reader is closed during startup.
 - Fix reader chrome, volume-button paging, and keep-awake not working on Android by registering their native plugins with the Capacitor bridge
 - Add a setting to keep the screen awake while reading
+- Refresh library progress from local storage after reader navigation, including when returning with Android Back or the reader Back button.
 
 ## 0.2.0
 

@@ -486,6 +486,7 @@
       location.percentage,
       location.spineIndex,
     );
+    books = await getBooks(server.id);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
   }
