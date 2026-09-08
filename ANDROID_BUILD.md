@@ -13,6 +13,23 @@ Verified on Linux with the `turnleaf_api36` Google APIs x86_64 emulator: install
 
 ## Commands
 
+Check the local Android toolchain before starting a build. The preflight checks
+`android/local.properties`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, and the usual
+per-user SDK locations. It also verifies that the compile SDK (API 36) and at
+least one Android Build Tools version are installed.
+
+```bash
+npm run android:doctor
+```
+
+The project-specific `android/local.properties` file is intentionally ignored
+by Git because its path is machine-specific. Create it when the SDK is in a
+non-standard location, or export `ANDROID_HOME` instead:
+
+```bash
+printf 'sdk.dir=%s\n' "/absolute/path/to/Android/Sdk" > android/local.properties
+```
+
 ```bash
 export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"

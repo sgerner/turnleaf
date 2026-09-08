@@ -177,9 +177,14 @@ Turnleaf has been tested on Android. The repo includes the Capacitor Android pro
 ```bash
 export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+npm run android:doctor
 npm run cap:sync
 npm run android:debug
 ```
+
+`android:doctor` checks the SDK path, API 36, and Android Build Tools before a
+Gradle build. If the SDK is installed somewhere else, set `ANDROID_HOME` or
+create the ignored `android/local.properties` file with its absolute path.
 
 Useful follow-up commands:
 
