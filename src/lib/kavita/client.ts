@@ -11,6 +11,7 @@ const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
 const LIGHT_NOVEL_LIBRARY_TYPE = 4;
 const BROWSER_PROXY_PREFIX = '/__kavita__/';
+const SERIES_PAGE_SIZE = 500;
 
 export class KavitaError extends Error {
   constructor(
@@ -48,20 +49,25 @@ export class KavitaClient {
   }
 
   async getBookSeries(signal?: AbortSignal): Promise<KavitaSeries[]> {
-    const options: RequestInit = {
-      method: 'POST',
-      body: JSON.stringify({
-        statements: [],
-        combination: 0,
-        sortOptions: { sortField: 1, isAscending: true },
-        limitTo: 0,
-      }),
-    };
-    if (signal) options.signal = signal;
-    const series = await this.request<KavitaSeries[]>(
-      '/api/Series/v2?PageNumber=1&PageSize=500',
-      options,
-    );
+    const series: KavitaSeries[] = [];
+    for (let pageNumber = 1; ; pageNumber += 1) {
+      const options: RequestInit = {
+        method: 'POST',
+        body: JSON.stringify({
+          statements: [],
+          combination: 0,
+          sortOptions: { sortField: 1, isAscending: true },
+          limitTo: 0,
+        }),
+      };
+      if (signal) options.signal = signal;
+      const page = await this.request<KavitaSeries[]>(
+        `/api/Series/v2?PageNumber=${pageNumber}&PageSize=${SERIES_PAGE_SIZE}`,
+        options,
+      );
+      series.push(...page);
+      if (page.length < SERIES_PAGE_SIZE) break;
+    }
     return series.filter((item) => item.format === 3);
   }
 

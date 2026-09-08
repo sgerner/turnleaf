@@ -67,6 +67,44 @@ it('requests the Kavita series list with POST', async () => {
   );
 });
 
+it('loads every series page for large libraries', async () => {
+  const page = Array.from({ length: 500 }, (_, id) => ({
+    id,
+    name: `Book ${id}`,
+    libraryId: 1,
+    format: 3,
+    pages: 1,
+    pagesRead: 0,
+    created: '2026-01-01',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: '',
+  }));
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => page,
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [page[0]],
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+  expect(series).toHaveLength(501);
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    2,
+    'https://books.example.com/api/Series/v2?PageNumber=2&PageSize=500',
+    expect.objectContaining({ method: 'POST' }),
+  );
+});
+
 it.each([[[2, 4]], [[4]]])(
   'connects to supported EPUB library types %j',
   async (supportedTypes) => {
