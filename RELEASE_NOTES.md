@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Update the changed book in memory after reader progress saves instead of reloading the full library.
 - docs: add future implementation work plan
 - Add a native library index for server-scoped title queries.
 - Reduce derived library work by normalizing searches once and selecting Continue Reading in one pass.
