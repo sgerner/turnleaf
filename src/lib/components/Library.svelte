@@ -200,13 +200,15 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
   } = $props();
+  type LibrarySortOrder = 'title' | 'author' | 'recent';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   let books = $state<BookRecord[]>([]);
   let query = $state('');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
-  let visibleBooks = $derived(
-    books.filter((book) => {
+  let sortOrder = $state<LibrarySortOrder>('title');
+  let visibleBooks = $derived.by(() => {
+    const filtered = books.filter((book) => {
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
         .toLowerCase()
         .includes(query.trim().toLowerCase());
@@ -216,8 +218,24 @@
         (!downloadedOnly || Boolean(book.downloadPath)) &&
         (!hideCompleted || !completed)
       );
-    }),
-  );
+    });
+
+    return [...filtered].sort((a, b) => {
+      if (sortOrder === 'recent') {
+        return (
+          (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? '') || a.title.localeCompare(b.title)
+        );
+      }
+      if (sortOrder === 'author') {
+        return (
+          (a.author ?? '').localeCompare(b.author ?? '') ||
+          a.title.localeCompare(b.title) ||
+          a.id.localeCompare(b.id)
+        );
+      }
+      return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
+    });
+  });
   // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
   let continueBook = $derived(
     books
@@ -284,6 +302,24 @@
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
+  }
+
+  function parseSortOrder(value: string | null): LibrarySortOrder {
+    return value === 'author' || value === 'recent' ? value : 'title';
+  }
+
+  function handleSortChange(event: Event): void {
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    sortOrder = parseSortOrder(value);
+    void setPreference('librarySort', sortOrder);
+  }
+
+  function clearFilters(): void {
+    query = '';
+    downloadedOnly = false;
+    hideCompleted = false;
+    sortOrder = 'title';
+    void setPreference('librarySort', sortOrder);
   }
 
   function activeElement(): HTMLElement | null {
@@ -409,9 +445,12 @@
     if (destroyed) return;
     const savedAutoSync = await getPreference('syncFurthest');
     if (destroyed) return;
+    const savedSort = await getPreference('librarySort');
+    if (destroyed) return;
     pendingTheme = (savedTheme as SkeletonTheme | null) ?? (theme as SkeletonTheme);
     pendingMode = savedMode === 'light' ? 'light' : mode;
     pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
+    sortOrder = parseSortOrder(savedSort);
     books = await getBooks(server.id);
     if (destroyed) return;
     retainCoversFor(books);
@@ -1059,6 +1098,19 @@
           <span>Hide completed</span>
         </button>
       </div>
+      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
+        <span>Sort</span>
+        <select
+          class="select preset-tonal-surface h-10 min-w-32"
+          aria-label="Sort books"
+          value={sortOrder}
+          onchange={handleSortChange}
+        >
+          <option value="title">Title</option>
+          <option value="author">Author</option>
+          <option value="recent">Recently read</option>
+        </select>
+      </label>
     </div>
 
     {#if offline}
@@ -1069,6 +1121,16 @@
     {#if message}
       <div class="alert preset-tonal-surface mt-4" role="status" transition:fade>
         {message}
+      </div>
+    {/if}
+    {#if !loading && books.length > 0}
+      <div class="mt-4 flex items-center justify-between gap-3 text-sm text-surface-700-300">
+        <p>{visibleBooks.length} of {books.length} books</p>
+        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title'}
+          <button class="btn btn-sm preset-tonal-surface h-10" type="button" onclick={clearFilters}>
+            Clear filters
+          </button>
+        {/if}
       </div>
     {/if}
 
