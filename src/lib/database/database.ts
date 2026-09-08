@@ -548,16 +548,18 @@ export async function confirmSync(
     return;
   }
   const db = await openDatabase();
-  const result = await db.run('DELETE FROM sync_queue WHERE book_id=? AND updated_at=?', [
-    bookId,
-    expectedUpdatedAt,
+  await db.executeTransaction([
+    {
+      statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=local_updated_at,
+        server_updated_at=? WHERE book_id=? AND local_updated_at=?
+        AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=?)`,
+      values: [serverUpdatedAt, bookId, expectedUpdatedAt, bookId, expectedUpdatedAt],
+    },
+    {
+      statement: 'DELETE FROM sync_queue WHERE book_id=? AND updated_at=?',
+      values: [bookId, expectedUpdatedAt],
+    },
   ]);
-  if ((result.changes?.changes ?? 0) === 0) return;
-  await db.run(
-    `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=local_updated_at,
-    server_updated_at=? WHERE book_id=? AND local_updated_at=?`,
-    [serverUpdatedAt, bookId, expectedUpdatedAt],
-  );
 }
 
 export async function markSyncFailure(bookId: string, error: string): Promise<void> {
