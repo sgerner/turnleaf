@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a reproducible library virtualization benchmark for 500, 5,000, and 10,000-book datasets.
 - Align architecture, offline/sync, and security documentation with the auth-key transport, browser preview boundary, cover cache, sync preference, and current dependency override.
 - Document the iOS readiness matrix and keep platform support explicitly unverified until macOS and device checks pass.
 - Group library settings by appearance, sync, connection, and storage, and add concise first-run guidance.
