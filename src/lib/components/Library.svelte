@@ -852,7 +852,7 @@
       </div>
       <div class="card preset-tonal-surface flex shrink-0 gap-1 p-1">
         <button
-          class="btn btn-sm preset-tonal-surface h-8 w-8 !p-0"
+          class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
           onclick={() => (settingsVisible = true)}
           aria-label="Open settings"
@@ -866,7 +866,7 @@
           </svg>
         </button>
         <button
-          class="btn btn-sm preset-tonal-surface h-8 w-8 !p-0"
+          class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
           onclick={refresh}
           disabled={refreshing}
@@ -919,7 +919,15 @@
             {continueBook.author ?? 'Unknown author'}
           </p>
           <div class="mt-2 flex items-center gap-2">
-            <div class="h-1.5 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800">
+            <div
+              class="h-2 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800"
+              role="progressbar"
+              aria-label={`Reading progress for ${continueBook.title}`}
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={Math.round(progressOf(continueBook))}
+              aria-valuetext={`${Math.round(progressOf(continueBook))}% complete`}
+            >
               <div
                 class="h-full preset-filled-primary-600-400"
                 style:width={`${progressOf(continueBook)}%`}
@@ -955,7 +963,7 @@
         {#if query}
           <button
             type="button"
-            class="btn btn-sm absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 p-0 preset-filled-surface-200-800"
+            class="btn btn-sm absolute right-1 top-1/2 h-11 w-11 -translate-y-1/2 p-0 preset-filled-surface-200-800"
             onclick={() => (query = '')}
             aria-label="Clear search"
             title="Clear search"
@@ -1106,7 +1114,15 @@
                       </span>
                     {/if}
                     {#if progressOf(book) > 0}
-                      <div class="absolute inset-x-0 bottom-0 h-1.5">
+                      <div
+                        class="absolute inset-x-0 bottom-0 h-2"
+                        role="progressbar"
+                        aria-label={`Reading progress for ${book.title}`}
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow={Math.round(progressOf(book))}
+                        aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                      >
                         <div
                           class="h-full preset-filled-primary-600-400"
                           style:width={`${progressOf(book)}%`}
@@ -1124,7 +1140,7 @@
                   </p>
                 </button>
                 <button
-                  class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-7 w-7 !p-0 shadow-md"
+                  class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-11 w-11 !p-0 shadow-md"
                   type="button"
                   onclick={() => openMenu(book)}
                   aria-label={`Book actions for ${book.title}`}
