@@ -67,6 +67,34 @@ it('requests the Kavita series list with POST', async () => {
   );
 });
 
+it.each([[[2, 4]], [[4]]])(
+  'connects to supported EPUB library types %j',
+  async (supportedTypes) => {
+    const libraries = [...supportedTypes, 0, 1, 3, 5, 6].map((type, id) => ({
+      id,
+      name: `Library ${id}`,
+      type,
+    }));
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => libraries,
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => ({ version: 'test' }),
+      } as unknown as Response);
+
+    const result = await new KavitaClient('https://books.example.com', 'abc123').testConnection();
+
+    expect(result.bookLibraries.map((library) => library.type)).toEqual(supportedTypes);
+  },
+);
+
 it('retries a failed progress read once', async () => {
   const fetchMock = vi
     .fn()
