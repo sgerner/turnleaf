@@ -423,6 +423,7 @@
           if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
           return URL.createObjectURL(blob);
         },
+        dispose: revokeBrowserCover,
         onLoaded: (seriesId, cover) => {
           if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
             revokeBrowserCover(cover);

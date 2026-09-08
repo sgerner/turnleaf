@@ -31,6 +31,7 @@ describe('loadCoversWithConcurrency', () => {
   it('does not publish a cover that completes after cancellation', async () => {
     const controller = new AbortController();
     const loaded: number[] = [];
+    const disposed: number[] = [];
     let resolveCover: ((seriesId: number) => void) | undefined;
     const pendingCover = new Promise<number>((resolve) => {
       resolveCover = resolve;
@@ -40,6 +41,7 @@ describe('loadCoversWithConcurrency', () => {
       signal: controller.signal,
       load: async () => pendingCover,
       onLoaded: (seriesId) => loaded.push(seriesId),
+      dispose: (seriesId) => disposed.push(seriesId),
     });
 
     controller.abort();
@@ -47,6 +49,7 @@ describe('loadCoversWithConcurrency', () => {
     await loading;
 
     expect(loaded).toEqual([]);
+    expect(disposed).toEqual([7]);
   });
 
   it('skips series that already have a cover', async () => {

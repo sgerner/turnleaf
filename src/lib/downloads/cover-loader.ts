@@ -8,6 +8,7 @@ export interface CoverLoaderOptions<T> {
   hasCover?: (seriesId: number) => boolean;
   load: (seriesId: number, signal: AbortSignal) => Promise<T>;
   onLoaded: (seriesId: number, cover: T) => void;
+  dispose?: (cover: T) => void;
 }
 
 /**
@@ -19,7 +20,7 @@ export interface CoverLoaderOptions<T> {
  */
 export async function loadCoversWithConcurrency<T>(
   items: readonly CoverLoadItem[],
-  { signal, concurrency = 6, hasCover, load, onLoaded }: CoverLoaderOptions<T>,
+  { signal, concurrency = 6, hasCover, load, onLoaded, dispose }: CoverLoaderOptions<T>,
 ): Promise<void> {
   const seriesIds = [
     ...new Set(items.map((item) => item.seriesId).filter((seriesId) => !hasCover?.(seriesId))),
@@ -38,6 +39,7 @@ export async function loadCoversWithConcurrency<T>(
       try {
         const cover = await load(seriesId, signal);
         if (!signal.aborted) onLoaded(seriesId, cover);
+        else dispose?.(cover);
       } catch {
         if (signal.aborted) return;
       }
