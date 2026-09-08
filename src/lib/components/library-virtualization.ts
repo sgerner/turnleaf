@@ -38,10 +38,13 @@ export function calculateVirtualWindow(
 
   const top = Math.max(0, Number.isFinite(scrollTop) ? scrollTop : 0);
   const viewport = Math.max(0, Number.isFinite(viewportHeight) ? viewportHeight : 0);
-  const firstVisibleRow = Math.floor(top / height);
-  const lastVisibleRow = Math.floor(Math.max(top, top + viewport - 1) / height);
+  const firstVisibleRow = Math.min(totalRows - 1, Math.floor(top / height));
+  const lastVisibleRow = Math.min(
+    totalRows - 1,
+    Math.floor(Math.max(top, top + viewport - 1) / height),
+  );
   const firstRow = Math.max(0, firstVisibleRow - overscan);
-  const lastRow = Math.min(totalRows - 1, lastVisibleRow + overscan);
+  const lastRow = Math.max(firstRow, Math.min(totalRows - 1, lastVisibleRow + overscan));
 
   return {
     firstRow,
