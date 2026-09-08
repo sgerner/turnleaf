@@ -1,7 +1,7 @@
 <script lang="ts">
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
-  import { onDestroy, onMount } from 'svelte';
+  import { tick, onDestroy, onMount } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreference, setPreference } from '../database/database';
@@ -17,6 +17,7 @@
     type ReadingMode,
   } from '../reader/appearance';
   import { ReaderSession, type ReaderLocation, type TocItem } from '../reader/session';
+  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   let {
     bookUrl,
@@ -43,6 +44,10 @@
   let controlsVisible = $state(false);
   let settingsVisible = $state(false);
   let tocVisible = $state(false);
+  let settingsPanel = $state<HTMLElement | null>(null);
+  let tocPanel = $state<HTMLElement | null>(null);
+  let settingsOpener: HTMLElement | null = null;
+  let tocOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
@@ -137,6 +142,46 @@
     scheduleChromeHide();
   }
 
+  function activeElement(): HTMLElement | null {
+    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  }
+
+  function focusPanel(getPanel: () => HTMLElement | null): void {
+    void tick().then(() => focusFirstElement(getPanel()));
+  }
+
+  function openSettings(): void {
+    settingsOpener = activeElement();
+    settingsVisible = true;
+    tocVisible = false;
+    tocOpener = null;
+    focusPanel(() => settingsPanel);
+  }
+
+  function closeSettings(): void {
+    settingsVisible = false;
+    const opener = settingsOpener;
+    settingsOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openToc(): void {
+    tocOpener = activeElement();
+    tocVisible = true;
+    settingsVisible = false;
+    settingsOpener = null;
+    focusPanel(() => tocPanel);
+  }
+
+  function closeToc(): void {
+    tocVisible = false;
+    const opener = tocOpener;
+    tocOpener = null;
+    restoreFocus(opener);
+  }
+
   function showFooter(): void {
     footerVisible = true;
     scheduleChromeHide();
@@ -146,8 +191,8 @@
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
       controlsVisible = false;
-      settingsVisible = false;
-      tocVisible = false;
+      closeSettings();
+      closeToc();
       footerVisible = false;
     }, 5_000);
   }
@@ -275,7 +320,11 @@
     Press Escape to close an open reader panel.
   </p>
 
-  <nav class="tap-zones" aria-label="Page navigation">
+  <nav
+    class="tap-zones"
+    aria-label="Page navigation"
+    inert={Boolean(settingsVisible || tocVisible)}
+  >
     <button
       type="button"
       aria-label="Previous page"
@@ -336,7 +385,11 @@
 
   {#if controlsVisible}
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
-      <header class="reader-bar reader-top" transition:fly={{ y: -8, duration: 140 }}>
+      <header
+        class="reader-bar reader-top"
+        inert={Boolean(settingsVisible || tocVisible)}
+        transition:fly={{ y: -8, duration: 140 }}
+      >
         <div class="grid w-full grid-cols-4 gap-2">
           <button
             class="btn preset-tonal-surface min-h-12"
@@ -349,22 +402,18 @@
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
-            onclick={() => {
-              tocVisible = !tocVisible;
-              settingsVisible = false;
-            }}
+            onclick={() => (tocVisible ? closeToc() : openToc())}
             aria-expanded={tocVisible}
+            aria-controls="reader-contents"
           >
             Contents
           </button>
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
-            onclick={() => {
-              settingsVisible = !settingsVisible;
-              tocVisible = false;
-            }}
+            onclick={() => (settingsVisible ? closeSettings() : openSettings())}
             aria-expanded={settingsVisible}
+            aria-controls="reader-appearance"
           >
             Text
           </button>
@@ -394,15 +443,32 @@
         </p>
       </header>
 
+      {#if settingsVisible || tocVisible}
+        <button
+          class="reader-panel-backdrop"
+          type="button"
+          tabindex="-1"
+          aria-label="Close reader panel"
+          onclick={() => (settingsVisible ? closeSettings() : closeToc())}
+        ></button>
+      {/if}
+
       {#if settingsVisible}
-        <section
+        <div
+          bind:this={settingsPanel}
           class="reader-settings card preset-filled-surface-50-950 relative"
+          id="reader-appearance"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-appearance-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, settingsPanel!, closeSettings)}
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
             class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
             type="button"
-            onclick={() => (settingsVisible = false)}
+            onclick={closeSettings}
             aria-label="Close reading appearance"
             title="Close"
           >
@@ -413,7 +479,7 @@
               />
             </svg>
           </button>
-          <h2 class="font-serif text-xl">Reading appearance</h2>
+          <h2 id="reader-appearance-title" class="font-serif text-xl">Reading appearance</h2>
           <div class="mt-4 grid grid-cols-2 gap-2" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
               <button
@@ -531,19 +597,25 @@
             />
             Keep screen on while reading
           </label>
-        </section>
+        </div>
       {/if}
 
       {#if tocVisible}
-        <nav
+        <div
+          bind:this={tocPanel}
           class="reader-settings card preset-filled-surface-50-950 relative"
-          aria-label="Table of contents"
+          id="reader-contents"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-contents-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, tocPanel!, closeToc)}
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
             class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
             type="button"
-            onclick={() => (tocVisible = false)}
+            onclick={closeToc}
             aria-label="Close table of contents"
             title="Close"
           >
@@ -554,7 +626,7 @@
               />
             </svg>
           </button>
-          <h2 class="font-serif text-xl">Contents</h2>
+          <h2 id="reader-contents-title" class="font-serif text-xl">Contents</h2>
           <div class="mt-3 max-h-[55dvh] overflow-auto">
             {#each toc as item (item.href)}
               <button
@@ -562,12 +634,12 @@
                 type="button"
                 onclick={() => {
                   void session?.display(item.href);
-                  tocVisible = false;
+                  closeToc();
                 }}>{item.label}</button
               >
             {/each}
           </div>
-        </nav>
+        </div>
       {/if}
     </div>
   {/if}
@@ -759,6 +831,16 @@
     margin-inline: auto;
     max-width: 30rem;
     padding: 1.25rem;
+    z-index: 1;
+  }
+
+  .reader-panel-backdrop {
+    position: absolute;
+    z-index: 0;
+    inset: 0;
+    border: 0;
+    background: hsl(0 0% 0% / 0.24);
+    pointer-events: auto;
   }
 
   .active-mode {
