@@ -12,8 +12,7 @@
 - Report individual and bulk download-removal failures instead of claiming storage was cleared.
 - Update the changed book in memory after reader progress saves instead of reloading the full library.
 - docs: add future implementation work plan
-- Add a native library index for server-scoped title queries.
-- Reduce derived library work by normalizing searches once and selecting Continue Reading in one pass.
+- Add persistent library sort order, result counts, and a clear-filters action for offline discovery.
 - Add accessible modal semantics, focus trapping, Escape/backdrop closing, and focus restoration to library and reader panels.
 - Add keyboard page navigation and an accessible reader shortcut hint for non-touch users.
 - Increase compact library controls to touch-friendly targets and expose reading progress to assistive technology.
