@@ -13,6 +13,11 @@ export interface ReaderLocation {
 
 export type ReaderLocationOrigin = 'navigation' | 'restore';
 
+export interface ReaderSelection {
+  cfi: string;
+  text: string;
+}
+
 export interface TocItem {
   label: string;
   href: string;
@@ -332,6 +337,7 @@ export class ReaderSession {
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
+  private selectionListeners: Array<() => void> = [];
   private current: Location | null = null;
   private userNavigationPending = false;
   private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
@@ -349,6 +355,7 @@ export class ReaderSession {
     appearance: Appearance,
     onLocation: (location: ReaderLocation, origin: ReaderLocationOrigin) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
+    onSelection?: (selection: ReaderSelection) => void,
   ): Promise<void> {
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -359,6 +366,25 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    if (onSelection) {
+      this.rendition.hooks.content.register((contents: Contents) => {
+        const handler = () => {
+          const selection = contents.window.getSelection();
+          if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+          const text = selection.toString().replace(/\s+/g, ' ').trim();
+          if (!text) return;
+          try {
+            onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
+          } catch {
+            // Selection can change while a section is being replaced.
+          }
+        };
+        contents.document.addEventListener('selectionchange', handler);
+        this.selectionListeners.push(() =>
+          contents.document.removeEventListener('selectionchange', handler),
+        );
+      });
+    }
     this.onLocation = onLocation;
     this.relocated = (location) => {
       this.current = location;
@@ -502,6 +528,8 @@ export class ReaderSession {
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     this.rendition?.destroy();
+    this.selectionListeners.forEach((remove) => remove());
+    this.selectionListeners = [];
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
