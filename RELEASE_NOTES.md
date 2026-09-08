@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reconcile removed books and clean up credentials
+- Reconcile complete Kavita metadata snapshots without purging cached books after partial or failed fetches; retain downloaded books and pending local progress when Kavita removes them.
+- Report credential and server-configuration cleanup failures accurately and compensate failed onboarding saves so orphaned auth keys remain recoverable.
+- Document offline metadata retention and retry behavior.
 - Harden release link validation and provenance
 - Validate GitHub update links and publish Android releases from tested revisions with least-privilege workflow permissions.
 - Continue syncing later progress items when an earlier item fails, while recording the failed item for retry.

@@ -105,6 +105,21 @@ it('loads every series page for large libraries', async () => {
   );
 });
 
+it('rejects an incomplete series page instead of treating it as an empty library', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => ({ unexpected: true }),
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'invalid-response',
+  });
+});
+
 it.each([[[2, 4]], [[4]]])(
   'connects to supported EPUB library types %j',
   async (supportedTypes) => {

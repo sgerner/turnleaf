@@ -157,7 +157,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
     expect.stringContaining('ALTER TABLE books ADD COLUMN pages'),
     expect.stringContaining('CREATE TABLE preferences'),
-    expect.stringContaining('CREATE INDEX IF NOT EXISTS idx_books_server_title'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_available'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
