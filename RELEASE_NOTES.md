@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- docs: record remaining work implementation status
 - docs: add Android device validation checklist
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
 - Add a reproducible Android accessibility, network isolation, and offline reopen validation checklist.
