@@ -172,5 +172,21 @@
         {/if}
       </button>
     </form>
+
+    <aside class="card preset-tonal-surface p-5" aria-labelledby="getting-started-title">
+      <h2 id="getting-started-title" class="font-serif text-xl">Getting started</h2>
+      <ol class="mt-3 grid gap-3 text-sm text-surface-800-200">
+        <li>
+          <strong>1. Connect.</strong> Turnleaf checks the address and key before saving them.
+        </li>
+        <li>
+          <strong>2. Download.</strong> Use a book's download action to keep an EPUB available offline.
+        </li>
+        <li>
+          <strong>3. Resume.</strong> Your reading position is saved locally and can sync when Kavita
+          is reachable.
+        </li>
+      </ol>
+    </aside>
   </div>
 </main>

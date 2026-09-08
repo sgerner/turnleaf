@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Group library settings by appearance, sync, connection, and storage, and add concise first-run guidance.
 - Prioritize visible covers and share bounded requests across refresh generations, with server-scoped native cache files and safe partial transfers.
 - Validate downloaded EPUB ZIP containers with bounded range reads and reject malformed or unsafe archives before making them available; validate Kavita library, series, detail, progress, and paginated response shapes without replacing saved offline data after a failed refresh.
 - Reconcile removed books and clean up credentials
