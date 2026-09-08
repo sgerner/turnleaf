@@ -5,6 +5,9 @@
 - Update DOMPurify and the EPUB XML parser to patched releases so production dependency audits pass.
 - Add pure black/white "eink" theme for e-paper readers
 - Add local Kavita dev environment via Docker Compose
+- Prevent reader native controls from being re-enabled after the reader is closed during startup.
+- Fix reader chrome, volume-button paging, and keep-awake not working on Android by registering their native plugins with the Capacitor bridge
+- Add a setting to keep the screen awake while reading
 
 ## 0.2.0
 

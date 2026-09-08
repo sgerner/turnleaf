@@ -18,4 +18,9 @@ describe('appearance serialization', () => {
     expect(parseAppearance('{}').progressBar).toBe(true);
     expect(parseAppearance('{"progressBar":false}').progressBar).toBe(false);
   });
+
+  it('defaults keeping the screen awake off', () => {
+    expect(parseAppearance('{}').keepAwake).toBe(false);
+    expect(parseAppearance('{"keepAwake":true}').keepAwake).toBe(true);
+  });
 });
