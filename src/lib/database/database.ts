@@ -621,6 +621,13 @@ export interface PendingSyncItem {
   updatedAt: string;
 }
 
+export interface SyncStatus {
+  pendingCount: number;
+  failedCount: number;
+  lastError: string | null;
+  lastUpdatedAt: string | null;
+}
+
 export async function getPendingSync(): Promise<PendingSyncItem[]> {
   if (!Capacitor.isNativePlatform()) {
     return Object.values(readBrowserState().syncQueue)
@@ -636,6 +643,33 @@ export async function getPendingSync(): Promise<PendingSyncItem[]> {
     payload: String(row.payload_json),
     updatedAt: String(row.updated_at),
   }));
+}
+
+export async function getSyncStatus(): Promise<SyncStatus> {
+  if (!Capacitor.isNativePlatform()) {
+    const rows = Object.values(readBrowserState().syncQueue).sort((a, b) =>
+      b.updatedAt.localeCompare(a.updatedAt),
+    );
+    return {
+      pendingCount: rows.length,
+      failedCount: rows.filter((row) => Boolean(row.lastError)).length,
+      lastError: rows.find((row) => row.lastError)?.lastError ?? null,
+      lastUpdatedAt: rows[0]?.updatedAt ?? null,
+    };
+  }
+  const db = await openDatabase();
+  const result = await db.query(
+    'SELECT updated_at,last_error FROM sync_queue ORDER BY updated_at DESC',
+  );
+  const rows = result.values ?? [];
+  return {
+    pendingCount: rows.length,
+    failedCount: rows.filter((row) => row.last_error).length,
+    lastError: rows.find((row) => row.last_error)?.last_error
+      ? String(rows.find((row) => row.last_error)?.last_error)
+      : null,
+    lastUpdatedAt: rows[0]?.updated_at ? String(rows[0].updated_at) : null,
+  };
 }
 
 export async function confirmSync(

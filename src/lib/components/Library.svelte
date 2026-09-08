@@ -9,6 +9,7 @@
     getBooks,
     getReadingState,
     getPreference,
+    getSyncStatus,
     markDownloaded,
     markBookCompleted,
     removeDownload,
@@ -19,6 +20,7 @@
     setPreference,
     type BookRecord,
     type ServerConfig,
+    type SyncStatus,
   } from '../database/database';
   import {
     cacheCover,
@@ -281,6 +283,13 @@
   let downloadingBookId = $state<string | null>(null);
   let offline = $state(false);
   let message = $state('');
+  let syncStatus = $state<SyncStatus>({
+    pendingCount: 0,
+    failedCount: 0,
+    lastError: null,
+    lastUpdatedAt: null,
+  });
+  let syncing = $state(false);
   let settingsVisible = $state(false);
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
@@ -470,6 +479,8 @@
     sortOrder = parseSortOrder(savedSort);
     books = await getBooks(server.id);
     if (destroyed) return;
+    await refreshSyncStatus();
+    if (destroyed) return;
     retainCoversFor(books);
     void loadCovers(books);
     loading = false;
@@ -483,7 +494,7 @@
           if (destroyed) return;
           offline = !connected;
           if (connected)
-            void flushProgress(client)
+            void syncProgress(false)
               .then(refresh)
               .catch(() => {});
         }),
@@ -492,7 +503,7 @@
     cleanups.push(
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
-          if (!destroyed && !isActive) void flushProgress(client).catch(() => {});
+          if (!destroyed && !isActive) void syncProgress(false);
         }),
       ),
     );
@@ -517,6 +528,34 @@
       return async () => {};
     }
     return handle.remove;
+  }
+
+  async function refreshSyncStatus(): Promise<void> {
+    try {
+      syncStatus = await getSyncStatus();
+    } catch {
+      // A status read must not block opening the saved library.
+    }
+  }
+
+  async function syncProgress(showFeedback = true): Promise<void> {
+    if (syncing) return;
+    syncing = true;
+    try {
+      if (offline) {
+        if (showFeedback)
+          message = 'Offline. Reading progress will retry when Kavita is available.';
+        return;
+      }
+      await flushProgress(client);
+      if (showFeedback) message = 'Reading progress synced.';
+    } catch {
+      if (showFeedback)
+        message = 'Some reading progress is waiting to sync. Try again when online.';
+    } finally {
+      await refreshSyncStatus();
+      syncing = false;
+    }
   }
 
   onDestroy(() => {
@@ -739,7 +778,7 @@
         xpath: null,
         percentage: null,
       };
-      if (preferFurthest) void flushProgress(client).catch(() => {});
+      if (preferFurthest) void syncProgress(false);
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
@@ -781,8 +820,9 @@
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
     books = books.map((item) => (item.id === book.id ? { ...item, pagesRead, lastReadAt } : item));
+    await refreshSyncStatus();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void flushProgress(client).catch(() => {}), 2_500);
+    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
   }
 
   async function syncLatestForReader(
@@ -809,7 +849,7 @@
           }
         : item,
     );
-    void flushProgress(client).catch(() => {});
+    void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
   }
@@ -1173,6 +1213,17 @@
       </label>
     </div>
 
+    {#if !loading && books.length > 0}
+      <div class="mt-4 flex items-center justify-between gap-3 text-sm text-surface-700-300">
+        <p>{visibleBooks.length} of {books.length} books</p>
+        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title'}
+          <button class="btn btn-sm preset-tonal-surface h-10" type="button" onclick={clearFilters}>
+            Clear filters
+          </button>
+        {/if}
+      </div>
+    {/if}
+
     {#if offline}
       <div class="alert preset-tonal-warning mt-5" role="status" transition:fade>
         Offline. Saved books remain available.
@@ -1183,14 +1234,29 @@
         {message}
       </div>
     {/if}
-    {#if !loading && books.length > 0}
-      <div class="mt-4 flex items-center justify-between gap-3 text-sm text-surface-700-300">
-        <p>{visibleBooks.length} of {books.length} books</p>
-        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title'}
-          <button class="btn btn-sm preset-tonal-surface h-10" type="button" onclick={clearFilters}>
-            Clear filters
-          </button>
-        {/if}
+    {#if syncStatus.pendingCount > 0}
+      <div
+        class="alert preset-tonal-warning mt-4 flex flex-wrap items-center justify-between gap-3"
+        role="status"
+      >
+        <div class="min-w-0">
+          <p>
+            {syncStatus.failedCount > 0
+              ? `${syncStatus.failedCount} reading progress update${syncStatus.failedCount === 1 ? '' : 's'} failed and remain queued.`
+              : `${syncStatus.pendingCount} reading progress update${syncStatus.pendingCount === 1 ? '' : 's'} waiting to sync.`}
+          </p>
+          {#if syncStatus.lastError}
+            <p class="mt-1 truncate text-xs opacity-80">Last error: {syncStatus.lastError}</p>
+          {/if}
+        </div>
+        <button
+          class="btn btn-sm preset-tonal-warning h-10 shrink-0"
+          type="button"
+          onclick={() => void syncProgress()}
+          disabled={syncing || offline}
+        >
+          {syncing ? 'Retrying...' : 'Retry sync'}
+        </button>
       </div>
     {/if}
 
