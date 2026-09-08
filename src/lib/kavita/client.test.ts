@@ -43,6 +43,7 @@ it('loads covers with the api key header', async () => {
   expect(fetch).toHaveBeenCalledWith(
     'https://books.example.com/api/Image/series-cover?seriesId=4',
     expect.objectContaining({
+      redirect: 'error',
       headers: expect.objectContaining({
         'x-api-key': 'abc123',
       }),
@@ -60,6 +61,7 @@ it('requests the Kavita series list with POST', async () => {
     'https://books.example.com/api/Series/v2?PageNumber=1&PageSize=500',
     expect.objectContaining({
       method: 'POST',
+      redirect: 'error',
       headers: expect.objectContaining({
         'x-api-key': 'abc123',
       }),

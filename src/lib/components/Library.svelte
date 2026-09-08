@@ -208,6 +208,7 @@
     onServerDeleted: () => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
+  type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
@@ -223,6 +224,23 @@
   let hideCompleted = $state(true);
   let normalizedQuery = $derived(query.trim().toLowerCase());
   let sortOrder = $state<LibrarySortOrder>('title');
+  let authorFilter = $state('');
+  let seriesFilter = $state('');
+  let viewMode = $state<LibraryViewMode>('grid');
+  let authors = $derived(
+    [
+      ...new Set(
+        books.map((book) => book.author).filter((author): author is string => Boolean(author)),
+      ),
+    ].sort((a, b) => a.localeCompare(b)),
+  );
+  let seriesNames = $derived(
+    [
+      ...new Set(
+        books.map((book) => book.series).filter((series): series is string => Boolean(series)),
+      ),
+    ].sort((a, b) => a.localeCompare(b)),
+  );
   let visibleBooks = $derived.by(() => {
     const filtered = books.filter((book) => {
       const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
@@ -234,7 +252,9 @@
         matchesQuery &&
         (book.remoteAvailable !== false || retainedOffline) &&
         (!downloadedOnly || Boolean(book.downloadPath)) &&
-        (!hideCompleted || !completed)
+        (!hideCompleted || !completed) &&
+        (!authorFilter || book.author === authorFilter) &&
+        (!seriesFilter || book.series === seriesFilter)
       );
     });
 
@@ -334,18 +354,44 @@
     return value === 'author' || value === 'recent' ? value : 'title';
   }
 
+  function parseViewMode(value: string | null): LibraryViewMode {
+    return value === 'list' ? 'list' : 'grid';
+  }
+
   function handleSortChange(event: Event): void {
     const value = (event.currentTarget as HTMLSelectElement).value;
     sortOrder = parseSortOrder(value);
     void setPreference('librarySort', sortOrder);
   }
 
+  function handleAuthorChange(event: Event): void {
+    authorFilter = (event.currentTarget as HTMLSelectElement).value;
+    void setPreference('libraryAuthor', authorFilter);
+  }
+
+  function handleSeriesChange(event: Event): void {
+    seriesFilter = (event.currentTarget as HTMLSelectElement).value;
+    void setPreference('librarySeries', seriesFilter);
+  }
+
+  function handleViewModeChange(next: LibraryViewMode): void {
+    viewMode = next;
+    void setPreference('libraryView', next);
+    scheduleVirtualWindow();
+  }
+
   function clearFilters(): void {
     query = '';
     downloadedOnly = false;
     hideCompleted = false;
+    authorFilter = '';
+    seriesFilter = '';
     sortOrder = 'title';
+    viewMode = 'grid';
     void setPreference('librarySort', sortOrder);
+    void setPreference('libraryAuthor', authorFilter);
+    void setPreference('librarySeries', seriesFilter);
+    void setPreference('libraryView', viewMode);
   }
 
   function activeElement(): HTMLElement | null {
@@ -363,6 +409,7 @@
   }
 
   function columnsForWidth(width: number): number {
+    if (viewMode === 'list') return 1;
     if (width >= 1024) return 5;
     if (width >= 768) return 4;
     if (width >= 640) return 3;
@@ -370,6 +417,7 @@
   }
 
   function rowHeightFor(width: number, columns: number): number {
+    if (viewMode === 'list') return 112;
     const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
     return Math.max(1, Math.ceil(cardWidth * 1.5 + CARD_TEXT_HEIGHT_PX + GRID_ROW_GAP_PX));
   }
@@ -451,6 +499,10 @@
   });
 
   $effect(() => {
+    if (viewMode === 'grid' || viewMode === 'list') scheduleVirtualWindow();
+  });
+
+  $effect(() => {
     if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => scheduleVirtualWindow());
     observer.observe(virtualGrid);
@@ -473,10 +525,19 @@
     if (destroyed) return;
     const savedSort = await getPreference('librarySort');
     if (destroyed) return;
+    const savedAuthor = await getPreference('libraryAuthor');
+    if (destroyed) return;
+    const savedSeries = await getPreference('librarySeries');
+    if (destroyed) return;
+    const savedView = await getPreference('libraryView');
+    if (destroyed) return;
     pendingTheme = (savedTheme as SkeletonTheme | null) ?? (theme as SkeletonTheme);
     pendingMode = savedMode === 'light' ? 'light' : mode;
     pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
     sortOrder = parseSortOrder(savedSort);
+    authorFilter = savedAuthor ?? '';
+    seriesFilter = savedSeries ?? '';
+    viewMode = parseViewMode(savedView);
     books = await getBooks(server.id);
     if (destroyed) return;
     await refreshSyncStatus();
@@ -1211,12 +1272,62 @@
           <option value="recent">Recently read</option>
         </select>
       </label>
+      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
+        <span>Author</span>
+        <select
+          class="select preset-tonal-surface h-10 min-w-36"
+          aria-label="Filter by author"
+          value={authorFilter}
+          onchange={handleAuthorChange}
+        >
+          <option value="">All authors</option>
+          {#each authors as author (author)}
+            <option value={author}>{author}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
+        <span>Series</span>
+        <select
+          class="select preset-tonal-surface h-10 min-w-36"
+          aria-label="Filter by series"
+          value={seriesFilter}
+          onchange={handleSeriesChange}
+        >
+          <option value="">All series</option>
+          {#each seriesNames as series (series)}
+            <option value={series}>{series}</option>
+          {/each}
+        </select>
+      </label>
+      <div class="mt-2 flex items-center gap-1" role="group" aria-label="Library view">
+        <button
+          class="btn btn-sm h-10 {viewMode === 'grid'
+            ? 'preset-filled-primary-700-300'
+            : 'preset-tonal-surface'}"
+          type="button"
+          aria-pressed={viewMode === 'grid'}
+          onclick={() => handleViewModeChange('grid')}
+        >
+          Grid
+        </button>
+        <button
+          class="btn btn-sm h-10 {viewMode === 'list'
+            ? 'preset-filled-primary-700-300'
+            : 'preset-tonal-surface'}"
+          type="button"
+          aria-pressed={viewMode === 'list'}
+          onclick={() => handleViewModeChange('list')}
+        >
+          List
+        </button>
+      </div>
     </div>
 
     {#if !loading && books.length > 0}
       <div class="mt-4 flex items-center justify-between gap-3 text-sm text-surface-700-300">
         <p>{visibleBooks.length} of {books.length} books</p>
-        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title'}
+        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title' || authorFilter || seriesFilter || viewMode !== 'grid'}
           <button class="btn btn-sm preset-tonal-surface h-10" type="button" onclick={clearFilters}>
             Clear filters
           </button>
@@ -1324,71 +1435,132 @@
                   }}
                   disabled={downloadingBookId === book.id}
                 >
-                  <div
-                    class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
-                  >
-                    {#if covers[book.seriesId]}
-                      <img
-                        class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                        src={covers[book.seriesId]}
-                        loading="lazy"
-                        decoding="async"
-                        alt=""
-                      />
-                    {/if}
-                    {#if book.remoteAvailable === false && book.downloadPath}
-                      <span
-                        class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                        title="Saved offline; no longer available on Kavita"
-                        aria-label="Saved offline; no longer available on Kavita"
-                      >
-                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                          <path
-                            fill="currentColor"
-                            d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                  {#if viewMode === 'list'}
+                    <div
+                      class="preset-tonal-surface flex min-h-24 items-center gap-4 rounded-lg p-3 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                    >
+                      <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
+                        {#if covers[book.seriesId]}
+                          <img
+                            class="h-full w-full object-cover"
+                            src={covers[book.seriesId]}
+                            loading="lazy"
+                            decoding="async"
+                            alt=""
                           />
-                        </svg>
-                      </span>
-                    {/if}
-                    {#if downloadingBookId === book.id}
-                      <span
-                        class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                        title="Downloading"
-                        aria-label="Downloading"
-                      >
-                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
-                          <path
-                            fill="currentColor"
-                            d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
-                          />
-                        </svg>
-                      </span>
-                    {/if}
-                    {#if progressOf(book) > 0}
-                      <div
-                        class="absolute inset-x-0 bottom-0 h-2"
-                        role="progressbar"
-                        aria-label={`Reading progress for ${book.title}`}
-                        aria-valuemin="0"
-                        aria-valuemax="100"
-                        aria-valuenow={Math.round(progressOf(book))}
-                        aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                      >
-                        <div
-                          class="h-full preset-filled-primary-600-400"
-                          style:width={`${progressOf(book)}%`}
-                        ></div>
+                        {/if}
+                        {#if book.remoteAvailable === false && book.downloadPath}
+                          <span
+                            class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
+                            title="Saved offline; no longer available on Kavita"
+                            aria-label="Saved offline; no longer available on Kavita"
+                          >
+                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                              <path
+                                fill="currentColor"
+                                d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                              />
+                            </svg>
+                          </span>
+                        {/if}
                       </div>
-                    {/if}
-                  </div>
-                  <h2
-                    class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
-                  >
-                    {book.title}
-                  </h2>
-                  <p class="mt-1 truncate text-sm text-surface-700-300">
-                    {book.author ?? 'Unknown author'}
-                  </p>
+                      <div class="min-w-0 flex-1">
+                        <h2
+                          class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                        >
+                          {book.title}
+                        </h2>
+                        <p class="mt-1 truncate text-sm text-surface-700-300">
+                          {book.author ?? 'Unknown author'}
+                        </p>
+                        {#if book.series}
+                          <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                        {/if}
+                        {#if progressOf(book) > 0}
+                          <div
+                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                            role="progressbar"
+                            aria-label={`Reading progress for ${book.title}`}
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                            aria-valuenow={Math.round(progressOf(book))}
+                            aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                          >
+                            <div
+                              class="h-full preset-filled-primary-600-400"
+                              style:width={`${progressOf(book)}%`}
+                            ></div>
+                          </div>
+                        {/if}
+                      </div>
+                    </div>
+                  {:else}
+                    <div
+                      class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                    >
+                      {#if covers[book.seriesId]}
+                        <img
+                          class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                          src={covers[book.seriesId]}
+                          loading="lazy"
+                          decoding="async"
+                          alt=""
+                        />
+                      {/if}
+                      {#if book.remoteAvailable === false && book.downloadPath}
+                        <span
+                          class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                          title="Saved offline; no longer available on Kavita"
+                          aria-label="Saved offline; no longer available on Kavita"
+                        >
+                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                            <path
+                              fill="currentColor"
+                              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                            />
+                          </svg>
+                        </span>
+                      {/if}
+                      {#if downloadingBookId === book.id}
+                        <span
+                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                          title="Downloading"
+                          aria-label="Downloading"
+                        >
+                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
+                            <path
+                              fill="currentColor"
+                              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+                            />
+                          </svg>
+                        </span>
+                      {/if}
+                      {#if progressOf(book) > 0}
+                        <div
+                          class="absolute inset-x-0 bottom-0 h-2"
+                          role="progressbar"
+                          aria-label={`Reading progress for ${book.title}`}
+                          aria-valuemin="0"
+                          aria-valuemax="100"
+                          aria-valuenow={Math.round(progressOf(book))}
+                          aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                        >
+                          <div
+                            class="h-full preset-filled-primary-600-400"
+                            style:width={`${progressOf(book)}%`}
+                          ></div>
+                        </div>
+                      {/if}
+                    </div>
+                    <h2
+                      class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                    >
+                      {book.title}
+                    </h2>
+                    <p class="mt-1 truncate text-sm text-surface-700-300">
+                      {book.author ?? 'Unknown author'}
+                    </p>
+                  {/if}
                 </button>
                 <button
                   class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-11 w-11 !p-0 shadow-md"
