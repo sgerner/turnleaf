@@ -48,11 +48,5 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Build web app
-        run: npm run build
-
-      - name: Sync Android project
-        run: npx cap sync android
-
       - name: Build Android debug APK
-        run: cd android && ./gradlew assembleDebug
+        run: npm run android:debug

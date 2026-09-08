@@ -46,17 +46,11 @@ jobs:
           echo "TURNLEAF_VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "TURNLEAF_RELEASE_TAG=v${RELEASE_VERSION}" >> "$GITHUB_ENV"
 
-      - name: Build web assets
-        run: npm run build
-
       - name: Finalize release notes
         run: npm run release:finalize
 
       - name: Prepare release notes
         run: npm run --silent release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
-
-      - name: Sync Android project
-        run: npx cap sync android
 
       - name: Restore signing key
         env:
@@ -91,7 +85,7 @@ jobs:
           EOF
 
       - name: Build signed release APK
-        run: cd android && ./gradlew assembleRelease
+        run: npm run android:release
 
       - name: Publish GitHub release
         env:
