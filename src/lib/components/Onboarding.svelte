@@ -3,7 +3,7 @@
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
-  import { saveApiKey } from '../native/credentials';
+  import { removeApiKey, saveApiKey } from '../native/credentials';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
   let { onConnected }: { onConnected: (server: ServerConfig) => void } = $props();
@@ -49,9 +49,20 @@
       try {
         await saveServer(server);
       } catch (storageError) {
-        throw new Error('The connection worked, but local setup could not be saved.', {
-          cause: storageError,
-        });
+        try {
+          await removeApiKey(credentialRef);
+        } catch (cleanupError) {
+          throw new Error(
+            'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
+            { cause: cleanupError },
+          );
+        }
+        throw new Error(
+          'The connection worked, but local setup could not be saved. No auth key was retained; try again.',
+          {
+            cause: storageError,
+          },
+        );
       }
       apiKey = '';
       onConnected(server);

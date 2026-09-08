@@ -8,15 +8,23 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-release-apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release_version.outputs.release_tag }}
+      version_base: ${{ steps.release_version.outputs.version_base }}
+      tested_revision: ${{ steps.release_version.outputs.tested_revision }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -37,6 +45,7 @@ jobs:
         run: npm ci
 
       - name: Derive release version
+        id: release_version
         run: |
           set -eu
           BASE_VERSION="$(node -p "require('./package.json').version")"
@@ -45,12 +54,21 @@ jobs:
           echo "TURNLEAF_VERSION_NAME=${RELEASE_VERSION}" >> "$GITHUB_ENV"
           echo "TURNLEAF_VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "TURNLEAF_RELEASE_TAG=v${RELEASE_VERSION}" >> "$GITHUB_ENV"
+          echo "release_tag=v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tested_revision=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Finalize release notes
         run: npm run release:finalize
 
-      - name: Prepare release notes
-        run: npm run --silent release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
+      - name: Run release quality gates
+        run: |
+          npm run security:audit
+          npm run format:check
+          npm run lint
+          npm run check
+          npm test
+          npm run android:debug
 
       - name: Restore signing key
         env:
@@ -87,12 +105,58 @@ jobs:
       - name: Build signed release APK
         run: npm run android:release
 
+      - name: Stage release artifacts and notes
+        run: |
+          set -eu
+          mkdir -p release-payload
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK"
+          npm run --silent release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
+          {
+            cat "$RUNNER_TEMP/turnleaf-release-notes.md"
+            printf '\n\nTested revision: `%s`\n' "$GITHUB_SHA"
+          } > release-payload/turnleaf-release-notes.md
+          cp "$APK" release-payload/app-release.apk
+          printf '%s\n' "$GITHUB_SHA" > release-payload/tested-revision.txt
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnleaf-release
+          path: release-payload
+          if-no-files-found: error
+
+  publish-github-release:
+    needs: build-release-apk
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download tested release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: turnleaf-release
+          path: release-payload
+
+      - name: Verify release provenance
+        env:
+          TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
+        run: |
+          set -eu
+          test "$(cat release-payload/tested-revision.txt)" = "$TESTED_REVISION"
+          grep -Fq "Tested revision: \`$TESTED_REVISION\`" release-payload/turnleaf-release-notes.md
+          test -s release-payload/app-release.apk
+          test -s release-payload/turnleaf-release-notes.md
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build-release-apk.outputs.release_tag }}
+          VERSION_BASE: ${{ needs.build-release-apk.outputs.version_base }}
+          TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
         run: |
-          APK="android/app/build/outputs/apk/release/app-release.apk"
-          gh release create "$TURNLEAF_RELEASE_TAG" "$APK" \
-            --title "Turnleaf $TURNLEAF_VERSION_BASE" \
-            --notes-file "$RUNNER_TEMP/turnleaf-release-notes.md" \
-            --target "${{ github.sha }}"
+          gh release create "$RELEASE_TAG" "release-payload/app-release.apk" \
+            --title "Turnleaf $VERSION_BASE" \
+            --notes-file "release-payload/turnleaf-release-notes.md" \
+            --target "$TESTED_REVISION"
