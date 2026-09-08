@@ -53,6 +53,7 @@ jobs:
 
   android-emulator-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Check out source
@@ -82,10 +83,11 @@ jobs:
       - name: Launch emulator and smoke test app startup
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 35
+          api-level: 34
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -no-audio -no-boot-anim
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
+          force-avd-creation: true
           disable-animations: true
           script: npm run android:smoke
