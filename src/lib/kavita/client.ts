@@ -126,6 +126,7 @@ export class KavitaClient {
         url,
         headers: { 'x-api-key': this.apiKey },
         responseType: 'blob',
+        disableRedirects: true,
         connectTimeout: REQUEST_TIMEOUT_MS,
         readTimeout: REQUEST_TIMEOUT_MS,
       });
@@ -152,6 +153,7 @@ export class KavitaClient {
       const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
       const response = await fetch(url, {
         signal: combined,
+        redirect: 'error',
         headers: { 'x-api-key': this.apiKey },
       });
       if (!response.ok) throw new KavitaError('The book cover could not be loaded.', 'server');
@@ -205,6 +207,7 @@ export class KavitaClient {
       const response = await fetch(this.resolveUrl(path), {
         ...init,
         signal,
+        redirect: 'error',
         headers: {
           Accept: 'application/json',
           'Content-Type': 'application/json',
@@ -255,6 +258,7 @@ export class KavitaClient {
       },
       connectTimeout: REQUEST_TIMEOUT_MS,
       readTimeout: REQUEST_TIMEOUT_MS,
+      disableRedirects: true,
     };
     if (typeof init.body === 'string') options.data = JSON.parse(init.body) as unknown;
     try {

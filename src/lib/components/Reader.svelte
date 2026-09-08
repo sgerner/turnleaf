@@ -16,7 +16,21 @@
     type Appearance,
     type ReadingMode,
   } from '../reader/appearance';
-  import { ReaderSession, type ReaderLocation, type TocItem } from '../reader/session';
+  import {
+    ReaderSession,
+    type ReaderLocation,
+    type ReaderSelection,
+    type TocItem,
+  } from '../reader/session';
+  import type { ReaderSearchResult } from '../reader/search';
+  import {
+    addAnnotation,
+    annotationsMarkdown,
+    parseAnnotations,
+    removeAnnotation,
+    updateAnnotation,
+    type StoredAnnotation,
+  } from '../reader/annotations';
   import {
     parseBookmarks,
     parseLocationHistory,
@@ -56,17 +70,32 @@
   let settingsVisible = $state(false);
   let tocVisible = $state(false);
   let bookmarksVisible = $state(false);
+  let annotationsVisible = $state(false);
+  let searchVisible = $state(false);
   let settingsPanel = $state<HTMLElement | null>(null);
   let tocPanel = $state<HTMLElement | null>(null);
   let bookmarksPanel = $state<HTMLElement | null>(null);
+  let annotationsPanel = $state<HTMLElement | null>(null);
+  let searchPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
   let bookmarksOpener: HTMLElement | null = null;
+  let annotationsOpener: HTMLElement | null = null;
+  let searchOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
   let bookmarks = $state<StoredReaderLocation[]>([]);
   let locationHistory = $state<StoredReaderLocation[]>([]);
   let editingBookmarkId = $state<string | null>(null);
   let bookmarkDraft = $state('');
+  let annotations = $state<StoredAnnotation[]>([]);
+  let selectedText = $state<ReaderSelection | null>(null);
+  let editingAnnotationId = $state<string | null>(null);
+  let annotationDraft = $state('');
+  let searchQuery = $state('');
+  let searchResults = $state<ReaderSearchResult[]>([]);
+  let searching = $state(false);
+  let searchError = $state('');
+  let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let error = $state('');
@@ -97,8 +126,11 @@
     if (destroyed) return;
     const savedHistory = await getPreference(`readerHistory:${bookId}`);
     if (destroyed) return;
+    const savedAnnotations = await getPreference(`readerAnnotations:${bookId}`);
+    if (destroyed) return;
     bookmarks = parseBookmarks(savedBookmarks);
     locationHistory = parseLocationHistory(savedHistory);
+    annotations = parseAnnotations(savedAnnotations);
     appearanceLoaded = true;
     session = new ReaderSession(bookUrl);
     try {
@@ -123,6 +155,11 @@
             if (controlsVisible) controlsVisible = false;
             else showControls();
           } else void turn(zone);
+        },
+        (selection) => {
+          if (destroyed) return;
+          selectedText = selection;
+          showControls();
         },
       );
       if (destroyed) return;
@@ -157,6 +194,7 @@
     window.removeEventListener('keydown', handleKeyboardNavigation);
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
+    searchController?.abort();
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
@@ -185,8 +223,12 @@
     settingsVisible = true;
     tocVisible = false;
     bookmarksVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
     tocOpener = null;
     bookmarksOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
     focusPanel(() => settingsPanel);
   }
 
@@ -202,8 +244,12 @@
     tocVisible = true;
     settingsVisible = false;
     bookmarksVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
     settingsOpener = null;
     bookmarksOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
     focusPanel(() => tocPanel);
   }
 
@@ -219,8 +265,12 @@
     bookmarksVisible = true;
     settingsVisible = false;
     tocVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
     settingsOpener = null;
     tocOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
     focusPanel(() => bookmarksPanel);
   }
 
@@ -229,6 +279,50 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openAnnotations(): void {
+    annotationsOpener = activeElement();
+    annotationsVisible = true;
+    settingsVisible = false;
+    tocVisible = false;
+    bookmarksVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    focusPanel(() => annotationsPanel);
+  }
+
+  function closeAnnotations(): void {
+    annotationsVisible = false;
+    editingAnnotationId = null;
+    const opener = annotationsOpener;
+    annotationsOpener = null;
+    restoreFocus(opener);
+  }
+
+  function openSearch(): void {
+    searchOpener = activeElement();
+    searchVisible = true;
+    settingsVisible = false;
+    tocVisible = false;
+    bookmarksVisible = false;
+    annotationsVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    annotationsOpener = null;
+    searchError = '';
+    focusPanel(() => searchPanel);
+  }
+
+  function closeSearch(): void {
+    searchVisible = false;
+    searchController?.abort();
+    searchController = null;
+    const opener = searchOpener;
+    searchOpener = null;
     restoreFocus(opener);
   }
 
@@ -244,6 +338,8 @@
       closeSettings();
       closeToc();
       closeBookmarks();
+      closeAnnotations();
+      closeSearch();
       footerVisible = false;
     }, 5_000);
   }
@@ -279,6 +375,7 @@
       .then(async () => {
         await setPreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
         await setPreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+        await setPreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
       })
       .catch(() => {
         // The reader remains usable when a preference write is temporarily unavailable.
@@ -313,6 +410,79 @@
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
     persistReaderLocations();
+  }
+
+  function saveAnnotation(): void {
+    if (!selectedText) return;
+    annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
+    annotationDraft = '';
+    selectedText = null;
+    persistReaderLocations();
+  }
+
+  function editAnnotation(annotation: StoredAnnotation): void {
+    annotations = updateAnnotation(annotations, annotation.id, annotationDraft);
+    editingAnnotationId = null;
+    annotationDraft = '';
+    persistReaderLocations();
+  }
+
+  function startAnnotationEdit(annotation: StoredAnnotation): void {
+    editingAnnotationId = annotation.id;
+    annotationDraft = annotation.note;
+  }
+
+  function deleteAnnotation(annotation: StoredAnnotation): void {
+    annotations = removeAnnotation(annotations, annotation.id);
+    persistReaderLocations();
+  }
+
+  function exportAnnotations(): void {
+    if (!annotations.length) return;
+    const blob = new Blob([annotationsMarkdown(title, annotations)], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'book'}-notes.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function runSearch(): Promise<void> {
+    if (!session || !searchQuery.trim()) {
+      searchResults = [];
+      searchError = searchQuery.trim() ? 'The reader is still opening.' : '';
+      return;
+    }
+    searchController?.abort();
+    const controller = new AbortController();
+    searchController = controller;
+    searching = true;
+    searchError = '';
+    try {
+      searchResults = await session.search(searchQuery, controller.signal);
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        searchResults = [];
+        searchError = cause instanceof Error ? cause.message : 'Search could not be completed.';
+      }
+    } finally {
+      if (searchController === controller) {
+        searching = false;
+        searchController = null;
+      }
+    }
+  }
+
+  async function openSearchResult(result: ReaderSearchResult): Promise<void> {
+    if (!session) return;
+    try {
+      await session.displayCfi(result.cfi);
+      closeSearch();
+      showControls();
+    } catch {
+      searchError = 'This search result is no longer available in the current EPUB.';
+    }
   }
 
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
@@ -390,11 +560,16 @@
       showControls();
       return;
     }
-    if (event.key === 'Escape' && (settingsVisible || tocVisible || bookmarksVisible)) {
+    if (
+      event.key === 'Escape' &&
+      (settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible)
+    ) {
       event.preventDefault();
       closeSettings();
       closeToc();
       closeBookmarks();
+      closeAnnotations();
+      closeSearch();
       showControls();
     }
   }
@@ -440,7 +615,9 @@
   <nav
     class="tap-zones"
     aria-label="Page navigation"
-    inert={Boolean(settingsVisible || tocVisible || bookmarksVisible)}
+    inert={Boolean(
+      settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible,
+    )}
   >
     <button
       type="button"
@@ -504,10 +681,12 @@
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
       <header
         class="reader-bar reader-top"
-        inert={Boolean(settingsVisible || tocVisible || bookmarksVisible)}
+        inert={Boolean(
+          settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible,
+        )}
         transition:fly={{ y: -8, duration: 140 }}
       >
-        <div class="grid w-full grid-cols-5 gap-2">
+        <div class="grid w-full grid-cols-7 gap-2">
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
@@ -548,6 +727,26 @@
           <button
             class="btn preset-tonal-surface min-h-12"
             type="button"
+            onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
+            aria-label="Open highlights and notes"
+            aria-expanded={annotationsVisible}
+            aria-controls="reader-annotations"
+          >
+            <span class="sr-only sm:not-sr-only">Notes</span>
+            <span class="sm:sr-only" aria-hidden="true">✎</span>
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
+            onclick={() => (searchVisible ? closeSearch() : openSearch())}
+            aria-expanded={searchVisible}
+            aria-controls="reader-search"
+          >
+            Search
+          </button>
+          <button
+            class="btn preset-tonal-surface min-h-12"
+            type="button"
             onclick={() => syncLatestLocation()}
             aria-label="Sync latest reading position"
             title="Sync latest reading position"
@@ -571,14 +770,22 @@
         </p>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible}
+      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
           onclick={() =>
-            settingsVisible ? closeSettings() : tocVisible ? closeToc() : closeBookmarks()}
+            settingsVisible
+              ? closeSettings()
+              : tocVisible
+                ? closeToc()
+                : bookmarksVisible
+                  ? closeBookmarks()
+                  : annotationsVisible
+                    ? closeAnnotations()
+                    : closeSearch()}
         ></button>
       {/if}
 
@@ -771,6 +978,77 @@
         </div>
       {/if}
 
+      {#if searchVisible}
+        <div
+          bind:this={searchPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          id="reader-search"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-search-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            type="button"
+            onclick={closeSearch}
+            aria-label="Close book search"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+          <h2 id="reader-search-title" class="font-serif text-xl">Search this book</h2>
+          <form
+            class="mt-4 flex gap-2"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void runSearch();
+            }}
+          >
+            <label class="sr-only" for="reader-search-query">Search this book</label>
+            <input
+              id="reader-search-query"
+              class="input min-w-0 flex-1"
+              type="search"
+              bind:value={searchQuery}
+              placeholder="Find a word or phrase"
+              autocomplete="off"
+            />
+            <button class="btn preset-filled-primary-700-300" type="submit" disabled={searching}>
+              {searching ? 'Searching…' : 'Search'}
+            </button>
+          </form>
+          {#if searchError}
+            <p class="mt-3 text-sm text-error-700-300" role="alert">{searchError}</p>
+          {:else if !searching && searchQuery.trim() && searchResults.length === 0}
+            <p class="mt-3 text-sm text-surface-700-300" role="status">No matches found.</p>
+          {/if}
+          {#if searchResults.length > 0}
+            <ol class="mt-4 grid gap-2" aria-label="Search results">
+              {#each searchResults as result, index (result.cfi)}
+                <li>
+                  <button
+                    class="btn w-full justify-start text-left"
+                    type="button"
+                    onclick={() => void openSearchResult(result)}
+                  >
+                    <span class="mr-2 text-xs text-surface-700-300">{index + 1}</span>
+                    <span class="line-clamp-3">{result.excerpt}</span>
+                  </button>
+                </li>
+              {/each}
+            </ol>
+          {/if}
+        </div>
+      {/if}
+
       {#if bookmarksVisible}
         <div
           bind:this={bookmarksPanel}
@@ -897,6 +1175,151 @@
               </div>
             {/if}
           </section>
+        </div>
+      {/if}
+
+      {#if annotationsVisible}
+        <div
+          bind:this={annotationsPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          id="reader-annotations"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-annotations-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, annotationsPanel!, closeAnnotations)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            type="button"
+            onclick={closeAnnotations}
+            aria-label="Close highlights and notes"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+          <h2 id="reader-annotations-title" class="font-serif text-xl">Highlights and notes</h2>
+          <p class="mt-2 text-sm text-surface-700-300">
+            Saved on this device. Select text in the book to add a highlight and an optional note.
+          </p>
+
+          {#if selectedText}
+            <form
+              class="mt-4 rounded-lg preset-tonal-primary p-3"
+              onsubmit={(event) => {
+                event.preventDefault();
+                saveAnnotation();
+              }}
+            >
+              <p class="text-sm italic">“{selectedText.text}”</p>
+              <label class="label mt-3">
+                <span class="label-text">Note (optional)</span>
+                <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+              </label>
+              <div class="mt-3 flex gap-2">
+                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                  Save highlight
+                </button>
+                <button
+                  class="btn preset-tonal-surface"
+                  type="button"
+                  onclick={() => {
+                    selectedText = null;
+                    annotationDraft = '';
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          {/if}
+
+          <div class="mt-4 flex items-center justify-between gap-2">
+            <h3 class="text-sm font-semibold uppercase tracking-wide">Saved highlights</h3>
+            <button
+              class="btn btn-sm preset-tonal-surface"
+              type="button"
+              onclick={exportAnnotations}
+              disabled={annotations.length === 0}
+            >
+              Export Markdown
+            </button>
+          </div>
+          {#if annotations.length === 0}
+            <p class="mt-2 text-sm text-surface-700-300">No highlights yet.</p>
+          {:else}
+            <div class="mt-2 grid gap-2">
+              {#each annotations as annotation (annotation.id)}
+                <article class="rounded-lg preset-tonal-surface p-3">
+                  <button
+                    class="w-full text-left text-sm italic"
+                    type="button"
+                    onclick={() => {
+                      void session?.displayCfi(annotation.cfi);
+                      closeAnnotations();
+                    }}
+                  >
+                    “{annotation.excerpt}”
+                  </button>
+                  {#if editingAnnotationId === annotation.id}
+                    <form
+                      class="mt-2 grid gap-2"
+                      onsubmit={(event) => {
+                        event.preventDefault();
+                        editAnnotation(annotation);
+                      }}
+                    >
+                      <label class="label">
+                        <span class="label-text">Note</span>
+                        <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+                      </label>
+                      <div class="flex gap-2">
+                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
+                          Save
+                        </button>
+                        <button
+                          class="btn btn-sm preset-tonal-surface"
+                          type="button"
+                          onclick={() => {
+                            editingAnnotationId = null;
+                            annotationDraft = '';
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  {:else}
+                    {#if annotation.note}
+                      <p class="mt-2 whitespace-pre-wrap text-sm">{annotation.note}</p>
+                    {/if}
+                    <div class="mt-2 flex justify-end gap-2">
+                      <button
+                        class="btn btn-sm preset-tonal-surface"
+                        type="button"
+                        onclick={() => startAnnotationEdit(annotation)}
+                      >
+                        Edit note
+                      </button>
+                      <button
+                        class="btn btn-sm preset-tonal-error"
+                        type="button"
+                        onclick={() => deleteAnnotation(annotation)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  {/if}
+                </article>
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
