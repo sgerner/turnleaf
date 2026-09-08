@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test: update migration coverage for library index
 - perf: index native library title reads
 - Add offline reader bookmarks and recent-location history with local CFI restoration, rename, and delete actions.
 - Add a server-scoped native library title index with migration and query-plan coverage.
