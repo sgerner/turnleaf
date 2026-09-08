@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Harden release link validation and provenance
+- Validate GitHub update links and publish Android releases from tested revisions with least-privilege workflow permissions.
 - Continue syncing later progress items when an earlier item fails, while recording the failed item for retry.
 - Report individual and bulk download-removal failures instead of claiming storage was cleared.
 - Update the changed book in memory after reader progress saves instead of reloading the full library.
