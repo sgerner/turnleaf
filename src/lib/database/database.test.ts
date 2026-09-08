@@ -135,3 +135,12 @@ it('rolls back every metadata change when one task fails', async () => {
 
   expect(database.rows()).toEqual([existingBook]);
 });
+
+it('skips the native transaction when there is no metadata to refresh', async () => {
+  const database = createDatabase([]);
+
+  await replaceBooksInTransaction(database.db, 'server', []);
+
+  expect(database.executeTransaction).not.toHaveBeenCalled();
+  expect(database.rows()).toEqual([]);
+});

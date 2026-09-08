@@ -275,6 +275,7 @@ export async function replaceBooksInTransaction(
   books: BookRecord[],
   refreshedAt = new Date().toISOString(),
 ): Promise<void> {
+  if (books.length === 0) return;
   await db.executeTransaction(books.map((book) => replaceBookTask(serverId, book, refreshedAt)));
 }
 
