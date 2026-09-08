@@ -8,6 +8,7 @@
 - Load library covers with bounded concurrency, cancel stale refresh work, and clean up browser cover URLs.
 - Make native library metadata refreshes transactional so failed updates leave the saved library unchanged.
 - Add a retry-first local-data recovery path with an explicit reset warning that preserves downloaded EPUB files.
+- Make native reading progress, completion, sync acknowledgement, and migrations transactional.
 
 ## 0.3.2
 
