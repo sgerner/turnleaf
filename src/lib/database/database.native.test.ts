@@ -121,6 +121,33 @@ it('serializes concurrent native progress transactions', async () => {
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
 });
 
+it('serializes direct native writes with transactions', async () => {
+  let activeWrites = 0;
+  let peakWrites = 0;
+  const delay = async (): Promise<void> => {
+    activeWrites += 1;
+    peakWrites = Math.max(peakWrites, activeWrites);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeWrites -= 1;
+  };
+  mocks.executeTransaction.mockImplementation(async () => {
+    await delay();
+    return { changes: { changes: 0 } };
+  });
+  mocks.db.run.mockImplementation(async () => {
+    await delay();
+    return { changes: { changes: 0 } };
+  });
+
+  const { markSyncFailure, saveLocalProgress } = await import('./database');
+  await Promise.all([
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
+    markSyncFailure(book.id, 'offline'),
+  ]);
+
+  expect(peakWrites).toBe(1);
+});
+
 it('keeps a failed native progress transaction atomic', async () => {
   const persisted = { book: false, readingState: false, syncQueue: false };
   mocks.executeTransaction.mockImplementationOnce(async (tasks: capTask[]) => {

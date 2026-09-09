@@ -65,15 +65,35 @@ interface BrowserDatabaseState {
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
 
+function enqueueNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const next = nativeTransactionQueue.then(operation);
+  nativeTransactionQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
 async function executeNativeTransaction(
   db: Pick<SQLiteDBConnection, 'executeTransaction'>,
   tasks: capTask[],
 ): Promise<void> {
-  const next = nativeTransactionQueue.then(() =>
-    db.executeTransaction(tasks).then(() => undefined),
-  );
-  nativeTransactionQueue = next.catch(() => undefined);
-  await next;
+  await enqueueNativeWrite(() => db.executeTransaction(tasks).then(() => undefined));
+}
+
+async function executeNativeRun(
+  db: Pick<SQLiteDBConnection, 'run'>,
+  statement: string,
+  values: unknown[] = [],
+): Promise<void> {
+  await enqueueNativeWrite(() => db.run(statement, values).then(() => undefined));
+}
+
+async function executeNativeStatement(
+  db: Pick<SQLiteDBConnection, 'execute'>,
+  statement: string,
+): Promise<void> {
+  await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
 }
 
 function createBrowserState(): BrowserDatabaseState {
@@ -139,7 +159,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       ? await sqlite.retrieveConnection('turnleaf', false)
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
-  await db.execute('PRAGMA foreign_keys = ON;');
+  await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
   await migrate(db);
   return db;
 }
@@ -185,7 +205,8 @@ export async function saveServer(config: ServerConfig): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     `INSERT OR REPLACE INTO server_config
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
       VALUES (?, ?, ?, ?, ?, ?)`,
@@ -213,7 +234,7 @@ export async function removeServer(serverId: string): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run('DELETE FROM server_config WHERE id=?', [serverId]);
+  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
@@ -430,7 +451,8 @@ export async function markDownloaded(bookId: string, path: string, size: number)
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     "UPDATE books SET download_path=?, download_status='available', file_size=? WHERE id=?",
     [path, size, bookId],
   );
@@ -734,7 +756,8 @@ export async function markSyncFailure(bookId: string, error: string): Promise<vo
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     `UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=?
     WHERE book_id=?`,
     [new Date().toISOString(), error.slice(0, 240), bookId],
@@ -753,7 +776,8 @@ export async function removeDownload(bookId: string): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     "UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id=?",
     [bookId],
   );
@@ -776,7 +800,8 @@ export async function setPreference(key: string, value: string): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     `INSERT INTO preferences (key,value,updated_at) VALUES (?,?,?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     [key, value, new Date().toISOString()],
