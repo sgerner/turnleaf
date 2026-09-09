@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: hide advanced library filters behind panel
 - fix: keep settings controls visible while scrolling
 - fix: close reader panels with Android Back
 - Keep reader panels open while in use
