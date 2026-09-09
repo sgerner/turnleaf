@@ -42,6 +42,7 @@ export interface BookRecord {
 
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
+let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -63,6 +64,17 @@ interface BrowserDatabaseState {
 }
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
+
+async function executeNativeTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  tasks: capTask[],
+): Promise<void> {
+  const next = nativeTransactionQueue.then(() =>
+    db.executeTransaction(tasks).then(() => undefined),
+  );
+  nativeTransactionQueue = next.catch(() => undefined);
+  await next;
+}
 
 function createBrowserState(): BrowserDatabaseState {
   return {
@@ -158,7 +170,7 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
   const current = await db.getVersion();
   for (const migration of migrations) {
     if (migration.version <= (current.version ?? 0)) continue;
-    await db.executeTransaction([
+    await executeNativeTransaction(db, [
       { statement: migration.statements },
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
@@ -339,7 +351,10 @@ export async function replaceBooksInTransaction(
   refreshedAt = new Date().toISOString(),
 ): Promise<void> {
   if (books.length === 0) return;
-  await db.executeTransaction(books.map((book) => replaceBookTask(serverId, book, refreshedAt)));
+  await executeNativeTransaction(
+    db,
+    books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
+  );
 }
 
 const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
@@ -357,7 +372,7 @@ export async function reconcileBooksInTransaction(
   const ids = books.map((book) => book.id);
   const absent = ids.length ? `id NOT IN (${ids.map(() => '?').join(',')})` : '1=1';
   const values = [serverId, ...ids];
-  await db.executeTransaction([
+  await executeNativeTransaction(db, [
     ...books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
     {
       statement: `UPDATE books SET remote_available=0 WHERE server_id=? AND ${absent}
@@ -547,7 +562,7 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await db.executeTransaction([
+  await executeNativeTransaction(db, [
     createReadingStateTask(book.id, cfi, xpath, percentage, now),
     createSyncQueueTask(book.id, payload, now),
     {
@@ -612,7 +627,7 @@ export async function markBookCompleted(
     tasks.push(createReadingStateTask(book.id, readingState.cfi, readingState.xpath, 1, now));
   }
   tasks.push(createSyncQueueTask(book.id, payload, now));
-  await db.executeTransaction(tasks);
+  await executeNativeTransaction(db, tasks);
 }
 
 export interface PendingSyncItem {
@@ -692,7 +707,7 @@ export async function confirmSync(
     return;
   }
   const db = await openDatabase();
-  await db.executeTransaction([
+  await executeNativeTransaction(db, [
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=local_updated_at,
         server_updated_at=? WHERE book_id=? AND local_updated_at=?

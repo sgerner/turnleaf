@@ -100,6 +100,27 @@ it('groups progress, queue, and book updates into one native transaction', async
   ]);
 });
 
+it('serializes concurrent native progress transactions', async () => {
+  let activeTransactions = 0;
+  let peakTransactions = 0;
+  mocks.executeTransaction.mockImplementation(async () => {
+    activeTransactions += 1;
+    peakTransactions = Math.max(peakTransactions, activeTransactions);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeTransactions -= 1;
+    return { changes: { changes: 0 } };
+  });
+
+  const { saveLocalProgress } = await import('./database');
+  await Promise.all([
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.5),
+  ]);
+
+  expect(peakTransactions).toBe(1);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
+});
+
 it('keeps a failed native progress transaction atomic', async () => {
   const persisted = { book: false, readingState: false, syncQueue: false };
   mocks.executeTransaction.mockImplementationOnce(async (tasks: capTask[]) => {
