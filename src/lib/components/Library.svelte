@@ -226,7 +226,11 @@
   let sortOrder = $state<LibrarySortOrder>('title');
   let authorFilter = $state('');
   let seriesFilter = $state('');
+  let filtersVisible = $state(false);
   let viewMode = $state<LibraryViewMode>('grid');
+  let advancedFiltersActive = $derived(
+    sortOrder !== 'title' || Boolean(authorFilter) || Boolean(seriesFilter),
+  );
   let authors = $derived(
     [
       ...new Set(
@@ -291,6 +295,7 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
+  let readerBackHandler: (() => boolean) | null = null;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -573,8 +578,10 @@
         await App.addListener('backButton', () => {
           if (destroyed) return;
           if (actionMenuBook) closeMenu();
-          else if (reading) reading = null;
-          else if (settingsVisible) closeSettings();
+          else if (reading) {
+            if (readerBackHandler || document.querySelector('[data-reader-panel]')) return;
+            reading = null;
+          } else if (settingsVisible) closeSettings();
           else void App.exitApp();
         }),
       ),
@@ -1011,6 +1018,13 @@
     void relocated(reading.book, location);
   }
 
+  function registerReaderBackHandler(handler: () => boolean): () => void {
+    readerBackHandler = handler;
+    return () => {
+      if (readerBackHandler === handler) readerBackHandler = null;
+    };
+  }
+
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     settingsError = '';
@@ -1085,6 +1099,7 @@
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
     onSyncLatest={() => syncLatestForReader(reading!.book)}
+    registerBackHandler={registerReaderBackHandler}
   />
 {:else}
   <main
@@ -1226,9 +1241,13 @@
           </button>
         {/if}
       </label>
-      <div class="grid grid-cols-2">
+      <div
+        class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+        role="group"
+        aria-label="Library filters"
+      >
         <button
-          class="h-8 !px-2 !py-0 btn btn-sm !text-sm rounded-none {downloadedOnly
+          class="h-10 !px-2 !py-0 btn btn-sm !text-sm rounded-none {downloadedOnly
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1242,7 +1261,7 @@
           <span>Downloaded Only</span>
         </button>
         <button
-          class="h-8 !px-2 !py-0 btn btn-sm !text-sm rounded-none {hideCompleted
+          class="h-10 !px-2 !py-0 btn btn-sm !text-sm rounded-none {hideCompleted
             ? 'preset-filled-secondary-100-900'
             : 'preset-filled-primary-700-300'}"
           type="button"
@@ -1258,48 +1277,81 @@
           </svg>
           <span>Hide completed</span>
         </button>
+        <button
+          class="btn btn-sm h-10 w-11 !p-0 rounded-none {filtersVisible || advancedFiltersActive
+            ? 'preset-filled-primary-700-300'
+            : 'preset-filled-tertiary-100-900'}"
+          type="button"
+          aria-expanded={filtersVisible}
+          aria-controls="library-filter-panel"
+          aria-label={filtersVisible ? 'Hide library filters' : 'Show library filters'}
+          title="More filters and sorting"
+          onclick={() => (filtersVisible = !filtersVisible)}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M3 5h18v2H3V5zm3 6h12v2H6v-2zm3 6h6v2H9v-2z" />
+          </svg>
+        </button>
       </div>
-      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
-        <span>Sort</span>
-        <select
-          class="select preset-tonal-surface h-10 min-w-32"
-          aria-label="Sort books"
-          value={sortOrder}
-          onchange={handleSortChange}
+      {#if filtersVisible}
+        <div
+          id="library-filter-panel"
+          class="preset-tonal-surface mt-3 rounded-xl border border-surface-300/40 p-4"
+          role="region"
+          aria-labelledby="library-filter-panel-title"
+          transition:fly={{ y: -8, duration: 160 }}
         >
-          <option value="title">Title</option>
-          <option value="author">Author</option>
-          <option value="recent">Recently read</option>
-        </select>
-      </label>
-      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
-        <span>Author</span>
-        <select
-          class="select preset-tonal-surface h-10 min-w-36"
-          aria-label="Filter by author"
-          value={authorFilter}
-          onchange={handleAuthorChange}
-        >
-          <option value="">All authors</option>
-          {#each authors as author (author)}
-            <option value={author}>{author}</option>
-          {/each}
-        </select>
-      </label>
-      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
-        <span>Series</span>
-        <select
-          class="select preset-tonal-surface h-10 min-w-36"
-          aria-label="Filter by series"
-          value={seriesFilter}
-          onchange={handleSeriesChange}
-        >
-          <option value="">All series</option>
-          {#each seriesNames as series (series)}
-            <option value={series}>{series}</option>
-          {/each}
-        </select>
-      </label>
+          <div class="flex items-center justify-between gap-3">
+            <h2 id="library-filter-panel-title" class="text-sm font-medium">More filters</h2>
+            {#if advancedFiltersActive}
+              <span class="text-xs text-surface-700-300">Filters active</span>
+            {/if}
+          </div>
+          <div class="mt-3 grid gap-3 sm:grid-cols-3">
+            <label class="label">
+              <span class="label-text">Sort order</span>
+              <select
+                class="select preset-tonal-surface"
+                aria-label="Sort books"
+                value={sortOrder}
+                onchange={handleSortChange}
+              >
+                <option value="title">Title</option>
+                <option value="author">Author</option>
+                <option value="recent">Recently read</option>
+              </select>
+            </label>
+            <label class="label">
+              <span class="label-text">Author</span>
+              <select
+                class="select preset-tonal-surface"
+                aria-label="Filter by author"
+                value={authorFilter}
+                onchange={handleAuthorChange}
+              >
+                <option value="">All authors</option>
+                {#each authors as author (author)}
+                  <option value={author}>{author}</option>
+                {/each}
+              </select>
+            </label>
+            <label class="label">
+              <span class="label-text">Series</span>
+              <select
+                class="select preset-tonal-surface"
+                aria-label="Filter by series"
+                value={seriesFilter}
+                onchange={handleSeriesChange}
+              >
+                <option value="">All series</option>
+                {#each seriesNames as series (series)}
+                  <option value={series}>{series}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+        </div>
+      {/if}
       <div class="mt-2 flex items-center gap-1" role="group" aria-label="Library view">
         <button
           class="btn btn-sm h-10 {viewMode === 'grid'
@@ -1804,7 +1856,7 @@
   >
     <div
       bind:this={settingsDialog}
-      class="card preset-filled-surface-50-950 relative w-full max-w-md max-h-[88dvh] overflow-auto p-6"
+      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="library-settings-title"
@@ -1812,21 +1864,24 @@
       onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
       transition:fly={{ y: 16, duration: 150 }}
     >
-      <button
-        class="btn btn-sm preset-tonal-surface absolute right-4 top-4 h-9 w-9 p-0"
-        type="button"
-        onclick={closeSettings}
-        aria-label="Close settings"
+      <div
+        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
       >
-        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-          <path
-            fill="currentColor"
-            d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-          />
-        </svg>
-      </button>
-
-      <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
+        <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
+        <button
+          class="btn btn-sm preset-tonal-surface h-9 w-9 shrink-0 p-0"
+          type="button"
+          onclick={closeSettings}
+          aria-label="Close settings"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+      </div>
 
       <div class="mt-6" aria-labelledby="library-settings-appearance-title">
         <h3 id="library-settings-appearance-title" class="text-lg font-medium">
