@@ -3,6 +3,9 @@
 ## Unreleased
 
 - fix: hide advanced library filters behind panel
+- fix: keep settings controls visible while scrolling
+- fix: close reader panels with Android Back
+- Keep reader panels open while in use
 - fix: fit reader controls on mobile
 - fix: serialize all native database writes
 - fix: serialize native sqlite transactions
