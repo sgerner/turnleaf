@@ -42,6 +42,7 @@ export interface BookRecord {
 
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
+let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -63,6 +64,37 @@ interface BrowserDatabaseState {
 }
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
+
+function enqueueNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const next = nativeTransactionQueue.then(operation);
+  nativeTransactionQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+async function executeNativeTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  tasks: capTask[],
+): Promise<void> {
+  await enqueueNativeWrite(() => db.executeTransaction(tasks).then(() => undefined));
+}
+
+async function executeNativeRun(
+  db: Pick<SQLiteDBConnection, 'run'>,
+  statement: string,
+  values: unknown[] = [],
+): Promise<void> {
+  await enqueueNativeWrite(() => db.run(statement, values).then(() => undefined));
+}
+
+async function executeNativeStatement(
+  db: Pick<SQLiteDBConnection, 'execute'>,
+  statement: string,
+): Promise<void> {
+  await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
+}
 
 function createBrowserState(): BrowserDatabaseState {
   return {
@@ -127,7 +159,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       ? await sqlite.retrieveConnection('turnleaf', false)
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
-  await db.execute('PRAGMA foreign_keys = ON;');
+  await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
   await migrate(db);
   return db;
 }
@@ -158,7 +190,7 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
   const current = await db.getVersion();
   for (const migration of migrations) {
     if (migration.version <= (current.version ?? 0)) continue;
-    await db.executeTransaction([
+    await executeNativeTransaction(db, [
       { statement: migration.statements },
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
@@ -173,7 +205,8 @@ export async function saveServer(config: ServerConfig): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     `INSERT OR REPLACE INTO server_config
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
       VALUES (?, ?, ?, ?, ?, ?)`,
@@ -201,7 +234,7 @@ export async function removeServer(serverId: string): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run('DELETE FROM server_config WHERE id=?', [serverId]);
+  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
@@ -339,7 +372,10 @@ export async function replaceBooksInTransaction(
   refreshedAt = new Date().toISOString(),
 ): Promise<void> {
   if (books.length === 0) return;
-  await db.executeTransaction(books.map((book) => replaceBookTask(serverId, book, refreshedAt)));
+  await executeNativeTransaction(
+    db,
+    books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
+  );
 }
 
 const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
@@ -357,7 +393,7 @@ export async function reconcileBooksInTransaction(
   const ids = books.map((book) => book.id);
   const absent = ids.length ? `id NOT IN (${ids.map(() => '?').join(',')})` : '1=1';
   const values = [serverId, ...ids];
-  await db.executeTransaction([
+  await executeNativeTransaction(db, [
     ...books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
     {
       statement: `UPDATE books SET remote_available=0 WHERE server_id=? AND ${absent}
@@ -415,7 +451,8 @@ export async function markDownloaded(bookId: string, path: string, size: number)
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     "UPDATE books SET download_path=?, download_status='available', file_size=? WHERE id=?",
     [path, size, bookId],
   );
@@ -547,7 +584,7 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await db.executeTransaction([
+  await executeNativeTransaction(db, [
     createReadingStateTask(book.id, cfi, xpath, percentage, now),
     createSyncQueueTask(book.id, payload, now),
     {
@@ -612,7 +649,7 @@ export async function markBookCompleted(
     tasks.push(createReadingStateTask(book.id, readingState.cfi, readingState.xpath, 1, now));
   }
   tasks.push(createSyncQueueTask(book.id, payload, now));
-  await db.executeTransaction(tasks);
+  await executeNativeTransaction(db, tasks);
 }
 
 export interface PendingSyncItem {
@@ -692,7 +729,7 @@ export async function confirmSync(
     return;
   }
   const db = await openDatabase();
-  await db.executeTransaction([
+  await executeNativeTransaction(db, [
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=local_updated_at,
         server_updated_at=? WHERE book_id=? AND local_updated_at=?
@@ -719,7 +756,8 @@ export async function markSyncFailure(bookId: string, error: string): Promise<vo
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     `UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=?
     WHERE book_id=?`,
     [new Date().toISOString(), error.slice(0, 240), bookId],
@@ -738,7 +776,8 @@ export async function removeDownload(bookId: string): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     "UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id=?",
     [bookId],
   );
@@ -761,7 +800,8 @@ export async function setPreference(key: string, value: string): Promise<void> {
     return;
   }
   const db = await openDatabase();
-  await db.run(
+  await executeNativeRun(
+    db,
     `INSERT INTO preferences (key,value,updated_at) VALUES (?,?,?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     [key, value, new Date().toISOString()],
