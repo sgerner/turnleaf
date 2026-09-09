@@ -226,7 +226,23 @@
     void tick().then(() => focusFirstElement(getPanel()));
   }
 
+  function hasOpenReaderPanel(): boolean {
+    return settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible;
+  }
+
+  function pauseChromeHide(): void {
+    if (hideTimer !== null) {
+      window.clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+  }
+
+  function resumeChromeHide(): void {
+    if (controlsVisible && !hasOpenReaderPanel()) scheduleChromeHide();
+  }
+
   function openSettings(): void {
+    pauseChromeHide();
     settingsOpener = activeElement();
     settingsVisible = true;
     tocVisible = false;
@@ -245,9 +261,11 @@
     const opener = settingsOpener;
     settingsOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openToc(): void {
+    pauseChromeHide();
     tocOpener = activeElement();
     tocVisible = true;
     settingsVisible = false;
@@ -266,9 +284,11 @@
     const opener = tocOpener;
     tocOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openBookmarks(): void {
+    pauseChromeHide();
     bookmarksOpener = activeElement();
     bookmarksVisible = true;
     settingsVisible = false;
@@ -288,9 +308,11 @@
     const opener = bookmarksOpener;
     bookmarksOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openAnnotations(): void {
+    pauseChromeHide();
     annotationsOpener = activeElement();
     annotationsVisible = true;
     settingsVisible = false;
@@ -308,9 +330,11 @@
     const opener = annotationsOpener;
     annotationsOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openSearch(): void {
+    pauseChromeHide();
     searchOpener = activeElement();
     searchVisible = true;
     settingsVisible = false;
@@ -332,6 +356,7 @@
     const opener = searchOpener;
     searchOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function showFooter(): void {
@@ -342,12 +367,9 @@
   function scheduleChromeHide(): void {
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
+      hideTimer = null;
+      if (hasOpenReaderPanel()) return;
       controlsVisible = false;
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
       footerVisible = false;
     }, 5_000);
   }
