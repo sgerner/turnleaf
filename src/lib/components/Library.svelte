@@ -231,6 +231,9 @@
   let advancedFiltersActive = $derived(
     sortOrder !== 'title' || Boolean(authorFilter) || Boolean(seriesFilter),
   );
+  let libraryFiltersActive = $derived(
+    Boolean(query.trim()) || downloadedOnly || hideCompleted || advancedFiltersActive,
+  );
   let authors = $derived(
     [
       ...new Set(
@@ -392,11 +395,9 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
-    viewMode = 'grid';
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
-    void setPreference('libraryView', viewMode);
   }
 
   function activeElement(): HTMLElement | null {
@@ -1242,7 +1243,7 @@
         {/if}
       </label>
       <div
-        class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+        class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]"
         role="group"
         aria-label="Library filters"
       >
@@ -1292,6 +1293,22 @@
             <path fill="currentColor" d="M3 5h18v2H3V5zm3 6h12v2H6v-2zm3 6h6v2H9v-2z" />
           </svg>
         </button>
+        {#if libraryFiltersActive}
+          <button
+            class="btn btn-sm h-10 w-11 !p-0 rounded-none preset-tonal-surface"
+            type="button"
+            onclick={clearFilters}
+            aria-label="Clear library filters"
+            title="Clear filters"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+        {/if}
       </div>
       {#if filtersVisible}
         <div
@@ -1352,38 +1369,35 @@
           </div>
         </div>
       {/if}
-      <div class="mt-2 flex items-center gap-1" role="group" aria-label="Library view">
-        <button
-          class="btn btn-sm h-10 {viewMode === 'grid'
-            ? 'preset-filled-primary-700-300'
-            : 'preset-tonal-surface'}"
-          type="button"
-          aria-pressed={viewMode === 'grid'}
-          onclick={() => handleViewModeChange('grid')}
-        >
-          Grid
-        </button>
-        <button
-          class="btn btn-sm h-10 {viewMode === 'list'
-            ? 'preset-filled-primary-700-300'
-            : 'preset-tonal-surface'}"
-          type="button"
-          aria-pressed={viewMode === 'list'}
-          onclick={() => handleViewModeChange('list')}
-        >
-          List
-        </button>
-      </div>
     </div>
 
     {#if !loading && books.length > 0}
-      <div class="mt-4 flex items-center justify-between gap-3 text-sm text-surface-700-300">
+      <div
+        class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-surface-700-300"
+      >
         <p>{visibleBooks.length} of {books.length} books</p>
-        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title' || authorFilter || seriesFilter || viewMode !== 'grid'}
-          <button class="btn btn-sm preset-tonal-surface h-10" type="button" onclick={clearFilters}>
-            Clear filters
+        <div class="flex items-center gap-1" role="group" aria-label="Library view">
+          <button
+            class="btn btn-sm h-10 {viewMode === 'grid'
+              ? 'preset-filled-primary-700-300'
+              : 'preset-tonal-surface'}"
+            type="button"
+            aria-pressed={viewMode === 'grid'}
+            onclick={() => handleViewModeChange('grid')}
+          >
+            Grid
           </button>
-        {/if}
+          <button
+            class="btn btn-sm h-10 {viewMode === 'list'
+              ? 'preset-filled-primary-700-300'
+              : 'preset-tonal-surface'}"
+            type="button"
+            aria-pressed={viewMode === 'list'}
+            onclick={() => handleViewModeChange('list')}
+          >
+            List
+          </button>
+        </div>
       </div>
     {/if}
 

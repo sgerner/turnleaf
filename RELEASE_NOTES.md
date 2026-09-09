@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: align library view controls and filter actions
 - fix: hide advanced library filters behind panel
 - fix: keep settings controls visible while scrolling
 - fix: close reader panels with Android Back
