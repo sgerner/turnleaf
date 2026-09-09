@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: fit reader controls on mobile
 - fix: publish releases without a checkout
 - fix: normalize finalized release notes
 - ci: use software-compatible Android smoke image
