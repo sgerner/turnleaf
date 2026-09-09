@@ -226,7 +226,14 @@
   let sortOrder = $state<LibrarySortOrder>('title');
   let authorFilter = $state('');
   let seriesFilter = $state('');
+  let filtersVisible = $state(false);
   let viewMode = $state<LibraryViewMode>('grid');
+  let advancedFiltersActive = $derived(
+    sortOrder !== 'title' || Boolean(authorFilter) || Boolean(seriesFilter),
+  );
+  let libraryFiltersActive = $derived(
+    Boolean(query.trim()) || downloadedOnly || hideCompleted || advancedFiltersActive,
+  );
   let authors = $derived(
     [
       ...new Set(
@@ -291,6 +298,7 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
+  let readerBackHandler: (() => boolean) | null = null;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -387,11 +395,9 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
-    viewMode = 'grid';
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
-    void setPreference('libraryView', viewMode);
   }
 
   function activeElement(): HTMLElement | null {
@@ -573,8 +579,10 @@
         await App.addListener('backButton', () => {
           if (destroyed) return;
           if (actionMenuBook) closeMenu();
-          else if (reading) reading = null;
-          else if (settingsVisible) closeSettings();
+          else if (reading) {
+            if (readerBackHandler || document.querySelector('[data-reader-panel]')) return;
+            reading = null;
+          } else if (settingsVisible) closeSettings();
           else void App.exitApp();
         }),
       ),
@@ -1011,6 +1019,13 @@
     void relocated(reading.book, location);
   }
 
+  function registerReaderBackHandler(handler: () => boolean): () => void {
+    readerBackHandler = handler;
+    return () => {
+      if (readerBackHandler === handler) readerBackHandler = null;
+    };
+  }
+
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     settingsError = '';
@@ -1085,6 +1100,7 @@
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
     onSyncLatest={() => syncLatestForReader(reading!.book)}
+    registerBackHandler={registerReaderBackHandler}
   />
 {:else}
   <main
@@ -1226,9 +1242,13 @@
           </button>
         {/if}
       </label>
-      <div class="grid grid-cols-2">
+      <div
+        class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]"
+        role="group"
+        aria-label="Library filters"
+      >
         <button
-          class="h-8 !px-2 !py-0 btn btn-sm !text-sm rounded-none {downloadedOnly
+          class="h-10 !px-2 !py-0 btn btn-sm !text-sm rounded-none {downloadedOnly
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1242,7 +1262,7 @@
           <span>Downloaded Only</span>
         </button>
         <button
-          class="h-8 !px-2 !py-0 btn btn-sm !text-sm rounded-none {hideCompleted
+          class="h-10 !px-2 !py-0 btn btn-sm !text-sm rounded-none {hideCompleted
             ? 'preset-filled-secondary-100-900'
             : 'preset-filled-primary-700-300'}"
           type="button"
@@ -1258,80 +1278,126 @@
           </svg>
           <span>Hide completed</span>
         </button>
-      </div>
-      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
-        <span>Sort</span>
-        <select
-          class="select preset-tonal-surface h-10 min-w-32"
-          aria-label="Sort books"
-          value={sortOrder}
-          onchange={handleSortChange}
-        >
-          <option value="title">Title</option>
-          <option value="author">Author</option>
-          <option value="recent">Recently read</option>
-        </select>
-      </label>
-      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
-        <span>Author</span>
-        <select
-          class="select preset-tonal-surface h-10 min-w-36"
-          aria-label="Filter by author"
-          value={authorFilter}
-          onchange={handleAuthorChange}
-        >
-          <option value="">All authors</option>
-          {#each authors as author (author)}
-            <option value={author}>{author}</option>
-          {/each}
-        </select>
-      </label>
-      <label class="mt-2 flex items-center gap-2 text-sm text-surface-700-300">
-        <span>Series</span>
-        <select
-          class="select preset-tonal-surface h-10 min-w-36"
-          aria-label="Filter by series"
-          value={seriesFilter}
-          onchange={handleSeriesChange}
-        >
-          <option value="">All series</option>
-          {#each seriesNames as series (series)}
-            <option value={series}>{series}</option>
-          {/each}
-        </select>
-      </label>
-      <div class="mt-2 flex items-center gap-1" role="group" aria-label="Library view">
         <button
-          class="btn btn-sm h-10 {viewMode === 'grid'
+          class="btn btn-sm h-10 w-11 !p-0 rounded-none {filtersVisible || advancedFiltersActive
             ? 'preset-filled-primary-700-300'
-            : 'preset-tonal-surface'}"
+            : 'preset-filled-tertiary-100-900'}"
           type="button"
-          aria-pressed={viewMode === 'grid'}
-          onclick={() => handleViewModeChange('grid')}
+          aria-expanded={filtersVisible}
+          aria-controls="library-filter-panel"
+          aria-label={filtersVisible ? 'Hide library filters' : 'Show library filters'}
+          title="More filters and sorting"
+          onclick={() => (filtersVisible = !filtersVisible)}
         >
-          Grid
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M3 5h18v2H3V5zm3 6h12v2H6v-2zm3 6h6v2H9v-2z" />
+          </svg>
         </button>
-        <button
-          class="btn btn-sm h-10 {viewMode === 'list'
-            ? 'preset-filled-primary-700-300'
-            : 'preset-tonal-surface'}"
-          type="button"
-          aria-pressed={viewMode === 'list'}
-          onclick={() => handleViewModeChange('list')}
-        >
-          List
-        </button>
+        {#if libraryFiltersActive}
+          <button
+            class="btn btn-sm h-10 w-11 !p-0 rounded-none preset-tonal-surface"
+            type="button"
+            onclick={clearFilters}
+            aria-label="Clear library filters"
+            title="Clear filters"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+        {/if}
       </div>
+      {#if filtersVisible}
+        <div
+          id="library-filter-panel"
+          class="preset-tonal-surface mt-3 rounded-xl border border-surface-300/40 p-4"
+          role="region"
+          aria-labelledby="library-filter-panel-title"
+          transition:fly={{ y: -8, duration: 160 }}
+        >
+          <div class="flex items-center justify-between gap-3">
+            <h2 id="library-filter-panel-title" class="text-sm font-medium">More filters</h2>
+            {#if advancedFiltersActive}
+              <span class="text-xs text-surface-700-300">Filters active</span>
+            {/if}
+          </div>
+          <div class="mt-3 grid gap-3 sm:grid-cols-3">
+            <label class="label">
+              <span class="label-text">Sort order</span>
+              <select
+                class="select preset-tonal-surface"
+                aria-label="Sort books"
+                value={sortOrder}
+                onchange={handleSortChange}
+              >
+                <option value="title">Title</option>
+                <option value="author">Author</option>
+                <option value="recent">Recently read</option>
+              </select>
+            </label>
+            <label class="label">
+              <span class="label-text">Author</span>
+              <select
+                class="select preset-tonal-surface"
+                aria-label="Filter by author"
+                value={authorFilter}
+                onchange={handleAuthorChange}
+              >
+                <option value="">All authors</option>
+                {#each authors as author (author)}
+                  <option value={author}>{author}</option>
+                {/each}
+              </select>
+            </label>
+            <label class="label">
+              <span class="label-text">Series</span>
+              <select
+                class="select preset-tonal-surface"
+                aria-label="Filter by series"
+                value={seriesFilter}
+                onchange={handleSeriesChange}
+              >
+                <option value="">All series</option>
+                {#each seriesNames as series (series)}
+                  <option value={series}>{series}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+        </div>
+      {/if}
     </div>
 
     {#if !loading && books.length > 0}
-      <div class="mt-4 flex items-center justify-between gap-3 text-sm text-surface-700-300">
+      <div
+        class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-surface-700-300"
+      >
         <p>{visibleBooks.length} of {books.length} books</p>
-        {#if query || downloadedOnly || hideCompleted || sortOrder !== 'title' || authorFilter || seriesFilter || viewMode !== 'grid'}
-          <button class="btn btn-sm preset-tonal-surface h-10" type="button" onclick={clearFilters}>
-            Clear filters
+        <div class="flex items-center gap-1" role="group" aria-label="Library view">
+          <button
+            class="btn btn-sm h-10 {viewMode === 'grid'
+              ? 'preset-filled-primary-700-300'
+              : 'preset-tonal-surface'}"
+            type="button"
+            aria-pressed={viewMode === 'grid'}
+            onclick={() => handleViewModeChange('grid')}
+          >
+            Grid
           </button>
-        {/if}
+          <button
+            class="btn btn-sm h-10 {viewMode === 'list'
+              ? 'preset-filled-primary-700-300'
+              : 'preset-tonal-surface'}"
+            type="button"
+            aria-pressed={viewMode === 'list'}
+            onclick={() => handleViewModeChange('list')}
+          >
+            List
+          </button>
+        </div>
       </div>
     {/if}
 
@@ -1424,158 +1490,200 @@
             style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book (book.id)}
-              <article class="relative text-left" data-book-id={book.id}>
-                <button
-                  class="group block w-full text-left"
-                  type="button"
-                  onclick={() => void open(book)}
-                  oncontextmenu={(event) => {
-                    event.preventDefault();
-                    openMenu(book);
-                  }}
-                  disabled={downloadingBookId === book.id}
-                >
-                  {#if viewMode === 'list'}
-                    <div
-                      class="preset-tonal-surface flex min-h-24 items-center gap-4 rounded-lg p-3 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+              <article
+                class="relative text-left"
+                data-book-id={book.id}
+                oncontextmenu={(event) => {
+                  event.preventDefault();
+                  openMenu(book);
+                }}
+              >
+                {#if viewMode === 'list'}
+                  <div class="relative">
+                    <button
+                      class="group block w-full text-left"
+                      type="button"
+                      onclick={() => void open(book)}
+                      disabled={downloadingBookId === book.id}
                     >
-                      <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
-                        {#if covers[book.seriesId]}
-                          <img
-                            class="h-full w-full object-cover"
-                            src={covers[book.seriesId]}
-                            loading="lazy"
-                            decoding="async"
-                            alt=""
-                          />
-                        {/if}
-                        {#if book.remoteAvailable === false && book.downloadPath}
-                          <span
-                            class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
-                            title="Saved offline; no longer available on Kavita"
-                            aria-label="Saved offline; no longer available on Kavita"
-                          >
-                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                              <path
-                                fill="currentColor"
-                                d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
-                              />
-                            </svg>
-                          </span>
-                        {/if}
-                      </div>
-                      <div class="min-w-0 flex-1">
-                        <h2
-                          class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
-                        >
-                          {book.title}
-                        </h2>
-                        <p class="mt-1 truncate text-sm text-surface-700-300">
-                          {book.author ?? 'Unknown author'}
-                        </p>
-                        {#if book.series}
-                          <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
-                        {/if}
-                        {#if progressOf(book) > 0}
-                          <div
-                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
-                            role="progressbar"
-                            aria-label={`Reading progress for ${book.title}`}
-                            aria-valuemin="0"
-                            aria-valuemax="100"
-                            aria-valuenow={Math.round(progressOf(book))}
-                            aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                          >
-                            <div
-                              class="h-full preset-filled-primary-600-400"
-                              style:width={`${progressOf(book)}%`}
-                            ></div>
-                          </div>
-                        {/if}
-                      </div>
-                    </div>
-                  {:else}
-                    <div
-                      class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
-                    >
-                      {#if covers[book.seriesId]}
-                        <img
-                          class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                          src={covers[book.seriesId]}
-                          loading="lazy"
-                          decoding="async"
-                          alt=""
-                        />
-                      {/if}
-                      {#if book.remoteAvailable === false && book.downloadPath}
-                        <span
-                          class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                          title="Saved offline; no longer available on Kavita"
-                          aria-label="Saved offline; no longer available on Kavita"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                            <path
-                              fill="currentColor"
-                              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                      <div
+                        class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                      >
+                        <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
+                          {#if covers[book.seriesId]}
+                            <img
+                              class="h-full w-full object-cover"
+                              src={covers[book.seriesId]}
+                              loading="lazy"
+                              decoding="async"
+                              alt=""
                             />
-                          </svg>
-                        </span>
-                      {/if}
-                      {#if downloadingBookId === book.id}
-                        <span
-                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                          title="Downloading"
-                          aria-label="Downloading"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
-                            <path
-                              fill="currentColor"
-                              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
-                            />
-                          </svg>
-                        </span>
-                      {/if}
-                      {#if progressOf(book) > 0}
-                        <div
-                          class="absolute inset-x-0 bottom-0 h-2"
-                          role="progressbar"
-                          aria-label={`Reading progress for ${book.title}`}
-                          aria-valuemin="0"
-                          aria-valuemax="100"
-                          aria-valuenow={Math.round(progressOf(book))}
-                          aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                        >
-                          <div
-                            class="h-full preset-filled-primary-600-400"
-                            style:width={`${progressOf(book)}%`}
-                          ></div>
+                          {/if}
+                          {#if book.remoteAvailable === false && book.downloadPath}
+                            <span
+                              class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
+                              title="Saved offline; no longer available on Kavita"
+                              aria-label="Saved offline; no longer available on Kavita"
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                                <path
+                                  fill="currentColor"
+                                  d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                                />
+                              </svg>
+                            </span>
+                          {/if}
                         </div>
-                      {/if}
-                    </div>
-                    <h2
-                      class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                        <div class="min-w-0 flex-1">
+                          <h2
+                            class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                          >
+                            {book.title}
+                          </h2>
+                          <p class="mt-1 truncate text-sm text-surface-700-300">
+                            {book.author ?? 'Unknown author'}
+                          </p>
+                          {#if book.series}
+                            <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                          {/if}
+                          {#if progressOf(book) > 0}
+                            <div
+                              class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                              role="progressbar"
+                              aria-label={`Reading progress for ${book.title}`}
+                              aria-valuemin="0"
+                              aria-valuemax="100"
+                              aria-valuenow={Math.round(progressOf(book))}
+                              aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                            >
+                              <div
+                                class="h-full preset-filled-primary-600-400"
+                                style:width={`${progressOf(book)}%`}
+                              ></div>
+                            </div>
+                          {/if}
+                        </div>
+                      </div>
+                    </button>
+                    <button
+                      class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
+                      type="button"
+                      onclick={() => openMenu(book)}
+                      aria-label={`Book actions for ${book.title}`}
+                      title="More actions"
                     >
-                      {book.title}
-                    </h2>
-                    <p class="mt-1 truncate text-sm text-surface-700-300">
-                      {book.author ?? 'Unknown author'}
-                    </p>
-                  {/if}
-                </button>
-                <button
-                  class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-11 w-11 !p-0 shadow-md"
-                  type="button"
-                  onclick={() => openMenu(book)}
-                  aria-label={`Book actions for ${book.title}`}
-                  title="More actions"
-                >
-                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                    <path
-                      fill="currentColor"
-                      d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
-                    />
-                  </svg>
-                </button>
+                      <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                        <path
+                          fill="currentColor"
+                          d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                {:else}
+                  <div class="group block w-full text-left">
+                    <div class="relative">
+                      <button
+                        class="block w-full text-left"
+                        type="button"
+                        onclick={() => void open(book)}
+                        aria-label={`Open ${book.title}`}
+                        disabled={downloadingBookId === book.id}
+                      >
+                        <div
+                          class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                        >
+                          {#if covers[book.seriesId]}
+                            <img
+                              class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                              src={covers[book.seriesId]}
+                              loading="lazy"
+                              decoding="async"
+                              alt=""
+                            />
+                          {/if}
+                          {#if book.remoteAvailable === false && book.downloadPath}
+                            <span
+                              class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                              title="Saved offline; no longer available on Kavita"
+                              aria-label="Saved offline; no longer available on Kavita"
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                                <path
+                                  fill="currentColor"
+                                  d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                                />
+                              </svg>
+                            </span>
+                          {/if}
+                          {#if downloadingBookId === book.id}
+                            <span
+                              class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                              title="Downloading"
+                              aria-label="Downloading"
+                            >
+                              <svg
+                                aria-hidden="true"
+                                viewBox="0 0 24 24"
+                                class="h-4 w-4 animate-spin"
+                              >
+                                <path
+                                  fill="currentColor"
+                                  d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+                                />
+                              </svg>
+                            </span>
+                          {/if}
+                          {#if progressOf(book) > 0}
+                            <div
+                              class="absolute inset-x-0 bottom-0 h-2"
+                              role="progressbar"
+                              aria-label={`Reading progress for ${book.title}`}
+                              aria-valuemin="0"
+                              aria-valuemax="100"
+                              aria-valuenow={Math.round(progressOf(book))}
+                              aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                            >
+                              <div
+                                class="h-full preset-filled-primary-600-400"
+                                style:width={`${progressOf(book)}%`}
+                              ></div>
+                            </div>
+                          {/if}
+                        </div>
+                      </button>
+                      <button
+                        class="btn btn-sm preset-tonal-tertiary absolute right-3 bottom-3 z-10 h-11 w-11 !p-0 shadow-md"
+                        type="button"
+                        onclick={() => openMenu(book)}
+                        aria-label={`Book actions for ${book.title}`}
+                        title="More actions"
+                      >
+                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                          <path
+                            fill="currentColor"
+                            d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                    <button
+                      class="mt-3 block w-full text-left"
+                      type="button"
+                      onclick={() => void open(book)}
+                      disabled={downloadingBookId === book.id}
+                    >
+                      <h2
+                        class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                      >
+                        {book.title}
+                      </h2>
+                      <p class="mt-1 truncate text-sm text-surface-700-300">
+                        {book.author ?? 'Unknown author'}
+                      </p>
+                    </button>
+                  </div>
+                {/if}
               </article>
             {/each}
           </div>
@@ -1762,7 +1870,7 @@
   >
     <div
       bind:this={settingsDialog}
-      class="card preset-filled-surface-50-950 relative w-full max-w-md max-h-[88dvh] overflow-auto p-6"
+      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="library-settings-title"
@@ -1770,21 +1878,24 @@
       onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
       transition:fly={{ y: 16, duration: 150 }}
     >
-      <button
-        class="btn btn-sm preset-tonal-surface absolute right-4 top-4 h-9 w-9 p-0"
-        type="button"
-        onclick={closeSettings}
-        aria-label="Close settings"
+      <div
+        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
       >
-        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-          <path
-            fill="currentColor"
-            d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-          />
-        </svg>
-      </button>
-
-      <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
+        <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
+        <button
+          class="btn btn-sm preset-tonal-surface h-9 w-9 shrink-0 p-0"
+          type="button"
+          onclick={closeSettings}
+          aria-label="Close settings"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+      </div>
 
       <div class="mt-6" aria-labelledby="library-settings-appearance-title">
         <h3 id="library-settings-appearance-title" class="text-lg font-medium">

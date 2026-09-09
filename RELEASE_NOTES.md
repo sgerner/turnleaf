@@ -3,6 +3,12 @@
 ## Unreleased
 
 - fix: reduce reader bottom spacing
+- fix: place library book actions with each card
+- fix: align library view controls and filter actions
+- fix: hide advanced library filters behind panel
+- fix: keep settings controls visible while scrolling
+- fix: close reader panels with Android Back
+- Keep reader panels open while in use
 - fix: fit reader controls on mobile
 - fix: serialize all native database writes
 - fix: serialize native sqlite transactions

@@ -52,6 +52,7 @@
     onBack,
     onRelocated,
     onSyncLatest,
+    registerBackHandler,
   }: {
     bookUrl: string;
     bookId: string;
@@ -62,6 +63,7 @@
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: () => Promise<{ xpath: string | null; percentage: number | null } | null>;
+    registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
   let viewport: HTMLDivElement;
@@ -104,6 +106,7 @@
   let bottomSwipeStart: { id: number; x: number; y: number } | null = null;
   let saveTimer: number | null = null;
   let resumeHandle: PluginListenerHandle | null = null;
+  let removeBackHandler: (() => void) | null = null;
   let syncingLatest = $state(false);
   let destroyed = false;
   let appearanceLoaded = false;
@@ -118,7 +121,9 @@
     : null;
 
   onMount(async () => {
+    if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
+    document.addEventListener('backbutton', handleDocumentBackButton);
     const saved = await getPreference('appearance');
     if (destroyed) return;
     if (saved) appearance = parseAppearance(saved);
@@ -191,7 +196,10 @@
 
   onDestroy(() => {
     destroyed = true;
+    removeBackHandler?.();
+    removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
+    document.removeEventListener('backbutton', handleDocumentBackButton);
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     searchController?.abort();
@@ -218,7 +226,23 @@
     void tick().then(() => focusFirstElement(getPanel()));
   }
 
+  function hasOpenReaderPanel(): boolean {
+    return settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible;
+  }
+
+  function pauseChromeHide(): void {
+    if (hideTimer !== null) {
+      window.clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+  }
+
+  function resumeChromeHide(): void {
+    if (controlsVisible && !hasOpenReaderPanel()) scheduleChromeHide();
+  }
+
   function openSettings(): void {
+    pauseChromeHide();
     settingsOpener = activeElement();
     settingsVisible = true;
     tocVisible = false;
@@ -237,9 +261,11 @@
     const opener = settingsOpener;
     settingsOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openToc(): void {
+    pauseChromeHide();
     tocOpener = activeElement();
     tocVisible = true;
     settingsVisible = false;
@@ -258,9 +284,11 @@
     const opener = tocOpener;
     tocOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openBookmarks(): void {
+    pauseChromeHide();
     bookmarksOpener = activeElement();
     bookmarksVisible = true;
     settingsVisible = false;
@@ -280,9 +308,11 @@
     const opener = bookmarksOpener;
     bookmarksOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openAnnotations(): void {
+    pauseChromeHide();
     annotationsOpener = activeElement();
     annotationsVisible = true;
     settingsVisible = false;
@@ -300,9 +330,11 @@
     const opener = annotationsOpener;
     annotationsOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function openSearch(): void {
+    pauseChromeHide();
     searchOpener = activeElement();
     searchVisible = true;
     settingsVisible = false;
@@ -324,6 +356,7 @@
     const opener = searchOpener;
     searchOpener = null;
     restoreFocus(opener);
+    resumeChromeHide();
   }
 
   function showFooter(): void {
@@ -334,12 +367,9 @@
   function scheduleChromeHide(): void {
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
+      hideTimer = null;
+      if (hasOpenReaderPanel()) return;
       controlsVisible = false;
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
       footerVisible = false;
     }, 5_000);
   }
@@ -572,6 +602,24 @@
       closeSearch();
       showControls();
     }
+  }
+
+  function handleBackButton(): boolean {
+    if (settingsVisible) closeSettings();
+    else if (tocVisible) closeToc();
+    else if (bookmarksVisible) closeBookmarks();
+    else if (annotationsVisible) closeAnnotations();
+    else if (searchVisible) closeSearch();
+    else {
+      onBack();
+      return true;
+    }
+    showControls();
+    return true;
+  }
+
+  function handleDocumentBackButton(event: Event): void {
+    if (handleBackButton()) event.preventDefault();
   }
 
   function handleBottomSwipeStart(event: PointerEvent): void {
@@ -832,6 +880,7 @@
         <div
           bind:this={settingsPanel}
           class="reader-settings card preset-filled-surface-50-950 relative"
+          data-reader-panel
           id="reader-appearance"
           role="dialog"
           aria-modal="true"
@@ -992,6 +1041,7 @@
         <div
           bind:this={tocPanel}
           class="reader-settings card preset-filled-surface-50-950 relative"
+          data-reader-panel
           id="reader-contents"
           role="dialog"
           aria-modal="true"
@@ -1034,6 +1084,7 @@
         <div
           bind:this={searchPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          data-reader-panel
           id="reader-search"
           role="dialog"
           aria-modal="true"
@@ -1105,6 +1156,7 @@
         <div
           bind:this={bookmarksPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          data-reader-panel
           id="reader-bookmarks"
           role="dialog"
           aria-modal="true"
@@ -1234,6 +1286,7 @@
         <div
           bind:this={annotationsPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          data-reader-panel
           id="reader-annotations"
           role="dialog"
           aria-modal="true"
