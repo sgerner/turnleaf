@@ -1490,158 +1490,200 @@
             style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book (book.id)}
-              <article class="relative text-left" data-book-id={book.id}>
-                <button
-                  class="group block w-full text-left"
-                  type="button"
-                  onclick={() => void open(book)}
-                  oncontextmenu={(event) => {
-                    event.preventDefault();
-                    openMenu(book);
-                  }}
-                  disabled={downloadingBookId === book.id}
-                >
-                  {#if viewMode === 'list'}
-                    <div
-                      class="preset-tonal-surface flex min-h-24 items-center gap-4 rounded-lg p-3 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+              <article
+                class="relative text-left"
+                data-book-id={book.id}
+                oncontextmenu={(event) => {
+                  event.preventDefault();
+                  openMenu(book);
+                }}
+              >
+                {#if viewMode === 'list'}
+                  <div class="relative">
+                    <button
+                      class="group block w-full text-left"
+                      type="button"
+                      onclick={() => void open(book)}
+                      disabled={downloadingBookId === book.id}
                     >
-                      <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
-                        {#if covers[book.seriesId]}
-                          <img
-                            class="h-full w-full object-cover"
-                            src={covers[book.seriesId]}
-                            loading="lazy"
-                            decoding="async"
-                            alt=""
-                          />
-                        {/if}
-                        {#if book.remoteAvailable === false && book.downloadPath}
-                          <span
-                            class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
-                            title="Saved offline; no longer available on Kavita"
-                            aria-label="Saved offline; no longer available on Kavita"
-                          >
-                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                              <path
-                                fill="currentColor"
-                                d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
-                              />
-                            </svg>
-                          </span>
-                        {/if}
-                      </div>
-                      <div class="min-w-0 flex-1">
-                        <h2
-                          class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
-                        >
-                          {book.title}
-                        </h2>
-                        <p class="mt-1 truncate text-sm text-surface-700-300">
-                          {book.author ?? 'Unknown author'}
-                        </p>
-                        {#if book.series}
-                          <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
-                        {/if}
-                        {#if progressOf(book) > 0}
-                          <div
-                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
-                            role="progressbar"
-                            aria-label={`Reading progress for ${book.title}`}
-                            aria-valuemin="0"
-                            aria-valuemax="100"
-                            aria-valuenow={Math.round(progressOf(book))}
-                            aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                          >
-                            <div
-                              class="h-full preset-filled-primary-600-400"
-                              style:width={`${progressOf(book)}%`}
-                            ></div>
-                          </div>
-                        {/if}
-                      </div>
-                    </div>
-                  {:else}
-                    <div
-                      class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
-                    >
-                      {#if covers[book.seriesId]}
-                        <img
-                          class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                          src={covers[book.seriesId]}
-                          loading="lazy"
-                          decoding="async"
-                          alt=""
-                        />
-                      {/if}
-                      {#if book.remoteAvailable === false && book.downloadPath}
-                        <span
-                          class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                          title="Saved offline; no longer available on Kavita"
-                          aria-label="Saved offline; no longer available on Kavita"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                            <path
-                              fill="currentColor"
-                              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                      <div
+                        class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                      >
+                        <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
+                          {#if covers[book.seriesId]}
+                            <img
+                              class="h-full w-full object-cover"
+                              src={covers[book.seriesId]}
+                              loading="lazy"
+                              decoding="async"
+                              alt=""
                             />
-                          </svg>
-                        </span>
-                      {/if}
-                      {#if downloadingBookId === book.id}
-                        <span
-                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                          title="Downloading"
-                          aria-label="Downloading"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
-                            <path
-                              fill="currentColor"
-                              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
-                            />
-                          </svg>
-                        </span>
-                      {/if}
-                      {#if progressOf(book) > 0}
-                        <div
-                          class="absolute inset-x-0 bottom-0 h-2"
-                          role="progressbar"
-                          aria-label={`Reading progress for ${book.title}`}
-                          aria-valuemin="0"
-                          aria-valuemax="100"
-                          aria-valuenow={Math.round(progressOf(book))}
-                          aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                        >
-                          <div
-                            class="h-full preset-filled-primary-600-400"
-                            style:width={`${progressOf(book)}%`}
-                          ></div>
+                          {/if}
+                          {#if book.remoteAvailable === false && book.downloadPath}
+                            <span
+                              class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
+                              title="Saved offline; no longer available on Kavita"
+                              aria-label="Saved offline; no longer available on Kavita"
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                                <path
+                                  fill="currentColor"
+                                  d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                                />
+                              </svg>
+                            </span>
+                          {/if}
                         </div>
-                      {/if}
-                    </div>
-                    <h2
-                      class="mt-3 line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                        <div class="min-w-0 flex-1">
+                          <h2
+                            class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                          >
+                            {book.title}
+                          </h2>
+                          <p class="mt-1 truncate text-sm text-surface-700-300">
+                            {book.author ?? 'Unknown author'}
+                          </p>
+                          {#if book.series}
+                            <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                          {/if}
+                          {#if progressOf(book) > 0}
+                            <div
+                              class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                              role="progressbar"
+                              aria-label={`Reading progress for ${book.title}`}
+                              aria-valuemin="0"
+                              aria-valuemax="100"
+                              aria-valuenow={Math.round(progressOf(book))}
+                              aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                            >
+                              <div
+                                class="h-full preset-filled-primary-600-400"
+                                style:width={`${progressOf(book)}%`}
+                              ></div>
+                            </div>
+                          {/if}
+                        </div>
+                      </div>
+                    </button>
+                    <button
+                      class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
+                      type="button"
+                      onclick={() => openMenu(book)}
+                      aria-label={`Book actions for ${book.title}`}
+                      title="More actions"
                     >
-                      {book.title}
-                    </h2>
-                    <p class="mt-1 truncate text-sm text-surface-700-300">
-                      {book.author ?? 'Unknown author'}
-                    </p>
-                  {/if}
-                </button>
-                <button
-                  class="btn btn-sm preset-tonal-tertiary absolute right-2 bottom-0 z-10 h-11 w-11 !p-0 shadow-md"
-                  type="button"
-                  onclick={() => openMenu(book)}
-                  aria-label={`Book actions for ${book.title}`}
-                  title="More actions"
-                >
-                  <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                    <path
-                      fill="currentColor"
-                      d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
-                    />
-                  </svg>
-                </button>
+                      <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                        <path
+                          fill="currentColor"
+                          d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                {:else}
+                  <div class="group block w-full text-left">
+                    <div class="relative">
+                      <button
+                        class="block w-full text-left"
+                        type="button"
+                        onclick={() => void open(book)}
+                        aria-label={`Open ${book.title}`}
+                        disabled={downloadingBookId === book.id}
+                      >
+                        <div
+                          class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                        >
+                          {#if covers[book.seriesId]}
+                            <img
+                              class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                              src={covers[book.seriesId]}
+                              loading="lazy"
+                              decoding="async"
+                              alt=""
+                            />
+                          {/if}
+                          {#if book.remoteAvailable === false && book.downloadPath}
+                            <span
+                              class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                              title="Saved offline; no longer available on Kavita"
+                              aria-label="Saved offline; no longer available on Kavita"
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                                <path
+                                  fill="currentColor"
+                                  d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                                />
+                              </svg>
+                            </span>
+                          {/if}
+                          {#if downloadingBookId === book.id}
+                            <span
+                              class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                              title="Downloading"
+                              aria-label="Downloading"
+                            >
+                              <svg
+                                aria-hidden="true"
+                                viewBox="0 0 24 24"
+                                class="h-4 w-4 animate-spin"
+                              >
+                                <path
+                                  fill="currentColor"
+                                  d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+                                />
+                              </svg>
+                            </span>
+                          {/if}
+                          {#if progressOf(book) > 0}
+                            <div
+                              class="absolute inset-x-0 bottom-0 h-2"
+                              role="progressbar"
+                              aria-label={`Reading progress for ${book.title}`}
+                              aria-valuemin="0"
+                              aria-valuemax="100"
+                              aria-valuenow={Math.round(progressOf(book))}
+                              aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                            >
+                              <div
+                                class="h-full preset-filled-primary-600-400"
+                                style:width={`${progressOf(book)}%`}
+                              ></div>
+                            </div>
+                          {/if}
+                        </div>
+                      </button>
+                      <button
+                        class="btn btn-sm preset-tonal-tertiary absolute right-3 bottom-3 z-10 h-11 w-11 !p-0 shadow-md"
+                        type="button"
+                        onclick={() => openMenu(book)}
+                        aria-label={`Book actions for ${book.title}`}
+                        title="More actions"
+                      >
+                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                          <path
+                            fill="currentColor"
+                            d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                    <button
+                      class="mt-3 block w-full text-left"
+                      type="button"
+                      onclick={() => void open(book)}
+                      disabled={downloadingBookId === book.id}
+                    >
+                      <h2
+                        class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                      >
+                        {book.title}
+                      </h2>
+                      <p class="mt-1 truncate text-sm text-surface-700-300">
+                        {book.author ?? 'Unknown author'}
+                      </p>
+                    </button>
+                  </div>
+                {/if}
               </article>
             {/each}
           </div>

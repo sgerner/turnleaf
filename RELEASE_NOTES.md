@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: place library book actions with each card
 - fix: align library view controls and filter actions
 - fix: hide advanced library filters behind panel
 - fix: keep settings controls visible while scrolling
