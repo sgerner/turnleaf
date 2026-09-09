@@ -3,6 +3,9 @@
 ## Unreleased
 
 - fix: keep settings controls visible while scrolling
+- fix: fit reader controls on mobile
+- fix: serialize all native database writes
+- fix: serialize native sqlite transactions
 - fix: publish releases without a checkout
 - fix: normalize finalized release notes
 - ci: use software-compatible Android smoke image
