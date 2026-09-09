@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.3
+
 - fix: compact library filter toggles on narrow screens
 - fix: reduce reader bottom spacing
 - fix: place library book actions with each card
@@ -135,7 +137,6 @@
 - Reset visible release versions
 - Add local data reset recovery
 - Fix Android volume key paging
-
 - Add a startup reset path that clears corrupted local SQLite state without deleting downloaded EPUB files.
 
 ## 0.1.5
@@ -155,7 +156,6 @@
 - Align ESLint 10 packages
 - Switch release notes to post-commit amend
 - Add release note commit hook
-
 - GitHub Android release builds now publish versioned APK tags and version codes so the in-app update banner can detect them.
 - Library "Mark as read" now queues a Kavita progress update instead of only changing local state.
 - Reader safe-area layout now keeps EPUB text clear of the camera notch and status bar.

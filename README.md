@@ -12,6 +12,12 @@ GitHub release bodies are generated from the matching versioned section in `RELE
 
 ## Recent release notes
 
+### 0.3.3
+
+- Improve mobile library filtering, view controls, and large-library performance.
+- Add reader appearance panels, bookmarks, highlights, notes, and in-book search.
+- Make native metadata refreshes transactional and cover loading cancellable.
+
 ### 0.3.2
 
 - Generate clean GitHub release notes without npm command output.
