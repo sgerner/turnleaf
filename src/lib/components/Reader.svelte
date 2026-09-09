@@ -966,6 +966,19 @@
             />
           </label>
           <label class="label mt-4">
+            <span class="label-text">Bottom margin: {appearance.bottomMargin} pixels</span>
+            <input
+              class="range"
+              type="range"
+              min="0"
+              max="64"
+              step="2"
+              value={appearance.bottomMargin}
+              oninput={(event) =>
+                updateAppearance({ bottomMargin: Number(event.currentTarget.value) })}
+            />
+          </label>
+          <label class="label mt-4">
             <span class="label-text"
               >Paragraph spacing: {appearance.paragraphSpacing.toFixed(1)}</span
             >

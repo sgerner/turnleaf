@@ -8,10 +8,16 @@ describe('appearance serialization', () => {
   });
 
   it('bounds unsafe numeric values', () => {
-    expect(parseAppearance('{"fontSize":200,"lineHeight":0}')).toMatchObject({
+    expect(parseAppearance('{"fontSize":200,"lineHeight":0,"bottomMargin":200}')).toMatchObject({
       fontSize: 34,
       lineHeight: 1.2,
+      bottomMargin: 64,
     });
+  });
+
+  it('defaults the bottom margin for older saved appearances', () => {
+    expect(parseAppearance('{}').bottomMargin).toBe(defaultAppearance.bottomMargin);
+    expect(parseAppearance('{"bottomMargin":-4}').bottomMargin).toBe(0);
   });
 
   it('defaults the progress bar on', () => {
