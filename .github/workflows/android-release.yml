@@ -159,4 +159,5 @@ jobs:
           gh release create "$RELEASE_TAG" "release-payload/app-release.apk" \
             --title "Turnleaf $VERSION_BASE" \
             --notes-file "release-payload/turnleaf-release-notes.md" \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$TESTED_REVISION"
