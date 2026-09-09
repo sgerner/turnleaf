@@ -686,88 +686,127 @@
         )}
         transition:fly={{ y: -8, duration: 140 }}
       >
-        <div class="grid w-full grid-cols-7 gap-2">
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={onBack}
-            aria-label="Back to library"
-          >
-            Back
-          </button>
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={() => (tocVisible ? closeToc() : openToc())}
-            aria-expanded={tocVisible}
-            aria-controls="reader-contents"
-          >
-            Contents
-          </button>
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={() => (settingsVisible ? closeSettings() : openSettings())}
-            aria-expanded={settingsVisible}
-            aria-controls="reader-appearance"
-          >
-            Text
-          </button>
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
-            aria-label="Open bookmarks and history"
-            aria-expanded={bookmarksVisible}
-            aria-controls="reader-bookmarks"
-          >
-            <span class="sr-only sm:not-sr-only">Marks</span>
-            <span class="sm:sr-only" aria-hidden="true">★</span>
-          </button>
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
-            aria-label="Open highlights and notes"
-            aria-expanded={annotationsVisible}
-            aria-controls="reader-annotations"
-          >
-            <span class="sr-only sm:not-sr-only">Notes</span>
-            <span class="sm:sr-only" aria-hidden="true">✎</span>
-          </button>
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={() => (searchVisible ? closeSearch() : openSearch())}
-            aria-expanded={searchVisible}
-            aria-controls="reader-search"
-          >
-            Search
-          </button>
-          <button
-            class="btn preset-tonal-surface min-h-12"
-            type="button"
-            onclick={() => syncLatestLocation()}
-            aria-label="Sync latest reading position"
-            title="Sync latest reading position"
-            disabled={syncingLatest}
-          >
-            <svg
-              aria-hidden="true"
-              viewBox="0 0 24 24"
-              class:animate-spin={syncingLatest}
-              class="h-5 w-5"
+        <div class="reader-toolbar">
+          <div class="reader-toolbar-actions">
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={onBack}
+              aria-label="Back to library"
+              title="Back to library"
             >
-              <path
-                fill="currentColor"
-                d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
-              />
-            </svg>
-          </button>
+              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path
+                  fill="currentColor"
+                  d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2Z"
+                />
+              </svg>
+              <span class="reader-toolbar-label">Back</span>
+            </button>
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={() => (tocVisible ? closeToc() : openToc())}
+              aria-label="Contents"
+              aria-expanded={tocVisible}
+              aria-controls="reader-contents"
+              title="Contents"
+            >
+              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path fill="currentColor" d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z" />
+              </svg>
+              <span class="reader-toolbar-label">Contents</span>
+            </button>
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={() => (settingsVisible ? closeSettings() : openSettings())}
+              aria-label="Reading appearance"
+              aria-expanded={settingsVisible}
+              aria-controls="reader-appearance"
+              title="Reading appearance"
+            >
+              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path fill="currentColor" d="M5 4h14v2h-6v14h-2V6H5V4Z" />
+              </svg>
+              <span class="reader-toolbar-label">Text</span>
+            </button>
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
+              aria-label="Open bookmarks and history"
+              aria-expanded={bookmarksVisible}
+              aria-controls="reader-bookmarks"
+              title="Open bookmarks and history"
+            >
+              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path
+                  fill="currentColor"
+                  d="m12 3 2.78 5.63 6.22.9-4.5 4.38 1.06 6.2L12 17.18l-5.56 2.93 1.06-6.2L3 9.53l6.22-.9L12 3Z"
+                />
+              </svg>
+              <span class="reader-toolbar-label">Marks</span>
+            </button>
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
+              aria-label="Open highlights and notes"
+              aria-expanded={annotationsVisible}
+              aria-controls="reader-annotations"
+              title="Open highlights and notes"
+            >
+              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path
+                  fill="currentColor"
+                  d="m4 17.25 9.67-9.67 2.75 2.75L6.75 20H4v-2.75ZM17.12 6.13l.75-.75a1.5 1.5 0 0 1 2.12 0l.63.63a1.5 1.5 0 0 1 0 2.12l-.75.75-2.75-2.75Z"
+                />
+              </svg>
+              <span class="reader-toolbar-label">Notes</span>
+            </button>
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={() => (searchVisible ? closeSearch() : openSearch())}
+              aria-label="Search this book"
+              aria-expanded={searchVisible}
+              aria-controls="reader-search"
+              title="Search this book"
+            >
+              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                <path
+                  fill="currentColor"
+                  d="m15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5ZM9.5 14A4.5 4.5 0 1 1 9.5 5a4.5 4.5 0 0 1 0 9Z"
+                />
+              </svg>
+              <span class="reader-toolbar-label">Search</span>
+            </button>
+            <button
+              class="btn min-w-0 preset-tonal-surface min-h-12"
+              type="button"
+              onclick={() => syncLatestLocation()}
+              aria-label="Sync latest reading position"
+              title="Sync latest reading position"
+              disabled={syncingLatest}
+            >
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                class:animate-spin={syncingLatest}
+                class="reader-toolbar-icon reader-toolbar-icon-always"
+              >
+                <path
+                  fill="currentColor"
+                  d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
+                />
+              </svg>
+            </button>
+          </div>
+          <p class="reader-toolbar-title">
+            {title}
+          </p>
         </div>
-        <p class="min-w-0 flex-1 truncate text-center text-sm font-bold text-primary-500">
-          {title}
-        </p>
       </header>
 
       {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible}
@@ -1473,6 +1512,82 @@
   .reader-top {
     top: 0;
     padding-top: env(safe-area-inset-top);
+  }
+
+  .reader-toolbar {
+    display: flex;
+    min-width: 0;
+    width: 100%;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .reader-toolbar-actions {
+    display: grid;
+    min-width: 0;
+    flex: 1 1 auto;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 0.5rem;
+  }
+
+  .reader-toolbar-actions :global(button) {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .reader-toolbar-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reader-toolbar-icon {
+    display: none;
+    width: 1.25rem;
+    height: 1.25rem;
+    flex: 0 0 auto;
+  }
+
+  .reader-toolbar-icon-always {
+    display: block;
+  }
+
+  .reader-toolbar-title {
+    min-width: 0;
+    max-width: 14rem;
+    flex: 0 1 14rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+    font-size: 0.875rem;
+    font-weight: 700;
+    color: var(--color-primary-500);
+  }
+
+  @media (max-width: 40rem) {
+    .reader-toolbar {
+      display: block;
+    }
+
+    .reader-toolbar-actions {
+      width: 100%;
+      gap: 0.25rem;
+    }
+
+    .reader-toolbar-label {
+      display: none;
+    }
+
+    .reader-toolbar-icon {
+      display: block;
+      margin-inline: auto;
+    }
+
+    .reader-toolbar-title {
+      display: none;
+    }
   }
 
   .reader-bottom {
