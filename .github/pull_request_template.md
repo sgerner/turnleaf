@@ -2,12 +2,14 @@
 
 ## Checks
 
-- [ ] `npm run format:check`
-- [ ] `npm run lint`
-- [ ] `npm run check`
-- [ ] `npm test`
-- [ ] `npm run build`
-- [ ] `npm run android:debug`
+- [ ] `npm run verify`
+- [ ] `npm run android:debug` (when changing Capacitor or Android behavior)
+- [ ] `npm run android:smoke` (when an emulator or device is available)
+- [ ] Manual/device validation recorded in [DEVICE_VALIDATION.md](../DEVICE_VALIDATION.md) when applicable
+
+## UI changes
+
+- [ ] Screenshots or a short screen recording attached when the change is visible
 
 ## Security
 

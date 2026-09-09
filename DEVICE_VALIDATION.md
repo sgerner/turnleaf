@@ -8,15 +8,12 @@ Run these from a clean checkout before the device pass:
 
 ```sh
 npm ci
-npm run check
-npm run lint
-npm run format:check
-npm test -- --run
+npm run verify
 npm run android:debug
 npm run android:smoke
 ```
 
-`android:smoke` installs the debug APK, starts `app.turnleaf.reader/.MainActivity`, and verifies that the application process stays alive. The CI emulator job runs the same script on an API 35 Google APIs x86_64 image.
+`npm run verify` runs the same web quality gates used by pull-request CI. `android:smoke` installs the debug APK as `app.turnleaf.reader.debug`, starts its main activity, and verifies that the application process stays alive. The `.debug` application ID lets contributors test alongside a signed production install without replacing it. The CI emulator job runs the same script on an API 29 default x86 Nexus 5 image.
 
 ## Android accessibility pass
 

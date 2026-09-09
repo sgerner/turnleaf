@@ -8,7 +8,9 @@ Latest release: [GitHub Releases](https://github.com/sgerner/turnleaf/releases/l
 
 Tracked release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
-GitHub release bodies are generated from the matching versioned section in `RELEASE_NOTES.md`, while `## Unreleased` stays empty until the next development cycle.
+GitHub release bodies are generated from the matching versioned section in
+`RELEASE_NOTES.md`; `## Unreleased` records changes that are still in
+development.
 
 ## Recent release notes
 
@@ -146,16 +148,22 @@ Because the app is a Capacitor wrapper around a Svelte application, it should bu
 
 ### Prerequisites
 
-- Node.js
+- Node.js 22 (see `.nvmrc`)
 - npm
 - For Android: Java 21, Android Studio, Android SDK, and an emulator or device
 - For iOS on macOS: Xcode and CocoaPods
+- Docker, if you want to run the local Kavita fixture
 
 ### Install
 
 ```bash
 npm ci
+npm run verify
 ```
+
+`npm ci` installs the dependencies and enables the repository's Git hooks. The
+single contributor check is `npm run verify`; it runs the production dependency
+audit, formatting check, lint, type check, unit tests, and web build.
 
 ### Run the web app
 
@@ -180,16 +188,27 @@ requests after 12 seconds. It does not follow redirects or forward cookies,
 authorization, or forwarding headers. Plain HTTP is intentionally limited to
 loopback development servers.
 
+### Run a local Kavita server
+
+Docker is optional, but it provides a repeatable server for onboarding, download,
+offline, and reader testing:
+
+```bash
+npm run dev:kavita
+npm run dev
+```
+
+Complete the one-time Kavita setup in [dev/README.md](dev/README.md). Stop the
+fixture with `npm run dev:kavita:down`, or inspect it with
+`npm run dev:kavita:logs`.
+
 ### Quality checks
 
 ```bash
-npm run format
-npm run format:check
-npm run lint
-npm run check
-npm test
-npm run build
+npm run verify
 ```
+
+Run `npm run format` separately when you intend to rewrite formatting.
 
 ## Android setup
 
@@ -212,8 +231,16 @@ Useful follow-up commands:
 
 ```bash
 npm run android:open
+npm run android:smoke
 npm run android:release
 ```
+
+`android:smoke` installs the debug APK as `app.turnleaf.reader.debug` and
+verifies that the app process starts on a connected emulator or USB device. The
+`.debug` application ID lets it run alongside a signed production install.
+`android:open` and `ios:open` read an optional `.env` file when present, so a
+fresh checkout does not need one. Copy `.env.example` to `.env` only when you
+need to set an Android Studio path or a remote browser-proxy origin.
 
 If you want to run from Android Studio, open the generated Android project after `cap sync` and use the usual emulator or device workflow.
 
@@ -244,7 +271,9 @@ If you are trying iOS, please report back what works and what does not.
 
 ## Contributing
 
-Contributions and forks are welcome.
+Contributions and forks are welcome. The complete setup, testing, Android
+validation, pull-request, and release-note workflow is in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 Please keep changes small and direct:
 
@@ -254,18 +283,14 @@ Please keep changes small and direct:
 - Preserve offline-first behavior.
 - Do not add new dependencies unless they are clearly necessary.
 
-GitHub Actions runs pull-request checks for formatting, linting, type checking, tests, the web build, dependency review, CodeQL scanning, and an Android debug build. PRs that touch native behavior should also be verified locally on the relevant platform when possible.
+GitHub Actions runs `npm run verify`, an Android debug build, an emulator startup smoke test, dependency review, and CodeQL scanning. PRs that touch native behavior should also be verified locally on the relevant platform when possible.
 
 Use [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md) for the Android accessibility, network-isolation, and offline-reopen acceptance pass. CI also runs an emulator startup smoke test; that smoke test does not replace TalkBack or network-trace validation.
 
 Before opening a pull request, run:
 
 ```bash
-npm run format
-npm run check
-npm run lint
-npm test
-npm run build
+npm run verify
 ```
 
 If your change touches native behavior, also run the relevant Capacitor or Android build command.

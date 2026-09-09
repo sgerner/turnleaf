@@ -6,7 +6,7 @@ connect to during development, instead of needing a production server.
 ## Start it
 
 ```bash
-docker compose -f dev/docker-compose.yml up -d
+npm run dev:kavita
 ```
 
 This uses LinuxServer.io's Kavita image.
@@ -38,8 +38,10 @@ Run Turnleaf's dev server (`npm run dev`) and use the onboarding form:
 To stop Kavita and keep its saved configuration and book files, run:
 
 ```bash
-docker compose -f dev/docker-compose.yml down
+npm run dev:kavita:down
 ```
+
+Use `npm run dev:kavita:logs` to follow the Kavita container logs while it is running.
 
 This Compose setup uses bind mounts, so stopping the container preserves both
 `dev/kavita/config/` and `dev/kavita/data/`.

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- docs: streamline contributor setup, local Kavita testing, Android validation, and pull-request checks.
+- dev: add one-command quality verification and installable Android debug builds that can coexist with production.
+
 ## 0.3.3
 
 - fix: compact library filter toggles on narrow screens
