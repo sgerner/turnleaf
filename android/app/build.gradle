@@ -47,6 +47,12 @@ android {
         }
     }
     buildTypes {
+        debug {
+            // Keep local debug installs alongside a signed production build on a
+            // contributor's device, so smoke checks never need to replace or
+            // uninstall their production app.
+            applicationIdSuffix ".debug"
+        }
         release {
             if (releaseSigningConfigured) {
                 signingConfig signingConfigs.release

@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url';
 
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const apkPath = resolve(projectRoot, 'android/app/build/outputs/apk/debug/app-debug.apk');
-const packageName = 'app.turnleaf.reader';
-const activity = `${packageName}/.MainActivity`;
+const packageName = 'app.turnleaf.reader.debug';
+const activity = `${packageName}/app.turnleaf.reader.MainActivity`;
 
 function run(command, args) {
   return new Promise((resolveCommand, rejectCommand) => {
