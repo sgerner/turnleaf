@@ -10,9 +10,15 @@ const sections = [];
 const prefix = [];
 let current = null;
 
+const compactBody = (body) =>
+  body.filter((line) => line.trim().length > 0).map((line) => line.trimEnd());
+
 for (const line of lines) {
   if (line.startsWith('## ')) {
-    if (current) sections.push(current);
+    if (current) {
+      current.body = compactBody(current.body);
+      sections.push(current);
+    }
     current = { heading: line.trim(), body: [] };
     continue;
   }
@@ -24,7 +30,10 @@ for (const line of lines) {
   }
 }
 
-if (current) sections.push(current);
+if (current) {
+  current.body = compactBody(current.body);
+  sections.push(current);
+}
 
 const unreleased = sections.find((section) => section.heading === '## Unreleased');
 if (!unreleased) {

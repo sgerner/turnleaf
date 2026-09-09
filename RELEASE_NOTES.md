@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: normalize finalized release notes
 - ci: use software-compatible Android smoke image
 - ci: make emulator smoke startup deterministic
 - ci: add Android emulator startup smoke test
