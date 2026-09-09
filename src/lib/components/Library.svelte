@@ -291,6 +291,7 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
+  let readerBackHandler: (() => boolean) | null = null;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -573,8 +574,10 @@
         await App.addListener('backButton', () => {
           if (destroyed) return;
           if (actionMenuBook) closeMenu();
-          else if (reading) reading = null;
-          else if (settingsVisible) closeSettings();
+          else if (reading) {
+            if (readerBackHandler || document.querySelector('[data-reader-panel]')) return;
+            reading = null;
+          } else if (settingsVisible) closeSettings();
           else void App.exitApp();
         }),
       ),
@@ -1011,6 +1014,13 @@
     void relocated(reading.book, location);
   }
 
+  function registerReaderBackHandler(handler: () => boolean): () => void {
+    readerBackHandler = handler;
+    return () => {
+      if (readerBackHandler === handler) readerBackHandler = null;
+    };
+  }
+
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     settingsError = '';
@@ -1085,6 +1095,7 @@
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
     onSyncLatest={() => syncLatestForReader(reading!.book)}
+    registerBackHandler={registerReaderBackHandler}
   />
 {:else}
   <main
