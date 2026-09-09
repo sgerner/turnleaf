@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: reduce reader bottom spacing
 - fix: publish releases without a checkout
 - fix: normalize finalized release notes
 - ci: use software-compatible Android smoke image

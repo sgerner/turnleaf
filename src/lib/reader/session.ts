@@ -546,7 +546,7 @@ export class ReaderSession {
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) calc(max(${value.margin}px, env(safe-area-inset-bottom)) + 2.5rem) max(${value.margin}px, env(safe-area-inset-left)) !important`,
+        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
         'box-sizing': 'border-box',
       },
       p: {

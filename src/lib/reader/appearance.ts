@@ -7,6 +7,7 @@ export interface Appearance {
   lineHeight: number;
   paragraphSpacing: number;
   margin: number;
+  bottomMargin: number;
   alignment: 'start' | 'justify';
   publisherStyles: boolean;
   hyphenation: boolean;
@@ -21,6 +22,7 @@ export const defaultAppearance: Appearance = {
   lineHeight: 1.55,
   paragraphSpacing: 0.6,
   margin: 24,
+  bottomMargin: 0,
   alignment: 'start',
   publisherStyles: true,
   hyphenation: false,
@@ -43,6 +45,10 @@ export function parseAppearance(value: string): Appearance {
     lineHeight: Math.min(
       2,
       Math.max(1.2, Number(parsed.lineHeight ?? defaultAppearance.lineHeight)),
+    ),
+    bottomMargin: Math.min(
+      64,
+      Math.max(0, Number(parsed.bottomMargin ?? defaultAppearance.bottomMargin)),
     ),
     progressBar: parsed.progressBar !== false,
   };
