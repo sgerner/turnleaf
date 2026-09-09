@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: close reader panels with Android Back
 - fix: publish releases without a checkout
 - fix: normalize finalized release notes
 - ci: use software-compatible Android smoke image
