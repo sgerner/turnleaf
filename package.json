@@ -50,7 +50,7 @@
   "devDependencies": {
     "@capacitor/android": "^8.4.1",
     "@capacitor/cli": "^8.4.1",
-    "@capacitor/ios": "^8.4.1",
+    "@capacitor/ios": "^8.5.1",
     "@eslint/js": "^10.0.1",
     "@skeletonlabs/skeleton": "^4.15.2",
     "@skeletonlabs/skeleton-svelte": "^4.15.2",
