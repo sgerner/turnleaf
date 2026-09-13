@@ -3,6 +3,7 @@
 ## Unreleased
 
 - fix(deps): keep Skeleton packages on the same major
+- fix(bench): update library benchmark for Vitest 5
 - docs: streamline contributor setup, local Kavita testing, Android validation, and pull-request checks.
 - dev: add one-command quality verification and installable Android debug builds that can coexist with production.
 
