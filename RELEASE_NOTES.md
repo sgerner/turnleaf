@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- chore(release): bump version to 0.3.4
 ## 0.3.4
 
 - fix(deps): keep Skeleton packages on the same major
