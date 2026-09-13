@@ -53,7 +53,7 @@
     "@capacitor/ios": "^8.5.1",
     "@eslint/js": "^10.0.1",
     "@skeletonlabs/skeleton": "^4.15.2",
-    "@skeletonlabs/skeleton-svelte": "^4.15.2",
+    "@skeletonlabs/skeleton-svelte": "^5.0.1",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tailwindcss/vite": "^4.3.2",
     "@types/node": "^26.1.0",
