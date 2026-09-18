@@ -38,8 +38,8 @@
 }
 
 [data-theme='vintage'] {
-  --base-font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
-  --heading-font-family: Iowan Old Style, Palatino Linotype, Book Antiqua, Georgia, serif;
+  --typo-base--font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
+  --typo-heading--font-family: Iowan Old Style, Palatino Linotype, Book Antiqua, Georgia, serif;
 }
 
 html,
@@ -57,12 +57,8 @@ html {
 body {
   min-width: 320px;
   overflow: hidden;
-  background: var(--body-background-color);
-  color: var(--base-font-color);
-  @variant dark {
-    background: var(--body-background-color-dark);
-    color: var(--base-font-color-dark);
-  }
+  background: light-dark(var(--color-root-bg-light), var(--color-root-bg-dark));
+  color: light-dark(var(--typo-base--color-light), var(--typo-base--color-dark));
 }
 
 button,

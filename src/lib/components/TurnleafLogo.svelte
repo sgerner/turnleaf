@@ -27,7 +27,6 @@
     display: inline-flex;
     align-items: center;
     gap: 0.85rem;
-    color: var(--base-font-color);
   }
 
   .turnleaf-image {
@@ -38,7 +37,7 @@
   }
 
   .turnleaf-wordmark {
-    font-family: var(--heading-font-family);
+    font-family: var(--typo-heading--font-family, inherit);
     font-size: calc(var(--turnleaf-logo-size) * 0.65);
     line-height: 1;
     letter-spacing: 0.02em;

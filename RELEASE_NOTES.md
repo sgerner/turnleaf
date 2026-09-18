@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
+
 ## 0.3.4
 
 - fix(deps): keep Skeleton packages on the same major

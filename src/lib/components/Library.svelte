@@ -73,121 +73,6 @@
   ] as const;
   type SkeletonTheme = (typeof skeletonThemes)[number];
 
-  // Primary/secondary/tertiary-500 colors for each Skeleton theme (extracted from
-  // node_modules/@skeletonlabs/skeleton/src/themes/*.css and src/lib/themes/*.css
-  // - for locally authored themes). Hardcoded because Skeleton v4 switches theme
-  // variables globally; arbitrary child elements with data-theme do not inherit a
-  // different theme's palette.
-  const themeColors: Record<SkeletonTheme, [string, string, string]> = {
-    catppuccin: [
-      'oklch(66.37% 0.18 273.14deg)',
-      'oklch(72.56% 0.17 338.45deg)',
-      'oklch(60.23% 0.1 201.09deg)',
-    ],
-    cerberus: ['oklch(0.57 0.21 258.29)', 'oklch(0.49 0.23 300.45)', 'oklch(0.65 0.26 2.47)'],
-    concord: [
-      'oklch(57.74% 0.21 273.85deg)',
-      'oklch(65.34% 0.22 351.93deg)',
-      'oklch(69.62% 0.15 247.99deg)',
-    ],
-    crimson: [
-      'oklch(55.71% 0.21 19.55deg)',
-      'oklch(59.26% 0.09 239.95deg)',
-      'oklch(78.4% 0.01 31.17deg)',
-    ],
-    eink: ['oklch(0.5 0 0)', 'oklch(0.5 0 0)', 'oklch(0.5 0 0)'],
-    fennec: [
-      'oklch(65.88% 0.21 38.25deg)',
-      'oklch(87.53% 0.1 74.15deg)',
-      'oklch(57.22% 0.05 185.36deg)',
-    ],
-    hamlindigo: [
-      'oklch(80.28% 0.08 266.51deg)',
-      'oklch(65.46% 0.07 87.04deg)',
-      'oklch(64.32% 0.06 213.24deg)',
-    ],
-    legacy: [
-      'oklch(69.84% 0.15 162.21deg)',
-      'oklch(51.06% 0.23 276.97deg)',
-      'oklch(68.47% 0.15 237.31deg)',
-    ],
-    mint: [
-      'oklch(83.57% 0.18 148.98deg)',
-      'oklch(59.27% 0.21 282.75deg)',
-      'oklch(44.74% 0.03 322.1deg)',
-    ],
-    modern: [
-      'oklch(65.59% 0.21 354.32deg)',
-      'oklch(71.48% 0.13 215.21deg)',
-      'oklch(70.37% 0.12 182.49deg)',
-    ],
-    mona: [
-      'oklch(56.31% 0.21 294.98deg)',
-      'oklch(63.43% 0.16 148.39deg)',
-      'oklch(81.11% 0.1 190.5deg)',
-    ],
-    nosh: [
-      'oklch(56.22% 0.23 24.62deg)',
-      'oklch(89.23% 0.04 17.93deg)',
-      'oklch(42.89% 0.04 161.33deg)',
-    ],
-    nouveau: [
-      'oklch(83.44% 0.16 97deg)',
-      'oklch(56.7% 0.19 256.45deg)',
-      'oklch(62.5% 0.15 284.38deg)',
-    ],
-    pine: [
-      'oklch(62.15% 0.08 79.85deg)',
-      'oklch(31.9% 0.11 347.8deg)',
-      'oklch(61.68% 0.02 103.61deg)',
-    ],
-    reign: [
-      'oklch(94.82% 0.17 110.7deg)',
-      'oklch(94.82% 0.17 110.7deg)',
-      'oklch(94.82% 0.17 110.7deg)',
-    ],
-    rocket: [
-      'oklch(71.48% 0.13 215.21deg)',
-      'oklch(62.31% 0.19 259.81deg)',
-      'oklch(62.68% 0.23 303.91deg)',
-    ],
-    rose: [
-      'oklch(69.89% 0.13 348.12deg)',
-      'oklch(46.75% 0.22 272.16deg)',
-      'oklch(78.41% 0.08 291.85deg)',
-    ],
-    sahara: [
-      'oklch(78.19% 0.15 76.87deg)',
-      'oklch(76.32% 0.12 183.49deg)',
-      'oklch(85.72% 0.12 126.76deg)',
-    ],
-    seafoam: [
-      'oklch(80.78% 0.07 190.34deg)',
-      'oklch(32.36% 0.07 262.2deg)',
-      'oklch(65.36% 0.23 34.04deg)',
-    ],
-    terminus: [
-      'oklch(48.65% 0.3 279.02deg)',
-      'oklch(89.36% 0.16 171.7deg)',
-      'oklch(91.3% 0.21 117.7deg)',
-    ],
-    vintage: [
-      'oklch(71.39% 0.16 59.66deg)',
-      'oklch(80.21% 0.08 152.14deg)',
-      'oklch(71.48% 0.13 215.21deg)',
-    ],
-    vox: [
-      'oklch(82.71% 0.1 51.5deg)',
-      'oklch(92.54% 0.17 123.36deg)',
-      'oklch(80.24% 0.12 298.53deg)',
-    ],
-    wintry: [
-      'oklch(62.31% 0.19 259.81deg)',
-      'oklch(68.47% 0.15 237.31deg)',
-      'oklch(66.28% 0.18 280.87deg)',
-    ],
-  };
-
   let {
     server,
     apiKey,
@@ -1957,10 +1842,13 @@
               title={option}
               onclick={() => void updateTheme(option)}
             >
-              <span class="flex h-full w-full">
-                {#each themeColors[option] as color, index (index)}
-                  <span class="h-full flex-1" style:background-color={color}></span>
-                {/each}
+              <span class="flex h-full w-full" data-theme={option}>
+                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
+                ></span>
+                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
+                ></span>
+                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
+                ></span>
               </span>
             </button>
           {/each}

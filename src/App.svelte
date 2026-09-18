@@ -217,7 +217,7 @@
     overflow: hidden;
     background-color: color-mix(
       in oklab,
-      var(--body-background-color) 72%,
+      var(--color-root-bg-light) 72%,
       var(--color-surface-50-950) 28%
     );
     background:
@@ -248,7 +248,7 @@
   :global([data-mode='dark']) .app-shell {
     background-color: color-mix(
       in oklab,
-      var(--body-background-color-dark) 92%,
+      var(--color-root-bg-dark) 92%,
       var(--color-surface-950) 8%
     );
     background:
