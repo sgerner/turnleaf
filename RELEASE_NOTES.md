@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: preserve newer local reading progress when an older upload completes.
+- security: refresh the transitive devalue dependency to a patched release.
 - fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
 
 ## 0.3.4

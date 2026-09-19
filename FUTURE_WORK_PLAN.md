@@ -34,13 +34,13 @@ Each numbered item should normally be its own PR. Add regression coverage with t
 
 ### R1 — Acknowledge only the progress version actually uploaded
 
-**P1 · M · confirmed**
+**P1 · M · implemented**
 
-Evidence: [sync.ts](src/lib/sync/sync.ts), `run`, snapshots pending payloads, uploads them, then calls `confirmSync(bookId, ...)`. [database.ts](src/lib/database/database.ts), `getPendingSync` and `confirmSync`, do not carry a queue revision; confirmation deletes by book ID and marks the current local state synchronized.
+Evidence: [sync.ts](src/lib/sync/sync.ts), `run`, snapshots pending payloads, uploads them, then calls `confirmSync(bookId, ...)`. [database.ts](src/lib/database/database.ts), `getPendingSync` and `confirmSync`, now carry a queue revision and local timestamp through the conditional acknowledgement.
 
-A relocation arriving while an older request is in flight can replace the queue row; the old request's completion can then remove the newer update. Introduce a monotonic revision or equivalent token carried through upload and conditional acknowledgement. Update the acknowledged baseline from the sent snapshot, not whatever happens to be current. Scope in-flight flushing to server/credential identity so account changes cannot reuse unrelated work.
+A relocation arriving while an older request is in flight can replace the queue row; the old request's completion can then remove the newer update. The sync queue now carries a per-book monotonic revision alongside its local timestamp; pending uploads carry both values, and success or failure updates are conditional on both still identifying the uploaded row. Acknowledgement records the uploaded local timestamp as the baseline instead of using a newer local state. Scope in-flight flushing to server/credential identity remains follow-up work.
 
-Acceptance: delay upload A, save B, complete A, and prove B remains pending and is subsequently uploaded. Repeat with failure, duplicate completion, background/foreground events, and credential/server changes on browser and native paths.
+Acceptance: delay upload A, save B, complete A, and prove B remains pending and is subsequently uploaded. This is covered for browser storage, including same-millisecond saves and the acknowledged baseline; native SQL applies the same revision guard. Repeat with failure, duplicate completion, background/foreground events, and credential/server changes on browser and native paths as follow-up coverage.
 
 ### R2 — Commit local reading state and queue changes together
 

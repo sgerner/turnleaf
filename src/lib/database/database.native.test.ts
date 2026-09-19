@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 5;
+  let databaseVersion = 6;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 5;
+      databaseVersion = 6;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -77,6 +77,7 @@ const readingState = {
   xpath: '/html/body/p[1]',
   percentage: 0.4,
   localUpdatedAt: '2026-01-01T00:00:00.000Z',
+  syncedLocalUpdatedAt: null,
   serverUpdatedAt: null,
   pendingSync: false,
 };
@@ -142,7 +143,7 @@ it('serializes direct native writes with transactions', async () => {
   const { markSyncFailure, saveLocalProgress } = await import('./database');
   await Promise.all([
     saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
-    markSyncFailure(book.id, 'offline'),
+    markSyncFailure(book.id, 'offline', 1, readingState.localUpdatedAt),
   ]);
 
   expect(peakWrites).toBe(1);
@@ -179,7 +180,7 @@ it('groups completion and acknowledgement writes separately', async () => {
   const { confirmSync, markBookCompleted } = await import('./database');
 
   await markBookCompleted(book, readingState);
-  await confirmSync(book.id, '2026-01-02T00:00:00.000Z', readingState.localUpdatedAt);
+  await confirmSync(book.id, '2026-01-02T00:00:00.000Z', 1, readingState.localUpdatedAt);
 
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
   const [completionTasks, acknowledgementTasks] = mocks.executeTransaction.mock.calls;
@@ -199,7 +200,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(5);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(6);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -207,6 +208,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE TABLE preferences'),
     expect.stringContaining('ALTER TABLE books ADD COLUMN remote_available'),
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
+    expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -214,5 +216,6 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 3;',
     'PRAGMA user_version = 4;',
     'PRAGMA user_version = 5;',
+    'PRAGMA user_version = 6;',
   ]);
 });
