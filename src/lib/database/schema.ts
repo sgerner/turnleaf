@@ -90,4 +90,10 @@ export const migrations = [
       CREATE INDEX IF NOT EXISTS books_server_title_idx ON books(server_id, title, id);
     `,
   },
+  {
+    version: 6,
+    statements: `
+      ALTER TABLE sync_queue ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ] as const;

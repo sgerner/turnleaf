@@ -189,6 +189,7 @@ it('does not acknowledge a queue item that was replaced while it uploaded', asyn
         xpath: null,
         percentage: 0.5,
         localUpdatedAt: '2026-09-07T00:00:01.000Z',
+        syncedLocalUpdatedAt: null,
         serverUpdatedAt: null,
         pendingSync: true,
       },
@@ -202,15 +203,65 @@ it('does not acknowledge a queue item that was replaced while it uploaded', asyn
         lastError: null,
         createdAt: '2026-09-07T00:00:01.000Z',
         updatedAt: '2026-09-07T00:00:01.000Z',
+        revision: 2,
       },
     },
     preferences: {},
   };
   localStorage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
 
-  await confirmSync('book-1', '2026-09-07T00:00:02.000Z', '2026-09-07T00:00:00.000Z');
+  await confirmSync('book-1', '2026-09-07T00:00:02.000Z', 1, '2026-09-07T00:00:00.000Z');
 
   expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toEqual(state);
+});
+
+it('records the uploaded local revision as the acknowledged baseline', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const updatedAt = '2026-09-07T00:00:01.000Z';
+  const state = {
+    serverConfig: null,
+    books: [],
+    readingState: {
+      'book-1': {
+        cfi: 'cfi',
+        xpath: null,
+        percentage: 0.5,
+        localUpdatedAt: updatedAt,
+        syncedLocalUpdatedAt: null,
+        serverUpdatedAt: null,
+        pendingSync: true,
+      },
+    },
+    syncQueue: {
+      'book-1': {
+        bookId: 'book-1',
+        payloadJson: '{"pageNum":2}',
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
+        createdAt: updatedAt,
+        updatedAt,
+        revision: 4,
+      },
+    },
+    preferences: {},
+  };
+  localStorage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
+
+  await confirmSync('book-1', '2026-09-07T00:00:02.000Z', 4, updatedAt);
+
+  expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
+    readingState: {
+      'book-1': {
+        pendingSync: false,
+        syncedLocalUpdatedAt: updatedAt,
+      },
+    },
+    syncQueue: {},
+  });
 });
 
 it('reports pending and failed browser sync work for recovery UI', async () => {

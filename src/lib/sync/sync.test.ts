@@ -1,4 +1,5 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { saveLocalProgress } from '../database/database';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -31,7 +32,7 @@ class MemoryStorage implements Storage {
   }
 }
 
-const pendingState = (updatedAt: string, payloadJson: string) => ({
+const pendingState = (updatedAt: string, payloadJson: string, revision = 1) => ({
   serverConfig: null,
   books: [],
   readingState: {
@@ -40,6 +41,7 @@ const pendingState = (updatedAt: string, payloadJson: string) => ({
       xpath: null,
       percentage: payloadJson.includes('2') ? 0.2 : 0.1,
       localUpdatedAt: updatedAt,
+      syncedLocalUpdatedAt: null,
       serverUpdatedAt: null,
       pendingSync: true,
     },
@@ -53,6 +55,7 @@ const pendingState = (updatedAt: string, payloadJson: string) => ({
       lastError: null,
       createdAt: updatedAt,
       updatedAt,
+      revision,
     },
   },
   preferences: {},
@@ -66,26 +69,80 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-it('keeps a newer local queue item when an older upload completes', async () => {
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+const book = {
+  id: 'book-1',
+  serverId: 'server',
+  libraryId: 1,
+  seriesId: 1,
+  volumeId: 1,
+  chapterId: 1,
+  title: 'Book',
+  author: null,
+  series: null,
+  descriptionHtml: null,
+  format: 'epub',
+  pages: 100,
+  pagesRead: 10,
+  createdAt: '2026-01-01T00:00:00.000Z',
+  lastReadAt: null,
+  downloadPath: null,
+  downloadStatus: 'none',
+  fileSize: null,
+};
+
+it('keeps and uploads a newer local relocation when an older upload completes', async () => {
+  vi.useFakeTimers();
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  vi.setSystemTime(new Date(updatedAt));
   let resolveUploaded!: () => void;
   const uploaded = new Promise<void>((resolve) => {
     resolveUploaded = resolve;
   });
-  const first = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}');
-  const second = pendingState('2026-09-07T00:00:01.000Z', '{"pageNum":2}');
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const first = pendingState(updatedAt, '{"pageNum":1}');
   localStorage.setItem(STORAGE_KEY, JSON.stringify(first));
 
-  const saveProgress = vi.fn(async () => uploaded);
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      resolveStarted();
+      return uploaded;
+    })
+    .mockResolvedValue(undefined);
   const flush = flushProgress({ saveProgress } as never);
-  await vi.waitFor(() => expect(saveProgress).toHaveBeenCalledOnce());
+  await started;
 
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(second));
+  await saveLocalProgress(book, 'cfi-b', 'xpath-b', 0.2);
   resolveUploaded();
   await flush;
 
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof second;
-  expect(saved.syncQueue['book-1']).toEqual(second.syncQueue['book-1']);
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof first;
+  expect(saved.syncQueue['book-1']).toMatchObject({
+    payloadJson: expect.stringContaining('"pageNum":20'),
+    revision: 2,
+  });
   expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+  expect(saved.readingState['book-1']?.syncedLocalUpdatedAt).toBeNull();
+
+  await flushProgress({ saveProgress } as never);
+
+  expect(saveProgress).toHaveBeenNthCalledWith(
+    2,
+    expect.objectContaining({ pageNum: 20, bookScrollId: 'xpath-b' }),
+  );
+  const acknowledged = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof first;
+  expect(acknowledged.syncQueue['book-1']).toBeUndefined();
+  expect(acknowledged.readingState['book-1']).toMatchObject({
+    pendingSync: false,
+    syncedLocalUpdatedAt: updatedAt,
+  });
 });
 
 it('continues syncing later items when an earlier item fails', async () => {
@@ -105,6 +162,7 @@ it('continues syncing later items when an earlier item fails', async () => {
     payloadJson: '{"pageNum":2}',
     createdAt: '2026-09-07T00:00:01.000Z',
     updatedAt: '2026-09-07T00:00:01.000Z',
+    revision: 1,
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
