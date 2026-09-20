@@ -44,13 +44,13 @@ Acceptance: delay upload A, save B, complete A, and prove B remains pending and 
 
 ### R2 — Commit local reading state and queue changes together
 
-**P1 · M · confirmed**
+**P1 · M · implemented**
 
-Evidence: [database.ts](src/lib/database/database.ts), `saveLocalProgress`, `markBookCompleted`, and `confirmSync`, issue multiple independent writes. Metadata refresh transactions do not cover these operations. `migrate` commits schema statements separately from the version update.
+Evidence: [database.ts](src/lib/database/database.ts), `saveLocalProgress`, `markBookCompleted`, and `confirmSync` now submit their related reading-state, book-progress, and queue mutations as one serialized native SQLite transaction. Browser preview applies the same changes to one complete localStorage snapshot through a single write. `migrate` keeps each schema change and its version advancement in the same transaction.
 
-Use atomic units for reading state, book progress, and the queue entry; serialize or version rapid relocation writes. Make each migration and its version advancement crash-consistent using the supported SQLite transaction API. Preserve files and reading history on error.
+The native transaction queue serializes concurrent writes, and the existing queue revision guards keep an older acknowledgement or failure from changing a newer relocation. Storage failures leave the previous browser snapshot intact. File-backed SQLite tests inject failures at every progress task boundary, exercise completion and acknowledgement rollback, retry the queue after reopen, and verify interrupted migrations can be retried.
 
-Acceptance: inject failure between every write; reopen the database and verify consistent state and retryability. Test migrations from supported schema versions and interrupted migration recovery. Use actual SQLite integration coverage in addition to mocks that simulate rollback themselves.
+Acceptance: inject failure between every write; reopen the database and verify consistent state and retryability. Test migrations from supported schema versions and interrupted migration recovery. Use actual SQLite integration coverage in addition to mocks that simulate rollback themselves. Covered by the native file-backed failure-injection suite and browser storage-failure tests.
 
 ### R3 — Recover local data without unnecessary loss
 

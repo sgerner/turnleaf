@@ -1,11 +1,18 @@
 import { expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
-import { confirmSync, getSyncStatus, replaceBooksInTransaction, type BookRecord } from './database';
+import {
+  confirmSync,
+  getSyncStatus,
+  replaceBooksInTransaction,
+  saveLocalProgress,
+  type BookRecord,
+} from './database';
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
+  failWrites = false;
 
   get length(): number {
     return this.values.size;
@@ -28,6 +35,7 @@ class MemoryStorage implements Storage {
   }
 
   setItem(key: string, value: string): void {
+    if (this.failWrites) throw new Error('browser storage write failed');
     this.values.set(key, value);
   }
 }
@@ -256,6 +264,109 @@ it('records the uploaded local revision as the acknowledged baseline', async () 
   expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
     readingState: {
       'book-1': {
+        pendingSync: false,
+        syncedLocalUpdatedAt: updatedAt,
+      },
+    },
+    syncQueue: {},
+  });
+});
+
+it('keeps browser progress and its retryable queue row together when storage fails', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const state = {
+    serverConfig: null,
+    books: [existingBook],
+    readingState: {
+      [existingBook.id]: {
+        cfi: 'old-cfi',
+        xpath: '/old',
+        percentage: 0.25,
+        localUpdatedAt: '2026-09-07T00:00:00.000Z',
+        syncedLocalUpdatedAt: null,
+        serverUpdatedAt: null,
+        pendingSync: true,
+      },
+    },
+    syncQueue: {
+      [existingBook.id]: {
+        bookId: existingBook.id,
+        payloadJson: '{"pageNum":25}',
+        attemptCount: 1,
+        lastAttemptAt: '2026-09-07T00:00:01.000Z',
+        lastError: 'offline',
+        createdAt: '2026-09-07T00:00:00.000Z',
+        updatedAt: '2026-09-07T00:00:00.000Z',
+        revision: 1,
+      },
+    },
+    preferences: {},
+  };
+  storage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
+  const before = storage.getItem(BROWSER_STORAGE_KEY);
+
+  storage.failWrites = true;
+  await expect(saveLocalProgress(existingBook, 'new-cfi', '/new', 0.8)).rejects.toThrow(
+    'browser storage write failed',
+  );
+
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBe(before);
+});
+
+it('keeps a browser queue item retryable when acknowledgement storage fails', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  const state = {
+    serverConfig: null,
+    books: [existingBook],
+    readingState: {
+      [existingBook.id]: {
+        cfi: 'cfi',
+        xpath: '/html/body/p[1]',
+        percentage: 0.5,
+        localUpdatedAt: updatedAt,
+        syncedLocalUpdatedAt: null,
+        serverUpdatedAt: null,
+        pendingSync: true,
+      },
+    },
+    syncQueue: {
+      [existingBook.id]: {
+        bookId: existingBook.id,
+        payloadJson: '{"pageNum":50}',
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
+        createdAt: updatedAt,
+        updatedAt,
+        revision: 3,
+      },
+    },
+    preferences: {},
+  };
+  storage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
+  const before = storage.getItem(BROWSER_STORAGE_KEY);
+
+  storage.failWrites = true;
+  await expect(
+    confirmSync(existingBook.id, '2026-09-07T00:00:02.000Z', 3, updatedAt),
+  ).rejects.toThrow('browser storage write failed');
+
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBe(before);
+
+  storage.failWrites = false;
+  await confirmSync(existingBook.id, '2026-09-07T00:00:02.000Z', 3, updatedAt);
+  expect(JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
+    readingState: {
+      [existingBook.id]: {
         pendingSync: false,
         syncedLocalUpdatedAt: updatedAt,
       },
