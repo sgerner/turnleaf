@@ -11,6 +11,7 @@ interface ZipTestEntry {
   name: string;
   data?: Uint8Array;
   declaredSize?: number;
+  flags?: number;
 }
 
 function write16(bytes: Uint8Array, offset: number, value: number): void {
@@ -28,6 +29,7 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     name: new TextEncoder().encode(entry.name),
     data: entry.data ?? new Uint8Array(),
     declaredSize: entry.declaredSize ?? entry.data?.length ?? 0,
+    flags: entry.flags ?? 0,
   }));
   const localSize = normalized.reduce(
     (total, entry) => total + 30 + entry.name.length + entry.data.length,
@@ -41,6 +43,7 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     localOffsets.push(offset);
     write32(archive, offset, 0x04034b50);
     write16(archive, offset + 4, 20);
+    write16(archive, offset + 6, entry.flags);
     write16(archive, offset + 26, entry.name.length);
     offset += 30;
     archive.set(entry.name, offset);
@@ -53,6 +56,7 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     write32(archive, offset, 0x02014b50);
     write16(archive, offset + 4, 20);
     write16(archive, offset + 6, 20);
+    write16(archive, offset + 8, entry.flags);
     write16(archive, offset + 28, entry.name.length);
     write32(archive, offset + 20, entry.data.length);
     write32(archive, offset + 24, entry.declaredSize);
@@ -100,6 +104,34 @@ describe('EPUB container validation', () => {
 
     expect(reads.length).toBe(5);
     expect(Math.max(...reads.map((read) => read.length))).toBeLessThan(archive.length);
+  });
+
+  it('accepts the UTF-8 filename flag used by real Kavita EPUBs', async () => {
+    const archive = makeZip(
+      validEntries().map((entry) => ({
+        ...entry,
+        flags: 0x800,
+      })),
+    );
+
+    await validateEpubArchive(archive.length, async (offset, length) =>
+      archive.slice(offset, offset + length),
+    );
+  });
+
+  it('continues to reject encrypted entries while allowing the UTF-8 flag', async () => {
+    await expectInvalid(
+      makeZip(
+        validEntries().map((entry, index) =>
+          index === 0
+            ? {
+                ...entry,
+                flags: 0x801,
+              }
+            : entry,
+        ),
+      ),
+    );
   });
 
   it('rejects an HTML error body, even when it is larger than the old size check', async () => {
