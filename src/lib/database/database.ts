@@ -48,20 +48,19 @@ interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
   books: BookRecord[];
   readingState: Record<string, StoredReadingState>;
-  syncQueue: Record<
-    string,
-    {
-      bookId: string;
-      payloadJson: string;
-      attemptCount: number;
-      lastAttemptAt: string | null;
-      lastError: string | null;
-      createdAt: string;
-      updatedAt: string;
-      revision: number;
-    }
-  >;
+  syncQueue: Record<string, BrowserSyncQueueRow>;
   preferences: Record<string, string>;
+}
+
+interface BrowserSyncQueueRow {
+  bookId: string;
+  payloadJson: string;
+  attemptCount: number;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  revision: number;
 }
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -138,6 +137,19 @@ function readBrowserState(): BrowserDatabaseState {
 function writeBrowserState(state: BrowserDatabaseState): void {
   if (typeof window === 'undefined') return;
   window.localStorage.setItem(BROWSER_STORAGE_KEY, JSON.stringify(state));
+}
+
+/**
+ * Browser preview commits the complete local snapshot in one storage write.
+ * Keeping the read/modify/write boundary here mirrors a native transaction:
+ * if setItem fails, the previous serialized snapshot remains available for a
+ * retry instead of leaving progress and its queue row out of sync.
+ */
+function updateBrowserState(mutate: (state: BrowserDatabaseState) => boolean | void): boolean {
+  const state = readBrowserState();
+  if (mutate(state) === false) return false;
+  writeBrowserState(state);
+  return true;
 }
 
 export async function openDatabase(): Promise<SQLiteDBConnection> {
@@ -546,43 +558,43 @@ export async function saveLocalProgress(
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    state.readingState[book.id] = {
-      cfi,
-      xpath,
-      percentage,
-      localUpdatedAt: now,
-      syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
-      serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
-      pendingSync: true,
-    };
-    state.syncQueue[book.id] = {
-      bookId: book.id,
-      payloadJson: JSON.stringify({
-        libraryId: book.libraryId,
-        seriesId: book.seriesId,
-        volumeId: book.volumeId,
-        chapterId: book.chapterId,
-        pageNum: pagesRead,
-        bookScrollId: xpath,
-      }),
-      attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
-      lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
-      lastError: state.syncQueue[book.id]?.lastError ?? null,
-      createdAt: state.syncQueue[book.id]?.createdAt ?? now,
-      updatedAt: now,
-      revision: (state.syncQueue[book.id]?.revision ?? 0) + 1,
-    };
-    state.books = state.books.map((item) =>
-      item.id === book.id
-        ? {
-            ...item,
-            pagesRead,
-            lastReadAt: now,
-          }
-        : item,
-    );
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      state.readingState[book.id] = {
+        cfi,
+        xpath,
+        percentage,
+        localUpdatedAt: now,
+        syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
+        serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
+        pendingSync: true,
+      };
+      state.syncQueue[book.id] = {
+        bookId: book.id,
+        payloadJson: JSON.stringify({
+          libraryId: book.libraryId,
+          seriesId: book.seriesId,
+          volumeId: book.volumeId,
+          chapterId: book.chapterId,
+          pageNum: pagesRead,
+          bookScrollId: xpath,
+        }),
+        attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
+        lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
+        lastError: state.syncQueue[book.id]?.lastError ?? null,
+        createdAt: state.syncQueue[book.id]?.createdAt ?? now,
+        updatedAt: now,
+        revision: (state.syncQueue[book.id]?.revision ?? 0) + 1,
+      };
+      state.books = state.books.map((item) =>
+        item.id === book.id
+          ? {
+              ...item,
+              pagesRead,
+              lastReadAt: now,
+            }
+          : item,
+      );
+    });
     return;
   }
   const db = await openDatabase();
@@ -618,36 +630,36 @@ export async function markBookCompleted(
     bookScrollId: readingState?.xpath ?? null,
   };
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    state.books = state.books.map((item) =>
-      item.id === book.id
-        ? {
-            ...item,
-            pagesRead: book.pages,
-            lastReadAt: now,
-          }
-        : item,
-    );
-    if (readingState) {
-      state.readingState[book.id] = {
-        ...readingState,
-        percentage: 1,
-        localUpdatedAt: now,
-        syncedLocalUpdatedAt: readingState.syncedLocalUpdatedAt ?? null,
-        pendingSync: true,
+    updateBrowserState((state) => {
+      state.books = state.books.map((item) =>
+        item.id === book.id
+          ? {
+              ...item,
+              pagesRead: book.pages,
+              lastReadAt: now,
+            }
+          : item,
+      );
+      if (readingState) {
+        state.readingState[book.id] = {
+          ...readingState,
+          percentage: 1,
+          localUpdatedAt: now,
+          syncedLocalUpdatedAt: readingState.syncedLocalUpdatedAt ?? null,
+          pendingSync: true,
+        };
+      }
+      state.syncQueue[book.id] = {
+        bookId: book.id,
+        payloadJson: JSON.stringify(payload),
+        attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
+        lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
+        lastError: state.syncQueue[book.id]?.lastError ?? null,
+        createdAt: state.syncQueue[book.id]?.createdAt ?? now,
+        updatedAt: now,
+        revision: (state.syncQueue[book.id]?.revision ?? 0) + 1,
       };
-    }
-    state.syncQueue[book.id] = {
-      bookId: book.id,
-      payloadJson: JSON.stringify(payload),
-      attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
-      lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
-      lastError: state.syncQueue[book.id]?.lastError ?? null,
-      createdAt: state.syncQueue[book.id]?.createdAt ?? now,
-      updatedAt: now,
-      revision: (state.syncQueue[book.id]?.revision ?? 0) + 1,
-    };
-    writeBrowserState(state);
+    });
     return;
   }
   const db = await openDatabase();
@@ -735,23 +747,23 @@ export async function confirmSync(
   expectedUpdatedAt: string,
 ): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    if (
-      state.syncQueue[bookId]?.revision !== expectedRevision ||
-      state.syncQueue[bookId]?.updatedAt !== expectedUpdatedAt
-    ) {
-      return;
-    }
-    delete state.syncQueue[bookId];
-    if (state.readingState[bookId]) {
-      state.readingState[bookId] = {
-        ...state.readingState[bookId],
-        pendingSync: false,
-        syncedLocalUpdatedAt: expectedUpdatedAt,
-        serverUpdatedAt,
-      };
-    }
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      if (
+        state.syncQueue[bookId]?.revision !== expectedRevision ||
+        state.syncQueue[bookId]?.updatedAt !== expectedUpdatedAt
+      ) {
+        return false;
+      }
+      delete state.syncQueue[bookId];
+      if (state.readingState[bookId]) {
+        state.readingState[bookId] = {
+          ...state.readingState[bookId],
+          pendingSync: false,
+          syncedLocalUpdatedAt: expectedUpdatedAt,
+          serverUpdatedAt,
+        };
+      }
+    });
     return;
   }
   const db = await openDatabase();
@@ -784,14 +796,13 @@ export async function markSyncFailure(
   expectedUpdatedAt: string,
 ): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    const row = state.syncQueue[bookId];
-    if (row?.revision === expectedRevision && row.updatedAt === expectedUpdatedAt) {
+    updateBrowserState((state) => {
+      const row = state.syncQueue[bookId];
+      if (row?.revision !== expectedRevision || row.updatedAt !== expectedUpdatedAt) return false;
       row.attemptCount += 1;
       row.lastAttemptAt = new Date().toISOString();
       row.lastError = error.slice(0, 240);
-      writeBrowserState(state);
-    }
+    });
     return;
   }
   const db = await openDatabase();
