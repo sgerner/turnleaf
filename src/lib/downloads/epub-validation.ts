@@ -1,6 +1,7 @@
 const ZIP_END_OF_CENTRAL_DIRECTORY = 0x06054b50;
 const ZIP_CENTRAL_DIRECTORY_ENTRY = 0x02014b50;
 const ZIP_LOCAL_FILE_HEADER = 0x04034b50;
+const ZIP_ENCRYPTION_FLAGS = 0x1 | 0x40;
 const ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH = 22;
 const ZIP_MAX_COMMENT_LENGTH = 0xffff;
 
@@ -122,7 +123,7 @@ function parseCentralDirectory(
     if (diskNumber !== 0 || compressedSize === 0xffffffff || uncompressedSize === 0xffffffff) {
       throw new EpubValidationError('The EPUB uses an unsupported ZIP layout.');
     }
-    if (flags & 0x1 || flags & 0x40 || (compressionMethod !== 0 && compressionMethod !== 8)) {
+    if (flags & ZIP_ENCRYPTION_FLAGS || (compressionMethod !== 0 && compressionMethod !== 8)) {
       throw new EpubValidationError('The EPUB uses an unsupported or encrypted ZIP entry.');
     }
 
@@ -168,7 +169,7 @@ function validateMimetypeEntry(head: Uint8Array, entry: EpubArchiveEntry): void 
     entry.name !== 'mimetype' ||
     entry.localHeaderOffset !== 0 ||
     entry.compressionMethod !== 0 ||
-    entry.flags !== 0 ||
+    entry.flags & ZIP_ENCRYPTION_FLAGS ||
     entry.compressedSize !== 20 ||
     entry.uncompressedSize !== 20
   ) {
@@ -183,7 +184,12 @@ function validateMimetypeEntry(head: Uint8Array, entry: EpubArchiveEntry): void 
   const nameLength = readUint16(head, 26);
   const extraLength = readUint16(head, 28);
   const dataOffset = 30 + nameLength + extraLength;
-  if (flags !== 0 || compressionMethod !== 0 || nameLength !== 8 || extraLength !== 0) {
+  if (
+    flags & ZIP_ENCRYPTION_FLAGS ||
+    compressionMethod !== 0 ||
+    nameLength !== 8 ||
+    extraLength !== 0
+  ) {
     throw new EpubValidationError('The EPUB mimetype local header is malformed.');
   }
   if (dataOffset + 20 > head.length) {
