@@ -33,7 +33,7 @@ function mapChapterToBook(
   series: KavitaSeries,
   chapter: KavitaChapter,
 ): BookRecord {
-  const file = chapter.files.find((item) => item.extension.toLowerCase() === '.epub');
+  const file = chapter.files.find(isEpubFile);
   if (!file) throw new Error('An EPUB chapter did not include an EPUB file.');
   return {
     id: `${serverId}:${series.id}:${chapter.id}`,
@@ -42,9 +42,10 @@ function mapChapterToBook(
     seriesId: series.id,
     volumeId: chapter.volumeId,
     chapterId: chapter.id,
-    title: chapter.titleName || chapter.title || series.name,
+    title: chapter.titleName || chapter.title || series.name || `Book ${chapter.id}`,
     author: chapter.writers.map((writer) => writer.name).join(', ') || null,
-    series: chapter.titleName && chapter.titleName !== series.name ? series.name : null,
+    series:
+      chapter.titleName && series.name && chapter.titleName !== series.name ? series.name : null,
     descriptionHtml: chapter.summary || null,
     format: 'epub',
     pages: chapter.pages || series.pages,
@@ -65,6 +66,11 @@ function lastReadAt(chapter: KavitaChapter, series: KavitaSeries): string | null
 
 function isEpubChapter(chapter: KavitaChapter): boolean {
   return (
-    chapter.format === 3 && chapter.files.some((file) => file.extension.toLowerCase() === '.epub')
+    (chapter.format === undefined || chapter.format === null || chapter.format === 3) &&
+    chapter.files.some(isEpubFile)
   );
+}
+
+function isEpubFile(file: KavitaChapter['files'][number]): boolean {
+  return file.format === 3 || file.extension?.toLowerCase() === '.epub';
 }

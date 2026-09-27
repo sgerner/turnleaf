@@ -221,3 +221,44 @@ it('falls back to aggregate progress only when chapter progress is absent', () =
     lastReadAt: '2026-09-06T10:00:00',
   });
 });
+
+it('maps EPUBs when Kavita omits optional names, covers, or file extensions', () => {
+  const series = {
+    id: 14,
+    name: null,
+    libraryId: 1,
+    format: 3,
+    pages: 20,
+    pagesRead: 0,
+    created: '2026-09-05',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: null,
+  } satisfies KavitaSeries;
+  const chapter = {
+    id: 140,
+    title: '',
+    titleName: '',
+    volumeId: 14,
+    pages: 20,
+    pagesRead: 0,
+    summary: '',
+    format: null,
+    files: [{ id: 140, bytes: 1000, extension: null, format: 3 }],
+    writers: [],
+  };
+  const detail = {
+    chapters: [chapter],
+    specials: [],
+    volumes: [],
+    storylineChapters: [],
+  } satisfies KavitaSeriesDetail;
+
+  expect(mapSeriesToBooks('primary', series, detail)).toMatchObject([
+    {
+      chapterId: 140,
+      title: 'Book 140',
+      series: null,
+      fileSize: 1000,
+    },
+  ]);
+});

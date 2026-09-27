@@ -1,9 +1,12 @@
 import { beforeEach, expect, it, vi } from 'vitest';
+import { CapacitorHttp } from '@capacitor/core';
 import { KavitaClient } from './client';
+
+const capacitorRuntime = vi.hoisted(() => ({ native: false }));
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
-    isNativePlatform: () => false,
+    isNativePlatform: () => capacitorRuntime.native,
     convertFileSrc: (value: string) => value,
   },
   CapacitorHttp: {
@@ -13,6 +16,9 @@ vi.mock('@capacitor/core', () => ({
 }));
 
 beforeEach(() => {
+  capacitorRuntime.native = false;
+  vi.mocked(CapacitorHttp.get).mockReset();
+  vi.mocked(CapacitorHttp.request).mockReset();
   const fetchMock = vi.fn(async () => ({
     ok: true,
     status: 200,
@@ -43,7 +49,7 @@ it('loads covers with the api key header', async () => {
   expect(fetch).toHaveBeenCalledWith(
     'https://books.example.com/api/Image/series-cover?seriesId=4',
     expect.objectContaining({
-      redirect: 'error',
+      redirect: 'manual',
       headers: expect.objectContaining({
         'x-api-key': 'abc123',
       }),
@@ -61,11 +67,166 @@ it('requests the Kavita series list with POST', async () => {
     'https://books.example.com/api/Series/v2?PageNumber=1&PageSize=500',
     expect.objectContaining({
       method: 'POST',
-      redirect: 'error',
+      redirect: 'manual',
       headers: expect.objectContaining({
         'x-api-key': 'abc123',
       }),
     }),
+  );
+});
+
+it('follows same-origin GET redirects', async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: false,
+      status: 302,
+      type: 'basic',
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === 'location' ? '/api/Series/series-detail/?seriesId=4' : null,
+      },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      type: 'basic',
+      headers: { get: () => null },
+      json: async () => ({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await new KavitaClient('https://books.example.com', 'abc123').getSeriesDetail(4);
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+    redirect: 'manual',
+    headers: { 'x-api-key': 'abc123' },
+  });
+  expect(fetchMock.mock.calls[1]?.[0]).toBe(
+    'https://books.example.com/api/Series/series-detail/?seriesId=4',
+  );
+  expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+    headers: { 'x-api-key': 'abc123' },
+  });
+});
+
+it('follows same-origin POST redirects only when they preserve the method', async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: false,
+      status: 307,
+      type: 'basic',
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === 'location' ? '/api/Series/v2/?PageNumber=1&PageSize=500' : null,
+      },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      type: 'basic',
+      headers: { get: () => null },
+      json: async () => [],
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'x-api-key': 'abc123' },
+  });
+});
+
+it('rejects cross-origin redirects before sending the auth key to the new origin', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 307,
+    type: 'basic',
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'location' ? 'https://other.example.com/api/Series/v2' : null,
+    },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toThrow('Kavita redirected to a different server');
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it('rejects POST redirects that would change the request method', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 302,
+    type: 'basic',
+    headers: {
+      get: (name: string) => (name.toLowerCase() === 'location' ? '/api/Series/v2/' : null),
+    },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toThrow('redirected a POST request');
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it('explains browser redirects whose destination cannot be inspected safely', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 0,
+    type: 'opaqueredirect',
+    headers: { get: () => null },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toThrow('browser could not safely verify the destination');
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it('follows native same-origin redirects with redirects disabled on each request', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request)
+    .mockResolvedValueOnce({
+      status: 307,
+      headers: { Location: '/api/Series/v2/?PageNumber=1&PageSize=500' },
+      data: '',
+      url: '',
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      data: '[]',
+      url: '',
+    });
+
+  await new KavitaClient('https://books.example.com/kavita', 'abc123').getBookSeries();
+
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(CapacitorHttp.request).mock.calls[0]?.[0]).toMatchObject({
+    url: 'https://books.example.com/kavita/api/Series/v2?PageNumber=1&PageSize=500',
+    disableRedirects: true,
+    headers: { 'x-api-key': 'abc123' },
+  });
+  expect(vi.mocked(CapacitorHttp.request).mock.calls[1]?.[0]).toMatchObject({
+    url: 'https://books.example.com/api/Series/v2/?PageNumber=1&PageSize=500',
+    disableRedirects: true,
+  });
+});
+
+it('preserves a Kavita base path in URLs used for covers and downloads', () => {
+  const client = new KavitaClient('https://books.example.com/kavita/', 'abc123');
+
+  expect(client.coverUrl(4)).toBe(
+    'https://books.example.com/kavita/api/Image/series-cover?seriesId=4',
+  );
+  expect(client.downloadUrl(42)).toBe(
+    'https://books.example.com/kavita/api/Download/chapter?chapterId=42',
   );
 });
 
@@ -120,6 +281,87 @@ it('rejects malformed series payloads at the response boundary', async () => {
   ).rejects.toMatchObject({
     kind: 'invalid-response',
   });
+});
+
+it('accepts nullable optional series metadata without relaxing required series data', async () => {
+  const payload = [
+    {
+      id: 1,
+      name: null,
+      libraryId: 1,
+      format: 3,
+      pages: 12,
+      pagesRead: 0,
+      created: '2026-09-01',
+      latestReadDate: '0001-01-01T00:00:00',
+      coverImage: null,
+    },
+  ];
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => payload,
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).resolves.toEqual(payload);
+});
+
+it('still rejects a series missing required progress data', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => [
+      {
+        id: 1,
+        name: null,
+        libraryId: 1,
+        format: 3,
+        pages: 12,
+        created: '2026-09-01',
+        latestReadDate: '0001-01-01T00:00:00',
+      },
+    ],
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({ kind: 'invalid-response' });
+});
+
+it('accepts Kavita chapter fields that its DTO defines as nullable', async () => {
+  const detail = {
+    chapters: [
+      {
+        id: 5,
+        title: 'Chapter',
+        titleName: 'Chapter',
+        volumeId: 4,
+        pages: 10,
+        pagesRead: 0,
+        summary: '',
+        format: null,
+        files: [{ id: 5, bytes: 1000, extension: null, format: 3 }],
+        writers: [],
+      },
+    ],
+    specials: [],
+    volumes: [],
+    storylineChapters: [],
+  };
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => detail,
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getSeriesDetail(4),
+  ).resolves.toEqual(detail);
 });
 
 it('rejects a repeated series across pagination pages', async () => {

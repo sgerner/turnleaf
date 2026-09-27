@@ -34,7 +34,7 @@
     loadCoversWithConcurrency,
     type CoverLoadItem,
   } from '../downloads/cover-loader';
-  import { KavitaClient } from '../kavita/client';
+  import { KavitaClient, KavitaError } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
@@ -105,6 +105,7 @@
   });
   let books = $state<BookRecord[]>([]);
   let query = $state('');
+  let offlineMessage = $state('Offline. Saved books remain available.');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
   let normalizedQuery = $derived(query.trim().toLowerCase());
@@ -437,6 +438,11 @@
     void loadCovers(books);
     loading = false;
     offline = !(await Network.getStatus()).connected;
+    offlineMessage = offline
+      ? books.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.'
+      : '';
     if (destroyed) return;
     if (!offline) await refresh();
     if (destroyed) return;
@@ -445,6 +451,11 @@
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
           offline = !connected;
+          offlineMessage = connected
+            ? ''
+            : books.length
+              ? 'No network connection. Showing your saved library.'
+              : 'No network connection. Connect to Kavita to load your library.';
           if (connected)
             void syncProgress(false)
               .then(refresh)
@@ -554,11 +565,28 @@
       retainCoversFor(books);
       void loadCovers(books);
       offline = false;
-    } catch {
+      offlineMessage = '';
+    } catch (cause) {
       offline = true;
-      message = books.length
-        ? 'Kavita is unavailable. Showing your saved library.'
-        : 'Kavita could not be reached.';
+      const savedBooks = books.length
+        ? 'Showing your saved library.'
+        : 'No saved books are available yet.';
+      if (cause instanceof KavitaError) {
+        switch (cause.kind) {
+          case 'authentication':
+            offlineMessage = `Kavita rejected the saved auth key. Update it in Settings. ${savedBooks}`;
+            break;
+          case 'invalid-response':
+            offlineMessage = `Kavita returned data Turnleaf could not read. Check the Kavita version and server logs. ${savedBooks}`;
+            break;
+          case 'network':
+          case 'server':
+            offlineMessage = `${cause.message} ${savedBooks}`;
+            break;
+        }
+      } else {
+        offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
+      }
     } finally {
       refreshing = false;
     }
@@ -1292,7 +1320,7 @@
 
     {#if offline}
       <div class="alert preset-tonal-warning mt-5" role="status" transition:fade>
-        Offline. Saved books remain available.
+        {offlineMessage}
       </div>
     {/if}
     {#if message}

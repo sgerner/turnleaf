@@ -1,4 +1,4 @@
-import { Capacitor, CapacitorHttp, type HttpOptions } from '@capacitor/core';
+import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
 import type {
   ConnectedServer,
   KavitaLibrary,
@@ -21,6 +21,8 @@ const BROWSER_PROXY_PREFIX = '/__kavita__/';
 const SERIES_PAGE_SIZE = 500;
 const MAX_SERIES_RESULTS = 100_000;
 const MAX_SERIES_PAGES = MAX_SERIES_RESULTS / SERIES_PAGE_SIZE + 1;
+const MAX_REDIRECTS = 5;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export class KavitaError extends Error {
   constructor(
@@ -29,6 +31,86 @@ export class KavitaError extends Error {
     readonly status?: number,
   ) {
     super(message);
+  }
+}
+
+function redirectTarget(
+  status: number,
+  location: string | null,
+  currentUrl: string,
+  serverOrigin: string,
+  method: string,
+  opaqueRedirect = false,
+): string | null {
+  if (opaqueRedirect) {
+    throw new KavitaError(
+      'Kavita redirected, but the browser could not safely verify the destination. Update the saved address to Kavita’s final address.',
+      'server',
+    );
+  }
+  if (status >= 300 && status < 400 && !REDIRECT_STATUSES.has(status)) {
+    throw new KavitaError(
+      'Kavita returned a redirect type Turnleaf cannot follow. Update the saved address to the final API address.',
+      'server',
+      status,
+    );
+  }
+  if (!REDIRECT_STATUSES.has(status)) return null;
+  if (!location) {
+    throw new KavitaError('Kavita redirected without a destination address.', 'server', status);
+  }
+
+  let destination: URL;
+  try {
+    destination = new URL(location, currentUrl);
+  } catch {
+    throw new KavitaError('Kavita returned an invalid redirect address.', 'server', status);
+  }
+
+  const hasSensitiveQuery = [...destination.searchParams.keys()].some((key) =>
+    /^(?:api[_-]?key|x-api-key|authorization|auth|(?:access|refresh)[_-]?token|token|password|secret)$/i.test(
+      key,
+    ),
+  );
+  if (
+    (destination.protocol !== 'http:' && destination.protocol !== 'https:') ||
+    destination.origin !== serverOrigin ||
+    destination.username ||
+    destination.password ||
+    hasSensitiveQuery
+  ) {
+    const current = new URL(currentUrl);
+    const message =
+      current.protocol === 'http:' && destination.protocol === 'https:'
+        ? 'Kavita redirected from HTTP to HTTPS. Update the saved address to its final HTTPS address.'
+        : 'Kavita redirected to a different server. Update the saved address to its final address.';
+    throw new KavitaError(message, 'server', status);
+  }
+
+  if (!['GET', 'HEAD'].includes(method.toUpperCase()) && [301, 302, 303].includes(status)) {
+    throw new KavitaError(
+      'Kavita redirected a POST request with a status that changes its method. Update the saved address to the final API address.',
+      'server',
+      status,
+    );
+  }
+
+  return destination.toString();
+}
+
+function nativeHeader(headers: Record<string, string>, name: string): string | null {
+  return (
+    Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1] ?? null
+  );
+}
+
+function assertRedirectLimit(count: number, status: number): void {
+  if (count > MAX_REDIRECTS) {
+    throw new KavitaError(
+      'Kavita redirected too many times. Check the saved server address.',
+      'server',
+      status,
+    );
   }
 }
 
@@ -122,14 +204,7 @@ export class KavitaClient {
     const url = this.coverUrl(seriesId);
     if (Capacitor.isNativePlatform()) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      const response = await CapacitorHttp.get({
-        url,
-        headers: { 'x-api-key': this.apiKey },
-        responseType: 'blob',
-        disableRedirects: true,
-        connectTimeout: REQUEST_TIMEOUT_MS,
-        readTimeout: REQUEST_TIMEOUT_MS,
-      });
+      const response = await this.nativeGetWithRedirects(url, signal);
       this.assertStatus(response.status);
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (typeof response.data !== 'string') {
@@ -151,12 +226,11 @@ export class KavitaClient {
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
     try {
       const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
-      const response = await fetch(url, {
+      const response = await this.browserFetchWithRedirects(url, {
         signal: combined,
-        redirect: 'error',
         headers: { 'x-api-key': this.apiKey },
       });
-      if (!response.ok) throw new KavitaError('The book cover could not be loaded.', 'server');
+      this.assertStatus(response.status);
       return await response.blob();
     } finally {
       window.clearTimeout(timer);
@@ -204,10 +278,9 @@ export class KavitaClient {
     const signal = init.signal ? AbortSignal.any([init.signal, timeout.signal]) : timeout.signal;
 
     try {
-      const response = await fetch(this.resolveUrl(path), {
+      const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
         ...init,
         signal,
-        redirect: 'error',
         headers: {
           Accept: 'application/json',
           'Content-Type': 'application/json',
@@ -249,7 +322,7 @@ export class KavitaClient {
     if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const method = init.method ?? 'GET';
     const options: HttpOptions = {
-      url: `${this.baseUrl}${path}`,
+      url: this.resolveUrl(path),
       method,
       headers: {
         Accept: 'application/json',
@@ -262,7 +335,32 @@ export class KavitaClient {
     };
     if (typeof init.body === 'string') options.data = JSON.parse(init.body) as unknown;
     try {
-      const response = await CapacitorHttp.request(options);
+      let currentUrl = options.url;
+      const visited = new Set([currentUrl]);
+      let redirectCount = 0;
+      let response: HttpResponse;
+      while (true) {
+        response = await CapacitorHttp.request({ ...options, url: currentUrl });
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const nextUrl = redirectTarget(
+          response.status,
+          nativeHeader(response.headers, 'location'),
+          currentUrl,
+          new URL(this.baseUrl).origin,
+          method,
+        );
+        if (!nextUrl) break;
+        assertRedirectLimit(++redirectCount, response.status);
+        if (visited.has(nextUrl)) {
+          throw new KavitaError(
+            'Kavita redirected in a loop. Check the saved server address.',
+            'server',
+            response.status,
+          );
+        }
+        visited.add(nextUrl);
+        currentUrl = nextUrl;
+      }
       this.assertStatus(response.status);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (typeof response.data === 'string') {
@@ -283,6 +381,72 @@ export class KavitaClient {
     }
   }
 
+  private async nativeGetWithRedirects(url: string, signal?: AbortSignal): Promise<HttpResponse> {
+    let currentUrl = url;
+    const visited = new Set([currentUrl]);
+    let redirectCount = 0;
+    while (true) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const response = await CapacitorHttp.get({
+        url: currentUrl,
+        headers: { 'x-api-key': this.apiKey },
+        responseType: 'blob',
+        disableRedirects: true,
+        connectTimeout: REQUEST_TIMEOUT_MS,
+        readTimeout: REQUEST_TIMEOUT_MS,
+      });
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const nextUrl = redirectTarget(
+        response.status,
+        nativeHeader(response.headers, 'location'),
+        currentUrl,
+        new URL(this.baseUrl).origin,
+        'GET',
+      );
+      if (!nextUrl) return response;
+      assertRedirectLimit(++redirectCount, response.status);
+      if (visited.has(nextUrl)) {
+        throw new KavitaError(
+          'Kavita redirected in a loop. Check the saved server address.',
+          'server',
+          response.status,
+        );
+      }
+      visited.add(nextUrl);
+      currentUrl = nextUrl;
+    }
+  }
+
+  private async browserFetchWithRedirects(url: string, init: RequestInit): Promise<Response> {
+    const method = init.method ?? 'GET';
+    const serverOrigin = new URL(this.baseUrl).origin;
+    let currentUrl = url;
+    const visited = new Set([currentUrl]);
+    let redirectCount = 0;
+    while (true) {
+      const response = await fetch(currentUrl, { ...init, redirect: 'manual' });
+      const nextUrl = redirectTarget(
+        response.status,
+        response.headers.get('location'),
+        currentUrl,
+        serverOrigin,
+        method,
+        response.type === 'opaqueredirect',
+      );
+      if (!nextUrl) return response;
+      assertRedirectLimit(++redirectCount, response.status);
+      if (visited.has(nextUrl)) {
+        throw new KavitaError(
+          'Kavita redirected in a loop. Check the saved server address.',
+          'server',
+          response.status,
+        );
+      }
+      visited.add(nextUrl);
+      currentUrl = nextUrl;
+    }
+  }
+
   private assertStatus(status: number): void {
     if (status === 401 || status === 403) {
       throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
@@ -293,7 +457,8 @@ export class KavitaClient {
   }
 
   private resolveUrl(path: string): string {
-    const absolute = new URL(path, this.baseUrl).toString();
+    const baseUrl = this.baseUrl.replace(/\/+$/, '') + '/';
+    const absolute = new URL(path.replace(/^\/+/, ''), baseUrl).toString();
     if (
       !Capacitor.isNativePlatform() &&
       import.meta.env.DEV &&

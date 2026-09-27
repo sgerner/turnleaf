@@ -97,7 +97,36 @@ describe('development proxy request boundaries', () => {
     await expect(readProxyBody(request('GET', ['ignored']), 1)).resolves.toBeUndefined();
   });
 
-  it('converts redirects, timeouts, and upstream failures into safe proxy errors', async () => {
+  it('follows same-origin redirects and rejects redirects that are unsafe to follow', async () => {
+    const requestedUrls: string[] = [];
+    const redirected = await fetchProxyTarget(
+      new URL('http://localhost:5000/kavita/api/Series/v2'),
+      {
+        method: 'POST',
+        headers: new Headers({ 'x-api-key': 'kavita-key' }),
+        body: Buffer.from('{}'),
+      },
+      {
+        fetchImpl: async (input, init) => {
+          requestedUrls.push(String(input));
+          expect(init?.method).toBe('POST');
+          expect(init?.headers).toBeInstanceOf(Headers);
+          if (requestedUrls.length === 1) {
+            return new Response(null, {
+              status: 307,
+              headers: { location: '/kavita/api/Series/v2/' },
+            });
+          }
+          return new Response('[]', { status: 200 });
+        },
+      },
+    );
+    expect(await redirected.text()).toBe('[]');
+    expect(requestedUrls).toEqual([
+      'http://localhost:5000/kavita/api/Series/v2',
+      'http://localhost:5000/kavita/api/Series/v2/',
+    ]);
+
     await expect(
       fetchProxyTarget(
         new URL('http://localhost:5000'),
@@ -110,8 +139,26 @@ describe('development proxy request boundaries', () => {
             new Response(null, { status: 302, headers: { location: 'https://evil.example' } }),
         },
       ),
-    ).rejects.toMatchObject({ statusCode: 502 });
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: expect.stringContaining('redirected to a different server'),
+    });
 
+    await expect(
+      fetchProxyTarget(
+        new URL('http://localhost:5000'),
+        { method: 'POST', body: Buffer.from('{}') },
+        {
+          fetchImpl: async () => new Response(null, { status: 302, headers: { location: '/' } }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: expect.stringContaining('changes its method'),
+    });
+  });
+
+  it('converts upstream timeouts and failures into safe proxy errors', async () => {
     await expect(
       fetchProxyTarget(
         new URL('http://localhost:5000'),

@@ -5,6 +5,8 @@ export const DEV_PROXY_PREFIX = '/__kavita__/';
 export const DEV_PROXY_ORIGINS_ENV = 'TURNLEAF_DEV_PROXY_ORIGINS';
 export const MAX_PROXY_BODY_BYTES = 1024 * 1024;
 export const PROXY_TIMEOUT_MS = 12_000;
+const MAX_PROXY_REDIRECTS = 5;
+const PROXY_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 const ALLOWED_REQUEST_HEADERS = new Set(['accept', 'content-type', 'x-api-key']);
 const BLOCKED_RESPONSE_HEADERS = new Set([
@@ -151,15 +153,59 @@ export async function fetchProxyTarget(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetchImpl(target, {
-      ...init,
-      redirect: 'manual',
-      signal: controller.signal,
-    });
-    if (response.status >= 300 && response.status < 400) {
-      throw new DevProxyError(502, 'The Kavita development proxy does not follow redirects.');
+    let currentTarget = target;
+    let redirectCount = 0;
+    const method = (init.method ?? 'GET').toUpperCase();
+    while (true) {
+      const response = await fetchImpl(currentTarget, {
+        ...init,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if (
+        response.status >= 300 &&
+        response.status < 400 &&
+        !PROXY_REDIRECT_STATUSES.has(response.status)
+      ) {
+        throw new DevProxyError(
+          502,
+          'Kavita returned a redirect type the development proxy cannot follow.',
+        );
+      }
+      if (!PROXY_REDIRECT_STATUSES.has(response.status)) return response;
+
+      const location = response.headers.get('location');
+      if (!location) {
+        throw new DevProxyError(502, 'Kavita redirected without a destination address.');
+      }
+      let destination: URL;
+      try {
+        destination = new URL(location, currentTarget);
+      } catch {
+        throw new DevProxyError(502, 'Kavita returned an invalid redirect address.');
+      }
+      if (
+        (destination.protocol !== 'http:' && destination.protocol !== 'https:') ||
+        destination.origin !== target.origin ||
+        destination.username ||
+        destination.password
+      ) {
+        throw new DevProxyError(
+          502,
+          'Kavita redirected to a different server. Update the saved address to Kavita’s final address.',
+        );
+      }
+      if (!['GET', 'HEAD'].includes(method) && [301, 302, 303].includes(response.status)) {
+        throw new DevProxyError(
+          502,
+          'Kavita redirected a POST request with a status that changes its method. Update the saved address to the final API address.',
+        );
+      }
+      if (++redirectCount > MAX_PROXY_REDIRECTS) {
+        throw new DevProxyError(502, 'Kavita redirected too many times. Check the saved address.');
+      }
+      currentTarget = destination;
     }
-    return response;
   } catch (error) {
     if (error instanceof DevProxyError) throw error;
     if (controller.signal.aborted) {

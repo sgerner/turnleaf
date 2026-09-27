@@ -25,7 +25,7 @@ export function isKavitaLibrary(value: unknown): value is KavitaLibrary {
   return (
     isRecord(value) &&
     isInteger(value.id) &&
-    (value.name === null || isString(value.name)) &&
+    (value.name === undefined || value.name === null || isString(value.name)) &&
     isInteger(value.type)
   );
 }
@@ -34,14 +34,14 @@ export function isKavitaSeries(value: unknown): value is KavitaSeries {
   return (
     isRecord(value) &&
     isInteger(value.id) &&
-    isString(value.name) &&
+    (value.name === undefined || value.name === null || isString(value.name)) &&
     isInteger(value.libraryId) &&
     isInteger(value.format) &&
     isInteger(value.pages) &&
     isInteger(value.pagesRead) &&
     isString(value.created) &&
     isString(value.latestReadDate) &&
-    isString(value.coverImage)
+    (value.coverImage === undefined || value.coverImage === null || isString(value.coverImage))
   );
 }
 
@@ -50,7 +50,7 @@ export function isKavitaFile(value: unknown): value is KavitaFile {
     isRecord(value) &&
     isInteger(value.id) &&
     isInteger(value.bytes) &&
-    isString(value.extension) &&
+    (value.extension === undefined || value.extension === null || isString(value.extension)) &&
     isInteger(value.format)
   );
 }
@@ -69,7 +69,7 @@ export function isKavitaChapter(value: unknown): value is KavitaChapter {
     isInteger(value.pages) &&
     (value.pagesRead === undefined || isInteger(value.pagesRead)) &&
     isString(value.summary) &&
-    isInteger(value.format) &&
+    (value.format === undefined || value.format === null || isInteger(value.format)) &&
     Array.isArray(value.files) &&
     value.files.every(isKavitaFile) &&
     Array.isArray(value.writers) &&

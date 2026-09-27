@@ -1,6 +1,6 @@
 export interface KavitaLibrary {
   id: number;
-  name: string | null;
+  name?: string | null;
   type: number;
 }
 
@@ -28,14 +28,14 @@ export interface ConnectedServer {
 
 export interface KavitaSeries {
   id: number;
-  name: string;
+  name?: string | null;
   libraryId: number;
   format: number;
   pages: number;
   pagesRead: number;
   created: string;
   latestReadDate: string;
-  coverImage: string;
+  coverImage?: string | null;
 }
 
 export interface KavitaPerson {
@@ -45,7 +45,7 @@ export interface KavitaPerson {
 export interface KavitaFile {
   id: number;
   bytes: number;
-  extension: string;
+  extension?: string | null;
   format: number;
 }
 
@@ -57,7 +57,7 @@ export interface KavitaChapter {
   pages: number;
   pagesRead?: number;
   summary: string;
-  format: number;
+  format?: number | null;
   files: KavitaFile[];
   writers: KavitaPerson[];
   lastReadingProgressUtc?: string | null;
