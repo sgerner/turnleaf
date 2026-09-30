@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
 import { KavitaClient } from './client';
+import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 
 const capacitorRuntime = vi.hoisted(() => ({ native: false }));
 
@@ -16,6 +17,7 @@ vi.mock('@capacitor/core', () => ({
 }));
 
 beforeEach(() => {
+  clearDiagnostics();
   capacitorRuntime.native = false;
   vi.mocked(CapacitorHttp.get).mockReset();
   vi.mocked(CapacitorHttp.request).mockReset();
@@ -309,7 +311,7 @@ it('accepts nullable optional series metadata without relaxing required series d
   ).resolves.toEqual(payload);
 });
 
-it('still rejects a series missing required progress data', async () => {
+it('keeps missing series progress unknown instead of rejecting the library or inventing zero', async () => {
   vi.mocked(fetch).mockResolvedValueOnce({
     ok: true,
     status: 200,
@@ -327,9 +329,9 @@ it('still rejects a series missing required progress data', async () => {
     ],
   } as unknown as Response);
 
-  await expect(
-    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
-  ).rejects.toMatchObject({ kind: 'invalid-response' });
+  const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+  expect(series).toHaveLength(1);
+  expect(series[0]?.pagesRead).toBeUndefined();
 });
 
 it('accepts Kavita chapter fields that its DTO defines as nullable', async () => {
@@ -361,7 +363,10 @@ it('accepts Kavita chapter fields that its DTO defines as nullable', async () =>
 
   await expect(
     new KavitaClient('https://books.example.com', 'abc123').getSeriesDetail(4),
-  ).resolves.toEqual(detail);
+  ).resolves.toMatchObject({
+    ...detail,
+    chapters: [{ ...detail.chapters[0], format: 3, lastReadingProgressUtc: null }],
+  });
 });
 
 it('rejects a repeated series across pagination pages', async () => {
@@ -432,7 +437,7 @@ it('rejects malformed library elements without inventing a server connection', a
     ok: true,
     status: 200,
     headers: { get: () => null },
-    json: async () => [{ id: 1, name: 'Books', type: '2' }],
+    json: async () => [{ id: 'not-an-id', name: 'Books', type: '2' }],
   } as unknown as Response);
 
   await expect(
@@ -447,7 +452,7 @@ it('rejects malformed series details before callers map them', async () => {
     ok: true,
     status: 200,
     headers: { get: () => null },
-    json: async () => ({ chapters: [] }),
+    json: async () => ({ chapters: [], volumes: 'not-an-array' }),
   } as unknown as Response);
 
   await expect(
@@ -498,4 +503,82 @@ it('retries a failed progress read once', async () => {
 
   expect(progress.pageNum).toBe(9);
   expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+it('normalizes native HTTP JSON strings and exposes field diagnostics without server secrets', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {},
+    url: '',
+    data: JSON.stringify([
+      {
+        id: '12',
+        libraryId: '1',
+        format: 3,
+        name: null,
+        pages: null,
+        pagesRead: null,
+        latestReadDate: null,
+      },
+    ]),
+  });
+  const client = new KavitaClient('http://private.example:5000', 'private-api-key');
+  await expect(client.getBookSeries()).resolves.toMatchObject([{ id: 12, pages: 0 }]);
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {},
+    url: '',
+    data: JSON.stringify({
+      chapters: [
+        { id: 'secret-book-title', volumeId: 1, format: 3, files: [{ id: 4, format: 3 }] },
+      ],
+    }),
+  });
+  await expect(client.getSeriesDetail(12)).rejects.toThrow(
+    '$.chapters[0].id: expected integer, received string',
+  );
+  const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+  expect(log).toContain('status=200');
+  expect(log).toContain('path=series[12].chapters[0].id');
+  expect(log).toContain('actual=string');
+  expect(log).not.toContain('private.example');
+  expect(log).not.toContain('private-api-key');
+  expect(log).not.toContain('secret-book-title');
+});
+
+it('uses the raw page length to continue pagination after excluding unrelated media', async () => {
+  const mixed: Record<string, unknown>[] = Array.from({ length: 499 }, () => ({ format: 0 }));
+  mixed.push({ id: 1, libraryId: 1, format: 3 });
+  vi.mocked(fetch)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => mixed,
+    } as unknown as Response)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [{ id: 2, libraryId: 1, format: 3 }],
+    } as unknown as Response);
+  const series = await new KavitaClient('http://books.example', 'key').getBookSeries();
+  expect(series.map((item) => item.id)).toEqual([1, 2]);
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+it('rejects duplicate EPUB IDs within a single page before reconciliation', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    json: async () => [
+      { id: 1, libraryId: 1, format: 3 },
+      { id: 1, libraryId: 1, format: 3 },
+    ],
+  } as unknown as Response);
+  await expect(new KavitaClient('http://books.example', 'key').getBookSeries()).rejects.toThrow(
+    'repeated series page',
+  );
 });

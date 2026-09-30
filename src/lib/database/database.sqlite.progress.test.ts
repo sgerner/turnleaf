@@ -253,6 +253,31 @@ describe('native progress transactions against SQLite', () => {
     });
   });
 
+  it('keeps pending SQLite progress ahead of a known remote snapshot', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    await database.saveLocalProgress(book, 'local-cfi', '/local', 0.4);
+    const localProgress = (await database.getBooks(server.id))[0];
+    expect(localProgress).toBeDefined();
+
+    await database.reconcileBooks(server.id, [
+      {
+        ...book,
+        title: 'Updated metadata',
+        pagesRead: 0,
+        lastReadAt: null,
+        remoteProgressKnown: true,
+      },
+    ]);
+
+    expect((await database.getBooks(server.id))[0]).toMatchObject({
+      title: 'Updated metadata',
+      pagesRead: localProgress!.pagesRead,
+      lastReadAt: localProgress!.lastReadAt,
+    });
+    expect(await database.getPendingSync()).toHaveLength(1);
+  });
+
   it('retries an interrupted migration after reopening the same database file', async () => {
     const database = await importDatabase();
     native.failTransactionAt = 1;

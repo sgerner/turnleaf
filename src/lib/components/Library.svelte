@@ -39,6 +39,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import Reader from './Reader.svelte';
@@ -205,11 +206,14 @@
   });
   let syncing = $state(false);
   let settingsVisible = $state(false);
+  let diagnosticsVisible = $state(false);
+  let diagnosticsOutput = $state('');
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
   let settingsError = $state('');
+  let diagnosticsMessage = $state('');
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
@@ -538,20 +542,26 @@
   async function refresh(): Promise<void> {
     if (destroyed || refreshing) return;
     refreshing = true;
+    let diagnosticEndpoint = '/api/unknown';
     cancelCoverLoading();
     message = '';
     try {
+      diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries();
       const mapped: BookRecord[] = [];
+      let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
         if (destroyed) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
+        diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
           ...(
             await Promise.all(
-              batch.map(async (item) =>
-                mapSeriesToBooks(server.id, item, await client.getSeriesDetail(item.id)),
-              ),
+              batch.map(async (item) => {
+                const detail = await client.getSeriesDetail(item.id);
+                if (detail.incomplete) incomplete = true;
+                return mapSeriesToBooks(server.id, item, detail);
+              }),
             )
           ).flat(),
         );
@@ -559,14 +569,32 @@
       if (destroyed) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
-      await reconcileBooks(server.id, mapped);
+      diagnosticEndpoint = '/api/unknown';
+      await reconcileBooks(server.id, mapped, { preserveMissing: incomplete });
       if (destroyed) return;
       books = await getBooks(server.id);
       retainCoversFor(books);
       void loadCovers(books);
       offline = false;
       offlineMessage = '';
+      if (incomplete)
+        message =
+          'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
+      recordDiagnostic({
+        category:
+          cause instanceof KavitaError
+            ? cause.kind === 'invalid-response'
+              ? 'response'
+              : 'request'
+            : 'mapping',
+        endpoint: diagnosticEndpoint,
+        ...(cause instanceof KavitaError && cause.status ? { status: cause.status } : {}),
+        actualType: cause instanceof Error ? 'object' : typeof cause,
+        detail:
+          cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
+      });
+      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       offline = true;
       const savedBooks = books.length
         ? 'Showing your saved library.'
@@ -577,7 +605,7 @@
             offlineMessage = `Kavita rejected the saved auth key. Update it in Settings. ${savedBooks}`;
             break;
           case 'invalid-response':
-            offlineMessage = `Kavita returned data Turnleaf could not read. Check the Kavita version and server logs. ${savedBooks}`;
+            offlineMessage = `${cause.message} Open Settings to copy diagnostics. ${savedBooks}`;
             break;
           case 'network':
           case 'server':
@@ -878,6 +906,77 @@
     const opener = settingsOpener;
     settingsOpener = null;
     restoreFocus(opener);
+  }
+
+  function diagnosticsText(): string {
+    return exportDiagnostics({
+      appVersion: __APP_VERSION__,
+      platform: Capacitor.getPlatform(),
+      kavitaVersion: server.kavitaVersion,
+    });
+  }
+
+  async function copyDiagnostics(): Promise<void> {
+    diagnosticsMessage = '';
+    diagnosticsOutput = diagnosticsText();
+    try {
+      const text = diagnosticsOutput;
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const field = document.createElement('textarea');
+        field.value = text;
+        field.setAttribute('readonly', '');
+        field.style.position = 'fixed';
+        field.style.opacity = '0';
+        document.body.appendChild(field);
+        let copied = false;
+        try {
+          field.select();
+          copied = document.execCommand('copy');
+        } finally {
+          field.remove();
+        }
+        if (!copied) throw new Error('Clipboard unavailable');
+      }
+      diagnosticsMessage = 'Diagnostics copied. Review them before sharing.';
+    } catch {
+      diagnosticsVisible = true;
+      diagnosticsMessage =
+        'Copy is unavailable here. Open the log below to select and copy it, or download it.';
+    }
+  }
+
+  function downloadDiagnostics(): void {
+    diagnosticsMessage = '';
+    diagnosticsOutput = diagnosticsText();
+    const file = new Blob([diagnosticsOutput], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(file);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'turnleaf-diagnostics.txt';
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    diagnosticsVisible = true;
+    diagnosticsMessage =
+      'Review the log before sharing. If the file did not download, select and copy it below.';
+  }
+
+  function showDiagnostics(): void {
+    diagnosticsOutput = diagnosticsText();
+    diagnosticsVisible = !diagnosticsVisible;
+  }
+
+  function selectDiagnostics(): void {
+    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-diagnostics-output');
+    field?.focus();
+    field?.select();
+  }
+
+  function clearDiagnosticLog(): void {
+    clearDiagnostics();
+    diagnosticsOutput = diagnosticsText();
+    diagnosticsMessage = 'Diagnostics cleared.';
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -1984,6 +2083,58 @@
             >Remove all downloaded books</button
           >
         </div>
+      </div>
+      <div class="mt-7" aria-labelledby="library-settings-diagnostics-title">
+        <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
+        <p class="mt-1 text-sm text-surface-700-300">
+          Copy or download recent connection details recorded since this app launched to help
+          troubleshoot. The log includes API route and rejected field information, but not your
+          server address, API key, book titles, or response data. It stays in memory until the app
+          closes or you clear it. Review it before sharing.
+        </p>
+        <div class="mt-3 grid grid-cols-2 gap-2">
+          <button
+            class="btn preset-tonal-surface"
+            type="button"
+            onclick={() => void copyDiagnostics()}>Copy diagnostics</button
+          >
+          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}
+            >Download log</button
+          >
+        </div>
+        <button
+          class="btn preset-tonal-surface mt-2 w-full"
+          type="button"
+          onclick={showDiagnostics}
+        >
+          {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
+        </button>
+        {#if diagnosticsVisible}
+          <div class="mt-3 grid gap-2">
+            <p class="text-sm text-surface-700-300">
+              If copy or download is unavailable, select all text below, then copy it manually.
+            </p>
+            <textarea
+              id="turnleaf-diagnostics-output"
+              class="input min-h-48 w-full font-mono text-xs"
+              readonly
+              rows="10"
+              bind:value={diagnosticsOutput}
+              aria-label="Turnleaf diagnostics log"
+              onclick={selectDiagnostics}></textarea>
+            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}
+              >Select all text</button
+            >
+          </div>
+        {/if}
+        <button
+          class="btn preset-tonal-surface mt-2 w-full"
+          type="button"
+          onclick={clearDiagnosticLog}>Clear diagnostics</button
+        >
+        {#if diagnosticsMessage}
+          <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
+        {/if}
       </div>
       <div class="flex items-center justify-between gap-3">
         <dt class="text-surface-700-300">Downloaded storage</dt>

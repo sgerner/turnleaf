@@ -2,7 +2,9 @@ import { expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 import {
   confirmSync,
+  getBooks,
   getSyncStatus,
+  reconcileBooks,
   replaceBooksInTransaction,
   saveLocalProgress,
   type BookRecord,
@@ -181,6 +183,212 @@ it('skips the native transaction when there is no metadata to refresh', async ()
 
   expect(database.executeTransaction).not.toHaveBeenCalled();
   expect(database.rows()).toEqual([]);
+});
+
+it('preserves browser progress when a remote snapshot omits it and applies a known zero', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [existingBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await reconcileBooks('server', [
+    {
+      ...refreshedBook,
+      title: 'Updated with incomplete progress',
+      pagesRead: 0,
+      lastReadAt: null,
+      remoteProgressKnown: false,
+    },
+  ]);
+
+  let savedBooks = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}').books as BookRecord[];
+  expect(savedBooks[0]).toMatchObject({
+    title: 'Updated with incomplete progress',
+    pagesRead: existingBook.pagesRead,
+    lastReadAt: existingBook.lastReadAt,
+  });
+  expect(savedBooks[0]).not.toHaveProperty('remoteProgressKnown');
+
+  await reconcileBooks('server', [
+    {
+      ...refreshedBook,
+      pagesRead: 0,
+      lastReadAt: '2026-02-02T00:00:00.000Z',
+      remoteProgressKnown: true,
+    },
+  ]);
+
+  savedBooks = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}').books as BookRecord[];
+  expect(savedBooks[0]).toMatchObject({
+    pagesRead: 0,
+    lastReadAt: '2026-02-02T00:00:00.000Z',
+  });
+  expect(savedBooks[0]).not.toHaveProperty('remoteProgressKnown');
+
+  await reconcileBooks('server', [
+    {
+      ...refreshedBook,
+      pagesRead: 7,
+      lastReadAt: null,
+      remoteProgressKnown: true,
+      remoteReadDateKnown: false,
+    },
+  ]);
+
+  savedBooks = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}').books as BookRecord[];
+  expect(savedBooks[0]).toMatchObject({
+    pagesRead: 7,
+    lastReadAt: '2026-02-02T00:00:00.000Z',
+  });
+  expect(savedBooks[0]).not.toHaveProperty('remoteReadDateKnown');
+});
+
+it('keeps pending browser progress ahead of a remote metadata refresh', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  const queuedBook: BookRecord = {
+    ...existingBook,
+    pagesRead: 45,
+    lastReadAt: updatedAt,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [queuedBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'local-cfi',
+          xpath: '/local',
+          percentage: 0.45,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+        },
+      },
+      syncQueue: {
+        [existingBook.id]: {
+          bookId: existingBook.id,
+          payloadJson: '{"pageNum":45}',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 1,
+        },
+      },
+      preferences: {},
+    }),
+  );
+
+  await reconcileBooks('server', [
+    {
+      ...refreshedBook,
+      pagesRead: 0,
+      lastReadAt: null,
+      remoteProgressKnown: true,
+    },
+  ]);
+
+  const savedState = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    books: BookRecord[];
+    syncQueue: Record<string, unknown>;
+  };
+  expect(savedState.books[0]).toMatchObject({ pagesRead: 45, lastReadAt: updatedAt });
+  expect(savedState.syncQueue[existingBook.id]).toBeDefined();
+});
+
+it('updates incoming browser books while preserving unmatched rows from a partial snapshot', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const unmatched: BookRecord = {
+    ...existingBook,
+    id: 'server:1:11',
+    chapterId: 11,
+    title: 'Unmatched saved book',
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+    remoteAvailable: false,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [existingBook, unmatched],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await reconcileBooks('server', [{ ...refreshedBook, title: 'Updated from partial snapshot' }], {
+    preserveMissing: true,
+  });
+
+  const savedBooks = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}').books as BookRecord[];
+  expect(savedBooks).toHaveLength(2);
+  expect(savedBooks.find((book) => book.id === existingBook.id)).toMatchObject({
+    title: 'Updated from partial snapshot',
+    remoteAvailable: true,
+  });
+  expect(savedBooks.find((book) => book.id === unmatched.id)).toEqual(unmatched);
+});
+
+it('preserves every browser row when a partial snapshot contains no books', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const saved = [
+    { ...existingBook, remoteAvailable: true },
+    {
+      ...existingBook,
+      id: 'server:1:11',
+      chapterId: 11,
+      title: 'Unmatched saved book',
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+      remoteAvailable: false,
+    },
+  ];
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: saved,
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  const before = await getBooks('server');
+  await reconcileBooks('server', [], { preserveMissing: true });
+
+  expect(await getBooks('server')).toEqual(before);
 });
 
 it('does not acknowledge a queue item that was replaced while it uploaded', async () => {

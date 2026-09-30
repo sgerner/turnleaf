@@ -8,6 +8,12 @@ Latest release: [GitHub Releases](https://github.com/sgerner/turnleaf/releases/l
 
 Tracked release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
+If a Kavita refresh fails, open **Settings → Diagnostics** after reproducing it.
+Copy the log or use **View diagnostics** to select the text on Android, then paste it
+into your GitHub issue. The log includes endpoint statuses and unexpected field
+types, but excludes your server address, API key, book titles, and response bodies.
+It stays in memory until the app closes or you clear it.
+
 GitHub release bodies are generated from the matching versioned section in
 `RELEASE_NOTES.md`; `## Unreleased` records changes that are still in
 development.

@@ -1,18 +1,13 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
-import type {
-  ConnectedServer,
-  KavitaLibrary,
-  KavitaProgress,
-  KavitaSeries,
-  KavitaSeriesDetail,
-} from './types';
+import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
+import { isKavitaProgress, readHealthVersion } from './validation';
 import {
-  isKavitaLibrary,
-  isKavitaProgress,
-  isKavitaSeries,
-  isKavitaSeriesDetail,
-  readHealthVersion,
-} from './validation';
+  KavitaPayloadError,
+  normalizeLibraries,
+  normalizeSeriesPage,
+  normalizeSeriesDetail,
+} from './normalization';
+import { recordDiagnostic } from '../diagnostics/log';
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
@@ -31,6 +26,26 @@ export class KavitaError extends Error {
     readonly status?: number,
   ) {
     super(message);
+  }
+}
+
+function normalizePayload<T>(endpoint: string, read: () => T, context = ''): T {
+  try {
+    return read();
+  } catch (error) {
+    if (!(error instanceof KavitaPayloadError)) throw error;
+    recordDiagnostic({
+      category: 'validation',
+      endpoint,
+      path: context ? `${context}${error.path.slice(1)}` : error.path,
+      expected: error.expected,
+      actualType: error.actualType,
+      detail: 'invalid-field',
+    });
+    throw new KavitaError(
+      `Kavita response at ${endpoint}${context ? ` (${context})` : ''} could not be read: ${error.message}`,
+      'invalid-response',
+    );
   }
 }
 
@@ -123,10 +138,7 @@ export class KavitaClient {
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
     const options = signal ? { signal } : {};
     const payload = await this.request<unknown>('/api/Library/libraries', options);
-    if (!Array.isArray(payload) || !payload.every(isKavitaLibrary)) {
-      throw new KavitaError('Kavita returned an unexpected library response.', 'invalid-response');
-    }
-    const libraries = payload as KavitaLibrary[];
+    const libraries = normalizePayload('/api/Library/libraries', () => normalizeLibraries(payload));
 
     const health = await this.request<unknown>('/api/Health', options).catch(() => null);
     return {
@@ -156,19 +168,15 @@ export class KavitaClient {
         `/api/Series/v2?PageNumber=${pageNumber}&PageSize=${SERIES_PAGE_SIZE}`,
         options,
       );
-      if (
-        !Array.isArray(payload) ||
-        payload.length > SERIES_PAGE_SIZE ||
-        !payload.every(isKavitaSeries)
-      ) {
-        throw new KavitaError('Kavita returned an invalid series page.', 'invalid-response');
-      }
-      const page = payload as KavitaSeries[];
+      const page = normalizePayload('/api/Series/v2', () => normalizeSeriesPage(payload));
+      const rawPageLength = (payload as unknown[]).length;
+      if (rawPageLength > SERIES_PAGE_SIZE)
+        throw new KavitaError('Kavita returned an oversized series page.', 'invalid-response');
       const pageIds = new Set<number>();
-      if (page.some((item) => pageIds.has(item.id) || seenSeriesIds.has(item.id))) {
-        throw new KavitaError('Kavita returned a repeated series page.', 'invalid-response');
-      }
       page.forEach((item) => {
+        if (pageIds.has(item.id) || seenSeriesIds.has(item.id)) {
+          throw new KavitaError('Kavita returned a repeated series page.', 'invalid-response');
+        }
         pageIds.add(item.id);
         seenSeriesIds.add(item.id);
       });
@@ -176,9 +184,9 @@ export class KavitaClient {
       if (series.length > MAX_SERIES_RESULTS) {
         throw new KavitaError('Kavita returned too many series.', 'invalid-response');
       }
-      if (page.length < SERIES_PAGE_SIZE) break;
+      if (rawPageLength < SERIES_PAGE_SIZE) return series;
     }
-    return series.filter((item) => item.format === 3);
+    throw new KavitaError('Kavita returned too many series pages.', 'invalid-response');
   }
 
   async getSeriesDetail(seriesId: number, signal?: AbortSignal): Promise<KavitaSeriesDetail> {
@@ -186,10 +194,11 @@ export class KavitaClient {
       `/api/Series/series-detail?seriesId=${seriesId}`,
       signal ? { signal } : {},
     );
-    if (!isKavitaSeriesDetail(detail)) {
-      throw new KavitaError('Kavita returned an invalid series detail.', 'invalid-response');
-    }
-    return detail;
+    return normalizePayload(
+      '/api/Series/series-detail',
+      () => normalizeSeriesDetail(detail),
+      `series[${seriesId}]`,
+    );
   }
 
   downloadUrl(chapterId: number): string {
@@ -289,6 +298,7 @@ export class KavitaClient {
         },
       });
 
+      recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
       if (response.status === 401 || response.status === 403) {
         throw new KavitaError('Kavita rejected this auth key.', 'authentication', response.status);
       }
@@ -305,10 +315,16 @@ export class KavitaClient {
       try {
         return (await response.json()) as T;
       } catch {
-        throw new KavitaError('Kavita returned malformed JSON.', 'invalid-response');
+        if (path === '/api/Health') return undefined as T;
+        recordDiagnostic({ category: 'validation', endpoint: path, detail: 'invalid-json' });
+        throw new KavitaError(
+          `Kavita returned malformed JSON at ${path.split('?')[0]}.`,
+          'invalid-response',
+        );
       }
     } catch (error) {
       if (error instanceof KavitaError) throw error;
+      recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
       const message = timeout.signal.aborted
         ? 'Kavita did not respond in time.'
         : 'Kavita could not be reached. Check the address and network.';
@@ -361,6 +377,7 @@ export class KavitaClient {
         visited.add(nextUrl);
         currentUrl = nextUrl;
       }
+      recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
       this.assertStatus(response.status);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (typeof response.data === 'string') {
@@ -368,12 +385,18 @@ export class KavitaClient {
         try {
           return JSON.parse(response.data) as T;
         } catch {
-          throw new KavitaError('Kavita returned malformed JSON.', 'invalid-response');
+          if (path === '/api/Health') return undefined as T;
+          recordDiagnostic({ category: 'validation', endpoint: path, detail: 'invalid-json' });
+          throw new KavitaError(
+            `Kavita returned malformed JSON at ${path.split('?')[0]}.`,
+            'invalid-response',
+          );
         }
       }
       return response.data as T;
     } catch (error) {
       if (error instanceof KavitaError || error instanceof DOMException) throw error;
+      recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
       throw new KavitaError(
         'Kavita could not be reached. Check the address and network.',
         'network',

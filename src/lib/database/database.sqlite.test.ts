@@ -105,6 +105,57 @@ describe('native metadata transactions against SQLite', () => {
     });
   });
 
+  it('preserves SQLite progress when a remote snapshot omits it, but applies a known zero', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    await replaceBooksInTransaction(adapter, 'server', [baseBook]);
+
+    await replaceBooksInTransaction(adapter, 'server', [
+      {
+        ...baseBook,
+        title: 'Updated with incomplete progress',
+        pagesRead: 0,
+        lastReadAt: null,
+        remoteProgressKnown: false,
+      },
+    ]);
+
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      title: 'Updated with incomplete progress',
+      pages_read: baseBook.pagesRead,
+      last_read_at: baseBook.lastReadAt,
+    });
+
+    await replaceBooksInTransaction(adapter, 'server', [
+      {
+        ...baseBook,
+        pagesRead: 0,
+        lastReadAt: '2026-02-02T00:00:00.000Z',
+        remoteProgressKnown: true,
+      },
+    ]);
+
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      pages_read: 0,
+      last_read_at: '2026-02-02T00:00:00.000Z',
+    });
+
+    await replaceBooksInTransaction(adapter, 'server', [
+      {
+        ...baseBook,
+        pagesRead: 7,
+        lastReadAt: null,
+        remoteProgressKnown: true,
+        remoteReadDateKnown: false,
+      },
+    ]);
+
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      pages_read: 7,
+      last_read_at: '2026-02-02T00:00:00.000Z',
+    });
+  });
+
   it('rolls back every task when a later metadata row violates SQLite constraints', async () => {
     db = createDatabase();
     const adapter = createAdapter(db);
@@ -145,5 +196,56 @@ describe('native metadata transactions against SQLite', () => {
 
     expect(readBook(db, retained.id)).toMatchObject({ remote_available: 0 });
     expect(readBook(db, removable.id)).toBeUndefined();
+  });
+
+  it('updates incoming SQLite books while preserving unmatched rows from a partial snapshot', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const unmatched = {
+      ...baseBook,
+      id: 'server:1:11',
+      chapterId: 11,
+      title: 'Unmatched saved book',
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+      remoteAvailable: false,
+    };
+    await replaceBooksInTransaction(adapter, 'server', [baseBook, unmatched]);
+
+    await reconcileBooksInTransaction(
+      adapter,
+      'server',
+      [{ ...baseBook, title: 'Updated from partial snapshot' }],
+      '2026-09-10T00:00:00.000Z',
+      true,
+    );
+
+    expect(readBook(db, baseBook.id)).toMatchObject({ title: 'Updated from partial snapshot' });
+    expect(readBook(db, unmatched.id)).toMatchObject({
+      title: 'Unmatched saved book',
+      remote_available: 0,
+    });
+  });
+
+  it('preserves every SQLite row and availability when a partial snapshot is empty', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const unmatched = {
+      ...baseBook,
+      id: 'server:1:11',
+      chapterId: 11,
+      title: 'Unmatched saved book',
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+      remoteAvailable: false,
+    };
+    await replaceBooksInTransaction(adapter, 'server', [baseBook, unmatched]);
+    const before = [readBook(db, baseBook.id), readBook(db, unmatched.id)];
+
+    await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z', true);
+
+    expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
   });
 });

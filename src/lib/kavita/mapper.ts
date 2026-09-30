@@ -49,9 +49,11 @@ function mapChapterToBook(
     descriptionHtml: chapter.summary || null,
     format: 'epub',
     pages: chapter.pages || series.pages,
-    pagesRead: chapter.pagesRead ?? series.pagesRead,
+    pagesRead: chapter.pagesRead ?? 0,
+    ...(chapter.pagesRead === undefined ? { remoteProgressKnown: false } : {}),
+    ...(!chapter.lastReadingProgressUtc ? { remoteReadDateKnown: false } : {}),
     createdAt: series.created,
-    lastReadAt: lastReadAt(chapter, series),
+    lastReadAt: lastReadAt(chapter),
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
@@ -59,8 +61,8 @@ function mapChapterToBook(
   };
 }
 
-function lastReadAt(chapter: KavitaChapter, series: KavitaSeries): string | null {
-  const value = chapter.lastReadingProgressUtc ?? series.latestReadDate;
+function lastReadAt(chapter: KavitaChapter): string | null {
+  const value = chapter.lastReadingProgressUtc;
   return !value || value.startsWith(EMPTY_DATE) ? null : value;
 }
 
