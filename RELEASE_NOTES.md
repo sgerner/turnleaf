@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: tolerate incomplete Kavita responses and expose diagnostics
+- fix: tolerate incomplete Kavita metadata while preserving saved books and per-book progress, and provide field-level diagnostics that can be copied or exported from Settings (#134).
 - fix: explain Kavita refresh failures, safely follow same-origin redirects, and accept nullable API metadata.
 - fix: commit local reading state, book progress, and retryable sync queue changes atomically across native SQLite and browser storage.
 - fix: accept UTF-8 EPUB ZIP flags from Kavita (#121)

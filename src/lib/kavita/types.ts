@@ -32,7 +32,7 @@ export interface KavitaSeries {
   libraryId: number;
   format: number;
   pages: number;
-  pagesRead: number;
+  pagesRead?: number;
   created: string;
   latestReadDate: string;
   coverImage?: string | null;
@@ -69,6 +69,8 @@ export interface KavitaVolume {
 }
 
 export interface KavitaSeriesDetail {
+  /** A partial response can update known books but must not remove missing local entries. */
+  incomplete?: boolean;
   chapters: KavitaChapter[];
   specials: KavitaChapter[];
   volumes?: KavitaVolume[];

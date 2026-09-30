@@ -1,7 +1,35 @@
 import { expect, it } from 'vitest';
 import { issue51VolumeDetail } from './fixtures/issue-51-volume-detail';
 import { mapSeriesToBooks } from './mapper';
+import { normalizeSeriesPage, normalizeSeriesDetail } from './normalization';
 import type { KavitaSeries, KavitaSeriesDetail } from './types';
+
+it.each([null, 0])(
+  'carries unknown progress through normalized mapping while preserving explicit zero (%s)',
+  (pagesRead) => {
+    const series = normalizeSeriesPage([{ id: 1, libraryId: 1, format: 3 }])[0]!;
+    const detail = normalizeSeriesDetail({
+      volumes: [
+        {
+          id: 7,
+          chapters: [
+            {
+              id: 9,
+              pagesRead,
+              lastReadingProgressUtc: pagesRead === 0 ? '0001-01-01T00:00:00' : null,
+              files: [{ id: 9, format: 3 }],
+            },
+          ],
+        },
+      ],
+    });
+    const book = mapSeriesToBooks('primary', series, detail)[0]!;
+    expect(book.pagesRead).toBe(0);
+    expect(book.remoteProgressKnown).toBe(pagesRead === null ? false : undefined);
+    expect(book.remoteReadDateKnown).toBe(pagesRead === null ? false : undefined);
+    expect(book.volumeId).toBe(7);
+  },
+);
 
 it('maps a Kavita standalone EPUB special into one local book', () => {
   const series = {
@@ -186,7 +214,7 @@ it('keeps chapter progress and dates separate from series aggregates', () => {
   ]);
 });
 
-it('falls back to aggregate progress only when chapter progress is absent', () => {
+it('keeps absent chapter progress unknown rather than applying a series aggregate', () => {
   const series = {
     id: 13,
     name: 'Missing Progress',
@@ -217,8 +245,10 @@ it('falls back to aggregate progress only when chapter progress is absent', () =
   } satisfies KavitaSeriesDetail;
 
   expect(mapSeriesToBooks('primary', series, detail)[0]).toMatchObject({
-    pagesRead: 12,
-    lastReadAt: '2026-09-06T10:00:00',
+    pagesRead: 0,
+    lastReadAt: null,
+    remoteProgressKnown: false,
+    remoteReadDateKnown: false,
   });
 });
 
