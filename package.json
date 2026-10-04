@@ -33,7 +33,7 @@
     "postinstall": "node scripts/install-githooks.mjs"
   },
   "dependencies": {
-    "@aparajita/capacitor-secure-storage": "^8.0.0",
+    "@aparajita/capacitor-secure-storage": "^8.0.1",
     "@capacitor-community/sqlite": "^8.1.0",
     "@capacitor/app": "^8.1.1",
     "@capacitor/core": "^8.5.2",
