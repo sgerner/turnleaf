@@ -44,7 +44,7 @@
     "dompurify": "^3.4.15",
     "epubjs": "^0.3.93",
     "jeep-sqlite": "^2.8.0",
-    "sql.js": "^1.14.1",
+    "sql.js": "^1.15.0",
     "svelte": "^5.57.2"
   },
   "devDependencies": {
