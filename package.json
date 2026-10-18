@@ -36,7 +36,7 @@
     "@aparajita/capacitor-secure-storage": "^8.0.1",
     "@capacitor-community/sqlite": "^8.1.1",
     "@capacitor/app": "^8.1.2",
-    "@capacitor/core": "^8.5.2",
+    "@capacitor/core": "^8.5.3",
     "@capacitor/file-transfer": "^2.0.6",
     "@capacitor/filesystem": "^8.1.2",
     "@capacitor/network": "^8.0.1",
