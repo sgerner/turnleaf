@@ -45,7 +45,7 @@
     "epubjs": "^0.3.93",
     "jeep-sqlite": "^2.8.0",
     "sql.js": "^1.15.1",
-    "svelte": "^5.57.2"
+    "svelte": "^5.57.3"
   },
   "devDependencies": {
     "@capacitor/android": "^8.5.3",
