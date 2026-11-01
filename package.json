@@ -48,7 +48,7 @@
     "svelte": "^5.57.2"
   },
   "devDependencies": {
-    "@capacitor/android": "^8.5.3",
+    "@capacitor/android": "^8.6.0",
     "@capacitor/cli": "^8.5.3",
     "@capacitor/ios": "^8.5.3",
     "@eslint/js": "^10.0.1",
