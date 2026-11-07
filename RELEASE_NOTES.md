@@ -2,8 +2,7 @@
 
 ## Unreleased
 
-- fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
-
+- fix: preserve reader focus and save pending preferences on background
 - chore: remove unused web assets and template code
 - fix: recover missing Kavita keys without replacing the saved library
 - ci: verify Android release artifacts and streamline checks
@@ -18,6 +17,7 @@
 - fix: preserve newer local reading progress when an older upload completes.
 - security: refresh the transitive devalue dependency to a patched release.
 - fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
+- fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
 
 ## 0.3.4
 

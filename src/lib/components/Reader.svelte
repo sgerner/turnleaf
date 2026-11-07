@@ -2,6 +2,7 @@
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { tick, onDestroy, onMount } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreference, setPreference } from '../database/database';
@@ -52,6 +53,7 @@
     onBack,
     onRelocated,
     onSyncLatest,
+    onRetryDownload,
     registerBackHandler,
   }: {
     bookUrl: string;
@@ -63,10 +65,13 @@
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: () => Promise<{ xpath: string | null; percentage: number | null } | null>;
+    onRetryDownload?: (() => Promise<void>) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
   let viewport: HTMLDivElement;
+  let readerToolbar = $state<HTMLElement | null>(null);
+  let topRevealButton = $state<HTMLButtonElement | null>(null);
   let session: ReaderSession | null = null;
   let controlsVisible = $state(false);
   let settingsVisible = $state(false);
@@ -101,6 +106,8 @@
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let error = $state('');
+  let startupOpenFailed = $state(false);
+  let retryingReader = $state(false);
   let hideTimer: number | null = null;
   let footerVisible = $state(false);
   let bottomSwipeStart: { id: number; x: number; y: number } | null = null;
@@ -109,7 +116,7 @@
   let removeBackHandler: (() => void) | null = null;
   let syncingLatest = $state(false);
   let destroyed = false;
-  let appearanceLoaded = false;
+  let localNavigationDuringSession = false;
   const nativeFeatures = Capacitor.isNativePlatform()
     ? createReaderNativeFeatures({
         hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
@@ -123,97 +130,137 @@
   onMount(async () => {
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
-    document.addEventListener('backbutton', handleDocumentBackButton);
-    const saved = await getPreference('appearance');
+    const [saved, savedBookmarks, savedHistory, savedAnnotations] = await Promise.all([
+      getPreference('appearance'),
+      getPreference(`readerBookmarks:${bookId}`),
+      getPreference(`readerHistory:${bookId}`),
+      getPreference(`readerAnnotations:${bookId}`),
+    ]);
     if (destroyed) return;
     if (saved) appearance = parseAppearance(saved);
-    const savedBookmarks = await getPreference(`readerBookmarks:${bookId}`);
-    if (destroyed) return;
-    const savedHistory = await getPreference(`readerHistory:${bookId}`);
-    if (destroyed) return;
-    const savedAnnotations = await getPreference(`readerAnnotations:${bookId}`);
-    if (destroyed) return;
     bookmarks = parseBookmarks(savedBookmarks);
     locationHistory = parseLocationHistory(savedHistory);
     annotations = parseAnnotations(savedAnnotations);
-    appearanceLoaded = true;
-    session = new ReaderSession(bookUrl);
     try {
-      await session.open(
-        viewport,
-        initialCfi,
-        initialXPath,
-        initialPercentage,
-        appearance,
-        (next, origin) => {
-          if (destroyed) return;
-          location = next;
-          if (origin === 'navigation') {
-            onRelocated(next);
-            locationHistory = recordLocation(locationHistory, next);
-            void persistReaderLocations();
-          }
-        },
-        (zone) => {
-          if (destroyed) return;
-          if (zone === 'center') {
-            if (controlsVisible) controlsVisible = false;
-            else showControls();
-          } else void turn(zone);
-        },
-        (selection) => {
-          if (destroyed) return;
-          selectedText = selection;
-          showControls();
-        },
-      );
-      if (destroyed) return;
-      toc = session.tableOfContents();
+      await openReaderSession();
     } catch {
       if (destroyed) return;
+      startupOpenFailed = true;
       error = 'This EPUB could not be opened. The download may be incomplete or corrupted.';
+      session?.destroy();
+      session = null;
       return;
     }
 
-    if (nativeFeatures) {
-      await nativeFeatures.enable(appearance.keepAwake);
-      if (destroyed) return;
-
-      try {
-        const handle = await App.addListener('appStateChange', ({ isActive }) => {
-          if (!destroyed && isActive) void syncLatestLocation(false);
-        });
-        if (destroyed) {
-          await handle.remove();
-          return;
-        }
-        resumeHandle = handle;
-      } catch {
-        // Resume syncing is optional; the reader itself should keep working.
-      }
-    }
+    await enableNativeReaderFeatures();
   });
+
+  async function openReaderSession(): Promise<void> {
+    const nextSession = new ReaderSession(bookUrl);
+    session = nextSession;
+    await nextSession.open(
+      viewport,
+      initialCfi,
+      initialXPath,
+      initialPercentage,
+      appearance,
+      (next, origin) => {
+        if (destroyed) return;
+        location = next;
+        if (origin === 'navigation') {
+          localNavigationDuringSession = true;
+          onRelocated(next);
+          locationHistory = recordLocation(locationHistory, next);
+          queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+        }
+      },
+      (zone) => {
+        if (destroyed) return;
+        if (zone === 'center') {
+          if (controlsVisible) controlsVisible = false;
+          else showControls();
+        } else void turn(zone);
+      },
+      (selection) => {
+        if (destroyed) return;
+        selectedText = selection;
+        showControls();
+      },
+      handleKeyboardNavigation,
+    );
+    if (!destroyed) toc = nextSession.tableOfContents();
+  }
+
+  async function enableNativeReaderFeatures(): Promise<void> {
+    if (!nativeFeatures) return;
+    try {
+      await nativeFeatures.enable(appearance.keepAwake);
+    } catch {
+      // Native reader chrome is optional; the reader itself should keep working.
+    }
+    if (destroyed || resumeHandle) return;
+
+    try {
+      const handle = await App.addListener('appStateChange', ({ isActive }) => {
+        if (destroyed) return;
+        if (isActive) void syncLatestLocation(false);
+        else flushPendingPreferences();
+      });
+      if (destroyed) {
+        await handle.remove();
+        return;
+      }
+      resumeHandle = handle;
+    } catch {
+      // Resume syncing is optional; the reader itself should keep working.
+    }
+  }
+
+  async function retryReaderOpen(): Promise<void> {
+    if (!startupOpenFailed || !onRetryDownload || retryingReader) return;
+    retryingReader = true;
+    try {
+      await onRetryDownload();
+      if (destroyed) return;
+      error = '';
+      await openReaderSession();
+      if (destroyed) return;
+      startupOpenFailed = false;
+      await enableNativeReaderFeatures();
+    } catch (cause) {
+      if (destroyed) return;
+      session?.destroy();
+      session = null;
+      startupOpenFailed = true;
+      error =
+        cause instanceof Error
+          ? cause.message
+          : 'The EPUB could not be opened after retrying the download.';
+    } finally {
+      retryingReader = false;
+    }
+  }
 
   onDestroy(() => {
     destroyed = true;
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
-    document.removeEventListener('backbutton', handleDocumentBackButton);
     if (hideTimer !== null) window.clearTimeout(hideTimer);
-    if (saveTimer !== null) window.clearTimeout(saveTimer);
+    flushPendingPreferences();
     searchController?.abort();
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
-    if (appearanceLoaded) void setPreference('appearance', serializeAppearance(appearance));
     void nativeFeatures?.disable();
     session?.destroy();
   });
 
   function showControls(): void {
+    const restoreToolbarFocus = document.activeElement === topRevealButton;
     controlsVisible = true;
     scheduleChromeHide();
+    if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
   }
 
   function activeElement(): HTMLElement | null {
@@ -224,6 +271,10 @@
 
   function focusPanel(getPanel: () => HTMLElement | null): void {
     void tick().then(() => focusFirstElement(getPanel()));
+  }
+
+  function restorePanelFocus(opener: HTMLElement | null): void {
+    void tick().then(() => restoreFocus(opener));
   }
 
   function hasOpenReaderPanel(): boolean {
@@ -260,7 +311,7 @@
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restoreFocus(opener);
+    restorePanelFocus(opener);
     resumeChromeHide();
   }
 
@@ -283,7 +334,7 @@
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
-    restoreFocus(opener);
+    restorePanelFocus(opener);
     resumeChromeHide();
   }
 
@@ -307,7 +358,7 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restoreFocus(opener);
+    restorePanelFocus(opener);
     resumeChromeHide();
   }
 
@@ -329,7 +380,7 @@
     editingAnnotationId = null;
     const opener = annotationsOpener;
     annotationsOpener = null;
-    restoreFocus(opener);
+    restorePanelFocus(opener);
     resumeChromeHide();
   }
 
@@ -355,7 +406,7 @@
     searchController = null;
     const opener = searchOpener;
     searchOpener = null;
-    restoreFocus(opener);
+    restorePanelFocus(opener);
     resumeChromeHide();
   }
 
@@ -364,13 +415,33 @@
     scheduleChromeHide();
   }
 
+  function toggleFooter(): void {
+    if (footerVisible) footerVisible = false;
+    else showFooter();
+  }
+
+  function currentSectionLabel(): string {
+    if (!location) return 'Opening book...';
+    const sectionHref = location.href.split('#')[0];
+    const item = toc.find((entry) => entry.href.split('#')[0] === sectionHref);
+    return item?.label || `Section ${location.spineIndex + 1}`;
+  }
+
+  function currentProgressLabel(): string {
+    return `${Math.round((location?.percentage ?? 0) * 100)}%`;
+  }
+
   function scheduleChromeHide(): void {
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
       hideTimer = null;
       if (hasOpenReaderPanel()) return;
+      const restoreToolbarFocus = Boolean(
+        readerToolbar && document.activeElement && readerToolbar.contains(document.activeElement),
+      );
       controlsVisible = false;
       footerVisible = false;
+      if (restoreToolbarFocus) void tick().then(() => topRevealButton?.focus());
     }, 5_000);
   }
 
@@ -381,10 +452,7 @@
       void nativeFeatures?.setKeepAwake(patch.keepAwake);
     }
     if (saveTimer !== null) window.clearTimeout(saveTimer);
-    saveTimer = window.setTimeout(
-      () => void setPreference('appearance', serializeAppearance(appearance)),
-      500,
-    );
+    saveTimer = window.setTimeout(flushPendingPreferences, 500);
     showControls();
   }
 
@@ -398,18 +466,34 @@
     };
   }
 
-  let locationWrite: Promise<void> = Promise.resolve();
+  const pendingPreferences = new SvelteMap<string, string>();
+  let preferenceWrite = Promise.resolve();
 
-  function persistReaderLocations(): void {
-    locationWrite = locationWrite
-      .then(async () => {
-        await setPreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
-        await setPreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
-        await setPreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
-      })
-      .catch(() => {
-        // The reader remains usable when a preference write is temporarily unavailable.
-      });
+  function queuePreference(key: string, value: string): void {
+    pendingPreferences.set(key, value);
+    flushPreferences();
+  }
+
+  function flushPreferences(): void {
+    preferenceWrite = preferenceWrite.then(async () => {
+      for (const [key, value] of [...pendingPreferences]) {
+        try {
+          await setPreference(key, value);
+          if (pendingPreferences.get(key) === value) pendingPreferences.delete(key);
+        } catch {
+          // Keep this preference pending for the next save or lifecycle flush.
+        }
+      }
+    });
+  }
+
+  function flushPendingPreferences(): void {
+    if (saveTimer !== null) {
+      window.clearTimeout(saveTimer);
+      saveTimer = null;
+      pendingPreferences.set('appearance', serializeAppearance(appearance));
+    }
+    flushPreferences();
   }
 
   function currentBookmark(): StoredReaderLocation | null {
@@ -421,7 +505,7 @@
   function toggleCurrentBookmark(): void {
     if (!location) return;
     bookmarks = toggleBookmark(bookmarks, readerLocation(location));
-    persistReaderLocations();
+    queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
     showControls();
   }
 
@@ -433,13 +517,13 @@
   function saveBookmarkName(bookmark: StoredReaderLocation): void {
     bookmarks = renameBookmark(bookmarks, bookmark.id, bookmarkDraft);
     editingBookmarkId = null;
-    persistReaderLocations();
+    queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
   }
 
   function deleteBookmark(bookmark: StoredReaderLocation): void {
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
-    persistReaderLocations();
+    queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
   }
 
   function saveAnnotation(): void {
@@ -447,14 +531,14 @@
     annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
     annotationDraft = '';
     selectedText = null;
-    persistReaderLocations();
+    queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
   function editAnnotation(annotation: StoredAnnotation): void {
     annotations = updateAnnotation(annotations, annotation.id, annotationDraft);
     editingAnnotationId = null;
     annotationDraft = '';
-    persistReaderLocations();
+    queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
   function startAnnotationEdit(annotation: StoredAnnotation): void {
@@ -464,7 +548,7 @@
 
   function deleteAnnotation(annotation: StoredAnnotation): void {
     annotations = removeAnnotation(annotations, annotation.id);
-    persistReaderLocations();
+    queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
   function exportAnnotations(): void {
@@ -542,9 +626,11 @@
 
   async function syncLatestLocation(showFeedback = true): Promise<void> {
     if (!session || !onSyncLatest || syncingLatest) return;
+    if (!showFeedback && (initialCfi || localNavigationDuringSession)) return;
     syncingLatest = true;
     try {
       const progress = await onSyncLatest();
+      if (destroyed || (!showFeedback && localNavigationDuringSession)) return;
       if (progress?.xpath) {
         const restored = await session.displayServerLocation(progress.xpath);
         if (!restored && progress.percentage && progress.percentage > 0) {
@@ -565,29 +651,24 @@
     const detail = (event as CustomEvent<{ direction?: string }>).detail;
     if (detail?.direction === 'next' || detail?.direction === 'previous') {
       void turn(detail.direction);
-      showControls();
     }
   }
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed || event.defaultPrevented) return;
-    const target = event.target;
-    if (
-      target instanceof HTMLElement &&
-      target.closest('button, a, input, select, textarea, [contenteditable="true"]')
-    ) {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const target = event.target as Element | null;
+    if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
       return;
     }
     if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
       event.preventDefault();
       void turn('previous');
-      showControls();
       return;
     }
     if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
       event.preventDefault();
       void turn('next');
-      showControls();
       return;
     }
     if (
@@ -616,10 +697,6 @@
     }
     showControls();
     return true;
-  }
-
-  function handleDocumentBackButton(event: Event): void {
-    if (handleBackButton()) event.preventDefault();
   }
 
   function handleBottomSwipeStart(event: PointerEvent): void {
@@ -654,6 +731,13 @@
 
 <div class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
   <div class="reader-viewport" bind:this={viewport}></div>
+
+  <p class="sr-only" aria-live="polite" aria-atomic="true">
+    {#if location}
+      {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
+      {currentProgressLabel()} complete.
+    {/if}
+  </p>
 
   <p id="reader-keyboard-help" class="sr-only">
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
@@ -710,6 +794,7 @@
     <button
       type="button"
       class="reader-top-reveal"
+      bind:this={topRevealButton}
       aria-label="Show reading controls"
       onclick={showControls}
     ></button>
@@ -719,8 +804,19 @@
     <div class="absolute inset-0 grid place-items-center p-8" role="alert">
       <div class="card preset-tonal-error max-w-sm p-6 text-center">
         <p>{error}</p>
-        <button class="btn preset-filled-error-500 mt-5" type="button" onclick={onBack}>Back</button
-        >
+        <div class="mt-5 flex flex-wrap justify-center gap-3">
+          {#if startupOpenFailed && onRetryDownload}
+            <button
+              class="btn preset-filled-primary-700-300"
+              type="button"
+              disabled={retryingReader}
+              onclick={() => void retryReaderOpen()}
+            >
+              {retryingReader ? 'Retrying download…' : 'Retry download'}
+            </button>
+          {/if}
+          <button class="btn preset-filled-error-500" type="button" onclick={onBack}>Back</button>
+        </div>
       </div>
     </div>
   {/if}
@@ -728,6 +824,7 @@
   {#if controlsVisible}
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
       <header
+        bind:this={readerToolbar}
         class="reader-bar reader-top"
         inert={Boolean(
           settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible,
@@ -904,7 +1001,7 @@
             </svg>
           </button>
           <h2 id="reader-appearance-title" class="font-serif text-xl">Reading appearance</h2>
-          <div class="mt-4 grid grid-cols-2 gap-2" aria-label="Reading color mode">
+          <div class="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
               <button
                 class:active-mode={appearance.mode === mode}
@@ -1432,10 +1529,21 @@
 
   {#if footerVisible}
     <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
-      <span class="truncate text-xs">{location?.href ?? 'Opening book...'}</span>
-      <span class="text-xs tabular-nums">{Math.round((location?.percentage ?? 0) * 100)}%</span>
+      <span class="truncate text-xs">{currentSectionLabel()}</span>
+      <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
     </footer>
   {/if}
+
+  <button
+    class="reader-progress-reveal btn btn-sm preset-tonal-surface"
+    type="button"
+    aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
+    aria-pressed={footerVisible}
+    title={footerVisible ? 'Hide reading details' : 'Show reading details'}
+    onclick={toggleFooter}
+  >
+    {currentProgressLabel()}
+  </button>
 
   <div
     class="reader-bottom-reveal"
@@ -1685,6 +1793,16 @@
     transition: width 120ms linear;
   }
 
+  .reader-progress-reveal {
+    position: absolute;
+    right: max(1rem, env(safe-area-inset-right));
+    bottom: max(0.25rem, env(safe-area-inset-bottom));
+    z-index: 19;
+    min-width: 3rem;
+    min-height: 2.75rem;
+    color: var(--reader-bar-text);
+  }
+
   .reader-settings {
     position: absolute;
     left: 1rem;
@@ -1692,6 +1810,8 @@
     bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
     margin-inline: auto;
     max-width: 30rem;
+    max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    overflow: auto;
     padding: 1.25rem;
     z-index: 1;
   }

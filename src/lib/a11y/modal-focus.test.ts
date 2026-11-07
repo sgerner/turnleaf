@@ -19,6 +19,12 @@ it('focuses the first available control when a modal opens', () => {
   expect(document.activeElement).toBe(first);
 });
 
+it('skips controls removed from sequential navigation', () => {
+  first.tabIndex = -1;
+  focusFirstElement(dialog);
+  expect(document.activeElement).toBe(last);
+});
+
 it('wraps forward and backward tab navigation inside the modal', () => {
   last.focus();
   const forward = new KeyboardEvent('keydown', {

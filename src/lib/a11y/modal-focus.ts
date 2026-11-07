@@ -12,7 +12,10 @@ const FOCUSABLE_SELECTOR = [
 
 export function getFocusableElements(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) => element.getAttribute('aria-hidden') !== 'true' && !element.hidden,
+    (element) =>
+      element.tabIndex >= 0 &&
+      !element.matches(':disabled') &&
+      !element.closest('[hidden], [inert], [aria-hidden="true"]'),
   );
 }
 
