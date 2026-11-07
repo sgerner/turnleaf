@@ -1,9 +1,21 @@
 import { Capacitor } from '@capacitor/core';
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
-import { validateEpubArchive } from './epub-validation';
+import { recordDiagnostic } from '../diagnostics/log';
+import { EpubValidationError, validateEpubArchive } from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
+export const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
+const RETRYABLE_HTTP_STATUSES = new Set([408, 500, 502, 503, 504]);
+
+export class EpubTransferError extends Error {
+  constructor(
+    readonly status: number | undefined,
+    readonly connectionFailed: boolean,
+  ) {
+    super('The EPUB transfer failed.');
+  }
+}
 
 function decodeNativeBytes(data: string | Blob): Uint8Array {
   if (typeof data !== 'string') throw new Error('The native EPUB could not be inspected.');
@@ -73,14 +85,43 @@ export async function downloadEpub(
   let renamed = false;
 
   try {
-    await FileTransfer.downloadFile({
-      url: downloadUrl,
-      path: destination.uri,
-      headers: { 'x-api-key': apiKey },
-      progress: true,
-    });
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await FileTransfer.downloadFile({
+          url: downloadUrl,
+          path: destination.uri,
+          headers: { 'x-api-key': apiKey },
+        });
+        break;
+      } catch (error) {
+        const failure = error as { code?: unknown; data?: { httpStatus?: unknown } } | null;
+        const httpStatus = failure?.data?.httpStatus;
+        const status =
+          typeof httpStatus === 'number' &&
+          Number.isInteger(httpStatus) &&
+          httpStatus >= 100 &&
+          httpStatus <= 599
+            ? httpStatus
+            : undefined;
+        const connectionFailed = failure?.code === 'OS-PLUG-FLTR-0008';
+        const retryable =
+          status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
+        if (attempt > 0 || !retryable) throw new EpubTransferError(status, connectionFailed);
+
+        await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
+          () => {},
+        );
+        recordDiagnostic({
+          category: 'download',
+          endpoint: EPUB_DOWNLOAD_ENDPOINT,
+          status,
+          detail: 'download-retry',
+        });
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      }
+    }
     const stat = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
-    if (stat.type !== 'file') throw new Error('Kavita did not return an EPUB file.');
+    if (stat.type !== 'file') throw new EpubValidationError('Kavita did not return an EPUB file.');
     await validateEpubArchive(stat.size, (offset, length) =>
       readNativeRange(temporaryPath, offset, length),
     );

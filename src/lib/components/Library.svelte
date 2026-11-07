@@ -27,8 +27,11 @@
     clearCoverCache,
     deleteDownloadedEpub,
     downloadEpub,
+    EPUB_DOWNLOAD_ENDPOINT,
+    EpubTransferError,
     verifyDownloadedEpub,
   } from '../downloads/native-download';
+  import { EpubValidationError } from '../downloads/epub-validation';
   import {
     createSharedCoverLoader,
     loadCoversWithConcurrency,
@@ -715,14 +718,31 @@
       message = `${book.title} is ready offline.`;
       return refreshed;
     } catch (error) {
-      const detail =
-        error instanceof Error
-          ? `${error.name}: ${error.message}`
-          : typeof error === 'object' && error !== null
-            ? String('code' in error ? error.code : 'native error')
-            : String(error);
-      console.error(`EPUB download failed: ${detail}`);
-      message = 'The download was interrupted. Try again when Kavita is available.';
+      let detail = 'download-storage';
+      let status: number | undefined;
+      if (error instanceof EpubTransferError) {
+        status = error.status;
+        detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
+        if (status === 401) {
+          message = 'Kavita rejected authentication for this download. Check your API key.';
+        } else if (status === 403) {
+          message = 'Kavita denied the download. Check your account’s download permissions.';
+        } else if (status !== undefined) {
+          message = `Kavita returned HTTP ${status} during the download.`;
+        } else if (error.connectionFailed) {
+          message = 'Turnleaf could not connect to Kavita to download this book.';
+        } else {
+          message = 'The file transfer failed.';
+        }
+      } else if (error instanceof EpubValidationError) {
+        detail = 'download-validation';
+        message = error.message;
+      } else {
+        message = 'Turnleaf could not save the book on this device.';
+      }
+      recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
+      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
+      message += ' Open Settings to copy diagnostics.';
       return null;
     } finally {
       downloadingBookId = null;
@@ -2087,10 +2107,9 @@
       <div class="mt-7" aria-labelledby="library-settings-diagnostics-title">
         <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
         <p class="mt-1 text-sm text-surface-700-300">
-          Copy or download recent connection details recorded since this app launched to help
-          troubleshoot. The log includes API route and rejected field information, but not your
-          server address, API key, book titles, or response data. It stays in memory until the app
-          closes or you clear it. Review it before sharing.
+          Copy or download recent connection and book download details. The log includes API routes,
+          HTTP statuses, and failure categories. It stays in memory until the app closes or you
+          clear it. Review it before sharing.
         </p>
         <div class="mt-3 grid grid-cols-2 gap-2">
           <button
