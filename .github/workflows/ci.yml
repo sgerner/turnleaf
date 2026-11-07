@@ -1,8 +1,15 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - master
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -26,6 +33,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+          cache: gradle
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -58,6 +67,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+          cache: gradle
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4

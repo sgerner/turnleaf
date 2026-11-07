@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- ci: verify Android release artifacts and streamline checks
 - fix: preserve offline EPUBs after transient storage errors
 - fix: improve EPUB download recovery and diagnostics
 - fix: retry temporary EPUB transfer failures once and report download failures in Settings diagnostics (#189).
