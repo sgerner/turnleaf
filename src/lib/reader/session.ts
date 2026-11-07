@@ -347,6 +347,7 @@ export class ReaderSession {
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private selectionListeners: Array<() => void> = [];
   private current: Location | null = null;
+  private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private userNavigationPending = false;
   private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
     null;
@@ -442,12 +443,9 @@ export class ReaderSession {
   private reportLocation(location: Location, origin: ReaderLocationOrigin): void {
     if (!this.onLocation) return;
     const start = location.start;
-    const sections = this.spineSections();
+    const { sections, indexes } = this.getSpine();
     const sectionCount = Math.max(1, sections.length);
-    const sectionIndex = Math.max(
-      0,
-      sections.findIndex((section) => section.href === start.href),
-    );
+    const sectionIndex = indexes.get(start.href) ?? 0;
     const pageIndex = this.pageIndex(start.displayed.page);
     const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
     const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
@@ -485,7 +483,7 @@ export class ReaderSession {
     const normalizedQuery = normalizeReaderSearchQuery(query);
     if (!normalizedQuery) return [];
     const results: ReaderSearchResult[] = [];
-    const sections = this.spineSections();
+    const { sections } = this.getSpine();
     const request = this.book.request as (url: string) => Promise<Document>;
 
     for (const section of sections) {
@@ -595,6 +593,7 @@ export class ReaderSession {
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.spine = null;
     this.book.destroy();
   }
 
@@ -630,7 +629,7 @@ export class ReaderSession {
     if (!this.rendition) return false;
     const target = parseKavitaXPath(xpath);
     if (!target) return false;
-    const section = this.spineSections()[target.spineIndex];
+    const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
       const cfi = kavitaXPathToCfi(xpath, section.cfiBase);
@@ -673,10 +672,16 @@ export class ReaderSession {
     }
   }
 
-  private spineSections(): SpineSection[] {
+  private getSpine(): NonNullable<ReaderSession['spine']> {
+    if (this.spine) return this.spine;
     const sections: SpineSection[] = [];
-    this.book.spine.each((section: SpineSection) => sections.push(section));
-    return sections;
+    const indexes = new Map<string, number>();
+    this.book.spine.each((section: SpineSection) => {
+      if (!indexes.has(section.href)) indexes.set(section.href, sections.length);
+      sections.push(section);
+    });
+    this.spine = { sections, indexes };
+    return this.spine;
   }
 
   private pageIndex(page: number): number {

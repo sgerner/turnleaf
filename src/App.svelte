@@ -7,7 +7,7 @@
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
   import {
-    getPreference,
+    getPreferences,
     getServer,
     resetLocalDatabase,
     setPreference,
@@ -36,9 +36,12 @@
     apiKey = null;
     void checkForRelease();
     try {
-      const saved = await getServer();
-      const savedTheme = await getPreference(themePreferenceKey);
-      const savedMode = await getPreference(modePreferenceKey);
+      const [saved, preferences] = await Promise.all([
+        getServer(),
+        getPreferences([themePreferenceKey, modePreferenceKey]),
+      ]);
+      const savedTheme = preferences.get(themePreferenceKey);
+      const savedMode = preferences.get(modePreferenceKey);
       uiTheme = savedTheme ?? defaultTheme;
       uiMode = savedMode === 'light' ? 'light' : 'dark';
       if (saved) {

@@ -8,7 +8,7 @@
   import {
     getBooks,
     getReadingState,
-    getPreference,
+    getPreferences,
     getSyncStatus,
     acceptRemoteProgress,
     markDownloaded,
@@ -458,23 +458,24 @@
     window.addEventListener('resize', scheduleVirtualWindow);
     scheduleVirtualWindow();
 
-    const [savedAutoSync, savedSort, savedAuthor, savedSeries, savedView, savedBooks] =
-      await Promise.all([
-        getPreference('syncFurthest'),
-        getPreference('librarySort'),
-        getPreference('libraryAuthor'),
-        getPreference('librarySeries'),
-        getPreference('libraryView'),
-        getBooks(server.id),
-      ]);
+    const [preferences, savedBooks] = await Promise.all([
+      getPreferences([
+        'syncFurthest',
+        'librarySort',
+        'libraryAuthor',
+        'librarySeries',
+        'libraryView',
+      ]),
+      getBooks(server.id, { includeDescription: false }),
+    ]);
     if (destroyed) return;
     pendingTheme = theme as SkeletonTheme;
     pendingMode = mode;
-    pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
-    sortOrder = parseSortOrder(savedSort);
-    authorFilter = savedAuthor ?? '';
-    seriesFilter = savedSeries ?? '';
-    viewMode = parseViewMode(savedView);
+    pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
+    sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
+    authorFilter = preferences.get('libraryAuthor') ?? '';
+    seriesFilter = preferences.get('librarySeries') ?? '';
+    viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     books = savedBooks;
     retainCoversFor(books);
     void loadCovers(books);
@@ -622,7 +623,7 @@
       diagnosticEndpoint = '/api/unknown';
       await reconcileBooks(server.id, mapped, { preserveMissing: incomplete });
       if (destroyed) return;
-      books = await getBooks(server.id);
+      books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);
       void loadCovers(books);
       offline = false;
@@ -837,7 +838,7 @@
     if (!file) {
       await removeDownload(book.id);
       message = 'The downloaded file is missing. Download it again.';
-      books = await getBooks(server.id);
+      books = await getBooks(server.id, { includeDescription: false });
       const refreshed = books.find((item) => item.id === book.id) ?? null;
       if (refreshed) await open(refreshed, options);
       return;

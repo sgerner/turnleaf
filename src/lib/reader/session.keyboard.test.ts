@@ -14,6 +14,12 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
   const book = {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
+    spine: {
+      each: vi.fn((visit: (section: { href: string }) => void) => {
+        visit({ href: 'first.xhtml' });
+        visit({ href: 'second.xhtml' });
+      }),
+    },
   };
   return { mockBook: book, mockRendition: rendition };
 });
@@ -76,6 +82,31 @@ describe('ReaderSession keyboard navigation', () => {
 
     click({ target: document.createElement('p'), clientX: 250 }, contents);
     expect(onTap).toHaveBeenCalledExactlyOnceWith('next');
+    session.destroy();
+  });
+
+  it('indexes the spine once across repeated relocation events', async () => {
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    const start = { href: 'second.xhtml', index: 1, cfi: '', displayed: { page: 1, total: 4 } };
+    relocated({ start });
+    relocated({ start: { ...start, displayed: { page: 2, total: 4 } } });
+
+    expect(mockBook.spine.each).toHaveBeenCalledOnce();
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ percentage: 0.625 }),
+      'restore',
+    );
     session.destroy();
   });
 });

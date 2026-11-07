@@ -472,14 +472,22 @@ export async function reconcileBooksInTransaction(
   await executeNativeTransaction(db, tasks);
 }
 
-export async function getBooks(serverId: string): Promise<BookRecord[]> {
+export async function getBooks(
+  serverId: string,
+  { includeDescription = true } = {},
+): Promise<BookRecord[]> {
   if (!Capacitor.isNativePlatform()) {
-    return readBrowserState().books.filter((book) => book.serverId === serverId);
+    const books = readBrowserState().books.filter((book) => book.serverId === serverId);
+    return includeDescription ? books : books.map((book) => ({ ...book, descriptionHtml: null }));
   }
   const db = await openDatabase();
-  const result = await db.query('SELECT * FROM books WHERE server_id = ? ORDER BY title', [
-    serverId,
-  ]);
+  const result = await db.query(
+    `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+      format, pages, pages_read, created_at, last_read_at, download_path, download_status,
+      file_size, remote_available${includeDescription ? ', description_html' : ''}
+      FROM books WHERE server_id = ? ORDER BY title`,
+    [serverId],
+  );
   return (result.values ?? []).map((row) => ({
     id: String(row.id),
     serverId: String(row.server_id),
@@ -1019,13 +1027,23 @@ export async function removeDownload(bookId: string): Promise<void> {
   );
 }
 
-export async function getPreference(key: string): Promise<string | null> {
+export async function getPreferences(keys: readonly string[]): Promise<Map<string, string>> {
+  if (keys.length === 0) return new Map();
   if (!Capacitor.isNativePlatform()) {
-    return readBrowserState().preferences[key] ?? null;
+    const { preferences } = readBrowserState();
+    const values = new Map<string, string>();
+    for (const key of keys) {
+      const value = preferences[key];
+      if (typeof value === 'string') values.set(key, value);
+    }
+    return values;
   }
   const db = await openDatabase();
-  const row = (await db.query('SELECT value FROM preferences WHERE key=?', [key])).values?.[0];
-  return row ? String(row.value) : null;
+  const result = await db.query(
+    `SELECT key, value FROM preferences WHERE key IN (${keys.map(() => '?').join(', ')})`,
+    [...keys],
+  );
+  return new Map((result.values ?? []).map((row) => [String(row.key), String(row.value)]));
 }
 
 export async function setPreference(key: string, value: string): Promise<void> {
