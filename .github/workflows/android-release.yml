@@ -37,6 +37,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -113,6 +114,7 @@ jobs:
             printf '\n\nTested revision: `%s`\n' "$GITHUB_SHA"
           } > release-payload/turnleaf-release-notes.md
           cp "$APK" release-payload/app-release.apk
+          (cd release-payload && sha256sum app-release.apk > app-release.apk.sha256)
           printf '%s\n' "$GITHUB_SHA" > release-payload/tested-revision.txt
 
       - name: Upload release artifacts
@@ -144,6 +146,7 @@ jobs:
           grep -Fq "Tested revision: \`$TESTED_REVISION\`" release-payload/turnleaf-release-notes.md
           test -s release-payload/app-release.apk
           test -s release-payload/turnleaf-release-notes.md
+          (cd release-payload && sha256sum --check app-release.apk.sha256)
 
       - name: Publish GitHub release
         env:
@@ -152,7 +155,7 @@ jobs:
           VERSION_BASE: ${{ needs.build-release-apk.outputs.version_base }}
           TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
         run: |
-          gh release create "$RELEASE_TAG" "release-payload/app-release.apk" \
+          gh release create "$RELEASE_TAG" "release-payload/app-release.apk" "release-payload/app-release.apk.sha256" \
             --title "Turnleaf $VERSION_BASE" \
             --notes-file "release-payload/turnleaf-release-notes.md" \
             --repo "$GITHUB_REPOSITORY" \

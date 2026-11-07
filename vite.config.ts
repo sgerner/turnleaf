@@ -12,7 +12,7 @@ import {
   DevProxyError,
   fetchProxyTarget,
   validateProxyTarget,
-} from './scripts/dev-proxy';
+} from './scripts/dev-proxy.ts';
 
 const packageJson = JSON.parse(
   readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
