@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: preserve reader focus and save pending preferences on background
 - chore: remove unused web assets and template code
 - fix: recover missing Kavita keys without replacing the saved library
 - ci: verify Android release artifacts and streamline checks

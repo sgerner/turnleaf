@@ -344,6 +344,7 @@ export class ReaderSession {
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
+  private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private selectionListeners: Array<() => void> = [];
   private current: Location | null = null;
   private userNavigationPending = false;
@@ -363,6 +364,7 @@ export class ReaderSession {
     onLocation: (location: ReaderLocation, origin: ReaderLocationOrigin) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection) => void,
+    onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -405,6 +407,10 @@ export class ReaderSession {
       onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
     };
     this.rendition.on('click', this.contentClick);
+    if (onKeyboardNavigation) {
+      this.keyboardNavigation = onKeyboardNavigation;
+      this.rendition.on('keydown', this.keyboardNavigation);
+    }
     this.applyAppearance(appearance);
     await this.rendition.started;
     if (cfi) {
@@ -569,12 +575,15 @@ export class ReaderSession {
   destroy(): void {
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
+    if (this.rendition && this.keyboardNavigation)
+      this.rendition.off('keydown', this.keyboardNavigation);
     this.rendition?.destroy();
     this.selectionListeners.forEach((remove) => remove());
     this.selectionListeners = [];
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
+    this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
     this.book.destroy();
