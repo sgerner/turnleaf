@@ -5,7 +5,7 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
-  import { getPreference, setPreference } from '../database/database';
+  import { getPreferences, setPreference } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -130,17 +130,18 @@
   onMount(async () => {
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
-    const [saved, savedBookmarks, savedHistory, savedAnnotations] = await Promise.all([
-      getPreference('appearance'),
-      getPreference(`readerBookmarks:${bookId}`),
-      getPreference(`readerHistory:${bookId}`),
-      getPreference(`readerAnnotations:${bookId}`),
+    const preferences = await getPreferences([
+      'appearance',
+      `readerBookmarks:${bookId}`,
+      `readerHistory:${bookId}`,
+      `readerAnnotations:${bookId}`,
     ]);
     if (destroyed) return;
+    const saved = preferences.get('appearance');
     if (saved) appearance = parseAppearance(saved);
-    bookmarks = parseBookmarks(savedBookmarks);
-    locationHistory = parseLocationHistory(savedHistory);
-    annotations = parseAnnotations(savedAnnotations);
+    bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
+    locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
+    annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
     try {
       await openReaderSession();
     } catch {

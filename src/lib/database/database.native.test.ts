@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => {
     executeTransaction,
     getVersion: vi.fn(async () => ({ version: databaseVersion })),
     open: vi.fn(async () => undefined),
-    query: vi.fn(async () => ({ values: [] })),
+    query: vi.fn(async () => ({ values: [] as Record<string, unknown>[] })),
     run: vi.fn(async () => ({ changes: { changes: 1 } })),
   };
   const sqlite = {
@@ -84,6 +84,20 @@ const readingState = {
 
 beforeEach(() => {
   mocks.reset();
+});
+
+it('reads several preferences with one native query', async () => {
+  const { getPreferences } = await import('./database');
+  mocks.db.query.mockResolvedValueOnce({ values: [{ key: 'uiTheme', value: 'eink' }] });
+
+  const values = await getPreferences(['uiTheme', 'uiMode']);
+
+  expect(mocks.db.query).toHaveBeenCalledExactlyOnceWith(
+    'SELECT key, value FROM preferences WHERE key IN (?, ?)',
+    ['uiTheme', 'uiMode'],
+  );
+  expect(values.get('uiTheme')).toBe('eink');
+  expect(values.has('uiMode')).toBe(false);
 });
 
 it('groups progress, queue, and book updates into one native transaction', async () => {
