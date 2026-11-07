@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: preserve offline EPUBs after transient storage errors
 - fix: improve EPUB download recovery and diagnostics
 - fix: retry temporary EPUB transfer failures once and report download failures in Settings diagnostics (#189).
 - fix(deps): update DOMPurify to clear the release audit

@@ -777,7 +777,14 @@
       if (refreshed) await open(refreshed, options);
       return;
     }
-    const file = await verifyDownloadedEpub(book.downloadPath);
+    let file;
+    try {
+      file = await verifyDownloadedEpub(book.downloadPath);
+    } catch {
+      message =
+        'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
+      return;
+    }
     if (!file) {
       await removeDownload(book.id);
       message = 'The downloaded file is missing. Download it again.';

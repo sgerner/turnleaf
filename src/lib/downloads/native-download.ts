@@ -30,7 +30,9 @@ async function readNativeRange(path: string, offset: number, length: number): Pr
     offset,
     length,
   });
-  return decodeNativeBytes(result.data);
+  const bytes = decodeNativeBytes(result.data);
+  if (bytes.length !== length) throw new Error('The native EPUB read was incomplete.');
+  return bytes;
 }
 
 function assertSafeBookId(bookId: string): void {
@@ -167,7 +169,9 @@ export async function verifyDownloadedEpub(
       webViewUrl: Capacitor.convertFileSrc(uri.uri),
       size: stat.size,
     };
-  } catch {
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008') return null;
+    if (!(error instanceof EpubValidationError)) throw error;
     await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data }).catch(() => {});
     return null;
   }
