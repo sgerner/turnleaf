@@ -32,6 +32,8 @@
   async function loadLocalData(): Promise<void> {
     booting = true;
     startupError = '';
+    server = null;
+    apiKey = null;
     void checkForRelease();
     try {
       const saved = await getServer();
@@ -40,8 +42,13 @@
       uiTheme = savedTheme ?? defaultTheme;
       uiMode = savedMode === 'light' ? 'light' : 'dark';
       if (saved) {
-        apiKey = await getApiKey(saved.credentialRef);
-        if (apiKey) server = saved;
+        server = saved;
+        try {
+          apiKey = await getApiKey(saved.credentialRef);
+        } catch {
+          startupError =
+            'Turnleaf could not access the saved Kavita key. Retry to open your library.';
+        }
       }
     } catch {
       startupError =
@@ -57,10 +64,9 @@
 
   async function repairLocalData(): Promise<void> {
     repairing = true;
-    startupError = '';
     try {
       await resetLocalDatabase();
-      startupError = '';
+      await loadLocalData();
     } catch {
       startupError =
         'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
@@ -82,7 +88,7 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
-    if (booting) return;
+    if (booting || startupError) return;
     void setPreference(themePreferenceKey, uiTheme);
     void setPreference(modePreferenceKey, uiMode);
   });
@@ -164,22 +170,19 @@
           apiKey = null;
         }}
       />
-    {:else}
-      {#if startupError}
-        <div
-          class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3"
-          role="alert"
-        >
-          <p>{startupError}</p>
-          <div class="flex flex-wrap gap-2">
-            <button
-              class="btn btn-sm preset-filled-error-500 !text-sm"
-              type="button"
-              onclick={() => void loadLocalData()}
-              disabled={repairing}
-            >
-              Retry
-            </button>
+    {:else if startupError}
+      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
+        <p>{startupError}</p>
+        <div class="flex flex-wrap gap-2">
+          <button
+            class="btn btn-sm preset-filled-error-500 !text-sm"
+            type="button"
+            onclick={() => void loadLocalData()}
+            disabled={repairing}
+          >
+            Retry
+          </button>
+          {#if !server}
             <button
               class="btn btn-sm preset-tonal-error !text-sm"
               type="button"
@@ -196,12 +199,14 @@
             >
               {repairing ? 'Resetting...' : 'Reset local data'}
             </button>
-          </div>
+          {/if}
         </div>
-      {/if}
+      </div>
+    {:else}
       <Onboarding
-        onConnected={async (connected) => {
-          apiKey = await getApiKey(connected.credentialRef);
+        savedServer={server}
+        onConnected={(connected, key) => {
+          apiKey = key;
           server = connected;
         }}
       />
@@ -421,6 +426,10 @@
     .orb-tertiary {
       animation: drift-tertiary 64s ease-in-out infinite alternate;
     }
+  }
+
+  :global([data-theme='eink']) .app-ambient {
+    display: none;
   }
 
   @keyframes drift-primary {
