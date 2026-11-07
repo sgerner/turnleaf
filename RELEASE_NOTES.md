@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- fix: protect reading progress and improve offline book recovery
+- Persist the selected Kavita progress on conflict and retry failed EPUB opens while preserving saved downloads.
+- Batch library startup reads and keep virtualized rows stable while scrolling.
+- Download books without opening them and identify downloaded books in the library.
 - fix: preserve reader focus and save pending preferences on background
 - chore: remove unused web assets and template code
 - fix: recover missing Kavita keys without replacing the saved library

@@ -2,17 +2,21 @@ import { confirmSync, getPendingSync, markSyncFailure } from '../database/databa
 import type { KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
-let flushing: Promise<void> | null = null;
+const flushing = new Map<string, Promise<void>>();
 
-export function flushProgress(client: KavitaClient): Promise<void> {
-  if (flushing) return flushing;
-  flushing = run(client).finally(() => (flushing = null));
-  return flushing;
+export function flushProgress(client: KavitaClient, serverId: string): Promise<void> {
+  const pending = flushing.get(serverId);
+  if (pending) return pending;
+  const current = run(client, serverId).finally(() => {
+    if (flushing.get(serverId) === current) flushing.delete(serverId);
+  });
+  flushing.set(serverId, current);
+  return current;
 }
 
-async function run(client: KavitaClient): Promise<void> {
+async function run(client: KavitaClient, serverId: string): Promise<void> {
   const failures: unknown[] = [];
-  for (const item of await getPendingSync()) {
+  for (const item of await getPendingSync(serverId)) {
     try {
       await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
       await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);

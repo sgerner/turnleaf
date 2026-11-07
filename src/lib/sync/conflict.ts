@@ -84,6 +84,7 @@ export function toKavitaPageNumber(
 }
 
 export interface OpenLocalProgress {
+  cfi?: string;
   percentage: number;
   pendingSync: boolean;
   xpath: string | null;
@@ -110,6 +111,11 @@ export function chooseOpenProgress(
   if (local.pendingSync) {
     return remote?.bookScrollId !== local.xpath ? 'conflict' : 'local';
   }
+
+  // Kavita's XPath does not retain EPUB.js's exact CFI. When both snapshots
+  // point at the same element, keep the finer local locator even with
+  // automatic furthest selection turned off.
+  if (local.xpath && remote?.bookScrollId === local.xpath) return 'local';
 
   if (preferFurthest && remote) {
     if (local.xpath && remote.bookScrollId) {

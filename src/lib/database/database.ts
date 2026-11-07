@@ -6,6 +6,7 @@ import {
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
+import type { KavitaProgress } from '../kavita/types';
 import { migrations } from './schema';
 
 export interface ServerConfig {
@@ -65,6 +66,7 @@ interface BrowserDatabaseState {
 
 interface BrowserSyncQueueRow {
   bookId: string;
+  serverId: string;
   payloadJson: string;
   attemptCount: number;
   lastAttemptAt: string | null;
@@ -123,19 +125,26 @@ function readBrowserState(): BrowserDatabaseState {
   if (!raw) return createBrowserState();
   try {
     const parsed = JSON.parse(raw) as Partial<BrowserDatabaseState>;
+    const books = Array.isArray(parsed.books)
+      ? (parsed.books as BookRecord[]).map((book) => ({
+          ...book,
+          remoteAvailable: book.remoteAvailable !== false,
+        }))
+      : [];
+    const booksById = new Map(books.map((book) => [book.id, book]));
     return {
       serverConfig: parsed.serverConfig ?? null,
-      books: Array.isArray(parsed.books)
-        ? (parsed.books as BookRecord[]).map((book) => ({
-            ...book,
-            remoteAvailable: book.remoteAvailable !== false,
-          }))
-        : [],
+      books,
       readingState: parsed.readingState ?? {},
       syncQueue: Object.fromEntries(
         Object.entries(parsed.syncQueue ?? {}).map(([bookId, row]) => [
           bookId,
-          { ...row, revision: Number(row.revision ?? 0) },
+          {
+            ...row,
+            serverId:
+              row.serverId ?? booksById.get(bookId)?.serverId ?? parsed.serverConfig?.id ?? '',
+            revision: Number(row.revision ?? 0),
+          },
         ]),
       ),
       preferences: parsed.preferences ?? {},
@@ -358,9 +367,6 @@ export async function reconcileBooks(
   );
 }
 
-/** Backward-compatible name for callers that already pass a complete snapshot. */
-export const replaceBooks = reconcileBooks;
-
 const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
    description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
@@ -445,23 +451,22 @@ export async function reconcileBooksInTransaction(
   refreshedAt = new Date().toISOString(),
   preserveMissing = false,
 ): Promise<void> {
-  const tasks = books.map((book) => replaceBookTask(serverId, book, refreshedAt));
+  const tasks: capTask[] = [];
   if (!preserveMissing) {
-    const ids = books.map((book) => book.id);
-    const absent = ids.length ? `id NOT IN (${ids.map(() => '?').join(',')})` : '1=1';
-    const values = [serverId, ...ids];
-    tasks.push(
-      {
-        statement: `UPDATE books SET remote_available=0 WHERE server_id=? AND ${absent}
-          AND ${retainedBookCondition}`,
-        values,
-      },
-      {
-        statement: `DELETE FROM books WHERE server_id=? AND ${absent}
-          AND NOT ${retainedBookCondition}`,
-        values,
-      },
-    );
+    tasks.push({
+      statement: 'UPDATE books SET remote_available=0 WHERE server_id=? AND remote_available=1',
+      values: [serverId],
+    });
+  }
+  for (const book of books) {
+    tasks.push(replaceBookTask(serverId, { ...book, remoteAvailable: true }, refreshedAt));
+  }
+  if (!preserveMissing) {
+    tasks.push({
+      statement: `DELETE FROM books WHERE server_id=? AND remote_available=0
+        AND NOT ${retainedBookCondition}`,
+      values: [serverId],
+    });
   }
   if (!tasks.length) return;
   await executeNativeTransaction(db, tasks);
@@ -525,6 +530,8 @@ export interface StoredReadingState {
   syncedLocalUpdatedAt: string | null;
   serverUpdatedAt: string | null;
   pendingSync: boolean;
+  /** Monotonic reading revision, retained after the queue row is acknowledged. */
+  syncRevision?: number | null;
 }
 
 export interface PendingProgressPayload {
@@ -537,15 +544,18 @@ export interface PendingProgressPayload {
 }
 
 const readingStateUpsertStatement = `INSERT INTO reading_state
-  (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync)
-  VALUES (?,?,?,?,?,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
+  (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync,sync_revision)
+  VALUES (?,?,?,?,?,1,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
   kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
-  local_updated_at=excluded.local_updated_at,pending_sync=1`;
+  local_updated_at=excluded.local_updated_at,pending_sync=1,
+  sync_revision=reading_state.sync_revision+1`;
 
 const syncQueueUpsertStatement = `INSERT INTO sync_queue
-  (book_id,payload_json,created_at,updated_at,revision) VALUES (?,?,?,?,1)
+  (book_id,payload_json,created_at,updated_at,revision)
+  VALUES (?,?,?,?,COALESCE((SELECT sync_revision FROM reading_state WHERE book_id=?),1))
   ON CONFLICT(book_id) DO UPDATE SET payload_json=excluded.payload_json,
-  updated_at=excluded.updated_at,revision=sync_queue.revision+1`;
+  attempt_count=0,last_attempt_at=NULL,last_error=NULL,
+  updated_at=excluded.updated_at,revision=excluded.revision`;
 
 function createReadingStateTask(
   bookId: string,
@@ -567,13 +577,22 @@ function createSyncQueueTask(
 ): capTask {
   return {
     statement: syncQueueUpsertStatement,
-    values: [bookId, JSON.stringify(payload), updatedAt, updatedAt],
+    values: [bookId, JSON.stringify(payload), updatedAt, updatedAt, bookId],
   };
 }
 
 export async function getReadingState(bookId: string): Promise<StoredReadingState | null> {
   if (!Capacitor.isNativePlatform()) {
-    return readBrowserState().readingState[bookId] ?? null;
+    const state = readBrowserState();
+    const readingState = state.readingState[bookId];
+    if (!readingState) return null;
+    return {
+      ...readingState,
+      syncRevision: Math.max(
+        Number(readingState.syncRevision ?? 0),
+        Number(state.syncQueue[bookId]?.revision ?? 0),
+      ),
+    };
   }
   const db = await openDatabase();
   const row = (await db.query('SELECT * FROM reading_state WHERE book_id=?', [bookId])).values?.[0];
@@ -586,6 +605,7 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
     syncedLocalUpdatedAt: row.synced_local_updated_at ? String(row.synced_local_updated_at) : null,
     serverUpdatedAt: row.server_updated_at ? String(row.server_updated_at) : null,
     pendingSync: Number(row.pending_sync) === 1,
+    syncRevision: Number(row.sync_revision ?? 0),
   };
 }
 
@@ -600,6 +620,11 @@ export async function saveLocalProgress(
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      const syncRevision =
+        Math.max(
+          Number(state.readingState[book.id]?.syncRevision ?? 0),
+          Number(state.syncQueue[book.id]?.revision ?? 0),
+        ) + 1;
       state.readingState[book.id] = {
         cfi,
         xpath,
@@ -608,6 +633,7 @@ export async function saveLocalProgress(
         syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
         serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
         pendingSync: true,
+        syncRevision,
       };
       state.syncQueue[book.id] = {
         bookId: book.id,
@@ -619,12 +645,13 @@ export async function saveLocalProgress(
           pageNum: pagesRead,
           bookScrollId: xpath,
         }),
-        attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
-        lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
-        lastError: state.syncQueue[book.id]?.lastError ?? null,
+        serverId: book.serverId,
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
         createdAt: state.syncQueue[book.id]?.createdAt ?? now,
         updatedAt: now,
-        revision: (state.syncQueue[book.id]?.revision ?? 0) + 1,
+        revision: syncRevision,
       };
       state.books = state.books.map((item) =>
         item.id === book.id
@@ -672,6 +699,11 @@ export async function markBookCompleted(
   };
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      const syncRevision =
+        Math.max(
+          Number(state.readingState[book.id]?.syncRevision ?? 0),
+          Number(state.syncQueue[book.id]?.revision ?? 0),
+        ) + 1;
       state.books = state.books.map((item) =>
         item.id === book.id
           ? {
@@ -681,24 +713,26 @@ export async function markBookCompleted(
             }
           : item,
       );
-      if (readingState) {
-        state.readingState[book.id] = {
-          ...readingState,
-          percentage: 1,
-          localUpdatedAt: now,
-          syncedLocalUpdatedAt: readingState.syncedLocalUpdatedAt ?? null,
-          pendingSync: true,
-        };
-      }
+      state.readingState[book.id] = {
+        cfi: readingState?.cfi ?? '',
+        xpath: readingState?.xpath ?? null,
+        percentage: 1,
+        localUpdatedAt: now,
+        syncedLocalUpdatedAt: readingState?.syncedLocalUpdatedAt ?? null,
+        serverUpdatedAt: readingState?.serverUpdatedAt ?? null,
+        pendingSync: true,
+        syncRevision,
+      };
       state.syncQueue[book.id] = {
         bookId: book.id,
         payloadJson: JSON.stringify(payload),
-        attemptCount: state.syncQueue[book.id]?.attemptCount ?? 0,
-        lastAttemptAt: state.syncQueue[book.id]?.lastAttemptAt ?? null,
-        lastError: state.syncQueue[book.id]?.lastError ?? null,
+        serverId: book.serverId,
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
         createdAt: state.syncQueue[book.id]?.createdAt ?? now,
         updatedAt: now,
-        revision: (state.syncQueue[book.id]?.revision ?? 0) + 1,
+        revision: syncRevision,
       };
     });
     return;
@@ -710,9 +744,9 @@ export async function markBookCompleted(
       values: [book.pages, now, book.id],
     },
   ];
-  if (readingState) {
-    tasks.push(createReadingStateTask(book.id, readingState.cfi, readingState.xpath, 1, now));
-  }
+  tasks.push(
+    createReadingStateTask(book.id, readingState?.cfi ?? '', readingState?.xpath ?? null, 1, now),
+  );
   tasks.push(createSyncQueueTask(book.id, payload, now));
   await executeNativeTransaction(db, tasks);
 }
@@ -731,9 +765,10 @@ export interface SyncStatus {
   lastUpdatedAt: string | null;
 }
 
-export async function getPendingSync(): Promise<PendingSyncItem[]> {
+export async function getPendingSync(serverId: string): Promise<PendingSyncItem[]> {
   if (!Capacitor.isNativePlatform()) {
     return Object.values(readBrowserState().syncQueue)
+      .filter((row) => row.serverId === serverId)
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
       .map((row) => ({
         bookId: row.bookId,
@@ -744,7 +779,10 @@ export async function getPendingSync(): Promise<PendingSyncItem[]> {
   }
   const db = await openDatabase();
   const result = await db.query(
-    'SELECT book_id,payload_json,updated_at,revision FROM sync_queue ORDER BY updated_at',
+    `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision
+    FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
+    WHERE books.server_id=? ORDER BY sync_queue.updated_at`,
+    [serverId],
   );
   return (result.values ?? []).map((row) => ({
     bookId: String(row.book_id),
@@ -754,11 +792,11 @@ export async function getPendingSync(): Promise<PendingSyncItem[]> {
   }));
 }
 
-export async function getSyncStatus(): Promise<SyncStatus> {
+export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
-    const rows = Object.values(readBrowserState().syncQueue).sort((a, b) =>
-      b.updatedAt.localeCompare(a.updatedAt),
-    );
+    const rows = Object.values(readBrowserState().syncQueue)
+      .filter((row) => row.serverId === serverId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return {
       pendingCount: rows.length,
       failedCount: rows.filter((row) => Boolean(row.lastError)).length,
@@ -768,7 +806,10 @@ export async function getSyncStatus(): Promise<SyncStatus> {
   }
   const db = await openDatabase();
   const result = await db.query(
-    'SELECT updated_at,last_error FROM sync_queue ORDER BY updated_at DESC',
+    `SELECT sync_queue.updated_at,sync_queue.last_error
+    FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
+    WHERE books.server_id=? ORDER BY sync_queue.updated_at DESC`,
+    [serverId],
   );
   const rows = result.values ?? [];
   return {
@@ -779,6 +820,109 @@ export async function getSyncStatus(): Promise<SyncStatus> {
       : null,
     lastUpdatedAt: rows[0]?.updated_at ? String(rows[0].updated_at) : null,
   };
+}
+
+/**
+ * Accept the server side of an open-progress conflict, but only if the exact
+ * local queue revision shown to the user is still pending.
+ */
+export async function acceptRemoteProgress(
+  book: BookRecord,
+  remote: KavitaProgress,
+  expectedRevision: number,
+  expectedUpdatedAt: string,
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
+  const percentage = book.pages > 0 ? Math.max(0, Math.min(0.999, remote.pageNum / book.pages)) : 0;
+  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+  const xpath = remote.bookScrollId ?? null;
+
+  if (!Capacitor.isNativePlatform()) {
+    return updateBrowserState((state) => {
+      const queue = state.syncQueue[book.id];
+      const reading = state.readingState[book.id];
+      if (
+        !queue ||
+        !reading ||
+        !reading.pendingSync ||
+        Math.max(Number(reading.syncRevision ?? 0), queue.revision) !== expectedRevision ||
+        queue.revision !== expectedRevision ||
+        queue.updatedAt !== expectedUpdatedAt ||
+        reading.localUpdatedAt !== expectedUpdatedAt
+      ) {
+        return false;
+      }
+      state.readingState[book.id] = {
+        ...reading,
+        cfi: '',
+        xpath,
+        percentage,
+        localUpdatedAt: now,
+        syncedLocalUpdatedAt: now,
+        serverUpdatedAt,
+        pendingSync: false,
+        syncRevision: expectedRevision,
+      };
+      delete state.syncQueue[book.id];
+      state.books = state.books.map((item) =>
+        item.id === book.id ? { ...item, pagesRead, lastReadAt: serverUpdatedAt } : item,
+      );
+    });
+  }
+
+  const db = await openDatabase();
+  await executeNativeTransaction(db, [
+    {
+      statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
+        synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?,pending_sync=0
+        WHERE book_id=? AND pending_sync=1 AND local_updated_at=? AND sync_revision=?
+        AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?)`,
+      values: [
+        xpath,
+        percentage,
+        now,
+        now,
+        remote.pageNum,
+        xpath,
+        serverUpdatedAt,
+        book.id,
+        expectedUpdatedAt,
+        expectedRevision,
+        book.id,
+        expectedRevision,
+        expectedUpdatedAt,
+      ],
+    },
+    {
+      statement: `DELETE FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?
+        AND EXISTS (SELECT 1 FROM reading_state WHERE book_id=? AND pending_sync=0
+          AND cfi='' AND local_updated_at=?)`,
+      values: [book.id, expectedRevision, expectedUpdatedAt, book.id, now],
+    },
+    {
+      statement: `UPDATE books SET pages_read=?,last_read_at=?
+        WHERE id=? AND EXISTS (
+          SELECT 1 FROM reading_state WHERE book_id=? AND cfi=''
+          AND local_updated_at=? AND pending_sync=0
+        )`,
+      values: [pagesRead, serverUpdatedAt, book.id, book.id, now],
+    },
+  ]);
+
+  const adopted = (
+    await db.query(
+      'SELECT cfi,local_updated_at,pending_sync,server_updated_at FROM reading_state WHERE book_id=?',
+      [book.id],
+    )
+  ).values?.[0];
+  return Boolean(
+    adopted &&
+    String(adopted.cfi) === '' &&
+    String(adopted.local_updated_at) === now &&
+    Number(adopted.pending_sync) === 0 &&
+    String(adopted.server_updated_at) === serverUpdatedAt,
+  );
 }
 
 export async function confirmSync(
@@ -802,6 +946,7 @@ export async function confirmSync(
           pendingSync: false,
           syncedLocalUpdatedAt: expectedUpdatedAt,
           serverUpdatedAt,
+          syncRevision: expectedRevision,
         };
       }
     });

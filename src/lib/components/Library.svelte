@@ -10,6 +10,7 @@
     getReadingState,
     getPreference,
     getSyncStatus,
+    acceptRemoteProgress,
     markDownloaded,
     markBookCompleted,
     removeDownload,
@@ -21,6 +22,7 @@
     type BookRecord,
     type ServerConfig,
     type SyncStatus,
+    type StoredReadingState,
   } from '../database/database';
   import {
     cacheCover,
@@ -109,7 +111,7 @@
   });
   let books = $state<BookRecord[]>([]);
   let query = $state('');
-  let offlineMessage = $state('Offline. Saved books remain available.');
+  let offlineMessage = $state('');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
   let normalizedQuery = $derived(query.trim().toLowerCase());
@@ -192,9 +194,10 @@
   let conflict = $state<{
     book: BookRecord;
     url: string;
-    localCfi: string;
+    local: StoredReadingState;
     remote: KavitaProgress;
   } | null>(null);
+  let conflictError = $state('');
   let covers = $state<Record<number, string>>({});
   let loading = $state(true);
   let refreshing = $state(false);
@@ -208,6 +211,9 @@
     lastUpdatedAt: null,
   });
   let syncing = $state(false);
+  let syncWork: Promise<void> | null = null;
+  let resolvingOpenProgress = false;
+  let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
   let diagnosticsVisible = $state(false);
   let diagnosticsOutput = $state('');
@@ -215,6 +221,7 @@
   let pendingMode = $state<'light' | 'dark'>('dark');
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
+  let showReplacementKey = $state(false);
   let settingsError = $state('');
   let diagnosticsMessage = $state('');
   let replacingApiKey = $state(false);
@@ -416,34 +423,28 @@
     window.addEventListener('resize', scheduleVirtualWindow);
     scheduleVirtualWindow();
 
-    const savedTheme = await getPreference('uiTheme');
+    const [savedAutoSync, savedSort, savedAuthor, savedSeries, savedView, savedBooks] =
+      await Promise.all([
+        getPreference('syncFurthest'),
+        getPreference('librarySort'),
+        getPreference('libraryAuthor'),
+        getPreference('librarySeries'),
+        getPreference('libraryView'),
+        getBooks(server.id),
+      ]);
     if (destroyed) return;
-    const savedMode = await getPreference('uiMode');
-    if (destroyed) return;
-    const savedAutoSync = await getPreference('syncFurthest');
-    if (destroyed) return;
-    const savedSort = await getPreference('librarySort');
-    if (destroyed) return;
-    const savedAuthor = await getPreference('libraryAuthor');
-    if (destroyed) return;
-    const savedSeries = await getPreference('librarySeries');
-    if (destroyed) return;
-    const savedView = await getPreference('libraryView');
-    if (destroyed) return;
-    pendingTheme = (savedTheme as SkeletonTheme | null) ?? (theme as SkeletonTheme);
-    pendingMode = savedMode === 'light' ? 'light' : mode;
+    pendingTheme = theme as SkeletonTheme;
+    pendingMode = mode;
     pendingAutoSync = savedAutoSync === null ? true : savedAutoSync === 'true';
     sortOrder = parseSortOrder(savedSort);
     authorFilter = savedAuthor ?? '';
     seriesFilter = savedSeries ?? '';
     viewMode = parseViewMode(savedView);
-    books = await getBooks(server.id);
-    if (destroyed) return;
-    await refreshSyncStatus();
-    if (destroyed) return;
+    books = savedBooks;
     retainCoversFor(books);
     void loadCovers(books);
     loading = false;
+    void refreshSyncStatus();
     offline = !(await Network.getStatus()).connected;
     offlineMessage = offline
       ? books.length
@@ -481,9 +482,11 @@
       await registerListener(
         await App.addListener('backButton', () => {
           if (destroyed) return;
-          if (actionMenuBook) closeMenu();
+          if (conflict) closeConflict();
+          else if (actionMenuBook) closeMenu();
           else if (reading) {
-            if (readerBackHandler || document.querySelector('[data-reader-panel]')) return;
+            if (readerBackHandler?.()) return;
+            if (document.querySelector('[data-reader-panel]')) return;
             reading = null;
           } else if (settingsVisible) closeSettings();
           else void App.exitApp();
@@ -504,14 +507,23 @@
 
   async function refreshSyncStatus(): Promise<void> {
     try {
-      syncStatus = await getSyncStatus();
+      const status = await getSyncStatus(server.id);
+      if (!destroyed) syncStatus = status;
     } catch {
       // A status read must not block opening the saved library.
     }
   }
 
-  async function syncProgress(showFeedback = true): Promise<void> {
-    if (syncing) return;
+  function syncProgress(showFeedback = true): Promise<void> {
+    if (syncWork) return syncWork;
+    if (destroyed || conflict || resolvingOpenProgress) return Promise.resolve();
+    syncWork = runProgressSync(showFeedback).finally(() => {
+      syncWork = null;
+    });
+    return syncWork;
+  }
+
+  async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     try {
       if (offline) {
@@ -519,7 +531,7 @@
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client);
+      await flushProgress(client, server.id);
       if (showFeedback) message = 'Reading progress synced.';
     } catch {
       if (showFeedback)
@@ -598,7 +610,6 @@
           cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
       });
       if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
-      offline = true;
       const savedBooks = books.length
         ? 'Showing your saved library.'
         : 'No saved books are available yet.';
@@ -698,7 +709,10 @@
   }
 
   async function download(book: BookRecord): Promise<BookRecord | null> {
-    if (downloadingBookId) return null;
+    if (downloadingBookId) {
+      message = 'A book is already downloading. Try again when it finishes.';
+      return null;
+    }
     downloadingBookId = book.id;
     message = `Downloading ${book.title}...`;
     try {
@@ -793,8 +807,27 @@
       if (refreshed) await open(refreshed, options);
       return;
     }
-    const local = await getReadingState(book.id);
-    const remote = offline ? null : await client.getProgress(book.chapterId).catch(() => null);
+    if (destroyed || reading || conflict || resolvingOpenProgress) return;
+    resolvingOpenProgress = true;
+    let local;
+    let remote;
+    try {
+      // Let an in-flight upload finish before reading both sides. While reading
+      // them or showing a conflict, a new flush must not send the disputed item.
+      await syncWork;
+      [local, remote] = await Promise.all([
+        getReadingState(book.id),
+        offline || book.remoteAvailable === false
+          ? null
+          : client.getProgress(book.chapterId).catch(() => null),
+      ]);
+    } catch {
+      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
+      return;
+    } finally {
+      resolvingOpenProgress = false;
+    }
+    if (destroyed) return;
     const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
     const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
     if (openProgress === 'remote') {
@@ -811,15 +844,15 @@
       reading = {
         book,
         url: file.webViewUrl,
-        cfi: local?.cfi ?? null,
-        xpath: null,
-        percentage: null,
+        cfi: local?.cfi || null,
+        xpath: local?.cfi ? null : (local?.xpath ?? null),
+        percentage: local?.cfi ? null : (local?.percentage ?? null),
       };
       if (preferFurthest) void syncProgress(false);
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
-      openConflict({ book, url: file.webViewUrl, localCfi: local.cfi, remote });
+      openConflict({ book, url: file.webViewUrl, local, remote });
       return;
     }
     reading = {
@@ -834,6 +867,16 @@
             ? metadataPercentage(book)
             : null,
     };
+  }
+
+  async function retryReaderDownload(): Promise<void> {
+    const current = reading;
+    if (!current || offline || current.book.remoteAvailable === false) {
+      throw new Error('This book is not available from Kavita right now.');
+    }
+    const refreshed = await download(current.book);
+    if (!refreshed) throw new Error('Turnleaf could not download this book.');
+    if (reading?.book.id === current.book.id) reading = { ...current, book: refreshed };
   }
 
   function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
@@ -906,20 +949,73 @@
     actionMenuBook = null;
     const opener = actionMenuOpener;
     actionMenuOpener = null;
-    restoreFocus(opener);
+    void tick().then(() => restoreFocus(opener));
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
     conflictOpener = activeElement();
+    conflictError = '';
     conflict = next;
     focusModal(() => conflictDialog);
   }
 
   function closeConflict(): void {
+    if (acceptingRemoteProgress) return;
+    dismissConflict();
+  }
+
+  function dismissConflict(): void {
     conflict = null;
+    conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    restoreFocus(opener);
+    void tick().then(() => restoreFocus(opener));
+  }
+
+  async function continueFromKavita(): Promise<void> {
+    const current = conflict;
+    if (!current || acceptingRemoteProgress) return;
+    const { local } = current;
+    if (!local.pendingSync || local.syncRevision == null) {
+      conflictError =
+        'The local reading position changed. Close and reopen this book to choose again.';
+      return;
+    }
+
+    acceptingRemoteProgress = true;
+    try {
+      const accepted = await acceptRemoteProgress(
+        current.book,
+        current.remote,
+        local.syncRevision,
+        local.localUpdatedAt,
+      );
+      if (!accepted) {
+        dismissConflict();
+        await open(current.book);
+        return;
+      }
+
+      const lastReadAt = current.remote.lastModifiedUtc ?? new Date().toISOString();
+      const pagesRead = Math.max(0, Math.min(current.book.pages, current.remote.pageNum));
+      books = books.map((book) =>
+        book.id === current.book.id ? { ...book, pagesRead, lastReadAt } : book,
+      );
+      reading = {
+        book: current.book,
+        url: current.url,
+        cfi: null,
+        xpath: current.remote.bookScrollId ?? null,
+        percentage: remotePercentage(current.remote, current.book),
+      };
+      dismissConflict();
+      void refreshSyncStatus();
+    } catch {
+      conflictError =
+        'Turnleaf could not confirm that choice. Reopen the book to check its saved position.';
+    } finally {
+      acceptingRemoteProgress = false;
+    }
   }
 
   function openSettings(): void {
@@ -930,9 +1026,10 @@
 
   function closeSettings(): void {
     settingsVisible = false;
+    showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restoreFocus(opener);
+    void tick().then(() => restoreFocus(opener));
   }
 
   function diagnosticsText(): string {
@@ -1091,6 +1188,7 @@
       replacementApiKey = '';
       message = 'API key updated.';
       closeSettings();
+      void refresh();
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -1139,6 +1237,9 @@
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
     onSyncLatest={() => syncLatestForReader(reading!.book)}
+    onRetryDownload={offline || reading.book.remoteAvailable === false
+      ? undefined
+      : retryReaderDownload}
     registerBackHandler={registerReaderBackHandler}
   />
 {:else}
@@ -1147,6 +1248,12 @@
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
     inert={Boolean(actionMenuBook || conflict || settingsVisible)}
   >
+    <p class="sr-only" role="status">
+      {offlineMessage || message || (refreshing ? 'Refreshing library' : '')}
+      {#if !loading && !refreshing}
+        {visibleBooks.length} of {books.length} books.
+      {/if}
+    </p>
     <header class="flex items-center justify-between gap-4">
       <div class="flex min-w-0 items-center gap-3">
         <TurnleafLogo size={36} wordmark={false} />
@@ -1246,8 +1353,8 @@
     {/if}
 
     <div class="mt-5 flex flex-col sm:flex-row sm:items-center">
-      <label class="relative grow">
-        <span class="sr-only">Search your library</span>
+      <div class="relative grow">
+        <label class="sr-only" for="library-search">Search your library</label>
         <svg
           aria-hidden="true"
           viewBox="0 0 24 24"
@@ -1259,7 +1366,8 @@
           />
         </svg>
         <input
-          class="input preset-tonal-surface h-10 pl-10 pr-10 text-sm"
+          id="library-search"
+          class="input preset-tonal-surface h-11 pl-10 pr-14 text-sm"
           type="search"
           placeholder="Search books or authors"
           bind:value={query}
@@ -1280,14 +1388,14 @@
             </svg>
           </button>
         {/if}
-      </label>
+      </div>
       <div
         class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]"
         role="group"
         aria-label="Library filters"
       >
         <button
-          class="h-10 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {downloadedOnly
+          class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {downloadedOnly
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1303,7 +1411,7 @@
           <span class="hidden sm:inline">Downloaded Only</span>
         </button>
         <button
-          class="h-10 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {hideCompleted
+          class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {hideCompleted
             ? 'preset-filled-secondary-100-900'
             : 'preset-filled-primary-700-300'}"
           type="button"
@@ -1322,7 +1430,7 @@
           <span class="hidden sm:inline">Hide completed</span>
         </button>
         <button
-          class="btn btn-sm h-10 w-11 !p-0 rounded-none {filtersVisible || advancedFiltersActive
+          class="btn btn-sm h-11 w-11 !p-0 rounded-none {filtersVisible || advancedFiltersActive
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1338,7 +1446,7 @@
         </button>
         {#if libraryFiltersActive}
           <button
-            class="btn btn-sm h-10 w-11 !p-0 rounded-none preset-tonal-surface"
+            class="btn btn-sm h-11 w-11 !p-0 rounded-none preset-tonal-surface"
             type="button"
             onclick={clearFilters}
             aria-label="Clear library filters"
@@ -1353,66 +1461,63 @@
           </button>
         {/if}
       </div>
-      {#if filtersVisible}
-        <div
-          id="library-filter-panel"
-          class="preset-tonal-surface mt-3 rounded-xl border border-surface-300/40 p-4"
-          role="region"
-          aria-labelledby="library-filter-panel-title"
-          transition:fly={{ y: -8, duration: 160 }}
-        >
-          <div class="flex items-center justify-between gap-3">
-            <h2 id="library-filter-panel-title" class="text-sm font-medium">More filters</h2>
-            {#if advancedFiltersActive}
-              <span class="text-xs text-surface-700-300">Filters active</span>
-            {/if}
-          </div>
-          <div class="mt-3 grid gap-3 sm:grid-cols-3">
-            <label class="label">
-              <span class="label-text">Sort order</span>
-              <select
-                class="select preset-tonal-surface"
-                aria-label="Sort books"
-                value={sortOrder}
-                onchange={handleSortChange}
-              >
-                <option value="title">Title</option>
-                <option value="author">Author</option>
-                <option value="recent">Recently read</option>
-              </select>
-            </label>
-            <label class="label">
-              <span class="label-text">Author</span>
-              <select
-                class="select preset-tonal-surface"
-                aria-label="Filter by author"
-                value={authorFilter}
-                onchange={handleAuthorChange}
-              >
-                <option value="">All authors</option>
-                {#each authors as author (author)}
-                  <option value={author}>{author}</option>
-                {/each}
-              </select>
-            </label>
-            <label class="label">
-              <span class="label-text">Series</span>
-              <select
-                class="select preset-tonal-surface"
-                aria-label="Filter by series"
-                value={seriesFilter}
-                onchange={handleSeriesChange}
-              >
-                <option value="">All series</option>
-                {#each seriesNames as series (series)}
-                  <option value={series}>{series}</option>
-                {/each}
-              </select>
-            </label>
-          </div>
-        </div>
-      {/if}
     </div>
+    {#if filtersVisible}
+      <div
+        id="library-filter-panel"
+        class="preset-tonal-surface mt-3 rounded-xl border border-surface-300/40 p-4"
+        role="region"
+        aria-labelledby="library-filter-panel-title"
+        transition:fly={{ y: -8, duration: 160 }}
+      >
+        <div class="flex items-center justify-between gap-3">
+          <h2 id="library-filter-panel-title" class="text-sm font-medium">More filters</h2>
+          {#if advancedFiltersActive}
+            <span class="text-xs text-surface-700-300">Filters active</span>
+          {/if}
+        </div>
+        <div class="mt-3 grid gap-3 sm:grid-cols-3">
+          <label class="label">
+            <span class="label-text">Sort order</span>
+            <select
+              class="select preset-tonal-surface"
+              value={sortOrder}
+              onchange={handleSortChange}
+            >
+              <option value="title">Title</option>
+              <option value="author">Author</option>
+              <option value="recent">Recently read</option>
+            </select>
+          </label>
+          <label class="label">
+            <span class="label-text">Author</span>
+            <select
+              class="select preset-tonal-surface"
+              value={authorFilter}
+              onchange={handleAuthorChange}
+            >
+              <option value="">All authors</option>
+              {#each authors as author (author)}
+                <option value={author}>{author}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="label">
+            <span class="label-text">Series</span>
+            <select
+              class="select preset-tonal-surface"
+              value={seriesFilter}
+              onchange={handleSeriesChange}
+            >
+              <option value="">All series</option>
+              {#each seriesNames as series (series)}
+                <option value={series}>{series}</option>
+              {/each}
+            </select>
+          </label>
+        </div>
+      </div>
+    {/if}
 
     {#if !loading && books.length > 0}
       <div
@@ -1444,13 +1549,13 @@
       </div>
     {/if}
 
-    {#if offline}
-      <div class="alert preset-tonal-warning mt-5" role="status" transition:fade>
+    {#if offlineMessage}
+      <div class="alert preset-tonal-warning mt-5" transition:fade>
         {offlineMessage}
       </div>
     {/if}
     {#if message}
-      <div class="alert preset-tonal-surface mt-4" role="status" transition:fade>
+      <div class="alert preset-tonal-surface mt-4" transition:fade>
         {message}
       </div>
     {/if}
@@ -1524,7 +1629,7 @@
         style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
         aria-label="Books"
       >
-        {#each Array.from( { length: virtualWindow.lastRow - virtualWindow.firstRow + 1 } ) as _, rowOffset (rowOffset)}
+        {#each Array.from( { length: virtualWindow.lastRow - virtualWindow.firstRow + 1 } ) as _, rowOffset (virtualWindow.firstRow + rowOffset)}
           {@const rowIndex = virtualWindow.firstRow + rowOffset}
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
@@ -1561,6 +1666,21 @@
                               decoding="async"
                               alt=""
                             />
+                          {/if}
+                          {#if book.downloadPath && book.remoteAvailable !== false}
+                            <span
+                              class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
+                              role="img"
+                              title="Downloaded for offline reading"
+                              aria-label="Downloaded for offline reading"
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                                <path
+                                  fill="currentColor"
+                                  d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
+                                />
+                              </svg>
+                            </span>
                           {/if}
                           {#if book.remoteAvailable === false && book.downloadPath}
                             <span
@@ -1644,6 +1764,21 @@
                               decoding="async"
                               alt=""
                             />
+                          {/if}
+                          {#if book.downloadPath && book.remoteAvailable !== false}
+                            <span
+                              class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                              role="img"
+                              title="Downloaded for offline reading"
+                              aria-label="Downloaded for offline reading"
+                            >
+                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                                <path
+                                  fill="currentColor"
+                                  d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
+                                />
+                              </svg>
+                            </span>
                           {/if}
                           {#if book.remoteAvailable === false && book.downloadPath}
                             <span
@@ -1764,7 +1899,7 @@
           </p>
         </div>
         <button
-          class="btn btn-sm h-8 w-8 !p-0"
+          class="btn btn-sm h-11 w-11 !p-0"
           type="button"
           onclick={closeMenu}
           aria-label="Close book actions"
@@ -1794,6 +1929,25 @@
           </svg>
           <span>{actionMenuBook.downloadPath ? 'Open book' : 'Download and open'}</span>
         </button>
+        {#if !actionMenuBook.downloadPath}
+          <button
+            class="btn preset-tonal-surface justify-start"
+            type="button"
+            disabled={Boolean(downloadingBookId) ||
+              offline ||
+              actionMenuBook.remoteAvailable === false}
+            onclick={() => {
+              const book = actionMenuBook;
+              closeMenu();
+              if (book) void download(book);
+            }}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+              <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+            </svg>
+            <span>Download for offline</span>
+          </button>
+        {/if}
         <button
           class="btn preset-tonal-primary justify-start"
           type="button"
@@ -1868,37 +2022,58 @@
     >
       <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
       <p class="mt-3 text-surface-600-400">
-        This device and Kavita both moved since the last sync.
+        This device and Kavita have different reading positions.
       </p>
+      <dl class="mt-4 grid gap-2 text-sm">
+        <div>
+          <dt class="font-medium">This device</dt>
+          <dd>
+            {Math.round(conflict.local.percentage * 100)}% ·
+            {new Date(conflict.local.localUpdatedAt).toLocaleString()}
+          </dd>
+        </div>
+        <div>
+          <dt class="font-medium">Kavita</dt>
+          <dd>
+            {#if conflict.book.pages > 0}
+              {Math.round(Math.min(1, conflict.remote.pageNum / conflict.book.pages) * 100)}%
+            {:else}
+              Page {conflict.remote.pageNum}
+            {/if}
+            {#if conflict.remote.lastModifiedUtc}
+              · {new Date(conflict.remote.lastModifiedUtc).toLocaleString()}
+            {/if}
+          </dd>
+        </div>
+      </dl>
       <div class="mt-6 grid gap-3">
+        {#if conflictError}
+          <p class="text-sm text-error-700-300" role="alert">{conflictError}</p>
+        {/if}
         <button
           class="btn preset-filled-primary-700-300"
           type="button"
+          disabled={acceptingRemoteProgress}
           onclick={() => {
             reading = {
               book: conflict!.book,
               url: conflict!.url,
-              cfi: conflict!.localCfi,
-              xpath: null,
-              percentage: null,
+              cfi: conflict!.local.cfi || null,
+              xpath: conflict!.local.cfi ? null : conflict!.local.xpath,
+              percentage: conflict!.local.percentage,
             };
             closeConflict();
+            void syncProgress(false);
           }}>Continue from this device</button
         >
         <button
           class="btn preset-tonal-primary"
           type="button"
-          onclick={() => {
-            reading = {
-              book: conflict!.book,
-              url: conflict!.url,
-              cfi: null,
-              xpath: conflict!.remote.bookScrollId ?? null,
-              percentage: remotePercentage(conflict!.remote, conflict!.book),
-            };
-            closeConflict();
-          }}>Continue from Kavita</button
+          disabled={acceptingRemoteProgress}
+          onclick={() => void continueFromKavita()}
         >
+          {acceptingRemoteProgress ? 'Saving choice…' : 'Continue from Kavita'}
+        </button>
       </div>
     </div>
   </div>
@@ -1926,7 +2101,7 @@
       >
         <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
         <button
-          class="btn btn-sm preset-tonal-surface h-9 w-9 shrink-0 p-0"
+          class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
           type="button"
           onclick={closeSettings}
           aria-label="Close settings"
@@ -2056,18 +2231,28 @@
         {/if}
 
         <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
-          <label class="label">
-            <span class="label-text">Replace API key</span>
-            <span class="flex">
+          <div class="label">
+            <label for="replacement-api-key" class="label-text">Replace API key</label>
+            <div class="flex flex-wrap gap-2">
               <input
+                id="replacement-api-key"
                 class="input min-w-0 flex-1 max-w-96"
-                type="password"
+                type={showReplacementKey ? 'text' : 'password'}
                 spellcheck="false"
                 autocomplete="off"
                 bind:value={replacementApiKey}
                 placeholder="Enter a new Kavita key"
+                aria-invalid={settingsError ? true : undefined}
+                aria-describedby={settingsError ? 'settings-key-error' : undefined}
                 required
               />
+              <button
+                class="btn preset-tonal-surface"
+                type="button"
+                onclick={() => (showReplacementKey = !showReplacementKey)}
+              >
+                {showReplacementKey ? 'Hide key' : 'Show key'}
+              </button>
               <button
                 class="btn preset-filled-primary-700-300 shrink-0"
                 type="submit"
@@ -2075,14 +2260,19 @@
               >
                 {replacingApiKey ? 'Testing...' : 'Save'}
               </button>
-            </span>
+            </div>
             <span class="label-text text-xs text-surface-700-300">
               The new key is tested before it is saved.
             </span>
-          </label>
-          {#if settingsError}
-            <div class="alert preset-tonal-error" role="alert" transition:fade>{settingsError}</div>
-          {/if}
+          </div>
+          <div
+            id="settings-key-error"
+            role="alert"
+            class:alert={settingsError}
+            class:preset-tonal-error={settingsError}
+          >
+            {settingsError}
+          </div>
           <button
             class="btn preset-tonal-error"
             type="button"

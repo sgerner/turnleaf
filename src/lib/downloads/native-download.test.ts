@@ -37,7 +37,7 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
-import { downloadEpub, verifyDownloadedEpub } from './native-download';
+import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
@@ -187,5 +187,20 @@ describe('native EPUB download boundary', () => {
   it('clears a file whose contents fail EPUB validation', async () => {
     await expect(verifyDownloadedEpub('books/book.epub')).resolves.toBeNull();
     expect(native.deleted).toEqual(['books/book.epub']);
+  });
+});
+
+describe('native cover cache', () => {
+  it('serves a cached cover without checking or creating its parent directories', async () => {
+    await expect(cacheCover('https://books.example.com/cover', 'secret', 7)).resolves.toBe(
+      'web://file://covers/default/7.img',
+    );
+
+    expect(Filesystem.stat).toHaveBeenCalledExactlyOnceWith({
+      path: 'covers/default/7.img',
+      directory: 'DATA',
+    });
+    expect(Filesystem.mkdir).not.toHaveBeenCalled();
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
 });

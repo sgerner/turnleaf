@@ -68,7 +68,11 @@ export interface DownloadedBookFile {
 async function ensureDataDirectory(path: string): Promise<void> {
   const existing = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (existing?.type === 'directory') return;
-  await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true });
+  try {
+    await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true });
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code !== 'OS-PLUG-FILE-0010') throw error;
+  }
 }
 
 export async function downloadEpub(
@@ -84,7 +88,6 @@ export async function downloadEpub(
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}.partial`;
   const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
-  let renamed = false;
 
   try {
     for (let attempt = 0; ; attempt += 1) {
@@ -127,23 +130,21 @@ export async function downloadEpub(
     await validateEpubArchive(stat.size, (offset, length) =>
       readNativeRange(temporaryPath, offset, length),
     );
+    const final = await Filesystem.getUri({ path: finalPath, directory: Directory.Data });
+    const webViewUrl = Capacitor.convertFileSrc(final.uri);
     await Filesystem.rename({
       from: temporaryPath,
       to: finalPath,
       directory: Directory.Data,
     });
-    renamed = true;
-    const final = await Filesystem.getUri({ path: finalPath, directory: Directory.Data });
     return {
       relativePath: finalPath,
       nativeUri: final.uri,
-      webViewUrl: Capacitor.convertFileSrc(final.uri),
+      webViewUrl,
       size: stat.size,
     };
   } catch (error) {
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
-    if (renamed)
-      await Filesystem.deleteFile({ path: finalPath, directory: Directory.Data }).catch(() => {});
     throw error;
   }
 }
@@ -191,17 +192,14 @@ export async function cacheCover(
   cacheNamespace = 'default',
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-  const directory = 'covers';
   const namespace = safeCoverNamespace(cacheNamespace);
-  const path = `${directory}/${namespace}/${seriesId}.img`;
+  const directory = `covers/${namespace}`;
+  const path = `${directory}/${seriesId}.img`;
   const temporaryPath = `${path}.partial`;
-  await ensureDataDirectory(directory);
-  await ensureDataDirectory(`${directory}/${namespace}`);
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-  const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
     try {
@@ -226,6 +224,7 @@ export async function cacheCover(
     }
   }
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   return Capacitor.convertFileSrc(existing.uri);
 }
 
