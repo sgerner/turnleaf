@@ -12,6 +12,8 @@ export const MAX_EPUB_EXPANDED_SIZE = 1024 * 1024 * 1024;
 /** Keep central-directory inspection bounded even for a hostile entry count. */
 export const MAX_EPUB_ENTRIES = 10_000;
 export const MAX_EPUB_CENTRAL_DIRECTORY_SIZE = 16 * 1024 * 1024;
+const MAX_REPAIR_FILE_SIZE = 16 * 1024 * 1024;
+const CONTAINER_PATH = 'META-INF/container.xml';
 const MAX_CONTAINER_XML_SIZE = 1024 * 1024;
 const INITIAL_READ_SIZE = 4096;
 const ZIP_TAIL_READ_SIZE = ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH + ZIP_MAX_COMMENT_LENGTH;
@@ -256,12 +258,12 @@ async function readBoundedStream(stream: ReadableStream<Uint8Array>): Promise<Ui
   return bytes;
 }
 
-async function validateContainerEntry(
+async function readXmlEntry(
   entry: EpubArchiveEntry,
   archiveOffset: number,
   fileSize: number,
   readRange: EpubRangeReader,
-): Promise<void> {
+): Promise<Uint8Array | undefined> {
   const localHeader = await readRange(entry.localHeaderOffset, 30);
   requireRange(localHeader, 30, 'The EPUB container local header is truncated.');
   if (!hasSignature(localHeader, 0, ZIP_LOCAL_FILE_HEADER)) {
@@ -313,18 +315,136 @@ async function validateContainerEntry(
   ) {
     throw new EpubValidationError('The EPUB container entry is malformed.');
   }
-  validateContainerXml(uncompressed);
+  return uncompressed;
+}
+
+function createContainerRecords(
+  packagePath: string,
+  centralDirectory: Uint8Array,
+  centralDirectoryOffset: number,
+  entryCount: number,
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const name = encoder.encode(CONTAINER_PATH);
+  const xml = encoder.encode(
+    '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">' +
+      '<rootfiles><rootfile media-type="application/oebps-package+xml" full-path="' +
+      packagePath +
+      '"/></rootfiles></container>',
+  );
+  let crc = 0xffffffff;
+  for (const byte of xml) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  crc ^= 0xffffffff;
+
+  // Replace the old directory with the new entry, updated directory and end record.
+  // Offsets to all original entries remain valid.
+  const localSize = 30 + name.length + xml.length;
+  const newEntryOffset = localSize + centralDirectory.length;
+  const endOffset = newEntryOffset + 46 + name.length;
+  const bytes = new Uint8Array(endOffset + ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, ZIP_LOCAL_FILE_HEADER, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(12, 33, true); // January 1, 1980 in DOS date format.
+  view.setUint32(14, crc, true);
+  view.setUint32(18, xml.length, true);
+  view.setUint32(22, xml.length, true);
+  view.setUint16(26, name.length, true);
+  bytes.set(name, 30);
+  bytes.set(xml, 30 + name.length);
+  bytes.set(centralDirectory, localSize);
+
+  view.setUint32(newEntryOffset, ZIP_CENTRAL_DIRECTORY_ENTRY, true);
+  view.setUint16(newEntryOffset + 4, 20, true);
+  bytes.set(bytes.subarray(4, 30), newEntryOffset + 6);
+  view.setUint32(newEntryOffset + 42, centralDirectoryOffset, true);
+  bytes.set(name, newEntryOffset + 46);
+
+  view.setUint32(endOffset, ZIP_END_OF_CENTRAL_DIRECTORY, true);
+  view.setUint16(endOffset + 8, entryCount + 1, true);
+  view.setUint16(endOffset + 10, entryCount + 1, true);
+  view.setUint32(endOffset + 12, endOffset - localSize, true);
+  view.setUint32(endOffset + 16, centralDirectoryOffset + localSize, true);
+  return bytes;
+}
+
+async function findRecoveryPackage(
+  entries: EpubArchiveEntry[],
+  archiveOffset: number,
+  fileSize: number,
+  readRange: EpubRangeReader,
+): Promise<string | undefined> {
+  const candidates = entries.filter((entry) => /\.opf$/i.test(entry.name));
+  const entry = candidates[0];
+  if (
+    candidates.length !== 1 ||
+    !entry ||
+    !/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(entry.name) ||
+    entry.compressedSize > MAX_CONTAINER_XML_SIZE ||
+    entry.uncompressedSize > MAX_CONTAINER_XML_SIZE ||
+    typeof DOMParser === 'undefined'
+  ) {
+    return;
+  }
+
+  const bytes = await readXmlEntry(entry, archiveOffset, fileSize, readRange);
+  if (!bytes) return;
+  let xml: string;
+  try {
+    xml = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return;
+  }
+  if (/<!DOCTYPE/i.test(xml)) return;
+  const root = new DOMParser().parseFromString(xml, 'application/xml').documentElement;
+  if (root.localName !== 'package' || root.namespaceURI !== 'http://www.idpf.org/2007/opf') return;
+  const children = Array.from(root.children);
+  const manifest = children.find((child) => child.localName === 'manifest');
+  const spine = children.find((child) => child.localName === 'spine');
+  if (!manifest || !spine) return;
+  const items = new Map(
+    Array.from(manifest.children, (item) => [item.getAttribute('id'), item.getAttribute('href')]),
+  );
+  const chapters = Array.from(spine.children).filter((child) => child.localName === 'itemref');
+  const names = new Set(entries.map((archiveEntry) => archiveEntry.name));
+  const base = new URL(entry.name, 'https://epub.invalid/');
+  if (
+    chapters.length > 0 &&
+    chapters.every((chapter) => {
+      const href = items.get(chapter.getAttribute('idref'));
+      if (!href) return false;
+      try {
+        const url = new URL(href, base);
+        return (
+          url.origin === base.origin &&
+          !url.pathname.endsWith('/') &&
+          names.has(decodeURIComponent(url.pathname.slice(1)))
+        );
+      } catch {
+        return false;
+      }
+    })
+  ) {
+    return entry.name;
+  }
 }
 
 /**
  * Inspect only the ZIP header, end record, and central directory. The caller
  * supplies a range reader so native files are never loaded wholesale merely
- * to decide whether they are safe to mark as available.
+ * to decide whether they are safe to mark as available. When recovery is enabled,
+ * return a repaired copy only for a small archive with an identifiable package.
  */
 export async function validateEpubArchive(
   fileSize: number,
   readRange: EpubRangeReader,
-): Promise<void> {
+  allowContainerRecovery = false,
+): Promise<Uint8Array | undefined> {
   if (!Number.isSafeInteger(fileSize) || fileSize < ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH) {
     throw new EpubValidationError('The downloaded EPUB is empty or too small.');
   }
@@ -383,9 +503,38 @@ export async function validateEpubArchive(
   }
 
   const mimetype = archiveEntries[0];
-  const container = archiveEntries.find((entry) => entry.name === 'META-INF/container.xml');
+  const container = archiveEntries.find((entry) => entry.name === CONTAINER_PATH);
   if (!mimetype || !container) {
-    throw new EpubValidationError('The EPUB is missing its required container files.');
+    const error = new EpubValidationError('The EPUB is missing its required container files.');
+    if (
+      !allowContainerRecovery ||
+      !mimetype ||
+      fileSize > MAX_REPAIR_FILE_SIZE ||
+      entries >= MAX_EPUB_ENTRIES
+    ) {
+      throw error;
+    }
+    validateMimetypeEntry(head, mimetype);
+    const packagePath = await findRecoveryPackage(
+      archiveEntries,
+      centralDirectoryOffset,
+      fileSize,
+      readRange,
+    );
+    if (!packagePath) throw error;
+
+    const records = createContainerRecords(
+      packagePath,
+      centralDirectory,
+      centralDirectoryOffset,
+      entries,
+    );
+    const repaired = new Uint8Array(centralDirectoryOffset + records.length);
+    const prefix = await readRange(0, centralDirectoryOffset);
+    requireRange(prefix, centralDirectoryOffset, 'The downloaded EPUB is truncated.');
+    repaired.set(prefix);
+    repaired.set(records, centralDirectoryOffset);
+    return repaired;
   }
   if (
     container.name.endsWith('/') ||
@@ -395,5 +544,6 @@ export async function validateEpubArchive(
     throw new EpubValidationError('The EPUB container.xml entry is invalid.');
   }
   validateMimetypeEntry(head, mimetype);
-  await validateContainerEntry(container, centralDirectoryOffset, fileSize, readRange);
+  const xml = await readXmlEntry(container, centralDirectoryOffset, fileSize, readRange);
+  if (xml) validateContainerXml(xml);
 }

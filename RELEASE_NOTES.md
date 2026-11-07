@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
+
 - chore: remove unused web assets and template code
 - fix: recover missing Kavita keys without replacing the saved library
 - ci: verify Android release artifacts and streamline checks

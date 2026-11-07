@@ -147,6 +147,44 @@ describe('EPUB container validation', () => {
     );
   });
 
+  it('repairs a missing container only when one package points to chapters in the ZIP', async () => {
+    const packageDocument = {
+      name: 'OEBPS/content.opf',
+      data: new TextEncoder().encode(
+        '<package xmlns="http://www.idpf.org/2007/opf"><manifest>' +
+          '<item id="chapter" href="chapter.xhtml"/></manifest>' +
+          '<spine><itemref idref="chapter"/></spine></package>',
+      ),
+    };
+    const entries = validEntries([
+      packageDocument,
+      { name: 'OEBPS/chapter.xhtml', data: new TextEncoder().encode('<html/>') },
+    ]).filter((entry) => entry.name !== 'META-INF/container.xml');
+    const repair = (archive: Uint8Array) =>
+      validateEpubArchive(
+        archive.length,
+        async (offset, length) => archive.slice(offset, offset + length),
+        true,
+      );
+    const original = makeZip(entries);
+    await expectInvalid(original);
+    const repaired = await repair(original);
+    expect(repaired).toBeDefined();
+    expect(new TextDecoder().decode(repaired)).toContain('full-path="OEBPS/content.opf"');
+    await expect(
+      validateEpubArchive(repaired!.length, async (offset, length) =>
+        repaired!.slice(offset, offset + length),
+      ),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      repair(makeZip([...entries, { ...packageDocument, name: 'alternate.opf' }])),
+    ).rejects.toThrow(/missing its required container files/);
+    await expect(
+      repair(makeZip(entries.filter((entry) => !entry.name.endsWith('.xhtml')))),
+    ).rejects.toThrow(/missing its required container files/);
+  });
+
   it('rejects malformed container XML even when the ZIP structure is intact', async () => {
     await expectInvalid(
       makeZip([
