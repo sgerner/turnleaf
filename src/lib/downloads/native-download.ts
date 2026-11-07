@@ -127,9 +127,25 @@ export async function downloadEpub(
     }
     const stat = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
     if (stat.type !== 'file') throw new EpubValidationError('Kavita did not return an EPUB file.');
-    await validateEpubArchive(stat.size, (offset, length) =>
-      readNativeRange(temporaryPath, offset, length),
-    );
+    const readRange = (offset: number, length: number) =>
+      readNativeRange(temporaryPath, offset, length);
+    const repaired = await validateEpubArchive(stat.size, readRange, true);
+    if (repaired) {
+      let binary = '';
+      for (let offset = 0; offset < repaired.length; offset += 8192) {
+        binary += String.fromCharCode(...repaired.subarray(offset, offset + 8192));
+      }
+      await Filesystem.writeFile({
+        path: temporaryPath,
+        directory: Directory.Data,
+        data: btoa(binary),
+      });
+      const written = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
+      if (written.type !== 'file' || written.size !== repaired.length) {
+        throw new Error('The repaired EPUB could not be saved.');
+      }
+      await validateEpubArchive(written.size, readRange);
+    }
     const final = await Filesystem.getUri({ path: finalPath, directory: Directory.Data });
     const webViewUrl = Capacitor.convertFileSrc(final.uri);
     await Filesystem.rename({
@@ -141,7 +157,7 @@ export async function downloadEpub(
       relativePath: finalPath,
       nativeUri: final.uri,
       webViewUrl,
-      size: stat.size,
+      size: repaired?.length ?? stat.size,
     };
   } catch (error) {
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
