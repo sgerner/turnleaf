@@ -96,4 +96,13 @@ export const migrations = [
       ALTER TABLE sync_queue ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    version: 7,
+    statements: `
+      ALTER TABLE reading_state ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;
+      UPDATE reading_state SET sync_revision=COALESCE(
+        (SELECT revision FROM sync_queue WHERE sync_queue.book_id=reading_state.book_id), 0
+      );
+    `,
+  },
 ] as const;

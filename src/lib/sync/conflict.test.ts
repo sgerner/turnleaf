@@ -101,6 +101,17 @@ describe('reader open progress selection', () => {
     expect(chooseOpenProgress(local, remote, 100, false)).toBe('remote');
   });
 
+  it('keeps the exact local CFI when Kavita points to the same saved XPath', () => {
+    expect(
+      chooseOpenProgress(
+        { ...local, cfi: 'epubcfi(/6/4!/4/2/1:12)', xpath: remote.bookScrollId },
+        remote,
+        100,
+        false,
+      ),
+    ).toBe('local');
+  });
+
   it('uses Kavita page progress when no XPath was saved', () => {
     expect(chooseOpenProgress(null, { pageNum: 40 }, 100, false)).toBe('remote');
     expect(chooseOpenProgress(local, { pageNum: 40 }, 100, false)).toBe('remote');

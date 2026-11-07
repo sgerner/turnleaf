@@ -49,6 +49,7 @@ const pendingState = (updatedAt: string, payloadJson: string, revision = 1) => (
   syncQueue: {
     'book-1': {
       bookId: 'book-1',
+      serverId: 'server',
       payloadJson,
       attemptCount: 0,
       lastAttemptAt: null,
@@ -116,7 +117,7 @@ it('keeps and uploads a newer local relocation when an older upload completes', 
       return uploaded;
     })
     .mockResolvedValue(undefined);
-  const flush = flushProgress({ saveProgress } as never);
+  const flush = flushProgress({ saveProgress } as never, 'server');
   await started;
 
   await saveLocalProgress(book, 'cfi-b', 'xpath-b', 0.2);
@@ -131,7 +132,7 @@ it('keeps and uploads a newer local relocation when an older upload completes', 
   expect(saved.readingState['book-1']?.pendingSync).toBe(true);
   expect(saved.readingState['book-1']?.syncedLocalUpdatedAt).toBeNull();
 
-  await flushProgress({ saveProgress } as never);
+  await flushProgress({ saveProgress } as never, 'server');
 
   expect(saveProgress).toHaveBeenNthCalledWith(
     2,
@@ -159,6 +160,7 @@ it('continues syncing later items when an earlier item fails', async () => {
   state.syncQueue['book-2'] = {
     ...state.syncQueue['book-1']!,
     bookId: 'book-2',
+    serverId: 'server',
     payloadJson: '{"pageNum":2}',
     createdAt: '2026-09-07T00:00:01.000Z',
     updatedAt: '2026-09-07T00:00:01.000Z',
@@ -171,7 +173,7 @@ it('continues syncing later items when an earlier item fails', async () => {
     .mockRejectedValueOnce(new Error('first item failed'))
     .mockResolvedValueOnce(undefined);
 
-  await expect(flushProgress({ saveProgress } as never)).rejects.toThrow(
+  await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
     '1 reading progress item failed to sync.',
   );
   expect(saveProgress).toHaveBeenCalledTimes(2);
@@ -180,4 +182,54 @@ it('continues syncing later items when an earlier item fails', async () => {
   expect(saved.syncQueue['book-1']?.lastError).toBe('first item failed');
   expect(saved.syncQueue['book-2']).toBeUndefined();
   expect(saved.readingState['book-2']?.pendingSync).toBe(false);
+});
+
+it('runs independent server queues without sharing an in-flight flush promise', async () => {
+  type QueueFixture = ReturnType<typeof pendingState>;
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as Omit<
+    QueueFixture,
+    'syncQueue'
+  > & {
+    syncQueue: Record<string, QueueFixture['syncQueue']['book-1']>;
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'other',
+    payloadJson: '{"pageNum":2}',
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  let releaseFirst!: () => void;
+  const firstBlocked = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const firstSave = vi.fn(() => firstBlocked);
+  const secondSave = vi.fn().mockResolvedValue(undefined);
+
+  const firstFlush = flushProgress({ saveProgress: firstSave } as never, 'server');
+  const secondFlush = flushProgress({ saveProgress: secondSave } as never, 'other');
+  await secondFlush;
+
+  expect(firstSave).toHaveBeenCalledOnce();
+  expect(secondSave).toHaveBeenCalledOnce();
+  releaseFirst();
+  await firstFlush;
+});
+
+it('allows a manual retry after an authorization failure', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}')),
+  );
+  const saveProgress = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('Kavita rejected this auth key.'))
+    .mockResolvedValueOnce(undefined);
+  const client = { saveProgress } as never;
+
+  await expect(flushProgress(client, 'server')).rejects.toThrow('1 reading progress item failed');
+  await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
+
+  expect(saveProgress).toHaveBeenCalledTimes(2);
 });

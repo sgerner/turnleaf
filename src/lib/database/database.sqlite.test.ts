@@ -228,6 +228,33 @@ describe('native metadata transactions against SQLite', () => {
     });
   });
 
+  it('reconciles a large snapshot with bounded SQL parameter counts', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const downloaded = { ...baseBook, remoteAvailable: false };
+    await replaceBooksInTransaction(adapter, 'server', [downloaded]);
+    const snapshot = Array.from({ length: 1_001 }, (_, index) => ({
+      ...baseBook,
+      id: `server:2:${index}`,
+      chapterId: index,
+      downloadPath: null,
+    }));
+
+    await reconcileBooksInTransaction(
+      {
+        executeTransaction(tasks) {
+          expect(Math.max(...tasks.map((task) => task.values?.length ?? 0))).toBeLessThan(999);
+          return adapter.executeTransaction(tasks);
+        },
+      },
+      'server',
+      [downloaded, ...snapshot],
+    );
+
+    expect(readBook(db, downloaded.id)).toMatchObject({ remote_available: 1 });
+    expect(db.prepare('SELECT COUNT(*) AS total FROM books').get()).toEqual({ total: 1_002 });
+  });
+
   it('preserves every SQLite row and availability when a partial snapshot is empty', async () => {
     db = createDatabase();
     const adapter = createAdapter(db);

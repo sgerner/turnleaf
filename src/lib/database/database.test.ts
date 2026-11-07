@@ -1,8 +1,10 @@
 import { expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 import {
+  acceptRemoteProgress,
   confirmSync,
   getBooks,
+  getPendingSync,
   getSyncStatus,
   reconcileBooks,
   replaceBooksInTransaction,
@@ -591,12 +593,13 @@ it('reports pending and failed browser sync work for recovery UI', async () => {
   localStorage.setItem(
     BROWSER_STORAGE_KEY,
     JSON.stringify({
-      serverConfig: null,
+      serverConfig: { id: 'server' },
       books: [],
       readingState: {},
       syncQueue: {
         'book-1': {
           bookId: 'book-1',
+          serverId: 'server',
           payloadJson: '{}',
           attemptCount: 1,
           lastAttemptAt: '2026-09-07T00:00:01.000Z',
@@ -606,6 +609,7 @@ it('reports pending and failed browser sync work for recovery UI', async () => {
         },
         'book-2': {
           bookId: 'book-2',
+          serverId: 'server',
           payloadJson: '{}',
           attemptCount: 0,
           lastAttemptAt: null,
@@ -618,10 +622,194 @@ it('reports pending and failed browser sync work for recovery UI', async () => {
     }),
   );
 
-  await expect(getSyncStatus()).resolves.toEqual({
+  await expect(getSyncStatus('server')).resolves.toEqual({
     pendingCount: 2,
     failedCount: 1,
     lastError: 'Kavita rejected this auth key.',
     lastUpdatedAt: '2026-09-07T00:00:02.000Z',
   });
+});
+
+it('scopes browser progress queues to their server', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const otherBook = { ...existingBook, id: 'other:1:10', serverId: 'other' };
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook, otherBook],
+      readingState: {},
+      syncQueue: {
+        [existingBook.id]: {
+          bookId: existingBook.id,
+          serverId: existingBook.serverId,
+          payloadJson: '{"pageNum":20}',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: '2026-09-07T00:00:00.000Z',
+          updatedAt: '2026-09-07T00:00:00.000Z',
+          revision: 1,
+        },
+        [otherBook.id]: {
+          bookId: otherBook.id,
+          serverId: otherBook.serverId,
+          payloadJson: '{"pageNum":80}',
+          attemptCount: 1,
+          lastAttemptAt: '2026-09-07T00:00:02.000Z',
+          lastError: 'wrong server',
+          createdAt: '2026-09-07T00:00:00.000Z',
+          updatedAt: '2026-09-07T00:00:02.000Z',
+          revision: 2,
+        },
+      },
+      preferences: {},
+    }),
+  );
+
+  await expect(getPendingSync('server')).resolves.toMatchObject([
+    { bookId: existingBook.id, payload: '{"pageNum":20}' },
+  ]);
+  await expect(getSyncStatus('server')).resolves.toEqual({
+    pendingCount: 1,
+    failedCount: 0,
+    lastError: null,
+    lastUpdatedAt: '2026-09-07T00:00:00.000Z',
+  });
+});
+
+it('clears retry errors when a new browser progress revision replaces the failed payload', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'old-cfi',
+          xpath: '/old',
+          percentage: 0.25,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+        },
+      },
+      syncQueue: {
+        [existingBook.id]: {
+          bookId: existingBook.id,
+          serverId: 'server',
+          payloadJson: '{"pageNum":25}',
+          attemptCount: 2,
+          lastAttemptAt: updatedAt,
+          lastError: 'expired key',
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 3,
+        },
+      },
+      preferences: {},
+    }),
+  );
+
+  await saveLocalProgress(existingBook, 'new-cfi', '/new', 0.8);
+
+  const state = JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    syncQueue: Record<
+      string,
+      {
+        attemptCount: number;
+        lastAttemptAt: string | null;
+        lastError: string | null;
+        revision: number;
+      }
+    >;
+  };
+  expect(state.syncQueue[existingBook.id]).toMatchObject({
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    revision: 4,
+  });
+  await expect(getSyncStatus('server')).resolves.toMatchObject({
+    pendingCount: 1,
+    failedCount: 0,
+    lastError: null,
+  });
+});
+
+it('accepts the selected browser server progress and drops only the displayed local revision', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'local-cfi',
+          xpath: '/local',
+          percentage: 0.4,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+        },
+      },
+      syncQueue: {
+        [existingBook.id]: {
+          bookId: existingBook.id,
+          serverId: 'server',
+          payloadJson: '{"pageNum":40}',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 2,
+        },
+      },
+      preferences: {},
+    }),
+  );
+
+  const remote = {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 10,
+    chapterId: 10,
+    pageNum: 80,
+    bookScrollId: '/remote',
+    lastModifiedUtc: '2026-09-07T00:00:05.000Z',
+  };
+  await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(true);
+  expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
+    readingState: {
+      [existingBook.id]: {
+        cfi: '',
+        xpath: '/remote',
+        percentage: 0.8,
+        pendingSync: false,
+      },
+    },
+    syncQueue: {},
+    books: [{ id: existingBook.id, pagesRead: 80 }],
+  });
+
+  await saveLocalProgress(existingBook, 'newer-cfi', '/newer', 0.9);
+  const newer = await getPendingSync('server');
+  await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
+  await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
