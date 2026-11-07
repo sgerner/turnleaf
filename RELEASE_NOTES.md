@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- chore: remove unused web assets and template code
 - fix: recover missing Kavita keys without replacing the saved library
 - ci: verify Android release artifacts and streamline checks
 - fix: preserve offline EPUBs after transient storage errors

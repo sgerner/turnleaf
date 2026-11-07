@@ -4,13 +4,6 @@ export interface KavitaLibrary {
   type: number;
 }
 
-export interface KavitaUser {
-  id: number;
-  username: string;
-  token: string;
-  kavitaVersion: string;
-}
-
 export interface KavitaProgress {
   libraryId: number;
   seriesId: number;
