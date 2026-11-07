@@ -6,7 +6,13 @@
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
-  let { onConnected }: { onConnected: (server: ServerConfig) => void } = $props();
+  let {
+    savedServer = null,
+    onConnected,
+  }: {
+    savedServer?: ServerConfig | null;
+    onConnected: (server: ServerConfig, key: string) => void;
+  } = $props();
 
   let serverUrl = $state('');
   let displayName = $state('Books');
@@ -14,24 +20,37 @@
   let allowHttp = $state(false);
   let busy = $state(false);
   let error = $state('');
+  let invalidField = $state<'address' | 'key' | null>(null);
+  let showKey = $state(false);
 
   async function connect(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     error = '';
+    invalidField = null;
     busy = true;
 
     try {
-      const normalized = normalizeServerUrl(serverUrl);
-      if (normalized.insecure && !allowHttp) {
+      const normalized = normalizeServerUrl(savedServer?.baseUrl ?? serverUrl);
+      if (!savedServer && normalized.insecure && !allowHttp) {
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
-      if (!apiKey.trim()) throw new Error('Enter a Kavita auth key.');
+      const key = apiKey.trim();
+      if (!key) {
+        invalidField = 'key';
+        throw new Error('Enter a Kavita auth key.');
+      }
 
-      const result = await new KavitaClient(normalized.baseUrl, apiKey.trim()).testConnection();
+      const result = await new KavitaClient(normalized.baseUrl, key).testConnection();
       if (result.bookLibraries.length === 0) {
         throw new Error(
           'This account has no book or light novel libraries. Other media types are not supported.',
         );
+      }
+
+      if (savedServer) {
+        await saveApiKey(savedServer.credentialRef, key);
+        onConnected(savedServer, key);
+        return;
       }
 
       const id = 'primary';
@@ -45,7 +64,7 @@
         lastConnectedAt: new Date().toISOString(),
       };
 
-      await saveApiKey(credentialRef, apiKey.trim());
+      await saveApiKey(credentialRef, key);
       try {
         await saveServer(server);
       } catch (storageError) {
@@ -65,8 +84,10 @@
         );
       }
       apiKey = '';
-      onConnected(server);
+      onConnected(server, key);
     } catch (cause) {
+      if (cause instanceof ServerUrlError) invalidField = 'address';
+      if (cause instanceof KavitaError && cause.kind === 'authentication') invalidField = 'key';
       if (
         cause instanceof KavitaError ||
         cause instanceof ServerUrlError ||
@@ -90,10 +111,18 @@
     <h1
       class="mt-6 font-serif text-4xl leading-[1.05] tracking-tight text-surface-950-50 sm:text-5xl lg:mt-10 lg:text-6xl"
     >
-      Your books,<br />quietly at hand.
+      {#if savedServer}
+        Reconnect to Kavita
+      {:else}
+        Your books,<br />quietly at hand.
+      {/if}
     </h1>
     <p class="mt-5 max-w-md text-base leading-relaxed text-surface-900-100 sm:text-lg">
-      Connect directly to Kavita. Download EPUB books and keep your place across devices.
+      {#if savedServer}
+        Enter a new auth key for {savedServer.baseUrl} to reopen your saved library.
+      {:else}
+        Connect directly to Kavita. Download EPUB books and keep your place across devices.
+      {/if}
     </p>
   </header>
 
@@ -102,58 +131,82 @@
       class="card preset-filled-surface-50-950 space-y-5 p-6 shadow-2xl sm:p-8"
       onsubmit={connect}
     >
-      <label class="label">
-        <span class="label-text">Kavita server address</span>
-        <input
-          class="input"
-          type="url"
-          inputmode="url"
-          autocomplete="url"
-          placeholder="https://books.example.com"
-          bind:value={serverUrl}
-          required
-        />
-      </label>
-
-      {#if serverUrl.trim().toLowerCase().startsWith('http://')}
-        <label
-          class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
-          transition:fade
-        >
-          <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
-          <span
-            >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
-            and auth key.</span
-          >
+      {#if !savedServer}
+        <label class="label">
+          <span class="label-text">Kavita server address</span>
+          <input
+            class="input"
+            type="url"
+            inputmode="url"
+            autocomplete="url"
+            placeholder="https://books.example.com"
+            bind:value={serverUrl}
+            aria-invalid={invalidField === 'address' || undefined}
+            aria-describedby={error ? 'connection-error' : undefined}
+            required
+          />
         </label>
+
+        {#if serverUrl.trim().toLowerCase().startsWith('http://')}
+          <label
+            class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
+            transition:fade
+          >
+            <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
+            <span
+              >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
+              and auth key.</span
+            >
+          </label>
+        {/if}
       {/if}
 
-      <label class="label">
-        <span class="label-text">Auth key</span>
-        <input
-          class="input"
-          type="password"
-          autocomplete="off"
-          spellcheck="false"
-          bind:value={apiKey}
-          required
-        />
+      <div class="label">
+        <label class="label-text" for="kavita-auth-key">Auth key</label>
+        <div class="flex gap-2">
+          <input
+            id="kavita-auth-key"
+            class="input min-w-0 flex-1"
+            type={showKey ? 'text' : 'password'}
+            autocomplete="off"
+            spellcheck="false"
+            bind:value={apiKey}
+            aria-invalid={invalidField === 'key' || undefined}
+            aria-describedby={error ? 'connection-error' : undefined}
+            required
+          />
+          <button
+            class="btn preset-tonal-surface"
+            type="button"
+            onclick={() => (showKey = !showKey)}
+          >
+            {showKey ? 'Hide key' : 'Show key'}
+          </button>
+        </div>
         <span class="label-text text-xs text-surface-800-200">
           Create this in Kavita for a dedicated non-administrator account with access only to the
           book or light novel libraries you want on this device.
         </span>
-      </label>
+      </div>
 
-      <label class="label">
-        <span class="label-text">
-          Library name <span class="text-surface-600-400">Optional</span></span
-        >
-        <input class="input" autocomplete="organization" bind:value={displayName} />
-      </label>
-
-      {#if error}
-        <div class="card preset-tonal-error p-4" role="alert" transition:fade>{error}</div>
+      {#if !savedServer}
+        <label class="label">
+          <span class="label-text">
+            Library name <span class="text-surface-600-400">Optional</span></span
+          >
+          <input class="input" autocomplete="organization" bind:value={displayName} />
+        </label>
       {/if}
+
+      <div
+        id="connection-error"
+        role="alert"
+        class:card={error}
+        class:p-4={error}
+        class:preset-tonal-error={error}
+      >
+        {error}
+      </div>
 
       <button class="btn btn-lg preset-filled-primary-700-300 w-full" type="submit" disabled={busy}>
         {#if busy}
@@ -165,7 +218,7 @@
           </svg>
           <span>Testing connection…</span>
         {:else}
-          <span>Connect to Kavita</span>
+          <span>{savedServer ? 'Reconnect to Kavita' : 'Connect to Kavita'}</span>
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
             <path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
           </svg>
