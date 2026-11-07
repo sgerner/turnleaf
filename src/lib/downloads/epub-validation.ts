@@ -404,31 +404,37 @@ async function findRecoveryPackage(
   const root = new DOMParser().parseFromString(xml, 'application/xml').documentElement;
   if (root.localName !== 'package' || root.namespaceURI !== 'http://www.idpf.org/2007/opf') return;
   const children = Array.from(root.children);
+  const metadata = children.find((child) => child.localName === 'metadata');
   const manifest = children.find((child) => child.localName === 'manifest');
   const spine = children.find((child) => child.localName === 'spine');
-  if (!manifest || !spine) return;
-  const items = new Map(
-    Array.from(manifest.children, (item) => [item.getAttribute('id'), item.getAttribute('href')]),
-  );
-  const chapters = Array.from(spine.children).filter((child) => child.localName === 'itemref');
+  if (!metadata || !manifest || !spine) return;
+
   const names = new Set(entries.map((archiveEntry) => archiveEntry.name));
   const base = new URL(entry.name, 'https://epub.invalid/');
+  const itemIds = new Set<string>();
+  for (const item of manifest.children) {
+    const id = item.getAttribute('id');
+    const href = item.getAttribute('href');
+    if (item.localName !== 'item' || !id || !href || itemIds.has(id)) return;
+    try {
+      const url = new URL(href, base);
+      if (
+        url.origin !== base.origin ||
+        url.pathname.endsWith('/') ||
+        !names.has(decodeURIComponent(url.pathname.slice(1)))
+      ) {
+        return;
+      }
+    } catch {
+      return;
+    }
+    itemIds.add(id);
+  }
+
+  const chapters = Array.from(spine.children).filter((child) => child.localName === 'itemref');
   if (
     chapters.length > 0 &&
-    chapters.every((chapter) => {
-      const href = items.get(chapter.getAttribute('idref'));
-      if (!href) return false;
-      try {
-        const url = new URL(href, base);
-        return (
-          url.origin === base.origin &&
-          !url.pathname.endsWith('/') &&
-          names.has(decodeURIComponent(url.pathname.slice(1)))
-        );
-      } catch {
-        return false;
-      }
-    })
+    chapters.every((chapter) => itemIds.has(chapter.getAttribute('idref') ?? ''))
   ) {
     return entry.name;
   }

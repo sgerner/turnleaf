@@ -151,7 +151,7 @@ describe('EPUB container validation', () => {
     const packageDocument = {
       name: 'OEBPS/content.opf',
       data: new TextEncoder().encode(
-        '<package xmlns="http://www.idpf.org/2007/opf"><manifest>' +
+        '<package xmlns="http://www.idpf.org/2007/opf"><metadata/><manifest>' +
           '<item id="chapter" href="chapter.xhtml"/></manifest>' +
           '<spine><itemref idref="chapter"/></spine></package>',
       ),
