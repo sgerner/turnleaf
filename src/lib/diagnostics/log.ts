@@ -1,9 +1,9 @@
-export type DiagnosticCategory = 'request' | 'response' | 'validation' | 'mapping';
+export type DiagnosticCategory = 'request' | 'response' | 'validation' | 'mapping' | 'download';
 
 export type DiagnosticEvent = {
   category: DiagnosticCategory;
   endpoint: string;
-  status?: number;
+  status?: number | undefined;
   path?: string;
   expected?: string;
   actualType?: string;
@@ -95,6 +95,11 @@ function sanitizeActualType(value: string | undefined): string | undefined {
 function sanitizeDetail(value: string | undefined): string | undefined {
   const allowed = new Set([
     'authentication',
+    'download-connection',
+    'download-retry',
+    'download-storage',
+    'download-transfer',
+    'download-validation',
     'invalid-field',
     'invalid-json',
     'invalid-response',
@@ -109,7 +114,11 @@ function sanitizeDetail(value: string | undefined): string | undefined {
 
 function isCategory(value: string): value is DiagnosticCategory {
   return (
-    value === 'request' || value === 'response' || value === 'validation' || value === 'mapping'
+    value === 'request' ||
+    value === 'response' ||
+    value === 'validation' ||
+    value === 'mapping' ||
+    value === 'download'
   );
 }
 

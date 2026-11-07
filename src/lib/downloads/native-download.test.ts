@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+// @vitest-environment node
+
+import { readFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const native = vi.hoisted(() => ({
   body: new Uint8Array(),
@@ -33,6 +36,7 @@ vi.mock('@capacitor/filesystem', () => ({
 
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
+import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import { downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
@@ -40,6 +44,7 @@ function encoded(bytes: Uint8Array): string {
 }
 
 beforeEach(() => {
+  clearDiagnostics();
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
@@ -81,7 +86,58 @@ beforeEach(() => {
     }));
 });
 
+afterEach(() => vi.useRealTimers());
+
 describe('native EPUB download boundary', () => {
+  it.each([
+    { code: 'OS-PLUG-FLTR-0008' },
+    {
+      code: 'OS-PLUG-FLTR-0010',
+      data: { httpStatus: 503, body: 'private book title', source: 'https://private.example' },
+    },
+  ])('retries a transient transfer failure and validates the replacement', async (error) => {
+    vi.useFakeTimers();
+    vi.mocked(FileTransfer.downloadFile)
+      .mockRejectedValueOnce(error)
+      .mockImplementationOnce(async () => {
+        expect(native.deleted).toEqual(['books/server-book.epub.partial']);
+        native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+        return {};
+      });
+
+    const result = expect(
+      downloadEpub('https://private.example/download', 'secret', 'server-book'),
+    ).resolves.toMatchObject({ relativePath: 'books/server-book.epub' });
+    await Promise.all([result, vi.runAllTimersAsync()]);
+
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(native.renamed).toBe(true);
+    const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(log).toContain('endpoint=/api/Download/chapter');
+    expect(log).toContain('detail=download-retry');
+    if (error.data) expect(log).toContain('status=503');
+    expect(log).not.toMatch(/private|secret|server-book/);
+  });
+
+  it.each([
+    { status: 403, attempts: 1 },
+    { status: 503, attempts: 2 },
+  ])('stops after $attempts attempt(s) on HTTP $status', async ({ status, attempts }) => {
+    vi.useFakeTimers();
+    vi.mocked(FileTransfer.downloadFile).mockRejectedValue({
+      code: 'OS-PLUG-FLTR-0010',
+      data: { httpStatus: status },
+    });
+    const result = expect(
+      downloadEpub('https://books.example.com/download', 'secret', 'server-book'),
+    ).rejects.toMatchObject({ status });
+    await Promise.all([result, vi.runAllTimersAsync()]);
+
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(attempts);
+    expect(native.deleted).toHaveLength(attempts);
+    expect(native.renamed).toBe(false);
+  });
+
   it('removes an HTML/error body from the partial path before rename', async () => {
     await expect(
       downloadEpub('https://books.example.com/download', 'secret', 'server-book'),
@@ -89,6 +145,7 @@ describe('native EPUB download boundary', () => {
 
     expect(native.renamed).toBe(false);
     expect(native.deleted).toContain('books/server-book.epub.partial');
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
   });
 
   it('does not inspect or delete a path outside the private books directory', async () => {
