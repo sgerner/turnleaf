@@ -153,4 +153,39 @@ describe('native EPUB download boundary', () => {
     expect(Filesystem.stat).not.toHaveBeenCalled();
     expect(Filesystem.deleteFile).not.toHaveBeenCalled();
   });
+
+  it.each(['stat', 'readFile', 'getUri'] as const)(
+    'preserves the EPUB when %s fails and allows a later retry',
+    async (operation) => {
+      native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+      vi.mocked(Filesystem[operation]).mockRejectedValueOnce(new Error('Temporary storage error'));
+
+      await expect(verifyDownloadedEpub('books/book.epub')).rejects.toThrow(
+        'Temporary storage error',
+      );
+      expect(native.deleted).toEqual([]);
+      await expect(verifyDownloadedEpub('books/book.epub')).resolves.toMatchObject({
+        relativePath: 'books/book.epub',
+      });
+    },
+  );
+
+  it('preserves a downloaded EPUB when the filesystem returns a short read', async () => {
+    native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+    vi.mocked(Filesystem.readFile).mockResolvedValueOnce({ data: '' });
+
+    await expect(verifyDownloadedEpub('books/book.epub')).rejects.toThrow('read was incomplete');
+    expect(native.deleted).toEqual([]);
+  });
+
+  it('distinguishes a missing file from a transient filesystem error', async () => {
+    vi.mocked(Filesystem.stat).mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' });
+    await expect(verifyDownloadedEpub('books/book.epub')).resolves.toBeNull();
+    expect(native.deleted).toEqual([]);
+  });
+
+  it('clears a file whose contents fail EPUB validation', async () => {
+    await expect(verifyDownloadedEpub('books/book.epub')).resolves.toBeNull();
+    expect(native.deleted).toEqual(['books/book.epub']);
+  });
 });
