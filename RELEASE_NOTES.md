@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: keep virtual books and EPUB content reachable
 - fix: protect reading progress and improve offline book recovery
 - Persist the selected Kavita progress on conflict and retry failed EPUB opens while preserving saved downloads.
 - Batch library startup reads and keep virtualized rows stable while scrolling.

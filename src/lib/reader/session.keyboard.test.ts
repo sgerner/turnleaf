@@ -48,4 +48,34 @@ describe('ReaderSession keyboard navigation', () => {
     expect(mockRendition.off).toHaveBeenCalledWith('keydown', onKeyboardNavigation);
     expect(mockBook.destroy).toHaveBeenCalledOnce();
   });
+
+  it('turns pages on ordinary content clicks while leaving links and text selection available', async () => {
+    const onTap = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      onTap,
+    );
+    const click = mockRendition.on.mock.calls.find(([name]) => name === 'click')?.[1];
+    const contents = {
+      window: { innerWidth: 300, getSelection: () => ({ isCollapsed: true }) },
+    };
+    click({ target: document.createElement('a'), clientX: 250 }, contents);
+    click(
+      { target: document.createElement('p'), clientX: 250 },
+      {
+        window: { innerWidth: 300, getSelection: () => ({ isCollapsed: false }) },
+      },
+    );
+    expect(onTap).not.toHaveBeenCalled();
+
+    click({ target: document.createElement('p'), clientX: 250 }, contents);
+    expect(onTap).toHaveBeenCalledExactlyOnceWith('next');
+    session.destroy();
+  });
 });

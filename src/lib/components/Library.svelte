@@ -400,6 +400,41 @@
     };
   }
 
+  async function continueTabbing(
+    event: KeyboardEvent,
+    index: number,
+    control: 'open' | 'actions',
+  ): Promise<void> {
+    if (event.key !== 'Tab' || event.defaultPrevented || !virtualGrid) return;
+    const backwards = event.shiftKey;
+    const atEdge = backwards
+      ? index === virtualWindow.startIndex &&
+        (control === 'open' || visibleBooks[index]?.id === downloadingBookId)
+      : index === virtualWindow.endIndex - 1 && control === 'actions';
+    const nextIndex = index + (backwards ? -1 : 1);
+    if (!atEdge || nextIndex < 0 || nextIndex >= visibleBooks.length) return;
+
+    event.preventDefault();
+    const grid = virtualGrid;
+    const targetTop =
+      grid.getBoundingClientRect().top + Math.floor(nextIndex / gridColumns) * rowHeight;
+    const container = libraryMain?.closest<HTMLElement>('.app-stage');
+    if (container) {
+      container.scrollTop += targetTop - container.getBoundingClientRect().top;
+    } else {
+      window.scrollBy({ top: targetTop, behavior: 'instant' });
+    }
+    updateVirtualWindow();
+    await tick();
+    const nextBook = grid.querySelector(`[data-book-index="${nextIndex}"]`);
+    const target = backwards
+      ? nextBook?.querySelector<HTMLButtonElement>('[data-book-actions]')
+      : nextBook?.querySelector<HTMLButtonElement>(
+          '[data-book-open]:not(:disabled), [data-book-actions]',
+        );
+    target?.focus();
+  }
+
   $effect(() => {
     if (visibleBooks.length > 0) scheduleVirtualWindow();
   });
@@ -1637,10 +1672,12 @@
             class="absolute inset-x-0 grid gap-x-4"
             style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
           >
-            {#each visibleBooks.slice(rowStart, rowEnd) as book (book.id)}
+            {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
+              {@const bookIndex = rowStart + bookOffset}
               <article
                 class="relative text-left"
                 data-book-id={book.id}
+                data-book-index={bookIndex}
                 oncontextmenu={(event) => {
                   event.preventDefault();
                   openMenu(book);
@@ -1651,7 +1688,9 @@
                     <button
                       class="group block w-full text-left"
                       type="button"
+                      data-book-open
                       onclick={() => void open(book)}
+                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
                       disabled={downloadingBookId === book.id}
                     >
                       <div
@@ -1731,7 +1770,9 @@
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
                       type="button"
+                      data-book-actions
                       onclick={() => openMenu(book)}
+                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
                       aria-label={`Book actions for ${book.title}`}
                       title="More actions"
                     >
@@ -1744,13 +1785,15 @@
                     </button>
                   </div>
                 {:else}
-                  <div class="group block w-full text-left">
-                    <div class="relative">
+                  <div class="group relative block w-full text-left">
+                    <div>
                       <button
-                        class="block w-full text-left"
+                        class="block w-full text-left after:absolute after:inset-0 disabled:after:hidden"
                         type="button"
+                        data-book-open
                         onclick={() => void open(book)}
-                        aria-label={`Open ${book.title}`}
+                        onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
+                        aria-label={`Open ${book.title}${book.downloadPath ? ', downloaded for offline reading' : ''}`}
                         disabled={downloadingBookId === book.id}
                       >
                         <div
@@ -1831,9 +1874,11 @@
                         </div>
                       </button>
                       <button
-                        class="btn btn-sm preset-tonal-tertiary absolute right-3 bottom-3 z-10 h-11 w-11 !p-0 shadow-md"
+                        class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
                         type="button"
+                        data-book-actions
                         onclick={() => openMenu(book)}
+                        onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
                         aria-label={`Book actions for ${book.title}`}
                         title="More actions"
                       >
@@ -1845,12 +1890,7 @@
                         </svg>
                       </button>
                     </div>
-                    <button
-                      class="mt-3 block w-full text-left"
-                      type="button"
-                      onclick={() => void open(book)}
-                      disabled={downloadingBookId === book.id}
-                    >
+                    <div class="mt-3">
                       <h2
                         class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
                       >
@@ -1859,7 +1899,7 @@
                       <p class="mt-1 truncate text-sm text-surface-700-300">
                         {book.author ?? 'Unknown author'}
                       </p>
-                    </button>
+                    </div>
                   </div>
                 {/if}
               </article>

@@ -1630,6 +1630,7 @@
     inset: 0;
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
+    pointer-events: none;
   }
 
   .reader-top-reveal {

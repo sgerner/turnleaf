@@ -403,6 +403,15 @@ export class ReaderSession {
     };
     this.rendition.on('relocated', this.relocated);
     this.contentClick = (event, contents) => {
+      const target = event.target as Element | null;
+      const selection = contents.window.getSelection();
+      if (
+        event.defaultPrevented ||
+        target?.closest?.('a, button, input, select, textarea, [contenteditable="true"]') ||
+        (selection && !selection.isCollapsed)
+      ) {
+        return;
+      }
       const position = event.clientX / contents.window.innerWidth;
       onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
     };
