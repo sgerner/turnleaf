@@ -1,3 +1,5 @@
+import { kavitaXPathSteps } from '../reader/kavita-xpath';
+
 export interface ProgressSnapshot {
   cfi: string | null;
   xpath: string | null;
@@ -41,8 +43,8 @@ export function chooseFurthestProgress(
 }
 
 export function compareKavitaLocations(local: string, remote: string): 'local' | 'remote' | 'same' {
-  const localPath = kavitaLocationSteps(local);
-  const remotePath = kavitaLocationSteps(remote);
+  const localPath = kavitaXPathSteps(local);
+  const remotePath = kavitaXPathSteps(remote);
   if (!localPath || !remotePath) return 'same';
   const length = Math.max(localPath.length, remotePath.length);
   for (let index = 0; index < length; index += 1) {
@@ -52,18 +54,6 @@ export function compareKavitaLocations(local: string, remote: string): 'local' |
     if (localStep > remoteStep) return 'local';
   }
   return 'same';
-}
-
-function kavitaLocationSteps(xpath: string): number[] | null {
-  const match = xpath.match(/^\/{1,2}body\/DocFragment\[(\d+)]\/body(?<content>\/.*)?$/i);
-  if (!match?.[1]) return null;
-  const steps = [Number(match[1])];
-  for (const part of match.groups?.content?.split('/').filter(Boolean) ?? []) {
-    const index = part.match(/\[(\d+)]$/)?.[1];
-    if (!index) return null;
-    steps.push(Number(index));
-  }
-  return steps;
 }
 
 export function shouldPreferFurthest(autoSync: boolean, manualRequest?: boolean): boolean {

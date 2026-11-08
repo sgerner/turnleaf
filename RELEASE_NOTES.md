@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: preserve the reader passage and keyboard focus
 - fix: preserve saved positions across catalog refreshes
 - test: verify offline reading and sync on Android
 - fix: restore visible focus and simplify native helpers

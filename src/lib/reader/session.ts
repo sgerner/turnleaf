@@ -5,6 +5,19 @@ import {
   normalizeReaderSearchQuery,
   type ReaderSearchResult,
 } from './search';
+import {
+  kavitaXPathToCfi,
+  parseKavitaXPath,
+  resolveContentXPath,
+  toKavitaXPath,
+} from './kavita-xpath';
+
+export {
+  kavitaXPathToCfi,
+  parseKavitaXPath,
+  resolveContentXPath,
+  toKavitaXPath,
+} from './kavita-xpath';
 
 export interface ReaderLocation {
   cfi: string;
@@ -26,75 +39,6 @@ export interface ReaderSelection {
 export interface TocItem {
   label: string;
   href: string;
-}
-
-interface KavitaXPathTarget {
-  spineIndex: number;
-  contentXPath: string;
-}
-
-export function parseKavitaXPath(xpath: string): KavitaXPathTarget | null {
-  const match = xpath.match(/^\/{1,2}body\/DocFragment\[(\d+)]\/body(?<content>\/.*)?$/i);
-  if (!match) return null;
-  const fragment = Number(match[1]);
-  if (!Number.isInteger(fragment) || fragment < 1) return null;
-  const content = match.groups?.content?.replace(/\/+$/, '') ?? '';
-  return {
-    spineIndex: fragment - 1,
-    contentXPath: `/html/body${content}`,
-  };
-}
-
-export function toKavitaXPath(contentXPath: string, spineIndex: number): string | null {
-  if (!Number.isInteger(spineIndex) || spineIndex < 0) return null;
-  const content = contentXPath
-    .replace(/^\/?html(?:\[1])?\/body(?:\[1])?/i, '')
-    .replace(/^\/?body(?:\[1])?/i, '');
-  return `//body/DocFragment[${spineIndex + 1}]/body${content.startsWith('/') ? content : `/${content}`}`;
-}
-
-export function resolveContentXPath(document: Document, xpath: string): Element | null {
-  const parts = xpath
-    .replace(/^\/html(?:\[1])?\/body(?:\[1])?/i, '')
-    .split('/')
-    .filter(Boolean);
-  let current: Element | null =
-    [...document.documentElement.children].find((element) => element.localName === 'body') ?? null;
-  if (!current) return null;
-
-  for (const part of parts) {
-    const match = part.match(/^([A-Za-z0-9:_-]+)\[(\d+)]$/);
-    if (!match) return null;
-    const [, rawName, rawIndex] = match;
-    if (!rawName || !rawIndex) return null;
-    const name = rawName.toLowerCase();
-    const index = Number(rawIndex) - 1;
-    const matches: Element[] = [...current.children].filter(
-      (element) => element.localName.toLowerCase() === name,
-    );
-    current = matches[index] ?? null;
-    if (!current) return null;
-  }
-  return current;
-}
-
-export function kavitaXPathToCfi(xpath: string, cfiBase: string): string | null {
-  const target = parseKavitaXPath(xpath);
-  if (!target) return null;
-  const parts = target.contentXPath
-    .replace(/^\/html(?:\[1])?\/body(?:\[1])?/i, '')
-    .split('/')
-    .filter(Boolean);
-  const steps: number[] = [];
-  for (const part of parts) {
-    const match = part.match(/^[A-Za-z0-9:_-]+\[(\d+)]$/);
-    if (!match) return null;
-    const index = Number(match[1]);
-    if (!Number.isInteger(index) || index < 1) return null;
-    steps.push(index * 2);
-  }
-  const elementPath = `/4${steps.map((step) => `/${step}`).join('')}`;
-  return `epubcfi(${cfiBase}!${elementPath},/1:0,/1:1)`;
 }
 
 interface SpineSection {
@@ -348,7 +292,11 @@ export class ReaderSession {
   private selectionListeners: Array<() => void> = [];
   private current: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
+  private locationGeneration = 0;
   private userNavigationPending = false;
+  private userNavigationStartCfi: string | null = null;
+  private reflowPending = false;
+  private appearance: Appearance | null = null;
   private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
     null;
 
@@ -397,10 +345,21 @@ export class ReaderSession {
     }
     this.onLocation = onLocation;
     this.relocated = (location) => {
+      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const isUserNavigation =
+        this.userNavigationPending &&
+        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
       this.current = location;
-      const origin = this.userNavigationPending ? 'navigation' : 'restore';
-      this.userNavigationPending = false;
+      const origin = isUserNavigation ? 'navigation' : 'restore';
+      if (isUserNavigation) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+      }
       this.reportLocation(location, origin);
+      if (this.reflowPending) {
+        this.reflowPending = false;
+        this.preserveCfi(location.start.cfi, this.locationGeneration);
+      }
     };
     this.rendition.on('relocated', this.relocated);
     this.contentClick = (event, contents) => {
@@ -422,21 +381,32 @@ export class ReaderSession {
       this.rendition.on('keydown', this.keyboardNavigation);
     }
     this.applyAppearance(appearance);
+    const restoreGeneration = this.beginLocationOperation(false);
     await this.rendition.started;
+    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
     if (cfi) {
-      await this.rendition.display(cfi);
+      await this.displayAtGeneration(cfi, restoreGeneration);
     } else if (serverXPath) {
-      const restored = await this.displayXPath(serverXPath);
+      const restored = await this.displayXPath(serverXPath, restoreGeneration);
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
       const restoredByPercentage =
         !restored && serverPercentage && serverPercentage > 0
-          ? await this.displayPercentage(serverPercentage)
+          ? await this.displayPercentage(serverPercentage, restoreGeneration)
           : false;
-      if (!restored && !restoredByPercentage) await this.rendition.display();
+      if (
+        this.isCurrentLocationOperation(restoreGeneration) &&
+        !restored &&
+        !restoredByPercentage
+      ) {
+        await this.displayAtGeneration(undefined, restoreGeneration);
+      }
     } else if (serverPercentage && serverPercentage > 0) {
-      const restored = await this.displayPercentage(serverPercentage);
-      if (!restored) await this.rendition.display();
+      const restored = await this.displayPercentage(serverPercentage, restoreGeneration);
+      if (this.isCurrentLocationOperation(restoreGeneration) && !restored) {
+        await this.displayAtGeneration(undefined, restoreGeneration);
+      }
     } else {
-      await this.rendition.display();
+      await this.displayAtGeneration(undefined, restoreGeneration);
     }
   }
 
@@ -530,17 +500,40 @@ export class ReaderSession {
   }
 
   displayServerLocation(xpath: string): Promise<boolean> {
-    this.userNavigationPending = false;
-    return this.displayXPath(xpath);
+    return this.displayXPath(xpath, this.beginLocationOperation(false));
   }
 
   displayServerPercentage(percentage: number): Promise<boolean> {
-    this.userNavigationPending = false;
-    return this.displayPercentage(percentage);
+    return this.displayPercentage(percentage, this.beginLocationOperation(false));
   }
 
   applyAppearance(value: Appearance): void {
-    if (!this.rendition) return;
+    const previous = this.appearance;
+    this.appearance = { ...value };
+    const rendition = this.rendition;
+    if (!rendition) return;
+    const themeChanged =
+      !previous ||
+      previous.mode !== value.mode ||
+      previous.fontFamily !== value.fontFamily ||
+      previous.fontSize !== value.fontSize ||
+      previous.lineHeight !== value.lineHeight ||
+      previous.margin !== value.margin ||
+      previous.bottomMargin !== value.bottomMargin ||
+      previous.paragraphSpacing !== value.paragraphSpacing ||
+      previous.alignment !== value.alignment ||
+      previous.hyphenation !== value.hyphenation;
+    const layoutChanged =
+      previous !== null &&
+      (previous.fontFamily !== value.fontFamily ||
+        previous.fontSize !== value.fontSize ||
+        previous.lineHeight !== value.lineHeight ||
+        previous.margin !== value.margin ||
+        previous.bottomMargin !== value.bottomMargin ||
+        previous.paragraphSpacing !== value.paragraphSpacing ||
+        previous.alignment !== value.alignment ||
+        previous.hyphenation !== value.hyphenation);
+    if (!themeChanged) return;
     const colors = MODE_COLORS[value.mode];
     const family =
       value.fontFamily === 'book'
@@ -548,7 +541,7 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
-    this.rendition.themes.register('turnleaf', {
+    rendition.themes.register('turnleaf', {
       html: {
         background: `${this.resolveToken(colors.background)} !important`,
         'box-sizing': 'border-box',
@@ -576,10 +569,19 @@ export class ReaderSession {
       a: { color: `${this.resolveToken(colors.link)} !important` },
       '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
     });
-    this.rendition.themes.select('turnleaf');
+    rendition.themes.select('turnleaf');
+    if (!layoutChanged) return;
+    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    if (!cfi) return;
+    if (this.userNavigationPending) {
+      this.reflowPending = true;
+      return;
+    }
+    this.preserveCfi(cfi, this.locationGeneration);
   }
 
   destroy(): void {
+    this.locationGeneration += 1;
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
@@ -593,6 +595,9 @@ export class ReaderSession {
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationStartCfi = null;
+    this.appearance = null;
+    this.reflowPending = false;
     this.spine = null;
     this.book.destroy();
   }
@@ -625,8 +630,20 @@ export class ReaderSession {
     }
   }
 
-  private async displayXPath(xpath: string): Promise<boolean> {
-    if (!this.rendition) return false;
+  private async displayAtGeneration(
+    target: string | undefined,
+    generation: number,
+  ): Promise<boolean> {
+    const rendition = this.rendition;
+    if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
+    if (target === undefined) await rendition.display();
+    else await rendition.display(target);
+    return this.isCurrentLocationOperation(generation);
+  }
+
+  private async displayXPath(xpath: string, generation: number): Promise<boolean> {
+    const rendition = this.rendition;
+    if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
     const target = parseKavitaXPath(xpath);
     if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
@@ -634,8 +651,9 @@ export class ReaderSession {
     try {
       const cfi = kavitaXPathToCfi(xpath, section.cfiBase);
       if (!cfi) return false;
-      await this.rendition.display(cfi);
-      const contents = (this.rendition.getContents() as unknown as Contents[]).find(
+      await rendition.display(cfi);
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
       if (!contents) return true;
@@ -643,33 +661,62 @@ export class ReaderSession {
       if (!node) return true;
       const range = contents.document.createRange();
       range.selectNodeContents(node);
-      await this.rendition.display(contents.cfiFromRange(range));
-      return true;
+      await rendition.display(contents.cfiFromRange(range));
+      return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
     }
   }
 
-  private async displayPercentage(percentage: number): Promise<boolean> {
-    if (!this.rendition) return false;
+  private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
+    if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
+    const { sections } = this.getSpine();
+    if (!sections.length) return false;
+    const position = Math.max(0, Math.min(0.999, percentage));
+    const section = sections[Math.floor(position * sections.length)];
+    if (!section) return false;
     try {
-      if (!this.book.locations.length()) await this.book.locations.generate(1600);
-      await this.rendition.display(Math.max(0, Math.min(0.999, percentage)));
-      return true;
+      return await this.displayAtGeneration(section.href, generation);
     } catch {
       return false;
     }
   }
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {
-    this.userNavigationPending = true;
+    const generation = this.beginLocationOperation(true);
     try {
       await display();
     } catch (error) {
-      this.userNavigationPending = false;
+      if (this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+      }
       throw error;
     }
+  }
+
+  private beginLocationOperation(userNavigation: boolean): number {
+    this.locationGeneration += 1;
+    this.userNavigationPending = userNavigation;
+    this.userNavigationStartCfi = userNavigation
+      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
+      : null;
+    return this.locationGeneration;
+  }
+
+  private isCurrentLocationOperation(generation: number): boolean {
+    return generation === this.locationGeneration && this.rendition !== null;
+  }
+
+  private preserveCfi(cfi: string, generation: number): void {
+    const rendition = this.rendition;
+    if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
+      return;
+    }
+    void rendition.display(cfi).catch(() => {
+      // The current passage may disappear while a reflow is being applied.
+    });
   }
 
   private getSpine(): NonNullable<ReaderSession['spine']> {

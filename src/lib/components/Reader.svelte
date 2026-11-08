@@ -84,11 +84,13 @@
   let bookmarksPanel = $state<HTMLElement | null>(null);
   let annotationsPanel = $state<HTMLElement | null>(null);
   let searchPanel = $state<HTMLElement | null>(null);
+  let syncConfirmationPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
   let bookmarksOpener: HTMLElement | null = null;
   let annotationsOpener: HTMLElement | null = null;
   let searchOpener: HTMLElement | null = null;
+  let syncConfirmationOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
   let bookmarks = $state<StoredReaderLocation[]>([]);
   let locationHistory = $state<StoredReaderLocation[]>([]);
@@ -105,6 +107,9 @@
   let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
+  let pendingSyncLocation = $state<{ xpath: string | null; percentage: number | null } | null>(
+    null,
+  );
   let error = $state('');
   let startupOpenFailed = $state(false);
   let retryingReader = $state(false);
@@ -278,8 +283,27 @@
     void tick().then(() => restoreFocus(opener));
   }
 
+  function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
+    void tick().then(() => {
+      const controls = panel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
+      const element = [...controls].find(
+        (control) =>
+          control.dataset.readerFocus === target &&
+          (id === undefined || control.dataset.readerFocusId === id),
+      );
+      (element ?? panel)?.focus();
+    });
+  }
+
   function hasOpenReaderPanel(): boolean {
-    return settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible;
+    return (
+      settingsVisible ||
+      tocVisible ||
+      bookmarksVisible ||
+      annotationsVisible ||
+      searchVisible ||
+      pendingSyncLocation !== null
+    );
   }
 
   function pauseChromeHide(): void {
@@ -411,6 +435,24 @@
     resumeChromeHide();
   }
 
+  function openSyncConfirmation(progress: {
+    xpath: string | null;
+    percentage: number | null;
+  }): void {
+    pauseChromeHide();
+    syncConfirmationOpener = activeElement();
+    pendingSyncLocation = progress;
+    focusPanel(() => syncConfirmationPanel);
+  }
+
+  function closeSyncConfirmation(): void {
+    pendingSyncLocation = null;
+    const opener = syncConfirmationOpener;
+    syncConfirmationOpener = null;
+    restorePanelFocus(opener);
+    resumeChromeHide();
+  }
+
   function showFooter(): void {
     footerVisible = true;
     scheduleChromeHide();
@@ -513,18 +555,23 @@
   function startBookmarkEdit(bookmark: StoredReaderLocation): void {
     editingBookmarkId = bookmark.id;
     bookmarkDraft = bookmark.label;
+    focusReaderTarget(bookmarksPanel, 'bookmark-editor', bookmark.id);
   }
 
   function saveBookmarkName(bookmark: StoredReaderLocation): void {
     bookmarks = renameBookmark(bookmarks, bookmark.id, bookmarkDraft);
     editingBookmarkId = null;
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    focusReaderTarget(bookmarksPanel, 'bookmark-rename', bookmark.id);
   }
 
   function deleteBookmark(bookmark: StoredReaderLocation): void {
+    const index = bookmarks.findIndex((entry) => entry.id === bookmark.id);
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    const next = bookmarks[Math.min(Math.max(index, 0), bookmarks.length - 1)];
+    focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
   function saveAnnotation(): void {
@@ -540,16 +587,21 @@
     editingAnnotationId = null;
     annotationDraft = '';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
   function startAnnotationEdit(annotation: StoredAnnotation): void {
     editingAnnotationId = annotation.id;
     annotationDraft = annotation.note;
+    focusReaderTarget(annotationsPanel, 'annotation-editor', annotation.id);
   }
 
   function deleteAnnotation(annotation: StoredAnnotation): void {
+    const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
+    focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
   }
 
   function exportAnnotations(): void {
@@ -625,20 +677,88 @@
     }
   }
 
+  function normalizeReaderXPath(xpath: string): string {
+    return xpath
+      .trim()
+      .toLowerCase()
+      .replace(/\/{2,}/g, '/')
+      .replace(/\/$/, '');
+  }
+
+  function hasSyncedLocation(progress: {
+    xpath: string | null;
+    percentage: number | null;
+  }): boolean {
+    return (
+      Boolean(progress.xpath?.trim()) ||
+      (typeof progress.percentage === 'number' &&
+        Number.isFinite(progress.percentage) &&
+        progress.percentage > 0)
+    );
+  }
+
+  function hasDivergentSyncLocation(progress: {
+    xpath: string | null;
+    percentage: number | null;
+  }): boolean {
+    if (!hasSyncedLocation(progress)) return false;
+    if (!location) return true;
+    const serverXPath = progress.xpath?.trim();
+    const localXPath = location.xpath?.trim();
+    if (serverXPath && localXPath) {
+      return normalizeReaderXPath(serverXPath) !== normalizeReaderXPath(localXPath);
+    }
+    if (typeof progress.percentage === 'number' && Number.isFinite(progress.percentage)) {
+      return Math.abs(location.percentage - progress.percentage) >= 0.001;
+    }
+    return true;
+  }
+
+  async function displaySyncedLocation(
+    reader: ReaderSession,
+    progress: { xpath: string | null; percentage: number | null },
+  ): Promise<void> {
+    if (progress.xpath) {
+      const restored = await reader.displayServerLocation(progress.xpath);
+      if (restored) return;
+    }
+    if (
+      typeof progress.percentage === 'number' &&
+      Number.isFinite(progress.percentage) &&
+      progress.percentage > 0
+    ) {
+      await reader.displayServerPercentage(progress.percentage);
+    }
+  }
+
+  async function confirmSyncLocation(): Promise<void> {
+    const progress = pendingSyncLocation;
+    const reader = session;
+    closeSyncConfirmation();
+    if (!progress || !reader) return;
+    try {
+      await displaySyncedLocation(reader, progress);
+    } catch {
+      error = 'Kavita’s latest reading position could not be opened.';
+    }
+    showControls();
+  }
+
   async function syncLatestLocation(showFeedback = true): Promise<void> {
     if (!session || !onSyncLatest || syncingLatest) return;
     if (!showFeedback && (initialCfi || localNavigationDuringSession)) return;
+    const reader = session;
     syncingLatest = true;
     try {
       const progress = await onSyncLatest();
-      if (destroyed || (!showFeedback && localNavigationDuringSession)) return;
-      if (progress?.xpath) {
-        const restored = await session.displayServerLocation(progress.xpath);
-        if (!restored && progress.percentage && progress.percentage > 0) {
-          await session.displayServerPercentage(progress.percentage);
-        }
-      } else if (progress?.percentage && progress.percentage > 0) {
-        await session.displayServerPercentage(progress.percentage);
+      if (destroyed || session !== reader || (!showFeedback && localNavigationDuringSession))
+        return;
+      if (progress && showFeedback && hasDivergentSyncLocation(progress)) {
+        openSyncConfirmation(progress);
+        return;
+      }
+      if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
+        await displaySyncedLocation(reader, progress);
       }
       if (showFeedback) showControls();
     } catch {
@@ -674,9 +794,15 @@
     }
     if (
       event.key === 'Escape' &&
-      (settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible)
+      (settingsVisible ||
+        tocVisible ||
+        bookmarksVisible ||
+        annotationsVisible ||
+        searchVisible ||
+        pendingSyncLocation)
     ) {
       event.preventDefault();
+      if (pendingSyncLocation) closeSyncConfirmation();
       closeSettings();
       closeToc();
       closeBookmarks();
@@ -687,7 +813,8 @@
   }
 
   function handleBackButton(): boolean {
-    if (settingsVisible) closeSettings();
+    if (pendingSyncLocation) closeSyncConfirmation();
+    else if (settingsVisible) closeSettings();
     else if (tocVisible) closeToc();
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
@@ -749,7 +876,12 @@
     class="tap-zones"
     aria-label="Page navigation"
     inert={Boolean(
-      settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible,
+      settingsVisible ||
+      tocVisible ||
+      bookmarksVisible ||
+      annotationsVisible ||
+      searchVisible ||
+      pendingSyncLocation,
     )}
   >
     <button
@@ -828,7 +960,12 @@
         bind:this={readerToolbar}
         class="reader-bar reader-top"
         inert={Boolean(
-          settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible,
+          settingsVisible ||
+          tocVisible ||
+          bookmarksVisible ||
+          annotationsVisible ||
+          searchVisible ||
+          pendingSyncLocation,
         )}
         transition:fly={{ y: -8, duration: 140 }}
       >
@@ -867,7 +1004,7 @@
               class="btn min-w-0 preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (settingsVisible ? closeSettings() : openSettings())}
-              aria-label="Reading appearance"
+              aria-label="Text, reading appearance"
               aria-expanded={settingsVisible}
               aria-controls="reader-appearance"
               title="Reading appearance"
@@ -881,7 +1018,7 @@
               class="btn min-w-0 preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
-              aria-label="Open bookmarks and history"
+              aria-label="Marks, bookmarks and history"
               aria-expanded={bookmarksVisible}
               aria-controls="reader-bookmarks"
               title="Open bookmarks and history"
@@ -898,7 +1035,7 @@
               class="btn min-w-0 preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
-              aria-label="Open highlights and notes"
+              aria-label="Notes: highlights and annotations"
               aria-expanded={annotationsVisible}
               aria-controls="reader-annotations"
               title="Open highlights and notes"
@@ -947,6 +1084,7 @@
                   d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
                 />
               </svg>
+              <span class="reader-toolbar-label">Sync</span>
             </button>
           </div>
           <p class="reader-toolbar-title">
@@ -955,23 +1093,60 @@
         </div>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible}
+      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || pendingSyncLocation}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
           onclick={() =>
-            settingsVisible
-              ? closeSettings()
-              : tocVisible
-                ? closeToc()
-                : bookmarksVisible
-                  ? closeBookmarks()
-                  : annotationsVisible
-                    ? closeAnnotations()
-                    : closeSearch()}
+            pendingSyncLocation
+              ? closeSyncConfirmation()
+              : settingsVisible
+                ? closeSettings()
+                : tocVisible
+                  ? closeToc()
+                  : bookmarksVisible
+                    ? closeBookmarks()
+                    : annotationsVisible
+                      ? closeAnnotations()
+                      : closeSearch()}
         ></button>
+      {/if}
+
+      {#if pendingSyncLocation}
+        <div
+          bind:this={syncConfirmationPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-w-sm"
+          data-reader-panel
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="reader-sync-confirm-title"
+          aria-describedby="reader-sync-confirm-description"
+          tabindex="-1"
+          onkeydown={(event) =>
+            trapModalKeydown(event, syncConfirmationPanel!, closeSyncConfirmation)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <h2 id="reader-sync-confirm-title" class="font-serif text-xl">
+            Move to Kavita’s latest position?
+          </h2>
+          <p id="reader-sync-confirm-description" class="mt-3 text-sm text-surface-700-300">
+            Kavita has a different reading position saved. Move this reader there?
+          </p>
+          <div class="mt-5 flex flex-wrap justify-end gap-2">
+            <button class="btn preset-tonal-surface" type="button" onclick={closeSyncConfirmation}>
+              Stay here
+            </button>
+            <button
+              class="btn preset-filled-primary-700-300"
+              type="button"
+              onclick={() => void confirmSyncLocation()}
+            >
+              Go to latest position
+            </button>
+          </div>
+        </div>
       {/if}
 
       {#if settingsVisible}
@@ -1029,10 +1204,14 @@
             </select>
           </label>
           <label class="label mt-5">
-            <span class="label-text">Text size: {appearance.fontSize} pixels</span>
+            <span class="label-text">
+              Text size: <span aria-hidden="true">{appearance.fontSize} pixels</span>
+            </span>
             <input
               class="range"
               type="range"
+              aria-label="Text size"
+              aria-valuetext={`${appearance.fontSize} pixels`}
               min="14"
               max="34"
               value={appearance.fontSize}
@@ -1040,10 +1219,14 @@
             />
           </label>
           <label class="label mt-4">
-            <span class="label-text">Line height: {appearance.lineHeight.toFixed(1)}</span>
+            <span class="label-text">
+              Line height: <span aria-hidden="true">{appearance.lineHeight.toFixed(1)}</span>
+            </span>
             <input
               class="range"
               type="range"
+              aria-label="Line height"
+              aria-valuetext={appearance.lineHeight.toFixed(1)}
               min="1.2"
               max="2"
               step="0.1"
@@ -1053,10 +1236,14 @@
             />
           </label>
           <label class="label mt-4">
-            <span class="label-text">Page margins: {appearance.margin} pixels</span>
+            <span class="label-text">
+              Page margins: <span aria-hidden="true">{appearance.margin} pixels</span>
+            </span>
             <input
               class="range"
               type="range"
+              aria-label="Page margins"
+              aria-valuetext={`${appearance.margin} pixels`}
               min="8"
               max="56"
               value={appearance.margin}
@@ -1064,10 +1251,14 @@
             />
           </label>
           <label class="label mt-4">
-            <span class="label-text">Bottom margin: {appearance.bottomMargin} pixels</span>
+            <span class="label-text">
+              Bottom margin: <span aria-hidden="true">{appearance.bottomMargin} pixels</span>
+            </span>
             <input
               class="range"
               type="range"
+              aria-label="Bottom margin"
+              aria-valuetext={`${appearance.bottomMargin} pixels`}
               min="0"
               max="64"
               step="2"
@@ -1077,12 +1268,15 @@
             />
           </label>
           <label class="label mt-4">
-            <span class="label-text"
-              >Paragraph spacing: {appearance.paragraphSpacing.toFixed(1)}</span
-            >
+            <span class="label-text">
+              Paragraph spacing:
+              <span aria-hidden="true">{appearance.paragraphSpacing.toFixed(1)}</span>
+            </span>
             <input
               class="range"
               type="range"
+              aria-label="Paragraph spacing"
+              aria-valuetext={`${appearance.paragraphSpacing.toFixed(1)} em`}
               min="0"
               max="1.5"
               step="0.1"
@@ -1285,6 +1479,7 @@
             <button
               class="btn mt-4 w-full preset-tonal-primary"
               type="button"
+              data-reader-focus="bookmark-current"
               onclick={toggleCurrentBookmark}
             >
               {currentBookmark() ? 'Remove bookmark at this page' : 'Bookmark this page'}
@@ -1315,6 +1510,8 @@
                         <input
                           class="input min-w-0 flex-1"
                           aria-label="Bookmark name"
+                          data-reader-focus="bookmark-editor"
+                          data-reader-focus-id={bookmark.id}
                           bind:value={bookmarkDraft}
                         />
                         <button class="btn btn-sm preset-filled-primary-700-300" type="submit"
@@ -1326,22 +1523,28 @@
                         <button
                           class="min-w-0 flex-1 truncate text-left text-sm font-medium"
                           type="button"
+                          data-reader-focus="bookmark-location"
+                          data-reader-focus-id={bookmark.id}
                           onclick={() => void returnToLocation(bookmark)}
                         >
                           {bookmark.label}
                         </button>
                         <button
-                          class="btn btn-sm preset-tonal-surface h-10 w-10 p-0"
+                          class="btn btn-sm preset-tonal-surface h-11 w-11 p-0"
                           type="button"
                           aria-label={`Rename ${bookmark.label}`}
+                          data-reader-focus="bookmark-rename"
+                          data-reader-focus-id={bookmark.id}
                           onclick={() => startBookmarkEdit(bookmark)}
                         >
                           <span aria-hidden="true">✎</span>
                         </button>
                         <button
-                          class="btn btn-sm preset-tonal-error h-10 w-10 p-0"
+                          class="btn btn-sm preset-tonal-error h-11 w-11 p-0"
                           type="button"
                           aria-label={`Delete ${bookmark.label}`}
+                          data-reader-focus="bookmark-delete"
+                          data-reader-focus-id={bookmark.id}
                           onclick={() => deleteBookmark(bookmark)}
                         >
                           <span aria-hidden="true">×</span>
@@ -1444,7 +1647,13 @@
           {/if}
 
           <div class="mt-4 flex items-center justify-between gap-2">
-            <h3 class="text-sm font-semibold uppercase tracking-wide">Saved highlights</h3>
+            <h3
+              class="text-sm font-semibold uppercase tracking-wide"
+              tabindex="-1"
+              data-reader-focus="annotations-heading"
+            >
+              Saved highlights
+            </h3>
             <button
               class="btn btn-sm preset-tonal-surface"
               type="button"
@@ -1480,7 +1689,11 @@
                     >
                       <label class="label">
                         <span class="label-text">Note</span>
-                        <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+                        <textarea
+                          class="textarea min-h-20"
+                          data-reader-focus="annotation-editor"
+                          data-reader-focus-id={annotation.id}
+                          bind:value={annotationDraft}></textarea>
                       </label>
                       <div class="flex gap-2">
                         <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
@@ -1492,6 +1705,7 @@
                           onclick={() => {
                             editingAnnotationId = null;
                             annotationDraft = '';
+                            focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
                           }}
                         >
                           Cancel
@@ -1506,6 +1720,9 @@
                       <button
                         class="btn btn-sm preset-tonal-surface"
                         type="button"
+                        aria-label={`Edit note for ${annotation.excerpt}`}
+                        data-reader-focus="annotation-edit"
+                        data-reader-focus-id={annotation.id}
                         onclick={() => startAnnotationEdit(annotation)}
                       >
                         Edit note
@@ -1513,6 +1730,7 @@
                       <button
                         class="btn btn-sm preset-tonal-error"
                         type="button"
+                        aria-label={`Delete highlight ${annotation.excerpt}`}
                         onclick={() => deleteAnnotation(annotation)}
                       >
                         Delete
@@ -1672,6 +1890,16 @@
   .reader-bar,
   .reader-settings {
     pointer-events: auto;
+  }
+
+  .reader-settings :global(button),
+  .reader-settings :global(input),
+  .reader-settings :global(select) {
+    min-height: 2.75rem;
+  }
+
+  .reader-settings :global(input[type='range']) {
+    touch-action: pan-x;
   }
 
   .reader-bar {
