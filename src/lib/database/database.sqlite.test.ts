@@ -190,11 +190,40 @@ describe('native metadata transactions against SQLite', () => {
       downloadStatus: 'none',
       fileSize: null,
     };
-    await replaceBooksInTransaction(adapter, 'server', [retained, removable]);
+    const withSyncedProgress = {
+      ...baseBook,
+      id: 'server:1:12',
+      chapterId: 12,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    const cfi = 'epubcfi(/6/4!/4/2/1:12)';
+    await replaceBooksInTransaction(adapter, 'server', [retained, removable, withSyncedProgress]);
+    db.prepare(
+      `INSERT INTO reading_state
+      (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
+       server_updated_at,pending_sync)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+    ).run(
+      withSyncedProgress.id,
+      cfi,
+      '/html/body/p[2]',
+      0.25,
+      '2026-09-07T00:00:00.000Z',
+      '2026-09-07T00:00:00.000Z',
+      '2026-09-07T00:00:00.000Z',
+    );
 
     await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z');
 
     expect(readBook(db, retained.id)).toMatchObject({ remote_available: 0 });
+    expect(readBook(db, withSyncedProgress.id)).toMatchObject({ remote_available: 0 });
+    expect(
+      db.prepare('SELECT cfi FROM reading_state WHERE book_id=?').get(withSyncedProgress.id),
+    ).toEqual({
+      cfi,
+    });
     expect(readBook(db, removable.id)).toBeUndefined();
   });
 

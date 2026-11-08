@@ -319,6 +319,7 @@ export async function reconcileBooks(
       books.map((book) => [book.id, { ...withoutRemoteProgressMarkers(book), serverId }]),
     );
     const existing = state.books.filter((book) => book.serverId === serverId);
+    const existingById = new Map(existing.map((book) => [book.id, book]));
     const unmatched = existing.filter((book) => !incoming.has(book.id));
     const retained = preserveMissing
       ? unmatched
@@ -328,11 +329,11 @@ export async function reconcileBooks(
               Boolean(book.downloadPath) ||
               book.downloadStatus === 'available' ||
               Boolean(state.syncQueue[book.id]) ||
-              state.readingState[book.id]?.pendingSync === true,
+              Boolean(state.readingState[book.id]),
           )
           .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
     const merged = [...incoming.values()].map((book) => {
-      const previous = existing.find((item) => item.id === book.id);
+      const previous = existingById.get(book.id);
       if (!previous) return { ...book, remoteAvailable: true };
       const pending =
         Boolean(state.syncQueue[book.id]) || state.readingState[book.id]?.pendingSync === true;
@@ -439,8 +440,7 @@ export async function replaceBooksInTransaction(
 }
 
 const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
-  OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id
-    AND reading_state.pending_sync=1)
+  OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id)
   OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
 
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
