@@ -317,6 +317,54 @@ it('keeps pending browser progress ahead of a remote metadata refresh', async ()
   expect(savedState.syncQueue[existingBook.id]).toBeDefined();
 });
 
+it('retains a vanished browser book with synced CFI but marks it unavailable', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const cfi = 'epubcfi(/6/4!/4/2/1:12)';
+  const undownloadedBook: BookRecord = {
+    ...existingBook,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [undownloadedBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi,
+          xpath: '/html/body/p[2]',
+          percentage: 0.25,
+          localUpdatedAt: '2026-09-07T00:00:00.000Z',
+          syncedLocalUpdatedAt: '2026-09-07T00:00:00.000Z',
+          serverUpdatedAt: '2026-09-07T00:00:00.000Z',
+          pendingSync: false,
+        },
+      },
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await reconcileBooks('server', []);
+
+  expect(await getBooks('server')).toMatchObject([
+    { id: existingBook.id, remoteAvailable: false, downloadPath: null },
+  ]);
+  expect(
+    (
+      JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+        readingState: Record<string, { cfi: string }>;
+      }
+    ).readingState[existingBook.id]?.cfi,
+  ).toBe(cfi);
+});
+
 it('updates incoming browser books while preserving unmatched rows from a partial snapshot', async () => {
   const storage = new MemoryStorage();
   Object.defineProperty(window, 'localStorage', {

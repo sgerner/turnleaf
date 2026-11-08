@@ -477,12 +477,12 @@ it('classifies malformed JSON as an invalid response', async () => {
   });
 });
 
-it('retries a failed progress read once', async () => {
+it('retries a transient 5xx progress read once', async () => {
   const fetchMock = vi
     .fn()
     .mockResolvedValueOnce({
       ok: false,
-      status: 401,
+      status: 500,
       headers: { get: () => null },
     })
     .mockResolvedValueOnce({
@@ -503,6 +503,24 @@ it('retries a failed progress read once', async () => {
 
   expect(progress.pageNum).toBe(9);
   expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+it('does not retry a progress read that returns not found', async () => {
+  const fetchMock = vi.fn(async () => ({
+    ok: false,
+    status: 404,
+    headers: { get: () => null },
+  }));
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getProgress(7),
+  ).rejects.toMatchObject({
+    kind: 'server',
+    status: 404,
+  });
+
+  expect(fetchMock).toHaveBeenCalledOnce();
 });
 
 it('normalizes native HTTP JSON strings and exposes field diagnostics without server secrets', async () => {

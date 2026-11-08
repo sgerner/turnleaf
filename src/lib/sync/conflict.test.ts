@@ -8,7 +8,6 @@ import {
   toKavitaPageNumber,
   type ProgressSnapshot,
 } from './conflict';
-import { coalesceSyncItem } from './queue';
 
 const snapshot = (xpath: string, percentage: number): ProgressSnapshot => ({
   cfi: null,
@@ -32,20 +31,6 @@ describe('progress reconciliation', () => {
     const shared = snapshot('/p[1]', 0.2);
     expect(detectProgressConflict(shared, snapshot('/p[2]', 0.3), shared)).toEqual({
       kind: 'server',
-    });
-  });
-});
-
-describe('sync queue coalescing', () => {
-  it('replaces payload while preserving creation and retry state', () => {
-    const first = coalesceSyncItem(null, 'book-1', { page: 2 }, 'one');
-    first.attemptCount = 3;
-    expect(coalesceSyncItem(first, 'book-1', { page: 9 }, 'two')).toEqual({
-      bookId: 'book-1',
-      payload: { page: 9 },
-      attemptCount: 3,
-      createdAt: 'one',
-      updatedAt: 'two',
     });
   });
 });

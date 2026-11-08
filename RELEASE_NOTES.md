@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: preserve saved positions across catalog refreshes
 - test: verify offline reading and sync on Android
 - fix: restore visible focus and simplify native helpers
 - ci: reuse the Android debug APK and scan native Java

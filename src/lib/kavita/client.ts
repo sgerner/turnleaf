@@ -137,10 +137,12 @@ export class KavitaClient {
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
     const options = signal ? { signal } : {};
-    const payload = await this.request<unknown>('/api/Library/libraries', options);
-    const libraries = normalizePayload('/api/Library/libraries', () => normalizeLibraries(payload));
-
-    const health = await this.request<unknown>('/api/Health', options).catch(() => null);
+    const [libraries, health] = await Promise.all([
+      this.request<unknown>('/api/Library/libraries', options).then((payload) =>
+        normalizePayload('/api/Library/libraries', () => normalizeLibraries(payload)),
+      ),
+      this.request<unknown>('/api/Health', options).catch(() => null),
+    ]);
     return {
       version: readHealthVersion(health),
       bookLibraries: libraries.filter(
@@ -259,7 +261,14 @@ export class KavitaClient {
       }
       return progress;
     } catch (error) {
-      if (signal?.aborted) throw error;
+      const retryable =
+        error instanceof KavitaError &&
+        (error.kind === 'network' ||
+          (error.kind === 'server' &&
+            error.status !== undefined &&
+            error.status >= 500 &&
+            error.status < 600));
+      if (signal?.aborted || !retryable) throw error;
       const progress = await this.request<unknown>(path, options);
       if (!isKavitaProgress(progress)) {
         throw new KavitaError(
