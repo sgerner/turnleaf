@@ -86,6 +86,13 @@ jobs:
           name: android-debug-apk
           path: android/app/build/outputs/apk/debug
 
+      - name: Enable emulator hardware acceleration
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo chgrp "$(id -gn)" /dev/kvm
+            sudo chmod g+rw /dev/kvm
+          fi
+
       - name: Verify the Android reading journey
         uses: reactivecircus/android-emulator-runner@v2
         with:
