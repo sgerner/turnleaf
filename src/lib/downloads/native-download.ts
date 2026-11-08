@@ -5,8 +5,10 @@ import { recordDiagnostic } from '../diagnostics/log';
 import { EpubValidationError, validateEpubArchive } from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
+const PARTIAL_SUFFIX = '.partial';
 export const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 500, 502, 503, 504]);
+let interruptedDownloadCleanup: Promise<void> | undefined;
 
 export class EpubTransferError extends Error {
   constructor(
@@ -75,19 +77,57 @@ async function ensureDataDirectory(path: string): Promise<void> {
   }
 }
 
+export function cleanupInterruptedEpubDownloads(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) return Promise.resolve();
+  // Each native transfer waits for the same startup pass before writing a partial file.
+  interruptedDownloadCleanup ??= (async () => {
+    try {
+      const { files } = await Filesystem.readdir({
+        path: BOOK_DIRECTORY,
+        directory: Directory.Data,
+      });
+      for (const file of files) {
+        if (file.type !== 'file' || !file.name.endsWith(`.epub${PARTIAL_SUFFIX}`)) continue;
+        const path = `${BOOK_DIRECTORY}/${file.name}`;
+        await Filesystem.deleteFile({ path, directory: Directory.Data }).catch(() => {});
+      }
+    } catch {
+      // The books directory may not exist yet. Cleanup must never block a new transfer.
+    }
+  })();
+  return interruptedDownloadCleanup;
+}
+
 export async function downloadEpub(
   downloadUrl: string,
   apiKey: string,
   bookId: string,
+  onProgress?: (percent: number) => void,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
   assertSafeBookId(bookId);
 
+  await cleanupInterruptedEpubDownloads();
   await ensureDataDirectory(BOOK_DIRECTORY);
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
-  const temporaryPath = `${finalPath}.partial`;
+  const temporaryPath = `${finalPath}${PARTIAL_SUFFIX}`;
   const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+  const listener = onProgress
+    ? await FileTransfer.addListener('progress', (event) => {
+        if (
+          event.type === 'download' &&
+          event.url === downloadUrl &&
+          event.lengthComputable &&
+          event.contentLength > 0 &&
+          Number.isFinite(event.bytes)
+        ) {
+          onProgress(
+            Math.max(0, Math.min(100, Math.floor((event.bytes / event.contentLength) * 100))),
+          );
+        }
+      }).catch(() => null)
+    : null;
 
   try {
     for (let attempt = 0; ; attempt += 1) {
@@ -96,6 +136,7 @@ export async function downloadEpub(
           url: downloadUrl,
           path: destination.uri,
           headers: { 'x-api-key': apiKey },
+          ...(listener ? { progress: true } : {}),
         });
         break;
       } catch (error) {
@@ -162,6 +203,8 @@ export async function downloadEpub(
   } catch (error) {
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     throw error;
+  } finally {
+    await listener?.remove().catch(() => {});
   }
 }
 

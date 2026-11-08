@@ -2,8 +2,7 @@
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
-  import { tick, onDestroy, onMount } from 'svelte';
-  import { SvelteSet } from 'svelte/reactivity';
+  import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import {
     getBooks,
@@ -27,6 +26,7 @@
   import {
     cacheCover,
     clearCoverCache,
+    cleanupInterruptedEpubDownloads,
     deleteDownloadedEpub,
     downloadEpub,
     EPUB_DOWNLOAD_ENDPOINT,
@@ -101,15 +101,18 @@
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
-  const sharedCoverLoader = createSharedCoverLoader<string>(async (seriesId, signal) => {
+  const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id);
     }
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-    return URL.createObjectURL(blob);
+    return blob;
   });
   let books = $state<BookRecord[]>([]);
+  let displayableBooks = $derived(
+    books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
+  );
   let query = $state('');
   let offlineMessage = $state('');
   let downloadedOnly = $state(false);
@@ -129,27 +132,31 @@
   let authors = $derived(
     [
       ...new Set(
-        books.map((book) => book.author).filter((author): author is string => Boolean(author)),
+        displayableBooks
+          .map((book) => book.author)
+          .filter((author): author is string => Boolean(author)),
       ),
     ].sort((a, b) => a.localeCompare(b)),
   );
   let seriesNames = $derived(
     [
       ...new Set(
-        books.map((book) => book.series).filter((series): series is string => Boolean(series)),
+        displayableBooks
+          .map((book) => book.series)
+          .filter((series): series is string => Boolean(series)),
       ),
     ].sort((a, b) => a.localeCompare(b)),
   );
   let visibleBooks = $derived.by(() => {
-    const filtered = books.filter((book) => {
-      const matchesQuery = `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
-        .toLowerCase()
-        .includes(normalizedQuery);
-      const retainedOffline = book.remoteAvailable === false && Boolean(book.downloadPath);
+    const filtered = displayableBooks.filter((book) => {
+      const matchesQuery =
+        !normalizedQuery ||
+        `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
+          .toLowerCase()
+          .includes(normalizedQuery);
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
       return (
         matchesQuery &&
-        (book.remoteAvailable !== false || retainedOffline) &&
         (!downloadedOnly || Boolean(book.downloadPath)) &&
         (!hideCompleted || !completed) &&
         (!authorFilter || book.author === authorFilter) &&
@@ -176,7 +183,7 @@
   // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
   let continueBook = $derived.by(() => {
     let latest: BookRecord | null = null;
-    for (const book of books) {
+    for (const book of displayableBooks) {
       if (!book.downloadPath || book.pages <= 0 || book.pagesRead >= book.pages || !book.lastReadAt)
         continue;
       if (!latest || book.lastReadAt.localeCompare(latest.lastReadAt ?? '') > 0) latest = book;
@@ -199,9 +206,16 @@
   } | null>(null);
   let conflictError = $state('');
   let covers = $state<Record<number, string>>({});
+  let loadedCoverSeries = new Set<number>();
+  let coverReloadRequest = $state(0);
   let loading = $state(true);
   let refreshing = $state(false);
   let downloadingBookId = $state<string | null>(null);
+  let downloadPercent = $state<number | null>(null);
+  let cleanupInProgress = $state(false);
+  let downloadFailureBook = $state<BookRecord | null>(null);
+  let failedDownloadCleanupPath = $state<string | null>(null);
+  let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
   let message = $state('');
   let syncStatus = $state<SyncStatus>({
@@ -240,6 +254,17 @@
   let gridColumns = $state(2);
   let rowHeight = $state(400);
   let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
+  let visibleCoverKey = $derived.by(() => {
+    if (reading) return `${coverReloadRequest}:reader`;
+    const firstIndex = virtualWindow.startIndex;
+    const endIndex = virtualWindow.endIndex;
+    const viewportBooks =
+      endIndex > firstIndex
+        ? visibleBooks.slice(firstIndex, endIndex)
+        : visibleBooks.slice(0, Math.min(visibleBooks.length, gridColumns * 3));
+    const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
+    return `${coverReloadRequest}:${[...new Set(booksToCover.map((book) => book.seriesId))].join(',')}`;
+  });
   let scrollTarget: HTMLElement | Window | null = null;
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
@@ -256,6 +281,13 @@
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
+  }
+
+  function openBookLabel(book: BookRecord, includeProgress = true): string {
+    const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
+    const progress =
+      includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
+    return `Open ${book.title}${downloaded}${progress}`;
   }
 
   function parseSortOrder(value: string | null): LibrarySortOrder {
@@ -300,6 +332,23 @@
     void setPreference('librarySeries', seriesFilter);
   }
 
+  function visibleCoverItems(): CoverLoadItem[] {
+    if (reading) return [];
+    const firstIndex = virtualWindow.startIndex;
+    const endIndex = virtualWindow.endIndex;
+    const viewportBooks =
+      endIndex > firstIndex
+        ? visibleBooks.slice(firstIndex, endIndex)
+        : visibleBooks.slice(0, Math.min(visibleBooks.length, gridColumns * 3));
+    const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
+    const seriesIds = new Set<number>();
+    return booksToCover.flatMap((book) => {
+      if (seriesIds.has(book.seriesId)) return [];
+      seriesIds.add(book.seriesId);
+      return [{ seriesId: book.seriesId }];
+    });
+  }
+
   function activeElement(): HTMLElement | null {
     return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
       ? document.activeElement
@@ -312,6 +361,10 @@
 
   function insecureServer(): boolean {
     return server.baseUrl.toLowerCase().startsWith('http://');
+  }
+
+  function isMissingNativeFile(error: unknown): boolean {
+    return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
   }
 
   function columnsForWidth(width: number): number {
@@ -436,7 +489,12 @@
   }
 
   $effect(() => {
-    if (visibleBooks.length > 0) scheduleVirtualWindow();
+    if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
+  });
+
+  $effect(() => {
+    visibleCoverKey;
+    if (!loading) untrack(() => void loadCovers(visibleCoverItems()));
   });
 
   $effect(() => {
@@ -452,6 +510,7 @@
   });
 
   onMount(async () => {
+    void cleanupInterruptedEpubDownloads();
     const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
     scrollTarget = scrollContainer ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
@@ -478,12 +537,11 @@
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     books = savedBooks;
     retainCoversFor(books);
-    void loadCovers(books);
     loading = false;
     void refreshSyncStatus();
     offline = !(await Network.getStatus()).connected;
     offlineMessage = offline
-      ? books.length
+      ? displayableBooks.length
         ? 'No network connection. Showing your saved library.'
         : 'No network connection. Connect to Kavita to load your library.'
       : '';
@@ -497,7 +555,7 @@
           offline = !connected;
           offlineMessage = connected
             ? ''
-            : books.length
+            : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
           if (connected)
@@ -625,7 +683,18 @@
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);
-      void loadCovers(books);
+      coverReloadRequest += 1;
+      if (downloadNeedsRefresh && downloadFailureBook) {
+        const refreshedFailure = books.find((item) => item.id === downloadFailureBook?.id) ?? null;
+        downloadNeedsRefresh = false;
+        if (refreshedFailure?.downloadPath) {
+          downloadFailureBook = null;
+          message = `${refreshedFailure.title} is ready offline.`;
+        } else {
+          if (refreshedFailure) downloadFailureBook = refreshedFailure;
+          message = 'Library state refreshed. You can retry the download.';
+        }
+      }
       offline = false;
       offlineMessage = '';
       if (incomplete)
@@ -646,7 +715,7 @@
           cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
       });
       if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
-      const savedBooks = books.length
+      const savedBooks = displayableBooks.length
         ? 'Showing your saved library.'
         : 'No saved books are available yet.';
       if (cause instanceof KavitaError) {
@@ -682,60 +751,55 @@
 
   function clearCovers(): void {
     for (const cover of Object.values(covers)) revokeBrowserCover(cover);
+    loadedCoverSeries.clear();
     covers = {};
   }
 
   function retainCoversFor(items: BookRecord[]): void {
-    const seriesIds = new Set(items.map((item) => item.seriesId));
+    retainCoversForSeries(new Set(items.map((item) => item.seriesId)));
+  }
+
+  function retainCoversForSeries(seriesIds: Set<number>): void {
     const retained = Object.fromEntries(
       Object.entries(covers).filter(([seriesId]) => seriesIds.has(Number(seriesId))),
     );
     for (const [seriesId, cover] of Object.entries(covers)) {
       if (!seriesIds.has(Number(seriesId))) revokeBrowserCover(cover);
     }
+    loadedCoverSeries = new Set(
+      Object.keys(retained)
+        .map((seriesId) => Number(seriesId))
+        .filter(Number.isFinite),
+    );
     covers = retained;
   }
 
-  async function loadCovers(items: BookRecord[]): Promise<void> {
+  async function loadCovers(items: CoverLoadItem[]): Promise<void> {
     if (destroyed) return;
+    const visibleSeriesIds = new Set(items.map((item) => item.seriesId));
+    retainCoversForSeries(visibleSeriesIds);
     cancelCoverLoading();
+    sharedCoverLoader.retain(visibleSeriesIds);
     const controller = new AbortController();
     const generation = coverLoadGeneration;
     coverLoadController = controller;
-    const priority: BookRecord[] = [];
-    if (continueBook) priority.push(continueBook);
-    const firstVisibleIndex =
-      virtualWindow.endIndex > virtualWindow.startIndex ? virtualWindow.startIndex : 0;
-    const visibleEndIndex =
-      virtualWindow.endIndex > virtualWindow.startIndex
-        ? virtualWindow.endIndex
-        : Math.min(visibleBooks.length, gridColumns * 3);
-    priority.push(...visibleBooks.slice(firstVisibleIndex, visibleEndIndex));
-    const ordered = [...priority, ...items];
-    const prioritizedItems: CoverLoadItem[] = [];
-    const seenSeries = new SvelteSet<number>();
-    for (const book of ordered) {
-      if (seenSeries.has(book.seriesId)) continue;
-      seenSeries.add(book.seriesId);
-      prioritizedItems.push({ seriesId: book.seriesId });
-    }
     try {
-      await loadCoversWithConcurrency(prioritizedItems, {
+      await loadCoversWithConcurrency(items, {
         signal: controller.signal,
         concurrency: COVER_LOAD_CONCURRENCY,
-        hasCover: (seriesId) => Boolean(covers[seriesId]),
+        hasCover: (seriesId) => loadedCoverSeries.has(seriesId),
         load: (seriesId) => sharedCoverLoader.load(seriesId),
-        dispose: revokeBrowserCover,
         onLoaded: (seriesId, cover) => {
           if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
-            revokeBrowserCover(cover);
             return;
           }
+          const displayCover = typeof cover === 'string' ? cover : URL.createObjectURL(cover);
           const previous = covers[seriesId];
-          if (previous && previous !== cover) revokeBrowserCover(previous);
+          if (previous && previous !== displayCover) revokeBrowserCover(previous);
+          loadedCoverSeries.add(seriesId);
           covers = {
             ...covers,
-            [seriesId]: cover,
+            [seriesId]: displayCover,
           };
         },
       });
@@ -745,23 +809,33 @@
   }
 
   async function download(book: BookRecord): Promise<BookRecord | null> {
-    if (downloadingBookId) {
-      message = 'A book is already downloading. Try again when it finishes.';
+    if (downloadingBookId || cleanupInProgress) {
+      message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
     downloadingBookId = book.id;
+    downloadPercent = null;
+    downloadFailureBook = null;
+    failedDownloadCleanupPath = null;
+    downloadNeedsRefresh = false;
     message = `Downloading ${book.title}...`;
+    let downloadedPath: string | null = null;
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
         apiKey,
         book.id.replaceAll(':', '-'),
+        (percent) => {
+          if (downloadingBookId === book.id) downloadPercent = percent;
+        },
       );
+      downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
+      downloadedPath = null;
       const refreshed = {
         ...book,
         downloadPath: file.relativePath,
-        downloadStatus: 'downloaded',
+        downloadStatus: 'available',
         fileSize: file.size,
       };
       books = books.map((item) => (item.id === book.id ? refreshed : item));
@@ -770,6 +844,31 @@
     } catch (error) {
       let detail = 'download-storage';
       let status: number | undefined;
+      let savedBooks: BookRecord[] | null = null;
+      let cleanupFailed = false;
+      if (downloadedPath) {
+        savedBooks = await getBooks(server.id, { includeDescription: false }).catch(() => null);
+        const persistedBook =
+          savedBooks?.find((item) => item.id === book.id && item.downloadPath === downloadedPath) ??
+          null;
+        if (persistedBook && savedBooks) {
+          books = savedBooks;
+          message = `${book.title} is ready offline.`;
+          return persistedBook;
+        }
+        if (savedBooks) {
+          try {
+            await deleteDownloadedEpub(downloadedPath);
+            downloadedPath = null;
+          } catch {
+            cleanupFailed = true;
+            failedDownloadCleanupPath = downloadedPath;
+          }
+        } else {
+          downloadNeedsRefresh = true;
+        }
+      }
+
       if (error instanceof EpubTransferError) {
         status = error.status;
         detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
@@ -790,22 +889,62 @@
       } else {
         message = 'Turnleaf could not save the book on this device.';
       }
+      if (cleanupFailed) {
+        detail = 'download-storage-cleanup';
+        message = 'Turnleaf could not save the book or remove its local file. Retry cleanup.';
+      } else if (downloadNeedsRefresh) {
+        detail = 'download-status-unconfirmed';
+        message =
+          'The download finished, but its saved status could not be checked. Refresh before retrying.';
+      }
       recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
       if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       message += ' Open Settings to copy diagnostics.';
+      downloadFailureBook = book;
       return null;
     } finally {
       downloadingBookId = null;
+      downloadPercent = null;
+    }
+  }
+
+  async function retryDownloadCleanup(): Promise<void> {
+    const path = failedDownloadCleanupPath;
+    if (!path || downloadingBookId || cleanupInProgress) return;
+    cleanupInProgress = true;
+    message = 'Removing the leftover local file…';
+    try {
+      await deleteDownloadedEpub(path);
+      failedDownloadCleanupPath = null;
+      message = 'The leftover local file was removed. You can retry the download.';
+    } catch {
+      message = 'Turnleaf still could not remove the local file. Try cleanup again later.';
+    } finally {
+      cleanupInProgress = false;
     }
   }
 
   async function remove(book: BookRecord): Promise<boolean> {
+    if (downloadingBookId || cleanupInProgress) {
+      message = 'Wait for the current download or cleanup to finish before removing a book.';
+      return false;
+    }
+    let fileCleared = false;
     try {
-      if (book.downloadPath) await deleteDownloadedEpub(book.downloadPath);
+      if (book.downloadPath) {
+        try {
+          await deleteDownloadedEpub(book.downloadPath);
+        } catch (error) {
+          if (!isMissingNativeFile(error)) throw error;
+        }
+        fileCleared = true;
+      }
       await removeDownload(book.id);
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'storage error';
-      message = `Could not remove ${book.title}: ${detail}`;
+      message = fileCleared
+        ? `${book.title}'s file was removed, but Turnleaf could not update its saved status. Try removing it again.`
+        : `Could not remove ${book.title}: ${detail}`;
       return false;
     }
     books = books.map((item) =>
@@ -813,7 +952,7 @@
         ? {
             ...item,
             downloadPath: null,
-            downloadStatus: 'missing',
+            downloadStatus: 'none',
             fileSize: null,
           }
         : item,
@@ -827,14 +966,52 @@
       if (refreshed) await open(refreshed, options);
       return;
     }
-    let file;
+    if (destroyed || reading || conflict || resolvingOpenProgress) return;
+    resolvingOpenProgress = true;
+    let file: Awaited<ReturnType<typeof verifyDownloadedEpub>> = null;
+    let local: StoredReadingState | null = null;
+    let remote: KavitaProgress | null = null;
     try {
-      file = await verifyDownloadedEpub(book.downloadPath);
+      const fileCheck = verifyDownloadedEpub(book.downloadPath).then(
+        (verified) => ({ ok: true as const, verified }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      const upload = syncWork;
+      const progressCheck = (async () => {
+        try {
+          // Read both sides only after an earlier upload has settled, so a
+          // pending local revision cannot change during conflict detection.
+          await upload;
+          const [savedLocal, savedRemote] = await Promise.all([
+            getReadingState(book.id),
+            offline || book.remoteAvailable === false
+              ? null
+              : client.getProgress(book.chapterId).catch(() => null),
+          ]);
+          return { ok: true as const, local: savedLocal, remote: savedRemote };
+        } catch (error) {
+          return { ok: false as const, error };
+        }
+      })();
+      const [verification, progress] = await Promise.all([fileCheck, progressCheck]);
+      if (!verification.ok) {
+        message =
+          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
+        return;
+      }
+      file = verification.verified;
+      if (file && !progress.ok) {
+        message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
+        return;
+      }
+      if (file && progress.ok) [local, remote] = [progress.local, progress.remote];
     } catch {
-      message =
-        'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
+      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
       return;
+    } finally {
+      resolvingOpenProgress = false;
     }
+    if (destroyed) return;
     if (!file) {
       await removeDownload(book.id);
       message = 'The downloaded file is missing. Download it again.';
@@ -843,27 +1020,6 @@
       if (refreshed) await open(refreshed, options);
       return;
     }
-    if (destroyed || reading || conflict || resolvingOpenProgress) return;
-    resolvingOpenProgress = true;
-    let local;
-    let remote;
-    try {
-      // Let an in-flight upload finish before reading both sides. While reading
-      // them or showing a conflict, a new flush must not send the disputed item.
-      await syncWork;
-      [local, remote] = await Promise.all([
-        getReadingState(book.id),
-        offline || book.remoteAvailable === false
-          ? null
-          : client.getProgress(book.chapterId).catch(() => null),
-      ]);
-    } catch {
-      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
-      return;
-    } finally {
-      resolvingOpenProgress = false;
-    }
-    if (destroyed) return;
     const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
     const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
     if (openProgress === 'remote') {
@@ -935,7 +1091,11 @@
     );
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
-    books = books.map((item) => (item.id === book.id ? { ...item, pagesRead, lastReadAt } : item));
+    const savedBook = books.find((item) => item.id === book.id);
+    if (savedBook) {
+      savedBook.pagesRead = pagesRead;
+      savedBook.lastReadAt = lastReadAt;
+    }
     await refreshSyncStatus();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
@@ -956,15 +1116,11 @@
   async function markDone(book: BookRecord): Promise<void> {
     const readingState = await getReadingState(book.id);
     await markBookCompleted(book, readingState);
-    books = books.map((item) =>
-      item.id === book.id
-        ? {
-            ...item,
-            pagesRead: book.pages,
-            lastReadAt: new Date().toISOString(),
-          }
-        : item,
-    );
+    const savedBook = books.find((item) => item.id === book.id);
+    if (savedBook) {
+      savedBook.pagesRead = book.pages;
+      savedBook.lastReadAt = new Date().toISOString();
+    }
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
@@ -1159,12 +1315,13 @@
 
   async function clearCache(): Promise<void> {
     cancelCoverLoading();
+    sharedCoverLoader.retain(new Set());
     await sharedCoverLoader.waitForIdle();
     if (destroyed) return;
     await clearCoverCache();
     if (destroyed) return;
     clearCovers();
-    void loadCovers(books);
+    coverReloadRequest += 1;
     message = 'Cover cache cleared.';
     closeSettings();
   }
@@ -1287,7 +1444,7 @@
     <p class="sr-only" role="status">
       {offlineMessage || message || (refreshing ? 'Refreshing library' : '')}
       {#if !loading && !refreshing}
-        {visibleBooks.length} of {books.length} books.
+        {visibleBooks.length} of {displayableBooks.length} books.
       {/if}
     </p>
     <header class="flex items-center justify-between gap-4">
@@ -1339,7 +1496,7 @@
       <button
         class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
         type="button"
-        aria-label={`Continue reading ${continueBook.title}`}
+        aria-label={`Continue reading ${continueBook.title}, ${Math.round(progressOf(continueBook))}% complete`}
         onclick={() => void open(continueBook!)}
         transition:fade
       >
@@ -1368,12 +1525,7 @@
           <div class="mt-2 flex items-center gap-2">
             <div
               class="h-2 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800"
-              role="progressbar"
-              aria-label={`Reading progress for ${continueBook.title}`}
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={Math.round(progressOf(continueBook))}
-              aria-valuetext={`${Math.round(progressOf(continueBook))}% complete`}
+              aria-hidden="true"
             >
               <div
                 class="h-full preset-filled-primary-600-400"
@@ -1555,14 +1707,14 @@
       </div>
     {/if}
 
-    {#if !loading && books.length > 0}
+    {#if !loading && displayableBooks.length > 0}
       <div
         class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-surface-700-300"
       >
-        <p>{visibleBooks.length} of {books.length} books</p>
+        <p>{visibleBooks.length} of {displayableBooks.length} books</p>
         <div class="flex items-center gap-1" role="group" aria-label="Library view">
           <button
-            class="btn btn-sm h-10 {viewMode === 'grid'
+            class="btn btn-sm h-11 {viewMode === 'grid'
               ? 'preset-filled-primary-700-300'
               : 'preset-tonal-surface'}"
             type="button"
@@ -1572,7 +1724,7 @@
             Grid
           </button>
           <button
-            class="btn btn-sm h-10 {viewMode === 'list'
+            class="btn btn-sm h-11 {viewMode === 'list'
               ? 'preset-filled-primary-700-300'
               : 'preset-tonal-surface'}"
             type="button"
@@ -1591,8 +1743,65 @@
       </div>
     {/if}
     {#if message}
-      <div class="alert preset-tonal-surface mt-4" transition:fade>
-        {message}
+      <div
+        class="alert preset-tonal-surface mt-4 flex flex-wrap items-center justify-between gap-3"
+        role={downloadFailureBook ? 'alert' : 'status'}
+        transition:fade
+      >
+        <p class="min-w-0 flex-1">{message}</p>
+        {#if downloadingBookId}
+          {@const downloadingTitle =
+            books.find((book) => book.id === downloadingBookId)?.title ?? 'book'}
+          <div class="flex shrink-0 items-center gap-2">
+            <div
+              class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
+              role="progressbar"
+              aria-label={`Download progress for ${downloadingTitle}`}
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={downloadPercent ?? undefined}
+              aria-valuetext={downloadPercent === null
+                ? 'Download in progress'
+                : `${downloadPercent}% downloaded`}
+            >
+              <div
+                class="h-full preset-filled-primary-600-400"
+                class:animate-pulse={downloadPercent === null}
+                style:width={`${downloadPercent ?? 35}%`}
+              ></div>
+            </div>
+            <span class="min-w-8 text-right text-xs tabular-nums">
+              {downloadPercent === null ? '…' : `${downloadPercent}%`}
+            </span>
+          </div>
+        {/if}
+        {#if downloadFailureBook}
+          {#if failedDownloadCleanupPath}
+            <button
+              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
+              type="button"
+              onclick={() => void retryDownloadCleanup()}
+              disabled={cleanupInProgress}
+              >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
+            >
+          {:else if downloadNeedsRefresh}
+            <button
+              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
+              type="button"
+              onclick={() => void refresh()}
+              disabled={refreshing}>Refresh library</button
+            >
+          {:else}
+            <button
+              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
+              type="button"
+              onclick={() => void download(downloadFailureBook!)}
+              disabled={Boolean(downloadingBookId) ||
+                offline ||
+                downloadFailureBook.remoteAvailable === false}>Retry download</button
+            >
+          {/if}
+        {/if}
       </div>
     {/if}
     {#if syncStatus.pendingCount > 0}
@@ -1632,7 +1841,7 @@
         </svg>
         <p class="text-sm">Opening your saved library...</p>
       </div>
-    {:else if books.length === 0}
+    {:else if displayableBooks.length === 0}
       <div
         class="mt-20 flex flex-col items-center gap-3 text-center text-surface-700-300"
         transition:fade
@@ -1644,6 +1853,14 @@
           />
         </svg>
         <p>No EPUB books found.</p>
+        <button
+          class="btn preset-tonal-surface mt-2 h-11"
+          type="button"
+          onclick={() => void refresh()}
+          disabled={refreshing || offline}
+        >
+          {refreshing ? 'Refreshing…' : 'Refresh library'}
+        </button>
       </div>
     {:else if visibleBooks.length === 0}
       <div
@@ -1685,88 +1902,88 @@
                 }}
               >
                 {#if viewMode === 'list'}
-                  <div class="relative">
+                  <div class="group relative">
+                    <div
+                      class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                    >
+                      <div
+                        class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
+                        aria-hidden="true"
+                      >
+                        {#if covers[book.seriesId]}
+                          <img
+                            class="h-full w-full object-cover"
+                            src={covers[book.seriesId]}
+                            loading="lazy"
+                            decoding="async"
+                            alt=""
+                          />
+                        {/if}
+                        {#if book.downloadPath && book.remoteAvailable !== false}
+                          <span
+                            class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
+                          >
+                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                              <path
+                                fill="currentColor"
+                                d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
+                              />
+                            </svg>
+                          </span>
+                        {/if}
+                        {#if book.remoteAvailable === false && book.downloadPath}
+                          <span
+                            class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
+                          >
+                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                              <path
+                                fill="currentColor"
+                                d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                              />
+                            </svg>
+                          </span>
+                        {/if}
+                      </div>
+                      <div class="min-w-0 flex-1">
+                        <h2
+                          class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                        >
+                          {book.title}
+                        </h2>
+                        <p class="mt-1 truncate text-sm text-surface-700-300">
+                          {book.author ?? 'Unknown author'}
+                        </p>
+                        {#if book.series}
+                          <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                        {/if}
+                        {#if progressOf(book) > 0}
+                          <div
+                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                            role="progressbar"
+                            aria-label={`Reading progress for ${book.title}`}
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                            aria-valuenow={Math.round(progressOf(book))}
+                            aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                          >
+                            <div
+                              class="h-full preset-filled-primary-600-400"
+                              style:width={`${progressOf(book)}%`}
+                            ></div>
+                          </div>
+                        {/if}
+                      </div>
+                    </div>
                     <button
-                      class="group block w-full text-left"
+                      class="absolute inset-0 z-0 rounded-lg text-left"
                       type="button"
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
+                      aria-label={openBookLabel(book, false)}
                       disabled={downloadingBookId === book.id}
                     >
-                      <div
-                        class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
-                      >
-                        <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
-                          {#if covers[book.seriesId]}
-                            <img
-                              class="h-full w-full object-cover"
-                              src={covers[book.seriesId]}
-                              loading="lazy"
-                              decoding="async"
-                              alt=""
-                            />
-                          {/if}
-                          {#if book.downloadPath && book.remoteAvailable !== false}
-                            <span
-                              class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
-                              role="img"
-                              title="Downloaded for offline reading"
-                              aria-label="Downloaded for offline reading"
-                            >
-                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                                <path
-                                  fill="currentColor"
-                                  d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
-                                />
-                              </svg>
-                            </span>
-                          {/if}
-                          {#if book.remoteAvailable === false && book.downloadPath}
-                            <span
-                              class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
-                              title="Saved offline; no longer available on Kavita"
-                              aria-label="Saved offline; no longer available on Kavita"
-                            >
-                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                                <path
-                                  fill="currentColor"
-                                  d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
-                                />
-                              </svg>
-                            </span>
-                          {/if}
-                        </div>
-                        <div class="min-w-0 flex-1">
-                          <h2
-                            class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
-                          >
-                            {book.title}
-                          </h2>
-                          <p class="mt-1 truncate text-sm text-surface-700-300">
-                            {book.author ?? 'Unknown author'}
-                          </p>
-                          {#if book.series}
-                            <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
-                          {/if}
-                          {#if progressOf(book) > 0}
-                            <div
-                              class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
-                              role="progressbar"
-                              aria-label={`Reading progress for ${book.title}`}
-                              aria-valuemin="0"
-                              aria-valuemax="100"
-                              aria-valuenow={Math.round(progressOf(book))}
-                              aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                            >
-                              <div
-                                class="h-full preset-filled-primary-600-400"
-                                style:width={`${progressOf(book)}%`}
-                              ></div>
-                            </div>
-                          {/if}
-                        </div>
-                      </div>
+                      <span class="sr-only">{openBookLabel(book)}</span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -1786,111 +2003,92 @@
                     </button>
                   </div>
                 {:else}
-                  <div class="group relative block w-full text-left">
-                    <div>
-                      <button
-                        class="block w-full text-left after:absolute after:inset-0 disabled:after:hidden"
-                        type="button"
-                        data-book-open
-                        onclick={() => void open(book)}
-                        onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                        aria-label={`Open ${book.title}${book.downloadPath ? ', downloaded for offline reading' : ''}`}
-                        disabled={downloadingBookId === book.id}
-                      >
-                        <div
-                          class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                  <div class="group relative">
+                    <div
+                      class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                      aria-hidden="true"
+                    >
+                      {#if covers[book.seriesId]}
+                        <img
+                          class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+                          src={covers[book.seriesId]}
+                          loading="lazy"
+                          decoding="async"
+                          alt=""
+                        />
+                      {/if}
+                      {#if book.downloadPath && book.remoteAvailable !== false}
+                        <span
+                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
-                          {#if covers[book.seriesId]}
-                            <img
-                              class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                              src={covers[book.seriesId]}
-                              loading="lazy"
-                              decoding="async"
-                              alt=""
+                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                            <path
+                              fill="currentColor"
+                              d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
                             />
-                          {/if}
-                          {#if book.downloadPath && book.remoteAvailable !== false}
-                            <span
-                              class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                              role="img"
-                              title="Downloaded for offline reading"
-                              aria-label="Downloaded for offline reading"
-                            >
-                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                                <path
-                                  fill="currentColor"
-                                  d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
-                                />
-                              </svg>
-                            </span>
-                          {/if}
-                          {#if book.remoteAvailable === false && book.downloadPath}
-                            <span
-                              class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                              title="Saved offline; no longer available on Kavita"
-                              aria-label="Saved offline; no longer available on Kavita"
-                            >
-                              <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                                <path
-                                  fill="currentColor"
-                                  d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
-                                />
-                              </svg>
-                            </span>
-                          {/if}
-                          {#if downloadingBookId === book.id}
-                            <span
-                              class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                              title="Downloading"
-                              aria-label="Downloading"
-                            >
-                              <svg
-                                aria-hidden="true"
-                                viewBox="0 0 24 24"
-                                class="h-4 w-4 animate-spin"
-                              >
-                                <path
-                                  fill="currentColor"
-                                  d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
-                                />
-                              </svg>
-                            </span>
-                          {/if}
-                          {#if progressOf(book) > 0}
-                            <div
-                              class="absolute inset-x-0 bottom-0 h-2"
-                              role="progressbar"
-                              aria-label={`Reading progress for ${book.title}`}
-                              aria-valuemin="0"
-                              aria-valuemax="100"
-                              aria-valuenow={Math.round(progressOf(book))}
-                              aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                            >
-                              <div
-                                class="h-full preset-filled-primary-600-400"
-                                style:width={`${progressOf(book)}%`}
-                              ></div>
-                            </div>
-                          {/if}
+                          </svg>
+                        </span>
+                      {/if}
+                      {#if book.remoteAvailable === false && book.downloadPath}
+                        <span
+                          class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                        >
+                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                            <path
+                              fill="currentColor"
+                              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                            />
+                          </svg>
+                        </span>
+                      {/if}
+                      {#if downloadingBookId === book.id}
+                        <span
+                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                        >
+                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
+                            <path
+                              fill="currentColor"
+                              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+                            />
+                          </svg>
+                        </span>
+                      {/if}
+                      {#if progressOf(book) > 0}
+                        <div class="absolute inset-x-0 bottom-0 h-2">
+                          <div
+                            class="h-full preset-filled-primary-600-400"
+                            style:width={`${progressOf(book)}%`}
+                          ></div>
                         </div>
-                      </button>
-                      <button
-                        class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
-                        type="button"
-                        data-book-actions
-                        onclick={() => openMenu(book)}
-                        onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                        aria-label={`Book actions for ${book.title}`}
-                        title="More actions"
-                      >
-                        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                          <path
-                            fill="currentColor"
-                            d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
-                          />
-                        </svg>
-                      </button>
+                      {/if}
                     </div>
+                    <button
+                      class="absolute inset-0 z-0 rounded-lg text-left"
+                      type="button"
+                      data-book-open
+                      onclick={() => void open(book)}
+                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
+                      aria-label={openBookLabel(book)}
+                      disabled={downloadingBookId === book.id}
+                    >
+                      <span class="sr-only">{openBookLabel(book)}</span>
+                    </button>
+                    <button
+                      class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
+                      type="button"
+                      data-book-actions
+                      onclick={() => openMenu(book)}
+                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
+                      aria-label={`Book actions for ${book.title}`}
+                      title="More actions"
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                        <path
+                          fill="currentColor"
+                          d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+                        />
+                      </svg>
+                    </button>
                     <div class="mt-3">
                       <h2
                         class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
@@ -2202,7 +2400,7 @@
         <div class="mt-3 flex flex-wrap gap-2">
           {#each skeletonThemes as option (option)}
             <button
-              class="inline-flex h-8 w-10 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
+              class="inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
               option
                 ? 'preset-filled-primary-700-300'
                 : 'preset-tonal-surface'}"
@@ -2235,16 +2433,23 @@
           <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span
           >
           <button
-            class={`switch-track ${
-              pendingAutoSync ? 'preset-filled-primary-700-300' : 'preset-filled-secondary-700-300'
-            }`}
+            class="switch-button"
             type="button"
             role="switch"
             aria-checked={pendingAutoSync}
             aria-label="Auto-sync furthest read"
             onclick={() => void updateAutoSync(!pendingAutoSync)}
           >
-            <span class="switch-thumb preset-filled-tertiary-100-900" aria-hidden="true"></span>
+            <span
+              class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
+                pendingAutoSync
+                  ? 'preset-filled-primary-700-300'
+                  : 'preset-filled-secondary-700-300'
+              }`}
+              aria-hidden="true"
+            >
+              <span class="switch-thumb preset-filled-tertiary-100-900"></span>
+            </span>
           </button>
         </div>
       </div>
@@ -2442,7 +2647,7 @@
     height: 1.75rem;
     flex: none;
     border-radius: 9999px;
-    border: 1px solid hsl(var(--color-primary-900) / 0.35);
+    border: 1px solid color-mix(in srgb, var(--color-primary-900) 35%, transparent);
     padding: 0.2rem;
     box-shadow:
       inset 0 1px 1px hsl(0 0% 100% / 0.08),
@@ -2452,6 +2657,18 @@
       background-color 160ms ease,
       border-color 160ms ease,
       box-shadow 160ms ease;
+  }
+
+  .switch-button {
+    display: inline-grid;
+    width: 3rem;
+    height: 2.75rem;
+    flex: none;
+    place-items: center;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    cursor: pointer;
   }
 
   .switch-thumb {
@@ -2465,15 +2682,7 @@
     transition: transform 160ms ease;
   }
 
-  .switch-track[aria-checked='true'] .switch-thumb {
+  .switch-checked .switch-thumb {
     transform: translateX(1.2rem);
-  }
-
-  .switch-track:focus-visible {
-    outline: 0;
-    box-shadow:
-      0 0 0 3px hsl(var(--color-primary-500) / 0.35),
-      inset 0 1px 1px hsl(0 0% 100% / 0.08),
-      0 1px 4px hsl(0 0% 0% / 0.2);
   }
 </style>
