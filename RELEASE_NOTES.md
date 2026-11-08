@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test: verify offline reading and sync on Android
 - fix: restore visible focus and simplify native helpers
 - ci: reuse the Android debug APK and scan native Java
 - perf: batch startup reads and reuse the EPUB spine index

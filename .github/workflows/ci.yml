@@ -86,15 +86,15 @@ jobs:
           name: android-debug-apk
           path: android/app/build/outputs/apk/debug
 
-      - name: Launch emulator and smoke test app startup
+      - name: Verify the Android reading journey
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 29
-          target: default
-          arch: x86
-          profile: Nexus 5
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
           force-avd-creation: true
           emulator-boot-timeout: 900
           disable-animations: true
-          script: npm run android:smoke
+          script: node scripts/android-reading-journey.mjs
