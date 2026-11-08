@@ -63,9 +63,7 @@ jobs:
         run: npm run release:finalize
 
       - name: Run release quality gates
-        run: |
-          npm run verify
-          npm run android:debug
+        run: npm run verify
 
       - name: Restore signing key
         env:

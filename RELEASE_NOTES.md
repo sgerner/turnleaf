@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- ci: reuse the Android debug APK and scan native Java
 - perf: batch startup reads and reuse the EPUB spine index
 - fix: keep virtual books and EPUB content reachable
 - fix: protect reading progress and improve offline book recovery
