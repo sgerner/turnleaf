@@ -4,25 +4,14 @@ import { Capacitor } from '@capacitor/core';
 const PREFIX = 'turnleaf_';
 const BROWSER_PREFIX = 'turnleaf_browser_';
 
-export class SecureStorageUnavailableError extends Error {}
-
-function requireNative(): void {
-  if (!Capacitor.isNativePlatform()) {
-    throw new SecureStorageUnavailableError(
-      'Secure credential storage is available in the Android and iOS applications.',
-    );
-  }
-}
-
 async function prepare(): Promise<void> {
-  requireNative();
   await SecureStorage.setKeyPrefix(PREFIX);
   await SecureStorage.setSynchronize(false);
 }
 
 function browserStorage(): Storage {
   if (typeof window === 'undefined' || !window.localStorage) {
-    throw new SecureStorageUnavailableError('Browser storage is unavailable in this context.');
+    throw new Error('Browser storage is unavailable in this context.');
   }
   return window.localStorage;
 }
