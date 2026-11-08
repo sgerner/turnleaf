@@ -48,7 +48,15 @@ jobs:
       - name: Build Android debug APK
         run: npm run android:debug
 
+      - name: Upload Android debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
   android-emulator-smoke:
+    needs: web-and-android-checks
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -60,7 +68,6 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
 
       - name: Set up Java
         uses: actions/setup-java@v6
@@ -73,11 +80,11 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build Android debug APK
-        run: npm run android:debug
+      - name: Download Android debug APK
+        uses: actions/download-artifact@v8
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug
 
       - name: Launch emulator and smoke test app startup
         uses: reactivecircus/android-emulator-runner@v2
