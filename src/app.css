@@ -67,7 +67,8 @@ input {
 }
 
 :focus-visible {
-  outline: 3px solid var(--color-primary-700-300);
+  outline: 3px solid
+    light-dark(var(--color-primary-700, currentColor), var(--color-primary-300, currentColor));
   outline-offset: 3px;
 }
 

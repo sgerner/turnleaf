@@ -216,12 +216,8 @@ final class TurnleafReaderChromeController {
                 return
             }
             viewController.setNeedsStatusBarAppearanceUpdate()
-            if #available(iOS 11.0, *) {
-                viewController.setNeedsUpdateOfHomeIndicatorAutoHidden()
-            }
-            if #available(iOS 13.0, *) {
-                viewController.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
-            }
+            viewController.setNeedsUpdateOfHomeIndicatorAutoHidden()
+            viewController.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
         }
     }
 }
