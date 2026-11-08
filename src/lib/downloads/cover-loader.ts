@@ -6,6 +6,7 @@ export interface SharedCoverLoader<T> {
   load: (seriesId: number) => Promise<T>;
   waitForIdle: () => Promise<void>;
   cancel: () => void;
+  retain: (seriesIds: ReadonlySet<number>) => void;
 }
 
 export interface CoverLoaderOptions<T> {
@@ -86,11 +87,26 @@ export function createSharedCoverLoader<T>(
       await Promise.allSettled([...requests.values()].map(({ promise }) => promise));
     },
     cancel() {
-      for (const { controller, reject } of requests.values()) {
+      const queuedRequests = new Set(pending.map(({ request }) => request));
+      for (const [seriesId, request] of requests) {
+        const { controller, reject } = request;
         controller.abort();
         reject(new DOMException('Aborted', 'AbortError'));
+        if (queuedRequests.has(request) && requests.get(seriesId) === request) {
+          requests.delete(seriesId);
+        }
       }
       pending.length = 0;
+    },
+    retain(seriesIds) {
+      for (let index = pending.length - 1; index >= 0; index -= 1) {
+        const queued = pending[index];
+        if (!queued || seriesIds.has(queued.seriesId)) continue;
+        queued.request.controller.abort();
+        queued.request.reject(new DOMException('Aborted', 'AbortError'));
+        if (requests.get(queued.seriesId) === queued.request) requests.delete(queued.seriesId);
+        pending.splice(index, 1);
+      }
     },
   };
 }

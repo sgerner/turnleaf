@@ -125,4 +125,33 @@ describe('createSharedCoverLoader', () => {
     await expect(queued).rejects.toMatchObject({ name: 'AbortError' });
     expect(aborted).toBe(true);
   });
+
+  it('drops queued requests outside the latest viewport and keeps active work', async () => {
+    const started: number[] = [];
+    const releases = new Map<number, () => void>();
+    let activeSignal: AbortSignal | undefined;
+    const shared = createSharedCoverLoader<number>(async (seriesId, signal) => {
+      started.push(seriesId);
+      if (seriesId === 1) activeSignal = signal;
+      await new Promise<void>((resolve) => releases.set(seriesId, resolve));
+      return seriesId;
+    }, 1);
+
+    const active = shared.load(1);
+    const obsolete = shared.load(2);
+    const retained = shared.load(3);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    shared.retain(new Set([1, 3]));
+    await expect(obsolete).rejects.toMatchObject({ name: 'AbortError' });
+    expect(activeSignal?.aborted).toBe(false);
+
+    releases.get(1)?.();
+    await expect(active).resolves.toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual([1, 3]);
+
+    releases.get(3)?.();
+    await expect(retained).resolves.toBe(3);
+  });
 });

@@ -227,7 +227,7 @@ async function run() {
     });
     await waitFor('saved offline progress', () =>
       web.evaluate(
-        `Number(document.querySelector('[aria-label="Reading progress for ${title}"]')?.getAttribute('aria-valuenow')) >= 50`,
+        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
       ),
     );
 
