@@ -206,7 +206,6 @@
   } | null>(null);
   let conflictError = $state('');
   let covers = $state<Record<number, string>>({});
-  let loadedCoverSeries = new Set<number>();
   let coverReloadRequest = $state(0);
   let loading = $state(true);
   let refreshing = $state(false);
@@ -255,7 +254,7 @@
   let rowHeight = $state(400);
   let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
   let visibleCoverKey = $derived.by(() => {
-    if (reading) return `${coverReloadRequest}:reader`;
+    if (reading) return `${coverReloadRequest}:`;
     const firstIndex = virtualWindow.startIndex;
     const endIndex = virtualWindow.endIndex;
     const viewportBooks =
@@ -330,23 +329,6 @@
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
-  }
-
-  function visibleCoverItems(): CoverLoadItem[] {
-    if (reading) return [];
-    const firstIndex = virtualWindow.startIndex;
-    const endIndex = virtualWindow.endIndex;
-    const viewportBooks =
-      endIndex > firstIndex
-        ? visibleBooks.slice(firstIndex, endIndex)
-        : visibleBooks.slice(0, Math.min(visibleBooks.length, gridColumns * 3));
-    const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
-    const seriesIds = new Set<number>();
-    return booksToCover.flatMap((book) => {
-      if (seriesIds.has(book.seriesId)) return [];
-      seriesIds.add(book.seriesId);
-      return [{ seriesId: book.seriesId }];
-    });
   }
 
   function activeElement(): HTMLElement | null {
@@ -493,8 +475,10 @@
   });
 
   $effect(() => {
-    visibleCoverKey;
-    if (!loading) untrack(() => void loadCovers(visibleCoverItems()));
+    const [, ids] = visibleCoverKey.split(':');
+    if (loading) return;
+    const items = ids ? ids.split(',').map((id) => ({ seriesId: Number(id) })) : [];
+    untrack(() => void loadCovers(items));
   });
 
   $effect(() => {
@@ -751,7 +735,6 @@
 
   function clearCovers(): void {
     for (const cover of Object.values(covers)) revokeBrowserCover(cover);
-    loadedCoverSeries.clear();
     covers = {};
   }
 
@@ -766,11 +749,6 @@
     for (const [seriesId, cover] of Object.entries(covers)) {
       if (!seriesIds.has(Number(seriesId))) revokeBrowserCover(cover);
     }
-    loadedCoverSeries = new Set(
-      Object.keys(retained)
-        .map((seriesId) => Number(seriesId))
-        .filter(Number.isFinite),
-    );
     covers = retained;
   }
 
@@ -787,7 +765,7 @@
       await loadCoversWithConcurrency(items, {
         signal: controller.signal,
         concurrency: COVER_LOAD_CONCURRENCY,
-        hasCover: (seriesId) => loadedCoverSeries.has(seriesId),
+        hasCover: (seriesId) => Boolean(covers[seriesId]),
         load: (seriesId) => sharedCoverLoader.load(seriesId),
         onLoaded: (seriesId, cover) => {
           if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
@@ -796,7 +774,6 @@
           const displayCover = typeof cover === 'string' ? cover : URL.createObjectURL(cover);
           const previous = covers[seriesId];
           if (previous && previous !== displayCover) revokeBrowserCover(previous);
-          loadedCoverSeries.add(seriesId);
           covers = {
             ...covers,
             [seriesId]: displayCover,
@@ -844,10 +821,11 @@
     } catch (error) {
       let detail = 'download-storage';
       let status: number | undefined;
-      let savedBooks: BookRecord[] | null = null;
       let cleanupFailed = false;
       if (downloadedPath) {
-        savedBooks = await getBooks(server.id, { includeDescription: false }).catch(() => null);
+        const savedBooks = await getBooks(server.id, { includeDescription: false }).catch(
+          () => null,
+        );
         const persistedBook =
           savedBooks?.find((item) => item.id === book.id && item.downloadPath === downloadedPath) ??
           null;
@@ -968,7 +946,7 @@
     }
     if (destroyed || reading || conflict || resolvingOpenProgress) return;
     resolvingOpenProgress = true;
-    let file: Awaited<ReturnType<typeof verifyDownloadedEpub>> = null;
+    let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
     let local: StoredReadingState | null = null;
     let remote: KavitaProgress | null = null;
     try {
