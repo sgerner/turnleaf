@@ -363,16 +363,21 @@ export class ReaderSession {
     };
     this.rendition.on('relocated', this.relocated);
     this.contentClick = (event, contents) => {
-      const target = event.target as Element | null;
+      const eventTarget = event.target as Element | null;
       const selection = contents.window.getSelection();
       if (
         event.defaultPrevented ||
-        target?.closest?.('a, button, input, select, textarea, [contenteditable="true"]') ||
+        eventTarget?.closest?.('a, button, input, select, textarea, [contenteditable="true"]') ||
         (selection && !selection.isCollapsed)
       ) {
         return;
       }
-      const position = event.clientX / contents.window.innerWidth;
+      const frame = contents.window.frameElement;
+      const viewport = target.getBoundingClientRect();
+      if (!frame || viewport.width === 0) return;
+      // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
+      const position =
+        (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
       onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
     };
     this.rendition.on('click', this.contentClick);
