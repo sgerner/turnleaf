@@ -58,24 +58,28 @@ describe('ReaderSession keyboard navigation', () => {
   it('turns pages on ordinary content clicks while leaving links and text selection available', async () => {
     const onTap = vi.fn();
     const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      null,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      onTap,
-    );
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), onTap);
     const click = mockRendition.on.mock.calls.find(([name]) => name === 'click')?.[1];
+    const frame = document.createElement('iframe');
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
     const contents = {
-      window: { innerWidth: 300, getSelection: () => ({ isCollapsed: true }) },
+      window: {
+        frameElement: frame,
+        innerWidth: 300,
+        getSelection: () => ({ isCollapsed: true }),
+      },
     };
     click({ target: document.createElement('a'), clientX: 250 }, contents);
     click(
       { target: document.createElement('p'), clientX: 250 },
       {
-        window: { innerWidth: 300, getSelection: () => ({ isCollapsed: false }) },
+        window: {
+          frameElement: frame,
+          innerWidth: 300,
+          getSelection: () => ({ isCollapsed: false }),
+        },
       },
     );
     expect(onTap).not.toHaveBeenCalled();
