@@ -1,4 +1,9 @@
-import { confirmSync, getPendingSync, markSyncFailure } from '../database/database';
+import {
+  confirmSync,
+  getPendingSync,
+  markSyncFailure,
+  type PendingSyncItem,
+} from '../database/database';
 import type { KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
@@ -16,18 +21,27 @@ export function flushProgress(client: KavitaClient, serverId: string): Promise<v
 
 async function run(client: KavitaClient, serverId: string): Promise<void> {
   const failures: unknown[] = [];
-  for (const item of await getPendingSync(serverId)) {
-    try {
-      await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
-      await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
-    } catch (error) {
-      await markSyncFailure(
-        item.bookId,
-        error instanceof Error ? error.message : 'Sync failed',
-        item.revision,
-        item.updatedAt,
-      );
-      failures.push(error);
+  const attempted = new Map<string, PendingSyncItem>();
+  while (true) {
+    const pending = (await getPendingSync(serverId)).filter((item) => {
+      const previous = attempted.get(item.bookId);
+      return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
+    });
+    if (pending.length === 0) break;
+    for (const item of pending) {
+      attempted.set(item.bookId, item);
+      try {
+        await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
+        await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
+      } catch (error) {
+        await markSyncFailure(
+          item.bookId,
+          error instanceof Error ? error.message : 'Sync failed',
+          item.revision,
+          item.updatedAt,
+        );
+        failures.push(error);
+      }
     }
   }
   if (failures.length > 0) {

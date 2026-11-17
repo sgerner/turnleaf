@@ -530,7 +530,10 @@
         : 'No network connection. Connect to Kavita to load your library.'
       : '';
     if (destroyed) return;
-    if (!offline) await refresh();
+    if (!offline) {
+      await refresh();
+      void syncProgress(false);
+    }
     if (destroyed) return;
     cleanups.push(
       await registerListener(
@@ -543,8 +546,8 @@
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
           if (connected)
-            void syncProgress(false)
-              .then(refresh)
+            void refresh()
+              .then(() => syncProgress(false))
               .catch(() => {});
         }),
       ),
@@ -611,9 +614,18 @@
       }
       await flushProgress(client, server.id);
       if (showFeedback) message = 'Reading progress synced.';
-    } catch {
-      if (showFeedback)
-        message = 'Some reading progress is waiting to sync. Try again when online.';
+    } catch (error) {
+      if (
+        error instanceof AggregateError &&
+        error.errors.some(
+          (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
+        )
+      ) {
+        message =
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
+      } else if (showFeedback) {
+        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+      }
     } finally {
       await refreshSyncStatus();
       syncing = false;
@@ -1074,20 +1086,42 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    await refreshSyncStatus();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
   }
 
   async function syncLatestForReader(
     book: BookRecord,
-  ): Promise<{ xpath: string | null; percentage: number | null } | null> {
-    if (offline) return null;
+    manual: boolean,
+  ): Promise<{
+    xpath: string | null;
+    percentage: number | null;
+    accept?: () => Promise<void>;
+  } | null> {
+    if (offline || book.remoteAvailable === false || (!manual && !pendingAutoSync)) return null;
+    const local = await getReadingState(book.id);
+    if (!manual && local?.pendingSync) return null;
     const remote = await client.getProgress(book.chapterId).catch(() => null);
     if (!remote) return null;
     return {
       xpath: remote.bookScrollId ?? null,
       percentage: remotePercentage(remote, book),
+      ...(local?.pendingSync && {
+        accept: async () => {
+          // A choice based on an older queue revision cannot replace a newly saved position.
+          const accepted =
+            local.syncRevision != null &&
+            (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt));
+          if (!accepted)
+            throw new Error('The saved reading position changed. Sync again to retry.');
+          const savedBook = books.find((item) => item.id === book.id);
+          if (savedBook) {
+            savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+            savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
+          }
+          void refreshSyncStatus();
+        },
+      }),
     };
   }
 
@@ -1359,7 +1393,10 @@
       replacementApiKey = '';
       message = 'API key updated.';
       closeSettings();
-      void refresh();
+      // An upload started with the previous key may still be finishing.
+      await syncWork;
+      await refresh();
+      await syncProgress(false);
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -1407,7 +1444,7 @@
     initialPercentage={reading.percentage}
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
-    onSyncLatest={() => syncLatestForReader(reading!.book)}
+    onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
     onRetryDownload={offline || reading.book.remoteAvailable === false
       ? undefined
       : retryReaderDownload}
