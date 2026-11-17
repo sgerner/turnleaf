@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Improve library filtering and accessibility with a skip link, clearer progress, and semantic settings groups.
+- Fix reconnect mode during submission
+- chore(android): remove unused Google Services setup and modernize the clean task
+- Offer credential recovery from startup errors
+- Share release note parsing and command execution
+- Let reconnect setup update a saved Kavita address with isolated credentials.
 - ci: preserve release journey coverage for production APKs
 - ci: preserve queued master checks while coalescing PR runs
 - Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
@@ -43,6 +49,8 @@
 - security: refresh the transitive devalue dependency to a patched release.
 - fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
 - fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
+- Offer Kavita key re-entry when local credential access fails, and announce when release links open a new tab.
+- Consolidate release-note parsing and inherited-output command execution across scripts.
 
 ## 0.3.4
 

@@ -1,20 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readReleaseNotes, releaseVersion } from './release-notes-source.mjs';
 
-const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-const version = packageJson.version;
-const source = readFileSync(new URL('../RELEASE_NOTES.md', import.meta.url), 'utf8');
-const lines = source.split(/\r?\n/);
-const start = lines.findIndex((line) => line.trim() === `## ${version}`);
+const heading = `## ${releaseVersion()}`;
+const { lines, sections } = readReleaseNotes();
+const section = sections.find((item) => item.heading === heading);
+if (!section) throw new Error(`Could not find a ${heading} section in RELEASE_NOTES.md`);
 
-if (start < 0) {
-  throw new Error(`Could not find a ## ${version} section in RELEASE_NOTES.md`);
-}
-
-const output = [];
-for (let index = start; index < lines.length; index += 1) {
-  const line = lines[index];
-  if (index > start && line.startsWith('## ')) break;
-  output.push(line);
-}
-
-process.stdout.write(`${output.join('\n').trim()}\n`);
+process.stdout.write(`${lines.slice(section.start, section.end).join('\n').trim()}\n`);

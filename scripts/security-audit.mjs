@@ -1,8 +1,8 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { runCommand } from './run-command.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -14,7 +14,7 @@ export function auditArguments(userConfigPath) {
   return ['audit', '--omit=dev', '--ignore-scripts', '--userconfig', userConfigPath];
 }
 
-export async function runAudit({ spawnImpl = spawn, cwd = projectRoot } = {}) {
+export async function runAudit({ spawnImpl, cwd = projectRoot } = {}) {
   const tempDirectory = await mkdtemp(join(tmpdir(), 'turnleaf-npm-audit-'));
   const userConfigPath = join(tempDirectory, 'empty.npmrc');
   await writeFile(userConfigPath, '');
@@ -24,26 +24,11 @@ export async function runAudit({ spawnImpl = spawn, cwd = projectRoot } = {}) {
   env.npm_config_userconfig = userConfigPath;
 
   try {
-    await new Promise((resolveCommand, rejectCommand) => {
-      const child = spawnImpl(npmExecutable(), auditArguments(userConfigPath), {
-        cwd,
-        env,
-        stdio: 'inherit',
-        shell: process.platform === 'win32',
-      });
-
-      child.once('error', rejectCommand);
-      child.once('exit', (code, signal) => {
-        if (code === 0) {
-          resolveCommand();
-          return;
-        }
-        rejectCommand(
-          new Error(
-            signal ? `npm audit terminated by ${signal}` : `npm audit exited with code ${code}`,
-          ),
-        );
-      });
+    await runCommand(npmExecutable(), auditArguments(userConfigPath), {
+      cwd,
+      env,
+      label: 'npm audit',
+      spawnImpl,
     });
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
