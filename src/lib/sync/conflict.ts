@@ -81,5 +81,5 @@ export function chooseOpenProgress(
     return chooseFurthestProgress(local.percentage, remotePercentage);
   }
 
-  return 'remote';
+  return 'local';
 }

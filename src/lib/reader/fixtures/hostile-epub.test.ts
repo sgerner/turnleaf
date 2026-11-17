@@ -37,10 +37,14 @@ it('keeps local EPUB content while removing network and executable references', 
 });
 
 it('sanitizes a local stylesheet before restoring its safe rules', async () => {
-  const document = new DOMParser().parseFromString(
-    '<html><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/book.css" /></head><body /></html>',
-    'application/xhtml+xml',
-  );
+  const chapter = () =>
+    new DOMParser().parseFromString(
+      '<html><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/book.css" /><link rel="stylesheet" href="styles/book.css" /></head><body /></html>',
+      'application/xhtml+xml',
+    );
+  const document = chapter();
+  const anotherChapter = chapter();
+  const stylesheetCache = new Map();
   vi.stubGlobal(
     'fetch',
     vi.fn(
@@ -55,8 +59,13 @@ it('sanitizes a local stylesheet before restoring its safe rules', async () => {
     ),
   );
 
-  await sanitizeEpubDocument(document);
+  await Promise.all([
+    sanitizeEpubDocument(document, stylesheetCache),
+    sanitizeEpubDocument(anotherChapter, stylesheetCache),
+  ]);
 
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(anotherChapter.querySelectorAll('style')).toHaveLength(2);
   expect(document.querySelector('base')?.getAttribute('href')).toContain('localhost');
   expect(document.querySelector('link[rel="stylesheet"]')).toBeNull();
   expect(document.querySelector('style')?.textContent).toContain('../Images/cover.jpg');

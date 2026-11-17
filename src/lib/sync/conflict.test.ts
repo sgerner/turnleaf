@@ -54,8 +54,8 @@ describe('reader open progress selection', () => {
     bookScrollId: '//body/DocFragment[2]/body/p[4]',
   };
 
-  it('uses Kavita progress when local state has already synced', () => {
-    expect(chooseOpenProgress(local, remote, 100, false)).toBe('remote');
+  it('preserves the synced local passage when automatic selection is off', () => {
+    expect(chooseOpenProgress(local, remote, 100, false)).toBe('local');
   });
 
   it('keeps the exact local CFI when Kavita points to the same saved XPath', () => {
@@ -71,7 +71,7 @@ describe('reader open progress selection', () => {
 
   it('uses Kavita page progress when no XPath was saved', () => {
     expect(chooseOpenProgress(null, { pageNum: 40 }, 100, false)).toBe('remote');
-    expect(chooseOpenProgress(local, { pageNum: 40 }, 100, false)).toBe('remote');
+    expect(chooseOpenProgress(local, { pageNum: 40 }, 100, false)).toBe('local');
   });
 
   it('uses furthest progress when requested', () => {
