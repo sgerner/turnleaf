@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Improve library filtering and accessibility with a skip link, clearer progress, and semantic settings groups.
+- chore(android): remove unused Google Services setup and modernize the clean task
 - Offer credential recovery from startup errors
 - Share release note parsing and command execution
 - Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
