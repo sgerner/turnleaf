@@ -3,13 +3,16 @@
 ## Unreleased
 
 - Offer credential recovery from startup errors
+- Share release note parsing and command execution
+- Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
+- chore: remove unused download, sync, and reader helpers
+- refactor: share the reader native plugin interface
 - Reduce repeated library and EPUB reader work
 - Reuse library search and sort work, retain recently loaded covers, and reduce reader and EPUB validation overhead.
 - Serialize confirmed positions with in-flight uploads
 - Fix reading progress sync and conflict handling
 - Sync queued reading positions on launch and after replacing the Kavita key, retry newer progress revisions, and pause uploads for removed books.
 - Preserve local reading positions with automatic selection off and save explicitly accepted Kavita conflicts.
-
 - fix: align EPUB taps with visible page (#214)
 - fix: keep library loading and download recovery responsive
 - fix: preserve the reader passage and keyboard focus
@@ -40,6 +43,7 @@
 - fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
 - fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
 - Offer Kavita key re-entry when local credential access fails, and announce when release links open a new tab.
+- Consolidate release-note parsing and inherited-output command execution across scripts.
 
 ## 0.3.4
 

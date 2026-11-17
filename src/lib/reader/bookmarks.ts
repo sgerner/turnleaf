@@ -43,13 +43,13 @@ export function parseLocationHistory(value: string | null): StoredReaderLocation
   return parseLocations(value, MAX_HISTORY);
 }
 
-export function locationLabel(percentage: number, href: string): string {
+function locationLabel(percentage: number, href: string): string {
   const percent = Math.round(Math.max(0, Math.min(1, percentage)) * 100);
   const chapter = href.split('#', 1)[0]?.split('/').pop() || 'current page';
   return `${percent}% · ${chapter}`;
 }
 
-export function bookmarkLocation(
+function bookmarkLocation(
   current: Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'>,
   savedAt = new Date().toISOString(),
 ): StoredReaderLocation {
