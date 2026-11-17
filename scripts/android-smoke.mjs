@@ -5,8 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { resolveDeviceSerial } from './android-device.mjs';
 
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const defaultApkPath = resolve(projectRoot, 'android/app/build/outputs/apk/debug/app-debug.apk');
-const defaultPackageName = 'app.turnleaf.reader.debug';
+const defaultApkPath = resolve(
+  projectRoot,
+  process.env.ANDROID_APK_PATH || 'android/app/build/outputs/apk/debug/app-debug.apk',
+);
+const defaultPackageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 
 function run(command, args) {
   return new Promise((resolveCommand, rejectCommand) => {

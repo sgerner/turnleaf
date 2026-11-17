@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { createCdpClient } from './android-cdp.mjs';
+import { runCleanup } from './android-cleanup.mjs';
 import { resolveDeviceSerial } from './android-device.mjs';
 import { main as smoke } from './android-smoke.mjs';
 
@@ -191,6 +192,7 @@ async function run() {
   let disabledNetwork = false;
   let journeyError;
   let cleanupError;
+  let journeyPassed = false;
   try {
     deviceSerial = await resolveDeviceSerial({ emulatorOnly: true });
     throwIfInterrupted();
@@ -283,30 +285,27 @@ async function run() {
         ),
     );
     throwIfInterrupted();
-    console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+    journeyPassed = true;
   } catch (error) {
     journeyError = error;
   } finally {
     const cleanup = [];
-    if (web) cleanup.push(['close WebView debugger', () => web.close()]);
     if (disabledNetwork) {
       cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);
       cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);
     }
+    if (web) cleanup.push(['close WebView debugger', () => web.close()]);
     if (tunnel)
       cleanup.push(['remove ADB reverse tunnel', () => adb('reverse', '--remove', tunnel)]);
 
-    const results = await Promise.allSettled(cleanup.map(([, action]) => action()));
+    const failures = await runCleanup(cleanup);
     fixture?.close();
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
-    const failures = results.flatMap((result, index) =>
-      result.status === 'rejected'
-        ? [`${cleanup[index][0]}: ${result.reason?.message ?? result.reason}`]
-        : [],
-    );
     if (failures.length) {
-      cleanupError = new Error(`Android journey cleanup failed: ${failures.join('; ')}`);
+      cleanupError = new Error(
+        `${journeyPassed ? 'Reading journey passed, but cleanup failed' : 'Android journey cleanup failed'}: ${failures.join('; ')}`,
+      );
     }
   }
 
@@ -315,6 +314,7 @@ async function run() {
     throw journeyError;
   }
   if (cleanupError) throw cleanupError;
+  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
 }
 
 await run().catch((error) => {

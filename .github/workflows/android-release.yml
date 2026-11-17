@@ -19,7 +19,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'master')
+       github.event.workflow_run.head_branch == 'master' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,6 +36,18 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.TESTED_REVISION }}
+
+      - name: Confirm release revision is current master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_REVISION: ${{ env.TESTED_REVISION }}
+        run: |
+          set -eu
+          CURRENT_MASTER="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master" --jq '.object.sha')"
+          if [ "$CURRENT_MASTER" != "$TESTED_REVISION" ]; then
+            echo "The tested revision is no longer current on master; refusing to build a release." >&2
+            exit 1
+          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -75,6 +88,44 @@ jobs:
       - name: Run release quality gates
         run: npm run verify
 
+      - name: Build debug APK for manual release journey
+        if: github.event_name == 'workflow_dispatch'
+        run: npm run android:debug
+
+      - name: Enable emulator hardware acceleration for manual journey
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo chgrp "$(id -gn)" /dev/kvm
+            sudo chmod g+rw /dev/kvm
+          fi
+
+      - name: Verify manually dispatched revision with reading journey
+        if: github.event_name == 'workflow_dispatch'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: true
+          script: npm run android:journey
+
+      - name: Confirm release revision is current before signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_REVISION: ${{ env.TESTED_REVISION }}
+        run: |
+          set -eu
+          CURRENT_MASTER="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master" --jq '.object.sha')"
+          if [ "$CURRENT_MASTER" != "$TESTED_REVISION" ]; then
+            echo "Master moved during release verification; refusing to sign an outdated APK." >&2
+            exit 1
+          fi
+
       - name: Restore signing key
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -110,14 +161,14 @@ jobs:
       - name: Build signed release APK
         run: npm run android:release
 
-      - name: Enable emulator hardware acceleration
+      - name: Enable emulator hardware acceleration for signed APK smoke test
         run: |
           if [ -c /dev/kvm ]; then
             sudo chgrp "$(id -gn)" /dev/kvm
             sudo chmod g+rw /dev/kvm
           fi
 
-      - name: Verify signed release APK reading journey
+      - name: Smoke-test signed release APK
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 36
@@ -131,7 +182,7 @@ jobs:
           script: |
             ANDROID_PACKAGE_NAME=app.turnleaf.reader \
             ANDROID_APK_PATH=android/app/build/outputs/apk/release/app-release.apk \
-            npm run android:journey
+            npm run android:smoke
 
       - name: Stage release artifacts and notes
         env:
@@ -180,6 +231,18 @@ jobs:
           test -s release-payload/app-release.apk
           test -s release-payload/turnleaf-release-notes.md
           (cd release-payload && sha256sum --check app-release.apk.sha256)
+
+      - name: Confirm release revision is still current master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
+        run: |
+          set -eu
+          CURRENT_MASTER="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/master" --jq '.object.sha')"
+          if [ "$CURRENT_MASTER" != "$TESTED_REVISION" ]; then
+            echo "Master moved before publication; refusing to publish an outdated APK." >&2
+            exit 1
+          fi
 
       - name: Publish GitHub release
         env:

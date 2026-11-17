@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- ci: preserve release journey coverage for production APKs
 - ci: preserve queued master checks while coalescing PR runs
 - Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
 - chore: remove unused download, sync, and reader helpers

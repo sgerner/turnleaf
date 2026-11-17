@@ -75,7 +75,7 @@ To open Android Studio or Xcode, use `npm run android:open` or `npm run ios:open
 6. For Android behavior, record the device/emulator, OS version, commit, and manual results using [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md).
 7. Describe the user-visible behavior, test commands, and any platform limitation in the PR body. The pull-request template includes the expected checks.
 
-GitHub Actions runs the web quality gates, Android debug build, and emulator reading journey. The release workflow waits for the successful same-revision CI run and then tests the signed APK journey before publishing. Dependency review and CodeQL run separately.
+GitHub Actions runs the web quality gates, Android debug build, and emulator reading journey. The release workflow waits for the successful same-revision CI run, checks that master has not moved, and smoke-tests the signed APK before publishing. Manual releases run the debug APK reading journey first. Dependency review and CodeQL run separately.
 
 ## Release notes and versions
 
