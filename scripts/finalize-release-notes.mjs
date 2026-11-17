@@ -1,39 +1,16 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
+import { readReleaseNotes, releaseVersion } from './release-notes-source.mjs';
 
-const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-const version = packageJson.version;
-const notesUrl = new URL('../RELEASE_NOTES.md', import.meta.url);
-const source = readFileSync(notesUrl, 'utf8');
-const lines = source.split(/\r?\n/);
-
-const sections = [];
-const prefix = [];
-let current = null;
-
-const compactBody = (body) =>
-  body.filter((line) => line.trim().length > 0).map((line) => line.trimEnd());
-
-for (const line of lines) {
-  if (line.startsWith('## ')) {
-    if (current) {
-      current.body = compactBody(current.body);
-      sections.push(current);
-    }
-    current = { heading: line.trim(), body: [] };
-    continue;
-  }
-
-  if (current) {
-    current.body.push(line);
-  } else {
-    prefix.push(line);
-  }
-}
-
-if (current) {
-  current.body = compactBody(current.body);
-  sections.push(current);
-}
+const version = releaseVersion();
+const { url, lines, sections: boundaries } = readReleaseNotes();
+const prefix = lines.slice(0, boundaries[0]?.start);
+const sections = boundaries.map(({ heading, start, end }) => ({
+  heading,
+  body: lines
+    .slice(start + 1, end)
+    .filter((line) => line.trim())
+    .map((line) => line.trimEnd()),
+}));
 
 const unreleased = sections.find((section) => section.heading === '## Unreleased');
 if (!unreleased) {
@@ -81,4 +58,4 @@ for (const section of sections) {
   }
 }
 
-writeFileSync(notesUrl, `${output.join('\n').trimEnd()}\n`);
+writeFileSync(url, `${output.join('\n').trimEnd()}\n`);

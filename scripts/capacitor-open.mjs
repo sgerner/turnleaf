@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runCommand } from './run-command.mjs';
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(scriptDirectory, '..');
@@ -56,28 +56,10 @@ export function runCapacitorOpen(platform, { env = environmentWithOptionalDotEnv
     process.platform === 'win32' ? 'cap.cmd' : 'cap',
   );
 
-  return new Promise((resolveCommand, rejectCommand) => {
-    const child = spawn(executable, ['open', platform], {
-      cwd: projectRoot,
-      env,
-      shell: process.platform === 'win32',
-      stdio: 'inherit',
-    });
-
-    child.once('error', rejectCommand);
-    child.once('exit', (code, signal) => {
-      if (code === 0) {
-        resolveCommand();
-        return;
-      }
-      rejectCommand(
-        new Error(
-          signal
-            ? `Capacitor open terminated by ${signal}`
-            : `Capacitor open exited with code ${code}`,
-        ),
-      );
-    });
+  return runCommand(executable, ['open', platform], {
+    cwd: projectRoot,
+    env,
+    label: 'Capacitor open',
   });
 }
 

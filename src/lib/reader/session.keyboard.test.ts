@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
+
+type TestTocItem = { label: string; href: string; subitems?: TestTocItem[] };
 
 const { mockBook, mockRendition } = vi.hoisted(() => {
   const rendition = {
@@ -8,7 +10,9 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
     off: vi.fn(),
     started: Promise.resolve(),
     themes: { register: vi.fn(), select: vi.fn() },
+    annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    resize: vi.fn(),
     destroy: vi.fn(),
   };
   const book = {
@@ -20,6 +24,7 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
         visit({ href: 'second.xhtml' });
       }),
     },
+    navigation: { toc: [] as TestTocItem[] },
   };
   return { mockBook: book, mockRendition: rendition };
 });
@@ -31,7 +36,10 @@ import { ReaderSession } from './session';
 describe('ReaderSession keyboard navigation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockBook.navigation.toc = [];
   });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it('forwards EPUB iframe key events to the reader and removes the listener on destroy', async () => {
     const onKeyboardNavigation = vi.fn();
@@ -111,6 +119,83 @@ describe('ReaderSession keyboard navigation', () => {
       expect.objectContaining({ percentage: 0.625 }),
       'restore',
     );
+    session.destroy();
+  });
+
+  it('keeps nested EPUB navigation entries in the table of contents', () => {
+    mockBook.navigation.toc = [
+      {
+        label: 'Part One',
+        href: 'part-one.xhtml',
+        subitems: [{ label: 'Chapter One', href: 'chapter-one.xhtml' }],
+      },
+    ];
+
+    expect(new ReaderSession('book.epub').tableOfContents()).toEqual([
+      {
+        label: 'Part One',
+        href: 'part-one.xhtml',
+        children: [{ label: 'Chapter One', href: 'chapter-one.xhtml', children: [] }],
+      },
+    ]);
+  });
+
+  it('adds and removes persistent CFI highlights in the EPUB rendition', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    session.updateHighlights([{ cfi: 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:8)' }]);
+    expect(mockRendition.annotations.highlight).toHaveBeenCalledWith(
+      'epubcfi(/6/2!/4/2/1:0,/1:0,/1:8)',
+      {},
+      undefined,
+      'turnleaf-highlight',
+      { fill: '#facc15', 'fill-opacity': '0.38' },
+    );
+
+    session.updateHighlights([]);
+    expect(mockRendition.annotations.remove).toHaveBeenCalledWith(
+      'epubcfi(/6/2!/4/2/1:0,/1:0,/1:8)',
+      'highlight',
+    );
+    session.destroy();
+  });
+
+  it('reflows the rendition when the reader viewport changes size', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
     session.destroy();
   });
 });

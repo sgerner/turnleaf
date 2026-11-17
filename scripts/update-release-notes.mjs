@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+import { readReleaseNotes } from './release-notes-source.mjs';
 
 const [mode, value] = process.argv.slice(2);
 
@@ -12,29 +13,23 @@ if (mode === '--subject') {
 
 if (!subject || /^merge\b/i.test(subject)) process.exit(0);
 
-const notesUrl = new URL('../RELEASE_NOTES.md', import.meta.url);
-const source = readFileSync(notesUrl, 'utf8');
-const lines = source.split(/\r?\n/);
-let headingIndex = lines.findIndex((line) => line.trim() === '## Unreleased');
+const { url, lines, sections } = readReleaseNotes();
+const unreleased = sections.find((section) => section.heading === '## Unreleased');
 
-if (headingIndex < 0) {
+if (!unreleased) {
   lines.unshift('# Release Notes', '', '## Unreleased', '', `- ${subject}`);
-  writeFileSync(notesUrl, `${lines.join('\n').trimEnd()}\n`);
+  writeFileSync(url, `${lines.join('\n').trimEnd()}\n`);
   process.exit(0);
 }
 
-const nextHeadingIndex = lines.findIndex(
-  (line, index) => index > headingIndex && line.startsWith('## '),
-);
-const sectionEnd = nextHeadingIndex === -1 ? lines.length : nextHeadingIndex;
-const sectionLines = lines.slice(headingIndex + 1, sectionEnd);
+const sectionLines = lines.slice(unreleased.start + 1, unreleased.end);
 
 if (sectionLines.some((line) => line.trim() === `- ${subject}`)) process.exit(0);
 
-let insertionIndex = headingIndex + 1;
+let insertionIndex = unreleased.start + 1;
 if (lines[insertionIndex]?.trim() !== '') {
   lines.splice(insertionIndex, 0, '');
 }
 lines.splice(insertionIndex + 1, 0, `- ${subject}`);
 
-writeFileSync(notesUrl, `${lines.join('\n').trimEnd()}\n`);
+writeFileSync(url, `${lines.join('\n').trimEnd()}\n`);

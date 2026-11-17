@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runCommand } from './run-command.mjs';
 import {
   detectJavaCompatibility,
   formatFailure,
@@ -25,30 +25,6 @@ export function gradleTask(mode) {
   if (mode === 'debug') return 'assembleDebug';
   if (mode === 'release') return 'assembleRelease';
   throw new Error(`Unsupported Android build mode: ${mode}`);
-}
-
-export function runCommand(command, args, options = {}) {
-  return new Promise((resolveCommand, rejectCommand) => {
-    const child = spawn(command, args, {
-      ...options,
-      shell: process.platform === 'win32',
-      stdio: 'inherit',
-    });
-
-    child.once('error', rejectCommand);
-    child.once('exit', (code, signal) => {
-      if (code === 0) {
-        resolveCommand();
-        return;
-      }
-
-      const error = new Error(
-        signal ? `${command} terminated by ${signal}` : `${command} exited with code ${code}`,
-      );
-      error.exitCode = code ?? 1;
-      rejectCommand(error);
-    });
-  });
 }
 
 export async function main(mode = process.argv[2]) {

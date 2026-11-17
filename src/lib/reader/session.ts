@@ -32,6 +32,7 @@ export interface ReaderSelection {
 export interface TocItem {
   label: string;
   href: string;
+  children: TocItem[];
 }
 
 interface SpineSection {
@@ -40,6 +41,12 @@ interface SpineSection {
   cfiBase: string;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
+}
+
+interface EpubTocItem {
+  label: string;
+  href: string;
+  subitems?: EpubTocItem[];
 }
 
 const MODE_COLORS = {
@@ -307,6 +314,9 @@ export class ReaderSession {
   private userNavigationStartCfi: string | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  private viewportSize: { width: number; height: number } | null = null;
+  private highlightCfis = new Set<string>();
   private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
     null;
 
@@ -331,8 +341,10 @@ export class ReaderSession {
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
+      resizeOnOrientationChange: true,
       allowScriptedContent: false,
     });
+    this.observeViewport(target);
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
@@ -458,10 +470,42 @@ export class ReaderSession {
   }
 
   tableOfContents(): TocItem[] {
-    return [...this.book.navigation.toc.values()].map((item) => ({
-      label: item.label,
-      href: item.href,
-    }));
+    const mapItems = (items: EpubTocItem[]): TocItem[] =>
+      items.map((item) => ({
+        label: item.label,
+        href: item.href,
+        children: mapItems(item.subitems ?? []),
+      }));
+
+    return mapItems(this.book.navigation.toc);
+  }
+
+  updateHighlights(annotations: Array<{ cfi: string }>): void {
+    const rendition = this.rendition;
+    if (!rendition) return;
+
+    const next = new Set(annotations.map((annotation) => annotation.cfi));
+    for (const cfi of this.highlightCfis) {
+      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+    }
+
+    const applied = new Set<string>();
+    for (const cfi of next) {
+      if (this.highlightCfis.has(cfi)) {
+        applied.add(cfi);
+        continue;
+      }
+      try {
+        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
+          fill: '#facc15',
+          'fill-opacity': '0.38',
+        });
+        applied.add(cfi);
+      } catch {
+        // A saved CFI can stop matching after an EPUB is replaced or changed.
+      }
+    }
+    this.highlightCfis = applied;
   }
 
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
@@ -602,6 +646,9 @@ export class ReaderSession {
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
     this.rendition?.destroy();
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    this.viewportSize = null;
     this.selectionListeners.forEach((remove) => remove());
     this.selectionListeners = [];
     this.rendition = null;
@@ -612,6 +659,7 @@ export class ReaderSession {
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
+    this.highlightCfis.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
@@ -620,6 +668,24 @@ export class ReaderSession {
 
   private harden(contents: Contents): Promise<void> {
     return sanitizeEpubDocument(contents.document, this.stylesheetCache);
+  }
+
+  private observeViewport(target: HTMLElement): void {
+    const initial = target.getBoundingClientRect();
+    this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
+    if (typeof ResizeObserver === 'undefined') return;
+
+    this.resizeObserver = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry || !this.rendition) return;
+      const width = Math.floor(entry.contentRect.width);
+      const height = Math.floor(entry.contentRect.height);
+      if (!width || !height) return;
+      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+      this.viewportSize = { width, height };
+      this.rendition.resize(width, height);
+    });
+    this.resizeObserver.observe(target);
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
