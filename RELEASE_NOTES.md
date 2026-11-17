@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Share release note parsing and command execution
 - Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
 - chore: remove unused download, sync, and reader helpers
 - refactor: share the reader native plugin interface
@@ -40,6 +41,7 @@
 - security: refresh the transitive devalue dependency to a patched release.
 - fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
 - fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
+- Consolidate release-note parsing and inherited-output command execution across scripts.
 
 ## 0.3.4
 
