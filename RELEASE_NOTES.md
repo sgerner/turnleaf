@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- ci: pass signed APK smoke settings through the emulator action environment
 - Improve library filtering and accessibility with a skip link, clearer progress, and semantic settings groups.
 - Fix reconnect mode during submission
 - chore(android): remove unused Google Services setup and modernize the clean task
