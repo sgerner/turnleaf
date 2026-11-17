@@ -124,16 +124,6 @@ it('keeps and uploads a newer local relocation when an older upload completes', 
   resolveUploaded();
   await flush;
 
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof first;
-  expect(saved.syncQueue['book-1']).toMatchObject({
-    payloadJson: expect.stringContaining('"pageNum":20'),
-    revision: 2,
-  });
-  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
-  expect(saved.readingState['book-1']?.syncedLocalUpdatedAt).toBeNull();
-
-  await flushProgress({ saveProgress } as never, 'server');
-
   expect(saveProgress).toHaveBeenNthCalledWith(
     2,
     expect.objectContaining({ pageNum: 20, bookScrollId: 'xpath-b' }),

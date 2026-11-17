@@ -775,8 +775,12 @@ export interface SyncStatus {
 
 export async function getPendingSync(serverId: string): Promise<PendingSyncItem[]> {
   if (!Capacitor.isNativePlatform()) {
-    return Object.values(readBrowserState().syncQueue)
-      .filter((row) => row.serverId === serverId)
+    const state = readBrowserState();
+    const unavailable = new Set(
+      state.books.filter((book) => book.remoteAvailable === false).map((book) => book.id),
+    );
+    return Object.values(state.syncQueue)
+      .filter((row) => row.serverId === serverId && !unavailable.has(row.bookId))
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
       .map((row) => ({
         bookId: row.bookId,
@@ -789,7 +793,7 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
   const result = await db.query(
     `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision
     FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? ORDER BY sync_queue.updated_at`,
+    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at`,
     [serverId],
   );
   return (result.values ?? []).map((row) => ({
@@ -802,8 +806,12 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
 
 export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
-    const rows = Object.values(readBrowserState().syncQueue)
-      .filter((row) => row.serverId === serverId)
+    const state = readBrowserState();
+    const unavailable = new Set(
+      state.books.filter((book) => book.remoteAvailable === false).map((book) => book.id),
+    );
+    const rows = Object.values(state.syncQueue)
+      .filter((row) => row.serverId === serverId && !unavailable.has(row.bookId))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return {
       pendingCount: rows.length,
@@ -816,7 +824,7 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   const result = await db.query(
     `SELECT sync_queue.updated_at,sync_queue.last_error
     FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? ORDER BY sync_queue.updated_at DESC`,
+    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
     [serverId],
   );
   const rows = result.values ?? [];
