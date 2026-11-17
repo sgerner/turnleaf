@@ -4,20 +4,32 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { createCdpClient } from './android-cdp.mjs';
+import { runCleanup } from './android-cleanup.mjs';
+import { resolveDeviceSerial } from './android-device.mjs';
 import { main as smoke } from './android-smoke.mjs';
 
-const packageName = 'app.turnleaf.reader.debug';
+const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
+let deviceSerial;
 const adb = async (...args) =>
-  (await promisify(execFile)('adb', args, { timeout: 20_000 })).stdout.trim();
+  (
+    await promisify(execFile)('adb', [...(deviceSerial ? ['-s', deviceSerial] : []), ...args], {
+      timeout: 20_000,
+    })
+  ).stdout.trim();
 
 async function waitFor(label, check) {
   const end = Date.now() + 30_000;
   let lastError;
   do {
+    if (receivedSignal)
+      throw new Error(`Android reading journey interrupted by ${receivedSignal}.`);
     try {
       const value = await check();
+      if (receivedSignal)
+        throw new Error(`Android reading journey interrupted by ${receivedSignal}.`);
       if (value) return value;
     } catch (error) {
       lastError = error;
@@ -40,27 +52,11 @@ async function connectWebView() {
     });
     const socket = new WebSocket(endpoint);
     await once(socket, 'open', { signal: AbortSignal.timeout(5_000) });
-    let id = 0;
+    const cdp = createCdpClient(socket);
     return {
-      async evaluate(expression) {
-        const requestId = ++id;
-        const message = once(socket, 'message', { signal: AbortSignal.timeout(5_000) });
-        socket.send(
-          JSON.stringify({
-            id: requestId,
-            method: 'Runtime.evaluate',
-            params: { expression, returnByValue: true, awaitPromise: true },
-          }),
-        );
-        const [event] = await message;
-        const reply = JSON.parse(event.data);
-        if (reply.id !== requestId || reply.error || reply.result?.exceptionDetails) {
-          throw new Error(`WebView evaluation failed: ${expression}`);
-        }
-        return reply.result.result.value;
-      },
+      evaluate: (expression) => cdp.evaluate(expression),
       async close() {
-        socket.close();
+        cdp.close();
         await adb('forward', '--remove', `tcp:${port}`);
       },
     };
@@ -174,17 +170,44 @@ const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).som
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
 
+let receivedSignal;
+
+function throwIfInterrupted() {
+  if (receivedSignal) throw new Error(`Android reading journey interrupted by ${receivedSignal}.`);
+}
+
 async function run() {
-  if (!(await adb('get-serialno')).startsWith('emulator-')) {
-    throw new Error('Use a fresh Android emulator for the reading journey.');
-  }
-  const fixture = await startFixture();
-  const tunnel = `tcp:${fixture.port}`;
+  const onSignal = (signal) => {
+    receivedSignal = signal;
+    process.exitCode = signal === 'SIGINT' ? 130 : 143;
+  };
+  const onSigint = () => onSignal('SIGINT');
+  const onSigterm = () => onSignal('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+
+  let fixture;
+  let tunnel;
   let web;
   let disabledNetwork = false;
+  let journeyError;
+  let cleanupError;
+  let journeyPassed = false;
   try {
+    deviceSerial = await resolveDeviceSerial({ emulatorOnly: true });
+    throwIfInterrupted();
+    fixture = await startFixture();
+    throwIfInterrupted();
+    tunnel = `tcp:${fixture.port}`;
     await adb('reverse', tunnel, tunnel);
-    await smoke();
+    throwIfInterrupted();
+    await smoke({
+      packageName,
+      apkPath: process.env.ANDROID_APK_PATH,
+      resetData: true,
+      serial: deviceSerial,
+    });
+    throwIfInterrupted();
     web = await connectWebView();
     await waitFor('onboarding', () => web.evaluate("!!document.querySelector('input[type=url]')"));
     await web.evaluate(`(() => {
@@ -261,19 +284,40 @@ async function run() {
             progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
         ),
     );
-    console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+    throwIfInterrupted();
+    journeyPassed = true;
+  } catch (error) {
+    journeyError = error;
   } finally {
-    try {
-      await web?.close();
-      if (disabledNetwork) {
-        await adb('shell', 'svc', 'wifi', 'enable');
-        await adb('shell', 'svc', 'data', 'enable');
-      }
-      await adb('reverse', '--remove', tunnel);
-    } finally {
-      fixture.close();
+    const cleanup = [];
+    if (disabledNetwork) {
+      cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);
+      cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);
+    }
+    if (web) cleanup.push(['close WebView debugger', () => web.close()]);
+    if (tunnel)
+      cleanup.push(['remove ADB reverse tunnel', () => adb('reverse', '--remove', tunnel)]);
+
+    const failures = await runCleanup(cleanup);
+    fixture?.close();
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+    if (failures.length) {
+      cleanupError = new Error(
+        `${journeyPassed ? 'Reading journey passed, but cleanup failed' : 'Android journey cleanup failed'}: ${failures.join('; ')}`,
+      );
     }
   }
+
+  if (journeyError) {
+    if (cleanupError) console.error(cleanupError.message);
+    throw journeyError;
+  }
+  if (cleanupError) throw cleanupError;
+  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
 }
 
-await run();
+await run().catch((error) => {
+  console.error(error.message);
+  process.exitCode ??= 1;
+});

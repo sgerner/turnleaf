@@ -58,9 +58,10 @@ npm run android:doctor
 npm run android:debug
 adb devices
 npm run android:smoke
+npm run android:journey
 ```
 
-`android:smoke` installs the debug APK as `app.turnleaf.reader.debug`, starts the app, and checks that its process stays alive. The `.debug` application ID lets it run alongside a signed production install. It is a startup check, not a replacement for the manual accessibility, offline, network-isolation, or feature pass in [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md).
+`android:smoke` installs the debug APK as `app.turnleaf.reader.debug`, starts the app, and checks that its process stays alive. The `.debug` application ID lets it run alongside a signed production install. `android:journey` runs the local-fixture onboarding, download, offline read, restart, and progress-sync check; it clears app data on the selected emulator so every run starts at onboarding. Both commands select a sole ready device automatically. Set `ANDROID_SERIAL` when multiple devices are connected; the journey requires an emulator. These checks do not replace the manual accessibility, offline, network-isolation, or feature pass in [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md).
 
 To open Android Studio or Xcode, use `npm run android:open` or `npm run ios:open`. Both commands load an optional local `.env` when present; copy `.env.example` to `.env` only when you need to set a tool path or a remote development-proxy origin. Never commit `.env`, signing files, SDK paths, credentials, or downloaded library data.
 
@@ -69,12 +70,12 @@ To open Android Studio or Xcode, use `npm run android:open` or `npm run ios:open
 1. Create a branch from the current `master` branch with a short `feature/` or `fix/` name.
 2. Keep the PR narrow. Separate UI, data, native, documentation, and dependency changes when they can be reviewed independently.
 3. Add or update a focused test for behavior that can be exercised in Node or the browser.
-4. Run `npm run verify`; run `npm run android:debug` and `npm run android:smoke` for native changes when the toolchain is available.
+4. Run `npm run verify`; run `npm run android:debug`, `npm run android:smoke`, and `npm run android:journey` for native changes when the toolchain and emulator are available.
 5. For UI changes, test at narrow and large viewport sizes and attach a screenshot or short recording.
 6. For Android behavior, record the device/emulator, OS version, commit, and manual results using [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md).
 7. Describe the user-visible behavior, test commands, and any platform limitation in the PR body. The pull-request template includes the expected checks.
 
-GitHub Actions repeats the web quality gates, Android debug build, emulator startup smoke test, dependency review, and CodeQL analysis. A local pass is useful evidence, but CI is still required before merge.
+GitHub Actions runs the web quality gates, Android debug build, and emulator reading journey. The release workflow waits for the successful same-revision CI run, checks that master has not moved, and smoke-tests the signed APK before publishing. Manual releases run the debug APK reading journey first. Dependency review and CodeQL run separately.
 
 ## Release notes and versions
 
