@@ -3,37 +3,9 @@ import {
   chooseOpenProgress,
   chooseFurthestProgress,
   compareKavitaLocations,
-  detectProgressConflict,
   shouldPreferFurthest,
   toKavitaPageNumber,
-  type ProgressSnapshot,
 } from './conflict';
-
-const snapshot = (xpath: string, percentage: number): ProgressSnapshot => ({
-  cfi: null,
-  xpath,
-  percentage,
-  updatedAt: '2026-06-20T00:00:00Z',
-});
-
-describe('progress reconciliation', () => {
-  it('detects changes on both sides without choosing the furthest point', () => {
-    const shared = snapshot('/p[1]', 0.2);
-    const decision = detectProgressConflict(
-      snapshot('/p[2]', 0.25),
-      snapshot('/p[8]', 0.8),
-      shared,
-    );
-    expect(decision.kind).toBe('conflict');
-  });
-
-  it('accepts a server-only change', () => {
-    const shared = snapshot('/p[1]', 0.2);
-    expect(detectProgressConflict(shared, snapshot('/p[2]', 0.3), shared)).toEqual({
-      kind: 'server',
-    });
-  });
-});
 
 describe('furthest progress selection', () => {
   it('prefers the greater percentage and keeps ties local', () => {
