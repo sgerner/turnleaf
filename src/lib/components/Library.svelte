@@ -576,6 +576,7 @@
             if (document.querySelector('[data-reader-panel]')) return;
             reading = null;
           } else if (settingsVisible) closeSettings();
+          else if (filtersVisible) filtersVisible = false;
           else void App.exitApp();
         }),
       ),
@@ -1470,6 +1471,12 @@
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
     inert={Boolean(actionMenuBook || conflict || settingsVisible)}
   >
+    <a
+      href="#library-results"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:p-3 preset-filled-surface-50-950"
+    >
+      Skip to library books
+    </a>
     <p class="sr-only" role="status">
       {offlineMessage || message || (refreshing ? 'Refreshing library' : '')}
       {#if !loading && !refreshing}
@@ -1629,8 +1636,8 @@
         </button>
         <button
           class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {hideCompleted
-            ? 'preset-filled-secondary-100-900'
-            : 'preset-filled-primary-700-300'}"
+            ? 'preset-filled-primary-700-300'
+            : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
           aria-label="Hide books you have finished"
@@ -1860,7 +1867,12 @@
     {/if}
 
     {#if loading}
-      <div class="mt-20 flex flex-col items-center gap-4 text-surface-700-300" transition:fade>
+      <div
+        id="library-results"
+        tabindex="-1"
+        class="mt-20 flex flex-col items-center gap-4 text-surface-700-300"
+        transition:fade
+      >
         <svg
           aria-hidden="true"
           viewBox="0 0 24 24"
@@ -1872,6 +1884,8 @@
       </div>
     {:else if displayableBooks.length === 0}
       <div
+        id="library-results"
+        tabindex="-1"
         class="mt-20 flex flex-col items-center gap-3 text-center text-surface-700-300"
         transition:fade
       >
@@ -1893,6 +1907,8 @@
       </div>
     {:else if visibleBooks.length === 0}
       <div
+        id="library-results"
+        tabindex="-1"
         class="mt-20 flex flex-col items-center gap-3 text-center text-surface-700-300"
         transition:fade
       >
@@ -1903,12 +1919,19 @@
           />
         </svg>
         <p>No books match your search.</p>
+        {#if libraryFiltersActive}
+          <button class="btn preset-tonal-surface mt-2 h-11" type="button" onclick={clearFilters}>
+            Clear search and filters
+          </button>
+        {/if}
       </div>
     {:else}
       <section
+        id="library-results"
         bind:this={virtualGrid}
         class="relative mt-8"
         style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
+        tabindex="-1"
         aria-label="Books"
       >
         {#each Array.from( { length: virtualWindow.lastRow - virtualWindow.firstRow + 1 } ) as _, rowOffset (virtualWindow.firstRow + rowOffset)}
@@ -1984,6 +2007,25 @@
                         </p>
                         {#if book.series}
                           <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                        {/if}
+                        {#if downloadingBookId === book.id}
+                          <div
+                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                            role="progressbar"
+                            aria-label={`Download progress for ${book.title}`}
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                            aria-valuenow={downloadPercent ?? undefined}
+                            aria-valuetext={downloadPercent === null
+                              ? 'Download in progress'
+                              : `${downloadPercent}% downloaded`}
+                          >
+                            <div
+                              class="h-full preset-filled-primary-600-400"
+                              class:animate-pulse={downloadPercent === null}
+                              style:width={`${downloadPercent ?? 35}%`}
+                            ></div>
+                          </div>
                         {/if}
                         {#if progressOf(book) > 0}
                           <div
@@ -2082,15 +2124,23 @@
                           </svg>
                         </span>
                       {/if}
-                      {#if progressOf(book) > 0}
-                        <div class="absolute inset-x-0 bottom-0 h-2">
-                          <div
-                            class="h-full preset-filled-primary-600-400"
-                            style:width={`${progressOf(book)}%`}
-                          ></div>
-                        </div>
-                      {/if}
                     </div>
+                    {#if progressOf(book) > 0}
+                      <div
+                        class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2"
+                        role="progressbar"
+                        aria-label={`Reading progress for ${book.title}`}
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow={Math.round(progressOf(book))}
+                        aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                      >
+                        <div
+                          class="h-full preset-filled-primary-600-400"
+                          style:width={`${progressOf(book)}%`}
+                        ></div>
+                      </div>
+                    {/if}
                     <button
                       class="absolute inset-0 z-0 rounded-lg text-left"
                       type="button"
@@ -2383,7 +2433,7 @@
         </button>
       </div>
 
-      <div class="mt-6" aria-labelledby="library-settings-appearance-title">
+      <section class="mt-6" aria-labelledby="library-settings-appearance-title">
         <h3 id="library-settings-appearance-title" class="text-lg font-medium">
           Reading appearance
         </h3>
@@ -2426,16 +2476,16 @@
         </div>
 
         <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
-        <div class="mt-3 flex flex-wrap gap-2">
+        <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
           {#each skeletonThemes as option (option)}
             <button
-              class="inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
+              class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
               option
-                ? 'preset-filled-primary-700-300'
+                ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
                 : 'preset-tonal-surface'}"
               type="button"
               aria-pressed={pendingTheme === option}
-              aria-label={option}
+              aria-label={`Use ${option} theme`}
               title={option}
               onclick={() => void updateTheme(option)}
             >
@@ -2447,6 +2497,16 @@
                 <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
                 ></span>
               </span>
+              {#if pendingTheme === option}
+                <span
+                  class="absolute inset-0 grid place-items-center bg-black/20"
+                  aria-hidden="true"
+                >
+                  <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
+                    <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
+                  </svg>
+                </span>
+              {/if}
             </button>
           {/each}
         </div>
@@ -2481,9 +2541,9 @@
             </span>
           </button>
         </div>
-      </div>
+      </section>
 
-      <div class="mt-7" aria-labelledby="library-settings-connection-title">
+      <section class="mt-7" aria-labelledby="library-settings-connection-title">
         <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
         <p class="mt-1 text-sm text-surface-700-300">
           Update the server address or replace the key used to access this library.
@@ -2557,9 +2617,9 @@
             Delete server
           </button>
         </form>
-      </div>
+      </section>
 
-      <div class="mt-7" aria-labelledby="library-settings-storage-title">
+      <section class="mt-7" aria-labelledby="library-settings-storage-title">
         <h3 id="library-settings-storage-title" class="text-lg font-medium">
           Storage and maintenance
         </h3>
@@ -2575,8 +2635,21 @@
             >Remove all downloaded books</button
           >
         </div>
-      </div>
-      <div class="mt-7" aria-labelledby="library-settings-diagnostics-title">
+        <dl class="mt-4 text-sm">
+          <div class="flex items-center justify-between gap-3">
+            <dt class="text-surface-700-300">Downloaded storage</dt>
+            <dd class="tabular-nums">
+              {(
+                books.reduce(
+                  (sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0),
+                  0,
+                ) / 1_048_576
+              ).toFixed(1)} MB
+            </dd>
+          </div>
+        </dl>
+      </section>
+      <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
         <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
         <p class="mt-1 text-sm text-surface-700-300">
           Copy or download recent connection and book download details. The log includes API routes,
@@ -2626,16 +2699,7 @@
         {#if diagnosticsMessage}
           <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
         {/if}
-      </div>
-      <div class="flex items-center justify-between gap-3">
-        <dt class="text-surface-700-300">Downloaded storage</dt>
-        <dd class="tabular-nums">
-          {(
-            books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
-            1_048_576
-          ).toFixed(1)} MB
-        </dd>
-      </div>
+      </section>
       {#if confirmDeleteServer}
         <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
           <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
