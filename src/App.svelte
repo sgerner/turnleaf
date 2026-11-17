@@ -49,7 +49,7 @@
           apiKey = await getApiKey(saved.credentialRef);
         } catch {
           startupError =
-            'Turnleaf could not access the saved Kavita key. Retry to open your library.';
+            'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
       }
     } catch {
@@ -125,7 +125,7 @@
                 target="_blank"
                 rel="noreferrer"
               >
-                Download APK
+                Download APK <span class="sr-only">(opens in a new tab)</span>
               </a>
             {/if}
             <a
@@ -134,7 +134,7 @@
               target="_blank"
               rel="noreferrer"
             >
-              Release notes
+              Release notes <span class="sr-only">(opens in a new tab)</span>
             </a>
             <button
               class="btn btn-sm preset-tonal-error !text-sm"
@@ -181,7 +181,15 @@
           >
             Retry
           </button>
-          {#if !server}
+          {#if server}
+            <button
+              class="btn btn-sm preset-tonal-surface !text-sm"
+              type="button"
+              onclick={() => (startupError = '')}
+            >
+              Enter auth key
+            </button>
+          {:else}
             <button
               class="btn btn-sm preset-tonal-error !text-sm"
               type="button"
