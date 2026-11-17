@@ -5,7 +5,7 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
-  import { getPreferences, setPreference } from '../database/database';
+  import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -519,13 +519,14 @@
 
   function flushPreferences(): void {
     preferenceWrite = preferenceWrite.then(async () => {
-      for (const [key, value] of [...pendingPreferences]) {
-        try {
-          await setPreference(key, value);
+      const batch = new Map(pendingPreferences);
+      try {
+        await setPreferences(batch);
+        for (const [key, value] of batch) {
           if (pendingPreferences.get(key) === value) pendingPreferences.delete(key);
-        } catch {
-          // Keep this preference pending for the next save or lifecycle flush.
         }
+      } catch {
+        // Keep pending preferences for the next save or lifecycle flush.
       }
     });
   }

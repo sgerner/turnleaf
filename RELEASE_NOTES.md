@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reduce repeated library and EPUB reader work
+- Reuse library search and sort work, retain recently loaded covers, and reduce reader and EPUB validation overhead.
+
 - fix: align EPUB taps with visible page (#214)
 - fix: keep library loading and download recovery responsive
 - fix: preserve the reader passage and keyboard focus
