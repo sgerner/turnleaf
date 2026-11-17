@@ -92,6 +92,7 @@
   let searchOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
+  let previousDocumentTitle = '';
   let bookmarks = $state<StoredReaderLocation[]>([]);
   let locationHistory = $state<StoredReaderLocation[]>([]);
   let editingBookmarkId = $state<string | null>(null);
@@ -133,6 +134,8 @@
     : null;
 
   onMount(async () => {
+    previousDocumentTitle = document.title;
+    document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
     const preferences = await getPreferences([
@@ -173,6 +176,7 @@
       (next, origin) => {
         if (destroyed) return;
         location = next;
+        updateDocumentTitle();
         if (origin === 'navigation') {
           localNavigationDuringSession = true;
           onRelocated(next);
@@ -194,7 +198,11 @@
       },
       handleKeyboardNavigation,
     );
-    if (!destroyed) toc = nextSession.tableOfContents();
+    if (!destroyed) {
+      toc = nextSession.tableOfContents();
+      nextSession.updateHighlights(annotations);
+      updateDocumentTitle();
+    }
   }
 
   async function enableNativeReaderFeatures(): Promise<void> {
@@ -252,6 +260,7 @@
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
+    document.title = previousDocumentTitle;
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     flushPendingPreferences();
     searchController?.abort();
@@ -466,8 +475,21 @@
   function currentSectionLabel(): string {
     if (!location) return 'Opening book...';
     const sectionHref = location.href.split('#')[0];
-    const item = toc.find((entry) => entry.href.split('#')[0] === sectionHref);
+    const findItem = (items: TocItem[]): TocItem | undefined => {
+      for (const item of items) {
+        if (item.href.split('#')[0] === sectionHref) return item;
+        const child = findItem(item.children);
+        if (child) return child;
+      }
+      return undefined;
+    };
+    const item = findItem(toc);
     return item?.label || `Section ${location.spineIndex + 1}`;
+  }
+
+  function updateDocumentTitle(): void {
+    const section = location ? ` · ${currentSectionLabel()} · page ${location.pageIndex + 1}` : '';
+    document.title = `${title}${section} · Turnleaf`;
   }
 
   function currentProgressLabel(): string {
@@ -577,6 +599,7 @@
   function saveAnnotation(): void {
     if (!selectedText) return;
     annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
+    session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
@@ -599,6 +622,7 @@
   function deleteAnnotation(annotation: StoredAnnotation): void {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
+    session?.updateHighlights(annotations);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
@@ -819,7 +843,12 @@
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
     else if (searchVisible) closeSearch();
-    else {
+    else if (controlsVisible) {
+      controlsVisible = false;
+      footerVisible = false;
+      pauseChromeHide();
+      void tick().then(() => topRevealButton?.focus());
+    } else {
       onBack();
       return true;
     }
@@ -857,7 +886,8 @@
   });
 </script>
 
-<div class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+  <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport}></div>
 
   <p class="sr-only" aria-live="polite" aria-atomic="true">
@@ -972,7 +1002,7 @@
         <div class="reader-toolbar">
           <div class="reader-toolbar-actions">
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={onBack}
               aria-label="Back to library"
@@ -987,7 +1017,7 @@
               <span class="reader-toolbar-label">Back</span>
             </button>
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (tocVisible ? closeToc() : openToc())}
               aria-label="Contents"
@@ -1001,7 +1031,7 @@
               <span class="reader-toolbar-label">Contents</span>
             </button>
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (settingsVisible ? closeSettings() : openSettings())}
               aria-label="Text, reading appearance"
@@ -1015,7 +1045,7 @@
               <span class="reader-toolbar-label">Text</span>
             </button>
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
               aria-label="Marks, bookmarks and history"
@@ -1032,7 +1062,7 @@
               <span class="reader-toolbar-label">Marks</span>
             </button>
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
               aria-label="Notes: highlights and annotations"
@@ -1049,7 +1079,7 @@
               <span class="reader-toolbar-label">Notes</span>
             </button>
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (searchVisible ? closeSearch() : openSearch())}
               aria-label="Search this book"
@@ -1066,7 +1096,7 @@
               <span class="reader-toolbar-label">Search</span>
             </button>
             <button
-              class="btn min-w-0 preset-tonal-surface min-h-12"
+              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
               type="button"
               onclick={() => syncLatestLocation()}
               aria-label="Sync latest reading position"
@@ -1357,17 +1387,29 @@
             </svg>
           </button>
           <h2 id="reader-contents-title" class="font-serif text-xl">Contents</h2>
+          {#snippet contentsList(items: TocItem[])}
+            <ul class="mt-2 grid list-none gap-1 p-0">
+              {#each items as item, index (`${item.href}-${index}`)}
+                <li>
+                  <button
+                    class="btn w-full justify-start text-left"
+                    type="button"
+                    onclick={() => {
+                      void session?.display(item.href);
+                      closeToc();
+                    }}>{item.label}</button
+                  >
+                  {#if item.children.length > 0}
+                    <div class="ml-4 border-l border-surface-300/50 pl-2">
+                      {@render contentsList(item.children)}
+                    </div>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/snippet}
           <div class="mt-3 max-h-[55dvh] overflow-auto">
-            {#each toc as item (item.href)}
-              <button
-                class="btn w-full justify-start text-left"
-                type="button"
-                onclick={() => {
-                  void session?.display(item.href);
-                  closeToc();
-                }}>{item.label}</button
-              >
-            {/each}
+            {@render contentsList(toc)}
           </div>
         </div>
       {/if}
@@ -1496,9 +1538,9 @@
             {#if bookmarks.length === 0}
               <p class="mt-2 text-sm text-surface-700-300">No bookmarks yet.</p>
             {:else}
-              <div class="mt-2 grid gap-2">
+              <ul class="mt-2 grid list-none gap-2 p-0">
                 {#each bookmarks as bookmark (bookmark.id)}
-                  <div class="rounded-lg preset-tonal-surface p-2">
+                  <li class="rounded-lg preset-tonal-surface p-2">
                     {#if editingBookmarkId === bookmark.id}
                       <form
                         class="flex gap-2"
@@ -1551,9 +1593,9 @@
                         </button>
                       </div>
                     {/if}
-                  </div>
+                  </li>
                 {/each}
-              </div>
+              </ul>
             {/if}
           </section>
 
@@ -1567,17 +1609,19 @@
             {#if locationHistory.length === 0}
               <p class="mt-2 text-sm text-surface-700-300">Recent page turns will appear here.</p>
             {:else}
-              <div class="mt-2 grid gap-1">
+              <ul class="mt-2 grid list-none gap-1 p-0">
                 {#each locationHistory as entry (entry.id + entry.savedAt)}
-                  <button
-                    class="btn w-full justify-start text-left text-sm"
-                    type="button"
-                    onclick={() => void returnToLocation(entry)}
-                  >
-                    {entry.label}
-                  </button>
+                  <li>
+                    <button
+                      class="btn w-full justify-start text-left text-sm"
+                      type="button"
+                      onclick={() => void returnToLocation(entry)}
+                    >
+                      {entry.label}
+                    </button>
+                  </li>
                 {/each}
-              </div>
+              </ul>
             {/if}
           </section>
         </div>
@@ -1772,7 +1816,7 @@
     onpointerup={handleBottomSwipeEnd}
     onpointercancel={handleBottomSwipeEnd}
   ></div>
-</div>
+</main>
 
 <style>
   .reader-shell {
@@ -1935,7 +1979,8 @@
   }
 
   .reader-toolbar-actions :global(button) {
-    min-width: 0;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
     overflow: hidden;
   }
 
@@ -1991,6 +2036,12 @@
 
     .reader-toolbar-title {
       display: none;
+    }
+  }
+
+  @media (max-width: 22.5rem) {
+    .reader-toolbar-actions {
+      grid-template-columns: repeat(4, minmax(2.75rem, 1fr));
     }
   }
 
