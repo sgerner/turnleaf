@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { kavitaXPathToCfi, parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './session';
+import {
+  kavitaXPathToCfi,
+  parseKavitaXPath,
+  resolveContentXPath,
+  toKavitaXPath,
+} from './kavita-xpath';
 
 describe('Kavita EPUB locations', () => {
   it('adds the one-based Kavita spine fragment to an EPUB content path', () => {
