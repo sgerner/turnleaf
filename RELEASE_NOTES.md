@@ -2,8 +2,13 @@
 
 ## Unreleased
 
-- feat: improve reader navigation and annotations
-- Keep reader highlights visible, preserve the reading passage through viewport resizes, and improve reader navigation and accessibility.
+- Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
+- Reduce repeated library and EPUB reader work
+- Reuse library search and sort work, retain recently loaded covers, and reduce reader and EPUB validation overhead.
+- Serialize confirmed positions with in-flight uploads
+- Fix reading progress sync and conflict handling
+- Sync queued reading positions on launch and after replacing the Kavita key, retry newer progress revisions, and pause uploads for removed books.
+- Preserve local reading positions with automatic selection off and save explicitly accepted Kavita conflicts.
 - fix: align EPUB taps with visible page (#214)
 - fix: keep library loading and download recovery responsive
 - fix: preserve the reader passage and keyboard focus

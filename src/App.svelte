@@ -10,7 +10,6 @@
     getPreferences,
     getServer,
     resetLocalDatabase,
-    setPreference,
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
@@ -91,9 +90,6 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
-    if (booting || startupError) return;
-    void setPreference(themePreferenceKey, uiTheme);
-    void setPreference(modePreferenceKey, uiMode);
   });
 </script>
 
