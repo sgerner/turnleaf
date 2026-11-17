@@ -1624,9 +1624,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
-          aria-label="Show only downloaded books"
           onclick={() => (downloadedOnly = !downloadedOnly)}
-          title="Show only downloaded books"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
@@ -1640,9 +1638,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
-          aria-label="Hide books you have finished"
           onclick={() => (hideCompleted = !hideCompleted)}
-          title="Hide books you have finished"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path
