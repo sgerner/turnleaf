@@ -3,6 +3,7 @@
 ## Unreleased
 
 - chore: remove unused download, sync, and reader helpers
+- refactor: share the reader native plugin interface
 - Reduce repeated library and EPUB reader work
 - Reuse library search and sort work, retain recently loaded covers, and reduce reader and EPUB validation overhead.
 - Serialize confirmed positions with in-flight uploads
