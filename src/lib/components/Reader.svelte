@@ -5,7 +5,7 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
-  import { getPreferences, setPreference } from '../database/database';
+  import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -43,6 +43,12 @@
   } from '../reader/bookmarks';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
+  type SyncedLocation = {
+    xpath: string | null;
+    percentage: number | null;
+    accept?: () => Promise<void>;
+  };
+
   let {
     bookUrl,
     bookId,
@@ -64,7 +70,7 @@
     initialPercentage?: number | null;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
-    onSyncLatest?: () => Promise<{ xpath: string | null; percentage: number | null } | null>;
+    onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
@@ -107,9 +113,7 @@
   let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
-  let pendingSyncLocation = $state<{ xpath: string | null; percentage: number | null } | null>(
-    null,
-  );
+  let pendingSyncLocation = $state<SyncedLocation | null>(null);
   let error = $state('');
   let startupOpenFailed = $state(false);
   let retryingReader = $state(false);
@@ -435,10 +439,7 @@
     resumeChromeHide();
   }
 
-  function openSyncConfirmation(progress: {
-    xpath: string | null;
-    percentage: number | null;
-  }): void {
+  function openSyncConfirmation(progress: SyncedLocation): void {
     pauseChromeHide();
     syncConfirmationOpener = activeElement();
     pendingSyncLocation = progress;
@@ -519,13 +520,14 @@
 
   function flushPreferences(): void {
     preferenceWrite = preferenceWrite.then(async () => {
-      for (const [key, value] of [...pendingPreferences]) {
-        try {
-          await setPreference(key, value);
+      const batch = new Map(pendingPreferences);
+      try {
+        await setPreferences(batch);
+        for (const [key, value] of batch) {
           if (pendingPreferences.get(key) === value) pendingPreferences.delete(key);
-        } catch {
-          // Keep this preference pending for the next save or lifecycle flush.
         }
+      } catch {
+        // Keep pending preferences for the next save or lifecycle flush.
       }
     });
   }
@@ -737,9 +739,14 @@
     closeSyncConfirmation();
     if (!progress || !reader) return;
     try {
+      await progress.accept?.();
+      if (destroyed || session !== reader) return;
       await displaySyncedLocation(reader, progress);
-    } catch {
-      error = 'Kavita’s latest reading position could not be opened.';
+    } catch (cause) {
+      error =
+        cause instanceof Error
+          ? cause.message
+          : 'Kavita’s latest reading position could not be opened.';
     }
     showControls();
   }
@@ -750,7 +757,7 @@
     const reader = session;
     syncingLatest = true;
     try {
-      const progress = await onSyncLatest();
+      const progress = await onSyncLatest(showFeedback);
       if (destroyed || session !== reader || (!showFeedback && localNavigationDuringSession))
         return;
       if (progress && showFeedback && hasDivergentSyncLocation(progress)) {
