@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- chore(android): remove unused Google Services setup and modernize the clean task
 - fix: align EPUB taps with visible page (#214)
 - fix: keep library loading and download recovery responsive
 - fix: preserve the reader passage and keyboard focus
