@@ -3,9 +3,11 @@
 ## Unreleased
 
 - Improve library filtering and accessibility with a skip link, clearer progress, and semantic settings groups.
+- Fix reconnect mode during submission
 - chore(android): remove unused Google Services setup and modernize the clean task
 - Offer credential recovery from startup errors
 - Share release note parsing and command execution
+- Let reconnect setup update a saved Kavita address with isolated credentials.
 - Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
 - chore: remove unused download, sync, and reader helpers
 - refactor: share the reader native plugin interface
