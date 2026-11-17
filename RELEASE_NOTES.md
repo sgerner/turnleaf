@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Offer credential recovery from startup errors
 - Reduce repeated library and EPUB reader work
 - Reuse library search and sort work, retain recently loaded covers, and reduce reader and EPUB validation overhead.
 - Serialize confirmed positions with in-flight uploads
@@ -38,6 +39,7 @@
 - security: refresh the transitive devalue dependency to a patched release.
 - fix: restore theme previews and custom theme styles after the Skeleton 5 token changes.
 - fix: recover EPUB downloads with a missing container file when the book package can be identified. (#189)
+- Offer Kavita key re-entry when local credential access fails, and announce when release links open a new tab.
 
 ## 0.3.4
 
