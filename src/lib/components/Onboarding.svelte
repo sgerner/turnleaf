@@ -29,12 +29,13 @@
     error = '';
     invalidField = null;
     busy = true;
+    const changingServerAddress = Boolean(savedServer && changeServerAddress);
 
     try {
       const normalized = normalizeServerUrl(
-        savedServer && !changeServerAddress ? savedServer.baseUrl : serverUrl,
+        savedServer && !changingServerAddress ? savedServer.baseUrl : serverUrl,
       );
-      if ((!savedServer || changeServerAddress) && normalized.insecure && !allowHttp) {
+      if ((!savedServer || changingServerAddress) && normalized.insecure && !allowHttp) {
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
       const key = apiKey.trim();
@@ -52,7 +53,7 @@
 
       if (savedServer) {
         let connectedServer = savedServer;
-        if (changeServerAddress) {
+        if (changingServerAddress) {
           const credentialRef = `${savedServer.credentialRef}_${Date.now().toString(36)}`;
           connectedServer = {
             ...savedServer,
@@ -168,9 +169,11 @@
       class="card preset-filled-surface-50-950 space-y-5 p-6 shadow-2xl sm:p-8"
       onsubmit={connect}
     >
-      {#if !savedServer}
+      {#if !savedServer || changeServerAddress}
         <label class="label">
-          <span class="label-text">Kavita server address</span>
+          <span class="label-text">
+            {savedServer ? 'New Kavita server address' : 'Kavita server address'}
+          </span>
           <input
             class="input"
             type="url"
@@ -207,6 +210,7 @@
         <button
           class="btn btn-sm preset-tonal-surface h-11 self-start"
           type="button"
+          disabled={busy}
           onclick={() => {
             changeServerAddress = !changeServerAddress;
             serverUrl = changeServerAddress ? savedServer.baseUrl : '';
@@ -222,33 +226,6 @@
         <p class="text-sm text-surface-700-300">
           Use this only when the new address reaches the same Kavita server and libraries.
         </p>
-        <label class="label">
-          <span class="label-text">New Kavita server address</span>
-          <input
-            class="input"
-            type="url"
-            inputmode="url"
-            autocomplete="url"
-            placeholder="https://books.example.com"
-            bind:value={serverUrl}
-            aria-invalid={invalidField === 'address' || undefined}
-            aria-describedby={error ? 'connection-error' : undefined}
-            required
-          />
-        </label>
-
-        {#if serverUrl.trim().toLowerCase().startsWith('http://')}
-          <label
-            class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
-            transition:fade
-          >
-            <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
-            <span
-              >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
-              and auth key.</span
-            >
-          </label>
-        {/if}
       {/if}
 
       <div class="label">

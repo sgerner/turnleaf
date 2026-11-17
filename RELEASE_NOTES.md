@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix reconnect mode during submission
 - chore(android): remove unused Google Services setup and modernize the clean task
 - Offer credential recovery from startup errors
 - Share release note parsing and command execution
