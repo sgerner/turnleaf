@@ -11,6 +11,7 @@
 - Fix reading progress sync and conflict handling
 - Sync queued reading positions on launch and after replacing the Kavita key, retry newer progress revisions, and pause uploads for removed books.
 - Preserve local reading positions with automatic selection off and save explicitly accepted Kavita conflicts.
+- ci: gate releases on the same-revision Android journey and harden repeatable multi-device checks
 - fix: align EPUB taps with visible page (#214)
 - fix: keep library loading and download recovery responsive
 - fix: preserve the reader passage and keyboard focus

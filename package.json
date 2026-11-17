@@ -27,6 +27,7 @@
     "android:doctor": "node scripts/check-android-sdk.mjs",
     "android:debug": "node scripts/android-build.mjs debug",
     "android:smoke": "node scripts/android-smoke.mjs",
+    "android:journey": "node scripts/android-reading-journey.mjs",
     "android:release": "node scripts/android-build.mjs release",
     "ios:sync": "npm run build && cap sync ios",
     "ios:open": "node scripts/capacitor-open.mjs ios",

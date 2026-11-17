@@ -2,11 +2,11 @@ import { access } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveDeviceSerial } from './android-device.mjs';
 
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const apkPath = resolve(projectRoot, 'android/app/build/outputs/apk/debug/app-debug.apk');
-const packageName = 'app.turnleaf.reader.debug';
-const activity = `${packageName}/app.turnleaf.reader.MainActivity`;
+const defaultApkPath = resolve(projectRoot, 'android/app/build/outputs/apk/debug/app-debug.apk');
+const defaultPackageName = 'app.turnleaf.reader.debug';
 
 function run(command, args) {
   return new Promise((resolveCommand, rejectCommand) => {
@@ -36,14 +36,27 @@ function run(command, args) {
   });
 }
 
-export async function main() {
-  await access(apkPath);
-  await run('adb', ['wait-for-device']);
-  await run('adb', ['install', '-r', apkPath]);
-  await run('adb', ['shell', 'am', 'start', '-W', '-n', activity]);
-  const process = await run('adb', ['shell', 'pidof', packageName]);
-  if (!process.stdout.trim()) throw new Error(`Android app process ${packageName} is not running.`);
-  console.log(`Android smoke check passed for ${packageName} (pid ${process.stdout.trim()}).`);
+export async function main({
+  apkPath = defaultApkPath,
+  packageName = defaultPackageName,
+  resetData = false,
+  serial = process.env.ANDROID_SERIAL,
+} = {}) {
+  const targetApkPath = resolve(apkPath);
+  const activity = `${packageName}/app.turnleaf.reader.MainActivity`;
+  const targetSerial = await resolveDeviceSerial({ requestedSerial: serial });
+  const adb = (...args) => run('adb', ['-s', targetSerial, ...args]);
+
+  await access(targetApkPath);
+  await adb('wait-for-device');
+  await adb('install', '-r', targetApkPath);
+  if (resetData) await adb('shell', 'pm', 'clear', packageName);
+  await adb('shell', 'am', 'start', '-W', '-n', activity);
+  const appProcess = await adb('shell', 'pidof', packageName);
+  if (!appProcess.stdout.trim()) {
+    throw new Error(`Android app process ${packageName} is not running.`);
+  }
+  console.log(`Android smoke check passed for ${packageName} (pid ${appProcess.stdout.trim()}).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
