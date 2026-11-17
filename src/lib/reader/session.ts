@@ -12,13 +12,6 @@ import {
   toKavitaXPath,
 } from './kavita-xpath';
 
-export {
-  kavitaXPathToCfi,
-  parseKavitaXPath,
-  resolveContentXPath,
-  toKavitaXPath,
-} from './kavita-xpath';
-
 export interface ReaderLocation {
   cfi: string;
   xpath: string | null;

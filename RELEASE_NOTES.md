@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- chore: remove unused download, sync, and reader helpers
 - fix: align EPUB taps with visible page (#214)
 - fix: keep library loading and download recovery responsive
 - fix: preserve the reader passage and keyboard focus
