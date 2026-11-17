@@ -170,6 +170,9 @@ jobs:
 
       - name: Smoke-test signed release APK
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANDROID_PACKAGE_NAME: app.turnleaf.reader
+          ANDROID_APK_PATH: android/app/build/outputs/apk/release/app-release.apk
         with:
           api-level: 36
           target: google_apis
@@ -179,10 +182,7 @@ jobs:
           force-avd-creation: true
           emulator-boot-timeout: 900
           disable-animations: true
-          script: |
-            ANDROID_PACKAGE_NAME=app.turnleaf.reader \
-            ANDROID_APK_PATH=android/app/build/outputs/apk/release/app-release.apk \
-            npm run android:smoke
+          script: npm run android:smoke
 
       - name: Stage release artifacts and notes
         env:
