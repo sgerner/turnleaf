@@ -51,16 +51,37 @@
       }
 
       if (savedServer) {
-        const connectedServer = changeServerAddress
-          ? {
-              ...savedServer,
-              baseUrl: normalized.baseUrl,
-              kavitaVersion: result.version,
-              lastConnectedAt: new Date().toISOString(),
+        let connectedServer = savedServer;
+        if (changeServerAddress) {
+          const credentialRef = `${savedServer.credentialRef}_${Date.now().toString(36)}`;
+          connectedServer = {
+            ...savedServer,
+            baseUrl: normalized.baseUrl,
+            credentialRef,
+            kavitaVersion: result.version,
+            lastConnectedAt: new Date().toISOString(),
+          };
+          await saveApiKey(credentialRef, key);
+          try {
+            await saveServer(connectedServer);
+          } catch (storageError) {
+            try {
+              await removeApiKey(credentialRef);
+            } catch (cleanupError) {
+              throw new Error(
+                'The new address tested successfully, but local setup could not be saved and the new auth key could not be cleaned up. The saved connection was left in place; retry reconnect.',
+                { cause: cleanupError },
+              );
             }
-          : savedServer;
-        if (changeServerAddress) await saveServer(connectedServer);
-        await saveApiKey(savedServer.credentialRef, key);
+            throw new Error(
+              'The new address tested successfully, but local setup could not be saved. The saved connection and auth key were left in place; retry reconnect.',
+              { cause: storageError },
+            );
+          }
+          await removeApiKey(savedServer.credentialRef).catch(() => {});
+        } else {
+          await saveApiKey(savedServer.credentialRef, key);
+        }
         onConnected(connectedServer, key);
         return;
       }
@@ -198,6 +219,9 @@
       {/if}
 
       {#if savedServer && changeServerAddress}
+        <p class="text-sm text-surface-700-300">
+          Use this only when the new address reaches the same Kavita server and libraries.
+        </p>
         <label class="label">
           <span class="label-text">New Kavita server address</span>
           <input

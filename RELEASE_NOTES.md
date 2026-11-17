@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: keep reconnect credentials scoped to their server
 - fix: let reconnect update the server address
 - Let reconnect setup update the saved Kavita server address after testing it.
 - Add persistent EPUB highlights, viewport reflow, nested/current table of contents, and accessible reader navigation.
