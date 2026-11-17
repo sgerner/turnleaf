@@ -1055,17 +1055,24 @@ export async function getPreferences(keys: readonly string[]): Promise<Map<strin
 }
 
 export async function setPreference(key: string, value: string): Promise<void> {
+  await setPreferences(new Map([[key, value]]));
+}
+
+export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
+  if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    state.preferences[key] = value;
+    for (const [key, value] of preferences) state.preferences[key] = value;
     writeBrowserState(state);
     return;
   }
   const db = await openDatabase();
+  const now = new Date().toISOString();
   await executeNativeRun(
     db,
-    `INSERT INTO preferences (key,value,updated_at) VALUES (?,?,?)
+    `INSERT INTO preferences (key,value,updated_at)
+    VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
-    [key, value, new Date().toISOString()],
+    Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
 }

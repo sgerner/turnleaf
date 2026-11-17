@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reduce repeated library and EPUB reader work
+- Reuse library search and sort work, retain recently loaded covers, and reduce reader and EPUB validation overhead.
 - Serialize confirmed positions with in-flight uploads
 - Fix reading progress sync and conflict handling
 - Sync queued reading positions on launch and after replacing the Kavita key, retry newer progress revisions, and pause uploads for removed books.

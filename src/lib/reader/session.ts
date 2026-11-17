@@ -166,29 +166,42 @@ function decodeDataStylesheet(value: string): string | null {
   }
 }
 
-async function sanitizeStylesheets(document: Document): Promise<void> {
+type StylesheetCache = Map<string, Promise<string | null>>;
+
+async function loadLocalStylesheet(url: URL, cache: StylesheetCache): Promise<string | null> {
+  const key = url.href;
+  const existing = cache.get(key);
+  if (existing) return existing;
+  const request = fetch(url)
+    .then(async (response) => (response.ok ? sanitizeCss(await response.text()) : null))
+    .catch(() => null);
+  if (cache.size >= 32) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, request);
+  const stylesheet = await request;
+  if (stylesheet === null && cache.get(key) === request) cache.delete(key);
+  return stylesheet;
+}
+
+async function sanitizeStylesheets(document: Document, cache: StylesheetCache): Promise<void> {
   const links = [...document.querySelectorAll<HTMLLinkElement>('link[href]')].filter((link) =>
     (link.getAttribute('rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet'),
   );
   await Promise.all(
     links.map(async (link) => {
       const href = link.getAttribute('href') ?? '';
-      const next = link.nextSibling;
-      const parent = link.parentNode;
-      link.remove();
-      let stylesheet: string | null = decodeDataStylesheet(href);
-      if (!stylesheet && isLocalContentUrl(href, document)) {
-        try {
-          const response = await fetch(new URL(href, document.baseURI));
-          if (response.ok) stylesheet = await response.text();
-        } catch {
-          stylesheet = null;
-        }
-      }
-      if (!stylesheet) return;
       const style = document.createElement('style');
-      style.textContent = sanitizeCss(stylesheet);
-      parent?.insertBefore(style, next);
+      link.replaceWith(style);
+      const embedded = decodeDataStylesheet(href);
+      const stylesheet = embedded
+        ? sanitizeCss(embedded)
+        : isLocalContentUrl(href, document)
+          ? await loadLocalStylesheet(new URL(href, document.baseURI), cache)
+          : null;
+      if (stylesheet) style.textContent = stylesheet;
+      else style.remove();
     }),
   );
 }
@@ -231,7 +244,10 @@ function isSafeBaseReference(value: string, document: Document): boolean {
   return isLocalContentUrl(decoded, document);
 }
 
-export async function sanitizeEpubDocument(document: Document): Promise<void> {
+export async function sanitizeEpubDocument(
+  document: Document,
+  stylesheetCache: StylesheetCache = new Map(),
+): Promise<void> {
   document.querySelectorAll('base').forEach((base) => {
     const href = base.getAttribute('href') ?? '';
     if (!isSafeBaseReference(href, document)) base.remove();
@@ -279,12 +295,13 @@ export async function sanitizeEpubDocument(document: Document): Promise<void> {
     const safeStyle = sanitizeCss(style.textContent ?? '');
     style.textContent = safeStyle;
   });
-  await sanitizeStylesheets(document);
+  await sanitizeStylesheets(document, stylesheetCache);
   installEpubContentPolicy(document);
 }
 
 export class ReaderSession {
   private readonly book;
+  private readonly stylesheetCache: StylesheetCache = new Map();
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
@@ -604,11 +621,12 @@ export class ReaderSession {
     this.appearance = null;
     this.reflowPending = false;
     this.spine = null;
+    this.stylesheetCache.clear();
     this.book.destroy();
   }
 
   private harden(contents: Contents): Promise<void> {
-    return sanitizeEpubDocument(contents.document);
+    return sanitizeEpubDocument(contents.document, this.stylesheetCache);
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -623,13 +641,18 @@ export class ReaderSession {
       const parts: string[] = [];
       while (element && element.localName !== 'body' && element.localName !== 'html') {
         const tag = element.localName;
-        const siblings = element.parentElement
-          ? [...element.parentElement.children].filter((child) => child.localName === tag)
-          : [];
-        parts.unshift(`${tag}[${Math.max(1, siblings.indexOf(element) + 1)}]`);
+        let index = 1;
+        for (
+          let sibling = element.previousElementSibling;
+          sibling;
+          sibling = sibling.previousElementSibling
+        ) {
+          if (sibling.localName === tag) index += 1;
+        }
+        parts.push(`${tag}[${index}]`);
         element = element.parentElement;
       }
-      return toKavitaXPath(`/${parts.join('/')}`, spineIndex);
+      return toKavitaXPath(`/${parts.reverse().join('/')}`, spineIndex);
     } catch {
       return null;
     }

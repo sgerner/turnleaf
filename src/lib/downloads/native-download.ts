@@ -22,7 +22,11 @@ export class EpubTransferError extends Error {
 function decodeNativeBytes(data: string | Blob): Uint8Array {
   if (typeof data !== 'string') throw new Error('The native EPUB could not be inspected.');
   const binary = atob(data);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 async function readNativeRange(path: string, offset: number, length: number): Promise<Uint8Array> {
