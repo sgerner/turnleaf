@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Improve library filtering and accessibility with a skip link, clearer progress, and semantic settings groups.
 - Fix reconnect mode during submission
 - chore(android): remove unused Google Services setup and modernize the clean task
 - Offer credential recovery from startup errors
