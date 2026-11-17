@@ -15,6 +15,7 @@
   } = $props();
 
   let serverUrl = $state('');
+  let changeServerAddress = $state(false);
   let displayName = $state('Books');
   let apiKey = $state('');
   let allowHttp = $state(false);
@@ -30,8 +31,10 @@
     busy = true;
 
     try {
-      const normalized = normalizeServerUrl(savedServer?.baseUrl ?? serverUrl);
-      if (!savedServer && normalized.insecure && !allowHttp) {
+      const normalized = normalizeServerUrl(
+        savedServer && !changeServerAddress ? savedServer.baseUrl : serverUrl,
+      );
+      if ((!savedServer || changeServerAddress) && normalized.insecure && !allowHttp) {
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
       const key = apiKey.trim();
@@ -48,8 +51,17 @@
       }
 
       if (savedServer) {
+        const connectedServer = changeServerAddress
+          ? {
+              ...savedServer,
+              baseUrl: normalized.baseUrl,
+              kavitaVersion: result.version,
+              lastConnectedAt: new Date().toISOString(),
+            }
+          : savedServer;
+        if (changeServerAddress) await saveServer(connectedServer);
         await saveApiKey(savedServer.credentialRef, key);
-        onConnected(savedServer, key);
+        onConnected(connectedServer, key);
         return;
       }
 
@@ -119,7 +131,11 @@
     </h1>
     <p class="mt-5 max-w-md text-base leading-relaxed text-surface-900-100 sm:text-lg">
       {#if savedServer}
-        Enter a new auth key for {savedServer.baseUrl} to reopen your saved library.
+        {#if changeServerAddress}
+          Enter a new auth key for the server address below to reopen your saved library.
+        {:else}
+          Enter a new auth key for {savedServer.baseUrl} to reopen your saved library.
+        {/if}
       {:else}
         Connect directly to Kavita. Download EPUB books and keep your place across devices.
       {/if}
@@ -134,6 +150,56 @@
       {#if !savedServer}
         <label class="label">
           <span class="label-text">Kavita server address</span>
+          <input
+            class="input"
+            type="url"
+            inputmode="url"
+            autocomplete="url"
+            placeholder="https://books.example.com"
+            bind:value={serverUrl}
+            aria-invalid={invalidField === 'address' || undefined}
+            aria-describedby={error ? 'connection-error' : undefined}
+            required
+          />
+        </label>
+
+        {#if serverUrl.trim().toLowerCase().startsWith('http://')}
+          <label
+            class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
+            transition:fade
+          >
+            <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
+            <span
+              >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
+              and auth key.</span
+            >
+          </label>
+        {/if}
+      {:else}
+        <div class="label">
+          <span class="label-text">Kavita server address</span>
+          <span class="text-sm text-surface-700-300">{savedServer.baseUrl}</span>
+        </div>
+      {/if}
+
+      {#if savedServer}
+        <button
+          class="btn btn-sm preset-tonal-surface h-11 self-start"
+          type="button"
+          onclick={() => {
+            changeServerAddress = !changeServerAddress;
+            serverUrl = changeServerAddress ? savedServer.baseUrl : '';
+            error = '';
+            invalidField = null;
+          }}
+        >
+          {changeServerAddress ? 'Use saved address' : 'Change server address'}
+        </button>
+      {/if}
+
+      {#if savedServer && changeServerAddress}
+        <label class="label">
+          <span class="label-text">New Kavita server address</span>
           <input
             class="input"
             type="url"
