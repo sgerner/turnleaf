@@ -775,8 +775,12 @@ export interface SyncStatus {
 
 export async function getPendingSync(serverId: string): Promise<PendingSyncItem[]> {
   if (!Capacitor.isNativePlatform()) {
-    return Object.values(readBrowserState().syncQueue)
-      .filter((row) => row.serverId === serverId)
+    const state = readBrowserState();
+    const unavailable = new Set(
+      state.books.filter((book) => book.remoteAvailable === false).map((book) => book.id),
+    );
+    return Object.values(state.syncQueue)
+      .filter((row) => row.serverId === serverId && !unavailable.has(row.bookId))
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
       .map((row) => ({
         bookId: row.bookId,
@@ -789,7 +793,7 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
   const result = await db.query(
     `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision
     FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? ORDER BY sync_queue.updated_at`,
+    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at`,
     [serverId],
   );
   return (result.values ?? []).map((row) => ({
@@ -802,8 +806,12 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
 
 export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
-    const rows = Object.values(readBrowserState().syncQueue)
-      .filter((row) => row.serverId === serverId)
+    const state = readBrowserState();
+    const unavailable = new Set(
+      state.books.filter((book) => book.remoteAvailable === false).map((book) => book.id),
+    );
+    const rows = Object.values(state.syncQueue)
+      .filter((row) => row.serverId === serverId && !unavailable.has(row.bookId))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return {
       pendingCount: rows.length,
@@ -816,7 +824,7 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   const result = await db.query(
     `SELECT sync_queue.updated_at,sync_queue.last_error
     FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? ORDER BY sync_queue.updated_at DESC`,
+    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
     [serverId],
   );
   const rows = result.values ?? [];
@@ -1047,17 +1055,24 @@ export async function getPreferences(keys: readonly string[]): Promise<Map<strin
 }
 
 export async function setPreference(key: string, value: string): Promise<void> {
+  await setPreferences(new Map([[key, value]]));
+}
+
+export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
+  if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    state.preferences[key] = value;
+    for (const [key, value] of preferences) state.preferences[key] = value;
     writeBrowserState(state);
     return;
   }
   const db = await openDatabase();
+  const now = new Date().toISOString();
   await executeNativeRun(
     db,
-    `INSERT INTO preferences (key,value,updated_at) VALUES (?,?,?)
+    `INSERT INTO preferences (key,value,updated_at)
+    VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
-    [key, value, new Date().toISOString()],
+    Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
 }

@@ -1,7 +1,4 @@
 import { registerPlugin } from '@capacitor/core';
+import type { ReaderTogglePlugin } from './reader-toggle-plugin';
 
-export interface ReaderChromePlugin {
-  setEnabled(options: { enabled: boolean }): Promise<void>;
-}
-
-export const ReaderChrome = registerPlugin<ReaderChromePlugin>('ReaderChrome');
+export const ReaderChrome = registerPlugin<ReaderTogglePlugin>('ReaderChrome');

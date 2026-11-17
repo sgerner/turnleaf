@@ -3,6 +3,7 @@
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
   import { tick, onDestroy, onMount, untrack } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import {
     getBooks,
@@ -147,24 +148,16 @@
       ),
     ].sort((a, b) => a.localeCompare(b)),
   );
-  let visibleBooks = $derived.by(() => {
-    const filtered = displayableBooks.filter((book) => {
-      const matchesQuery =
-        !normalizedQuery ||
-        `${book.title} ${book.author ?? ''} ${book.series ?? ''}`
-          .toLowerCase()
-          .includes(normalizedQuery);
-      const completed = book.pages > 0 && book.pagesRead >= book.pages;
-      return (
-        matchesQuery &&
-        (!downloadedOnly || Boolean(book.downloadPath)) &&
-        (!hideCompleted || !completed) &&
-        (!authorFilter || book.author === authorFilter) &&
-        (!seriesFilter || book.series === seriesFilter)
-      );
-    });
-
-    return [...filtered].sort((a, b) => {
+  const searchableText = $derived(
+    new Map(
+      displayableBooks.map((book) => [
+        book.id,
+        `${book.title} ${book.author ?? ''} ${book.series ?? ''}`.toLowerCase(),
+      ]),
+    ),
+  );
+  const sortedBooks = $derived(
+    [...displayableBooks].sort((a, b) => {
       if (sortOrder === 'recent') {
         return (
           (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? '') || a.title.localeCompare(b.title)
@@ -178,8 +171,20 @@
         );
       }
       return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
-    });
-  });
+    }),
+  );
+  const visibleBooks = $derived(
+    sortedBooks.filter((book) => {
+      const completed = book.pages > 0 && book.pagesRead >= book.pages;
+      return (
+        (!normalizedQuery || searchableText.get(book.id)?.includes(normalizedQuery)) &&
+        (!downloadedOnly || Boolean(book.downloadPath)) &&
+        (!hideCompleted || !completed) &&
+        (!authorFilter || book.author === authorFilter) &&
+        (!seriesFilter || book.series === seriesFilter)
+      );
+    }),
+  );
   // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
   let continueBook = $derived.by(() => {
     let latest: BookRecord | null = null;
@@ -205,7 +210,7 @@
     remote: KavitaProgress;
   } | null>(null);
   let conflictError = $state('');
-  let covers = $state<Record<number, string>>({});
+  const covers = new SvelteMap<number, string>();
   let coverReloadRequest = $state(0);
   let loading = $state(true);
   let refreshing = $state(false);
@@ -274,6 +279,7 @@
   const GRID_ROW_GAP_PX = 32;
   const CARD_TEXT_HEIGHT_PX = 80;
   const COVER_LOAD_CONCURRENCY = 6;
+  const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
@@ -530,7 +536,10 @@
         : 'No network connection. Connect to Kavita to load your library.'
       : '';
     if (destroyed) return;
-    if (!offline) await refresh();
+    if (!offline) {
+      await refresh();
+      void syncProgress(false);
+    }
     if (destroyed) return;
     cleanups.push(
       await registerListener(
@@ -543,8 +552,8 @@
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
           if (connected)
-            void syncProgress(false)
-              .then(refresh)
+            void refresh()
+              .then(() => syncProgress(false))
               .catch(() => {});
         }),
       ),
@@ -594,7 +603,9 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
-    if (destroyed || conflict || resolvingOpenProgress) return Promise.resolve();
+    if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+      return Promise.resolve();
+    }
     syncWork = runProgressSync(showFeedback).finally(() => {
       syncWork = null;
     });
@@ -611,9 +622,18 @@
       }
       await flushProgress(client, server.id);
       if (showFeedback) message = 'Reading progress synced.';
-    } catch {
-      if (showFeedback)
-        message = 'Some reading progress is waiting to sync. Try again when online.';
+    } catch (error) {
+      if (
+        error instanceof AggregateError &&
+        error.errors.some(
+          (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
+        )
+      ) {
+        message =
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
+      } else if (showFeedback) {
+        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+      }
     } finally {
       await refreshSyncStatus();
       syncing = false;
@@ -734,28 +754,31 @@
   }
 
   function clearCovers(): void {
-    for (const cover of Object.values(covers)) revokeBrowserCover(cover);
-    covers = {};
+    for (const cover of covers.values()) revokeBrowserCover(cover);
+    covers.clear();
   }
 
   function retainCoversFor(items: BookRecord[]): void {
-    retainCoversForSeries(new Set(items.map((item) => item.seriesId)));
-  }
-
-  function retainCoversForSeries(seriesIds: Set<number>): void {
-    const retained = Object.fromEntries(
-      Object.entries(covers).filter(([seriesId]) => seriesIds.has(Number(seriesId))),
-    );
-    for (const [seriesId, cover] of Object.entries(covers)) {
-      if (!seriesIds.has(Number(seriesId))) revokeBrowserCover(cover);
+    const seriesIds = new Set(items.map((item) => item.seriesId));
+    for (const [seriesId, cover] of covers) {
+      if (seriesIds.has(seriesId)) continue;
+      revokeBrowserCover(cover);
+      covers.delete(seriesId);
     }
-    covers = retained;
   }
 
   async function loadCovers(items: CoverLoadItem[]): Promise<void> {
     if (destroyed) return;
     const visibleSeriesIds = new Set(items.map((item) => item.seriesId));
-    retainCoversForSeries(visibleSeriesIds);
+    const offscreen = [...covers.keys()].filter((seriesId) => !visibleSeriesIds.has(seriesId));
+    for (const seriesId of offscreen.slice(
+      0,
+      Math.max(0, offscreen.length - OFFSCREEN_COVER_LIMIT),
+    )) {
+      const cover = covers.get(seriesId);
+      if (cover) revokeBrowserCover(cover);
+      covers.delete(seriesId);
+    }
     cancelCoverLoading();
     sharedCoverLoader.retain(visibleSeriesIds);
     const controller = new AbortController();
@@ -765,19 +788,16 @@
       await loadCoversWithConcurrency(items, {
         signal: controller.signal,
         concurrency: COVER_LOAD_CONCURRENCY,
-        hasCover: (seriesId) => Boolean(covers[seriesId]),
+        hasCover: (seriesId) => Boolean(covers.get(seriesId)),
         load: (seriesId) => sharedCoverLoader.load(seriesId),
         onLoaded: (seriesId, cover) => {
           if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
             return;
           }
           const displayCover = typeof cover === 'string' ? cover : URL.createObjectURL(cover);
-          const previous = covers[seriesId];
+          const previous = covers.get(seriesId);
           if (previous && previous !== displayCover) revokeBrowserCover(previous);
-          covers = {
-            ...covers,
-            [seriesId]: displayCover,
-          };
+          covers.set(seriesId, displayCover);
         },
       });
     } finally {
@@ -1074,20 +1094,48 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    await refreshSyncStatus();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
   }
 
   async function syncLatestForReader(
     book: BookRecord,
-  ): Promise<{ xpath: string | null; percentage: number | null } | null> {
-    if (offline) return null;
+    manual: boolean,
+  ): Promise<{
+    xpath: string | null;
+    percentage: number | null;
+    accept?: () => Promise<void>;
+  } | null> {
+    if (offline || book.remoteAvailable === false || (!manual && !pendingAutoSync)) return null;
+    const local = await getReadingState(book.id);
+    if (!manual && local?.pendingSync) return null;
     const remote = await client.getProgress(book.chapterId).catch(() => null);
     if (!remote) return null;
     return {
       xpath: remote.bookScrollId ?? null,
       percentage: remotePercentage(remote, book),
+      ...(local?.pendingSync && {
+        accept: async () => {
+          acceptingRemoteProgress = true;
+          try {
+            // An upload cannot race with deletion of the exact revision it is sending.
+            await syncWork;
+            const accepted =
+              local.syncRevision != null &&
+              (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt));
+            if (!accepted)
+              throw new Error('The saved reading position changed. Sync again to retry.');
+            const savedBook = books.find((item) => item.id === book.id);
+            if (savedBook) {
+              savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+              savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
+            }
+            void refreshSyncStatus();
+          } finally {
+            acceptingRemoteProgress = false;
+          }
+        },
+      }),
     };
   }
 
@@ -1359,7 +1407,10 @@
       replacementApiKey = '';
       message = 'API key updated.';
       closeSettings();
-      void refresh();
+      // An upload started with the previous key may still be finishing.
+      await syncWork;
+      await refresh();
+      await syncProgress(false);
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -1407,7 +1458,7 @@
     initialPercentage={reading.percentage}
     onBack={() => (reading = null)}
     onRelocated={handleRelocated}
-    onSyncLatest={() => syncLatestForReader(reading!.book)}
+    onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
     onRetryDownload={offline || reading.book.remoteAvailable === false
       ? undefined
       : retryReaderDownload}
@@ -1478,10 +1529,10 @@
         onclick={() => void open(continueBook!)}
         transition:fade
       >
-        {#if covers[continueBook.seriesId]}
+        {#if covers.get(continueBook.seriesId)}
           <img
             class="h-24 w-16 shrink-0 rounded-lg object-cover shadow-md sm:h-28 sm:w-20"
-            src={covers[continueBook.seriesId]}
+            src={covers.get(continueBook.seriesId)}
             loading="lazy"
             decoding="async"
             alt=""
@@ -1888,10 +1939,10 @@
                         class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
                         aria-hidden="true"
                       >
-                        {#if covers[book.seriesId]}
+                        {#if covers.get(book.seriesId)}
                           <img
                             class="h-full w-full object-cover"
-                            src={covers[book.seriesId]}
+                            src={covers.get(book.seriesId)}
                             loading="lazy"
                             decoding="async"
                             alt=""
@@ -1986,10 +2037,10 @@
                       class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                       aria-hidden="true"
                     >
-                      {#if covers[book.seriesId]}
+                      {#if covers.get(book.seriesId)}
                         <img
                           class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                          src={covers[book.seriesId]}
+                          src={covers.get(book.seriesId)}
                           loading="lazy"
                           decoding="async"
                           alt=""

@@ -1,7 +1,4 @@
 import { registerPlugin } from '@capacitor/core';
+import type { ReaderTogglePlugin } from './reader-toggle-plugin';
 
-export interface VolumeButtonsPlugin {
-  setEnabled(options: { enabled: boolean }): Promise<void>;
-}
-
-export const VolumeButtons = registerPlugin<VolumeButtonsPlugin>('VolumeButtons');
+export const VolumeButtons = registerPlugin<ReaderTogglePlugin>('VolumeButtons');

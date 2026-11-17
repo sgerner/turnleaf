@@ -1,7 +1,4 @@
 import { registerPlugin } from '@capacitor/core';
+import type { ReaderTogglePlugin } from './reader-toggle-plugin';
 
-export interface KeepAwakePlugin {
-  setEnabled(options: { enabled: boolean }): Promise<void>;
-}
-
-export const KeepAwake = registerPlugin<KeepAwakePlugin>('KeepAwake');
+export const KeepAwake = registerPlugin<ReaderTogglePlugin>('KeepAwake');

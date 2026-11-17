@@ -372,6 +372,20 @@ describe('native progress transactions against SQLite', () => {
     });
   });
 
+  it('keeps progress for removed books locally and resumes uploads when they return', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    await database.reconcileBooks(server.id, []);
+    await database.saveLocalProgress(book, 'offline-cfi', '/offline', 0.5);
+
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+    expect(await database.getSyncStatus(server.id)).toMatchObject({ pendingCount: 0 });
+    expect(await database.getReadingState(book.id)).toMatchObject({ cfi: 'offline-cfi' });
+
+    await database.reconcileBooks(server.id, [book]);
+    expect(await database.getPendingSync(server.id)).toMatchObject([{ bookId: book.id }]);
+  });
+
   it('seeds the persistent progress revision when upgrading a pending version-6 queue', async () => {
     const updatedAt = '2026-01-01T00:00:00.000Z';
     native.database = new DatabaseSync(native.databasePath);
@@ -380,7 +394,8 @@ describe('native progress transactions against SQLite', () => {
         id TEXT PRIMARY KEY NOT NULL,
         server_id TEXT NOT NULL,
         pages_read INTEGER NOT NULL DEFAULT 0,
-        last_read_at TEXT
+        last_read_at TEXT,
+        remote_available INTEGER NOT NULL DEFAULT 1
       );
       CREATE TABLE reading_state (
         book_id TEXT PRIMARY KEY NOT NULL,
