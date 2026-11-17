@@ -15,6 +15,7 @@
   } = $props();
 
   let serverUrl = $state('');
+  let changeServerAddress = $state(false);
   let displayName = $state('Books');
   let apiKey = $state('');
   let allowHttp = $state(false);
@@ -28,10 +29,13 @@
     error = '';
     invalidField = null;
     busy = true;
+    const changingServerAddress = Boolean(savedServer && changeServerAddress);
 
     try {
-      const normalized = normalizeServerUrl(savedServer?.baseUrl ?? serverUrl);
-      if (!savedServer && normalized.insecure && !allowHttp) {
+      const normalized = normalizeServerUrl(
+        savedServer && !changingServerAddress ? savedServer.baseUrl : serverUrl,
+      );
+      if ((!savedServer || changingServerAddress) && normalized.insecure && !allowHttp) {
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
       const key = apiKey.trim();
@@ -48,8 +52,38 @@
       }
 
       if (savedServer) {
-        await saveApiKey(savedServer.credentialRef, key);
-        onConnected(savedServer, key);
+        let connectedServer = savedServer;
+        if (changingServerAddress) {
+          const credentialRef = `${savedServer.credentialRef}_${Date.now().toString(36)}`;
+          connectedServer = {
+            ...savedServer,
+            baseUrl: normalized.baseUrl,
+            credentialRef,
+            kavitaVersion: result.version,
+            lastConnectedAt: new Date().toISOString(),
+          };
+          await saveApiKey(credentialRef, key);
+          try {
+            await saveServer(connectedServer);
+          } catch (storageError) {
+            try {
+              await removeApiKey(credentialRef);
+            } catch (cleanupError) {
+              throw new Error(
+                'The new address tested successfully, but local setup could not be saved and the new auth key could not be cleaned up. The saved connection was left in place; retry reconnect.',
+                { cause: cleanupError },
+              );
+            }
+            throw new Error(
+              'The new address tested successfully, but local setup could not be saved. The saved connection and auth key were left in place; retry reconnect.',
+              { cause: storageError },
+            );
+          }
+          await removeApiKey(savedServer.credentialRef).catch(() => {});
+        } else {
+          await saveApiKey(savedServer.credentialRef, key);
+        }
+        onConnected(connectedServer, key);
         return;
       }
 
@@ -119,7 +153,11 @@
     </h1>
     <p class="mt-5 max-w-md text-base leading-relaxed text-surface-900-100 sm:text-lg">
       {#if savedServer}
-        Enter a new auth key for {savedServer.baseUrl} to reopen your saved library.
+        {#if changeServerAddress}
+          Enter a new auth key for the server address below to reopen your saved library.
+        {:else}
+          Enter a new auth key for {savedServer.baseUrl} to reopen your saved library.
+        {/if}
       {:else}
         Connect directly to Kavita. Download EPUB books and keep your place across devices.
       {/if}
@@ -131,9 +169,11 @@
       class="card preset-filled-surface-50-950 space-y-5 p-6 shadow-2xl sm:p-8"
       onsubmit={connect}
     >
-      {#if !savedServer}
+      {#if !savedServer || changeServerAddress}
         <label class="label">
-          <span class="label-text">Kavita server address</span>
+          <span class="label-text">
+            {savedServer ? 'New Kavita server address' : 'Kavita server address'}
+          </span>
           <input
             class="input"
             type="url"
@@ -159,6 +199,33 @@
             >
           </label>
         {/if}
+      {:else}
+        <div class="label">
+          <span class="label-text">Kavita server address</span>
+          <span class="text-sm text-surface-700-300">{savedServer.baseUrl}</span>
+        </div>
+      {/if}
+
+      {#if savedServer}
+        <button
+          class="btn btn-sm preset-tonal-surface h-11 self-start"
+          type="button"
+          disabled={busy}
+          onclick={() => {
+            changeServerAddress = !changeServerAddress;
+            serverUrl = changeServerAddress ? savedServer.baseUrl : '';
+            error = '';
+            invalidField = null;
+          }}
+        >
+          {changeServerAddress ? 'Use saved address' : 'Change server address'}
+        </button>
+      {/if}
+
+      {#if savedServer && changeServerAddress}
+        <p class="text-sm text-surface-700-300">
+          Use this only when the new address reaches the same Kavita server and libraries.
+        </p>
       {/if}
 
       <div class="label">
