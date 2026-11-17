@@ -597,7 +597,9 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
-    if (destroyed || conflict || resolvingOpenProgress) return Promise.resolve();
+    if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+      return Promise.resolve();
+    }
     syncWork = runProgressSync(showFeedback).finally(() => {
       syncWork = null;
     });
@@ -1108,18 +1110,24 @@
       percentage: remotePercentage(remote, book),
       ...(local?.pendingSync && {
         accept: async () => {
-          // A choice based on an older queue revision cannot replace a newly saved position.
-          const accepted =
-            local.syncRevision != null &&
-            (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt));
-          if (!accepted)
-            throw new Error('The saved reading position changed. Sync again to retry.');
-          const savedBook = books.find((item) => item.id === book.id);
-          if (savedBook) {
-            savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-            savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
+          acceptingRemoteProgress = true;
+          try {
+            // An upload cannot race with deletion of the exact revision it is sending.
+            await syncWork;
+            const accepted =
+              local.syncRevision != null &&
+              (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt));
+            if (!accepted)
+              throw new Error('The saved reading position changed. Sync again to retry.');
+            const savedBook = books.find((item) => item.id === book.id);
+            if (savedBook) {
+              savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+              savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
+            }
+            void refreshSyncStatus();
+          } finally {
+            acceptingRemoteProgress = false;
           }
-          void refreshSyncStatus();
         },
       }),
     };
