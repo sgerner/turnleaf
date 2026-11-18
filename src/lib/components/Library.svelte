@@ -574,7 +574,7 @@
           else if (reading) {
             if (readerBackHandler?.()) return;
             if (document.querySelector('[data-reader-panel]')) return;
-            reading = null;
+            void closeReader();
           } else if (settingsVisible) closeSettings();
           else if (filtersVisible) filtersVisible = false;
           else void App.exitApp();
@@ -1175,6 +1175,34 @@
     await open(book, { preferFurthest: true });
   }
 
+  async function closeReader(): Promise<void> {
+    const bookId = reading?.book.id;
+    reading = null;
+    await tick();
+    if (reading || !libraryMain) return;
+
+    const index = visibleBooks.findIndex((book) => book.id === bookId);
+    const grid = virtualGrid;
+    if (index >= 0 && grid) {
+      updateVirtualWindow();
+      const container = libraryMain.closest<HTMLElement>('.app-stage');
+      const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
+      if (container) container.scrollTop += top - container.getBoundingClientRect().top;
+      else window.scrollBy({ top, behavior: 'instant' });
+      updateVirtualWindow();
+      await tick();
+      const card = grid.querySelector(`[data-book-index="${index}"]`);
+      const control =
+        card?.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
+        card?.querySelector<HTMLElement>('[data-book-actions]');
+      if (control) {
+        control.focus();
+        return;
+      }
+    }
+    libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+  }
+
   function openMenu(book: BookRecord): void {
     actionMenuOpener = activeElement();
     actionMenuBook = book;
@@ -1185,7 +1213,13 @@
     actionMenuBook = null;
     const opener = actionMenuOpener;
     actionMenuOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    void tick().then(() => {
+      if (reading || actionMenuBook || !libraryMain) return;
+      restoreFocus(opener);
+      if (!libraryMain.contains(document.activeElement)) {
+        libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+      }
+    });
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
@@ -1474,10 +1508,11 @@
       bookUrl={reading.url}
       bookId={reading.book.id}
       title={reading.book.title}
+      defaultMode={mode}
       initialCfi={reading.cfi}
       initialXPath={reading.xpath}
       initialPercentage={reading.percentage}
-      onBack={() => (reading = null)}
+      onBack={() => void closeReader()}
       onRelocated={handleRelocated}
       onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
       onRetryDownload={offline || reading.book.remoteAvailable === false
@@ -1488,7 +1523,7 @@
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
       <p role="alert">Turnleaf could not load the reader. Reload the app to try again.</p>
-      <button class="btn preset-tonal-surface" type="button" onclick={() => (reading = null)}>
+      <button class="btn preset-tonal-surface" type="button" onclick={() => void closeReader()}>
         Back to library
       </button>
     </div>
@@ -2459,7 +2494,7 @@
 
       <section class="mt-6" aria-labelledby="library-settings-appearance-title">
         <h3 id="library-settings-appearance-title" class="text-lg font-medium">
-          Reading appearance
+          Application appearance
         </h3>
         <p class="mt-1 text-sm text-surface-700-300">
           Choose the colors and theme that make reading comfortable. Changes apply immediately.

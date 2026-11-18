@@ -13,6 +13,7 @@ export interface Appearance {
   hyphenation: boolean;
   progressBar: boolean;
   keepAwake: boolean;
+  volumeButtons: boolean;
 }
 
 export const defaultAppearance: Appearance = {
@@ -28,6 +29,7 @@ export const defaultAppearance: Appearance = {
   hyphenation: false,
   progressBar: true,
   keepAwake: false,
+  volumeButtons: true,
 };
 
 export function serializeAppearance(value: Appearance): string {
@@ -51,5 +53,6 @@ export function parseAppearance(value: string): Appearance {
       Math.max(0, Number(parsed.bottomMargin ?? defaultAppearance.bottomMargin)),
     ),
     progressBar: parsed.progressBar !== false,
+    volumeButtons: parsed.volumeButtons !== false,
   };
 }

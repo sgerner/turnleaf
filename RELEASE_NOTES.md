@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Improve reader accessibility and annotation controls
 - Persist adopted Kavita reading progress
 - Reduce startup bundle and packaged image sizes
 - Load the EPUB reader on demand and reduce the size of packaged image assets.

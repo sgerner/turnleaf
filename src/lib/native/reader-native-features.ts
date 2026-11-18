@@ -7,8 +7,9 @@ export interface ReaderNativeFeatureActions {
 }
 
 export interface ReaderNativeFeatures {
-  enable: (keepAwake: boolean) => Promise<void>;
+  enable: (keepAwake: boolean, volumeButtons?: boolean) => Promise<void>;
   setKeepAwake: (enabled: boolean) => Promise<void>;
+  setVolumeButtons: (enabled: boolean) => Promise<void>;
   disable: () => Promise<void>;
 }
 
@@ -35,7 +36,7 @@ export function createReaderNativeFeatures(
     }
   }
 
-  function enable(keepAwake: boolean): Promise<void> {
+  function enable(keepAwake: boolean, volumeButtons = true): Promise<void> {
     return enqueue(async () => {
       if (!active) return;
 
@@ -43,7 +44,7 @@ export function createReaderNativeFeatures(
       if (!active) return;
       await attempt(() => actions.setReaderChrome(true));
       if (!active) return;
-      await attempt(() => actions.setVolumeButtons(true));
+      await attempt(() => actions.setVolumeButtons(volumeButtons));
       if (!active) return;
       await attempt(() => actions.setKeepAwake(keepAwake));
     });
@@ -53,6 +54,13 @@ export function createReaderNativeFeatures(
     return enqueue(async () => {
       if (!active) return;
       await attempt(() => actions.setKeepAwake(enabled));
+    });
+  }
+
+  function setVolumeButtons(enabled: boolean): Promise<void> {
+    return enqueue(async () => {
+      if (!active) return;
+      await attempt(() => actions.setVolumeButtons(enabled));
     });
   }
 
@@ -67,5 +75,5 @@ export function createReaderNativeFeatures(
     });
   }
 
-  return { enable, setKeepAwake, disable };
+  return { enable, setKeepAwake, setVolumeButtons, disable };
 }
