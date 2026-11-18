@@ -48,7 +48,6 @@
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
-  import Reader from './Reader.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
@@ -1450,21 +1449,32 @@
 </script>
 
 {#if reading}
-  <Reader
-    bookUrl={reading.url}
-    bookId={reading.book.id}
-    title={reading.book.title}
-    initialCfi={reading.cfi}
-    initialXPath={reading.xpath}
-    initialPercentage={reading.percentage}
-    onBack={() => (reading = null)}
-    onRelocated={handleRelocated}
-    onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
-    onRetryDownload={offline || reading.book.remoteAvailable === false
-      ? undefined
-      : retryReaderDownload}
-    registerBackHandler={registerReaderBackHandler}
-  />
+  {#await import('./Reader.svelte')}
+    <p class="m-8" role="status">Opening reader…</p>
+  {:then { default: Reader }}
+    <Reader
+      bookUrl={reading.url}
+      bookId={reading.book.id}
+      title={reading.book.title}
+      initialCfi={reading.cfi}
+      initialXPath={reading.xpath}
+      initialPercentage={reading.percentage}
+      onBack={() => (reading = null)}
+      onRelocated={handleRelocated}
+      onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
+      onRetryDownload={offline || reading.book.remoteAvailable === false
+        ? undefined
+        : retryReaderDownload}
+      registerBackHandler={registerReaderBackHandler}
+    />
+  {:catch}
+    <div class="m-8 grid justify-items-start gap-3">
+      <p role="alert">Turnleaf could not load the reader. Reload the app to try again.</p>
+      <button class="btn preset-tonal-surface" type="button" onclick={() => (reading = null)}>
+        Back to library
+      </button>
+    </div>
+  {/await}
 {:else}
   <main
     bind:this={libraryMain}
