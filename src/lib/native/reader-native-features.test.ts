@@ -16,6 +16,20 @@ function actions(overrides: Partial<ReaderNativeFeatureActions> = {}): ReaderNat
 }
 
 describe('reader native features', () => {
+  it('applies the saved volume setting on open and updates it while reading', async () => {
+    const nativeActions = actions();
+    const features = createReaderNativeFeatures(nativeActions);
+    await features.enable(false, false);
+    await features.setVolumeButtons(true);
+    await features.disable();
+    await features.setVolumeButtons(true);
+    expect(vi.mocked(nativeActions.setVolumeButtons).mock.calls).toEqual([
+      [false],
+      [true],
+      [false],
+    ]);
+  });
+
   it('finishes an old reader teardown before enabling a newly opened reader', async () => {
     let releaseOldRequest!: () => void;
     const calls: string[] = [];

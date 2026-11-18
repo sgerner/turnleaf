@@ -332,7 +332,7 @@ export class ReaderSession {
     appearance: Appearance,
     onLocation: (location: ReaderLocation, origin: ReaderLocationOrigin) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
-    onSelection?: (selection: ReaderSelection) => void,
+    onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.rendition = this.book.renderTo(target, {
@@ -350,9 +350,15 @@ export class ReaderSession {
       this.rendition.hooks.content.register((contents: Contents) => {
         const handler = () => {
           const selection = contents.window.getSelection();
-          if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+          if (!selection || selection.isCollapsed || !selection.rangeCount) {
+            onSelection(null);
+            return;
+          }
           const text = selection.toString().replace(/\s+/g, ' ').trim();
-          if (!text) return;
+          if (!text) {
+            onSelection(null);
+            return;
+          }
           try {
             onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
           } catch {
@@ -371,6 +377,7 @@ export class ReaderSession {
       const isUserNavigation =
         this.userNavigationPending &&
         (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
       const origin = isUserNavigation ? 'navigation' : 'restore';
       if (isUserNavigation) {

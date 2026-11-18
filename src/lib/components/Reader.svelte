@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { tick, onDestroy, onMount } from 'svelte';
@@ -53,6 +54,7 @@
     bookUrl,
     bookId,
     title,
+    defaultMode = defaultAppearance.mode,
     initialCfi = null,
     initialXPath = null,
     initialPercentage = null,
@@ -65,6 +67,7 @@
     bookUrl: string;
     bookId: string;
     title: string;
+    defaultMode?: Appearance['mode'];
     initialCfi?: string | null;
     initialXPath?: string | null;
     initialPercentage?: number | null;
@@ -104,10 +107,16 @@
   let editingBookmarkId = $state<string | null>(null);
   let bookmarkDraft = $state('');
   let annotations = $state<StoredAnnotation[]>([]);
+  const androidReader = Capacitor.getPlatform() === 'android';
+  let exportMessage = $state('');
+  let exportFallback = $state('');
+  let exporting = $state(false);
+  let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
   let searchQuery = $state('');
+  let searched = $state(false);
   let searchResults = $state<ReaderSearchResult[]>([]);
   let searching = $state(false);
   let searchError = $state('');
@@ -150,7 +159,7 @@
     ]);
     if (destroyed) return;
     const saved = preferences.get('appearance');
-    if (saved) appearance = parseAppearance(saved);
+    appearance = saved ? parseAppearance(saved) : { ...defaultAppearance, mode: defaultMode };
     bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
@@ -197,8 +206,12 @@
       },
       (selection) => {
         if (destroyed) return;
-        selectedText = selection;
-        showControls();
+        if (selection) {
+          selectionMessage = '';
+          selectedText = selection;
+        } else if (!annotationsVisible) {
+          selectedText = null;
+        }
       },
       handleKeyboardNavigation,
     );
@@ -212,7 +225,7 @@
   async function enableNativeReaderFeatures(): Promise<void> {
     if (!nativeFeatures) return;
     try {
-      await nativeFeatures.enable(appearance.keepAwake);
+      await nativeFeatures.enable(appearance.keepAwake, androidReader && appearance.volumeButtons);
     } catch {
       // Native reader chrome is optional; the reader itself should keep working.
     }
@@ -401,6 +414,7 @@
   }
 
   function openAnnotations(): void {
+    controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
     annotationsVisible = true;
@@ -421,9 +435,17 @@
   function closeAnnotations(): void {
     annotationsVisible = false;
     editingAnnotationId = null;
+    selectedText = null;
+    annotationDraft = '';
+    exportFallback = '';
+    exportMessage = '';
     const opener = annotationsOpener;
     annotationsOpener = null;
-    restorePanelFocus(opener);
+    void tick().then(() => {
+      if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
+      else
+        readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-annotations"]')?.focus();
+    });
     resumeChromeHide();
   }
 
@@ -519,6 +541,9 @@
   function updateAppearance(patch: Partial<Appearance>): void {
     appearance = { ...appearance, ...patch };
     session?.applyAppearance(appearance);
+    if (patch.volumeButtons !== undefined && androidReader) {
+      void nativeFeatures?.setVolumeButtons(patch.volumeButtons);
+    }
     if (patch.keepAwake !== undefined) {
       void nativeFeatures?.setKeepAwake(patch.keepAwake);
     }
@@ -635,19 +660,60 @@
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
   }
 
-  function exportAnnotations(): void {
-    if (!annotations.length) return;
-    const blob = new Blob([annotationsMarkdown(title, annotations)], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'book'}-notes.md`;
-    link.click();
-    URL.revokeObjectURL(url);
+  async function copySelection(): Promise<void> {
+    const selection = selectedText;
+    if (!selection) return;
+    try {
+      await navigator.clipboard.writeText(selection.text);
+      selectedText = null;
+      selectionMessage = 'Selected text copied.';
+    } catch {
+      selectionMessage = 'Turnleaf could not copy the selection.';
+    }
+  }
+
+  async function exportAnnotations(copy = false): Promise<void> {
+    if (!annotations.length || exporting) return;
+    exportMessage = '';
+    exportFallback = '';
+    exporting = true;
+    const markdown = annotationsMarkdown(title, annotations);
+    const name = title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'book';
+    try {
+      if (copy) {
+        await navigator.clipboard.writeText(markdown);
+        exportMessage = 'Markdown copied.';
+      } else if (Capacitor.isNativePlatform()) {
+        const filename = `${name}-notes-${Date.now()}.md`;
+        await Filesystem.writeFile({
+          path: filename,
+          data: markdown,
+          directory: Directory.Documents,
+          encoding: Encoding.UTF8,
+        });
+        exportMessage = `Saved to Documents as ${filename}.`;
+      } else {
+        const blob = new Blob([markdown], { type: 'text/markdown' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${name}-notes.md`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      }
+    } catch {
+      exportFallback = markdown;
+      exportMessage = 'Copy the Markdown from the field below.';
+    } finally {
+      exporting = false;
+    }
   }
 
   async function runSearch(): Promise<void> {
     if (!session || !searchQuery.trim()) {
+      searched = false;
       searchResults = [];
       searchError = searchQuery.trim() ? 'The reader is still opening.' : '';
       return;
@@ -658,7 +724,11 @@
     searching = true;
     searchError = '';
     try {
-      searchResults = await session.search(searchQuery, controller.signal);
+      const results = await session.search(searchQuery, controller.signal);
+      if (searchController === controller) {
+        searchResults = results;
+        searched = true;
+      }
     } catch (cause) {
       if (!controller.signal.aborted) {
         searchResults = [];
@@ -807,6 +877,7 @@
   }
 
   function handleVolumeButton(event: Event): void {
+    if (!appearance.volumeButtons || hasOpenReaderPanel()) return;
     const detail = (event as CustomEvent<{ direction?: string }>).detail;
     if (detail?.direction === 'next' || detail?.direction === 'previous') {
       void turn(detail.direction);
@@ -947,6 +1018,37 @@
       onclick={() => turn('next')}
     ></button>
   </nav>
+
+  <p class="sr-only" role="status">{selectionMessage}</p>
+  {#if selectedText && !hasOpenReaderPanel()}
+    <div
+      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      role="group"
+      aria-label="Selected text"
+    >
+      <button
+        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => {
+          saveAnnotation();
+          selectionMessage = 'Highlight saved.';
+        }}>Highlight</button
+      >
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={openAnnotations}>Add note</button
+      >
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => void copySelection()}>Copy text</button
+      >
+    </div>
+  {/if}
 
   {#if appearance.progressBar}
     <div
@@ -1370,6 +1472,18 @@
             />
             Keep screen on while reading
           </label>
+          {#if androidReader}
+            <label class="mt-4 flex min-h-12 items-center gap-3">
+              <input
+                class="checkbox"
+                type="checkbox"
+                checked={appearance.volumeButtons}
+                onchange={(event) =>
+                  updateAppearance({ volumeButtons: event.currentTarget.checked })}
+              />
+              Turn pages with volume buttons
+            </label>
+          {/if}
         </div>
       {/if}
 
@@ -1488,9 +1602,14 @@
           </form>
           {#if searchError}
             <p class="mt-3 text-sm text-error-700-300" role="alert">{searchError}</p>
-          {:else if !searching && searchQuery.trim() && searchResults.length === 0}
-            <p class="mt-3 text-sm text-surface-700-300" role="status">No matches found.</p>
           {/if}
+          <p class="mt-3 text-sm text-surface-700-300" role="status">
+            {#if searched && !searching && !searchError}
+              {searchResults.length === 0
+                ? 'No matches found.'
+                : `${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} shown.`}
+            {/if}
+          </p>
           {#if searchResults.length > 0}
             <ol class="mt-4 grid gap-2" aria-label="Search results">
               {#each searchResults as result, index (result.cfi)}
@@ -1714,7 +1833,7 @@
             </form>
           {/if}
 
-          <div class="mt-4 flex items-center justify-between gap-2">
+          <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3
               class="text-sm font-semibold uppercase tracking-wide"
               tabindex="-1"
@@ -1725,12 +1844,27 @@
             <button
               class="btn btn-sm preset-tonal-surface"
               type="button"
-              onclick={exportAnnotations}
-              disabled={annotations.length === 0}
+              onclick={() => void exportAnnotations()}
+              disabled={annotations.length === 0 || exporting}
             >
               Export Markdown
             </button>
+            <button
+              class="btn btn-sm preset-tonal-surface"
+              type="button"
+              onclick={() => void exportAnnotations(true)}
+              disabled={annotations.length === 0 || exporting}
+            >
+              Copy Markdown
+            </button>
           </div>
+          <p class="text-sm" role="status">{exportMessage}</p>
+          {#if exportFallback}
+            <label class="label mt-2">
+              <span class="label-text">Exported Markdown</span>
+              <textarea class="textarea min-h-24" readonly value={exportFallback}></textarea>
+            </label>
+          {/if}
           {#if annotations.length === 0}
             <p class="mt-2 text-sm text-surface-700-300">No highlights yet.</p>
           {:else}

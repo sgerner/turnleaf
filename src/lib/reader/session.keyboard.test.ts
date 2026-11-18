@@ -97,6 +97,39 @@ describe('ReaderSession keyboard navigation', () => {
     session.destroy();
   });
 
+  it('reports selection collapse to clear the reader selection actions', async () => {
+    const session = new ReaderSession('book.epub');
+    const onSelection = vi.fn();
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+      onSelection,
+    );
+
+    const registerSelection = mockRendition.hooks.content.register.mock.calls[1]?.[0];
+    const text = document.createTextNode('Chapter One');
+    document.body.append(text);
+    const selection = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    selection.addRange(range);
+    registerSelection({ window, document, cfiFromRange: () => 'selected-cfi' });
+
+    document.dispatchEvent(new Event('selectionchange'));
+    expect(onSelection).toHaveBeenLastCalledWith({ cfi: 'selected-cfi', text: 'Chapter One' });
+    selection.removeAllRanges();
+    document.dispatchEvent(new Event('selectionchange'));
+    expect(onSelection).toHaveBeenLastCalledWith(null);
+
+    session.destroy();
+    text.remove();
+  });
+
   it('indexes the spine once across repeated relocation events', async () => {
     const onLocation = vi.fn();
     const session = new ReaderSession('book.epub');
