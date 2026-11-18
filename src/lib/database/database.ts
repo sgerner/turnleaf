@@ -838,6 +838,81 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   };
 }
 
+export async function saveRemoteProgress(
+  book: BookRecord,
+  remote: KavitaProgress,
+  expected: StoredReadingState | null,
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
+  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+  const next: StoredReadingState = {
+    cfi: '',
+    xpath: remote.bookScrollId ?? null,
+    percentage: book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0,
+    localUpdatedAt: now,
+    syncedLocalUpdatedAt: now,
+    serverUpdatedAt,
+    pendingSync: false,
+    syncRevision: (expected?.syncRevision ?? 0) + 1,
+  };
+  const matches = (current: StoredReadingState | null) =>
+    !expected?.pendingSync &&
+    !current?.pendingSync &&
+    current?.localUpdatedAt === expected?.localUpdatedAt &&
+    (current?.syncRevision ?? 0) === (expected?.syncRevision ?? 0);
+
+  if (!Capacitor.isNativePlatform()) {
+    return updateBrowserState((state) => {
+      if (
+        state.syncQueue[book.id] ||
+        !state.books.some((item) => item.id === book.id) ||
+        !matches(state.readingState[book.id] ?? null)
+      )
+        return false;
+      state.readingState[book.id] = next;
+      state.books = state.books.map((item) =>
+        item.id === book.id ? { ...item, pagesRead, lastReadAt: serverUpdatedAt } : item,
+      );
+    });
+  }
+
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    if (!matches(await getReadingState(book.id))) return false;
+    const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
+    if (queue.values?.length) return false;
+    await db.executeTransaction([
+      {
+        statement: `INSERT INTO reading_state
+          (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
+          server_page_num,server_xpath,server_updated_at,pending_sync,sync_revision)
+          VALUES (?,'',?,?,?,?,?,?,?,0,?) ON CONFLICT(book_id) DO UPDATE SET cfi='',
+          kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
+          local_updated_at=excluded.local_updated_at,synced_local_updated_at=excluded.synced_local_updated_at,
+          server_page_num=excluded.server_page_num,server_xpath=excluded.server_xpath,
+          server_updated_at=excluded.server_updated_at,pending_sync=0,sync_revision=excluded.sync_revision`,
+        values: [
+          book.id,
+          next.xpath,
+          next.percentage,
+          now,
+          now,
+          remote.pageNum,
+          next.xpath,
+          serverUpdatedAt,
+          next.syncRevision,
+        ],
+      },
+      {
+        statement: 'UPDATE books SET pages_read=?,last_read_at=? WHERE id=?',
+        values: [pagesRead, serverUpdatedAt, book.id],
+      },
+    ]);
+    return true;
+  });
+}
+
 /**
  * Accept the server side of an open-progress conflict, but only if the exact
  * local queue revision shown to the user is still pending.

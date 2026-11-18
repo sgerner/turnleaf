@@ -178,6 +178,28 @@ describe('native progress transactions against SQLite', () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
+  it('persists a remote-only position across reopen without scheduling an upload', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+    const remote = { ...book, pageNum: 41, bookScrollId: '/remote' };
+
+    expect(await database.saveRemoteProgress(book, remote, null)).toBe(true);
+    const reopened = await reopenDatabase(database);
+    const saved = await reopened.getReadingState(book.id);
+    expect(saved).toMatchObject({ xpath: '/remote', percentage: 0.41, pendingSync: false });
+    expect((await reopened.getBooks(server.id))[0]?.pagesRead).toBe(41);
+    expect(await reopened.getPendingSync(server.id)).toEqual([]);
+
+    expect(await reopened.saveRemoteProgress(book, { ...remote, pageNum: 52 }, saved)).toBe(true);
+    await reopened.saveLocalProgress(book, 'local-cfi', '/local', 0.63);
+    expect(await reopened.saveRemoteProgress(book, remote, saved)).toBe(false);
+    expect(await reopened.getReadingState(book.id)).toMatchObject({
+      cfi: 'local-cfi',
+      pendingSync: true,
+    });
+  });
+
   it.each([0, 1, 2])(
     'rolls back every progress write when task %i fails and preserves the prior retryable state after reopen',
     async (failAt) => {

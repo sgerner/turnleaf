@@ -17,6 +17,7 @@
     removeServer,
     reconcileBooks,
     saveLocalProgress,
+    saveRemoteProgress,
     saveServer,
     setPreference,
     type BookRecord,
@@ -1020,13 +1021,27 @@
     }
     const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
     const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
-    if (openProgress === 'remote') {
+    if (openProgress === 'remote' && remote) {
+      resolvingOpenProgress = true;
+      try {
+        if (!(await saveRemoteProgress(book, remote, local))) {
+          message = 'The saved reading position changed. Open the book again.';
+          return;
+        }
+        updateRemoteBookProgress(book, remote);
+      } catch {
+        message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
+        return;
+      } finally {
+        resolvingOpenProgress = false;
+      }
+      if (destroyed) return;
       reading = {
         book,
         url: file.webViewUrl,
         cfi: null,
-        xpath: remote?.bookScrollId ?? null,
-        percentage: remote ? remotePercentage(remote, book) : null,
+        xpath: remote.bookScrollId ?? null,
+        percentage: remotePercentage(remote, book),
       };
       return;
     }
@@ -1114,29 +1129,32 @@
     return {
       xpath: remote.bookScrollId ?? null,
       percentage: remotePercentage(remote, book),
-      ...(local?.pendingSync && {
-        accept: async () => {
-          acceptingRemoteProgress = true;
-          try {
-            // An upload cannot race with deletion of the exact revision it is sending.
-            await syncWork;
-            const accepted =
-              local.syncRevision != null &&
-              (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt));
-            if (!accepted)
-              throw new Error('The saved reading position changed. Sync again to retry.');
-            const savedBook = books.find((item) => item.id === book.id);
-            if (savedBook) {
-              savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-              savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
-            }
-            void refreshSyncStatus();
-          } finally {
-            acceptingRemoteProgress = false;
-          }
-        },
-      }),
+      accept: async () => {
+        acceptingRemoteProgress = true;
+        try {
+          // An upload cannot race with deletion of the exact revision it is sending.
+          await syncWork;
+          const accepted = local?.pendingSync
+            ? local.syncRevision != null &&
+              (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt))
+            : await saveRemoteProgress(book, remote, local);
+          if (!accepted)
+            throw new Error('The saved reading position changed. Sync again to retry.');
+          updateRemoteBookProgress(book, remote);
+          void refreshSyncStatus();
+        } finally {
+          acceptingRemoteProgress = false;
+        }
+      },
     };
+  }
+
+  function updateRemoteBookProgress(book: BookRecord, remote: KavitaProgress): void {
+    const savedBook = books.find((item) => item.id === book.id);
+    if (savedBook) {
+      savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+      savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
+    }
   }
 
   async function markDone(book: BookRecord): Promise<void> {

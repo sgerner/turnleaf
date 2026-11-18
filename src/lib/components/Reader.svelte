@@ -794,6 +794,8 @@
         return;
       }
       if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
+        await progress.accept?.();
+        if (destroyed || session !== reader || localNavigationDuringSession) return;
         await displaySyncedLocation(reader, progress);
       }
       if (showFeedback) showControls();
