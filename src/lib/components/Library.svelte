@@ -89,6 +89,7 @@
     onModeChange,
     onApiKeyChange,
     onServerDeleted,
+    onChangeServerAddress,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -98,6 +99,7 @@
     onModeChange: (mode: 'light' | 'dark') => void;
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
+    onChangeServerAddress: () => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -2617,6 +2619,9 @@
             <dd class="truncate text-right">{server.baseUrl}</dd>
           </div>
         </dl>
+        <button class="btn preset-tonal-surface mt-3" type="button" onclick={onChangeServerAddress}>
+          Change server address
+        </button>
         {#if insecureServer()}
           <div class="alert preset-tonal-warning mt-4" role="alert">
             Plain HTTP is enabled. Anyone on this network may be able to observe your reading

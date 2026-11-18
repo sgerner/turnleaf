@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Expose Kavita address changes from library settings
 - Improve reader accessibility and annotation controls
 - Persist adopted Kavita reading progress
 - Reduce startup bundle and packaged image sizes
