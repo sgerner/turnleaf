@@ -23,6 +23,7 @@
   let booting = $state(Capacitor.isNativePlatform());
   let startupError = $state('');
   let repairing = $state(false);
+  let changingServerAddress = $state(false);
   let apiKey = $state<string | null>(null);
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
@@ -155,7 +156,7 @@
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
         </div>
       </main>
-    {:else if server && apiKey}
+    {:else if server && apiKey && !changingServerAddress}
       <Library
         {server}
         {apiKey}
@@ -164,6 +165,7 @@
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
+        onChangeServerAddress={() => (changingServerAddress = true)}
         onServerDeleted={() => {
           server = null;
           apiKey = null;
@@ -212,9 +214,12 @@
     {:else}
       <Onboarding
         savedServer={server}
+        editAddress={changingServerAddress}
+        onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
         onConnected={(connected, key) => {
           apiKey = key;
           server = connected;
+          changingServerAddress = false;
         }}
       />
     {/if}

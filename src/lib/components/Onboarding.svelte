@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
@@ -8,14 +9,18 @@
 
   let {
     savedServer = null,
+    editAddress = false,
+    onCancel,
     onConnected,
   }: {
     savedServer?: ServerConfig | null;
+    editAddress?: boolean;
+    onCancel?: (() => void) | undefined;
     onConnected: (server: ServerConfig, key: string) => void;
   } = $props();
 
-  let serverUrl = $state('');
-  let changeServerAddress = $state(false);
+  let serverUrl = $state(untrack(() => (editAddress ? (savedServer?.baseUrl ?? '') : '')));
+  let changeServerAddress = $state(untrack(() => editAddress));
   let displayName = $state('Books');
   let apiKey = $state('');
   let allowHttp = $state(false);
@@ -206,7 +211,7 @@
         </div>
       {/if}
 
-      {#if savedServer}
+      {#if savedServer && !editAddress}
         <button
           class="btn btn-sm preset-tonal-surface h-11 self-start"
           type="button"
@@ -291,6 +296,16 @@
           </svg>
         {/if}
       </button>
+      {#if onCancel}
+        <button
+          class="btn preset-tonal-surface w-full"
+          type="button"
+          onclick={onCancel}
+          disabled={busy}
+        >
+          Cancel
+        </button>
+      {/if}
     </form>
 
     <aside class="card preset-tonal-surface p-5" aria-labelledby="getting-started-title">
