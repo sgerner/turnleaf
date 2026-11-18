@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reduce startup bundle and packaged image sizes
+- Load the EPUB reader on demand and reduce the size of packaged image assets.
+
 - ci: pass signed APK smoke settings through the emulator action environment
 - Improve library filtering and accessibility with a skip link, clearer progress, and semantic settings groups.
 - Fix reconnect mode during submission

@@ -46,23 +46,23 @@ development.
 
 ### Library
 
-![Turnleaf library view](public/Library.png)
+![Turnleaf library view](docs/screenshots/Library.png)
 
 ### Global Settings
 
-![Turnleaf settings view](public/Global_Settings.png)
+![Turnleaf settings view](docs/screenshots/Global_Settings.png)
 
 ### Reader
 
-![Turnleaf reader view](public/Reader.png)
+![Turnleaf reader view](docs/screenshots/Reader.png)
 
 ### Reader Settings
 
-![Turnleaf reader settings view](public/Reader_Settings.png)
+![Turnleaf reader settings view](docs/screenshots/Reader_Settings.png)
 
 ### Contents
 
-![Turnleaf table of contents view](public/Contents.png)
+![Turnleaf table of contents view](docs/screenshots/Contents.png)
 
 ## Why this exists
 
