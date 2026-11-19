@@ -16,6 +16,52 @@ function actions(overrides: Partial<ReaderNativeFeatureActions> = {}): ReaderNat
 }
 
 describe('reader native features', () => {
+  it('leaves volume buttons off unless enabled by preference', async () => {
+    const nativeActions = actions();
+    const features = createReaderNativeFeatures(nativeActions);
+
+    await features.enable(false);
+    await features.disable();
+
+    expect(vi.mocked(nativeActions.setVolumeButtons).mock.calls).toEqual([[false], [false]]);
+  });
+
+  it('restores native UI after a failed open without blocking a retry', async () => {
+    const calls: string[] = [];
+    const nativeActions = actions({
+      hideStatusBar: async () => void calls.push('hide'),
+      showStatusBar: async () => void calls.push('show'),
+      setReaderChrome: async (enabled) => void calls.push(`chrome:${enabled}`),
+      setVolumeButtons: async (enabled) => void calls.push(`volume:${enabled}`),
+      setKeepAwake: async (enabled) => void calls.push(`awake:${enabled}`),
+    });
+    const features = createReaderNativeFeatures(nativeActions);
+
+    await features.enable(true, true);
+    await features.restore();
+    await features.enable(false, true);
+    await features.disable();
+
+    expect(calls).toEqual([
+      'hide',
+      'chrome:true',
+      'volume:true',
+      'awake:true',
+      'show',
+      'chrome:false',
+      'volume:false',
+      'awake:false',
+      'hide',
+      'chrome:true',
+      'volume:true',
+      'awake:false',
+      'show',
+      'chrome:false',
+      'volume:false',
+      'awake:false',
+    ]);
+  });
+
   it('applies the saved volume setting on open and updates it while reading', async () => {
     const nativeActions = actions();
     const features = createReaderNativeFeatures(nativeActions);

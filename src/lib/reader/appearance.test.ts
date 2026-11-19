@@ -29,4 +29,11 @@ describe('appearance serialization', () => {
     expect(parseAppearance('{}').keepAwake).toBe(false);
     expect(parseAppearance('{"keepAwake":true}').keepAwake).toBe(true);
   });
+
+  it('defaults volume buttons off while preserving an explicit opt-in', () => {
+    expect(defaultAppearance.volumeButtons).toBe(false);
+    expect(parseAppearance('{}').volumeButtons).toBe(false);
+    expect(parseAppearance('{"volumeButtons":true}').volumeButtons).toBe(true);
+    expect(parseAppearance('{"volumeButtons":false}').volumeButtons).toBe(false);
+  });
 });

@@ -21,6 +21,7 @@
   import {
     ReaderSession,
     type ReaderLocation,
+    type ReaderLinkReturnTarget,
     type ReaderSelection,
     type TocItem,
   } from '../reader/session';
@@ -124,6 +125,7 @@
   let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
+  let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
   let pendingSyncLocation = $state<SyncedLocation | null>(null);
   let error = $state('');
   let startupOpenFailed = $state(false);
@@ -164,6 +166,7 @@
     bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
+    await enableNativeReaderChrome();
     try {
       await openReaderSession();
     } catch {
@@ -172,10 +175,11 @@
       error = 'This EPUB could not be opened. The download may be incomplete or corrupted.';
       session?.destroy();
       session = null;
+      await restoreNativeReaderChrome();
       return;
     }
 
-    await enableNativeReaderFeatures();
+    await listenForReaderResume();
   });
 
   async function openReaderSession(): Promise<void> {
@@ -187,15 +191,21 @@
       initialXPath,
       initialPercentage,
       appearance,
-      (next, origin) => {
+      (next, origin, returnTarget) => {
         if (destroyed) return;
         location = next;
         updateDocumentTitle();
-        if (origin === 'navigation') {
+        if (origin === 'link') {
+          linkReturnTarget = returnTarget ?? null;
+        } else if (origin === 'navigation') {
+          linkReturnTarget = null;
+        }
+        if (origin === 'navigation' || origin === 'link') {
           localNavigationDuringSession = true;
           onRelocated(next);
           locationHistory = recordLocation(locationHistory, next);
           queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+          if (origin === 'link') showControls();
         }
       },
       (zone) => {
@@ -223,14 +233,21 @@
     }
   }
 
-  async function enableNativeReaderFeatures(): Promise<void> {
+  async function enableNativeReaderChrome(): Promise<void> {
     if (!nativeFeatures) return;
     try {
       await nativeFeatures.enable(appearance.keepAwake, androidReader && appearance.volumeButtons);
     } catch {
       // Native reader chrome is optional; the reader itself should keep working.
     }
-    if (destroyed || resumeHandle) return;
+  }
+
+  async function restoreNativeReaderChrome(): Promise<void> {
+    await nativeFeatures?.restore();
+  }
+
+  async function listenForReaderResume(): Promise<void> {
+    if (!nativeFeatures || destroyed || resumeHandle) return;
 
     try {
       const handle = await App.addListener('appStateChange', ({ isActive }) => {
@@ -248,6 +265,11 @@
     }
   }
 
+  $effect(() => {
+    if (!nativeFeatures || !androidReader) return;
+    void nativeFeatures.setVolumeButtons(appearance.volumeButtons && !hasOpenReaderPanel());
+  });
+
   async function retryReaderOpen(): Promise<void> {
     if (!startupOpenFailed || !onRetryDownload || retryingReader) return;
     retryingReader = true;
@@ -255,14 +277,16 @@
       await onRetryDownload();
       if (destroyed) return;
       error = '';
+      await enableNativeReaderChrome();
       await openReaderSession();
       if (destroyed) return;
       startupOpenFailed = false;
-      await enableNativeReaderFeatures();
+      await listenForReaderResume();
     } catch (cause) {
       if (destroyed) return;
       session?.destroy();
       session = null;
+      await restoreNativeReaderChrome();
       startupOpenFailed = true;
       error =
         cause instanceof Error
@@ -502,9 +526,8 @@
     else showFooter();
   }
 
-  function currentSectionLabel(): string {
-    if (!location) return 'Opening book...';
-    const sectionHref = location.href.split('#')[0];
+  function sectionLabelForHref(href: string, spineIndex: number): string {
+    const sectionHref = href.split('#')[0];
     const findItem = (items: TocItem[]): TocItem | undefined => {
       for (const item of items) {
         if (item.href.split('#')[0] === sectionHref) return item;
@@ -514,7 +537,15 @@
       return undefined;
     };
     const item = findItem(toc);
-    return item?.label || `Section ${location.spineIndex + 1}`;
+    return item?.label || `Section ${spineIndex + 1}`;
+  }
+
+  function currentSectionLabel(): string {
+    return location ? sectionLabelForHref(location.href, location.spineIndex) : 'Opening book...';
+  }
+
+  function searchResultSectionLabel(result: ReaderSearchResult): string {
+    return sectionLabelForHref(result.href, result.spineIndex);
   }
 
   function updateDocumentTitle(): void {
@@ -543,9 +574,6 @@
   function updateAppearance(patch: Partial<Appearance>): void {
     appearance = { ...appearance, ...patch };
     session?.applyAppearance(appearance);
-    if (patch.volumeButtons !== undefined && androidReader) {
-      void nativeFeatures?.setVolumeButtons(patch.volumeButtons);
-    }
     if (patch.keepAwake !== undefined) {
       void nativeFeatures?.setKeepAwake(patch.keepAwake);
     }
@@ -767,6 +795,19 @@
     }
   }
 
+  async function returnToLink(): Promise<void> {
+    if (!session || !linkReturnTarget) return;
+    const target = linkReturnTarget;
+    try {
+      const restored = await session.displayCfi(target.cfi);
+      if (!restored && target.href) await session.display(target.href);
+      linkReturnTarget = null;
+      showControls();
+    } catch {
+      error = 'The location before this link is no longer available in the current EPUB.';
+    }
+  }
+
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     try {
       if (!session) throw new Error('Reader session is unavailable.');
@@ -938,6 +979,7 @@
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
     else if (searchVisible) closeSearch();
+    else if (linkReturnTarget) void returnToLink();
     else if (controlsVisible) {
       controlsVisible = false;
       footerVisible = false;
@@ -1028,6 +1070,17 @@
       onclick={() => turn('next')}
     ></button>
   </nav>
+
+  {#if linkReturnTarget && !hasOpenReaderPanel()}
+    <button
+      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
+      type="button"
+      aria-label="Return to the location before this link"
+      onclick={() => void returnToLink()}
+    >
+      Return to link
+    </button>
+  {/if}
 
   {#if readerSyncMessage && controlsVisible}
     <p
@@ -1634,7 +1687,12 @@
                     onclick={() => void openSearchResult(result)}
                   >
                     <span class="mr-2 text-xs text-surface-700-300">{index + 1}</span>
-                    <span class="line-clamp-3">{result.excerpt}</span>
+                    <span class="min-w-0">
+                      <span class="mb-1 block text-xs text-surface-700-300">
+                        {searchResultSectionLabel(result)}
+                      </span>
+                      <span class="line-clamp-3">{result.excerpt}</span>
+                    </span>
                   </button>
                 </li>
               {/each}

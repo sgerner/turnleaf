@@ -17,7 +17,9 @@ export interface ReaderLocation {
   pageCount: number;
 }
 
-export type ReaderLocationOrigin = 'navigation' | 'restore';
+export type ReaderLinkReturnTarget = Pick<ReaderLocation, 'cfi' | 'href'>;
+
+export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
 
 export interface ReaderSelection {
   cfi: string;
@@ -305,13 +307,20 @@ export class ReaderSession {
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
+  private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
+  private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
-  private onLocation: ((location: ReaderLocation, origin: ReaderLocationOrigin) => void) | null =
-    null;
+  private onLocation:
+    | ((
+        location: ReaderLocation,
+        origin: ReaderLocationOrigin,
+        returnTarget?: ReaderLinkReturnTarget,
+      ) => void)
+    | null = null;
 
   constructor(private readonly bookUrl: string) {
     this.book = ePub(bookUrl);
@@ -323,7 +332,11 @@ export class ReaderSession {
     serverXPath: string | null,
     serverPercentage: number | null,
     appearance: Appearance,
-    onLocation: (location: ReaderLocation, origin: ReaderLocationOrigin) => void,
+    onLocation: (
+      location: ReaderLocation,
+      origin: ReaderLocationOrigin,
+      returnTarget?: ReaderLinkReturnTarget,
+    ) => void,
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
@@ -367,14 +380,17 @@ export class ReaderSession {
       const isUserNavigation =
         this.userNavigationPending &&
         (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      const origin = isUserNavigation ? 'navigation' : 'restore';
-      if (isUserNavigation) {
+      if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
+        this.pendingLinkReturnTarget = null;
       }
-      this.reportLocation(location, origin);
+      this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
@@ -384,10 +400,16 @@ export class ReaderSession {
     this.contentClick = (event, contents) => {
       const eventTarget = event.target as Element | null;
       const selection = contents.window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
+      if (link) {
+        const href = link.getAttribute('href') ?? '';
+        if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
+        return;
+      }
       if (
         event.defaultPrevented ||
-        eventTarget?.closest?.('a, button, input, select, textarea, [contenteditable="true"]') ||
-        (selection && !selection.isCollapsed)
+        eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
       ) {
         return;
       }
@@ -426,7 +448,11 @@ export class ReaderSession {
     await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
-  private reportLocation(location: Location, origin: ReaderLocationOrigin): void {
+  private reportLocation(
+    location: Location,
+    origin: ReaderLocationOrigin,
+    returnTarget: ReaderLinkReturnTarget | null = null,
+  ): void {
     if (!this.onLocation) return;
     const start = location.start;
     const { sections, indexes } = this.getSpine();
@@ -435,17 +461,19 @@ export class ReaderSession {
     const pageIndex = this.pageIndex(start.displayed.page);
     const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
     const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
-    this.onLocation(
-      {
-        ...start,
-        percentage: semanticPercentage,
-        spineIndex: start.index,
-        pageIndex,
-        pageCount: start.displayed.total,
-        xpath: this.cfiToXPath(start.cfi, start.index),
-      },
-      origin,
-    );
+    const reported: ReaderLocation = {
+      ...start,
+      percentage: semanticPercentage,
+      spineIndex: start.index,
+      pageIndex,
+      pageCount: start.displayed.total,
+      xpath: this.cfiToXPath(start.cfi, start.index),
+    };
+    if (returnTarget) {
+      this.onLocation(reported, origin, returnTarget);
+    } else {
+      this.onLocation(reported, origin);
+    }
   }
 
   async next(): Promise<void> {
@@ -783,10 +811,22 @@ export class ReaderSession {
   private beginLocationOperation(userNavigation: boolean): number {
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
+    this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
+    this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
       : null;
     return this.locationGeneration;
+  }
+
+  private beginLinkedNavigation(): void {
+    const start = this.current?.start ?? this.rendition?.location?.start;
+    if (!start) return;
+    this.locationGeneration += 1;
+    this.userNavigationPending = true;
+    this.userNavigationStartCfi = start.cfi;
+    this.userNavigationOrigin = 'link';
+    this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }
 
   private isCurrentLocationOperation(generation: number): boolean {
