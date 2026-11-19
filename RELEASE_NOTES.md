@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops
 - Protect synced progress during catalog reconciliation
 - Load themes on demand and streamline EPUB validation
