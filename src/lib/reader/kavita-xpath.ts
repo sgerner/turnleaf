@@ -27,14 +27,14 @@ export function parseKavitaXPath(xpath: string): KavitaXPathTarget | null {
   };
 }
 
-export function kavitaXPathSteps(xpath: string): number[] | null {
+export function kavitaXPathSteps(xpath: string): { tag: string; index: number }[] | null {
   const match = matchKavitaXPath(xpath);
-  if (!match) return null;
-  const steps = [match.fragment];
+  if (!match || match.fragment < 1) return null;
+  const steps = [{ tag: 'DocFragment', index: match.fragment }];
   for (const part of match.content.split('/').filter(Boolean)) {
-    const index = part.match(/\[(\d+)]$/)?.[1];
-    if (!index) return null;
-    steps.push(Number(index));
+    const step = part.match(/^([A-Za-z0-9:_-]+)\[(\d+)]$/);
+    if (!step?.[1] || !step[2] || Number(step[2]) < 1) return null;
+    steps.push({ tag: step[1].toLowerCase(), index: Number(step[2]) });
   }
   return steps;
 }
@@ -68,23 +68,4 @@ export function resolveContentXPath(document: Document, xpath: string): Element 
     if (!current) return null;
   }
   return current;
-}
-
-export function kavitaXPathToCfi(xpath: string, cfiBase: string): string | null {
-  const target = parseKavitaXPath(xpath);
-  if (!target) return null;
-  const parts = target.contentXPath
-    .replace(/^\/html(?:\[1])?\/body(?:\[1])?/i, '')
-    .split('/')
-    .filter(Boolean);
-  const steps: number[] = [];
-  for (const part of parts) {
-    const match = part.match(/^[A-Za-z0-9:_-]+\[(\d+)]$/);
-    if (!match?.[1]) return null;
-    const index = Number(match[1]);
-    if (!Number.isInteger(index) || index < 1) return null;
-    steps.push(index * 2);
-  }
-  const elementPath = `/4${steps.map((step) => `/${step}`).join('')}`;
-  return `epubcfi(${cfiBase}!${elementPath},/1:0,/1:1)`;
 }

@@ -7,16 +7,24 @@ export function chooseFurthestProgress(
   return remotePercentage > localPercentage ? 'remote' : 'local';
 }
 
-export function compareKavitaLocations(local: string, remote: string): 'local' | 'remote' | 'same' {
+export function compareKavitaLocations(
+  local: string,
+  remote: string,
+): 'local' | 'remote' | 'same' | 'unknown' {
   const localPath = kavitaXPathSteps(local);
   const remotePath = kavitaXPathSteps(remote);
-  if (!localPath || !remotePath) return 'same';
+  if (!localPath || !remotePath) return 'unknown';
   const length = Math.max(localPath.length, remotePath.length);
   for (let index = 0; index < length; index += 1) {
-    const localStep = localPath[index] ?? 0;
-    const remoteStep = remotePath[index] ?? 0;
-    if (remoteStep > localStep) return 'remote';
-    if (localStep > remoteStep) return 'local';
+    const localStep = localPath[index];
+    const remoteStep = remotePath[index];
+    if (!localStep) return 'remote';
+    if (!remoteStep) return 'local';
+    // XPath indices count siblings of the same tag, so mixed tags have no
+    // intrinsic order without inspecting the chapter document.
+    if (localStep.tag !== remoteStep.tag) return 'unknown';
+    if (remoteStep.index > localStep.index) return 'remote';
+    if (localStep.index > remoteStep.index) return 'local';
   }
   return 'same';
 }
@@ -64,7 +72,11 @@ export function chooseOpenProgress(
   if (!hasRemoteLocation) return 'local';
 
   if (local.pendingSync) {
-    return remote?.bookScrollId !== local.xpath ? 'conflict' : 'local';
+    return !local.xpath || remote?.bookScrollId !== local.xpath ? 'conflict' : 'local';
+  }
+
+  if (preferFurthest && remote && bookPages > 0 && remote.pageNum >= bookPages) {
+    return local.percentage < 1 ? 'remote' : 'local';
   }
 
   // Kavita's XPath does not retain EPUB.js's exact CFI. When both snapshots
@@ -73,9 +85,10 @@ export function chooseOpenProgress(
   if (local.xpath && remote?.bookScrollId === local.xpath) return 'local';
 
   if (preferFurthest && remote) {
+    if (local.percentage >= 1) return 'local';
     if (local.xpath && remote.bookScrollId) {
       const location = compareKavitaLocations(local.xpath, remote.bookScrollId);
-      if (location !== 'same') return location;
+      return location === 'remote' ? 'remote' : 'local';
     }
     const remotePercentage = bookPages ? remote.pageNum / bookPages : 0;
     return chooseFurthestProgress(local.percentage, remotePercentage);

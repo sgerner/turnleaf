@@ -5,12 +5,7 @@ import {
   normalizeReaderSearchQuery,
   type ReaderSearchResult,
 } from './search';
-import {
-  kavitaXPathToCfi,
-  parseKavitaXPath,
-  resolveContentXPath,
-  toKavitaXPath,
-} from './kavita-xpath';
+import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
 
 export interface ReaderLocation {
   cfi: string;
@@ -38,7 +33,6 @@ export interface TocItem {
 interface SpineSection {
   href: string;
   index: number;
-  cfiBase: string;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
 }
@@ -419,29 +413,21 @@ export class ReaderSession {
     await this.rendition.started;
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
     if (cfi) {
-      await this.displayAtGeneration(cfi, restoreGeneration);
-    } else if (serverXPath) {
-      const restored = await this.displayXPath(serverXPath, restoreGeneration);
-      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-      const restoredByPercentage =
-        !restored && serverPercentage && serverPercentage > 0
-          ? await this.displayPercentage(serverPercentage, restoreGeneration)
-          : false;
-      if (
-        this.isCurrentLocationOperation(restoreGeneration) &&
-        !restored &&
-        !restoredByPercentage
-      ) {
-        await this.displayAtGeneration(undefined, restoreGeneration);
+      try {
+        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
+      } catch {
+        // A saved CFI can name a section removed in a newer copy of the EPUB.
       }
-    } else if (serverPercentage && serverPercentage > 0) {
-      const restored = await this.displayPercentage(serverPercentage, restoreGeneration);
-      if (this.isCurrentLocationOperation(restoreGeneration) && !restored) {
-        await this.displayAtGeneration(undefined, restoreGeneration);
-      }
-    } else {
-      await this.displayAtGeneration(undefined, restoreGeneration);
     }
+    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
+    if (
+      serverPercentage &&
+      serverPercentage > 0 &&
+      (await this.displayPercentage(serverPercentage, restoreGeneration))
+    ) {
+      return;
+    }
+    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(location: Location, origin: ReaderLocationOrigin): void {
@@ -743,16 +729,14 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      const cfi = kavitaXPathToCfi(xpath, section.cfiBase);
-      if (!cfi) return false;
-      await rendition.display(cfi);
+      await rendition.display(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
-      if (!contents) return true;
+      if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
-      if (!node) return true;
+      if (!node) return false;
       const range = contents.document.createRange();
       range.selectNodeContents(node);
       await rendition.display(contents.cfiFromRange(range));

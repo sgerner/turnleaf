@@ -1,10 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  kavitaXPathToCfi,
-  parseKavitaXPath,
-  resolveContentXPath,
-  toKavitaXPath,
-} from './kavita-xpath';
+import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
 
 describe('Kavita EPUB locations', () => {
   it('adds the one-based Kavita spine fragment to an EPUB content path', () => {
@@ -47,9 +42,12 @@ describe('Kavita EPUB locations', () => {
     expect(resolveContentXPath(document, '/html/body')?.localName).toBe('body');
   });
 
-  it('converts a Kavita element path directly to an EPUB CFI', () => {
-    expect(kavitaXPathToCfi('//body/DocFragment[9]/body/section[1]/p[165]/span[1]', '/6/18')).toBe(
-      'epubcfi(/6/18!/4/2/330/2,/1:0,/1:1)',
+  it('counts XPath indices among siblings of the requested tag', () => {
+    const document = new DOMParser().parseFromString(
+      '<html><body><p>first</p><h2>heading</h2><p>second</p></body></html>',
+      'text/html',
     );
+    expect(resolveContentXPath(document, '/html/body/p[2]')?.textContent).toBe('second');
+    expect(resolveContentXPath(document, '/html/body/h2[1]')?.textContent).toBe('heading');
   });
 });
