@@ -36,7 +36,7 @@ class MemoryStorage implements Storage {
 
 const pendingState = (updatedAt: string, payloadJson: string, revision = 1) => ({
   serverConfig: null,
-  books: [],
+  books: [{ ...book }],
   readingState: {
     'book-1': {
       cfi: 'cfi',
@@ -145,6 +145,7 @@ it('continues syncing later items when an earlier item fails', async () => {
     syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
   };
   const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' });
   state.readingState['book-2'] = {
     ...state.readingState['book-1']!,
     localUpdatedAt: '2026-09-07T00:00:01.000Z',
@@ -184,6 +185,7 @@ it('runs independent server queues without sharing an in-flight flush promise', 
   > & {
     syncQueue: Record<string, QueueFixture['syncQueue']['book-1']>;
   };
+  state.books.push({ ...book, id: 'book-2', serverId: 'other' });
   state.syncQueue['book-2'] = {
     ...state.syncQueue['book-1']!,
     bookId: 'book-2',

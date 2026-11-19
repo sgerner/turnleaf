@@ -191,6 +191,7 @@
   let coverReloadRequest = $state(0);
   let loading = $state(true);
   let refreshing = $state(false);
+  let refreshWork: Promise<void> | null = null;
   let downloadingBookId = $state<string | null>(null);
   let downloadPercent = $state<number | null>(null);
   let cleanupInProgress = $state(false);
@@ -523,11 +524,6 @@
         : 'No network connection. Connect to Kavita to load your library.'
       : '';
     if (destroyed) return;
-    if (!offline) {
-      await refresh();
-      void syncProgress(false);
-    }
-    if (destroyed) return;
     cleanups.push(
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
@@ -569,6 +565,10 @@
         }),
       ),
     );
+    if (!destroyed && !offline) {
+      await refresh();
+      void syncProgress(false);
+    }
   });
 
   async function registerListener(handle: {
@@ -642,9 +642,19 @@
     cleanups.forEach((remove) => void remove());
   });
 
-  async function refresh(): Promise<void> {
-    if (destroyed || refreshing) return;
+  function refresh(): Promise<void> {
+    if (destroyed) return Promise.resolve();
+    if (!refreshWork) {
+      refreshWork = refreshCatalog().finally(() => {
+        refreshWork = null;
+      });
+    }
+    return refreshWork;
+  }
+
+  async function refreshCatalog(): Promise<void> {
     refreshing = true;
+    const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
     message = '';
     try {
@@ -672,7 +682,7 @@
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
-      await reconcileBooks(server.id, mapped, { preserveMissing: incomplete });
+      await reconcileBooks(server.id, mapped, { preserveMissing: incomplete, snapshotStartedAt });
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);

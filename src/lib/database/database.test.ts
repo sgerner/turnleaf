@@ -644,7 +644,10 @@ it('reports pending and failed browser sync work for recovery UI', async () => {
     BROWSER_STORAGE_KEY,
     JSON.stringify({
       serverConfig: { id: 'server' },
-      books: [],
+      books: [
+        { ...existingBook, id: 'book-1' },
+        { ...existingBook, id: 'book-2' },
+      ],
       readingState: {},
       syncQueue: {
         'book-1': {
@@ -680,7 +683,7 @@ it('reports pending and failed browser sync work for recovery UI', async () => {
   });
 });
 
-it('scopes browser progress queues to their server', async () => {
+it('routes browser progress queues through current books and ignores orphaned rows', async () => {
   Object.defineProperty(window, 'localStorage', {
     configurable: true,
     value: new MemoryStorage(),
@@ -695,8 +698,7 @@ it('scopes browser progress queues to their server', async () => {
       syncQueue: {
         [existingBook.id]: {
           bookId: existingBook.id,
-          serverId: existingBook.serverId,
-          payloadJson: '{"pageNum":20}',
+          payloadJson: '{"libraryId":9,"seriesId":8,"volumeId":7,"chapterId":6,"pageNum":20}',
           attemptCount: 0,
           lastAttemptAt: null,
           lastError: null,
@@ -715,13 +717,34 @@ it('scopes browser progress queues to their server', async () => {
           updatedAt: '2026-09-07T00:00:02.000Z',
           revision: 2,
         },
+        'removed:book': {
+          bookId: 'removed:book',
+          payloadJson: '{"libraryId":9,"seriesId":8,"volumeId":7,"chapterId":6,"pageNum":80}',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: '2026-09-07T00:00:03.000Z',
+          updatedAt: '2026-09-07T00:00:03.000Z',
+          revision: 1,
+        },
       },
       preferences: {},
     }),
   );
 
-  await expect(getPendingSync('server')).resolves.toMatchObject([
-    { bookId: existingBook.id, payload: '{"pageNum":20}' },
+  await expect(getPendingSync('server')).resolves.toEqual([
+    {
+      bookId: existingBook.id,
+      payload: JSON.stringify({
+        libraryId: existingBook.libraryId,
+        seriesId: existingBook.seriesId,
+        volumeId: existingBook.volumeId,
+        chapterId: existingBook.chapterId,
+        pageNum: 20,
+      }),
+      updatedAt: '2026-09-07T00:00:00.000Z',
+      revision: 1,
+    },
   ]);
   await expect(getSyncStatus('server')).resolves.toEqual({
     pendingCount: 1,

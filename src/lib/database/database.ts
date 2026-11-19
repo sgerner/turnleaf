@@ -141,8 +141,7 @@ function readBrowserState(): BrowserDatabaseState {
           bookId,
           {
             ...row,
-            serverId:
-              row.serverId ?? booksById.get(bookId)?.serverId ?? parsed.serverConfig?.id ?? '',
+            serverId: row.serverId ?? booksById.get(bookId)?.serverId ?? '',
             revision: Number(row.revision ?? 0),
           },
         ]),
@@ -304,9 +303,10 @@ export async function getServer(): Promise<ServerConfig | null> {
 export async function reconcileBooks(
   serverId: string,
   books: BookRecord[],
-  options: { preserveMissing?: boolean } = {},
+  options: { preserveMissing?: boolean; snapshotStartedAt?: string } = {},
 ): Promise<void> {
   const preserveMissing = options.preserveMissing === true;
+  const snapshotStartedAt = options.snapshotStartedAt ?? null;
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
     const unknownProgress = new Set(
@@ -332,12 +332,17 @@ export async function reconcileBooks(
               Boolean(state.readingState[book.id]),
           )
           .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
+    const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
     const merged = [...incoming.values()].map((book) => {
       const previous = existingById.get(book.id);
       if (!previous) return { ...book, remoteAvailable: true };
-      const pending =
-        Boolean(state.syncQueue[book.id]) || state.readingState[book.id]?.pendingSync === true;
-      const preserveProgress = pending || unknownProgress.has(book.id);
+      const reading = state.readingState[book.id];
+      const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
+      const changedDuringRefresh =
+        reading &&
+        (Date.parse(reading.localUpdatedAt) >= began ||
+          Date.parse(reading.serverUpdatedAt ?? '') >= began);
+      const preserveProgress = pending || changedDuringRefresh || unknownProgress.has(book.id);
       const preserveReadDate = preserveProgress || unknownReadDate.has(book.id);
       return {
         ...withoutRemoteProgressMarkers(previous),
@@ -365,8 +370,17 @@ export async function reconcileBooks(
     books,
     undefined,
     preserveMissing,
+    snapshotStartedAt,
   );
 }
+
+// An upload can finish while the catalog is in flight and clear pending_sync.
+const preserveReadingProgress = `EXISTS (
+  SELECT 1 FROM reading_state WHERE book_id=excluded.id AND (
+    pending_sync=1 OR julianday(local_updated_at)>=julianday(?) OR
+    julianday(server_updated_at)>=julianday(?)
+  )
+) OR EXISTS (SELECT 1 FROM sync_queue WHERE book_id=excluded.id)`;
 
 const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
@@ -374,23 +388,22 @@ const replaceBookStatement = `INSERT INTO books
    pages, pages_read, created_at, last_read_at, remote_available)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
+   library_id=excluded.library_id, series_id=excluded.series_id,
+   volume_id=excluded.volume_id, chapter_id=excluded.chapter_id,
    title=excluded.title, author=excluded.author, series=excluded.series,
    description_html=excluded.description_html, format=excluded.format,
    metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
-   pages_read=CASE WHEN ?=0 OR EXISTS (
-     SELECT 1 FROM reading_state WHERE book_id=excluded.id AND pending_sync=1
-   ) OR EXISTS (
-     SELECT 1 FROM sync_queue WHERE book_id=excluded.id
-   ) THEN books.pages_read ELSE excluded.pages_read END,
+   pages_read=CASE WHEN ?=0 OR ${preserveReadingProgress} THEN books.pages_read ELSE excluded.pages_read END,
    created_at=excluded.created_at,
-   last_read_at=CASE WHEN ?=0 OR ?=0 OR EXISTS (
-     SELECT 1 FROM reading_state WHERE book_id=excluded.id AND pending_sync=1
-   ) OR EXISTS (
-     SELECT 1 FROM sync_queue WHERE book_id=excluded.id
-   ) THEN books.last_read_at ELSE excluded.last_read_at END,
+   last_read_at=CASE WHEN ?=0 OR ?=0 OR ${preserveReadingProgress} THEN books.last_read_at ELSE excluded.last_read_at END,
    remote_available=excluded.remote_available`;
 
-function replaceBookTask(serverId: string, book: BookRecord, refreshedAt: string): capTask {
+function replaceBookTask(
+  serverId: string,
+  book: BookRecord,
+  refreshedAt: string,
+  snapshotStartedAt: string | null = null,
+): capTask {
   return {
     statement: replaceBookStatement,
     values: [
@@ -415,8 +428,12 @@ function replaceBookTask(serverId: string, book: BookRecord, refreshedAt: string
       book.lastReadAt,
       book.remoteAvailable !== false ? 1 : 0,
       book.remoteProgressKnown === false ? 0 : 1,
+      snapshotStartedAt,
+      snapshotStartedAt,
       book.remoteProgressKnown === false ? 0 : 1,
       book.remoteReadDateKnown === false ? 0 : 1,
+      snapshotStartedAt,
+      snapshotStartedAt,
     ],
   };
 }
@@ -450,6 +467,7 @@ export async function reconcileBooksInTransaction(
   books: BookRecord[],
   refreshedAt = new Date().toISOString(),
   preserveMissing = false,
+  snapshotStartedAt: string | null = null,
 ): Promise<void> {
   const tasks: capTask[] = [];
   if (!preserveMissing) {
@@ -459,7 +477,9 @@ export async function reconcileBooksInTransaction(
     });
   }
   for (const book of books) {
-    tasks.push(replaceBookTask(serverId, { ...book, remoteAvailable: true }, refreshedAt));
+    tasks.push(
+      replaceBookTask(serverId, { ...book, remoteAvailable: true }, refreshedAt, snapshotStartedAt),
+    );
   }
   if (!preserveMissing) {
     tasks.push({
@@ -764,6 +784,43 @@ export interface PendingSyncItem {
   revision: number;
 }
 
+type BookProgressRouting = Pick<BookRecord, 'libraryId' | 'seriesId' | 'volumeId' | 'chapterId'>;
+
+function updatePendingProgressRouting(payloadJson: string, book: BookProgressRouting): string {
+  try {
+    const payload: unknown = JSON.parse(payloadJson);
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return payloadJson;
+    return JSON.stringify({
+      ...(payload as Record<string, unknown>),
+      libraryId: book.libraryId,
+      seriesId: book.seriesId,
+      volumeId: book.volumeId,
+      chapterId: book.chapterId,
+    });
+  } catch {
+    return payloadJson;
+  }
+}
+
+function getBrowserSyncRows(
+  state: BrowserDatabaseState,
+  serverId: string,
+): Array<{ bookId: string; row: BrowserSyncQueueRow; book: BookRecord }> {
+  const booksById = new Map(state.books.map((book) => [book.id, book]));
+  return Object.entries(state.syncQueue).flatMap(([bookId, row]) => {
+    const book = booksById.get(bookId);
+    if (
+      !book ||
+      book.serverId !== serverId ||
+      book.remoteAvailable === false ||
+      row.serverId !== book.serverId
+    ) {
+      return [];
+    }
+    return [{ bookId, row, book }];
+  });
+}
+
 export interface SyncStatus {
   pendingCount: number;
   failedCount: number;
@@ -774,42 +831,44 @@ export interface SyncStatus {
 export async function getPendingSync(serverId: string): Promise<PendingSyncItem[]> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    const unavailable = new Set(
-      state.books.filter((book) => book.remoteAvailable === false).map((book) => book.id),
-    );
-    return Object.values(state.syncQueue)
-      .filter((row) => row.serverId === serverId && !unavailable.has(row.bookId))
-      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
-      .map((row) => ({
-        bookId: row.bookId,
-        payload: row.payloadJson,
+    return getBrowserSyncRows(state, serverId)
+      .sort((a, b) => a.row.updatedAt.localeCompare(b.row.updatedAt))
+      .map(({ bookId, row, book }) => ({
+        bookId,
+        payload: updatePendingProgressRouting(row.payloadJson, book),
         updatedAt: row.updatedAt,
         revision: row.revision,
       }));
   }
   const db = await openDatabase();
   const result = await db.query(
-    `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision
-    FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
+    `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision,
+      books.library_id,books.series_id,books.volume_id,books.chapter_id
+    FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
     WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at`,
     [serverId],
   );
-  return (result.values ?? []).map((row) => ({
-    bookId: String(row.book_id),
-    payload: String(row.payload_json),
-    updatedAt: String(row.updated_at),
-    revision: Number(row.revision),
-  }));
+  return (result.values ?? []).map((row) => {
+    const bookId = String(row.book_id);
+    return {
+      bookId,
+      payload: updatePendingProgressRouting(String(row.payload_json), {
+        libraryId: Number(row.library_id),
+        seriesId: Number(row.series_id),
+        volumeId: Number(row.volume_id),
+        chapterId: Number(row.chapter_id),
+      }),
+      updatedAt: String(row.updated_at),
+      revision: Number(row.revision),
+    };
+  });
 }
 
 export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    const unavailable = new Set(
-      state.books.filter((book) => book.remoteAvailable === false).map((book) => book.id),
-    );
-    const rows = Object.values(state.syncQueue)
-      .filter((row) => row.serverId === serverId && !unavailable.has(row.bookId))
+    const rows = getBrowserSyncRows(state, serverId)
+      .map(({ row }) => row)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return {
       pendingCount: rows.length,
@@ -821,7 +880,7 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   const db = await openDatabase();
   const result = await db.query(
     `SELECT sync_queue.updated_at,sync_queue.last_error
-    FROM sync_queue INNER JOIN books ON books.id=sync_queue.book_id
+    FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
     WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
     [serverId],
   );

@@ -300,6 +300,27 @@ describe('native progress transactions against SQLite', () => {
     expect(await database.getPendingSync(server.id)).toHaveLength(1);
   });
 
+  it('keeps progress acknowledged while an older catalog snapshot was in flight', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    await database.saveLocalProgress(book, 'local-cfi', '/local', 0.4);
+    const pending = (await database.getPendingSync(server.id))[0]!;
+    const startedAt = new Date(Date.parse(pending.updatedAt) + 1000).toISOString();
+    const acknowledgedAt = new Date(Date.parse(startedAt) + 1000).toISOString();
+    await database.confirmSync(book.id, acknowledgedAt, pending.revision, pending.updatedAt);
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+
+    await database.reconcileBooks(server.id, [{ ...book, pagesRead: 0 }], {
+      snapshotStartedAt: startedAt,
+    });
+    expect((await database.getBooks(server.id))[0]?.pagesRead).toBe(40);
+
+    await database.reconcileBooks(server.id, [{ ...book, pagesRead: 60 }], {
+      snapshotStartedAt: new Date(Date.parse(acknowledgedAt) + 1000).toISOString(),
+    });
+    expect((await database.getBooks(server.id))[0]?.pagesRead).toBe(60);
+  });
+
   it('filters SQLite sync work by its owning server', async () => {
     const database = await importDatabase();
     const otherServer = { ...server, id: 'other', baseUrl: 'https://other.example.com' };
@@ -316,6 +337,30 @@ describe('native progress transactions against SQLite', () => {
     expect(await database.getSyncStatus(server.id)).toMatchObject({
       pendingCount: 1,
       failedCount: 0,
+    });
+  });
+
+  it('routes queued SQLite progress through refreshed book IDs', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+    await database.saveLocalProgress(book, 'local-cfi', '/local', 0.4);
+
+    await database.reconcileBooks(server.id, [{ ...book, libraryId: 2, volumeId: 22 }]);
+
+    const pending = (await database.getPendingSync(server.id))[0];
+    expect(pending).toBeDefined();
+    expect(JSON.parse(pending!.payload)).toMatchObject({
+      libraryId: 2,
+      seriesId: book.seriesId,
+      volumeId: 22,
+      chapterId: book.chapterId,
+      pageNum: 40,
+      bookScrollId: '/local',
+    });
+    expect((await database.getBooks(server.id))[0]).toMatchObject({
+      libraryId: 2,
+      volumeId: 22,
     });
   });
 
@@ -415,6 +460,10 @@ describe('native progress transactions against SQLite', () => {
       CREATE TABLE books (
         id TEXT PRIMARY KEY NOT NULL,
         server_id TEXT NOT NULL,
+        library_id INTEGER NOT NULL DEFAULT 0,
+        series_id INTEGER NOT NULL DEFAULT 0,
+        volume_id INTEGER NOT NULL DEFAULT 0,
+        chapter_id INTEGER NOT NULL DEFAULT 0,
         pages_read INTEGER NOT NULL DEFAULT 0,
         last_read_at TEXT,
         remote_available INTEGER NOT NULL DEFAULT 1
@@ -441,8 +490,8 @@ describe('native progress transactions against SQLite', () => {
         updated_at TEXT NOT NULL,
         revision INTEGER NOT NULL DEFAULT 0
       );
-      INSERT INTO books(id,server_id,pages_read,last_read_at)
-        VALUES ('server:1:10','server',25,'${updatedAt}');
+      INSERT INTO books(id,server_id,library_id,series_id,volume_id,chapter_id,pages_read,last_read_at)
+        VALUES ('server:1:10','server',1,1,10,10,25,'${updatedAt}');
       INSERT INTO reading_state(
         book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync
       ) VALUES ('server:1:10','legacy-cfi','/legacy',0.25,'${updatedAt}',1);
