@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { expect, it, vi } from 'vitest';
 import fixture from './hostile-epub.xhtml?raw';
 import { sanitizeEpubDocument } from '../session';

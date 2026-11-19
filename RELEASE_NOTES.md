@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Trim startup assets and verify Node tooling
 - Keep downloaded reading and large catalogs responsive
 - Restore EPUB positions without guessing mixed-tag order
 - Expose Kavita address changes from library settings

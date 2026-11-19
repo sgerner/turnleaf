@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { beforeEach, expect, it, vi } from 'vitest';
 import { focusFirstElement, restoreFocus, trapModalKeydown } from './modal-focus';
 
