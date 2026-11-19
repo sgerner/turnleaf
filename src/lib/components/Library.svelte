@@ -1052,8 +1052,8 @@
         book,
         url: file.webViewUrl,
         cfi: local?.cfi || null,
-        xpath: local?.cfi ? null : (local?.xpath ?? null),
-        percentage: local?.cfi ? null : (local?.percentage ?? null),
+        xpath: local?.xpath ?? null,
+        percentage: local?.percentage ?? null,
       };
       if (preferFurthest) void syncProgress(false);
       return;
@@ -2438,7 +2438,7 @@
               book: conflict!.book,
               url: conflict!.url,
               cfi: conflict!.local.cfi || null,
-              xpath: conflict!.local.cfi ? null : conflict!.local.xpath,
+              xpath: conflict!.local.xpath,
               percentage: conflict!.local.percentage,
             };
             closeConflict();

@@ -703,7 +703,7 @@ export async function markBookCompleted(
     volumeId: book.volumeId,
     chapterId: book.chapterId,
     pageNum: book.pages,
-    bookScrollId: readingState?.xpath ?? null,
+    bookScrollId: null,
   };
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
@@ -722,8 +722,8 @@ export async function markBookCompleted(
           : item,
       );
       state.readingState[book.id] = {
-        cfi: readingState?.cfi ?? '',
-        xpath: readingState?.xpath ?? null,
+        cfi: '',
+        xpath: null,
         percentage: 1,
         localUpdatedAt: now,
         syncedLocalUpdatedAt: readingState?.syncedLocalUpdatedAt ?? null,
@@ -752,9 +752,7 @@ export async function markBookCompleted(
       values: [book.pages, now, book.id],
     },
   ];
-  tasks.push(
-    createReadingStateTask(book.id, readingState?.cfi ?? '', readingState?.xpath ?? null, 1, now),
-  );
+  tasks.push(createReadingStateTask(book.id, '', null, 1, now));
   tasks.push(createSyncQueueTask(book.id, payload, now));
   await executeNativeTransaction(db, tasks);
 }

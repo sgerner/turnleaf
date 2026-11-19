@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Restore EPUB positions without guessing mixed-tag order
 - Expose Kavita address changes from library settings
 - Improve reader accessibility and annotation controls
 - Persist adopted Kavita reading progress

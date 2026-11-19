@@ -99,6 +99,21 @@ describe('reader open progress selection', () => {
     ).toBe('remote');
   });
 
+  it('keeps the local position when mixed tags prevent ordering sibling elements', () => {
+    expect(
+      chooseOpenProgress(
+        { ...local, xpath: '//body/DocFragment[2]/body/h2[1]' },
+        remote,
+        100,
+        true,
+      ),
+    ).toBe('local');
+  });
+
+  it('prefers remote completion even when it has an older locator', () => {
+    expect(chooseOpenProgress(local, { ...remote, pageNum: 100 }, 100, true)).toBe('remote');
+  });
+
   it('does not silently discard pending local progress', () => {
     expect(chooseOpenProgress({ ...local, pendingSync: true }, remote, 100, false)).toBe(
       'conflict',
