@@ -307,7 +307,9 @@ export class KavitaClient {
         },
       });
 
-      recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
+      if (response.status >= 400) {
+        recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
+      }
       if (response.status === 401 || response.status === 403) {
         throw new KavitaError('Kavita rejected this auth key.', 'authentication', response.status);
       }
@@ -386,7 +388,9 @@ export class KavitaClient {
         visited.add(nextUrl);
         currentUrl = nextUrl;
       }
-      recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
+      if (response.status >= 400) {
+        recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
+      }
       this.assertStatus(response.status);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (typeof response.data === 'string') {

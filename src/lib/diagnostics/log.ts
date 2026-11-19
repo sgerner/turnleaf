@@ -58,32 +58,33 @@ function sanitizePath(value: string | undefined): string | undefined {
   return value;
 }
 
+const KNOWNTYPEWORDS = new Set([
+  'any',
+  'array',
+  'boolean',
+  'id',
+  'integer',
+  'known',
+  'format',
+  'null',
+  'number',
+  'object',
+  'of',
+  'optional',
+  'or',
+  'record',
+  'detail',
+  'nonempty',
+  'series',
+  'string',
+  'undefined',
+  'unknown',
+]);
+
 function sanitizeExpected(value: string | undefined): string | undefined {
   if (!value || value.length > 60 || !/^[a-zA-Z][a-zA-Z0-9_ <>|?,.[\]-]*$/.test(value)) return;
-  const knownTypeWords = new Set([
-    'any',
-    'array',
-    'boolean',
-    'id',
-    'integer',
-    'known',
-    'format',
-    'null',
-    'number',
-    'object',
-    'of',
-    'optional',
-    'or',
-    'record',
-    'detail',
-    'nonempty',
-    'series',
-    'string',
-    'undefined',
-    'unknown',
-  ]);
   const words = value.toLowerCase().match(/[a-z]+/g) ?? [];
-  if (!words.length || words.some((word) => !knownTypeWords.has(word))) return;
+  if (!words.length || words.some((word) => !KNOWNTYPEWORDS.has(word))) return;
   return value;
 }
 
@@ -92,24 +93,25 @@ function sanitizeActualType(value: string | undefined): string | undefined {
   return normalized && ACTUAL_TYPES.has(normalized) ? normalized : undefined;
 }
 
+const ALLOWED = new Set([
+  'authentication',
+  'download-connection',
+  'download-retry',
+  'download-storage',
+  'download-transfer',
+  'download-validation',
+  'invalid-field',
+  'invalid-json',
+  'invalid-response',
+  'library-refresh-failed',
+  'missing-field',
+  'network',
+  'network-error',
+  'server',
+]);
+
 function sanitizeDetail(value: string | undefined): string | undefined {
-  const allowed = new Set([
-    'authentication',
-    'download-connection',
-    'download-retry',
-    'download-storage',
-    'download-transfer',
-    'download-validation',
-    'invalid-field',
-    'invalid-json',
-    'invalid-response',
-    'library-refresh-failed',
-    'missing-field',
-    'network',
-    'network-error',
-    'server',
-  ]);
-  return value && allowed.has(value) ? value : undefined;
+  return value && ALLOWED.has(value) ? value : undefined;
 }
 
 function isCategory(value: string): value is DiagnosticCategory {
@@ -146,7 +148,7 @@ export function recordDiagnostic(event: DiagnosticEvent): void {
   if (detail) entry.detail = detail;
 
   diagnostics.push(entry);
-  while (diagnostics.length > MAX_ENTRIES || JSON.stringify(diagnostics).length > MAX_LOG_CHARS) {
+  if (diagnostics.length > MAX_ENTRIES) {
     diagnostics.shift();
   }
 }

@@ -253,6 +253,7 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
+  allowDownload = true,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const namespace = safeCoverNamespace(cacheNamespace);
@@ -262,6 +263,7 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (!allowDownload) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
@@ -270,6 +272,8 @@ export async function cacheCover(
         url: downloadUrl,
         path: temporary.uri,
         headers: { 'x-api-key': apiKey },
+        connectTimeout: 5_000,
+        readTimeout: 5_000,
       });
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)
@@ -287,6 +291,9 @@ export async function cacheCover(
     }
   }
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  if (valid?.type === 'file' && valid.size > 0 && valid.uri) {
+    return Capacitor.convertFileSrc(valid.uri);
+  }
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   return Capacitor.convertFileSrc(existing.uri);
 }

@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
 import { KavitaClient } from './client';
@@ -557,7 +559,7 @@ it('normalizes native HTTP JSON strings and exposes field diagnostics without se
     '$.chapters[0].id: expected integer, received string',
   );
   const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
-  expect(log).toContain('status=200');
+  expect(log).not.toContain('status=200');
   expect(log).toContain('path=series[12].chapters[0].id');
   expect(log).toContain('actual=string');
   expect(log).not.toContain('private.example');

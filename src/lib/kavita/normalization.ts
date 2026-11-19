@@ -70,7 +70,8 @@ function text(value: unknown, endpoint: string, path: string): string {
   return '';
 }
 
-function date(value: unknown, endpoint: string, path: string): string {
+function date(value: unknown, endpoint: string, path: string, optional = false): string {
+  if (optional && value == null) return '';
   if (typeof value === 'string' && Number.isFinite(Date.parse(value))) return value;
   fallback(endpoint, path, value, 'string');
   return '';
@@ -126,7 +127,7 @@ export function normalizeSeriesPage(payload: unknown): KavitaSeries[] {
         pages: count(row.pages, SERIES_ENDPOINT, `${p}.pages`),
         ...progressFields(row.pagesRead, SERIES_ENDPOINT, `${p}.pagesRead`),
         created: date(row.created, SERIES_ENDPOINT, `${p}.created`),
-        latestReadDate: date(row.latestReadDate, SERIES_ENDPOINT, `${p}.latestReadDate`),
+        latestReadDate: date(row.latestReadDate, SERIES_ENDPOINT, `${p}.latestReadDate`, true),
       },
     ];
   });
@@ -216,7 +217,8 @@ function chapters(
         pages: count(row.pages, DETAIL_ENDPOINT, `${p}.pages`),
         ...progressFields(row.pagesRead, DETAIL_ENDPOINT, `${p}.pagesRead`),
         lastReadingProgressUtc:
-          date(row.lastReadingProgressUtc, DETAIL_ENDPOINT, `${p}.lastReadingProgressUtc`) || null,
+          date(row.lastReadingProgressUtc, DETAIL_ENDPOINT, `${p}.lastReadingProgressUtc`, true) ||
+          null,
       },
     ];
   });
