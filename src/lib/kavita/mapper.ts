@@ -18,7 +18,7 @@ export function mapSeriesToBooks(
     ...(detail.volumes ?? []).flatMap((volume) => volume.chapters),
   ];
   const seen = new Set<number>();
-  return chapters
+  const books = chapters
     .filter(isEpubChapter)
     .filter((chapter) => {
       if (seen.has(chapter.id)) return false;
@@ -26,6 +26,10 @@ export function mapSeriesToBooks(
       return true;
     })
     .map((chapter) => mapChapterToBook(serverId, series, chapter));
+  if (books.length > 1 && series.name) {
+    for (const book of books) book.series = series.name;
+  }
+  return books;
 }
 
 function mapChapterToBook(

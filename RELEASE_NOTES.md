@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Stop Kavita background requests when connectivity drops
+- Protect synced progress during catalog reconciliation
+- Load themes on demand and streamline EPUB validation
 - Strengthen Android and release verification
 - Trim startup assets and verify Node tooling
 - Keep downloaded reading and large catalogs responsive

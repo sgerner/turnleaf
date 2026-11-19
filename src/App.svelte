@@ -13,6 +13,7 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+  import { loadTheme } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
@@ -42,7 +43,8 @@
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
-      uiTheme = savedTheme ?? defaultTheme;
+      const theme = savedTheme ?? defaultTheme;
+      uiTheme = (await loadTheme(theme).catch(() => false)) ? theme : defaultTheme;
       uiMode = savedMode === 'light' ? 'light' : 'dark';
       if (saved) {
         server = saved;

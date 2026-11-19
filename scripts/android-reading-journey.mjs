@@ -73,19 +73,19 @@ async function startFixture() {
   const uploads = [];
   let downloads = 0;
   let offline = false;
-  let offlineRequests = 0;
+  const offlineRequests = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
   const server = createServer(async (request, response) => {
     if (request.headers['x-api-key'] !== key) {
       response.writeHead(401).end();
       return;
     }
+    const path = new URL(request.url, 'http://localhost').pathname;
     if (offline) {
-      offlineRequests += 1;
+      offlineRequests.push(path);
       response.writeHead(503).end();
       return;
     }
-    const path = new URL(request.url, 'http://localhost').pathname;
     const pagesRead = uploads.at(-1)?.pageNum ?? 0;
     let body;
     switch (path) {
@@ -157,9 +157,7 @@ async function startFixture() {
     get downloads() {
       return downloads;
     },
-    get offlineRequests() {
-      return offlineRequests;
-    },
+    offlineRequests,
     setOffline(value) {
       offline = value;
     },
@@ -264,6 +262,7 @@ async function run() {
       ),
     );
 
+    const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
     await web.close();
     web = undefined;
     await adb('shell', 'am', 'force-stop', packageName);
@@ -278,9 +277,9 @@ async function run() {
     web = await connectWebView();
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
-    if (fixture.offlineRequests > 0) {
+    if (fixture.offlineRequests.length > 0) {
       throw new Error(
-        `Turnleaf sent ${fixture.offlineRequests} authenticated requests while offline.`,
+        `Turnleaf sent authenticated requests offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
       );
     }
 

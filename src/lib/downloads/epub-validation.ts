@@ -459,12 +459,28 @@ export async function validateEpubArchive(
   }
 
   const headLength = Math.min(fileSize, INITIAL_READ_SIZE);
-  const head = await readRange(0, headLength);
-  requireRange(head, headLength, 'The downloaded EPUB is truncated.');
   const tailLength = Math.min(fileSize, ZIP_TAIL_READ_SIZE);
   const tailOffset = fileSize - tailLength;
-  const tail = await readRange(tailOffset, tailLength);
+  const tailRead = readRange(tailOffset, tailLength);
+  const [head, tail] = await Promise.all([
+    tailOffset === 0
+      ? tailRead.then((bytes) => bytes.subarray(0, headLength))
+      : readRange(0, headLength),
+    tailRead,
+  ]);
+  requireRange(head, headLength, 'The downloaded EPUB is truncated.');
   requireRange(tail, tailLength, 'The EPUB ZIP end record is truncated.');
+
+  const readBufferedRange: EpubRangeReader = (offset, length) => {
+    if (offset >= 0 && offset + length <= head.length) {
+      return Promise.resolve(head.subarray(offset, offset + length));
+    }
+    if (offset >= tailOffset && offset + length <= fileSize) {
+      const start = offset - tailOffset;
+      return Promise.resolve(tail.subarray(start, start + length));
+    }
+    return readRange(offset, length);
+  };
 
   let endOffset = -1;
   for (let offset = tail.length - ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH; offset >= 0; offset -= 1) {
@@ -497,7 +513,7 @@ export async function validateEpubArchive(
     throw new EpubValidationError('The EPUB ZIP central directory is invalid.');
   }
 
-  const centralDirectory = await readRange(centralDirectoryOffset, centralDirectorySize);
+  const centralDirectory = await readBufferedRange(centralDirectoryOffset, centralDirectorySize);
   requireRange(centralDirectory, centralDirectorySize, 'The EPUB central directory is truncated.');
   const archiveEntries = parseCentralDirectory(centralDirectory, entries, centralDirectoryOffset);
   const totalExpandedSize = archiveEntries.reduce(
@@ -525,7 +541,7 @@ export async function validateEpubArchive(
       archiveEntries,
       centralDirectoryOffset,
       fileSize,
-      readRange,
+      readBufferedRange,
     );
     if (!packagePath) throw error;
 
@@ -536,7 +552,7 @@ export async function validateEpubArchive(
       entries,
     );
     const repaired = new Uint8Array(centralDirectoryOffset + records.length);
-    const prefix = await readRange(0, centralDirectoryOffset);
+    const prefix = await readBufferedRange(0, centralDirectoryOffset);
     requireRange(prefix, centralDirectoryOffset, 'The downloaded EPUB is truncated.');
     repaired.set(prefix);
     repaired.set(records, centralDirectoryOffset);
@@ -550,6 +566,6 @@ export async function validateEpubArchive(
     throw new EpubValidationError('The EPUB container.xml entry is invalid.');
   }
   validateMimetypeEntry(head, mimetype);
-  const xml = await readXmlEntry(container, centralDirectoryOffset, fileSize, readRange);
+  const xml = await readXmlEntry(container, centralDirectoryOffset, fileSize, readBufferedRange);
   if (xml) validateContainerXml(xml);
 }
