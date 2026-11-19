@@ -1,7 +1,8 @@
 import tailwindcss from '@tailwindcss/vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { readFileSync } from 'node:fs';
-import { defineConfig, type Plugin } from 'vite';
+import type { Plugin } from 'vite';
+import { defineConfig } from 'vitest/config';
 import {
   DEV_PROXY_PREFIX,
   decodeProxyTarget,
@@ -75,8 +76,5 @@ export default defineConfig({
   build: {
     target: 'es2022',
     sourcemap: false,
-  },
-  test: {
-    environment: 'jsdom',
   },
 });

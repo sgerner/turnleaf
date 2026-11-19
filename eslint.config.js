@@ -1,13 +1,14 @@
 import js from '@eslint/js';
+import { defineConfig } from 'eslint/config';
 import svelte from 'eslint-plugin-svelte';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
-export default tseslint.config(
+export default defineConfig(
   { ignores: ['.opencode/', 'dist/', 'android/', 'ios/'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
-  ...svelte.configs['flat/recommended'],
+  ...svelte.configs.recommended,
   {
     files: ['**/*.svelte'],
     languageOptions: {

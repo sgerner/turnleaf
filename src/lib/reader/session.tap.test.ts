@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import type { Contents } from 'epubjs';
 import { expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
