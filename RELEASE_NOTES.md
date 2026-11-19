@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Strengthen Android and release verification
 - Trim startup assets and verify Node tooling
 - Keep downloaded reading and large catalogs responsive
 - Restore EPUB positions without guessing mixed-tag order

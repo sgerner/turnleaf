@@ -78,8 +78,14 @@ export function createCdpClient(socket, { timeoutMs = 5_000 } = {}) {
       }
 
       const reply = await response;
-      if (reply.error || reply.result?.exceptionDetails) {
-        throw new Error(`WebView evaluation failed: ${expression}`);
+      if (reply.error) {
+        throw new Error(`WebView evaluation failed (${reply.error.code}): ${reply.error.message}`);
+      }
+      const exception = reply.result?.exceptionDetails;
+      if (exception) {
+        throw new Error(
+          `WebView evaluation failed: ${exception.exception?.description ?? exception.text}`,
+        );
       }
       return reply.result?.result?.value;
     },

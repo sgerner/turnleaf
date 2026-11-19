@@ -10,6 +10,10 @@ on:
       - master
   workflow_dispatch:
 
+concurrency:
+  group: android-apk-release
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -22,6 +26,7 @@ jobs:
        github.event.workflow_run.head_branch == 'master' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     permissions:
       contents: read
     env:
@@ -90,6 +95,8 @@ jobs:
 
       - name: Build debug APK for manual release journey
         if: github.event_name == 'workflow_dispatch'
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
       - name: Enable emulator hardware acceleration for manual journey
@@ -159,6 +166,8 @@ jobs:
           EOF
 
       - name: Build signed release APK
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:release
 
       - name: Enable emulator hardware acceleration for signed APK smoke test
@@ -211,6 +220,7 @@ jobs:
   publish-github-release:
     needs: build-release-apk
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 
@@ -251,6 +261,13 @@ jobs:
           VERSION_BASE: ${{ needs.build-release-apk.outputs.version_base }}
           TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
         run: |
+          set -eu
+          PUBLISHED_NOTES="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" \
+            --jq '.[] | select(.draft == false) | .body')"
+          if printf '%s\n' "$PUBLISHED_NOTES" | grep -Fxq "Tested revision: \`$TESTED_REVISION\`"; then
+            echo "A release already exists for this tested revision."
+            exit 0
+          fi
           gh release create "$RELEASE_TAG" "release-payload/app-release.apk" "release-payload/app-release.apk.sha256" \
             --title "Turnleaf $VERSION_BASE" \
             --notes-file "release-payload/turnleaf-release-notes.md" \

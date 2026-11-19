@@ -10,8 +10,9 @@ export function npmExecutable(platform = process.platform) {
   return platform === 'win32' ? 'npm.cmd' : 'npm';
 }
 
-export function auditArguments(userConfigPath) {
-  return ['audit', '--omit=dev', '--ignore-scripts', '--userconfig', userConfigPath];
+export function auditArguments(userConfigPath, includeDev = false) {
+  const scope = includeDev ? ['--include=dev', '--audit-level=high'] : ['--omit=dev'];
+  return ['audit', ...scope, '--ignore-scripts', '--userconfig', userConfigPath];
 }
 
 export async function runAudit({ spawnImpl, cwd = projectRoot } = {}) {
@@ -24,12 +25,14 @@ export async function runAudit({ spawnImpl, cwd = projectRoot } = {}) {
   env.npm_config_userconfig = userConfigPath;
 
   try {
-    await runCommand(npmExecutable(), auditArguments(userConfigPath), {
-      cwd,
-      env,
-      label: 'npm audit',
-      spawnImpl,
-    });
+    for (const includeDev of [false, true]) {
+      await runCommand(npmExecutable(), auditArguments(userConfigPath, includeDev), {
+        cwd,
+        env,
+        label: includeDev ? 'npm audit all dependencies' : 'npm audit production dependencies',
+        spawnImpl,
+      });
+    }
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
   }

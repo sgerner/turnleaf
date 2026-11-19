@@ -73,13 +73,20 @@ async function startFixture() {
   const uploads = [];
   let downloads = 0;
   let offline = false;
+  let offlineRequests = 0;
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
   const server = createServer(async (request, response) => {
-    if (offline || request.headers['x-api-key'] !== key) {
-      response.writeHead(offline ? 503 : 401).end();
+    if (request.headers['x-api-key'] !== key) {
+      response.writeHead(401).end();
+      return;
+    }
+    if (offline) {
+      offlineRequests += 1;
+      response.writeHead(503).end();
       return;
     }
     const path = new URL(request.url, 'http://localhost').pathname;
+    const pagesRead = uploads.at(-1)?.pageNum ?? 0;
     let body;
     switch (path) {
       case '/api/Health':
@@ -89,7 +96,7 @@ async function startFixture() {
         body = [{ id: 1, name: 'Books', type: 2 }];
         break;
       case '/api/Series/v2':
-        body = [{ id: 1, libraryId: 1, name: title, format: 3, pages: 2, pagesRead: 0 }];
+        body = [{ id: 1, libraryId: 1, name: title, format: 3, pages: 2, pagesRead }];
         break;
       case '/api/Series/series-detail':
         body = {
@@ -103,7 +110,7 @@ async function startFixture() {
                   title,
                   titleName: title,
                   pages: 2,
-                  pagesRead: 0,
+                  pagesRead,
                   format: 3,
                   files: [{ id: 1, format: 3, extension: '.epub', bytes: epub.length }],
                 },
@@ -149,6 +156,9 @@ async function startFixture() {
     uploads,
     get downloads() {
       return downloads;
+    },
+    get offlineRequests() {
+      return offlineRequests;
     },
     setOffline(value) {
       offline = value;
@@ -225,7 +235,6 @@ async function run() {
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
-    fixture.setOffline(true);
     disabledNetwork = true;
     await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
@@ -235,6 +244,7 @@ async function run() {
       );
       return connected === false;
     });
+    fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
     await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
     await waitFor('second chapter', () => web.evaluate(chapter(2)));
@@ -268,8 +278,10 @@ async function run() {
     web = await connectWebView();
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
-    if (fixture.downloads !== 1 || fixture.uploads.length !== uploadCount) {
-      throw new Error('The offline restart requested another download or uploaded progress.');
+    if (fixture.offlineRequests > 0) {
+      throw new Error(
+        `Turnleaf sent ${fixture.offlineRequests} authenticated requests while offline.`,
+      );
     }
 
     fixture.setOffline(false);
@@ -284,10 +296,24 @@ async function run() {
             progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
         ),
     );
+    await waitFor('return to library after reconnect', async () => {
+      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
+      await web.evaluate(click('[aria-label="Show reading controls"]'));
+      return false;
+    });
+    await waitFor('saved passage after reconnect', () =>
+      web.evaluate(
+        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
+      ),
+    );
     throwIfInterrupted();
     journeyPassed = true;
   } catch (error) {
     journeyError = error;
+    if (deviceSerial) {
+      const crashes = await adb('logcat', '-d', '-b', 'crash', '-t', '80').catch(() => '');
+      if (crashes) console.error(crashes);
+    }
   } finally {
     const cleanup = [];
     if (disabledNetwork) {
@@ -318,6 +344,6 @@ async function run() {
 }
 
 await run().catch((error) => {
-  console.error(error.message);
+  console.error(error);
   process.exitCode ??= 1;
 });
