@@ -1,7 +1,9 @@
 import { access } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+import { promisify } from 'node:util';
 import { resolveDeviceSerial } from './android-device.mjs';
 
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -11,33 +13,7 @@ const defaultApkPath = resolve(
 );
 const defaultPackageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 
-function run(command, args) {
-  return new Promise((resolveCommand, rejectCommand) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
-    child.once('error', rejectCommand);
-    child.once('exit', (code, signal) => {
-      if (code === 0) {
-        resolveCommand({ stdout, stderr });
-        return;
-      }
-      rejectCommand(
-        new Error(
-          signal
-            ? `${command} terminated by ${signal}`
-            : `${command} exited with code ${code}: ${stderr.trim() || stdout.trim()}`,
-        ),
-      );
-    });
-  });
-}
+const run = promisify(execFile);
 
 export async function main({
   apkPath = defaultApkPath,
@@ -48,18 +24,33 @@ export async function main({
   const targetApkPath = resolve(apkPath);
   const activity = `${packageName}/app.turnleaf.reader.MainActivity`;
   const targetSerial = await resolveDeviceSerial({ requestedSerial: serial });
-  const adb = (...args) => run('adb', ['-s', targetSerial, ...args]);
+  const adb = (...args) => run('adb', ['-s', targetSerial, ...args], { timeout: 90_000 });
 
   await access(targetApkPath);
   await adb('wait-for-device');
   await adb('install', '-r', targetApkPath);
   if (resetData) await adb('shell', 'pm', 'clear', packageName);
-  await adb('shell', 'am', 'start', '-W', '-n', activity);
-  const appProcess = await adb('shell', 'pidof', packageName);
-  if (!appProcess.stdout.trim()) {
-    throw new Error(`Android app process ${packageName} is not running.`);
+  const launch = await adb('shell', 'am', 'start', '-S', '-W', '-n', activity);
+  if (!/^Status: ok\s*$/m.test(launch.stdout) || /^(Error|Exception):/m.test(launch.stdout)) {
+    throw new Error(`Android failed to launch ${activity}: ${launch.stdout.trim()}`);
   }
-  console.log(`Android smoke check passed for ${packageName} (pid ${appProcess.stdout.trim()}).`);
+  const firstPid = (await adb('shell', 'pidof', packageName)).stdout.trim();
+  await delay(3_000);
+  const appProcess = (await adb('shell', 'pidof', packageName)).stdout.trim();
+  const { stdout: activities } = await adb('shell', 'dumpsys', 'activity', 'activities');
+  const resumed = activities
+    .split('\n')
+    .some(
+      (line) =>
+        /(?:topResumedActivity|mResumedActivity)/.test(line) && line.includes(packageName + '/'),
+    );
+  if (!appProcess || firstPid !== appProcess || !resumed) {
+    const { stdout: crashes } = await adb('logcat', '-d', '-b', 'crash', '-t', '60');
+    throw new Error(
+      `Android app ${packageName} did not stay in the foreground.\n${crashes.trim()}`,
+    );
+  }
+  console.log(`Android smoke check passed for ${packageName} (pid ${appProcess}).`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

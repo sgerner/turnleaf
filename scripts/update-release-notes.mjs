@@ -1,15 +1,8 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { readReleaseNotes } from './release-notes-source.mjs';
 
 const [mode, value] = process.argv.slice(2);
-
-let subject = '';
-if (mode === '--subject') {
-  subject = value ?? '';
-} else if (mode) {
-  const rawMessage = readFileSync(mode, 'utf8').trim();
-  subject = rawMessage.split(/\r?\n/, 1)[0].trim();
-}
+const subject = mode === '--subject' ? value?.trim() : '';
 
 if (!subject || /^merge\b/i.test(subject)) process.exit(0);
 
@@ -31,5 +24,6 @@ if (lines[insertionIndex]?.trim() !== '') {
   lines.splice(insertionIndex, 0, '');
 }
 lines.splice(insertionIndex + 1, 0, `- ${subject}`);
+if (lines[insertionIndex + 2]?.startsWith('## ')) lines.splice(insertionIndex + 2, 0, '');
 
 writeFileSync(url, `${lines.join('\n').trimEnd()}\n`);

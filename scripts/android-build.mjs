@@ -27,6 +27,10 @@ export function gradleTask(mode) {
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 
+export function canReuseWebBuild(environment = process.env) {
+  return environment.TURNLEAF_REUSE_WEB_BUILD === 'true';
+}
+
 export async function main(mode = process.argv[2]) {
   let task;
   try {
@@ -54,10 +58,15 @@ export async function main(mode = process.argv[2]) {
   const env = childEnvironment(sdk.sdk.path);
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const gradle = process.platform === 'win32' ? 'gradlew.bat' : './gradlew';
+  const reuseWebBuild = canReuseWebBuild(env);
   console.log(`Using Android SDK at ${sdk.sdk.path} for Capacitor and Gradle.`);
 
   try {
-    await runCommand(npm, ['run', 'cap:sync'], { cwd: projectRoot, env });
+    if (!reuseWebBuild) await runCommand(npm, ['run', 'build'], { cwd: projectRoot, env });
+    await runCommand(npm, ['exec', '--', 'cap', 'sync', 'android'], {
+      cwd: projectRoot,
+      env,
+    });
     await runCommand(gradle, [task], { cwd: androidDirectory, env });
   } catch (error) {
     console.error(error.message);

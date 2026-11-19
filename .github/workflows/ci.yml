@@ -46,6 +46,8 @@ jobs:
         run: npm run verify
 
       - name: Build Android debug APK
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
       - name: Upload Android debug APK

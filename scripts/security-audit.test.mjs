@@ -16,4 +16,14 @@ describe('security audit command', () => {
       '/tmp/turnleaf-audit.npmrc',
     ]);
   });
+  it('includes build tools and gates high or critical findings in the full audit', () => {
+    expect(auditArguments('/tmp/turnleaf-audit.npmrc', true)).toEqual([
+      'audit',
+      '--include=dev',
+      '--audit-level=high',
+      '--ignore-scripts',
+      '--userconfig',
+      '/tmp/turnleaf-audit.npmrc',
+    ]);
+  });
 });

@@ -8,8 +8,8 @@ const sections = boundaries.map(({ heading, start, end }) => ({
   heading,
   body: lines
     .slice(start + 1, end)
-    .filter((line) => line.trim())
-    .map((line) => line.trimEnd()),
+    .join('\n')
+    .replace(/^\n+|\n+$/g, ''),
 }));
 
 const unreleased = sections.find((section) => section.heading === '## Unreleased');
@@ -20,31 +20,19 @@ if (!unreleased) {
 const versionHeading = `## ${version}`;
 let versionSection = sections.find((section) => section.heading === versionHeading);
 
-const unreleasedItems = unreleased.body.map((line) => line.trim()).filter(Boolean);
-const versionItems = versionSection
-  ? versionSection.body.map((line) => line.trim()).filter(Boolean)
-  : [];
-
-if (unreleasedItems.length === 0 && versionSection) {
-  process.exit(0);
+if (!unreleased.body.trim()) {
+  if (versionSection?.body.trim()) process.exit(0);
+  throw new Error(`Could not find release notes for ${version} or Unreleased in RELEASE_NOTES.md`);
 }
 
 if (!versionSection) {
-  versionSection = { heading: versionHeading, body: [] };
+  versionSection = { heading: versionHeading, body: '' };
   const unreleasedIndex = sections.indexOf(unreleased);
   sections.splice(unreleasedIndex + 1, 0, versionSection);
 }
 
-const existing = new Set(versionItems);
-versionSection.body = [...versionItems];
-for (const item of unreleasedItems) {
-  if (!existing.has(item)) {
-    versionSection.body.push(item);
-    existing.add(item);
-  }
-}
-
-unreleased.body = [];
+versionSection.body = [versionSection.body, unreleased.body].filter(Boolean).join('\n\n');
+unreleased.body = '';
 
 const output = [];
 output.push(...prefix);
@@ -54,7 +42,7 @@ for (const section of sections) {
   }
   output.push(section.heading, '');
   if (section.body.length > 0) {
-    output.push(...section.body, '');
+    output.push(section.body, '');
   }
 }
 
