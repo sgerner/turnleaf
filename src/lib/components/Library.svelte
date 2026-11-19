@@ -51,34 +51,8 @@
   import { flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
+  import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
-
-  const skeletonThemes = [
-    'catppuccin',
-    'cerberus',
-    'concord',
-    'crimson',
-    'eink',
-    'fennec',
-    'hamlindigo',
-    'legacy',
-    'mint',
-    'modern',
-    'mona',
-    'nosh',
-    'nouveau',
-    'pine',
-    'reign',
-    'rocket',
-    'rose',
-    'sahara',
-    'seafoam',
-    'terminus',
-    'vintage',
-    'vox',
-    'wintry',
-  ] as const;
-  type SkeletonTheme = (typeof skeletonThemes)[number];
 
   let {
     server,
@@ -1330,6 +1304,7 @@
   function openSettings(): void {
     settingsOpener = activeElement();
     settingsVisible = true;
+    void Promise.allSettled(skeletonThemes.map(loadTheme));
     focusModal(() => settingsDialog);
   }
 
@@ -1452,6 +1427,12 @@
   }
 
   async function updateTheme(next: SkeletonTheme): Promise<void> {
+    try {
+      await loadTheme(next);
+    } catch {
+      settingsError = 'The theme could not load. Try again.';
+      return;
+    }
     pendingTheme = next;
     onThemeChange(next);
     await setPreference('uiTheme', next);
@@ -2458,7 +2439,9 @@
     >
       <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
       <p class="mt-3 text-surface-600-400">
-        This device and Kavita have different reading positions.
+        This device and Kavita have different reading positions for <strong
+          >{conflict.book.title}</strong
+        >.
       </p>
       <dl class="mt-4 grid gap-2 text-sm">
         <div>
@@ -2472,7 +2455,7 @@
           <dt class="font-medium">Kavita</dt>
           <dd>
             {#if conflict.book.pages > 0}
-              {Math.round(Math.min(1, conflict.remote.pageNum / conflict.book.pages) * 100)}%
+              Page {conflict.remote.pageNum} of {conflict.book.pages}
             {:else}
               Page {conflict.remote.pageNum}
             {/if}
@@ -2510,6 +2493,9 @@
         >
           {acceptingRemoteProgress ? 'Saving choice…' : 'Continue from Kavita'}
         </button>
+        <button class="btn preset-tonal-surface" type="button" onclick={closeConflict}
+          >Cancel</button
+        >
       </div>
     </div>
   </div>
@@ -2676,7 +2662,15 @@
             <dd class="truncate text-right">{server.baseUrl}</dd>
           </div>
         </dl>
-        <button class="btn preset-tonal-surface mt-3" type="button" onclick={onChangeServerAddress}>
+        <button
+          class="btn preset-tonal-surface mt-3"
+          type="button"
+          disabled={Boolean(downloadingBookId) ||
+            cleanupInProgress ||
+            replacingApiKey ||
+            deletingServer}
+          onclick={onChangeServerAddress}
+        >
           Change server address
         </button>
         {#if insecureServer()}

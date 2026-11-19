@@ -164,9 +164,9 @@ it('maps the minimized volume-only payload reported in issue #51', () => {
     coverImage: 'cover.png',
   } satisfies KavitaSeries;
 
-  expect(
-    mapSeriesToBooks('primary', series, issue51VolumeDetail).map((book) => book.chapterId),
-  ).toEqual([1406, 1407, 1409, 1408]);
+  const books = mapSeriesToBooks('primary', series, issue51VolumeDetail);
+  expect(books.map((book) => book.chapterId)).toEqual([1406, 1407, 1409, 1408]);
+  expect(books.map((book) => book.series)).toEqual(Array(4).fill(series.name));
 });
 
 it('keeps chapter progress and dates separate from series aggregates', () => {

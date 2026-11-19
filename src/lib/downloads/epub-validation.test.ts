@@ -104,7 +104,7 @@ describe('EPUB container validation', () => {
       return archive.slice(offset, offset + length);
     });
 
-    expect(reads.length).toBe(5);
+    expect(reads).toHaveLength(2);
     expect(Math.max(...reads.map((read) => read.length))).toBeLessThan(archive.length);
   });
 

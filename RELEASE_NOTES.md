@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Load themes on demand and streamline EPUB validation
 - Strengthen Android and release verification
 - Trim startup assets and verify Node tooling
 - Keep downloaded reading and large catalogs responsive

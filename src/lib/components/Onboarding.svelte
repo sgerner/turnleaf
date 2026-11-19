@@ -29,6 +29,24 @@
   let invalidField = $state<'address' | 'key' | null>(null);
   let showKey = $state(false);
 
+  async function saveConnection(
+    server: ServerConfig,
+    key: string,
+    messages: { saveFailed: string; cleanupFailed: string },
+  ): Promise<void> {
+    await saveApiKey(server.credentialRef, key);
+    try {
+      await saveServer(server);
+    } catch (storageError) {
+      try {
+        await removeApiKey(server.credentialRef);
+      } catch (cleanupError) {
+        throw new Error(messages.cleanupFailed, { cause: cleanupError });
+      }
+      throw new Error(messages.saveFailed, { cause: storageError });
+    }
+  }
+
   async function connect(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     error = '';
@@ -67,23 +85,12 @@
             kavitaVersion: result.version,
             lastConnectedAt: new Date().toISOString(),
           };
-          await saveApiKey(credentialRef, key);
-          try {
-            await saveServer(connectedServer);
-          } catch (storageError) {
-            try {
-              await removeApiKey(credentialRef);
-            } catch (cleanupError) {
-              throw new Error(
-                'The new address tested successfully, but local setup could not be saved and the new auth key could not be cleaned up. The saved connection was left in place; retry reconnect.',
-                { cause: cleanupError },
-              );
-            }
-            throw new Error(
+          await saveConnection(connectedServer, key, {
+            saveFailed:
               'The new address tested successfully, but local setup could not be saved. The saved connection and auth key were left in place; retry reconnect.',
-              { cause: storageError },
-            );
-          }
+            cleanupFailed:
+              'The new address tested successfully, but local setup could not be saved and the new auth key could not be cleaned up. The saved connection was left in place; retry reconnect.',
+          });
           await removeApiKey(savedServer.credentialRef).catch(() => {});
         } else {
           await saveApiKey(savedServer.credentialRef, key);
@@ -103,25 +110,12 @@
         lastConnectedAt: new Date().toISOString(),
       };
 
-      await saveApiKey(credentialRef, key);
-      try {
-        await saveServer(server);
-      } catch (storageError) {
-        try {
-          await removeApiKey(credentialRef);
-        } catch (cleanupError) {
-          throw new Error(
-            'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
-            { cause: cleanupError },
-          );
-        }
-        throw new Error(
+      await saveConnection(server, key, {
+        saveFailed:
           'The connection worked, but local setup could not be saved. No auth key was retained; try again.',
-          {
-            cause: storageError,
-          },
-        );
-      }
+        cleanupFailed:
+          'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
+      });
       apiKey = '';
       onConnected(server, key);
     } catch (cause) {
