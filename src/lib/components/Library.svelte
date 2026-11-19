@@ -106,8 +106,9 @@
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
-      return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id);
+      return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id, !offline);
     }
+    if (offline) throw new Error('Offline');
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
@@ -120,7 +121,7 @@
   let offlineMessage = $state('');
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
-  let normalizedQuery = $derived(query.trim().toLowerCase());
+  let queryTerms = $derived(normalizeLibrarySearch(query).split(' ').filter(Boolean));
   let sortOrder = $state<LibrarySortOrder>('title');
   let authorFilter = $state('');
   let seriesFilter = $state('');
@@ -154,7 +155,7 @@
     new Map(
       displayableBooks.map((book) => [
         book.id,
-        `${book.title} ${book.author ?? ''} ${book.series ?? ''}`.toLowerCase(),
+        normalizeLibrarySearch(`${book.title} ${book.author ?? ''} ${book.series ?? ''}`),
       ]),
     ),
   );
@@ -179,7 +180,7 @@
     sortedBooks.filter((book) => {
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
       return (
-        (!normalizedQuery || searchableText.get(book.id)?.includes(normalizedQuery)) &&
+        queryTerms.every((term) => searchableText.get(book.id)?.includes(term)) &&
         (!downloadedOnly || Boolean(book.downloadPath)) &&
         (!hideCompleted || !completed) &&
         (!authorFilter || book.author === authorFilter) &&
@@ -232,7 +233,9 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
-  let resolvingOpenProgress = false;
+  let resolvingOpenProgress = $state(false);
+  let openProgressProbe = $state.raw<AbortController | null>(null);
+  let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
   let diagnosticsVisible = $state(false);
@@ -260,6 +263,14 @@
   let gridColumns = $state(2);
   let rowHeight = $state(400);
   let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
+  let focusedRow = $state(-1);
+  const renderedRows = $derived.by(() => {
+    const { firstRow, lastRow } = virtualWindow;
+    const rows = Array.from({ length: lastRow - firstRow + 1 }, (_, offset) => firstRow + offset);
+    if (focusedRow >= 0 && focusedRow < firstRow) rows.unshift(focusedRow);
+    if (focusedRow > lastRow) rows.push(focusedRow);
+    return rows;
+  });
   let visibleCoverKey = $derived.by(() => {
     if (reading) return `${coverReloadRequest}:`;
     const firstIndex = virtualWindow.startIndex;
@@ -279,12 +290,21 @@
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const GRID_GAP_PX = 16;
   const GRID_ROW_GAP_PX = 32;
-  const CARD_TEXT_HEIGHT_PX = 80;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
+
+  function normalizeLibrarySearch(value: string): string {
+    return value
+      .normalize('NFKD')
+      .toLowerCase()
+      .replace(/\p{M}/gu, '')
+      .replace(/['’]/g, '')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim();
+  }
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
@@ -366,9 +386,10 @@
   }
 
   function rowHeightFor(width: number, columns: number): number {
-    if (viewMode === 'list') return 112;
+    const rem = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+    if (viewMode === 'list') return Math.ceil(rem * 9.5);
     const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
-    return Math.max(1, Math.ceil(cardWidth * 1.5 + CARD_TEXT_HEIGHT_PX + GRID_ROW_GAP_PX));
+    return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 5 + GRID_ROW_GAP_PX));
   }
 
   function scheduleVirtualWindow(): void {
@@ -394,53 +415,50 @@
     if (gridColumns !== nextColumns) gridColumns = nextColumns;
     if (rowHeight !== nextRowHeight) rowHeight = nextRowHeight;
 
+    const activeCard = document.activeElement?.closest<HTMLElement>('[data-book-index]');
+    const activeIndex = Number(activeCard?.dataset.bookIndex);
+    focusedRow =
+      activeCard && visibleBooks[activeIndex]?.id === activeCard.dataset.bookId
+        ? Math.floor(activeIndex / nextColumns)
+        : -1;
+
     const gridRect = virtualGrid.getBoundingClientRect();
     const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
     if (scrollContainer) {
       const containerRect = scrollContainer.getBoundingClientRect();
       const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
-      virtualWindow = preserveFocusedRow(
-        calculateVirtualWindow(
-          visibleBooks.length,
-          nextColumns,
-          nextRowHeight,
-          scrollContainer.scrollTop - listTop,
-          scrollContainer.clientHeight,
-          VIRTUALIZATION_OVERSCAN_ROWS,
-        ),
+      virtualWindow = calculateVirtualWindow(
+        visibleBooks.length,
+        nextColumns,
+        nextRowHeight,
+        scrollContainer.scrollTop - listTop,
+        scrollContainer.clientHeight,
+        VIRTUALIZATION_OVERSCAN_ROWS,
       );
       return;
     }
     if (typeof window === 'undefined') return;
-    virtualWindow = preserveFocusedRow(
-      calculateVirtualWindow(
-        visibleBooks.length,
-        nextColumns,
-        nextRowHeight,
-        -gridRect.top,
-        window.innerHeight,
-        VIRTUALIZATION_OVERSCAN_ROWS,
-      ),
+    virtualWindow = calculateVirtualWindow(
+      visibleBooks.length,
+      nextColumns,
+      nextRowHeight,
+      -gridRect.top,
+      window.innerHeight,
+      VIRTUALIZATION_OVERSCAN_ROWS,
     );
   }
 
-  function preserveFocusedRow(next: VirtualWindow): VirtualWindow {
-    if (next.totalRows === 0 || typeof document === 'undefined') return next;
-    const activeBookId =
-      document.activeElement?.closest<HTMLElement>('[data-book-id]')?.dataset.bookId;
-    if (!activeBookId) return next;
-    const bookIndex = visibleBooks.findIndex((book) => book.id === activeBookId);
-    if (bookIndex < 0) return next;
-    const focusedRow = Math.floor(bookIndex / gridColumns);
-    const firstRow = Math.min(next.firstRow, focusedRow);
-    const lastRow = Math.max(next.lastRow, focusedRow);
-    return {
-      ...next,
-      firstRow,
-      lastRow,
-      startIndex: firstRow * gridColumns,
-      endIndex: Math.min(visibleBooks.length, (lastRow + 1) * gridColumns),
-    };
+  async function scrollToBook(index: number): Promise<HTMLElement | null> {
+    const grid = virtualGrid;
+    if (!grid) return null;
+    updateVirtualWindow();
+    const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
+    const container = libraryMain?.closest<HTMLElement>('.app-stage');
+    if (container) container.scrollTop += top - container.getBoundingClientRect().top;
+    else window.scrollBy({ top, behavior: 'instant' });
+    updateVirtualWindow();
+    await tick();
+    return grid.querySelector(`[data-book-index="${index}"]`);
   }
 
   async function continueTabbing(
@@ -450,26 +468,18 @@
   ): Promise<void> {
     if (event.key !== 'Tab' || event.defaultPrevented || !virtualGrid) return;
     const backwards = event.shiftKey;
-    const atEdge = backwards
-      ? index === virtualWindow.startIndex &&
-        (control === 'open' || visibleBooks[index]?.id === downloadingBookId)
-      : index === virtualWindow.endIndex - 1 && control === 'actions';
     const nextIndex = index + (backwards ? -1 : 1);
-    if (!atEdge || nextIndex < 0 || nextIndex >= visibleBooks.length) return;
+    if (nextIndex < 0 || nextIndex >= visibleBooks.length) return;
+    const crossesCard = backwards
+      ? control === 'open' || visibleBooks[index]?.id === downloadingBookId
+      : control === 'actions';
+    if (!crossesCard) return;
+    const nextIsVisible =
+      nextIndex >= virtualWindow.startIndex && nextIndex < virtualWindow.endIndex;
+    if (nextIsVisible || Math.floor(nextIndex / gridColumns) === focusedRow) return;
 
     event.preventDefault();
-    const grid = virtualGrid;
-    const targetTop =
-      grid.getBoundingClientRect().top + Math.floor(nextIndex / gridColumns) * rowHeight;
-    const container = libraryMain?.closest<HTMLElement>('.app-stage');
-    if (container) {
-      container.scrollTop += targetTop - container.getBoundingClientRect().top;
-    } else {
-      window.scrollBy({ top: targetTop, behavior: 'instant' });
-    }
-    updateVirtualWindow();
-    await tick();
-    const nextBook = grid.querySelector(`[data-book-index="${nextIndex}"]`);
+    const nextBook = await scrollToBook(nextIndex);
     const target = backwards
       ? nextBook?.querySelector<HTMLButtonElement>('[data-book-actions]')
       : nextBook?.querySelector<HTMLButtonElement>(
@@ -527,11 +537,12 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
+    offline = !(await Network.getStatus()).connected;
+    if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
     loading = false;
     void refreshSyncStatus();
-    offline = !(await Network.getStatus()).connected;
     offlineMessage = offline
       ? displayableBooks.length
         ? 'No network connection. Showing your saved library.'
@@ -548,6 +559,8 @@
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
           offline = !connected;
+          coverReloadRequest += 1;
+          kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
             : displayableBooks.length
@@ -575,7 +588,6 @@
           else if (actionMenuBook) closeMenu();
           else if (reading) {
             if (readerBackHandler?.()) return;
-            if (document.querySelector('[data-reader-panel]')) return;
             void closeReader();
           } else if (settingsVisible) closeSettings();
           else if (filtersVisible) filtersVisible = false;
@@ -649,6 +661,7 @@
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', scheduleVirtualWindow);
+    openProgressProbe?.abort();
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -659,7 +672,6 @@
     if (destroyed || refreshing) return;
     refreshing = true;
     let diagnosticEndpoint = '/api/unknown';
-    cancelCoverLoading();
     message = '';
     try {
       diagnosticEndpoint = '/api/Series/v2';
@@ -702,7 +714,7 @@
           message = 'Library state refreshed. You can retry the download.';
         }
       }
-      offline = false;
+      kavitaUnreachable = false;
       offlineMessage = '';
       if (incomplete)
         message =
@@ -734,6 +746,8 @@
             offlineMessage = `${cause.message} Open Settings to copy diagnostics. ${savedBooks}`;
             break;
           case 'network':
+            kavitaUnreachable = true;
+          // fall through
           case 'server':
             offlineMessage = `${cause.message} ${savedBooks}`;
             break;
@@ -961,6 +975,38 @@
     return true;
   }
 
+  async function checkOpenProgress(book: BookRecord, force?: boolean) {
+    try {
+      let remote: KavitaProgress | null = null;
+      if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
+        const probe = new AbortController();
+        openProgressProbe = probe;
+        const abort = new Promise<null>((resolve) => {
+          probe.signal.addEventListener('abort', () => resolve(null), { once: true });
+        });
+        const timer = window.setTimeout(() => probe.abort(), 1_500);
+        const upload = syncWork;
+        try {
+          remote = await Promise.race([
+            abort,
+            (async () => {
+              // Compare revisions only after any previous upload has settled.
+              await upload;
+              if (probe.signal.aborted || offline) return null;
+              return client.getProgress(book.chapterId, probe.signal).catch(() => null);
+            })(),
+          ]);
+        } finally {
+          window.clearTimeout(timer);
+          openProgressProbe = null;
+        }
+      }
+      return { ok: true as const, local: await getReadingState(book.id), remote };
+    } catch (error) {
+      return { ok: false as const, error };
+    }
+  }
+
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
     if (!book.downloadPath) {
       const refreshed = await download(book);
@@ -977,24 +1023,10 @@
         (verified) => ({ ok: true as const, verified }),
         (error: unknown) => ({ ok: false as const, error }),
       );
-      const upload = syncWork;
-      const progressCheck = (async () => {
-        try {
-          // Read both sides only after an earlier upload has settled, so a
-          // pending local revision cannot change during conflict detection.
-          await upload;
-          const [savedLocal, savedRemote] = await Promise.all([
-            getReadingState(book.id),
-            offline || book.remoteAvailable === false
-              ? null
-              : client.getProgress(book.chapterId).catch(() => null),
-          ]);
-          return { ok: true as const, local: savedLocal, remote: savedRemote };
-        } catch (error) {
-          return { ok: false as const, error };
-        }
-      })();
-      const [verification, progress] = await Promise.all([fileCheck, progressCheck]);
+      const [verification, progress] = await Promise.all([
+        fileCheck,
+        checkOpenProgress(book, options.preferFurthest),
+      ]);
       if (!verification.ok) {
         message =
           'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
@@ -1123,11 +1155,27 @@
     percentage: number | null;
     accept?: () => Promise<void>;
   } | null> {
-    if (offline || book.remoteAvailable === false || (!manual && !pendingAutoSync)) return null;
+    if (!manual && !pendingAutoSync) return null;
+    if (offline || book.remoteAvailable === false) {
+      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
+      return null;
+    }
+    if (manual) {
+      try {
+        await flushProgress(client, server.id);
+      } catch {
+        throw new Error('Reading progress is saved here and still waiting to upload.');
+      } finally {
+        void refreshSyncStatus();
+      }
+    }
     const local = await getReadingState(book.id);
-    if (!manual && local?.pendingSync) return null;
-    const remote = await client.getProgress(book.chapterId).catch(() => null);
-    if (!remote) return null;
+    if (local?.pendingSync) {
+      if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
+      return null;
+    }
+    const remote = await client.getProgress(book.chapterId);
+    if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
     return {
       xpath: remote.bookScrollId ?? null,
       percentage: remotePercentage(remote, book),
@@ -1136,10 +1184,7 @@
         try {
           // An upload cannot race with deletion of the exact revision it is sending.
           await syncWork;
-          const accepted = local?.pendingSync
-            ? local.syncRevision != null &&
-              (await acceptRemoteProgress(book, remote, local.syncRevision, local.localUpdatedAt))
-            : await saveRemoteProgress(book, remote, local);
+          const accepted = await saveRemoteProgress(book, remote, local);
           if (!accepted)
             throw new Error('The saved reading position changed. Sync again to retry.');
           updateRemoteBookProgress(book, remote);
@@ -1184,16 +1229,8 @@
     if (reading || !libraryMain) return;
 
     const index = visibleBooks.findIndex((book) => book.id === bookId);
-    const grid = virtualGrid;
-    if (index >= 0 && grid) {
-      updateVirtualWindow();
-      const container = libraryMain.closest<HTMLElement>('.app-stage');
-      const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
-      if (container) container.scrollTop += top - container.getBoundingClientRect().top;
-      else window.scrollBy({ top, behavior: 'instant' });
-      updateVirtualWindow();
-      await tick();
-      const card = grid.querySelector(`[data-book-index="${index}"]`);
+    if (index >= 0 && virtualGrid) {
+      const card = await scrollToBook(index);
       const control =
         card?.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
         card?.querySelector<HTMLElement>('[data-book-actions]');
@@ -1377,6 +1414,14 @@
 
   async function removeAllDownloads(): Promise<void> {
     const candidates = books.filter((item) => item.downloadPath);
+    if (
+      !candidates.length ||
+      downloadingBookId ||
+      !window.confirm(
+        `Remove ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'} from this device?`,
+      )
+    )
+      return;
     const failed: string[] = [];
     for (const book of candidates) {
       if (!(await remove(book))) failed.push(book.title);
@@ -1839,6 +1884,18 @@
         {offlineMessage}
       </div>
     {/if}
+    {#if resolvingOpenProgress}
+      <div class="alert preset-tonal-surface mt-4 flex flex-wrap items-center gap-3">
+        <p role="status">Opening downloaded book…</p>
+        {#if openProgressProbe}
+          <button
+            type="button"
+            class="btn preset-tonal-primary"
+            onclick={() => openProgressProbe?.abort()}>Open offline</button
+          >
+        {/if}
+      </div>
+    {/if}
     {#if message}
       <div
         class="alert preset-tonal-surface mt-4 flex flex-wrap items-center justify-between gap-3"
@@ -1994,9 +2051,10 @@
         style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
         tabindex="-1"
         aria-label="Books"
+        onfocusin={scheduleVirtualWindow}
+        onfocusout={scheduleVirtualWindow}
       >
-        {#each Array.from( { length: virtualWindow.lastRow - virtualWindow.firstRow + 1 } ) as _, rowOffset (virtualWindow.firstRow + rowOffset)}
-          {@const rowIndex = virtualWindow.firstRow + rowOffset}
+        {#each renderedRows as rowIndex (rowIndex)}
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
@@ -2138,7 +2196,6 @@
                   <div class="group relative">
                     <div
                       class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
-                      aria-hidden="true"
                     >
                       {#if covers.get(book.seriesId)}
                         <img
@@ -2185,23 +2242,23 @@
                           </svg>
                         </span>
                       {/if}
-                    </div>
-                    {#if progressOf(book) > 0}
-                      <div
-                        class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2"
-                        role="progressbar"
-                        aria-label={`Reading progress for ${book.title}`}
-                        aria-valuemin="0"
-                        aria-valuemax="100"
-                        aria-valuenow={Math.round(progressOf(book))}
-                        aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                      >
+                      {#if progressOf(book) > 0}
                         <div
-                          class="h-full preset-filled-primary-600-400"
-                          style:width={`${progressOf(book)}%`}
-                        ></div>
-                      </div>
-                    {/if}
+                          class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2"
+                          role="progressbar"
+                          aria-label={`Reading progress for ${book.title}`}
+                          aria-valuemin="0"
+                          aria-valuemax="100"
+                          aria-valuenow={Math.round(progressOf(book))}
+                          aria-valuetext={`${Math.round(progressOf(book))}% complete`}
+                        >
+                          <div
+                            class="h-full preset-filled-primary-600-400"
+                            style:width={`${progressOf(book)}%`}
+                          ></div>
+                        </div>
+                      {/if}
+                    </div>
                     <button
                       class="absolute inset-0 z-0 rounded-lg text-left"
                       type="button"
@@ -2695,8 +2752,11 @@
           <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
             >Clear cover cache</button
           >
-          <button class="btn preset-tonal-error" type="button" onclick={removeAllDownloads}
-            >Remove all downloaded books</button
+          <button
+            class="btn preset-tonal-error"
+            type="button"
+            disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+            onclick={removeAllDownloads}>Remove all downloaded books</button
           >
         </div>
         <dl class="mt-4 text-sm">

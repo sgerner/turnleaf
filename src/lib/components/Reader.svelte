@@ -119,6 +119,7 @@
   let searched = $state(false);
   let searchResults = $state<ReaderSearchResult[]>([]);
   let searching = $state(false);
+  let readerSyncMessage = $state('');
   let searchError = $state('');
   let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
@@ -469,6 +470,7 @@
     searchVisible = false;
     searchController?.abort();
     searchController = null;
+    searching = false;
     const opener = searchOpener;
     searchOpener = null;
     restorePanelFocus(opener);
@@ -855,6 +857,7 @@
     if (!showFeedback && (initialCfi || localNavigationDuringSession)) return;
     const reader = session;
     syncingLatest = true;
+    readerSyncMessage = '';
     try {
       const progress = await onSyncLatest(showFeedback);
       if (destroyed || session !== reader || (!showFeedback && localNavigationDuringSession))
@@ -868,9 +871,16 @@
         if (destroyed || session !== reader || localNavigationDuringSession) return;
         await displaySyncedLocation(reader, progress);
       }
-      if (showFeedback) showControls();
-    } catch {
-      // Opening the reader should stay quiet when the device is offline.
+      if (showFeedback) {
+        readerSyncMessage = 'Reading progress synced.';
+        showControls();
+      }
+    } catch (error) {
+      if (showFeedback && !destroyed && session === reader) {
+        readerSyncMessage =
+          error instanceof Error ? error.message : 'Reading progress could not sync.';
+        showControls();
+      }
     } finally {
       syncingLatest = false;
     }
@@ -1019,6 +1029,14 @@
     ></button>
   </nav>
 
+  {#if readerSyncMessage && controlsVisible}
+    <p
+      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
+      role="status"
+    >
+      {readerSyncMessage}
+    </p>
+  {/if}
   <p class="sr-only" role="status">{selectionMessage}</p>
   {#if selectedText && !hasOpenReaderPanel()}
     <div
@@ -1264,7 +1282,6 @@
         <div
           bind:this={syncConfirmationPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-w-sm"
-          data-reader-panel
           role="alertdialog"
           aria-modal="true"
           aria-labelledby="reader-sync-confirm-title"
@@ -1299,7 +1316,6 @@
         <div
           bind:this={settingsPanel}
           class="reader-settings card preset-filled-surface-50-950 relative"
-          data-reader-panel
           id="reader-appearance"
           role="dialog"
           aria-modal="true"
@@ -1491,7 +1507,6 @@
         <div
           bind:this={tocPanel}
           class="reader-settings card preset-filled-surface-50-950 relative"
-          data-reader-panel
           id="reader-contents"
           role="dialog"
           aria-modal="true"
@@ -1556,7 +1571,6 @@
         <div
           bind:this={searchPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
-          data-reader-panel
           id="reader-search"
           role="dialog"
           aria-modal="true"
@@ -1633,7 +1647,6 @@
         <div
           bind:this={bookmarksPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
-          data-reader-panel
           id="reader-bookmarks"
           role="dialog"
           aria-modal="true"
@@ -1774,7 +1787,6 @@
         <div
           bind:this={annotationsPanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
-          data-reader-panel
           id="reader-annotations"
           role="dialog"
           aria-modal="true"

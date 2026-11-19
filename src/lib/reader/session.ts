@@ -300,7 +300,6 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
-  private selectionListeners: Array<() => void> = [];
   private current: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
@@ -360,9 +359,6 @@ export class ReaderSession {
           }
         };
         contents.document.addEventListener('selectionchange', handler);
-        this.selectionListeners.push(() =>
-          contents.document.removeEventListener('selectionchange', handler),
-        );
       });
     }
     this.onLocation = onLocation;
@@ -506,7 +502,7 @@ export class ReaderSession {
     if (!normalizedQuery) return [];
     const results: ReaderSearchResult[] = [];
     const { sections } = this.getSpine();
-    const request = this.book.request as (url: string) => Promise<Document>;
+    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
 
     for (const section of sections) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -642,8 +638,6 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
-    this.selectionListeners.forEach((remove) => remove());
-    this.selectionListeners = [];
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
@@ -656,6 +650,18 @@ export class ReaderSession {
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
+    // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
+    const book = this.book as typeof this.book & {
+      archive?: { urlCache?: Record<string, string> };
+      resources?: { replacementUrls?: string[] };
+    };
+    const urls = new Set([
+      ...Object.values(book.archive?.urlCache ?? {}),
+      ...(book.resources?.replacementUrls ?? []),
+    ]);
+    for (const url of urls) {
+      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    }
     this.book.destroy();
   }
 
