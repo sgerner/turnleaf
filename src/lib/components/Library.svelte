@@ -80,7 +80,14 @@
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
-      return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id, !offline);
+      return cacheCover(
+        client.coverUrl(seriesId),
+        apiKey,
+        seriesId,
+        signal,
+        server.id,
+        await networkAvailable(),
+      );
     }
     if (offline) throw new Error('Offline');
     const blob = await client.getCover(seriesId, signal);
@@ -192,6 +199,7 @@
   let loading = $state(true);
   let refreshing = $state(false);
   let refreshWork: Promise<void> | null = null;
+  let refreshController: AbortController | null = null;
   let downloadingBookId = $state<string | null>(null);
   let downloadPercent = $state<number | null>(null);
   let cleanupInProgress = $state(false);
@@ -512,7 +520,7 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    offline = !(await Network.getStatus()).connected;
+    offline = !(await Network.getStatus().catch(() => null))?.connected;
     if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
@@ -529,6 +537,10 @@
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
           offline = !connected;
+          if (!connected) {
+            refreshController?.abort();
+            openProgressProbe?.abort();
+          }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
           offlineMessage = connected
@@ -581,6 +593,13 @@
     return handle.remove;
   }
 
+  async function networkAvailable(): Promise<boolean> {
+    if (offline || destroyed) return false;
+    if (!Capacitor.isNativePlatform()) return true;
+    const status = await Network.getStatus().catch(() => null);
+    return !offline && !destroyed && status?.connected === true;
+  }
+
   async function refreshSyncStatus(): Promise<void> {
     try {
       const status = await getSyncStatus(server.id);
@@ -604,7 +623,7 @@
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     try {
-      if (offline) {
+      if (!(await networkAvailable())) {
         if (showFeedback)
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
@@ -636,6 +655,7 @@
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', scheduleVirtualWindow);
     openProgressProbe?.abort();
+    refreshController?.abort();
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -643,7 +663,8 @@
   });
 
   function refresh(): Promise<void> {
-    if (destroyed) return Promise.resolve();
+    if (destroyed || offline) return Promise.resolve();
+    if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
     if (!refreshWork) {
       refreshWork = refreshCatalog().finally(() => {
         refreshWork = null;
@@ -654,23 +675,26 @@
 
   async function refreshCatalog(): Promise<void> {
     refreshing = true;
+    const controller = new AbortController();
+    refreshController = controller;
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
     message = '';
     try {
+      if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
-      const series = await client.getBookSeries();
+      const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (destroyed) return;
+        if (controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
           ...(
             await Promise.all(
               batch.map(async (item) => {
-                const detail = await client.getSeriesDetail(item.id);
+                const detail = await client.getSeriesDetail(item.id, controller.signal);
                 if (detail.incomplete) incomplete = true;
                 return mapSeriesToBooks(server.id, item, detail);
               }),
@@ -678,7 +702,7 @@
           ).flat(),
         );
       }
-      if (destroyed) return;
+      if (controller.signal.aborted) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -704,6 +728,7 @@
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
+      if (controller.signal.aborted) return;
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -740,6 +765,7 @@
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
     } finally {
+      refreshController = null;
       refreshing = false;
     }
   }
@@ -976,7 +1002,8 @@
             (async () => {
               // Compare revisions only after any previous upload has settled.
               await upload;
-              if (probe.signal.aborted || offline) return null;
+              if (probe.signal.aborted) return null;
+              if (!(await networkAvailable()) || probe.signal.aborted) return null;
               return client.getProgress(book.chapterId, probe.signal).catch(() => null);
             })(),
           ]);
@@ -1140,7 +1167,7 @@
     accept?: () => Promise<void>;
   } | null> {
     if (!manual && !pendingAutoSync) return null;
-    if (offline || book.remoteAvailable === false) {
+    if (book.remoteAvailable === false || !(await networkAvailable())) {
       if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
     }
