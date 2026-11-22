@@ -482,6 +482,35 @@ describe('Kavita annotations and personal ToC normalization', () => {
     expect(formatAnnotationCommentFields('   ')).toEqual({ comment: '', commentHtml: '' });
   });
 
+  it('safely extracts plain text from HTML comments without incomplete multi-character tag stripping or double unescaping', () => {
+    expect(
+      extractAnnotationNote(
+        null,
+        '<p>Line one<br>Line two<br />Line three</p>\n  <p></p>\n  <p>After blank</p>',
+        null,
+      ),
+    ).toBe('Line one\nLine two\nLine three\n\nAfter blank');
+    expect(
+      extractAnnotationNote(
+        null,
+        '<!-- <p>hidden</p> --><script>alert(1)</script><style>body{display:none}</style><p>Visible&#39;s &nbsp;note</p>',
+        null,
+      ),
+    ).toBe("Visible's  note");
+    expect(extractAnnotationNote(null, '<<br>script>alert(1)</script>', null)).not.toContain(
+      '<script',
+    );
+    expect(
+      extractAnnotationNote(null, '<scr<script>ipt>alert(1)</script>Note', null),
+    ).not.toContain('<script');
+    expect(
+      extractAnnotationNote(null, '<p>Keep</p><script src="https://evil.example/x.js"', null),
+    ).toBe('Keep');
+    expect(extractAnnotationNote(null, '<p>&amp;lt;script&amp;gt; &#x41; &#55296;</p>', null)).toBe(
+      '&lt;script&gt; A &#55296;',
+    );
+  });
+
   it('normalizes AnnotationDto payloads and falls back across comment fields', () => {
     const items = normalizeAnnotations([
       {

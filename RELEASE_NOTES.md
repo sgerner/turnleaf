@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Replace regex HTML tag stripping in annotation comment normalization
 - Sync annotations and bookmarks with Kavita and isolate study data per server
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2

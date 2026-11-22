@@ -276,18 +276,135 @@ function escapeHtmlText(value: string): string {
     .replaceAll("'", '&#39;');
 }
 
+function decodeHtmlEntities(text: string): string {
+  if (!text.includes('&')) return text;
+  return text.replace(
+    /&(?:#(\d+)|#x([0-9a-f]+)|([a-z0-9]+));/gi,
+    (match, dec: string | undefined, hex: string | undefined, named: string | undefined) => {
+      if (dec !== undefined) {
+        const codePoint = Number.parseInt(dec, 10);
+        return codePoint > 0 && codePoint <= 0x10ffff && (codePoint < 0xd800 || codePoint > 0xdfff)
+          ? String.fromCodePoint(codePoint)
+          : match;
+      }
+      if (hex !== undefined) {
+        const codePoint = Number.parseInt(hex, 16);
+        return codePoint > 0 && codePoint <= 0x10ffff && (codePoint < 0xd800 || codePoint > 0xdfff)
+          ? String.fromCodePoint(codePoint)
+          : match;
+      }
+      switch (named?.toLowerCase()) {
+        case 'nbsp':
+          return ' ';
+        case 'quot':
+          return '"';
+        case 'apos':
+          return "'";
+        case 'lt':
+          return '<';
+        case 'gt':
+          return '>';
+        case 'amp':
+          return '&';
+        default:
+          return match;
+      }
+    },
+  );
+}
+
+function isHtmlWhitespace(char: string): boolean {
+  return char === ' ' || char === '\t' || char === '\n' || char === '\r' || char === '\f';
+}
+
+function findRawTextElementEnd(
+  lowerHtml: string,
+  tagName: 'script' | 'style',
+  from: number,
+): number {
+  const closePrefix = `</${tagName}`;
+  let searchFrom = from;
+  while (searchFrom < lowerHtml.length) {
+    const candidate = lowerHtml.indexOf(closePrefix, searchFrom);
+    if (candidate === -1) return lowerHtml.length;
+    const afterName = candidate + closePrefix.length;
+    const boundary = lowerHtml[afterName];
+    if (boundary === undefined) return lowerHtml.length;
+    if (boundary === '>' || boundary === '/' || isHtmlWhitespace(boundary)) {
+      const endBracket = lowerHtml.indexOf('>', afterName);
+      return endBracket === -1 ? lowerHtml.length : endBracket + 1;
+    }
+    searchFrom = afterName;
+  }
+  return lowerHtml.length;
+}
+
 function stripSimpleHtml(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replaceAll('&nbsp;', ' ')
-    .replaceAll('&quot;', '"')
-    .replaceAll('&#39;', "'")
-    .replaceAll('&lt;', '<')
-    .replaceAll('&gt;', '>')
-    .replaceAll('&amp;', '&')
-    .trim();
+  const lowerHtml = html.toLowerCase();
+  const chunks: string[] = [];
+  let cursor = 0;
+
+  while (cursor < html.length) {
+    const tagStart = html.indexOf('<', cursor);
+    if (tagStart === -1) {
+      chunks.push(decodeHtmlEntities(html.slice(cursor)));
+      break;
+    }
+    if (tagStart > cursor) {
+      chunks.push(decodeHtmlEntities(html.slice(cursor, tagStart)));
+    }
+
+    if (lowerHtml.startsWith('<!--', tagStart)) {
+      const commentEnd = lowerHtml.indexOf('-->', tagStart + 4);
+      if (commentEnd === -1) break;
+      cursor = commentEnd + 3;
+      continue;
+    }
+
+    const tagEnd = html.indexOf('>', tagStart + 1);
+    if (tagEnd === -1) break;
+
+    const rawTag = lowerHtml.slice(tagStart + 1, tagEnd).trim();
+    cursor = tagEnd + 1;
+
+    let nameEnd = 0;
+    while (nameEnd < rawTag.length) {
+      const ch = rawTag[nameEnd]!;
+      if (isHtmlWhitespace(ch) || (ch === '/' && nameEnd > 0)) break;
+      nameEnd += 1;
+    }
+    const tagName = rawTag.slice(0, nameEnd);
+    const selfClosing = rawTag.endsWith('/');
+
+    if ((tagName === 'script' || tagName === 'style') && !selfClosing) {
+      cursor = findRawTextElementEnd(lowerHtml, tagName, cursor);
+      continue;
+    }
+
+    if (tagName === 'br') {
+      chunks.push('\n');
+      continue;
+    }
+
+    if (
+      tagName === '/p' ||
+      tagName === '/div' ||
+      tagName === '/li' ||
+      tagName === '/blockquote' ||
+      (tagName.length === 3 && tagName.startsWith('/h') && tagName[2]! >= '1' && tagName[2]! <= '6')
+    ) {
+      chunks.push('\n');
+      let next = cursor;
+      while (next < html.length && isHtmlWhitespace(html[next]!)) {
+        next += 1;
+      }
+      if (next < html.length && html[next] === '<') {
+        cursor = next;
+      }
+    }
+  }
+
+  return chunks.join('').trim();
 }
 
 function extractProseMirrorText(node: unknown): string | null {
