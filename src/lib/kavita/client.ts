@@ -426,6 +426,11 @@ export class KavitaClient {
       while (true) {
         this.assertCredentialReady(probe);
         response = await CapacitorHttp.request({ ...options, url: currentUrl });
+        if (!probe && (response.status === 401 || response.status === 403)) {
+          recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
+          this.localRejectedStatus = response.status;
+          markCredentialRejected(this.credentialEpoch, response.status);
+        }
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         const nextUrl = redirectTarget(
           response.status,
@@ -490,6 +495,10 @@ export class KavitaClient {
         connectTimeout: REQUEST_TIMEOUT_MS,
         readTimeout: REQUEST_TIMEOUT_MS,
       });
+      if (response.status === 401 || response.status === 403) {
+        this.localRejectedStatus = response.status;
+        markCredentialRejected(this.credentialEpoch, response.status);
+      }
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const nextUrl = redirectTarget(
         response.status,

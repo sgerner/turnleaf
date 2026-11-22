@@ -736,3 +736,31 @@ it('allows testConnection probes for a replacement key while saved credentials a
     bookLibraries: [{ id: 1, name: 'Books', type: 2 }],
   });
 });
+
+it('trips the credential breaker when an in-flight native request returns 401 after abort', async () => {
+  capacitorRuntime.native = true;
+  const loaded = syncLoadedCredential('stale-key', 'server_primary_api_key');
+  const controller = new AbortController();
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    controller.abort();
+    return {
+      status: 401,
+      headers: {},
+      url: 'https://books.example.com/api/Series/v2',
+      data: '',
+    };
+  });
+
+  const client = new KavitaClient('https://books.example.com', 'stale-key', {
+    credentialEpoch: loaded.epoch,
+  });
+  await expect(client.getBookSeries(controller.signal)).rejects.toMatchObject({
+    name: 'AbortError',
+  });
+  expect(getCredentialState()).toEqual({
+    status: 'rejected',
+    epoch: loaded.epoch,
+    statusCode: 401,
+  });
+  expect(client.canSendRequests()).toBe(false);
+});

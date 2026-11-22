@@ -220,6 +220,7 @@ async function run() {
       await web.close();
       web = undefined;
     }
+    await delay(250);
     await adb('shell', 'am', 'force-stop', packageName);
     await adb(
       'shell',
@@ -373,16 +374,18 @@ async function run() {
     await waitFor('replacement API key input', () =>
       web.evaluate("Boolean(document.querySelector('#replacement-api-key'))"),
     );
-    await web.evaluate(`(() => {
-      const input = document.querySelector('#replacement-api-key');
-      if (!input) return false;
-      input.value = ${JSON.stringify(rotatedKey)};
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      const submit = input.closest('form')?.querySelector('button[type="submit"]');
-      if (!submit || submit.disabled) return false;
-      submit.click();
-      return true;
-    })()`);
+    await waitFor('submit replacement API key', () =>
+      web.evaluate(`(() => {
+        const input = document.querySelector('#replacement-api-key');
+        if (!input) return false;
+        input.value = ${JSON.stringify(rotatedKey)};
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        const submit = input.closest('form')?.querySelector('button[type="submit"]');
+        if (!submit || submit.disabled) return false;
+        submit.click();
+        return true;
+      })()`),
+    );
     await waitFor('queued passage uploaded after key rotation', () =>
       fixture.uploads
         .slice(uploadCount)
