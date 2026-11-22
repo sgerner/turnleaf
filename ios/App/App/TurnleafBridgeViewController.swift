@@ -22,10 +22,6 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         TurnleafReaderChromeController.shared.enabled
     }
 
-    override var prefersHomeIndicatorAutoHidden: Bool {
-        TurnleafReaderChromeController.shared.enabled
-    }
-
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
         TurnleafReaderChromeController.shared.enabled ? [.bottom] : []
     }
