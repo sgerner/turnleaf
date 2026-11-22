@@ -45,6 +45,15 @@ interface EpubTocItem {
   subitems?: EpubTocItem[];
 }
 
+const TURNLEAF_STYLE_ID = 'epubjs-inserted-css-turnleaf';
+
+type ResolvedModeColors = {
+  background: string;
+  text: string;
+  link: string;
+  selection: string;
+};
+
 const MODE_COLORS = {
   light: {
     background: '--color-surface-50',
@@ -309,6 +318,12 @@ export class ReaderSession {
   private userNavigationStartCfi: string | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
+  private readonly paletteCache = new Map<string, ResolvedModeColors>();
+  private themeCss = '';
+  private pendingLayoutCss: string | null = null;
+  private reflowFrame: number | null = null;
+  private reflowInFlight = false;
+  private reflowAnchorCfi: string | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -382,6 +397,9 @@ export class ReaderSession {
         (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
+      if (!isUserNavigation && this.hasQueuedLayoutReflow()) {
+        return;
+      }
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
@@ -393,7 +411,8 @@ export class ReaderSession {
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
-        this.preserveCfi(location.start.cfi, this.locationGeneration);
+        this.reflowAnchorCfi = location.start.cfi;
+        this.scheduleLayoutReflow(this.locationGeneration);
       }
     };
     this.rendition.on('relocated', this.relocated);
@@ -588,17 +607,6 @@ export class ReaderSession {
     this.appearance = { ...value };
     const rendition = this.rendition;
     if (!rendition) return;
-    const themeChanged =
-      !previous ||
-      previous.mode !== value.mode ||
-      previous.fontFamily !== value.fontFamily ||
-      previous.fontSize !== value.fontSize ||
-      previous.lineHeight !== value.lineHeight ||
-      previous.margin !== value.margin ||
-      previous.bottomMargin !== value.bottomMargin ||
-      previous.paragraphSpacing !== value.paragraphSpacing ||
-      previous.alignment !== value.alignment ||
-      previous.hyphenation !== value.hyphenation;
     const layoutChanged =
       previous !== null &&
       (previous.fontFamily !== value.fontFamily ||
@@ -609,54 +617,35 @@ export class ReaderSession {
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
         previous.hyphenation !== value.hyphenation);
-    if (!themeChanged) return;
-    const colors = MODE_COLORS[value.mode];
-    const family =
-      value.fontFamily === 'book'
-        ? 'Iowan Old Style, Georgia, serif'
-        : value.fontFamily === 'accessible'
-          ? 'Atkinson Hyperlegible, Verdana, sans-serif'
-          : 'Avenir Next, Segoe UI, sans-serif';
-    rendition.themes.register('turnleaf', {
-      html: {
-        background: `${this.resolveToken(colors.background)} !important`,
-        'box-sizing': 'border-box',
-      },
-      body: {
-        color: `${this.resolveToken(colors.text)} !important`,
-        background: `${this.resolveToken(colors.background)} !important`,
-        'font-family': `${family} !important`,
-        'font-size': `${value.fontSize}px !important`,
-        'line-height': `${value.lineHeight} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
-        'box-sizing': 'border-box',
-      },
-      p: {
-        'margin-bottom': `${value.paragraphSpacing}em !important`,
-        'text-align': `${value.alignment} !important`,
-        hyphens: value.hyphenation ? 'auto' : 'none',
-      },
-      'img, svg, video, canvas, table, pre, blockquote': {
-        'max-width': '100% !important',
-      },
-      img: {
-        height: 'auto !important',
-      },
-      a: { color: `${this.resolveToken(colors.link)} !important` },
-      '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
-    });
-    rendition.themes.select('turnleaf');
-    if (!layoutChanged) return;
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
-    if (!cfi) return;
+    const nextCss = this.buildThemeCss(value, this.resolveModeColors(value.mode));
+    if (nextCss === this.themeCss && !layoutChanged) return;
+    this.themeCss = nextCss;
+    if (!layoutChanged) {
+      if (this.pendingLayoutCss !== null) {
+        this.pendingLayoutCss = nextCss;
+      } else {
+        this.syncThemeCss(nextCss);
+      }
+      return;
+    }
+    const anchorCfi =
+      this.reflowAnchorCfi ?? this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    if (!anchorCfi) {
+      this.syncThemeCss(nextCss);
+      return;
+    }
     if (this.userNavigationPending) {
+      this.pendingLayoutCss = nextCss;
       this.reflowPending = true;
       return;
     }
-    this.preserveCfi(cfi, this.locationGeneration);
+    this.reflowAnchorCfi = anchorCfi;
+    this.pendingLayoutCss = nextCss;
+    this.scheduleLayoutReflow(this.locationGeneration);
   }
 
   destroy(): void {
+    this.cancelPendingReflow(false);
     this.locationGeneration += 1;
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
@@ -674,8 +663,9 @@ export class ReaderSession {
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
+    this.themeCss = '';
+    this.paletteCache.clear();
     this.highlightCfis.clear();
-    this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
     // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
@@ -693,8 +683,11 @@ export class ReaderSession {
     this.book.destroy();
   }
 
-  private harden(contents: Contents): Promise<void> {
-    return sanitizeEpubDocument(contents.document, this.stylesheetCache);
+  private async harden(contents: Contents): Promise<void> {
+    await sanitizeEpubDocument(contents.document, this.stylesheetCache);
+    if (this.themeCss) {
+      this.applyThemeCssToDocument(contents.document, this.themeCss);
+    }
   }
 
   private observeViewport(target: HTMLElement): void {
@@ -809,6 +802,7 @@ export class ReaderSession {
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
+    this.cancelPendingReflow(true);
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
@@ -822,6 +816,7 @@ export class ReaderSession {
   private beginLinkedNavigation(): void {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
+    this.cancelPendingReflow(true);
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
@@ -833,14 +828,116 @@ export class ReaderSession {
     return generation === this.locationGeneration && this.rendition !== null;
   }
 
-  private preserveCfi(cfi: string, generation: number): void {
+  private hasQueuedLayoutReflow(): boolean {
+    return this.reflowFrame !== null || (this.pendingLayoutCss !== null && !this.reflowPending);
+  }
+
+  private cancelPendingReflow(flushCss: boolean): void {
+    if (this.reflowFrame !== null) {
+      cancelAnimationFrame(this.reflowFrame);
+      this.reflowFrame = null;
+    }
+    const pendingCss = this.pendingLayoutCss;
+    this.pendingLayoutCss = null;
+    this.reflowAnchorCfi = null;
+    this.reflowPending = false;
+    this.reflowInFlight = false;
+    if (flushCss && pendingCss !== null) {
+      this.syncThemeCss(pendingCss);
+    }
+  }
+
+  private scheduleLayoutReflow(generation: number): void {
+    if (this.reflowFrame !== null || this.reflowInFlight) return;
+    this.reflowFrame = requestAnimationFrame(() => {
+      this.reflowFrame = null;
+      void this.flushLayoutReflow(generation);
+    });
+  }
+
+  private async flushLayoutReflow(generation: number): Promise<void> {
     const rendition = this.rendition;
-    if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
+    if (
+      !rendition ||
+      !this.isCurrentLocationOperation(generation) ||
+      this.userNavigationPending ||
+      this.reflowInFlight
+    ) {
       return;
     }
-    void rendition.display(cfi).catch(() => {
+    const css = this.pendingLayoutCss;
+    const cfi = this.reflowAnchorCfi;
+    if (css === null || !cfi) {
+      if (css !== null) {
+        this.pendingLayoutCss = null;
+        this.syncThemeCss(css);
+      }
+      this.reflowAnchorCfi = null;
+      return;
+    }
+    this.pendingLayoutCss = null;
+    this.reflowInFlight = true;
+    this.syncThemeCss(css);
+    try {
+      await rendition.display(cfi);
+    } catch {
       // The current passage may disappear while a reflow is being applied.
-    });
+    } finally {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.reflowInFlight = false;
+        if (this.pendingLayoutCss !== null && !this.userNavigationPending) {
+          this.scheduleLayoutReflow(generation);
+        } else if (this.pendingLayoutCss === null && this.reflowFrame === null) {
+          this.reflowAnchorCfi = null;
+        }
+      }
+    }
+  }
+
+  private buildThemeCss(value: Appearance, colors: ResolvedModeColors): string {
+    const family =
+      value.fontFamily === 'book'
+        ? 'Iowan Old Style, Georgia, serif'
+        : value.fontFamily === 'accessible'
+          ? 'Atkinson Hyperlegible, Verdana, sans-serif'
+          : 'Avenir Next, Segoe UI, sans-serif';
+    return [
+      `html { background: ${colors.background} !important; box-sizing: border-box; }`,
+      `body { color: ${colors.text} !important; background: ${colors.background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; padding: 0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important; box-sizing: border-box; }`,
+      `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${value.hyphenation ? 'auto' : 'none'}; }`,
+      'img, svg, video, canvas, table, pre, blockquote { max-width: 100% !important; }',
+      'img { height: auto !important; }',
+      `a { color: ${colors.link} !important; }`,
+      `::selection { background: ${colors.selection} !important; }`,
+    ].join('\n');
+  }
+
+  private syncThemeCss(css: string): void {
+    const rawContents = (this.rendition?.getContents?.() ?? []) as unknown;
+    const list = Array.isArray(rawContents) ? rawContents : [rawContents];
+    for (const item of list) {
+      this.applyThemeCssToDocument((item as Contents | null | undefined)?.document, css);
+    }
+  }
+
+  private applyThemeCssToDocument(document: Document | null | undefined, css: string): void {
+    if (!document) return;
+    let style = document.getElementById(TURNLEAF_STYLE_ID) as HTMLStyleElement | null;
+    if (!style) {
+      const head =
+        document.head ??
+        document.documentElement?.insertBefore(
+          document.createElement('head'),
+          document.documentElement.firstChild,
+        );
+      if (!head) return;
+      style = document.createElement('style');
+      style.id = TURNLEAF_STYLE_ID;
+      head.appendChild(style);
+    }
+    if (style.textContent !== css) {
+      style.textContent = css;
+    }
   }
 
   private getSpine(): NonNullable<ReaderSession['spine']> {
@@ -861,7 +958,21 @@ export class ReaderSession {
     return Math.max(0, runtimePage.index ?? 0);
   }
 
-  private resolveToken(token: string): string {
-    return getComputedStyle(document.documentElement).getPropertyValue(token).trim() || token;
+  private resolveModeColors(mode: Appearance['mode']): ResolvedModeColors {
+    const root = document.documentElement;
+    const cacheKey = `${mode}\0${root.dataset.theme ?? ''}\0${root.dataset.mode ?? ''}\0${root.getAttribute('style') ?? ''}`;
+    const cached = this.paletteCache.get(cacheKey);
+    if (cached) return cached;
+    const computed = getComputedStyle(root);
+    const tokens = MODE_COLORS[mode];
+    const resolve = (token: string): string => computed.getPropertyValue(token).trim() || token;
+    const resolved: ResolvedModeColors = {
+      background: resolve(tokens.background),
+      text: resolve(tokens.text),
+      link: resolve(tokens.link),
+      selection: resolve(tokens.selection),
+    };
+    this.paletteCache.set(cacheKey, resolved);
+    return resolved;
   }
 }
