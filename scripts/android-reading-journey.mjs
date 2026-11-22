@@ -178,6 +178,96 @@ const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).som
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
 
+const readerSnapshotExpression = `(() => {
+  const shell = document.querySelector('.reader-shell');
+  const viewport = document.querySelector('.reader-viewport');
+  const frame = viewport?.querySelector('iframe');
+  const doc = frame?.contentDocument;
+  if (!shell || !viewport || !frame || !doc) return null;
+  const liveText =
+    shell.querySelector('[aria-live="polite"]')?.textContent?.replace(/\\s+/g, ' ').trim() ?? '';
+  const pageMatch = liveText.match(/,\\s*page\\s+(\\d+)\\s+of\\s+(\\d+),/i);
+  if (!pageMatch) return null;
+  const progressAttr = shell.querySelector('.reader-progress')?.getAttribute('aria-valuenow');
+  const progressNow = progressAttr === null || progressAttr === undefined ? NaN : Number(progressAttr);
+  const headingEl = doc.querySelector('h1');
+  const heading = headingEl?.textContent?.trim() ?? null;
+  const viewportRect = viewport.getBoundingClientRect();
+  const frameRect = frame.getBoundingClientRect();
+  const inViewport = (el) => {
+    const rect = el.getBoundingClientRect();
+    const left = frameRect.left + rect.left;
+    const right = frameRect.left + rect.right;
+    const top = frameRect.top + rect.top;
+    const bottom = frameRect.top + rect.bottom;
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      right > viewportRect.left + 8 &&
+      left < viewportRect.right - 8 &&
+      bottom > viewportRect.top + 8 &&
+      top < viewportRect.bottom - 8
+    );
+  };
+  const headingVisible = headingEl ? inViewport(headingEl) : false;
+  const visibleParagraphs = Array.from(doc.querySelectorAll('p'))
+    .filter((el) => inViewport(el))
+    .map((el) => el.textContent?.replace(/\\s+/g, ' ').trim().slice(0, 32) ?? '')
+    .filter(Boolean);
+  return {
+    heading,
+    headingVisible,
+    liveText,
+    page: Number(pageMatch[1]),
+    pageCount: Number(pageMatch[2]),
+    progressNow,
+    visibleParagraphs,
+  };
+})()`;
+
+const querySqliteRows = (statement) => `Capacitor.Plugins.CapacitorSQLite.query({
+  database: 'turnleaf',
+  statement: ${JSON.stringify(statement)},
+  values: [],
+  readonly: false,
+}).then((res) => res?.values ?? [])`;
+
+function isMidChapterTwoSnapshot(snapshot) {
+  if (!snapshot || snapshot.heading !== 'Chapter 2') return false;
+  if (!Number.isFinite(snapshot.page) || !Number.isFinite(snapshot.pageCount)) return false;
+  if (snapshot.pageCount < 3) return false;
+  const minMidPage = snapshot.pageCount >= 4 ? 3 : 2;
+  return (
+    snapshot.page >= minMidPage &&
+    snapshot.page < snapshot.pageCount &&
+    snapshot.headingVisible === false &&
+    Number.isFinite(snapshot.progressNow) &&
+    snapshot.progressNow > 50 &&
+    snapshot.visibleParagraphs.length > 0 &&
+    !snapshot.visibleParagraphs.some((snippet) => snippet.startsWith('Chapter 2, paragraph 1.'))
+  );
+}
+
+async function advanceToMidChapterTwo(web) {
+  let current = await waitFor('initial reader page snapshot', () =>
+    web.evaluate(readerSnapshotExpression),
+  );
+  for (let step = 0; step < 20; step += 1) {
+    if (isMidChapterTwoSnapshot(current)) return current;
+    const previousLiveText = current.liveText;
+    await waitFor(`next-page control (step ${step + 1})`, () =>
+      web.evaluate(click('[aria-label="Next page"]')),
+    );
+    current = await waitFor(`page relocation (step ${step + 1})`, async () => {
+      const next = await web.evaluate(readerSnapshotExpression);
+      return next && next.liveText !== previousLiveText ? next : null;
+    });
+  }
+  throw new Error(
+    `Did not reach a mid-chapter page in Chapter 2 after 20 page turns (last=${JSON.stringify(current)}).`,
+  );
+}
+
 let receivedSignal;
 
 function throwIfInterrupted() {
@@ -244,23 +334,56 @@ async function run() {
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
-    await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
-    await waitFor('second chapter', () => web.evaluate(chapter(2)));
-    await waitFor('reader position in the second chapter', () =>
-      web.evaluate(
-        'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
-      ),
+
+    const midChapterTarget = await advanceToMidChapterTwo(web);
+    const anchorParagraph = midChapterTarget.visibleParagraphs[0];
+    const committedProgress = await waitFor(
+      'persisted mid-chapter SQLite progress while Reader remains mounted',
+      async () => {
+        const readerMounted = await web.evaluate(
+          "Boolean(document.querySelector('.reader-shell .reader-viewport iframe'))",
+        );
+        if (!readerMounted) {
+          throw new Error('Reader unmounted unexpectedly before am force-stop.');
+        }
+        const rows = await web.evaluate(
+          querySqliteRows(
+            `SELECT r.cfi, r.kavita_xpath, r.percentage, r.pending_sync, q.revision
+             FROM reading_state r
+             JOIN sync_queue q ON q.book_id = r.book_id`,
+          ),
+        );
+        if (!Array.isArray(rows) || rows.length !== 1) return null;
+        const row = rows[0];
+        const xpathMatch =
+          typeof row.kavita_xpath === 'string'
+            ? row.kavita_xpath.match(/^\/\/body\/DocFragment\[2\]\/body\/p\[(\d+)\]$/)
+            : null;
+        const paragraphNumber = xpathMatch ? Number(xpathMatch[1]) : 0;
+        if (
+          Number(row.pending_sync) === 1 &&
+          typeof row.cfi === 'string' &&
+          row.cfi.startsWith('epubcfi(') &&
+          paragraphNumber > 1 &&
+          Math.round(Number(row.percentage) * 100) === midChapterTarget.progressNow
+        ) {
+          return {
+            cfi: row.cfi,
+            xpath: row.kavita_xpath,
+            percentage: Number(row.percentage),
+            revision: Number(row.revision),
+          };
+        }
+        return null;
+      },
     );
-    await waitFor('return to library control', async () => {
-      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
-      await web.evaluate(click('[aria-label="Show reading controls"]'));
-      return false;
-    });
-    await waitFor('saved offline progress', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+
+    const stillMountedBeforeStop = await web.evaluate(
+      "Boolean(document.querySelector('.reader-shell .reader-viewport iframe'))",
     );
+    if (!stillMountedBeforeStop) {
+      throw new Error('Expected Reader.svelte to remain mounted immediately before force-stop.');
+    }
 
     const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
     await web.close();
@@ -275,8 +398,27 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
+    await waitFor('offline library with pending sync banner', () =>
+      web.evaluate(`(() => {
+        const card = document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]');
+        const warnings = Array.from(document.querySelectorAll('.alert.preset-tonal-warning'));
+        return Boolean(
+          card &&
+          warnings.some((el) => el.textContent?.includes('1 reading progress update waiting to sync.'))
+        );
+      })()`),
+    );
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
-    await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
+    await waitFor('exact mid-chapter offline passage restored after force-stop', async () => {
+      const restored = await web.evaluate(readerSnapshotExpression);
+      if (!isMidChapterTwoSnapshot(restored)) return false;
+      return (
+        restored.page === midChapterTarget.page &&
+        restored.pageCount === midChapterTarget.pageCount &&
+        restored.progressNow === midChapterTarget.progressNow &&
+        restored.visibleParagraphs.includes(anchorParagraph)
+      );
+    });
     if (fixture.offlineRequests.length > 0) {
       throw new Error(
         `Turnleaf sent authenticated requests offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
@@ -287,12 +429,12 @@ async function run() {
     await adb('shell', 'svc', 'wifi', 'enable');
     await adb('shell', 'svc', 'data', 'enable');
     disabledNetwork = false;
-    await waitFor('queued passage uploaded after reconnect', () =>
+    await waitFor('queued mid-chapter passage uploaded after reconnect', () =>
       fixture.uploads
         .slice(uploadCount)
         .some(
           (progress) =>
-            progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
+            progress.chapterId === 1 && progress.bookScrollId === committedProgress.xpath,
         ),
     );
     await waitFor('return to library after reconnect', async () => {
@@ -300,11 +442,25 @@ async function run() {
       await web.evaluate(click('[aria-label="Show reading controls"]'));
       return false;
     });
-    await waitFor('saved passage after reconnect', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
-    );
+    await waitFor('synced passage in library with zero pending sync warning banners', async () => {
+      const domReady = await web.evaluate(`(() => {
+        const card = document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]');
+        const warning = document.querySelector('.alert.preset-tonal-warning');
+        return Boolean(card && !warning);
+      })()`);
+      if (!domReady) return false;
+      const queueRows = await web.evaluate(
+        querySqliteRows('SELECT COUNT(*) AS count FROM sync_queue'),
+      );
+      const readingRows = await web.evaluate(
+        querySqliteRows('SELECT pending_sync FROM reading_state'),
+      );
+      return (
+        Number(queueRows?.[0]?.count ?? -1) === 0 &&
+        readingRows?.length === 1 &&
+        Number(readingRows[0]?.pending_sync) === 0
+      );
+    });
     throwIfInterrupted();
     journeyPassed = true;
   } catch (error) {
@@ -339,7 +495,9 @@ async function run() {
     throw journeyError;
   }
   if (cleanupError) throw cleanupError;
-  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+  console.log(
+    'Android reading journey passed: connect, download, force-stop mid-chapter offline, restore exact passage, sync.',
+  );
 }
 
 await run().catch((error) => {

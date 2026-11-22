@@ -52,9 +52,16 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
   return record;
 }
 
+let sqlite: SQLiteConnection | null = null;
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
+const trackedConnections = new WeakSet<SQLiteDBConnection>();
+
+function getSqliteConnection(): SQLiteConnection {
+  sqlite ??= new SQLiteConnection(CapacitorSQLite);
+  return sqlite;
+}
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -105,8 +112,9 @@ async function executeNativeRun(
 async function executeNativeStatement(
   db: Pick<SQLiteDBConnection, 'execute'>,
   statement: string,
+  transaction = true,
 ): Promise<void> {
-  await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
+  await enqueueNativeWrite(() => db.execute(statement, transaction).then(() => undefined));
 }
 
 function createBrowserState(): BrowserDatabaseState {
@@ -188,17 +196,33 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
 }
 
 async function openNativeDatabase(): Promise<SQLiteDBConnection> {
-  const sqlite = new SQLiteConnection(CapacitorSQLite);
-  const consistency = await sqlite.checkConnectionsConsistency();
-  const existing = (await sqlite.isConnection('turnleaf', false)).result;
+  const manager = getSqliteConnection();
+  const consistency = await manager.checkConnectionsConsistency();
+  const existing = (await manager.isConnection('turnleaf', false)).result;
   const db =
     consistency.result && existing
-      ? await sqlite.retrieveConnection('turnleaf', false)
-      : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
+      ? await manager.retrieveConnection('turnleaf', false)
+      : await manager.createConnection('turnleaf', false, 'no-encryption', 1, false);
+  if (!trackedConnections.has(db)) {
+    trackedConnections.add(db);
+    const close = db.close.bind(db);
+    db.close = async () => {
+      try {
+        await close();
+      } finally {
+        if (connection === db) connection = null;
+      }
+    };
+  }
   await db.open();
-  await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
-  return db;
+  try {
+    await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;', false);
+    await migrate(db);
+    return db;
+  } catch (error) {
+    await db.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function resetLocalDatabase(): Promise<void> {
@@ -207,7 +231,14 @@ export async function resetLocalDatabase(): Promise<void> {
     return;
   }
 
+  const manager = getSqliteConnection();
   try {
+    if (opening) {
+      await opening.catch(() => undefined);
+    }
+    await nativeTransactionQueue;
+    const hadConnection =
+      Boolean(connection) || Boolean((await manager.isConnection('turnleaf', false)).result);
     if (connection) {
       try {
         await connection.close();
@@ -217,7 +248,13 @@ export async function resetLocalDatabase(): Promise<void> {
     }
     connection = null;
     opening = null;
+    if (!hadConnection) {
+      await manager.createConnection('turnleaf', false, 'no-encryption', 1, false);
+    }
     await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+    if ((await manager.isConnection('turnleaf', false)).result) {
+      await manager.closeConnection('turnleaf', false);
+    }
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
   }
@@ -244,9 +281,15 @@ export async function saveServer(config: ServerConfig): Promise<void> {
   const db = await openDatabase();
   await executeNativeRun(
     db,
-    `INSERT OR REPLACE INTO server_config
+    `INSERT INTO server_config
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
-      VALUES (?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        display_name=excluded.display_name,
+        base_url=excluded.base_url,
+        credential_ref=excluded.credential_ref,
+        kavita_version=excluded.kavita_version,
+        last_connected_at=excluded.last_connected_at`,
     [
       config.id,
       config.displayName,

@@ -966,7 +966,12 @@
       }
       await removeDownload(book.id);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : 'storage error';
+      const detail =
+        error instanceof Error
+          ? error.message
+          : typeof error === 'string' && error.trim()
+            ? error
+            : 'storage error';
       message = fileCleared
         ? `${book.title}'s file was removed, but Turnleaf could not update its saved status. Try removing it again.`
         : `Could not remove ${book.title}: ${detail}`;

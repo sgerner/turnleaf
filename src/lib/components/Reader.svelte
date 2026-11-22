@@ -888,7 +888,9 @@
       error =
         cause instanceof Error
           ? cause.message
-          : 'Kavita’s latest reading position could not be opened.';
+          : typeof cause === 'string' && cause.trim()
+            ? cause
+            : 'Kavita’s latest reading position could not be opened.';
     }
     showControls();
   }
@@ -919,7 +921,11 @@
     } catch (error) {
       if (showFeedback && !destroyed && session === reader) {
         readerSyncMessage =
-          error instanceof Error ? error.message : 'Reading progress could not sync.';
+          error instanceof Error
+            ? error.message
+            : typeof error === 'string' && error.trim()
+              ? error
+              : 'Reading progress could not sync.';
         showControls();
       }
     } finally {

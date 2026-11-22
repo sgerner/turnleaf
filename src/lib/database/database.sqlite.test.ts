@@ -1,15 +1,46 @@
 // @vitest-environment node
 
-import { DatabaseSync } from 'node:sqlite';
-import type { SQLInputValue } from 'node:sqlite';
-import type { capTask } from '@capacitor-community/sqlite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { SQLiteDBConnection } from '@capacitor-community/sqlite';
+import type * as CapacitorSQLiteModule from '@capacitor-community/sqlite';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SQLiteTestBridge } from './sqlite-test-bridge';
+
+const hoisted = vi.hoisted(() => ({
+  bridge: null as SQLiteTestBridge | null,
+}));
+
+vi.mock('@capacitor/core', () => ({
+  Capacitor: {
+    isNativePlatform: () => true,
+  },
+  registerPlugin: () => ({}),
+}));
+
+vi.mock('@capacitor-community/sqlite', async (importOriginal) => {
+  const actual = await importOriginal<typeof CapacitorSQLiteModule>();
+  const { createSQLiteTestBridge } = await import('./sqlite-test-bridge');
+  hoisted.bridge ??= createSQLiteTestBridge('turnleaf-meta-');
+  return {
+    ...actual,
+    CapacitorSQLite: hoisted.bridge.plugin as unknown as typeof actual.CapacitorSQLite,
+  };
+});
+
 import {
+  openDatabase,
   reconcileBooksInTransaction,
   replaceBooksInTransaction,
+  resetLocalDatabase,
+  saveServer,
   type BookRecord,
 } from './database';
-import { migrations } from './schema';
+
+function getBridge(): SQLiteTestBridge {
+  if (!hoisted.bridge) {
+    throw new Error('SQLite test bridge was not initialized');
+  }
+  return hoisted.bridge;
+}
 
 const baseBook: BookRecord = {
   id: 'server:1:10',
@@ -32,60 +63,43 @@ const baseBook: BookRecord = {
   fileSize: 1234,
 };
 
-function createDatabase(): DatabaseSync {
-  const db = new DatabaseSync(':memory:');
-  db.exec('PRAGMA foreign_keys = ON;');
-  for (const migration of migrations) db.exec(migration.statements);
-  db.prepare(
-    `INSERT INTO server_config
-      (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
-      VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(
-    'server',
-    'Test server',
-    'https://books.example.com',
-    'credential',
-    null,
-    baseBook.createdAt,
-  );
+async function createDatabase(): Promise<SQLiteDBConnection> {
+  const db = await openDatabase();
+  expect(db).toBeInstanceOf(SQLiteDBConnection);
+  await saveServer({
+    id: 'server',
+    displayName: 'Test server',
+    baseUrl: 'https://books.example.com',
+    credentialRef: 'credential',
+    kavitaVersion: null,
+    lastConnectedAt: baseBook.createdAt,
+  });
   return db;
 }
 
-function createAdapter(
-  db: DatabaseSync,
-): Pick<Parameters<typeof replaceBooksInTransaction>[0], 'executeTransaction'> {
-  return {
-    executeTransaction(tasks: capTask[]): Promise<{ changes: { changes: number } }> {
-      db.exec('BEGIN');
-      try {
-        for (const task of tasks) {
-          const statement = db.prepare(task.statement);
-          statement.run(...((task.values ?? []) as SQLInputValue[]));
-        }
-        db.exec('COMMIT');
-        return Promise.resolve({ changes: { changes: tasks.length } });
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
-    },
-  };
-}
-
-function readBook(db: DatabaseSync, id: string): Record<string, unknown> | undefined {
-  return db.prepare('SELECT * FROM books WHERE id=?').get(id) as
-    Record<string, unknown> | undefined;
+async function readBook(
+  db: SQLiteDBConnection,
+  id: string,
+): Promise<Record<string, unknown> | undefined> {
+  const result = await db.query('SELECT * FROM books WHERE id=?', [id]);
+  return result.values?.[0] as Record<string, unknown> | undefined;
 }
 
 describe('native metadata transactions against SQLite', () => {
-  let db: DatabaseSync;
+  beforeEach(() => {
+    getBridge().useNewDirectory('turnleaf-meta-');
+  });
 
-  afterEach(() => db.close());
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    getBridge().clearFaults();
+    await resetLocalDatabase().catch(() => undefined);
+    getBridge().cleanup();
+  });
 
   it('commits a refresh while retaining local download columns', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
-    await replaceBooksInTransaction(adapter, 'server', [baseBook], '2026-09-08T00:00:00.000Z');
+    const db = await createDatabase();
+    await replaceBooksInTransaction(db, 'server', [baseBook], '2026-09-08T00:00:00.000Z');
     const refreshed = {
       ...baseBook,
       title: 'Updated title',
@@ -94,9 +108,9 @@ describe('native metadata transactions against SQLite', () => {
       fileSize: null,
     };
 
-    await replaceBooksInTransaction(adapter, 'server', [refreshed], '2026-09-09T00:00:00.000Z');
+    await replaceBooksInTransaction(db, 'server', [refreshed], '2026-09-09T00:00:00.000Z');
 
-    expect(readBook(db, baseBook.id)).toMatchObject({
+    expect(await readBook(db, baseBook.id)).toMatchObject({
       title: 'Updated title',
       download_path: baseBook.downloadPath,
       download_status: baseBook.downloadStatus,
@@ -106,11 +120,10 @@ describe('native metadata transactions against SQLite', () => {
   });
 
   it('preserves SQLite progress when a remote snapshot omits it, but applies a known zero', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
-    await replaceBooksInTransaction(adapter, 'server', [baseBook]);
+    const db = await createDatabase();
+    await replaceBooksInTransaction(db, 'server', [baseBook]);
 
-    await replaceBooksInTransaction(adapter, 'server', [
+    await replaceBooksInTransaction(db, 'server', [
       {
         ...baseBook,
         title: 'Updated with incomplete progress',
@@ -120,13 +133,13 @@ describe('native metadata transactions against SQLite', () => {
       },
     ]);
 
-    expect(readBook(db, baseBook.id)).toMatchObject({
+    expect(await readBook(db, baseBook.id)).toMatchObject({
       title: 'Updated with incomplete progress',
       pages_read: baseBook.pagesRead,
       last_read_at: baseBook.lastReadAt,
     });
 
-    await replaceBooksInTransaction(adapter, 'server', [
+    await replaceBooksInTransaction(db, 'server', [
       {
         ...baseBook,
         pagesRead: 0,
@@ -135,12 +148,12 @@ describe('native metadata transactions against SQLite', () => {
       },
     ]);
 
-    expect(readBook(db, baseBook.id)).toMatchObject({
+    expect(await readBook(db, baseBook.id)).toMatchObject({
       pages_read: 0,
       last_read_at: '2026-02-02T00:00:00.000Z',
     });
 
-    await replaceBooksInTransaction(adapter, 'server', [
+    await replaceBooksInTransaction(db, 'server', [
       {
         ...baseBook,
         pagesRead: 7,
@@ -150,16 +163,15 @@ describe('native metadata transactions against SQLite', () => {
       },
     ]);
 
-    expect(readBook(db, baseBook.id)).toMatchObject({
+    expect(await readBook(db, baseBook.id)).toMatchObject({
       pages_read: 7,
       last_read_at: '2026-02-02T00:00:00.000Z',
     });
   });
 
   it('rolls back every task when a later metadata row violates SQLite constraints', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
-    await replaceBooksInTransaction(adapter, 'server', [baseBook], '2026-09-08T00:00:00.000Z');
+    const db = await createDatabase();
+    await replaceBooksInTransaction(db, 'server', [baseBook], '2026-09-08T00:00:00.000Z');
     const invalid = {
       ...baseBook,
       id: 'server:1:11',
@@ -168,19 +180,15 @@ describe('native metadata transactions against SQLite', () => {
     };
 
     await expect(
-      replaceBooksInTransaction(adapter, 'server', [
-        { ...baseBook, title: 'First update' },
-        invalid,
-      ]),
-    ).rejects.toThrow();
+      replaceBooksInTransaction(db, 'server', [{ ...baseBook, title: 'First update' }, invalid]),
+    ).rejects.toEqual(expect.stringMatching(/NOT NULL constraint failed: books\.title/i));
 
-    expect(readBook(db, baseBook.id)).toMatchObject({ title: 'Book' });
-    expect(readBook(db, invalid.id)).toBeUndefined();
+    expect(await readBook(db, baseBook.id)).toMatchObject({ title: 'Book' });
+    expect(await readBook(db, invalid.id)).toBeUndefined();
   });
 
   it('marks retained removals unavailable and deletes unretained removals atomically', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
+    const db = await createDatabase();
     const retained = { ...baseBook, id: 'server:1:10' };
     const removable = {
       ...baseBook,
@@ -199,37 +207,36 @@ describe('native metadata transactions against SQLite', () => {
       fileSize: null,
     };
     const cfi = 'epubcfi(/6/4!/4/2/1:12)';
-    await replaceBooksInTransaction(adapter, 'server', [retained, removable, withSyncedProgress]);
-    db.prepare(
+    await replaceBooksInTransaction(db, 'server', [retained, removable, withSyncedProgress]);
+    await db.run(
       `INSERT INTO reading_state
       (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
        server_updated_at,pending_sync)
       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-    ).run(
-      withSyncedProgress.id,
-      cfi,
-      '/html/body/p[2]',
-      0.25,
-      '2026-09-07T00:00:00.000Z',
-      '2026-09-07T00:00:00.000Z',
-      '2026-09-07T00:00:00.000Z',
+      [
+        withSyncedProgress.id,
+        cfi,
+        '/html/body/p[2]',
+        0.25,
+        '2026-09-07T00:00:00.000Z',
+        '2026-09-07T00:00:00.000Z',
+        '2026-09-07T00:00:00.000Z',
+      ],
     );
 
-    await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z');
+    await reconcileBooksInTransaction(db, 'server', [], '2026-09-10T00:00:00.000Z');
 
-    expect(readBook(db, retained.id)).toMatchObject({ remote_available: 0 });
-    expect(readBook(db, withSyncedProgress.id)).toMatchObject({ remote_available: 0 });
+    expect(await readBook(db, retained.id)).toMatchObject({ remote_available: 0 });
+    expect(await readBook(db, withSyncedProgress.id)).toMatchObject({ remote_available: 0 });
     expect(
-      db.prepare('SELECT cfi FROM reading_state WHERE book_id=?').get(withSyncedProgress.id),
-    ).toEqual({
-      cfi,
-    });
-    expect(readBook(db, removable.id)).toBeUndefined();
+      (await db.query('SELECT cfi FROM reading_state WHERE book_id=?', [withSyncedProgress.id]))
+        .values,
+    ).toEqual([{ cfi }]);
+    expect(await readBook(db, removable.id)).toBeUndefined();
   });
 
   it('updates incoming SQLite books while preserving unmatched rows from a partial snapshot', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
+    const db = await createDatabase();
     const unmatched = {
       ...baseBook,
       id: 'server:1:11',
@@ -240,28 +247,29 @@ describe('native metadata transactions against SQLite', () => {
       fileSize: null,
       remoteAvailable: false,
     };
-    await replaceBooksInTransaction(adapter, 'server', [baseBook, unmatched]);
+    await replaceBooksInTransaction(db, 'server', [baseBook, unmatched]);
 
     await reconcileBooksInTransaction(
-      adapter,
+      db,
       'server',
       [{ ...baseBook, title: 'Updated from partial snapshot' }],
       '2026-09-10T00:00:00.000Z',
       true,
     );
 
-    expect(readBook(db, baseBook.id)).toMatchObject({ title: 'Updated from partial snapshot' });
-    expect(readBook(db, unmatched.id)).toMatchObject({
+    expect(await readBook(db, baseBook.id)).toMatchObject({
+      title: 'Updated from partial snapshot',
+    });
+    expect(await readBook(db, unmatched.id)).toMatchObject({
       title: 'Unmatched saved book',
       remote_available: 0,
     });
   });
 
   it('reconciles a large snapshot with bounded SQL parameter counts', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
+    const db = await createDatabase();
     const downloaded = { ...baseBook, remoteAvailable: false };
-    await replaceBooksInTransaction(adapter, 'server', [downloaded]);
+    await replaceBooksInTransaction(db, 'server', [downloaded]);
     const snapshot = Array.from({ length: 1_001 }, (_, index) => ({
       ...baseBook,
       id: `server:2:${index}`,
@@ -269,24 +277,20 @@ describe('native metadata transactions against SQLite', () => {
       downloadPath: null,
     }));
 
-    await reconcileBooksInTransaction(
-      {
-        executeTransaction(tasks) {
-          expect(Math.max(...tasks.map((task) => task.values?.length ?? 0))).toBeLessThan(999);
-          return adapter.executeTransaction(tasks);
-        },
-      },
-      'server',
-      [downloaded, ...snapshot],
-    );
+    const txSpy = vi.spyOn(db, 'executeTransaction');
+    await reconcileBooksInTransaction(db, 'server', [downloaded, ...snapshot]);
 
-    expect(readBook(db, downloaded.id)).toMatchObject({ remote_available: 1 });
-    expect(db.prepare('SELECT COUNT(*) AS total FROM books').get()).toEqual({ total: 1_002 });
+    expect(txSpy).toHaveBeenCalledOnce();
+    const [tasks] = txSpy.mock.calls[0]!;
+    expect(Math.max(...tasks.map((task) => task.values?.length ?? 0))).toBeLessThan(999);
+    expect(await readBook(db, downloaded.id)).toMatchObject({ remote_available: 1 });
+    expect((await db.query('SELECT COUNT(*) AS total FROM books')).values).toEqual([
+      { total: 1_002 },
+    ]);
   });
 
   it('preserves every SQLite row and availability when a partial snapshot is empty', async () => {
-    db = createDatabase();
-    const adapter = createAdapter(db);
+    const db = await createDatabase();
     const unmatched = {
       ...baseBook,
       id: 'server:1:11',
@@ -297,11 +301,11 @@ describe('native metadata transactions against SQLite', () => {
       fileSize: null,
       remoteAvailable: false,
     };
-    await replaceBooksInTransaction(adapter, 'server', [baseBook, unmatched]);
-    const before = [readBook(db, baseBook.id), readBook(db, unmatched.id)];
+    await replaceBooksInTransaction(db, 'server', [baseBook, unmatched]);
+    const before = [await readBook(db, baseBook.id), await readBook(db, unmatched.id)];
 
-    await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z', true);
+    await reconcileBooksInTransaction(db, 'server', [], '2026-09-10T00:00:00.000Z', true);
 
-    expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
+    expect([await readBook(db, baseBook.id), await readBook(db, unmatched.id)]).toEqual(before);
   });
 });

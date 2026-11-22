@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Verify real SQLite wrappers and mid-chapter journey recovery
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops
