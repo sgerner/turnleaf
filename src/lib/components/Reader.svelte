@@ -2051,23 +2051,22 @@
     color: var(--reader-text);
     touch-action: pan-y;
     user-select: none;
-    --reader-background: var(--color-surface-50);
-    --reader-text: var(--color-surface-950);
+    --reader-background: var(--color-surface-50, #fafafa);
+    --reader-text: var(--color-surface-950, #18181b);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
-    --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
-    --reader-safe-bottom: max(
-      1rem,
-      env(safe-area-inset-bottom, 0px),
-      var(--safe-area-inset-bottom, 0px)
-    );
+    --reader-bar-text: var(--color-surface-950, #18181b);
+    --reader-safe-top: 0.5rem;
+    --reader-safe-bottom: 1rem;
     --reader-progress-height: 0.25rem;
   }
 
   .reader-viewport {
     position: absolute;
-    inset: var(--reader-safe-top) 0 var(--reader-safe-bottom) 0;
+    top: var(--reader-safe-top);
+    right: 0;
+    bottom: var(--reader-safe-bottom);
+    left: 0;
     overflow: hidden;
     width: 100%;
     height: auto;
@@ -2091,11 +2090,11 @@
   }
 
   .reader-shell[data-mode='dark'] {
-    --reader-background: var(--color-surface-950);
-    --reader-text: var(--color-surface-50);
+    --reader-background: var(--color-surface-950, #18181b);
+    --reader-text: var(--color-surface-50, #fafafa);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 38%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 32%, transparent);
-    --reader-bar-text: var(--color-surface-50);
+    --reader-bar-text: var(--color-surface-50, #fafafa);
   }
 
   .reader-overlay {
@@ -2126,7 +2125,7 @@
     top: 0;
     left: 0;
     right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    height: 4rem;
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2138,7 +2137,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: 2.5rem;
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2177,7 +2176,8 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding-inline: max(1rem, env(safe-area-inset-left));
+    padding-left: 1rem;
+    padding-right: 1rem;
     color: var(--reader-bar-text);
   }
 
@@ -2270,7 +2270,7 @@
   }
 
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    bottom: calc(var(--reader-progress-height) + 1.5rem);
     justify-content: space-between;
     padding-bottom: 0;
   }
@@ -2300,8 +2300,8 @@
 
   .reader-progress-reveal {
     position: absolute;
-    right: max(1rem, env(safe-area-inset-right));
-    bottom: max(0.25rem, env(safe-area-inset-bottom));
+    right: 1rem;
+    bottom: 0.25rem;
     z-index: 19;
     min-width: 3rem;
     min-height: 2.75rem;
@@ -2312,13 +2312,60 @@
     position: absolute;
     left: 1rem;
     right: 1rem;
-    bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    bottom: 4rem;
     margin-inline: auto;
     max-width: 30rem;
-    max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    max-height: 75vh;
     overflow: auto;
     padding: 1.25rem;
     z-index: 1;
+  }
+
+  @supports (top: max(1px, 2px)) {
+    .reader-shell {
+      --reader-safe-top: max(
+        0.5rem,
+        env(safe-area-inset-top, 0px),
+        var(--safe-area-inset-top, 0px)
+      );
+      --reader-safe-bottom: max(
+        1rem,
+        env(safe-area-inset-bottom, 0px),
+        var(--safe-area-inset-bottom, 0px)
+      );
+    }
+
+    .reader-top-reveal {
+      height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    }
+
+    .reader-bottom-reveal {
+      height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    }
+
+    .reader-bar {
+      padding-left: max(1rem, env(safe-area-inset-left));
+      padding-right: max(1rem, env(safe-area-inset-right));
+    }
+
+    .reader-bottom {
+      bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    }
+
+    .reader-progress-reveal {
+      right: max(1rem, env(safe-area-inset-right));
+      bottom: max(0.25rem, env(safe-area-inset-bottom));
+    }
+
+    .reader-settings {
+      bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    }
+  }
+
+  @supports (max-height: min(75dvh, 100dvh)) {
+    .reader-settings {
+      max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    }
   }
 
   .reader-panel-backdrop {
