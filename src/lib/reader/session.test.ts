@@ -761,4 +761,195 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
 
     session.destroy();
   });
+
+  it('defers ResizeObserver and Stage manager.resize calls during async open and flushes the latest size afterward', async () => {
+    const cssDeferred = createDeferred<Response>();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => cssDeferred.promise),
+    );
+
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const targetCfi = 'epubcfi(/6/2!/4/2/16:0)';
+    const harness = createSimulatedEpubHarness([
+      {
+        href: 'chapter-1.xhtml',
+        index: 0,
+        html: '<html xmlns="http://www.w3.org/1999/xhtml"><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/chapter.css" /></head><body><p>Styled chapter</p></body></html>',
+        pagesAt16: 2,
+        pagesAt18: 6,
+        pagesAt34: 12,
+        cfiTargets: {
+          [targetCfi]: { unthemedPage: 2, pageAt18: 5, pageAt34: 10 },
+        },
+      },
+    ]);
+    const rawManagerResize = vi.fn<(_width?: number, _height?: number) => void>(() => {
+      harness.manager.clear();
+      if (harness.rendition.location?.start?.cfi) {
+        void harness.rendition.display(harness.rendition.location.start.cfi);
+      }
+    });
+    Object.assign(harness.manager, { resize: rawManagerResize });
+    harness.rendition.resize.mockImplementation((width?: number, height?: number) => {
+      (harness.manager as typeof harness.manager & { resize: typeof rawManagerResize }).resize(
+        width,
+        height,
+      );
+    });
+
+    const viewport = document.createElement('div');
+    let currentRect = new DOMRect(0, 0, 411, 842);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => currentRect);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    const openPromise = session.open(
+      viewport,
+      targetCfi,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+
+    await vi.waitFor(() => expect(harness.activeViews).toHaveLength(1));
+
+    // Simulate Android ReaderChrome hiding system bars while open() is still awaiting stylesheet sanitization.
+    currentRect = new DOMRect(0, 0, 411, 880);
+    (harness.manager as typeof harness.manager & { resize: () => void }).resize();
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 880 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    currentRect = new DOMRect(0, 0, 411, 914);
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 914 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(rawManagerResize).not.toHaveBeenCalled();
+    expect(harness.rendition.resize).not.toHaveBeenCalled();
+    expect(harness.activeViews).toHaveLength(1);
+
+    cssDeferred.resolve(new Response('body { --chapter-ready: 1; }', { status: 200 }));
+    await openPromise;
+
+    expect(harness.rendition.resize).toHaveBeenCalledTimes(1);
+    expect(harness.rendition.resize).toHaveBeenCalledWith(411, 914);
+    await vi.waitFor(() => expect(harness.getScrollLeft()).toBe(1200));
+    expect(harness.activeViews).toHaveLength(1);
+
+    session.destroy();
+  });
+
+  it('keeps userNavigationPending intact if open() emits its queued relocated event after next() starts', async () => {
+    const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const handler of listeners.get(event) ?? []) {
+        handler(...args);
+      }
+    };
+    const nextDeferred = createDeferred<void>();
+    const queuedRendition = {
+      q: {
+        running: false,
+        length: () => 0,
+        enqueue: vi.fn((task: () => Promise<void>) => task()),
+      },
+      location: undefined as Location | undefined,
+      hooks: { content: { register: vi.fn() } },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (!listeners.has(event)) listeners.set(event, new Set());
+        listeners.get(event)!.add(handler);
+      }),
+      off: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        listeners.get(event)?.delete(handler);
+      }),
+      started: Promise.resolve(),
+      themes: { register: vi.fn(), select: vi.fn() },
+      annotations: { highlight: vi.fn(), remove: vi.fn() },
+      display: vi.fn(async () => {}),
+      next: vi.fn(() => nextDeferred.promise),
+      resize: vi.fn(),
+      destroy: vi.fn(),
+    };
+    createBookMock.mockReturnValue({
+      renderTo: vi.fn(() => queuedRendition),
+      destroy: vi.fn(),
+      spine: {
+        each: vi.fn((visit: (section: { href: string; index: number }) => void) => {
+          visit({ href: 'chapter1.xhtml', index: 0 });
+          visit({ href: 'chapter2.xhtml', index: 1 });
+        }),
+      },
+      navigation: { toc: [] },
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+
+    // Start next() before open()'s requestAnimationFrame relocated callback has fired.
+    const nextPromise = session.next();
+
+    const chapter1Location = {
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        href: 'chapter1.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    queuedRendition.location = chapter1Location;
+    emit('relocated', chapter1Location);
+
+    nextDeferred.resolve();
+    await nextPromise;
+
+    const chapter2Location = {
+      start: {
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        href: 'chapter2.xhtml',
+        index: 1,
+        percentage: 0.5,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    queuedRendition.location = chapter2Location;
+    emit('relocated', chapter2Location);
+
+    expect(onLocation).toHaveBeenCalledTimes(2);
+    expect(onLocation).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)', spineIndex: 0 }),
+      'restore',
+    );
+    expect(onLocation).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)', spineIndex: 1 }),
+      'navigation',
+    );
+
+    session.destroy();
+  });
 });
