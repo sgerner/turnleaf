@@ -145,7 +145,7 @@ function isSafeEpubReference(value: string, kind: EpubReferenceKind): boolean {
   if (kind === 'stylesheet' && SAFE_DATA_STYLESHEET.test(decoded)) return true;
   if (kind !== 'link' && decoded.toLowerCase().startsWith('blob:')) return true;
   if (/^[a-z][a-z\d+.-]*:/i.test(decoded)) return false;
-  if (decoded.startsWith('/') || decoded.startsWith('\\') || decoded.startsWith('//')) return false;
+  if (decoded.startsWith('/') || decoded.startsWith('\\')) return false;
   return true;
 }
 
@@ -191,7 +191,6 @@ function isLocalContentUrl(value: string, document: Document): boolean {
 function decodeDataStylesheet(value: string): string | null {
   if (!SAFE_DATA_STYLESHEET.test(value)) return null;
   const separator = value.indexOf(',');
-  if (separator < 0) return null;
   const metadata = value.slice(0, separator).toLowerCase();
   const body = value.slice(separator + 1);
   try {
@@ -291,7 +290,7 @@ function isSafeBaseReference(value: string, document: Document): boolean {
   const decoded = decodedReference(value);
   if (!decoded) return false;
   if (!/^[a-z][a-z\d+.-]*:/i.test(decoded)) {
-    return !decoded.startsWith('/') && !decoded.startsWith('\\') && !decoded.startsWith('//');
+    return !decoded.startsWith('/') && !decoded.startsWith('\\');
   }
   return isLocalContentUrl(decoded, document);
 }
@@ -1106,15 +1105,16 @@ export class ReaderSession {
     try {
       await rendition.display(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
+      if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
       if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
       if (!node) return false;
-      const range = contents.document.createRange();
-      range.selectNodeContents(node);
-      await rendition.display(contents.cfiFromRange(range));
+      const cfi = this.cfiFromXPathNode(contents, node);
+      if (!(contents.range(cfi) as Range | null)) return false;
+      await rendition.display(cfi);
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -1123,6 +1123,21 @@ export class ReaderSession {
       this.activeDisplayOperations = Math.max(0, this.activeDisplayOperations - 1);
       this.scheduleViewportResizeFlush();
     }
+  }
+
+  private cfiFromXPathNode(contents: Contents, node: Element): string {
+    const walker = contents.document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+      if (current.parentElement?.localName === 'style') continue;
+      const offset = current.textContent?.search(/\S/) ?? -1;
+      if (offset >= 0) {
+        const range = contents.document.createRange();
+        range.setStart(current, offset);
+        range.collapse(true);
+        return contents.cfiFromRange(range);
+      }
+    }
+    return contents.cfiFromNode(node);
   }
 
   private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
@@ -1217,9 +1232,7 @@ export class ReaderSession {
   }
 
   private pageIndex(page: number): number {
-    if (typeof page === 'number') return Math.max(0, page - 1);
-    const runtimePage = page as unknown as { index?: number };
-    return Math.max(0, runtimePage.index ?? 0);
+    return Math.max(0, page - 1);
   }
 
   private resolveToken(token: string): string {
