@@ -19,7 +19,309 @@ export interface ReaderLocation {
 
 export type ReaderLinkReturnTarget = Pick<ReaderLocation, 'cfi' | 'href'>;
 
-export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
+export type ReaderLocationOrigin = 'jump' | 'link' | 'navigation' | 'restore';
+
+export type ReaderSwipeDirection = 'previous' | 'next';
+
+export interface SwipeTouchPoint {
+  identifier?: number;
+  clientX: number;
+  clientY: number;
+}
+
+export interface SwipeTouchEventLike {
+  target?: EventTarget | null;
+  touches?: ArrayLike<SwipeTouchPoint>;
+  changedTouches?: ArrayLike<SwipeTouchPoint>;
+  defaultPrevented?: boolean;
+}
+
+export interface SwipePointerEventLike {
+  pointerId: number;
+  pointerType?: string;
+  button?: number;
+  clientX: number;
+  clientY: number;
+  target?: EventTarget | null;
+  defaultPrevented?: boolean;
+}
+
+export const SWIPE_MIN_DISTANCE_PX = 44;
+export const SWIPE_MAX_DRIFT_RATIO = 0.5;
+const SWIPE_CLICK_SUPPRESSION_MS = 500;
+const INTERACTIVE_SWIPE_SELECTOR =
+  'a, button, input, select, textarea, label, summary, [role="button"], [role="link"], [role="slider"], [contenteditable="true"]';
+
+function isInteractiveSwipeTarget(target: EventTarget | null | undefined): boolean {
+  const element =
+    target && typeof (target as Element).closest === 'function' ? (target as Element) : null;
+  return Boolean(element?.closest(INTERACTIVE_SWIPE_SELECTOR));
+}
+
+export function resolveSpinePercentageTarget(
+  percentage: number,
+  sectionCount: number,
+): { sectionIndex: number; sectionProgress: number } | null {
+  if (!Number.isFinite(percentage) || sectionCount <= 0) return null;
+  const clamped = Math.max(0, Math.min(1, percentage));
+  if (clamped >= 1) {
+    return { sectionIndex: sectionCount - 1, sectionProgress: 1 };
+  }
+  const scaled = Math.max(0, Math.min(sectionCount - 1e-7, clamped * sectionCount + 1e-9));
+  const sectionIndex = Math.floor(scaled);
+  const sectionProgress = Math.max(0, Math.min(1, scaled - sectionIndex));
+  return { sectionIndex, sectionProgress };
+}
+
+export function resolveSectionPageIndex(sectionProgress: number, totalPages: number): number {
+  const safeTotal = Math.max(1, Math.floor(totalPages));
+  if (!Number.isFinite(sectionProgress) || sectionProgress <= 0) return 0;
+  if (sectionProgress >= 1) return safeTotal - 1;
+  return Math.max(0, Math.min(safeTotal - 1, Math.floor(sectionProgress * safeTotal + 1e-6)));
+}
+
+export interface SwipeGestureTracker {
+  onTouchStart: (event: SwipeTouchEventLike, hasSelection?: () => boolean) => void;
+  onTouchMove: (event: SwipeTouchEventLike, hasSelection?: () => boolean) => void;
+  onTouchEnd: (event: SwipeTouchEventLike, hasSelection?: () => boolean) => void;
+  onTouchCancel: () => void;
+  onPointerDown: (event: SwipePointerEventLike, hasSelection?: () => boolean) => void;
+  onPointerMove: (event: SwipePointerEventLike, hasSelection?: () => boolean) => void;
+  onPointerUp: (event: SwipePointerEventLike, hasSelection?: () => boolean) => void;
+  onPointerCancel: (event: SwipePointerEventLike) => void;
+  consumeSuppressedClick: () => boolean;
+  reset: () => void;
+}
+
+export function createSwipeGestureTracker(
+  onSwipe: (direction: ReaderSwipeDirection) => void,
+  now: () => number = () => Date.now(),
+): SwipeGestureTracker {
+  let touchStart: {
+    id: number | undefined;
+    x: number;
+    y: number;
+    lastX: number;
+    lastY: number;
+    maxDriftY: number;
+    blocked: boolean;
+  } | null = null;
+  let touchCompletedAt = -Infinity;
+  const activeTouchPointers = new Set<number>();
+  let pointerStart: {
+    id: number;
+    x: number;
+    y: number;
+    lastX: number;
+    lastY: number;
+    maxDriftY: number;
+    blocked: boolean;
+  } | null = null;
+  let suppressClickUntil = 0;
+
+  function evaluateSwipe(
+    startX: number,
+    startY: number,
+    endX: number,
+    endY: number,
+    maxDriftY: number,
+  ): ReaderSwipeDirection | null {
+    const deltaX = endX - startX;
+    const absX = Math.abs(deltaX);
+    const absY = Math.max(Math.abs(endY - startY), maxDriftY);
+    if (absX < SWIPE_MIN_DISTANCE_PX) return null;
+    if (absY > absX * SWIPE_MAX_DRIFT_RATIO) return null;
+    return deltaX < 0 ? 'next' : 'previous';
+  }
+
+  function findTouch(
+    list: ArrayLike<SwipeTouchPoint> | undefined,
+    id: number | undefined,
+  ): SwipeTouchPoint | null {
+    if (!list || list.length === 0) return null;
+    if (id === undefined) return list[0] ?? null;
+    for (let index = 0; index < list.length; index += 1) {
+      const item = list[index];
+      if (item && item.identifier === id) return item;
+    }
+    return list[0] ?? null;
+  }
+
+  return {
+    onTouchStart(event, hasSelection) {
+      suppressClickUntil = 0;
+      activeTouchPointers.clear();
+      pointerStart = null;
+      const touches = event.touches;
+      const touchCount = touches?.length ?? 1;
+      if (touchCount !== 1) {
+        if (touchStart) touchStart.blocked = true;
+        else {
+          touchStart = {
+            id: undefined,
+            x: 0,
+            y: 0,
+            lastX: 0,
+            lastY: 0,
+            maxDriftY: 0,
+            blocked: true,
+          };
+        }
+        return;
+      }
+      const first = touches?.[0] ?? event.changedTouches?.[0];
+      if (!first) return;
+      const blocked =
+        Boolean(event.defaultPrevented) ||
+        isInteractiveSwipeTarget(event.target) ||
+        Boolean(hasSelection?.());
+      touchStart = {
+        id: first.identifier,
+        x: first.clientX,
+        y: first.clientY,
+        lastX: first.clientX,
+        lastY: first.clientY,
+        maxDriftY: 0,
+        blocked,
+      };
+    },
+
+    onTouchMove(event, hasSelection) {
+      if (!touchStart) return;
+      if ((event.touches?.length ?? 1) > 1 || hasSelection?.()) {
+        touchStart.blocked = true;
+        return;
+      }
+      const point = findTouch(event.touches ?? event.changedTouches, touchStart.id);
+      if (!point) return;
+      touchStart.lastX = point.clientX;
+      touchStart.lastY = point.clientY;
+      touchStart.maxDriftY = Math.max(touchStart.maxDriftY, Math.abs(point.clientY - touchStart.y));
+    },
+
+    onTouchEnd(event, hasSelection) {
+      touchCompletedAt = now();
+      if (!touchStart) return;
+      const remaining = event.touches?.length ?? 0;
+      if (touchStart.blocked || hasSelection?.()) {
+        if (remaining === 0) touchStart = null;
+        return;
+      }
+      if (remaining > 0) {
+        touchStart.blocked = true;
+        return;
+      }
+      const endPoint = findTouch(event.changedTouches, touchStart.id) ?? {
+        clientX: touchStart.lastX,
+        clientY: touchStart.lastY,
+      };
+      const gesture = touchStart;
+      touchStart = null;
+      const direction = evaluateSwipe(
+        gesture.x,
+        gesture.y,
+        endPoint.clientX,
+        endPoint.clientY,
+        gesture.maxDriftY,
+      );
+      if (!direction) return;
+      suppressClickUntil = touchCompletedAt + SWIPE_CLICK_SUPPRESSION_MS;
+      onSwipe(direction);
+    },
+
+    onTouchCancel() {
+      touchStart = null;
+    },
+
+    onPointerDown(event, hasSelection) {
+      if (event.pointerType !== 'touch') return;
+      if (touchStart !== null || now() - touchCompletedAt < 100) return;
+      suppressClickUntil = 0;
+      activeTouchPointers.add(event.pointerId);
+      if (activeTouchPointers.size !== 1) {
+        if (pointerStart) pointerStart.blocked = true;
+        return;
+      }
+      const blocked =
+        Boolean(event.defaultPrevented) ||
+        isInteractiveSwipeTarget(event.target) ||
+        Boolean(hasSelection?.());
+      pointerStart = {
+        id: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        lastX: event.clientX,
+        lastY: event.clientY,
+        maxDriftY: 0,
+        blocked,
+      };
+    },
+
+    onPointerMove(event, hasSelection) {
+      if (event.pointerType !== 'touch' || !pointerStart || touchStart !== null) return;
+      if (activeTouchPointers.size > 1 || hasSelection?.()) {
+        pointerStart.blocked = true;
+        return;
+      }
+      if (event.pointerId !== pointerStart.id) return;
+      pointerStart.lastX = event.clientX;
+      pointerStart.lastY = event.clientY;
+      pointerStart.maxDriftY = Math.max(
+        pointerStart.maxDriftY,
+        Math.abs(event.clientY - pointerStart.y),
+      );
+    },
+
+    onPointerUp(event, hasSelection) {
+      if (event.pointerType !== 'touch') return;
+      activeTouchPointers.delete(event.pointerId);
+      if (!pointerStart || touchStart !== null || now() - touchCompletedAt < 100) {
+        if (activeTouchPointers.size === 0) pointerStart = null;
+        return;
+      }
+      if (pointerStart.blocked || hasSelection?.() || activeTouchPointers.size > 0) {
+        if (activeTouchPointers.size > 0) pointerStart.blocked = true;
+        else pointerStart = null;
+        return;
+      }
+      if (event.pointerId !== pointerStart.id) return;
+      const gesture = pointerStart;
+      pointerStart = null;
+      const direction = evaluateSwipe(
+        gesture.x,
+        gesture.y,
+        event.clientX,
+        event.clientY,
+        gesture.maxDriftY,
+      );
+      if (!direction) return;
+      suppressClickUntil = now() + SWIPE_CLICK_SUPPRESSION_MS;
+      onSwipe(direction);
+    },
+
+    onPointerCancel(event) {
+      activeTouchPointers.delete(event.pointerId);
+      if (activeTouchPointers.size === 0) pointerStart = null;
+      else if (pointerStart) pointerStart.blocked = true;
+    },
+
+    consumeSuppressedClick() {
+      if (suppressClickUntil > 0 && now() <= suppressClickUntil) {
+        suppressClickUntil = 0;
+        return true;
+      }
+      suppressClickUntil = 0;
+      return false;
+    },
+
+    reset() {
+      touchStart = null;
+      pointerStart = null;
+      activeTouchPointers.clear();
+      suppressClickUntil = 0;
+    },
+  };
+}
 
 export interface ReaderSelection {
   cfi: string;
@@ -301,8 +603,15 @@ export class ReaderSession {
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
+  private contentTouchStart: ((event: TouchEvent, contents: Contents) => void) | null = null;
+  private contentTouchMove: ((event: TouchEvent, contents: Contents) => void) | null = null;
+  private contentTouchEnd: ((event: TouchEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+  private cleanupViewportGestures: (() => void) | null = null;
+  private swipeTracker: SwipeGestureTracker | null = null;
   private current: Location | null = null;
+  private deferringRelocation = false;
+  private deferredRelocation: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
   private userNavigationPending = false;
@@ -321,6 +630,7 @@ export class ReaderSession {
         returnTarget?: ReaderLinkReturnTarget,
       ) => void)
     | null = null;
+  private onSelection: ((selection: ReaderSelection | null) => void) | undefined = undefined;
 
   constructor(private readonly bookUrl: string) {
     this.book = ePub(bookUrl);
@@ -340,6 +650,7 @@ export class ReaderSession {
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
+    onSwipe?: (direction: ReaderSwipeDirection) => void,
   ): Promise<void> {
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -351,6 +662,23 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
+    const swipeTracker = createSwipeGestureTracker((direction) => {
+      if (onSwipe) {
+        onSwipe(direction);
+        return;
+      }
+      if (direction === 'next') void this.next().catch(() => {});
+      else void this.previous().catch(() => {});
+    });
+    this.swipeTracker = swipeTracker;
+    const hasContentSelection = (contents?: Contents): boolean => {
+      const selection = contents?.window?.getSelection?.();
+      return Boolean(selection && !selection.isCollapsed);
+    };
+    const hasWindowSelection = (): boolean => {
+      const selection = typeof window !== 'undefined' ? window.getSelection?.() : null;
+      return Boolean(selection && !selection.isCollapsed);
+    };
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
@@ -374,30 +702,63 @@ export class ReaderSession {
         contents.document.addEventListener('selectionchange', handler);
       });
     }
+    this.rendition.hooks.content.register((contents: Contents) => {
+      const doc = contents?.document;
+      if (!doc?.addEventListener) return;
+      doc.addEventListener('touchcancel', () => swipeTracker.onTouchCancel(), { passive: true });
+      doc.addEventListener(
+        'pointerdown',
+        (event: PointerEvent) =>
+          swipeTracker.onPointerDown(event, () => hasContentSelection(contents)),
+        { passive: true },
+      );
+      doc.addEventListener(
+        'pointermove',
+        (event: PointerEvent) =>
+          swipeTracker.onPointerMove(event, () => hasContentSelection(contents)),
+        { passive: true },
+      );
+      doc.addEventListener(
+        'pointerup',
+        (event: PointerEvent) =>
+          swipeTracker.onPointerUp(event, () => hasContentSelection(contents)),
+        { passive: true },
+      );
+      doc.addEventListener(
+        'pointercancel',
+        (event: PointerEvent) => swipeTracker.onPointerCancel(event),
+        { passive: true },
+      );
+    });
     this.onLocation = onLocation;
+    this.onSelection = onSelection;
     this.relocated = (location) => {
-      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-      const isUserNavigation =
-        this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
-      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (startCfi !== location.start.cfi) onSelection?.(null);
-      this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
-        this.userNavigationPending = false;
-        this.userNavigationStartCfi = null;
-        this.userNavigationOrigin = 'navigation';
-        this.pendingLinkReturnTarget = null;
+      if (this.deferringRelocation) {
+        this.current = location;
+        this.deferredRelocation = location;
+        return;
       }
-      this.reportLocation(location, origin, returnTarget);
-      if (this.reflowPending) {
-        this.reflowPending = false;
-        this.preserveCfi(location.start.cfi, this.locationGeneration);
-      }
+      this.handleRelocated(location);
     };
     this.rendition.on('relocated', this.relocated);
+    this.contentTouchStart = (event, contents) => {
+      swipeTracker.onTouchStart(event, () => hasContentSelection(contents));
+    };
+    this.contentTouchMove = (event, contents) => {
+      swipeTracker.onTouchMove(event, () => hasContentSelection(contents));
+    };
+    this.contentTouchEnd = (event, contents) => {
+      swipeTracker.onTouchEnd(event, () => hasContentSelection(contents));
+    };
+    this.rendition.on('touchstart', this.contentTouchStart);
+    this.rendition.on('touchmove', this.contentTouchMove);
+    this.rendition.on('touchend', this.contentTouchEnd);
+    this.attachViewportGestures(target, swipeTracker, hasWindowSelection);
     this.contentClick = (event, contents) => {
+      if (swipeTracker.consumeSuppressedClick()) {
+        event.preventDefault?.();
+        return;
+      }
       const eventTarget = event.target as Element | null;
       const selection = contents.window.getSelection();
       if (selection && !selection.isCollapsed) return;
@@ -583,6 +944,35 @@ export class ReaderSession {
     return this.displayPercentage(percentage, this.beginLocationOperation(false));
   }
 
+  async jumpToPercentage(percentage: number): Promise<boolean> {
+    if (!this.rendition || !Number.isFinite(percentage)) return false;
+    const generation = this.beginJumpOperation();
+    const moved = await this.displayPercentage(percentage, generation);
+    if (!moved && this.isCurrentLocationOperation(generation)) {
+      this.clearPendingUserNavigation();
+    }
+    return moved;
+  }
+
+  async jumpToPage(pageNumber: number): Promise<boolean> {
+    const rendition = this.rendition;
+    if (!rendition || !Number.isFinite(pageNumber) || pageNumber < 1) return false;
+    const generation = this.beginJumpOperation();
+    try {
+      const currentLocation = await this.resolveRenderedLocation();
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      const totalPages = Math.max(1, currentLocation?.start?.displayed?.total ?? 1);
+      const targetPageIndex = Math.max(0, Math.min(totalPages - 1, Math.floor(pageNumber) - 1));
+      await this.moveToSectionPage(targetPageIndex, totalPages, generation, true);
+      return this.isCurrentLocationOperation(generation);
+    } catch {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.clearPendingUserNavigation();
+      }
+      return false;
+    }
+  }
+
   applyAppearance(value: Appearance): void {
     const previous = this.appearance;
     this.appearance = { ...value };
@@ -660,8 +1050,18 @@ export class ReaderSession {
     this.locationGeneration += 1;
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
+    if (this.rendition && this.contentTouchStart)
+      this.rendition.off('touchstart', this.contentTouchStart);
+    if (this.rendition && this.contentTouchMove)
+      this.rendition.off('touchmove', this.contentTouchMove);
+    if (this.rendition && this.contentTouchEnd)
+      this.rendition.off('touchend', this.contentTouchEnd);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
+    this.cleanupViewportGestures?.();
+    this.cleanupViewportGestures = null;
+    this.swipeTracker?.reset();
+    this.swipeTracker = null;
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -669,9 +1069,15 @@ export class ReaderSession {
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
+    this.contentTouchStart = null;
+    this.contentTouchMove = null;
+    this.contentTouchEnd = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
+    this.onSelection = undefined;
     this.current = null;
+    this.deferringRelocation = false;
+    this.deferredRelocation = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
@@ -784,15 +1190,205 @@ export class ReaderSession {
   private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
     if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
     const { sections } = this.getSpine();
-    if (!sections.length) return false;
-    const position = Math.max(0, Math.min(0.999, percentage));
-    const section = sections[Math.floor(position * sections.length)];
+    const target = resolveSpinePercentageTarget(percentage, sections.length);
+    if (!target) return false;
+    const section = sections[target.sectionIndex];
     if (!section) return false;
+
+    this.deferringRelocation = true;
+    this.deferredRelocation = null;
     try {
-      return await this.displayAtGeneration(section.href, generation);
+      if (!(await this.displayAtGeneration(section.href, generation))) return false;
+      const rendered = await this.resolveRenderedLocation(section.href);
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      const totalPages = Math.max(1, rendered?.start?.displayed?.total ?? 1);
+      const targetPageIndex = resolveSectionPageIndex(target.sectionProgress, totalPages);
+      if (targetPageIndex > 0) {
+        const needsReportLocation =
+          this.deferredRelocation !== null || !(this.rendition && '_display' in this.rendition);
+        this.deferredRelocation = null;
+        this.deferringRelocation = false;
+        await this.moveToSectionPage(targetPageIndex, totalPages, generation, needsReportLocation);
+      }
+      return this.isCurrentLocationOperation(generation);
     } catch {
       return false;
+    } finally {
+      const pending = this.deferredRelocation;
+      this.deferringRelocation = false;
+      this.deferredRelocation = null;
+      if (pending && this.isCurrentLocationOperation(generation)) {
+        this.handleRelocated(pending);
+      }
     }
+  }
+
+  private async resolveRenderedLocation(expectedHref?: string): Promise<Location | null> {
+    const rendition = this.rendition as
+      | (Omit<Rendition, 'currentLocation'> & {
+          currentLocation?: () => Location | Promise<Location> | undefined;
+        })
+      | null;
+    if (!rendition) return null;
+    try {
+      const located = await Promise.resolve(rendition.currentLocation?.());
+      if (located?.start && (!expectedHref || located.start.href === expectedHref)) {
+        return located;
+      }
+    } catch {
+      // Fall back to the rendition's cached location if currentLocation fails.
+    }
+    if (
+      rendition.location?.start &&
+      (!expectedHref || rendition.location.start.href === expectedHref)
+    ) {
+      return rendition.location;
+    }
+    if (this.current?.start && (!expectedHref || this.current.start.href === expectedHref)) {
+      return this.current;
+    }
+    return null;
+  }
+
+  private async moveToSectionPage(
+    targetPageIndex: number,
+    totalPages: number,
+    generation: number,
+    needsReportLocation: boolean,
+  ): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition || !this.isCurrentLocationOperation(generation)) return;
+
+    const current = await this.resolveRenderedLocation();
+    const currentPageIndex = current?.start ? this.pageIndex(current.start.displayed.page) : 0;
+    if (targetPageIndex === currentPageIndex) {
+      if (current && this.userNavigationPending) {
+        this.handleRelocated(current);
+      }
+      return;
+    }
+
+    const manager = (
+      rendition as unknown as {
+        manager?: {
+          layout?: { delta?: number };
+          views?: { first?: () => { width?: () => number } | undefined };
+          moveTo?: (offset: { left: number; top: number }, width?: number) => void;
+        };
+      }
+    ).manager;
+
+    const delta = manager?.layout?.delta ?? 0;
+    if (delta > 0 && typeof manager?.moveTo === 'function') {
+      const viewWidth = manager.views?.first?.()?.width?.() ?? totalPages * delta;
+      manager.moveTo({ left: targetPageIndex * delta, top: 0 }, viewWidth);
+      if (needsReportLocation) {
+        await rendition.reportLocation?.();
+      }
+      return;
+    }
+
+    const steps = targetPageIndex - currentPageIndex;
+    const stepFn = steps > 0 ? rendition.next?.bind(rendition) : rendition.prev?.bind(rendition);
+    if (!stepFn) return;
+
+    const stepCount = Math.abs(steps);
+    for (let step = 0; step < stepCount; step += 1) {
+      if (!this.isCurrentLocationOperation(generation)) return;
+      const isLastStep = step === stepCount - 1;
+      this.deferringRelocation = !isLastStep;
+      this.deferredRelocation = null;
+      try {
+        await stepFn();
+      } finally {
+        this.deferringRelocation = false;
+        this.deferredRelocation = null;
+      }
+    }
+  }
+
+  private handleRelocated(location: Location): void {
+    const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+    const isUserNavigation =
+      this.userNavigationPending &&
+      (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+    const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+    const returnTarget =
+      origin === 'link' || origin === 'jump' ? this.pendingLinkReturnTarget : null;
+    if (startCfi !== location.start.cfi) this.onSelection?.(null);
+    this.current = location;
+    if (
+      isUserNavigation ||
+      this.userNavigationOrigin === 'link' ||
+      this.userNavigationOrigin === 'jump'
+    ) {
+      this.clearPendingUserNavigation();
+    }
+    this.reportLocation(location, origin, returnTarget);
+    if (this.reflowPending) {
+      this.reflowPending = false;
+      this.preserveCfi(location.start.cfi, this.locationGeneration);
+    }
+  }
+
+  private attachViewportGestures(
+    target: HTMLElement,
+    swipeTracker: SwipeGestureTracker,
+    hasSelection: () => boolean,
+  ): void {
+    this.cleanupViewportGestures?.();
+    const onTouchStart = (event: TouchEvent) => swipeTracker.onTouchStart(event, hasSelection);
+    const onTouchMove = (event: TouchEvent) => swipeTracker.onTouchMove(event, hasSelection);
+    const onTouchEnd = (event: TouchEvent) => swipeTracker.onTouchEnd(event, hasSelection);
+    const onTouchCancel = () => swipeTracker.onTouchCancel();
+    const onPointerDown = (event: PointerEvent) => swipeTracker.onPointerDown(event, hasSelection);
+    const onPointerMove = (event: PointerEvent) => swipeTracker.onPointerMove(event, hasSelection);
+    const onPointerUp = (event: PointerEvent) => swipeTracker.onPointerUp(event, hasSelection);
+    const onPointerCancel = (event: PointerEvent) => swipeTracker.onPointerCancel(event);
+    const onClickCapture = (event: MouseEvent) => {
+      if (!swipeTracker.consumeSuppressedClick()) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    target.addEventListener('touchstart', onTouchStart, { passive: true });
+    target.addEventListener('touchmove', onTouchMove, { passive: true });
+    target.addEventListener('touchend', onTouchEnd, { passive: true });
+    target.addEventListener('touchcancel', onTouchCancel, { passive: true });
+    target.addEventListener('pointerdown', onPointerDown, { passive: true });
+    target.addEventListener('pointermove', onPointerMove, { passive: true });
+    target.addEventListener('pointerup', onPointerUp, { passive: true });
+    target.addEventListener('pointercancel', onPointerCancel, { passive: true });
+    target.addEventListener('click', onClickCapture, true);
+
+    this.cleanupViewportGestures = () => {
+      target.removeEventListener('touchstart', onTouchStart);
+      target.removeEventListener('touchmove', onTouchMove);
+      target.removeEventListener('touchend', onTouchEnd);
+      target.removeEventListener('touchcancel', onTouchCancel);
+      target.removeEventListener('pointerdown', onPointerDown);
+      target.removeEventListener('pointermove', onPointerMove);
+      target.removeEventListener('pointerup', onPointerUp);
+      target.removeEventListener('pointercancel', onPointerCancel);
+      target.removeEventListener('click', onClickCapture, true);
+    };
+  }
+
+  private clearPendingUserNavigation(): void {
+    this.userNavigationPending = false;
+    this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
+  }
+
+  private beginJumpOperation(): number {
+    const start = this.current?.start ?? this.rendition?.location?.start ?? null;
+    this.locationGeneration += 1;
+    this.userNavigationPending = true;
+    this.userNavigationOrigin = 'jump';
+    this.userNavigationStartCfi = start?.cfi ?? null;
+    this.pendingLinkReturnTarget = start ? { cfi: start.cfi, href: start.href } : null;
+    return this.locationGeneration;
   }
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {
