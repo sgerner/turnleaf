@@ -253,7 +253,7 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
-  allowDownload = true,
+  allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const namespace = safeCoverNamespace(cacheNamespace);
@@ -263,10 +263,18 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!allowDownload) throw new Error('Offline');
+    const initiallyAllowed =
+      typeof allowDownload === 'function' ? await allowDownload() : allowDownload;
+    if (!initiallyAllowed) throw new Error('Offline');
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (typeof allowDownload === 'function' && !(await allowDownload())) {
+      throw new Error('Offline');
+    }
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     try {
       await FileTransfer.downloadFile({
         url: downloadUrl,

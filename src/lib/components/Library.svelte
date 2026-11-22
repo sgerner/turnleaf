@@ -94,7 +94,7 @@
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        networkAvailable,
       );
     }
     if (offline) throw new Error('Offline');
@@ -536,8 +536,14 @@
           if (destroyed) return;
           offline = !connected;
           if (!connected) {
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
             refreshController?.abort();
             openProgressProbe?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -626,7 +632,7 @@
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client, server.id);
+      await flushProgress(client, server.id, networkAvailable);
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
       if (
@@ -1172,7 +1178,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, networkAvailable);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {

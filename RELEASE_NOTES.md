@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- fix(reader): guard resize and relocation races during open and navigation
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input

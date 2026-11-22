@@ -203,4 +203,41 @@ describe('native cover cache', () => {
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
+
+  it('skips FileTransfer.downloadFile when connectivity drops during Filesystem setup', async () => {
+    let online = true;
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
+      online = false;
+      return { uri: `file://${path}` };
+    });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        () => online,
+      ),
+    ).rejects.toThrow('Offline');
+
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('aborts before FileTransfer.downloadFile when the cover signal aborts during Filesystem setup', async () => {
+    const controller = new AbortController();
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
+      controller.abort();
+      return { uri: `file://${path}` };
+    });
+
+    await expect(
+      cacheCover('https://books.example.com/cover', 'secret', 7, controller.signal, 'server-1'),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
 });
