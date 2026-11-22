@@ -8,7 +8,9 @@ import {
   getBooks,
   getPendingSync,
   getPreferences,
+  getReadingState,
   getSyncStatus,
+  markBookCompleted,
   reconcileBooks,
   replaceBooksInTransaction,
   resetLocalDatabase,
@@ -820,6 +822,96 @@ it('clears retry errors when a new browser progress revision replaces the failed
     failedCount: 0,
     lastError: null,
   });
+});
+
+it('preserves browser sync timestamps when marking a book completed', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const syncedLocalUpdatedAt = '2026-09-07T00:00:00.000Z';
+  const serverUpdatedAt = '2026-09-07T00:00:05.000Z';
+  const unreadBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:11',
+    volumeId: 11,
+    chapterId: 11,
+    pagesRead: 0,
+    lastReadAt: null,
+  };
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook, unreadBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'epubcfi(/6/4)',
+          xpath: '/html/body/p[2]',
+          percentage: 0.4,
+          localUpdatedAt: syncedLocalUpdatedAt,
+          syncedLocalUpdatedAt,
+          serverUpdatedAt,
+          pendingSync: false,
+          syncRevision: 2,
+        },
+      },
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await markBookCompleted(existingBook);
+  await markBookCompleted(unreadBook);
+
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: '',
+    xpath: null,
+    percentage: 1,
+    syncedLocalUpdatedAt,
+    serverUpdatedAt,
+    pendingSync: true,
+    syncRevision: 3,
+  });
+  await expect(getReadingState(unreadBook.id)).resolves.toMatchObject({
+    cfi: '',
+    xpath: null,
+    percentage: 1,
+    syncedLocalUpdatedAt: null,
+    serverUpdatedAt: null,
+    pendingSync: true,
+    syncRevision: 1,
+  });
+  await expect(getBooks('server')).resolves.toMatchObject([
+    { id: existingBook.id, pagesRead: existingBook.pages },
+    { id: unreadBook.id, pagesRead: unreadBook.pages },
+  ]);
+  await expect(getPendingSync('server')).resolves.toEqual([
+    expect.objectContaining({
+      bookId: existingBook.id,
+      payload: JSON.stringify({
+        libraryId: existingBook.libraryId,
+        seriesId: existingBook.seriesId,
+        volumeId: existingBook.volumeId,
+        chapterId: existingBook.chapterId,
+        pageNum: existingBook.pages,
+        bookScrollId: null,
+      }),
+      revision: 3,
+    }),
+    expect.objectContaining({
+      bookId: unreadBook.id,
+      payload: JSON.stringify({
+        libraryId: unreadBook.libraryId,
+        seriesId: unreadBook.seriesId,
+        volumeId: unreadBook.volumeId,
+        chapterId: unreadBook.chapterId,
+        pageNum: unreadBook.pages,
+        bookScrollId: null,
+      }),
+      revision: 1,
+    }),
+  ]);
 });
 
 it('accepts the selected browser server progress and drops only the displayed local revision', async () => {
