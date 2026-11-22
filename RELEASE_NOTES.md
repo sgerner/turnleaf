@@ -3,6 +3,7 @@
 ## Unreleased
 
 - chore(android): delete unreferenced XML resource templates
+- Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
