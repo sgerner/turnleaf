@@ -866,18 +866,18 @@ export class ReaderSession {
       if (!this.isCurrentLocationOperation(generation)) return false;
       this.lastDisplayedTarget = section.href;
       this.hasDisplayedTarget = true;
+      if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
       if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
       if (!node) return false;
-      const range = contents.document.createRange();
-      range.selectNodeContents(node);
-      const resolvedCfi = contents.cfiFromRange(range);
-      await rendition.display(resolvedCfi);
+      const cfi = this.cfiFromXPathNode(contents, node);
+      if (!(contents.range(cfi) as Range | null)) return false;
+      await rendition.display(cfi);
       if (this.isCurrentLocationOperation(generation)) {
-        this.lastDisplayedTarget = resolvedCfi;
+        this.lastDisplayedTarget = cfi;
         this.hasDisplayedTarget = true;
         return true;
       }
@@ -889,6 +889,21 @@ export class ReaderSession {
       this.displayInFlight = false;
       this.flushPendingViewportResize();
     }
+  }
+
+  private cfiFromXPathNode(contents: Contents, node: Element): string {
+    const walker = contents.document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+      if (current.parentElement?.localName === 'style') continue;
+      const offset = current.textContent?.search(/\S/) ?? -1;
+      if (offset >= 0) {
+        const range = contents.document.createRange();
+        range.setStart(current, offset);
+        range.collapse(true);
+        return contents.cfiFromRange(range);
+      }
+    }
+    return contents.cfiFromNode(node);
   }
 
   private async displayPercentage(percentage: number, generation: number): Promise<boolean> {

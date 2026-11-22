@@ -1,12 +1,16 @@
 // @vitest-environment jsdom
 
+import { tick } from 'svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   activateModal,
+  activeElement,
   deactivateModal,
   focusFirstElement,
+  focusModal,
   isolateModalBackground,
   restoreFocus,
+  restoreModalFocus,
   trapModalKeydown,
 } from './modal-focus';
 
@@ -30,6 +34,11 @@ beforeEach(() => {
 
 afterEach(() => {
   document.body.innerHTML = '';
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 it('focuses the first available control when a modal opens', () => {
@@ -168,4 +177,57 @@ it('redirects stray focusin outside an active modal and releases inert before re
 
   restoreFocus(opener);
   expect(document.activeElement).toBe(opener);
+});
+
+it('returns the focused HTMLElement and null for non-HTML targets or missing document', () => {
+  first.focus();
+  expect(activeElement()).toBe(first);
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  vi.spyOn(document, 'activeElement', 'get').mockReturnValue(svg);
+  expect(activeElement()).toBeNull();
+
+  vi.stubGlobal('document', undefined);
+  expect(activeElement()).toBeNull();
+});
+
+it('defers modal focus placement until after tick and ignores unmounted containers', async () => {
+  const opener = document.createElement('button');
+  document.body.append(opener);
+  opener.focus();
+
+  let mountedDialog: HTMLElement | null = null;
+  focusModal(() => mountedDialog);
+  expect(document.activeElement).toBe(opener);
+
+  mountedDialog = dialog;
+  await tick();
+  expect(document.activeElement).toBe(first);
+
+  focusModal(() => null);
+  await tick();
+  expect(document.activeElement).toBe(first);
+});
+
+it('defers focus restoration to connected enabled openers and skips disconnected or disabled ones', async () => {
+  const opener = document.createElement('button');
+  document.body.append(opener);
+  first.focus();
+
+  restoreModalFocus(opener);
+  expect(document.activeElement).toBe(first);
+  await tick();
+  expect(document.activeElement).toBe(opener);
+
+  first.focus();
+  opener.disabled = true;
+  restoreModalFocus(opener);
+  await tick();
+  expect(document.activeElement).toBe(first);
+
+  opener.disabled = false;
+  opener.remove();
+  restoreModalFocus(opener);
+  await tick();
+  expect(document.activeElement).toBe(first);
 });
