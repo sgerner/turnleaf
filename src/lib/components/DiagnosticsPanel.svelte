@@ -156,14 +156,18 @@
       <button
         class="btn btn-sm preset-tonal-surface !text-sm"
         type="button"
-        onclick={() => void copyDiagnostics()}>Copy diagnostics</button
+        onclick={() => void copyDiagnostics()}
       >
+        Copy diagnostics
+      </button>
       <button
         class="btn btn-sm preset-tonal-surface !text-sm"
         type="button"
         disabled={exporting}
-        onclick={() => void downloadDiagnostics()}>Download log</button
+        onclick={() => void downloadDiagnostics()}
       >
+        Download log
+      </button>
       <button
         class="btn btn-sm preset-tonal-surface !text-sm"
         type="button"
@@ -174,8 +178,10 @@
       <button
         class="btn btn-sm preset-tonal-surface !text-sm"
         type="button"
-        onclick={() => void clearDiagnosticLog()}>Clear diagnostics</button
+        onclick={() => void clearDiagnosticLog()}
       >
+        Clear diagnostics
+      </button>
     </div>
     {#if diagnosticsVisible}
       <div class="mt-3 grid gap-2">
@@ -193,8 +199,10 @@
         <button
           class="btn btn-sm preset-tonal-surface justify-self-start !text-sm"
           type="button"
-          onclick={selectDiagnostics}>Select all text</button
+          onclick={selectDiagnostics}
         >
+          Select all text
+        </button>
       </div>
     {/if}
     {#if diagnosticsMessage}
@@ -210,15 +218,17 @@
       clear it. Review it before sharing.
     </p>
     <div class="mt-3 grid grid-cols-2 gap-2">
-      <button class="btn preset-tonal-surface" type="button" onclick={() => void copyDiagnostics()}
-        >Copy diagnostics</button
-      >
+      <button class="btn preset-tonal-surface" type="button" onclick={() => void copyDiagnostics()}>
+        Copy diagnostics
+      </button>
       <button
         class="btn preset-tonal-surface"
         type="button"
         disabled={exporting}
-        onclick={() => void downloadDiagnostics()}>Download log</button
+        onclick={() => void downloadDiagnostics()}
       >
+        Download log
+      </button>
     </div>
     <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
       {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
@@ -236,16 +246,18 @@
           bind:value={diagnosticsOutput}
           aria-label="Turnleaf diagnostics log"
           onclick={selectDiagnostics}></textarea>
-        <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}
-          >Select all text</button
-        >
+        <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
+          Select all text
+        </button>
       </div>
     {/if}
     <button
       class="btn preset-tonal-surface mt-2 w-full"
       type="button"
-      onclick={() => void clearDiagnosticLog()}>Clear diagnostics</button
+      onclick={() => void clearDiagnosticLog()}
     >
+      Clear diagnostics
+    </button>
     {#if diagnosticsMessage}
       <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
     {/if}
