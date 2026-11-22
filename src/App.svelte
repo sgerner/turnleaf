@@ -234,64 +234,42 @@
     inset: 0;
     isolation: isolate;
     overflow: hidden;
-    background-color: color-mix(
-      in oklab,
-      var(--color-root-bg-light) 72%,
-      var(--color-surface-50-950) 28%
-    );
-    background:
+    background-color: var(--color-root-bg-light);
+    background-image:
       radial-gradient(
         circle at 18% 16%,
-        color-mix(in oklab, var(--color-primary-300-700) 42%, var(--color-surface-50-950) 58%),
+        color-mix(in oklab, var(--color-primary-300) 16%, var(--color-root-bg-light) 84%),
         transparent 44%
       ),
       radial-gradient(
         circle at 82% 18%,
-        color-mix(in oklab, var(--color-secondary-300-700) 34%, var(--color-surface-50-950) 66%),
+        color-mix(in oklab, var(--color-secondary-300) 14%, var(--color-root-bg-light) 86%),
         transparent 42%
       ),
       radial-gradient(
         circle at 52% 80%,
-        color-mix(in oklab, var(--color-tertiary-300-700) 38%, var(--color-surface-50-950) 62%),
+        color-mix(in oklab, var(--color-tertiary-300) 14%, var(--color-root-bg-light) 86%),
         transparent 46%
-      ),
-      linear-gradient(
-        180deg,
-        color-mix(in oklab, var(--color-surface-100-900) 30%, transparent),
-        transparent 30%,
-        transparent 70%,
-        color-mix(in oklab, var(--color-surface-50-950) 20%, transparent)
       );
   }
 
   :global([data-mode='dark']) .app-shell {
-    background-color: color-mix(
-      in oklab,
-      var(--color-root-bg-dark) 92%,
-      var(--color-surface-950) 8%
-    );
-    background:
+    background-color: var(--color-root-bg-dark);
+    background-image:
       radial-gradient(
         circle at 18% 16%,
-        color-mix(in oklab, var(--color-primary-300-700) 74%, var(--color-surface-950) 26%),
+        color-mix(in oklab, var(--color-primary-700) 16%, var(--color-root-bg-dark) 84%),
         transparent 38%
       ),
       radial-gradient(
         circle at 82% 18%,
-        color-mix(in oklab, var(--color-secondary-300-700) 64%, var(--color-surface-950) 36%),
+        color-mix(in oklab, var(--color-secondary-700) 14%, var(--color-root-bg-dark) 86%),
         transparent 36%
       ),
       radial-gradient(
         circle at 52% 80%,
-        color-mix(in oklab, var(--color-tertiary-300-700) 70%, var(--color-surface-950) 30%),
+        color-mix(in oklab, var(--color-tertiary-700) 14%, var(--color-root-bg-dark) 86%),
         transparent 40%
-      ),
-      linear-gradient(
-        180deg,
-        color-mix(in oklab, var(--color-surface-50-950) 72%, transparent),
-        transparent 28%,
-        transparent 66%,
-        color-mix(in oklab, var(--color-surface-50-950) 46%, transparent)
       );
   }
 
@@ -306,7 +284,7 @@
   .orb {
     position: absolute;
     border-radius: 9999px;
-    opacity: 0.66;
+    opacity: 0.45;
     transform: translate3d(0, 0, 0);
     will-change: transform;
   }
@@ -318,7 +296,7 @@
     top: 12vh;
     background: radial-gradient(
       circle at 32% 30%,
-      color-mix(in oklab, var(--color-primary-300-700) 58%, var(--color-surface-50-950) 42%),
+      color-mix(in oklab, var(--color-primary-300) 20%, var(--color-root-bg-light) 80%),
       transparent 66%
     );
   }
@@ -330,7 +308,7 @@
     top: 20vh;
     background: radial-gradient(
       circle at 38% 34%,
-      color-mix(in oklab, var(--color-secondary-300-700) 46%, var(--color-surface-50-950) 54%),
+      color-mix(in oklab, var(--color-secondary-300) 18%, var(--color-root-bg-light) 82%),
       transparent 68%
     );
   }
@@ -342,7 +320,7 @@
     bottom: 10vh;
     background: radial-gradient(
       circle at 36% 34%,
-      color-mix(in oklab, var(--color-tertiary-300-700) 52%, var(--color-surface-50-950) 48%),
+      color-mix(in oklab, var(--color-tertiary-300) 18%, var(--color-root-bg-light) 82%),
       transparent 68%
     );
   }
@@ -374,7 +352,7 @@
     background: radial-gradient(
       circle at center,
       transparent 42%,
-      color-mix(in oklab, var(--color-surface-50-950) 48%, transparent) 100%
+      color-mix(in oklab, var(--color-surface-50-950) 24%, transparent) 100%
     );
   }
 
@@ -388,13 +366,13 @@
   }
 
   :global([data-mode='dark']) .orb {
-    opacity: 0.84;
+    opacity: 0.45;
   }
 
   :global([data-mode='dark']) .orb-primary {
     background: radial-gradient(
       circle at 32% 30%,
-      color-mix(in oklab, var(--color-primary-300-700) 82%, var(--color-surface-950) 18%),
+      color-mix(in oklab, var(--color-primary-700) 20%, var(--color-root-bg-dark) 80%),
       transparent 62%
     );
   }
@@ -402,7 +380,7 @@
   :global([data-mode='dark']) .orb-secondary {
     background: radial-gradient(
       circle at 38% 34%,
-      color-mix(in oklab, var(--color-secondary-300-700) 74%, var(--color-surface-950) 26%),
+      color-mix(in oklab, var(--color-secondary-700) 18%, var(--color-root-bg-dark) 82%),
       transparent 60%
     );
   }
@@ -410,7 +388,7 @@
   :global([data-mode='dark']) .orb-tertiary {
     background: radial-gradient(
       circle at 36% 34%,
-      color-mix(in oklab, var(--color-tertiary-300-700) 78%, var(--color-surface-950) 22%),
+      color-mix(in oklab, var(--color-tertiary-700) 18%, var(--color-root-bg-dark) 82%),
       transparent 60%
     );
   }

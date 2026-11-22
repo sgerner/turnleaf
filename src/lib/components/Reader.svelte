@@ -1396,7 +1396,9 @@
             {#each ['light', 'dark'] as mode (mode)}
               <button
                 class:active-mode={appearance.mode === mode}
-                class="btn preset-outlined-surface-300-700 capitalize"
+                class="btn capitalize {appearance.mode === mode
+                  ? 'preset-filled-primary-700-300'
+                  : 'preset-outlined-surface-300-700'}"
                 type="button"
                 aria-pressed={appearance.mode === mode}
                 onclick={() => updateAppearance({ mode: mode as ReadingMode })}>{mode}</button
@@ -1600,7 +1602,7 @@
                     }}>{item.label}</button
                   >
                   {#if item.children.length > 0}
-                    <div class="ml-4 border-l border-surface-300/50 pl-2">
+                    <div class="ml-4 border-l border-[var(--control-border)] pl-2">
                       {@render contentsList(item.children)}
                     </div>
                   {/if}
@@ -2057,9 +2059,10 @@
     user-select: none;
     --reader-background: var(--color-surface-50);
     --reader-text: var(--color-surface-950);
-    --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
-    --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
-    --reader-bar-text: var(--color-surface-950);
+    --reader-bar-bg: var(--color-surface-50);
+    --reader-overlay-top: color-mix(in oklab, var(--reader-background) 92%, transparent);
+    --reader-overlay-bottom: color-mix(in oklab, var(--reader-background) 92%, transparent);
+    --reader-bar-text: color-mix(in oklab, var(--color-surface-950) 50%, oklch(0 0 0));
     --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
     --reader-safe-bottom: max(
       1rem,
@@ -2097,9 +2100,10 @@
   .reader-shell[data-mode='dark'] {
     --reader-background: var(--color-surface-950);
     --reader-text: var(--color-surface-50);
-    --reader-overlay-top: color-mix(in oklab, var(--reader-text) 38%, transparent);
-    --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 32%, transparent);
-    --reader-bar-text: var(--color-surface-50);
+    --reader-bar-bg: var(--color-surface-950);
+    --reader-overlay-top: color-mix(in oklab, var(--reader-background) 92%, transparent);
+    --reader-overlay-bottom: color-mix(in oklab, var(--reader-background) 92%, transparent);
+    --reader-bar-text: color-mix(in oklab, var(--color-surface-50) 50%, oklch(1 0 0));
   }
 
   .reader-overlay {
@@ -2113,6 +2117,10 @@
       transparent 78%,
       var(--reader-overlay-bottom)
     );
+  }
+
+  :global([data-theme='eink']) .reader-overlay {
+    background: none;
   }
 
   .tap-zones {
@@ -2182,12 +2190,15 @@
     align-items: center;
     gap: 0.75rem;
     padding-inline: max(1rem, env(safe-area-inset-left));
+    background: var(--reader-bar-bg);
     color: var(--reader-bar-text);
   }
 
   .reader-top {
     top: 0;
-    padding-top: env(safe-area-inset-top);
+    padding-top: max(0.375rem, env(safe-area-inset-top));
+    padding-bottom: 0.375rem;
+    border-bottom: 1px solid var(--control-border);
   }
 
   .reader-toolbar {
@@ -2240,7 +2251,7 @@
     text-align: center;
     font-size: 0.875rem;
     font-weight: 700;
-    color: var(--color-primary-500);
+    color: var(--reader-bar-text);
   }
 
   @media (max-width: 40rem) {
@@ -2276,7 +2287,8 @@
   .reader-bottom {
     bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
     justify-content: space-between;
-    padding-bottom: 0;
+    padding-block: 0.25rem;
+    border-top: 1px solid var(--control-border);
   }
 
   .reader-progress {
@@ -2292,13 +2304,13 @@
     height: var(--reader-progress-height);
     overflow: hidden;
     border-radius: 9999px;
-    background: color-mix(in oklab, var(--reader-text) 12%, transparent);
+    background: var(--progress-track-bg);
   }
 
   .reader-progress-fill {
     height: 100%;
     border-radius: inherit;
-    background: var(--reader-text);
+    background: var(--progress-fill-bg);
     transition: width 120ms linear;
   }
 
