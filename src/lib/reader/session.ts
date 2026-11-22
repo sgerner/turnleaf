@@ -50,13 +50,85 @@ type PaginatedRenditionOptions = RenditionOptions & {
   gap?: number;
 };
 
+interface PaginatedView {
+  section: {
+    index: number;
+    href: string;
+    cfiBase: string;
+  };
+  contents: Contents;
+  position: () => DOMRect;
+  width: () => number;
+}
+
+interface PaginatedLocationSection {
+  index: number;
+  href: string;
+  pages: number[];
+  totalPages: number;
+  mapping: { start: string; end: string } | undefined;
+}
+
+interface PaginatedViewManager {
+  _stageSize?: { width: number; height: number } | undefined;
+  isPaginated?: boolean;
+  settings?: {
+    axis?: string;
+    direction?: string;
+    fullsize?: boolean;
+  };
+  container?: HTMLElement;
+  layout?: {
+    width: number;
+    pageWidth: number;
+    delta: number;
+    count: (length: number) => { spreads: number; pages: number };
+  };
+  mapping?: {
+    page: (
+      contents: Contents,
+      cfiBase: string,
+      start: number,
+      end: number,
+    ) => { start: string; end: string } | undefined;
+  };
+  views?: {
+    length: number;
+  };
+  scrollLeft?: number;
+  visible?: () => PaginatedView[];
+  scrollTo?: (x: number, y: number, silent?: boolean) => void;
+  next?: () => Promise<void> | undefined;
+  prev?: () => Promise<void> | undefined;
+  moveTo?: (offset: { left: number; top: number }, width?: number) => void;
+  paginatedLocation?: () => PaginatedLocationSection[];
+}
+
 type ResizableRendition = Rendition & {
   resize: (width: number, height: number, epubcfi?: string) => void;
   reportLocation?: () => Promise<void>;
-  manager?: {
-    _stageSize?: { width: number; height: number } | undefined;
+  manager?: PaginatedViewManager;
+  q?: {
+    running?: unknown;
+    _q?: unknown[];
   };
 };
+
+const SUBPIXEL_SCROLL_TOLERANCE_PX = 2;
+const SUBPIXEL_TARGET_TOLERANCE_PX = 1;
+
+export function snapPageBoundary(
+  offset: number,
+  pageWidth: number,
+  maxTolerancePx = SUBPIXEL_SCROLL_TOLERANCE_PX,
+): number {
+  if (!Number.isFinite(offset) || !Number.isFinite(pageWidth) || pageWidth <= 0) {
+    return offset;
+  }
+  const tolerance = Math.min(maxTolerancePx, pageWidth / 4);
+  const nearest = Math.round(offset / pageWidth) * pageWidth;
+  return Math.abs(offset - nearest) <= tolerance ? Math.max(0, nearest) : offset;
+}
 
 function isSubSectionTarget(target: string | undefined): target is string {
   return Boolean(target && (target.startsWith('epubcfi(') || target.includes('#')));
@@ -334,6 +406,8 @@ export class ReaderSession {
   private resizeObserver: ResizeObserver | null = null;
   private resizeTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingResizeFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingResizeFallbackFrame: number | null = null;
+  private resizeFallbackGeneration = 0;
   private viewportSize: { width: number; height: number } | null = null;
   private pendingViewportSize: { width: number; height: number } | null = null;
   private openInProgress = false;
@@ -387,6 +461,8 @@ export class ReaderSession {
     this.renditionStarted = false;
     this.initialDisplayTarget = undefined;
     this.pendingSubSectionTarget = null;
+    this.viewportSize =
+      initialWidth > 0 && initialHeight > 0 ? { width: initialWidth, height: initialHeight } : null;
     this.pendingViewportSize = null;
     this.resizeReflowInFlight = false;
     this.navigationDisplayInFlight = false;
@@ -440,7 +516,8 @@ export class ReaderSession {
       this.current = location;
       if (
         isUserNavigation ||
-        (!this.navigationDisplayInFlight && this.userNavigationOrigin === 'link')
+        (!this.navigationDisplayInFlight &&
+          (this.userNavigationOrigin === 'link' || !this.reflowPending))
       ) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -495,6 +572,7 @@ export class ReaderSession {
       await this.rendition.started;
       if (!this.isCurrentLocationOperation(restoreGeneration)) return;
       this.renditionStarted = true;
+      this.installSubpixelPagination();
       if (cfi) {
         try {
           if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -812,9 +890,162 @@ export class ReaderSession {
     ].join('\n');
   }
 
+  private installSubpixelPagination(): void {
+    const manager = (this.rendition as ResizableRendition | null)?.manager;
+    if (!manager) return;
+
+    if (typeof manager.next === 'function') {
+      const origNext = manager.next.bind(manager);
+      manager.next = () => {
+        const dir = manager.settings?.direction;
+        const delta = manager.layout?.delta ?? 0;
+        const container = manager.container;
+        if (
+          manager.isPaginated &&
+          manager.settings?.axis === 'horizontal' &&
+          (!dir || dir === 'ltr') &&
+          !manager.settings.fullsize &&
+          container &&
+          manager.views?.length &&
+          delta > 0
+        ) {
+          const currentLeft = snapPageBoundary(container.scrollLeft, delta);
+          const nextLeft = currentLeft + delta;
+          const scrollWidth = snapPageBoundary(container.scrollWidth, delta);
+          if (nextLeft + delta <= scrollWidth) {
+            manager.scrollLeft = container.scrollLeft;
+            manager.scrollTo?.(nextLeft, 0, true);
+            return;
+          }
+          if (container.scrollLeft + container.offsetWidth + delta <= container.scrollWidth) {
+            manager.scrollTo?.(container.scrollWidth, 0, true);
+          }
+        }
+        return origNext();
+      };
+    }
+
+    if (typeof manager.prev === 'function') {
+      const origPrev = manager.prev.bind(manager);
+      manager.prev = () => {
+        const dir = manager.settings?.direction;
+        const delta = manager.layout?.delta ?? 0;
+        const container = manager.container;
+        if (
+          manager.isPaginated &&
+          manager.settings?.axis === 'horizontal' &&
+          (!dir || dir === 'ltr') &&
+          !manager.settings.fullsize &&
+          container &&
+          manager.views?.length &&
+          delta > 0
+        ) {
+          const currentLeft = snapPageBoundary(container.scrollLeft, delta);
+          if (currentLeft >= delta) {
+            manager.scrollLeft = container.scrollLeft;
+            manager.scrollTo?.(currentLeft - delta, 0, true);
+            return;
+          }
+          if (container.scrollLeft > 0) {
+            manager.scrollTo?.(0, 0, true);
+          }
+        }
+        return origPrev();
+      };
+    }
+
+    if (typeof manager.moveTo === 'function') {
+      const origMoveTo = manager.moveTo.bind(manager);
+      manager.moveTo = (offset, width) => {
+        const dir = manager.settings?.direction;
+        const delta = manager.layout?.delta ?? 0;
+        if (
+          manager.isPaginated &&
+          manager.settings?.axis === 'horizontal' &&
+          (!dir || dir === 'ltr') &&
+          delta > 0 &&
+          offset &&
+          Number.isFinite(offset.left)
+        ) {
+          const adjustedLeft = snapPageBoundary(offset.left, delta, SUBPIXEL_TARGET_TOLERANCE_PX);
+          if (adjustedLeft !== offset.left) {
+            origMoveTo({ ...offset, left: adjustedLeft }, width);
+            return;
+          }
+        }
+        origMoveTo(offset, width);
+      };
+    }
+
+    if (typeof manager.paginatedLocation === 'function') {
+      const origPaginatedLocation = manager.paginatedLocation.bind(manager);
+      manager.paginatedLocation = () => {
+        const dir = manager.settings?.direction;
+        const container = manager.container;
+        const layout = manager.layout;
+        const mappingHelper = manager.mapping;
+        if (
+          !manager.isPaginated ||
+          manager.settings?.axis !== 'horizontal' ||
+          (dir && dir !== 'ltr') ||
+          !container ||
+          !manager.visible ||
+          !layout ||
+          !mappingHelper ||
+          layout.pageWidth <= 0
+        ) {
+          return origPaginatedLocation();
+        }
+        const visible = manager.visible();
+        const containerRect = container.getBoundingClientRect();
+        const left = manager.settings.fullsize ? window.scrollX : 0;
+        let used = 0;
+
+        return visible.map((view) => {
+          const { index, href, cfiBase } = view.section;
+          const position = view.position();
+          const width = view.width();
+          const offset = containerRect.left + left;
+          const availableWidth = snapPageBoundary(position.right - offset, layout.pageWidth);
+          const pageWidth = Math.max(0, Math.min(availableWidth, layout.width) - used);
+          const start = snapPageBoundary(offset - position.left + used, layout.pageWidth);
+          const end = snapPageBoundary(start + pageWidth, layout.pageWidth);
+          used += pageWidth;
+
+          const mapping = mappingHelper.page(view.contents, cfiBase, start, end);
+          const totalPages = layout.count(width).pages;
+          let startPage = Math.floor(start / layout.pageWidth);
+          let endPage = Math.floor(end / layout.pageWidth);
+          if (startPage < 0) {
+            startPage = 0;
+            endPage += 1;
+          }
+          if (totalPages > 0) {
+            startPage = Math.min(startPage, totalPages - 1);
+            endPage = Math.min(Math.max(startPage + 1, endPage), totalPages);
+          }
+          const pages: number[] = [];
+          for (let page = startPage + 1; page <= endPage; page += 1) {
+            pages.push(page);
+          }
+          return {
+            index,
+            href,
+            pages,
+            totalPages,
+            mapping,
+          };
+        });
+      };
+    }
+  }
+
   private observeViewport(target: HTMLElement): void {
     const initial = target.getBoundingClientRect();
-    this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
+    const initialWidth = Math.floor(initial.width);
+    const initialHeight = Math.floor(initial.height);
+    this.viewportSize =
+      initialWidth > 0 && initialHeight > 0 ? { width: initialWidth, height: initialHeight } : null;
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -868,50 +1099,73 @@ export class ReaderSession {
   }
 
   private clearPendingResizeFallbackTimer(): void {
+    this.resizeFallbackGeneration += 1;
     if (this.pendingResizeFallbackTimer !== null) {
       clearTimeout(this.pendingResizeFallbackTimer);
       this.pendingResizeFallbackTimer = null;
+    }
+    if (this.pendingResizeFallbackFrame !== null) {
+      if (typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(this.pendingResizeFallbackFrame);
+      }
+      this.pendingResizeFallbackFrame = null;
     }
   }
 
   private schedulePendingResizeFallback(): void {
     this.clearPendingResizeFallbackTimer();
+    const generation = this.resizeFallbackGeneration;
     this.pendingResizeFallbackTimer = setTimeout(() => {
       this.pendingResizeFallbackTimer = null;
-      const rendition = this.rendition;
-      const pending = this.pendingViewportSize;
-      if (!rendition || !pending || this.openInProgress) return;
-      this.resizeReflowInFlight = false;
-      if (this.userNavigationPending) {
-        this.userNavigationPending = false;
-        this.userNavigationStartCfi = null;
-      }
-      const hasKnownLocation = Boolean(this.current?.start.cfi || rendition.location?.start.cfi);
-      if (hasKnownLocation) {
-        this.flushPendingViewportResize();
-        return;
-      }
-      this.pendingViewportSize = null;
-      if (
-        this.viewportSize?.width === pending.width &&
-        this.viewportSize.height === pending.height
-      ) {
-        return;
-      }
-      this.viewportSize = { width: pending.width, height: pending.height };
-      const resizable = rendition as ResizableRendition;
-      if (resizable.manager) {
-        resizable.manager._stageSize = undefined;
-      }
-      rendition.resize(pending.width, pending.height);
-      if ('manager' in rendition && !this.current && !rendition.location?.start) {
-        void this.displayAtGeneration(this.initialDisplayTarget, this.locationGeneration).catch(
-          () => {
-            // Ignore fallback display errors if the session was destroyed or navigated away.
-          },
-        );
-      }
+      this.waitForIdleResizeFallback(generation, 3);
     }, UNLOCATED_RESIZE_FALLBACK_MS);
+  }
+
+  private waitForIdleResizeFallback(generation: number, remainingFrames: number): void {
+    if (generation !== this.resizeFallbackGeneration) return;
+    const rendition = this.rendition;
+    const pending = this.pendingViewportSize;
+    if (!rendition || !pending || this.openInProgress || this.navigationDisplayInFlight) return;
+    const resizable = rendition as ResizableRendition;
+    const queueBusy = Boolean(resizable.q?.running || resizable.q?._q?.length);
+    if (
+      'manager' in rendition &&
+      typeof requestAnimationFrame === 'function' &&
+      (queueBusy || remainingFrames > 0)
+    ) {
+      const nextFrames = queueBusy ? 3 : remainingFrames - 1;
+      this.pendingResizeFallbackFrame = requestAnimationFrame(() => {
+        this.pendingResizeFallbackFrame = null;
+        this.waitForIdleResizeFallback(generation, nextFrames);
+      });
+      return;
+    }
+    this.resizeReflowInFlight = false;
+    if (this.userNavigationPending) {
+      this.userNavigationPending = false;
+      this.userNavigationStartCfi = null;
+    }
+    const hasKnownLocation = Boolean(this.current?.start.cfi || rendition.location?.start.cfi);
+    if (hasKnownLocation) {
+      this.flushPendingViewportResize();
+      return;
+    }
+    this.pendingViewportSize = null;
+    if (this.viewportSize?.width === pending.width && this.viewportSize.height === pending.height) {
+      return;
+    }
+    this.viewportSize = { width: pending.width, height: pending.height };
+    if (resizable.manager) {
+      resizable.manager._stageSize = undefined;
+    }
+    rendition.resize(pending.width, pending.height);
+    if ('manager' in rendition && !this.current && !rendition.location?.start) {
+      void this.displayAtGeneration(this.initialDisplayTarget, this.locationGeneration).catch(
+        () => {
+          // Ignore fallback display errors if the session was destroyed or navigated away.
+        },
+      );
+    }
   }
 
   private flushPendingViewportResize(): void {
@@ -1054,6 +1308,7 @@ export class ReaderSession {
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
+    this.clearPendingResizeFallbackTimer();
     this.locationGeneration += 1;
     this.pendingSubSectionTarget = null;
     this.userNavigationPending = userNavigation;
@@ -1068,6 +1323,7 @@ export class ReaderSession {
   private beginLinkedNavigation(): void {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
+    this.clearPendingResizeFallbackTimer();
     this.locationGeneration += 1;
     this.pendingSubSectionTarget = null;
     this.userNavigationPending = true;

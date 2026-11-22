@@ -38,7 +38,7 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
 
 vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 
-import { ReaderSession } from './session';
+import { ReaderSession, snapPageBoundary } from './session';
 
 describe('ReaderSession keyboard navigation', () => {
   beforeEach(() => {
@@ -375,6 +375,117 @@ describe('ReaderSession keyboard navigation', () => {
     session.destroy();
   });
 
+  it('ignores initial ResizeObserver callback matching open() viewport dimensions', async () => {
+    vi.useFakeTimers();
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {
+        resizeCallbacks[0]?.(
+          [{ contentRect: { width: 360, height: 780 } } as ResizeObserverEntry],
+          {} as ResizeObserver,
+        );
+      }
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 780));
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+    mockRendition.display.mockClear();
+
+    vi.advanceTimersByTime(500);
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+    expect(mockRendition.display).not.toHaveBeenCalled();
+    session.destroy();
+  });
+
+  it('waits for EPUB.js queue and animation frames before fallback resize so slow-frame page turns are preserved', async () => {
+    vi.useFakeTimers();
+    const rafCallbacks: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      rafCallbacks.push(cb);
+      return rafCallbacks.length;
+    });
+    vi.stubGlobal('cancelAnimationFrame', vi.fn());
+
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const managedRendition = Object.assign(mockRendition, {
+      manager: {
+        _stageSize: { width: 360, height: 780 } as { width: number; height: number } | undefined,
+      },
+      q: { running: true as boolean | undefined, _q: [() => {}] as Array<() => void> },
+    });
+
+    try {
+      const onLocation = vi.fn();
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 780));
+      const session = new ReaderSession('book.epub');
+      await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+      mockRendition.display.mockClear();
+
+      // Android SystemBars / ReaderChrome resize arrives before initial rAF relocation finishes.
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 360, height: 804 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      vi.advanceTimersByTime(150);
+
+      // User turns to page 2 while initial relocation and EPUB.js queue are still in flight on slow frames.
+      await session.next();
+      vi.advanceTimersByTime(300);
+
+      // Even after 300ms (> 250ms fallback timer), slow animation frames have not drained, so page turn must not be reset.
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+      expect(mockRendition.display).not.toHaveBeenCalled();
+
+      managedRendition.q.running = undefined;
+      managedRendition.q._q = [];
+
+      const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+      relocated({
+        start: {
+          href: 'first.xhtml',
+          index: 0,
+          cfi: 'epubcfi(/6/2!/4/2/6:0)',
+          displayed: { page: 2, total: 2 },
+        },
+      });
+
+      expect(onLocation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cfi: 'epubcfi(/6/2!/4/2/6:0)',
+          pageIndex: 1,
+          percentage: 0.25,
+        }),
+        'navigation',
+      );
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+        360,
+        804,
+        'epubcfi(/6/2!/4/2/6:0)',
+      );
+      session.destroy();
+    } finally {
+      delete (managedRendition as { manager?: unknown }).manager;
+      delete (managedRendition as { q?: unknown }).q;
+    }
+  });
+
   it('replaces #epubjs-inserted-css-turnleaf with 7 rules and zero duplicates across 10 slider ticks', async () => {
     const frame = document.createElement('iframe');
     document.body.append(frame);
@@ -507,5 +618,136 @@ describe('ReaderSession keyboard navigation', () => {
     expect(expand).toHaveBeenCalledOnce();
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/4/1:264)');
     session.destroy();
+  });
+
+  it('snaps subpixel horizontal pagination offsets on fractional-DPR viewports without skipping pages or clamping page index', async () => {
+    expect(snapPageBoundary(363.80950927734375, 364)).toBe(364);
+    expect(snapPageBoundary(362.6666564941406, 363)).toBe(363);
+    expect(snapPageBoundary(363.047607421875, 363)).toBe(363);
+    expect(snapPageBoundary(0.190476, 364)).toBe(0);
+    expect(snapPageBoundary(180, 364)).toBe(180);
+
+    const container = document.createElement('div');
+    let scrollLeft = 363.80950927734375;
+    let scrollWidth = 728;
+    const offsetWidth = 364;
+    Object.defineProperty(container, 'scrollLeft', {
+      get: () => scrollLeft,
+      set: (value: number) => {
+        scrollLeft = value;
+      },
+      configurable: true,
+    });
+    Object.defineProperty(container, 'scrollWidth', {
+      get: () => scrollWidth,
+      configurable: true,
+    });
+    Object.defineProperty(container, 'offsetWidth', {
+      get: () => offsetWidth,
+      configurable: true,
+    });
+    vi.spyOn(container, 'getBoundingClientRect').mockReturnValue(new DOMRect(24, 52, 364, 496));
+
+    const mappingPage = vi.fn(
+      (_contents: unknown, _cfiBase: string, start: number, end: number) => ({
+        start: `epubcfi(/6/2!/4/2/4/1:${start})`,
+        end: `epubcfi(/6/2!/4/2/4/1:${end})`,
+      }),
+    );
+    const origNext = vi.fn(async () => {});
+    const origPrev = vi.fn(async () => {});
+    const origMoveTo = vi.fn();
+    const scrollTo = vi.fn((x: number) => {
+      scrollLeft = x;
+    });
+
+    const managedRendition = Object.assign(mockRendition, {
+      manager: {
+        isPaginated: true,
+        settings: { axis: 'horizontal', direction: 'ltr', fullsize: false },
+        container,
+        layout: {
+          width: 364,
+          pageWidth: 364,
+          delta: 364,
+          count: (width: number) => ({
+            spreads: Math.ceil(width / 364),
+            pages: Math.ceil(width / 364),
+          }),
+        },
+        mapping: { page: mappingPage },
+        views: { length: 1 },
+        visible: () => [
+          {
+            section: { index: 0, href: 'first.xhtml', cfiBase: '/6/2!' },
+            contents: {} as never,
+            position: () => new DOMRect(24 - scrollLeft, 52, scrollWidth, 496),
+            width: () => scrollWidth,
+          },
+        ],
+        scrollTo,
+        next: origNext,
+        prev: origPrev,
+        moveTo: origMoveTo,
+        paginatedLocation: vi.fn(() => []),
+      },
+    });
+
+    try {
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+
+      // Page 2 of a 2-page chapter with Pixel 6 2.625 DPR quantized scrollLeft = 363.8095 (< 364)
+      const page2Location = managedRendition.manager.paginatedLocation();
+      expect(mappingPage).toHaveBeenCalledWith(expect.anything(), '/6/2!', 364, 728);
+      expect(page2Location).toEqual([
+        {
+          index: 0,
+          href: 'first.xhtml',
+          pages: [2],
+          totalPages: 2,
+          mapping: {
+            start: 'epubcfi(/6/2!/4/2/4/1:364)',
+            end: 'epubcfi(/6/2!/4/2/4/1:728)',
+          },
+        },
+      ]);
+
+      // On the last page of a 2-page chapter, next() delegates to section transition
+      await managedRendition.manager.next();
+      expect(origNext).toHaveBeenCalledOnce();
+
+      // On a 3-page chapter where Page 2 scrollLeft rounded up (364.1905 > 364), next() lands on Page 3 instead of skipping it
+      scrollWidth = 1092;
+      scrollLeft = 364.19049072265625;
+      origNext.mockClear();
+      scrollTo.mockClear();
+      managedRendition.manager.next();
+      expect(origNext).not.toHaveBeenCalled();
+      expect(scrollTo).toHaveBeenCalledExactlyOnceWith(728, 0, true);
+
+      // prev() from subpixel Page 2 returns cleanly to 0 without leaving subpixel residue
+      scrollLeft = 364.19049072265625;
+      scrollTo.mockClear();
+      managedRendition.manager.prev();
+      expect(origPrev).not.toHaveBeenCalled();
+      expect(scrollTo).toHaveBeenCalledExactlyOnceWith(0, 0, true);
+
+      // moveTo() snaps subpixel column start (363.8095 -> 364) when restoring a Page 2 CFI
+      managedRendition.manager.moveTo({ left: 363.80950927734375, top: 0 }, 728);
+      expect(origMoveTo).toHaveBeenCalledExactlyOnceWith({ left: 364, top: 0 }, 728);
+
+      session.destroy();
+    } finally {
+      delete (managedRendition as { manager?: unknown }).manager;
+    }
   });
 });
