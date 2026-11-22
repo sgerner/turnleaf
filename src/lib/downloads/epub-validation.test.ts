@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, vi } from 'vitest';
+import { Blob as NodeBlob } from 'node:buffer';
+import { deflateRawSync } from 'node:zlib';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   EpubValidationError,
   MAX_EPUB_ENTRIES,
@@ -13,7 +15,9 @@ interface ZipTestEntry {
   name: string;
   data?: Uint8Array;
   declaredSize?: number;
+  compressionMethod?: number;
   flags?: number;
+  localFlags?: number;
 }
 
 function write16(bytes: Uint8Array, offset: number, value: number): void {
@@ -31,7 +35,9 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     name: new TextEncoder().encode(entry.name),
     data: entry.data ?? new Uint8Array(),
     declaredSize: entry.declaredSize ?? entry.data?.length ?? 0,
+    compressionMethod: entry.compressionMethod ?? 0,
     flags: entry.flags ?? 0,
+    localFlags: entry.localFlags ?? entry.flags ?? 0,
   }));
   const localSize = normalized.reduce(
     (total, entry) => total + 30 + entry.name.length + entry.data.length,
@@ -45,7 +51,8 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     localOffsets.push(offset);
     write32(archive, offset, 0x04034b50);
     write16(archive, offset + 4, 20);
-    write16(archive, offset + 6, entry.flags);
+    write16(archive, offset + 6, entry.localFlags);
+    write16(archive, offset + 8, entry.compressionMethod);
     write16(archive, offset + 26, entry.name.length);
     offset += 30;
     archive.set(entry.name, offset);
@@ -59,6 +66,7 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     write16(archive, offset + 4, 20);
     write16(archive, offset + 6, 20);
     write16(archive, offset + 8, entry.flags);
+    write16(archive, offset + 10, entry.compressionMethod);
     write16(archive, offset + 28, entry.name.length);
     write32(archive, offset + 20, entry.data.length);
     write32(archive, offset + 24, entry.declaredSize);
@@ -96,6 +104,8 @@ async function expectInvalid(archive: Uint8Array, fileSize = archive.length): Pr
 }
 
 describe('EPUB container validation', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it('accepts a valid illustrated EPUB while using bounded range reads', async () => {
     const archive = makeZip(validEntries());
     const reads: Array<{ offset: number; length: number }> = [];
@@ -134,6 +144,82 @@ describe('EPUB container validation', () => {
         ),
       ),
     );
+  });
+
+  it('rejects an encrypted local mimetype header when central directory flags are clear', async () => {
+    for (const localFlags of [0x1, 0x40]) {
+      const archive = makeZip(
+        validEntries().map((entry, index) =>
+          index === 0
+            ? {
+                ...entry,
+                flags: 0,
+                localFlags,
+              }
+            : entry,
+        ),
+      );
+      await expect(
+        validateEpubArchive(archive.length, async (offset, length) =>
+          archive.slice(offset, offset + length),
+        ),
+      ).rejects.toThrow('The EPUB mimetype local header is malformed.');
+      await expectInvalid(archive);
+    }
+  });
+
+  it('validates deflated META-INF/container.xml entries and rejects corrupt deflate streams', async () => {
+    vi.stubGlobal('Blob', NodeBlob);
+    const xml = new TextEncoder().encode(
+      '<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>',
+    );
+    const deflatedValid = makeZip([
+      { name: 'mimetype', data: new TextEncoder().encode('application/epub+zip') },
+      {
+        name: 'META-INF/container.xml',
+        data: new Uint8Array(deflateRawSync(xml)),
+        declaredSize: xml.length,
+        compressionMethod: 8,
+      },
+      { name: 'OEBPS/cover.jpg', data: new Uint8Array(100_000) },
+    ]);
+    await expect(
+      validateEpubArchive(deflatedValid.length, async (offset, length) =>
+        deflatedValid.slice(offset, offset + length),
+      ),
+    ).resolves.toBeUndefined();
+
+    const malformedXml = new TextEncoder().encode('<container>');
+    await expectInvalid(
+      makeZip([
+        { name: 'mimetype', data: new TextEncoder().encode('application/epub+zip') },
+        {
+          name: 'META-INF/container.xml',
+          data: new Uint8Array(deflateRawSync(malformedXml)),
+          declaredSize: malformedXml.length,
+          compressionMethod: 8,
+        },
+      ]),
+    );
+
+    await expectInvalid(
+      makeZip([
+        { name: 'mimetype', data: new TextEncoder().encode('application/epub+zip') },
+        {
+          name: 'META-INF/container.xml',
+          data: new Uint8Array([0xff, 0xff]),
+          declaredSize: xml.length,
+          compressionMethod: 8,
+        },
+      ]),
+    );
+
+    vi.stubGlobal('DecompressionStream', undefined);
+    await expect(
+      validateEpubArchive(deflatedValid.length, async (offset, length) =>
+        deflatedValid.slice(offset, offset + length),
+      ),
+    ).resolves.toBeUndefined();
   });
 
   it('rejects an HTML error body, even when it is larger than the old size check', async () => {
