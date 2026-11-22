@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Index TOC paths and virtualize contents dialogs
+- Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
