@@ -51,7 +51,14 @@
   import { flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
-  import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import {
+    DEFAULT_THEME,
+    isSkeletonTheme,
+    loadTheme,
+    skeletonThemes,
+    themeSwatches,
+    type SkeletonTheme,
+  } from '../themes/themes';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   let {
@@ -61,6 +68,7 @@
     mode,
     onThemeChange,
     onModeChange,
+    onReadingChange,
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
@@ -71,6 +79,7 @@
     mode: 'light' | 'dark';
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
+    onReadingChange?: ((reading: boolean) => void) | undefined;
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
@@ -223,12 +232,14 @@
   let settingsVisible = $state(false);
   let diagnosticsVisible = $state(false);
   let diagnosticsOutput = $state('');
-  let pendingTheme = $state<SkeletonTheme>('vintage');
-  let pendingMode = $state<'light' | 'dark'>('dark');
+  let pendingTheme = $derived<SkeletonTheme>(isSkeletonTheme(theme) ? theme : DEFAULT_THEME);
+  let pendingMode = $derived<'light' | 'dark'>(mode);
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
+  let appearanceError = $state('');
   let settingsError = $state('');
+  let themeSwitchSequence = 0;
   let diagnosticsMessage = $state('');
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
@@ -472,6 +483,11 @@
   }
 
   $effect(() => {
+    const active = Boolean(reading);
+    onReadingChange?.(active);
+  });
+
+  $effect(() => {
     if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
   });
 
@@ -513,8 +529,6 @@
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
-    pendingTheme = theme as SkeletonTheme;
-    pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
     sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
     authorFilter = preferences.get('libraryAuthor') ?? '';
@@ -650,6 +664,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onReadingChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1341,7 +1356,6 @@
   function openSettings(): void {
     settingsOpener = activeElement();
     settingsVisible = true;
-    void Promise.allSettled(skeletonThemes.map(loadTheme));
     focusModal(() => settingsDialog);
   }
 
@@ -1464,12 +1478,18 @@
   }
 
   async function updateTheme(next: SkeletonTheme): Promise<void> {
+    const requestId = ++themeSwitchSequence;
     try {
-      await loadTheme(next);
+      const loaded = await loadTheme(next);
+      if (!loaded) throw new Error('Theme unavailable');
     } catch {
-      settingsError = 'The theme could not load. Try again.';
+      if (requestId === themeSwitchSequence && !destroyed) {
+        appearanceError = 'The theme could not load. Try again.';
+      }
       return;
     }
+    if (requestId !== themeSwitchSequence || destroyed) return;
+    appearanceError = '';
     pendingTheme = next;
     onThemeChange(next);
     await setPreference('uiTheme', next);
@@ -2619,6 +2639,7 @@
         <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
         <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
           {#each skeletonThemes as option (option)}
+            {@const swatch = themeSwatches[option]}
             <button
               class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
               option
@@ -2630,13 +2651,10 @@
               title={option}
               onclick={() => void updateTheme(option)}
             >
-              <span class="flex h-full w-full" data-theme={option}>
-                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
-                ></span>
+              <span class="flex h-full w-full">
+                <span class="h-full flex-1" style:background-color={swatch.primary}></span>
+                <span class="h-full flex-1" style:background-color={swatch.secondary}></span>
+                <span class="h-full flex-1" style:background-color={swatch.tertiary}></span>
               </span>
               {#if pendingTheme === option}
                 <span
@@ -2651,6 +2669,11 @@
             </button>
           {/each}
         </div>
+        {#if appearanceError}
+          <div class="alert preset-tonal-error mt-3" role="alert">
+            {appearanceError}
+          </div>
+        {/if}
 
         <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
         <p class="mt-1 text-sm text-surface-700-300">

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
@@ -13,12 +13,45 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
-  import { loadTheme } from './lib/themes/themes';
+  import {
+    DEFAULT_MODE,
+    DEFAULT_THEME,
+    isSkeletonTheme,
+    loadTheme,
+    normalizeUiMode,
+    readBootThemeCache,
+    syncShellAppearanceChrome,
+    writeBootThemeCache,
+    type SkeletonTheme,
+    type UiMode,
+  } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
-  const defaultTheme = 'fennec';
-  const defaultMode = 'dark';
+
+  let {
+    initialTheme,
+    initialMode,
+  }: {
+    initialTheme?: SkeletonTheme | undefined;
+    initialMode?: UiMode | undefined;
+  } = $props();
+
+  function resolveInitialAppearance(): { theme: SkeletonTheme; mode: UiMode } {
+    const cached = readBootThemeCache();
+    if (cached) return { theme: cached.theme, mode: cached.mode };
+    if (typeof document !== 'undefined') {
+      const domTheme = document.documentElement.dataset.theme;
+      const domMode = document.documentElement.dataset.mode;
+      return {
+        theme: domTheme && isSkeletonTheme(domTheme) ? domTheme : DEFAULT_THEME,
+        mode: normalizeUiMode(domMode),
+      };
+    }
+    return { theme: DEFAULT_THEME, mode: DEFAULT_MODE };
+  }
+
+  const bootAppearance = resolveInitialAppearance();
 
   let server = $state<ServerConfig | null>(null);
   let booting = $state(Capacitor.isNativePlatform());
@@ -26,8 +59,9 @@
   let repairing = $state(false);
   let changingServerAddress = $state(false);
   let apiKey = $state<string | null>(null);
-  let uiTheme = $state(defaultTheme);
-  let uiMode = $state<'light' | 'dark'>(defaultMode);
+  let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
+  let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
+  let readerActive = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
 
   async function loadLocalData(): Promise<void> {
@@ -35,6 +69,7 @@
     startupError = '';
     server = null;
     apiKey = null;
+    readerActive = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -43,9 +78,16 @@
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
-      const theme = savedTheme ?? defaultTheme;
-      uiTheme = (await loadTheme(theme).catch(() => false)) ? theme : defaultTheme;
-      uiMode = savedMode === 'light' ? 'light' : 'dark';
+      const requestedTheme = savedTheme && isSkeletonTheme(savedTheme) ? savedTheme : DEFAULT_THEME;
+      const resolvedTheme: SkeletonTheme = (await loadTheme(requestedTheme).catch(() => false))
+        ? requestedTheme
+        : DEFAULT_THEME;
+      const resolvedMode = normalizeUiMode(savedMode);
+      uiTheme = resolvedTheme;
+      uiMode = resolvedMode;
+      if (savedTheme !== undefined || savedMode !== undefined) {
+        writeBootThemeCache(resolvedTheme, resolvedMode);
+      }
       if (saved) {
         server = saved;
         try {
@@ -93,6 +135,7 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
+    syncShellAppearanceChrome(uiTheme, uiMode, { readerActive });
   });
 </script>
 
@@ -166,11 +209,13 @@
         mode={uiMode}
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
+        onReadingChange={(active) => (readerActive = active)}
         onApiKeyChange={(value) => (apiKey = value)}
         onChangeServerAddress={() => (changingServerAddress = true)}
         onServerDeleted={() => {
           server = null;
           apiKey = null;
+          readerActive = false;
         }}
       />
     {:else if startupError}
