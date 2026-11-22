@@ -1716,9 +1716,9 @@
                 style:width={`${progressOf(continueBook)}%`}
               ></div>
             </div>
-            <span class="text-xs tabular-nums text-surface-700-300"
-              >{Math.round(progressOf(continueBook))}%</span
-            >
+            <span class="text-xs tabular-nums text-surface-700-300">
+              {Math.round(progressOf(continueBook))}%
+            </span>
           </div>
         </div>
       </button>
@@ -1925,8 +1925,10 @@
           <button
             type="button"
             class="btn preset-tonal-primary"
-            onclick={() => openProgressProbe?.abort()}>Open offline</button
+            onclick={() => openProgressProbe?.abort()}
           >
+            Open offline
+          </button>
         {/if}
       </div>
     {/if}
@@ -1970,15 +1972,18 @@
               type="button"
               onclick={() => void retryDownloadCleanup()}
               disabled={cleanupInProgress}
-              >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
             >
+              {cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}
+            </button>
           {:else if downloadNeedsRefresh}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
               onclick={() => void refresh()}
-              disabled={refreshing}>Refresh library</button
+              disabled={refreshing}
             >
+              Refresh library
+            </button>
           {:else}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
@@ -1986,8 +1991,10 @@
               onclick={() => void download(downloadFailureBook!)}
               disabled={Boolean(downloadingBookId) ||
                 offline ||
-                downloadFailureBook.remoteAvailable === false}>Retry download</button
+                downloadFailureBook.remoteAvailable === false}
             >
+              Retry download
+            </button>
           {/if}
         {/if}
       </div>
@@ -2479,9 +2486,9 @@
       Choose where to continue
     </h2>
     <p class="mt-3 break-words text-surface-600-400">
-      This device and Kavita have different reading positions for <strong class="break-words"
-        >{conflict.book.title}</strong
-      >.
+      This device and Kavita have different reading positions for <strong class="break-words">
+        {conflict.book.title}
+      </strong>.
     </p>
     <dl class="mt-4 grid gap-2 text-sm">
       <div>
@@ -2523,8 +2530,10 @@
           };
           closeConflict();
           void syncProgress(false);
-        }}>Continue from this device</button
+        }}
       >
+        Continue from this device
+      </button>
       <button
         class="btn btn-multiline min-h-11 preset-tonal-primary"
         type="button"
@@ -2536,8 +2545,10 @@
       <button
         class="btn btn-multiline min-h-11 preset-tonal-surface"
         type="button"
-        onclick={closeConflict}>Cancel</button
+        onclick={closeConflict}
       >
+        Cancel
+      </button>
     </div>
   {/if}
 </ModalDialog>
@@ -2768,14 +2779,18 @@
       <button
         class="btn btn-multiline min-h-11 preset-outlined-error-500"
         type="button"
-        onclick={clearCache}>Clear cover cache</button
+        onclick={clearCache}
       >
+        Clear cover cache
+      </button>
       <button
         class="btn btn-multiline min-h-11 preset-tonal-error"
         type="button"
         disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-        onclick={removeAllDownloads}>Remove all downloaded books</button
+        onclick={removeAllDownloads}
       >
+        Remove all downloaded books
+      </button>
     </div>
     <dl class="mt-4 text-sm">
       <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
@@ -2800,13 +2815,17 @@
       <button
         class="btn btn-multiline min-h-11 preset-tonal-surface"
         type="button"
-        onclick={() => void copyDiagnostics()}>Copy diagnostics</button
+        onclick={() => void copyDiagnostics()}
       >
+        Copy diagnostics
+      </button>
       <button
         class="btn btn-multiline min-h-11 preset-tonal-surface"
         type="button"
-        onclick={downloadDiagnostics}>Download log</button
+        onclick={downloadDiagnostics}
       >
+        Download log
+      </button>
     </div>
     <button
       class="btn btn-multiline min-h-11 preset-tonal-surface mt-2 w-full"
@@ -2831,15 +2850,19 @@
         <button
           class="btn btn-multiline min-h-11 preset-tonal-surface"
           type="button"
-          onclick={selectDiagnostics}>Select all text</button
+          onclick={selectDiagnostics}
         >
+          Select all text
+        </button>
       </div>
     {/if}
     <button
       class="btn btn-multiline min-h-11 preset-tonal-surface mt-2 w-full"
       type="button"
-      onclick={clearDiagnosticLog}>Clear diagnostics</button
+      onclick={clearDiagnosticLog}
     >
+      Clear diagnostics
+    </button>
     {#if diagnosticsMessage}
       <p class="mt-2 break-words text-sm text-surface-700-300" role="status">
         {diagnosticsMessage}

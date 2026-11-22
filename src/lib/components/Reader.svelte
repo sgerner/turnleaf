@@ -1104,20 +1104,26 @@
         onclick={() => {
           saveAnnotation();
           selectionMessage = 'Highlight saved.';
-        }}>Highlight</button
+        }}
       >
+        Highlight
+      </button>
       <button
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}>Add note</button
+        onclick={openAnnotations}
       >
+        Add note
+      </button>
       <button
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={() => void copySelection()}>Copy text</button
+        onclick={() => void copySelection()}
       >
+        Copy text
+      </button>
     </div>
   {/if}
 
@@ -1409,8 +1415,10 @@
                 class="btn btn-multiline preset-outlined-surface-300-700 capitalize"
                 type="button"
                 aria-pressed={appearance.mode === mode}
-                onclick={() => updateAppearance({ mode: mode as ReadingMode })}>{mode}</button
+                onclick={() => updateAppearance({ mode: mode as ReadingMode })}
               >
+                {mode}
+              </button>
             {/each}
           </div>
           <label class="label mt-5">
@@ -1607,8 +1615,10 @@
                     onclick={() => {
                       void session?.display(item.href);
                       closeToc();
-                    }}>{item.label}</button
+                    }}
                   >
+                    {item.label}
+                  </button>
                   {#if item.children.length > 0}
                     <div class="ml-3 min-w-0 border-l border-surface-300/50 pl-2">
                       {@render contentsList(item.children)}
@@ -1707,9 +1717,9 @@
                       <span class="mb-1 block break-words text-xs text-surface-700-300">
                         {searchResultSectionLabel(result)}
                       </span>
-                      <span class="line-clamp-3 whitespace-normal break-words"
-                        >{result.excerpt}</span
-                      >
+                      <span class="line-clamp-3 whitespace-normal break-words">
+                        {result.excerpt}
+                      </span>
                     </span>
                   </button>
                 </li>
@@ -1792,8 +1802,10 @@
                         />
                         <button
                           class="btn btn-sm btn-multiline preset-filled-primary-700-300"
-                          type="submit">Save</button
+                          type="submit"
                         >
+                          Save
+                        </button>
                       </form>
                     {:else}
                       <div class="flex flex-wrap items-center gap-2">
