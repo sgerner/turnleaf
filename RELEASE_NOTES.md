@@ -4,6 +4,7 @@
 
 - Count foreign auth headers without storing raw keys in journey fixture
 - Guard FileTransfer redirects and prune cover code
+- fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
