@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Sync annotations and bookmarks with Kavita and isolate study data per server
+- Remove unreachable guards in ReaderSession
+- fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
