@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Clear selected passages when reader location changes
 - Fix EPUB keyboard notes, selection, and link focus
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing

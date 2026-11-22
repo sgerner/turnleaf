@@ -198,6 +198,7 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
+        if (location?.cfi !== next.cfi) selectedText = null;
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
