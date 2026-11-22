@@ -247,6 +247,108 @@ export async function deleteDownloadedEpub(relativePath: string): Promise<void> 
   await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data });
 }
 
+const BULK_DELETE_CONCURRENCY = 8;
+
+export interface BulkEpubCleanupResult {
+  removedPaths: string[];
+  failedPaths: string[];
+}
+
+function isMissingNativePath(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
+}
+
+function isSafeBookPath(path: string): boolean {
+  try {
+    assertSafeBookPath(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteAllDownloadedEpubs(
+  relativePaths: readonly string[] = [],
+  concurrency = BULK_DELETE_CONCURRENCY,
+): Promise<BulkEpubCleanupResult> {
+  const uniquePaths = [...new Set(relativePaths)];
+  const validPaths = uniquePaths.filter(isSafeBookPath);
+  const invalidPaths = uniquePaths.filter((path) => !isSafeBookPath(path));
+
+  if (!Capacitor.isNativePlatform()) {
+    return { removedPaths: validPaths, failedPaths: invalidPaths };
+  }
+
+  try {
+    await Filesystem.rmdir({
+      path: BOOK_DIRECTORY,
+      directory: Directory.Data,
+      recursive: true,
+    });
+    return { removedPaths: validPaths, failedPaths: invalidPaths };
+  } catch (error) {
+    if (isMissingNativePath(error)) {
+      return { removedPaths: validPaths, failedPaths: invalidPaths };
+    }
+  }
+
+  let fallbackPaths = validPaths;
+  if (fallbackPaths.length === 0 && invalidPaths.length === 0) {
+    try {
+      const { files } = await Filesystem.readdir({
+        path: BOOK_DIRECTORY,
+        directory: Directory.Data,
+      });
+      fallbackPaths = files
+        .filter((file) => file.type === 'file')
+        .map((file) => `${BOOK_DIRECTORY}/${file.name}`);
+    } catch (error) {
+      if (isMissingNativePath(error)) {
+        return { removedPaths: [], failedPaths: [] };
+      }
+      return { removedPaths: [], failedPaths: [BOOK_DIRECTORY] };
+    }
+  }
+
+  const outcomes = new Array<'removed' | 'failed'>(fallbackPaths.length);
+  const limit = Math.max(1, Math.min(Math.floor(concurrency) || 1, fallbackPaths.length || 1));
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, fallbackPaths.length) }, async () => {
+      while (cursor < fallbackPaths.length) {
+        const index = cursor;
+        cursor += 1;
+        const path = fallbackPaths[index]!;
+        try {
+          if (isSafeBookPath(path)) {
+            await deleteDownloadedEpub(path);
+          } else {
+            await Filesystem.deleteFile({ path, directory: Directory.Data });
+          }
+          outcomes[index] = 'removed';
+        } catch (error) {
+          outcomes[index] = isMissingNativePath(error) ? 'removed' : 'failed';
+        }
+      }
+    }),
+  );
+
+  const removedPaths: string[] = [];
+  const failedPaths: string[] = [...invalidPaths];
+  for (let index = 0; index < fallbackPaths.length; index += 1) {
+    if (outcomes[index] === 'removed') removedPaths.push(fallbackPaths[index]!);
+    else failedPaths.push(fallbackPaths[index]!);
+  }
+  if (failedPaths.length === 0) {
+    await Filesystem.rmdir({
+      path: BOOK_DIRECTORY,
+      directory: Directory.Data,
+      recursive: false,
+    }).catch(() => {});
+  }
+  return { removedPaths, failedPaths };
+}
+
 export async function cacheCover(
   downloadUrl: string,
   apiKey: string,

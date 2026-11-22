@@ -9,6 +9,8 @@ import {
   getPendingSync,
   getSyncStatus,
   reconcileBooks,
+  removeDownloads,
+  removeServer,
   replaceBooksInTransaction,
   saveLocalProgress,
   type BookRecord,
@@ -885,4 +887,116 @@ it('accepts the selected browser server progress and drops only the displayed lo
   const newer = await getPendingSync('server');
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
+});
+
+it('clears multiple browser downloads in one storage write and preserves failed/remaining rows', async () => {
+  const storage = new MemoryStorage();
+  const setItemSpy = vi.spyOn(storage, 'setItem');
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const secondBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:11',
+    chapterId: 11,
+    downloadPath: 'books/server-1-11.epub',
+    fileSize: 2048,
+  };
+  const keptBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:12',
+    chapterId: 12,
+    downloadPath: 'books/server-1-12.epub',
+    fileSize: 4096,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook, secondBook, keptBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+  setItemSpy.mockClear();
+
+  await removeDownloads([]);
+  expect(setItemSpy).not.toHaveBeenCalled();
+
+  await removeDownloads([existingBook.id, secondBook.id]);
+  expect(setItemSpy).toHaveBeenCalledOnce();
+  await expect(getBooks('server')).resolves.toMatchObject([
+    { id: existingBook.id, downloadPath: null, downloadStatus: 'none', fileSize: null },
+    { id: secondBook.id, downloadPath: null, downloadStatus: 'none', fileSize: null },
+    {
+      id: keptBook.id,
+      downloadPath: 'books/server-1-12.epub',
+      downloadStatus: 'available',
+      fileSize: 4096,
+    },
+  ]);
+
+  const beforeFailure = storage.getItem(BROWSER_STORAGE_KEY);
+  storage.failWrites = true;
+  await expect(removeDownloads([keptBook.id])).rejects.toThrow('browser storage write failed');
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBe(beforeFailure);
+});
+
+it('removes browser server config, books, reading state, and sync queue together', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: {
+        id: 'server',
+        displayName: 'Server',
+        baseUrl: 'https://books.example.com',
+        credentialRef: 'cred',
+        kavitaVersion: null,
+        lastConnectedAt: '2026-01-01T00:00:00.000Z',
+      },
+      books: [existingBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'cfi',
+          xpath: null,
+          percentage: 0.25,
+          localUpdatedAt: '2026-01-02T00:00:00.000Z',
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+        },
+      },
+      syncQueue: {
+        [existingBook.id]: {
+          bookId: existingBook.id,
+          serverId: 'server',
+          payloadJson: '{}',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: '2026-01-02T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+          revision: 1,
+        },
+      },
+      preferences: { uiTheme: 'vintage' },
+    }),
+  );
+
+  await removeServer('server');
+
+  expect(JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toEqual({
+    serverConfig: null,
+    books: [],
+    readingState: {},
+    syncQueue: {},
+    preferences: { uiTheme: 'vintage' },
+  });
 });

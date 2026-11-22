@@ -31,13 +31,20 @@ vi.mock('@capacitor/filesystem', () => ({
     readFile: vi.fn(),
     rename: vi.fn(),
     deleteFile: vi.fn(),
+    rmdir: vi.fn(),
+    readdir: vi.fn(),
   },
 }));
 
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
-import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
+import {
+  cacheCover,
+  deleteAllDownloadedEpubs,
+  downloadEpub,
+  verifyDownloadedEpub,
+} from './native-download';
 
 function encoded(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
@@ -62,6 +69,8 @@ beforeEach(() => {
     .mockImplementation(async ({ path }) => {
       native.deleted.push(path);
     });
+  vi.mocked(Filesystem.rmdir).mockReset().mockResolvedValue(undefined);
+  vi.mocked(Filesystem.readdir).mockReset().mockResolvedValue({ files: [] });
   vi.mocked(Filesystem.getUri)
     .mockReset()
     .mockImplementation(async ({ path }) => ({
@@ -202,5 +211,95 @@ describe('native cover cache', () => {
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+});
+
+describe('bulk EPUB cleanup', () => {
+  it('removes the books directory in one recursive rmdir call without per-file deletes', async () => {
+    const paths = ['books/a.epub', 'books/b.epub', 'books/c.epub'];
+
+    await expect(deleteAllDownloadedEpubs(paths)).resolves.toEqual({
+      removedPaths: paths,
+      failedPaths: [],
+    });
+
+    expect(Filesystem.rmdir).toHaveBeenCalledExactlyOnceWith({
+      path: 'books',
+      directory: 'DATA',
+      recursive: true,
+    });
+    expect(Filesystem.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('treats a missing books directory as already cleaned up', async () => {
+    vi.mocked(Filesystem.rmdir).mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' });
+
+    await expect(deleteAllDownloadedEpubs(['books/a.epub'])).resolves.toEqual({
+      removedPaths: ['books/a.epub'],
+      failedPaths: [],
+    });
+    expect(Filesystem.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it('falls back to bounded per-file deletion and reports partial failures when rmdir fails', async () => {
+    vi.mocked(Filesystem.rmdir).mockRejectedValue(new Error('directory busy'));
+    let activeDeletes = 0;
+    let peakDeletes = 0;
+    const paths = Array.from({ length: 12 }, (_, index) => `books/book-${index}.epub`);
+
+    vi.mocked(Filesystem.deleteFile).mockImplementation(async ({ path }) => {
+      activeDeletes += 1;
+      peakDeletes = Math.max(peakDeletes, activeDeletes);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeDeletes -= 1;
+      if (path === 'books/book-2.epub') throw { code: 'OS-PLUG-FILE-0008' };
+      if (path === 'books/book-5.epub' || path === 'books/book-9.epub') {
+        throw new Error('locked');
+      }
+      native.deleted.push(path);
+    });
+
+    const result = await deleteAllDownloadedEpubs([...paths, '../outside.epub'], 3);
+
+    expect(peakDeletes).toBeLessThanOrEqual(3);
+    expect(result.failedPaths).toEqual([
+      '../outside.epub',
+      'books/book-5.epub',
+      'books/book-9.epub',
+    ]);
+    expect(result.removedPaths).toEqual(
+      paths.filter((path) => path !== 'books/book-5.epub' && path !== 'books/book-9.epub'),
+    );
+    expect(native.deleted).not.toContain('../outside.epub');
+  });
+
+  it('discovers files via readdir when rmdir fails without explicit candidate paths', async () => {
+    vi.mocked(Filesystem.rmdir)
+      .mockRejectedValueOnce(new Error('directory busy'))
+      .mockResolvedValueOnce(undefined);
+    vi.mocked(Filesystem.readdir).mockResolvedValueOnce({
+      files: [
+        {
+          name: 'leftover.epub',
+          type: 'file',
+          size: 10,
+          mtime: 0,
+          uri: 'file://books/leftover.epub',
+        },
+        {
+          name: 'partial.epub.partial',
+          type: 'file',
+          size: 5,
+          mtime: 0,
+          uri: 'file://books/partial.epub.partial',
+        },
+      ],
+    });
+
+    await expect(deleteAllDownloadedEpubs([])).resolves.toEqual({
+      removedPaths: ['books/leftover.epub', 'books/partial.epub.partial'],
+      failedPaths: [],
+    });
+    expect(native.deleted).toEqual(['books/leftover.epub', 'books/partial.epub.partial']);
   });
 });

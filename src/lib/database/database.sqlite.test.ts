@@ -6,6 +6,7 @@ import type { capTask } from '@capacitor-community/sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   reconcileBooksInTransaction,
+  removeDownloadsInTransaction,
   replaceBooksInTransaction,
   type BookRecord,
 } from './database';
@@ -303,5 +304,48 @@ describe('native metadata transactions against SQLite', () => {
     await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z', true);
 
     expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
+  });
+
+  it('clears batched downloads in one SQLite transaction with bounded SQL parameters', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const catalog = Array.from({ length: 1_100 }, (_, index) => ({
+      ...baseBook,
+      id: `server:1:${index}`,
+      chapterId: index,
+      downloadPath: `books/book-${index}.epub`,
+      downloadStatus: 'available',
+      fileSize: 1_000 + index,
+    }));
+    await replaceBooksInTransaction(adapter, 'server', catalog);
+
+    let transactionCalls = 0;
+    const removedIds = catalog.slice(0, 1_050).map((book) => book.id);
+    await removeDownloadsInTransaction(
+      {
+        executeTransaction(tasks) {
+          transactionCalls += 1;
+          expect(Math.max(...tasks.map((task) => task.values?.length ?? 0))).toBeLessThan(999);
+          return adapter.executeTransaction(tasks);
+        },
+      },
+      removedIds,
+    );
+
+    expect(transactionCalls).toBe(1);
+    expect(
+      db.prepare('SELECT COUNT(*) AS remaining FROM books WHERE download_path IS NOT NULL').get(),
+    ).toEqual({ remaining: 50 });
+    expect(readBook(db, 'server:1:0')).toMatchObject({
+      download_path: null,
+      download_status: 'none',
+      file_size: null,
+      pages_read: baseBook.pagesRead,
+    });
+    expect(readBook(db, 'server:1:1099')).toMatchObject({
+      download_path: 'books/book-1099.epub',
+      download_status: 'available',
+      file_size: 2099,
+    });
   });
 });

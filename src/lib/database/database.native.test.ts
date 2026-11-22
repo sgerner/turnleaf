@@ -235,3 +235,35 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 7;',
   ]);
 });
+
+it('batches removeDownloads into one native transaction with bounded SQL parameters', async () => {
+  const { removeDownloads } = await import('./database');
+
+  await removeDownloads([]);
+  expect(mocks.executeTransaction).not.toHaveBeenCalled();
+
+  const ids = Array.from({ length: 1_205 }, (_, index) => `server:1:${index}`);
+  await removeDownloads([...ids, ids[0]!]);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks).toHaveLength(3);
+  expect(tasks?.map((task) => task.values?.length)).toEqual([500, 500, 205]);
+  for (const task of tasks ?? []) {
+    expect(task.statement).toContain(
+      "UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id IN (",
+    );
+    expect(task.values?.length ?? 0).toBeLessThan(999);
+  }
+});
+
+it('deletes server_config in one native write without per-book updates', async () => {
+  const { removeServer } = await import('./database');
+
+  await removeServer('server');
+
+  expect(mocks.db.run).toHaveBeenCalledExactlyOnceWith('DELETE FROM server_config WHERE id=?', [
+    'server',
+  ]);
+  expect(mocks.executeTransaction).not.toHaveBeenCalled();
+});
