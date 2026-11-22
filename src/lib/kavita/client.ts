@@ -146,6 +146,7 @@ export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
+    private readonly canRequest?: () => boolean | Promise<boolean>,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -277,6 +278,7 @@ export class KavitaClient {
             error.status >= 500 &&
             error.status < 600));
       if (signal?.aborted || !retryable) throw error;
+      if (this.canRequest && !(await this.canRequest())) throw error;
       const progress = await this.request<unknown>(path, options);
       if (!isKavitaProgress(progress)) {
         throw new KavitaError(
@@ -451,6 +453,36 @@ export class KavitaClient {
     );
   }
 
+  private assertNotAborted(signal?: AbortSignal | null): void {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  }
+
+  private assertCanRequest(signal?: AbortSignal | null): void | Promise<void> {
+    this.assertNotAborted(signal);
+    if (!this.canRequest) return;
+    const allowed = this.canRequest();
+    if (typeof allowed === 'boolean') {
+      if (!allowed) {
+        this.assertNotAborted(signal);
+        throw new KavitaError(
+          'Kavita could not be reached. Check the address and network.',
+          'network',
+        );
+      }
+      return;
+    }
+    return allowed.then((ok) => {
+      if (!ok) {
+        this.assertNotAborted(signal);
+        throw new KavitaError(
+          'Kavita could not be reached. Check the address and network.',
+          'network',
+        );
+      }
+      this.assertNotAborted(signal);
+    });
+  }
+
   private async request<T>(path: string, init: RequestInit = {}, expectJson = true): Promise<T> {
     if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init, expectJson);
     return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
@@ -508,6 +540,8 @@ export class KavitaClient {
       let redirectCount = 0;
       let response: HttpResponse;
       while (true) {
+        const guard = this.assertCanRequest(init.signal);
+        if (guard) await guard;
         response = await CapacitorHttp.request({ ...options, url: currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         const nextUrl = redirectTarget(
@@ -552,7 +586,8 @@ export class KavitaClient {
     const visited = new Set([currentUrl]);
     let redirectCount = 0;
     while (true) {
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const guard = this.assertCanRequest(signal);
+      if (guard) await guard;
       const response = await CapacitorHttp.get({
         url: currentUrl,
         headers: { 'x-api-key': this.apiKey },
@@ -590,6 +625,8 @@ export class KavitaClient {
     const visited = new Set([currentUrl]);
     let redirectCount = 0;
     while (true) {
+      const guard = this.assertCanRequest(init.signal);
+      if (guard) await guard;
       const response = await fetch(currentUrl, { ...init, redirect: 'manual' });
       const nextUrl = redirectTarget(
         response.status,

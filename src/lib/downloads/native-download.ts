@@ -107,6 +107,7 @@ export async function downloadEpub(
   apiKey: string,
   bookId: string,
   onProgress?: (percent: number) => void,
+  canDownload?: () => boolean | Promise<boolean>,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
@@ -135,6 +136,9 @@ export async function downloadEpub(
 
   try {
     for (let attempt = 0; ; attempt += 1) {
+      if (canDownload && !(await canDownload())) {
+        throw new EpubTransferError(undefined, true);
+      }
       try {
         await FileTransfer.downloadFile({
           url: downloadUrl,
@@ -253,9 +257,11 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
-  allowDownload = true,
+  allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  const isDownloadAllowed = async (): Promise<boolean> =>
+    typeof allowDownload === 'function' ? Boolean(await allowDownload()) : allowDownload;
   const namespace = safeCoverNamespace(cacheNamespace);
   const directory = `covers/${namespace}`;
   const path = `${directory}/${seriesId}.img`;
@@ -263,10 +269,13 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!allowDownload) throw new Error('Offline');
+    if (!(await isDownloadAllowed())) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (!(await isDownloadAllowed())) throw new Error('Offline');
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     try {
       await FileTransfer.downloadFile({
         url: downloadUrl,

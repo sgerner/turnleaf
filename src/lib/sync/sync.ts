@@ -28,10 +28,14 @@ import type { StoredReaderLocation } from '../reader/bookmarks';
 
 const flushing = new Map<string, Promise<void>>();
 
-export function flushProgress(client: KavitaClient, serverId: string): Promise<void> {
+export function flushProgress(
+  client: KavitaClient,
+  serverId: string,
+  canSync?: () => boolean | Promise<boolean>,
+): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId).finally(() => {
+  const current = run(client, serverId, canSync).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
@@ -216,13 +220,18 @@ async function syncPendingBookmark(
   }
 }
 
-async function run(client: KavitaClient, serverId: string): Promise<void> {
+async function run(
+  client: KavitaClient,
+  serverId: string,
+  canSync?: () => boolean | Promise<boolean>,
+): Promise<void> {
   const failures: unknown[] = [];
   let progressFailureCount = 0;
   let studyFailureCount = 0;
   const attemptedProgress = new Map<string, PendingSyncItem>();
   const attemptedAnnotations = new Map<string, string>();
   const attemptedBookmarks = new Map<string, string>();
+  const ensureOnline = async (): Promise<boolean> => (canSync ? Boolean(await canSync()) : true);
 
   while (true) {
     const [pendingProgress, pendingAnnotations, pendingBookmarks] = await Promise.all([
@@ -248,7 +257,13 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
       break;
     }
 
+    let stoppedOffline = false;
+
     for (const item of nextProgress) {
+      if (!(await ensureOnline())) {
+        stoppedOffline = true;
+        break;
+      }
       attemptedProgress.set(item.bookId, item);
       try {
         await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
@@ -265,36 +280,59 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
       }
     }
 
-    for (const item of nextAnnotations) {
-      attemptedAnnotations.set(item.id, `${item.syncState}:${item.syncRevision}:${item.updatedAt}`);
-      try {
-        await syncPendingAnnotation(client, item);
-      } catch (error) {
-        await markAnnotationSyncFailure(
+    if (!stoppedOffline) {
+      for (const item of nextAnnotations) {
+        if (!(await ensureOnline())) {
+          stoppedOffline = true;
+          break;
+        }
+        attemptedAnnotations.set(
           item.id,
-          item.bookId,
-          error instanceof Error ? error.message : 'Annotation sync failed',
-          item.syncRevision,
+          `${item.syncState}:${item.syncRevision}:${item.updatedAt}`,
         );
-        studyFailureCount += 1;
-        failures.push(error);
+        try {
+          await syncPendingAnnotation(client, item);
+        } catch (error) {
+          await markAnnotationSyncFailure(
+            item.id,
+            item.bookId,
+            error instanceof Error ? error.message : 'Annotation sync failed',
+            item.syncRevision,
+          );
+          studyFailureCount += 1;
+          failures.push(error);
+        }
       }
     }
 
-    for (const item of nextBookmarks) {
-      attemptedBookmarks.set(item.id, `${item.syncState}:${item.syncRevision}:${item.updatedAt}`);
-      try {
-        await syncPendingBookmark(client, item);
-      } catch (error) {
-        await markBookmarkSyncFailure(
-          item.id,
-          item.bookId,
-          error instanceof Error ? error.message : 'Bookmark sync failed',
-          item.syncRevision,
-        );
-        studyFailureCount += 1;
-        failures.push(error);
+    if (!stoppedOffline) {
+      for (const item of nextBookmarks) {
+        if (!(await ensureOnline())) {
+          stoppedOffline = true;
+          break;
+        }
+        attemptedBookmarks.set(item.id, `${item.syncState}:${item.syncRevision}:${item.updatedAt}`);
+        try {
+          await syncPendingBookmark(client, item);
+        } catch (error) {
+          await markBookmarkSyncFailure(
+            item.id,
+            item.bookId,
+            error instanceof Error ? error.message : 'Bookmark sync failed',
+            item.syncRevision,
+          );
+          studyFailureCount += 1;
+          failures.push(error);
+        }
       }
+    }
+
+    if (stoppedOffline) {
+      if (failures.length > 0) break;
+      throw new KavitaError(
+        'Kavita could not be reached. Check the address and network.',
+        'network',
+      );
     }
   }
 
@@ -313,6 +351,7 @@ export async function syncBookStudyData(
   client: KavitaClient,
   book: BookRecord,
   signal?: AbortSignal,
+  canSync?: () => boolean | Promise<boolean>,
 ): Promise<{ annotations: StoredAnnotation[]; bookmarks: StoredReaderLocation[] }> {
   if (book.remoteAvailable === false) {
     const [annotations, bookmarks] = await Promise.all([
@@ -322,10 +361,18 @@ export async function syncBookStudyData(
     return { annotations, bookmarks };
   }
 
+  if (signal?.aborted || (canSync && !(await canSync()))) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   try {
-    await flushProgress(client, book.serverId);
+    await flushProgress(client, book.serverId, canSync);
   } catch {
     // Reconcile preserves still-pending local items if a flush item failed.
+  }
+
+  if (signal?.aborted || (canSync && !(await canSync()))) {
+    throw new DOMException('Aborted', 'AbortError');
   }
 
   const [remoteAnnotations, remoteBookmarks] = await Promise.all([
@@ -344,14 +391,27 @@ export async function syncLibraryAnnotations(
   serverId: string,
   books?: readonly BookRecord[],
   signal?: AbortSignal,
+  canSync?: () => boolean | Promise<boolean>,
 ): Promise<BookAnnotationsGroup[]> {
+  if (signal?.aborted || (canSync && !(await canSync()))) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   try {
-    await flushProgress(client, serverId);
+    await flushProgress(client, serverId, canSync);
   } catch {
     // Continue pulling remote annotations even if an unrelated queue item failed.
   }
 
+  if (signal?.aborted || (canSync && !(await canSync()))) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   const catalog = books ?? (await getBooks(serverId, { includeDescription: false }));
+  if (signal?.aborted || (canSync && !(await canSync()))) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+
   const seriesIds = [
     ...new Set(
       catalog
@@ -364,7 +424,9 @@ export async function syncLibraryAnnotations(
   let cursor = 0;
   const workers = Array.from({ length: Math.min(concurrency, seriesIds.length) }, async () => {
     while (cursor < seriesIds.length) {
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (signal?.aborted || (canSync && !(await canSync()))) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
       const index = cursor;
       cursor += 1;
       const seriesId = seriesIds[index]!;

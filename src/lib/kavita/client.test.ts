@@ -960,3 +960,39 @@ it('fetches, creates, updates, and deletes Kavita annotations and PToC bookmarks
   );
   expect((fetchMock.mock.calls[7]?.[1] as RequestInit).method).toBe('DELETE');
 });
+
+it('skips native HTTP requests, native cover downloads, and progress retries when connectivity drops', async () => {
+  capacitorRuntime.native = true;
+  let online = false;
+  const client = new KavitaClient('https://books.example.com', 'abc123', async () => online);
+
+  await expect(client.getAnnotations(10)).rejects.toMatchObject({
+    kind: 'network',
+  });
+  await expect(client.getPersonalToc(10)).rejects.toMatchObject({
+    kind: 'network',
+  });
+  await expect(client.getCover(4)).rejects.toMatchObject({
+    kind: 'network',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(CapacitorHttp.get).not.toHaveBeenCalled();
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+
+  online = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    online = false;
+    return {
+      status: 503,
+      headers: {},
+      url: '',
+      data: '',
+    };
+  });
+
+  await expect(client.getProgress(7)).rejects.toMatchObject({
+    kind: 'server',
+    status: 503,
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledOnce();
+});

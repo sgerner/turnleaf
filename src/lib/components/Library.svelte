@@ -91,7 +91,7 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  const client = $derived(new KavitaClient(server.baseUrl, apiKey, networkAvailable));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
@@ -100,10 +100,10 @@
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        networkAvailable,
       );
     }
-    if (offline) throw new Error('Offline');
+    if (!(await networkAvailable())) throw new Error('Offline');
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
@@ -595,6 +595,8 @@
             openProgressProbe?.abort();
             notesSyncController?.abort();
             readerStudyController?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -702,7 +704,7 @@
             'Offline. Pending progress, bookmarks, and notes will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client, server.id);
+      await flushProgress(client, server.id, networkAvailable);
       await refreshStudyCounts();
       if (showFeedback) message = 'Reading progress, bookmarks, and notes synced.';
     } catch (error) {
@@ -764,7 +766,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !(await networkAvailable())) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -779,7 +781,7 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !(await networkAvailable())) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -809,7 +811,7 @@
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !(await networkAvailable())) return;
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -933,6 +935,7 @@
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        networkAvailable,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1262,7 +1265,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, networkAvailable);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
@@ -1272,6 +1275,10 @@
     const local = await getReadingState(book.id);
     if (local?.pendingSync) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
+      return null;
+    }
+    if (!(await networkAvailable())) {
+      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
     }
     const remote = await client.getProgress(book.chapterId);
@@ -1599,13 +1606,15 @@
     const controller = new AbortController();
     readerStudyController = controller;
     try {
-      const synced = await syncBookStudyData(client, book, controller.signal);
+      const synced = await syncBookStudyData(client, book, controller.signal, networkAvailable);
       if (destroyed || controller.signal.aborted) return null;
       await refreshStudyCounts();
       await refreshSyncStatus();
       return synced;
     } catch (cause) {
-      if (controller.signal.aborted || isAbortError(cause)) return null;
+      if (controller.signal.aborted || isAbortError(cause) || !(await networkAvailable())) {
+        return null;
+      }
       throw cause;
     } finally {
       if (readerStudyController === controller) readerStudyController = null;
@@ -1653,7 +1662,13 @@
     notesSyncController = controller;
     if (manual) notesMessage = '';
     try {
-      const groups = await syncLibraryAnnotations(client, server.id, books, controller.signal);
+      const groups = await syncLibraryAnnotations(
+        client,
+        server.id,
+        books,
+        controller.signal,
+        networkAvailable,
+      );
       if (destroyed || controller.signal.aborted) return;
       notesGroups = groups;
       await refreshStudyCounts();
@@ -1662,7 +1677,12 @@
         notesMessage = 'Highlights and notes synced with Kavita.';
       }
     } catch (cause) {
-      if (controller.signal.aborted || isAbortError(cause)) return;
+      if (controller.signal.aborted || isAbortError(cause) || !(await networkAvailable())) {
+        if (manual && !destroyed) {
+          notesMessage = 'Offline. Showing highlights and notes saved on this device.';
+        }
+        return;
+      }
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -1754,7 +1774,11 @@
       const nextKey = replacementApiKey.trim();
       if (!nextKey) throw new Error('Enter a new Kavita auth key.');
 
-      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
+      const result = await new KavitaClient(
+        server.baseUrl,
+        nextKey,
+        networkAvailable,
+      ).testConnection();
       if (result.bookLibraries.length === 0) {
         throw new Error(
           'This account has no book or light novel libraries. Only EPUB books are supported.',

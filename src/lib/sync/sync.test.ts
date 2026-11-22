@@ -403,3 +403,42 @@ it('syncs open-book and library-wide study data while preserving unsynced local 
   expect(groups).toHaveLength(1);
   expect(groups[0]?.annotations).toHaveLength(2);
 });
+
+it('stops study sync and progress flushing without sending requests or marking failures when connectivity drops', async () => {
+  await reconcileBooks('server', [book]);
+  await saveLocalProgress(book, 'cfi-offline', '//body/DocFragment[2]/body/p[1]', 0.5);
+
+  let checks = 0;
+  const client = {
+    saveProgress: vi.fn().mockResolvedValue(undefined),
+    getAnnotations: vi.fn().mockResolvedValue([]),
+    getPersonalToc: vi.fn().mockResolvedValue([]),
+    getSeriesAnnotations: vi.fn().mockResolvedValue([]),
+  };
+
+  // Initial check passes before flushProgress reads pending queue, then connectivity drops
+  // before flushProgress uploads or syncBookStudyData fetches /api/Annotation/all & /api/Reader/ptoc.
+  await expect(
+    syncBookStudyData(client as never, book, undefined, async () => {
+      checks += 1;
+      return checks === 1;
+    }),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+
+  expect(client.saveProgress).not.toHaveBeenCalled();
+  expect(client.getAnnotations).not.toHaveBeenCalled();
+  expect(client.getPersonalToc).not.toHaveBeenCalled();
+  await expect(getSyncStatus('server')).resolves.toMatchObject({
+    pendingCount: 1,
+    failedCount: 0,
+  });
+
+  let libraryChecks = 0;
+  await expect(
+    syncLibraryAnnotations(client as never, 'server', [book], undefined, async () => {
+      libraryChecks += 1;
+      return libraryChecks === 1;
+    }),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(client.getSeriesAnnotations).not.toHaveBeenCalled();
+});

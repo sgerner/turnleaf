@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Stop in-flight Kavita sync and transfer requests when connectivity drops
+- Stop in-flight Kavita study sync, cover, and download requests when connectivity drops
 - Replace regex HTML tag stripping in annotation comment normalization
 - Sync annotations and bookmarks with Kavita and isolate study data per server
 - Remove unreachable guards in ReaderSession
