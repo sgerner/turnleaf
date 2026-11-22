@@ -308,6 +308,22 @@
     return value === 'list' ? 'list' : 'grid';
   }
 
+  function parseBooleanPreference(value: string | undefined, fallback: boolean): boolean {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return fallback;
+  }
+
+  function toggleDownloadedOnly(): void {
+    downloadedOnly = !downloadedOnly;
+    void setPreference('libraryDownloadedOnly', String(downloadedOnly));
+  }
+
+  function toggleHideCompleted(): void {
+    hideCompleted = !hideCompleted;
+    void setPreference('libraryHideCompleted', String(hideCompleted));
+  }
+
   function handleSortChange(event: Event): void {
     const value = (event.currentTarget as HTMLSelectElement).value;
     sortOrder = parseSortOrder(value);
@@ -337,6 +353,8 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
+    void setPreference('libraryDownloadedOnly', 'false');
+    void setPreference('libraryHideCompleted', 'false');
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
@@ -509,6 +527,8 @@
         'libraryAuthor',
         'librarySeries',
         'libraryView',
+        'libraryDownloadedOnly',
+        'libraryHideCompleted',
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
@@ -516,6 +536,8 @@
     pendingTheme = theme as SkeletonTheme;
     pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
+    downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
+    hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
     sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
@@ -1752,7 +1774,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
-          onclick={() => (downloadedOnly = !downloadedOnly)}
+          onclick={toggleDownloadedOnly}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
@@ -1766,7 +1788,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
-          onclick={() => (hideCompleted = !hideCompleted)}
+          onclick={toggleHideCompleted}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path
