@@ -11,7 +11,7 @@
   import type { RegisterBackHandler } from '../native/back-button';
   import { handleReaderBack } from '../native/reader-back';
   import { ReaderChrome } from '../native/reader-chrome';
-  import { VolumeButtons } from '../native/volume-buttons';
+  import { VolumeButtons, parseVolumeButtonDirection } from '../native/volume-buttons';
   import { createReaderNativeFeatures } from '../native/reader-native-features';
   import {
     defaultAppearance,
@@ -931,9 +931,9 @@
 
   function handleVolumeButton(event: Event): void {
     if (!appearance.volumeButtons || hasOpenReaderPanel()) return;
-    const detail = (event as CustomEvent<{ direction?: string }>).detail;
-    if (detail?.direction === 'next' || detail?.direction === 'previous') {
-      void turn(detail.direction);
+    const direction = parseVolumeButtonDirection(event);
+    if (direction) {
+      void turn(direction);
     }
   }
 

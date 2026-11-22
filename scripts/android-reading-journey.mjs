@@ -3,14 +3,17 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
+  CONFIRMED_IMMERSIVE_MODE,
   DEFAULT_FONT_SCALE,
   KEYCODE_BACK,
   KEYCODE_VOLUME_DOWN,
   createAdbRunner,
   dumpWindowState,
   getFontScale,
+  getImmersiveModeConfirmations,
   sendKeyEvent,
   setFontScale,
+  setImmersiveModeConfirmations,
 } from './android-adb.mjs';
 import { createCdpClient } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
@@ -219,12 +222,21 @@ async function run() {
   let fixture;
   let tunnel;
   let web;
+  let previousImmersiveConfirmations = null;
+  let updatedImmersiveConfirmations = false;
   let disabledNetwork = false;
   let journeyError;
   let cleanupError;
   let journeyPassed = false;
   try {
     deviceSerial = await resolveDeviceSerial({ emulatorOnly: true });
+    throwIfInterrupted();
+    previousImmersiveConfirmations = await getImmersiveModeConfirmations(adb);
+    throwIfInterrupted();
+    if (previousImmersiveConfirmations !== CONFIRMED_IMMERSIVE_MODE) {
+      await setImmersiveModeConfirmations(adb, CONFIRMED_IMMERSIVE_MODE);
+      updatedImmersiveConfirmations = true;
+    }
     throwIfInterrupted();
     fixture = await startFixture();
     throwIfInterrupted();
@@ -451,6 +463,12 @@ async function run() {
         'restore Android system font_scale',
         () => adb('shell', 'settings', 'put', 'system', 'font_scale', DEFAULT_FONT_SCALE),
       ]);
+      if (updatedImmersiveConfirmations) {
+        cleanup.push([
+          'restore Android immersive_mode_confirmations',
+          () => setImmersiveModeConfirmations(adb, previousImmersiveConfirmations),
+        ]);
+      }
     }
     if (disabledNetwork) {
       cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);

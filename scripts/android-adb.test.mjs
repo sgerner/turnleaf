@@ -1,14 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  CONFIRMED_IMMERSIVE_MODE,
   DEFAULT_FONT_SCALE,
   KEYCODE_BACK,
   KEYCODE_VOLUME_DOWN,
   createAdbRunner,
   dumpWindowState,
   getFontScale,
+  getImmersiveModeConfirmations,
   parseWindowDump,
   sendKeyEvent,
   setFontScale,
+  setImmersiveModeConfirmations,
 } from './android-adb.mjs';
 
 const packageName = 'app.turnleaf.reader.debug';
@@ -49,6 +52,51 @@ WINDOW MANAGER WINDOWS (dumpsys window windows)
       InsetsSource id=c340002 type=navigationBars frame=[0,0][0,0] visible=false flags=
 `;
 
+const android16ImmersiveDump = `
+WINDOW MANAGER DISPLAY CONTENTS (dumpsys window displays)
+  mCurrentFocus=Window{4b33318 u0 app.turnleaf.reader.debug/app.turnleaf.reader.MainActivity}
+  mHoldScreenWindow=Window{4b33318 u0 app.turnleaf.reader.debug/app.turnleaf.reader.MainActivity}
+  WindowInsetsStateController
+    InsetsState
+      mDisplayFrame=Rect(0, 0 - 1080, 2400)
+        InsetsSource id=9a510001 type=navigationBars frame=[0,2337][1080,2400] visible=false flags=SUPPRESS_SCRIM|ANIMATE_RESIZING sideHint=BOTTOM boundingRects=null
+        InsetsSource id=1c660000 type=statusBars frame=[0,0][1080,63] visible=false flags= sideHint=TOP boundingRects=null
+    InsetsSourceProviders:
+      InsetsSourceProvider
+        mSource=InsetsSource id=1c660000 type=statusBars frame=[0,0][1080,63] visible=false flags= sideHint=TOP boundingRects=null
+      InsetsSourceProvider
+        mSource=InsetsSource id=9a510001 type=navigationBars frame=[0,2337][1080,2400] visible=false flags=SUPPRESS_SCRIM|ANIMATE_RESIZING sideHint=BOTTOM boundingRects=null
+WINDOW MANAGER WINDOWS (dumpsys window windows)
+  Window #7 Window{77c5c03 u0 StatusBar}:
+    isVisible=true
+  Window #8 Window{4b33318 u0 app.turnleaf.reader.debug/app.turnleaf.reader.MainActivity}:
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan forwardNavigation} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION
+      fl=KEEP_SCREEN_ON LAYOUT_IN_SCREEN LAYOUT_INSET_DECOR SPLIT_TOUCH HARDWARE_ACCELERATED DRAWS_SYSTEM_BAR_BACKGROUNDS
+      bhv=SHOW_TRANSIENT_BARS_BY_SWIPE}
+    isVisible=true
+    keepClearAreas: restricted=[], unrestricted=[]
+    Requested non-default-visibility types: statusBars navigationBars captionBar systemOverlays
+    mPrepareSyncSeqId=0
+`;
+
+const android16LibraryDump = `
+WINDOW MANAGER DISPLAY CONTENTS (dumpsys window displays)
+  mCurrentFocus=Window{4b33318 u0 app.turnleaf.reader.debug/app.turnleaf.reader.MainActivity}
+  mHoldScreenWindow=null
+  WindowInsetsStateController
+    InsetsState
+      mDisplayFrame=Rect(0, 0 - 1080, 2400)
+        InsetsSource id=9a510001 type=navigationBars frame=[0,2337][1080,2400] visible=true flags=SUPPRESS_SCRIM|ANIMATE_RESIZING sideHint=BOTTOM boundingRects=null
+        InsetsSource id=1c660000 type=statusBars frame=[0,0][1080,63] visible=true flags= sideHint=TOP boundingRects=null
+WINDOW MANAGER WINDOWS (dumpsys window windows)
+  Window #8 Window{4b33318 u0 app.turnleaf.reader.debug/app.turnleaf.reader.MainActivity}:
+    mAttrs={(0,0)(fillxfill) sim={adjust=pan forwardNavigation} layoutInDisplayCutoutMode=always ty=BASE_APPLICATION
+      fl=LAYOUT_IN_SCREEN LAYOUT_INSET_DECOR SPLIT_TOUCH HARDWARE_ACCELERATED DRAWS_SYSTEM_BAR_BACKGROUNDS}
+    isVisible=true
+    keepClearAreas: restricted=[], unrestricted=[]
+    mPrepareSyncSeqId=0
+`;
+
 const legacyAndroid11Dump = `
   Window #4 Window{abc1234 u0 app.turnleaf.reader.debug/app.turnleaf.reader.MainActivity}:
     mAttrs={(0,0)(fillxfill) ty=BASE_APPLICATION fl=LAYOUT_IN_SCREEN}
@@ -76,6 +124,21 @@ describe('Android ADB journey helpers', () => {
     });
   });
 
+  it('parses Android 16 WindowInsetsStateController and non-default requested visibility types', () => {
+    expect(parseWindowDump(android16ImmersiveDump, packageName)).toEqual({
+      windowFound: true,
+      windowToken: '4b33318',
+      keepScreenOn: true,
+      systemBarsVisible: false,
+    });
+    expect(parseWindowDump(android16LibraryDump, packageName)).toEqual({
+      windowFound: true,
+      windowToken: '4b33318',
+      keepScreenOn: false,
+      systemBarsVisible: true,
+    });
+  });
+
   it('parses legacy ITYPE_* inset sources and missing windows safely', () => {
     expect(parseWindowDump(legacyAndroid11Dump, packageName)).toEqual({
       windowFound: true,
@@ -91,13 +154,15 @@ describe('Android ADB journey helpers', () => {
     });
   });
 
-  it('builds serial-scoped ADB commands for key events, font_scale, and dumpsys window', async () => {
+  it('builds serial-scoped ADB commands for key events, immersive confirmation, font_scale, and dumpsys window', async () => {
     const calls = [];
     const execFileImpl = vi.fn((command, args, _options, callback) => {
       calls.push([command, ...args]);
       const joined = args.join(' ');
       if (joined.includes('settings get system font_scale')) {
         callback(null, { stdout: '2.0\n', stderr: '' });
+      } else if (joined.includes('settings get secure immersive_mode_confirmations')) {
+        callback(null, { stdout: 'null\n', stderr: '' });
       } else if (joined.includes('dumpsys window')) {
         callback(null, { stdout: libraryWindowDump, stderr: '' });
       } else {
@@ -106,6 +171,8 @@ describe('Android ADB journey helpers', () => {
     });
 
     const adb = createAdbRunner({ getSerial: () => 'emulator-5554', execFileImpl });
+    expect(await getImmersiveModeConfirmations(adb)).toBeNull();
+    await setImmersiveModeConfirmations(adb, CONFIRMED_IMMERSIVE_MODE);
     await sendKeyEvent(adb, KEYCODE_VOLUME_DOWN);
     await sendKeyEvent(adb, KEYCODE_BACK);
     await setFontScale(adb, '2.0');
@@ -116,14 +183,46 @@ describe('Android ADB journey helpers', () => {
       systemBarsVisible: true,
     });
     await setFontScale(adb, DEFAULT_FONT_SCALE);
+    await setImmersiveModeConfirmations(adb, null);
 
     expect(calls).toEqual([
+      [
+        'adb',
+        '-s',
+        'emulator-5554',
+        'shell',
+        'settings',
+        'get',
+        'secure',
+        'immersive_mode_confirmations',
+      ],
+      [
+        'adb',
+        '-s',
+        'emulator-5554',
+        'shell',
+        'settings',
+        'put',
+        'secure',
+        'immersive_mode_confirmations',
+        'confirmed',
+      ],
       ['adb', '-s', 'emulator-5554', 'shell', 'input', 'keyevent', 'KEYCODE_VOLUME_DOWN'],
       ['adb', '-s', 'emulator-5554', 'shell', 'input', 'keyevent', 'KEYCODE_BACK'],
       ['adb', '-s', 'emulator-5554', 'shell', 'settings', 'put', 'system', 'font_scale', '2.0'],
       ['adb', '-s', 'emulator-5554', 'shell', 'settings', 'get', 'system', 'font_scale'],
       ['adb', '-s', 'emulator-5554', 'shell', 'dumpsys', 'window'],
       ['adb', '-s', 'emulator-5554', 'shell', 'settings', 'put', 'system', 'font_scale', '1.0'],
+      [
+        'adb',
+        '-s',
+        'emulator-5554',
+        'shell',
+        'settings',
+        'delete',
+        'secure',
+        'immersive_mode_confirmations',
+      ],
     ]);
   });
 });

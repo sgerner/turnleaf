@@ -5,6 +5,7 @@ export const KEYCODE_BACK = 'KEYCODE_BACK';
 export const KEYCODE_VOLUME_DOWN = 'KEYCODE_VOLUME_DOWN';
 export const KEYCODE_VOLUME_UP = 'KEYCODE_VOLUME_UP';
 export const DEFAULT_FONT_SCALE = '1.0';
+export const CONFIRMED_IMMERSIVE_MODE = 'confirmed';
 
 export function createAdbRunner({ getSerial, execFileImpl = execFile, timeout = 20_000 } = {}) {
   const runExecFile = promisify(execFileImpl);
@@ -29,6 +30,19 @@ export async function getFontScale(adb) {
   const raw = await adb('shell', 'settings', 'get', 'system', 'font_scale');
   const parsed = Number.parseFloat(raw);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+export async function getImmersiveModeConfirmations(adb) {
+  const raw = await adb('shell', 'settings', 'get', 'secure', 'immersive_mode_confirmations');
+  return raw === '' || raw === 'null' ? null : raw;
+}
+
+export async function setImmersiveModeConfirmations(adb, value) {
+  if (value === null || value === undefined || value === '') {
+    await adb('shell', 'settings', 'delete', 'secure', 'immersive_mode_confirmations');
+    return;
+  }
+  await adb('shell', 'settings', 'put', 'secure', 'immersive_mode_confirmations', String(value));
 }
 
 function leadingSpaces(line) {
@@ -72,7 +86,14 @@ function parseInsetsControllerLines(lines) {
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const trimmed = line.trim();
-    if (trimmed !== 'InsetsStateController' && trimmed !== 'InsetsStateController:') continue;
+    if (
+      trimmed !== 'InsetsStateController' &&
+      trimmed !== 'InsetsStateController:' &&
+      trimmed !== 'WindowInsetsStateController' &&
+      trimmed !== 'WindowInsetsStateController:'
+    ) {
+      continue;
+    }
     const indent = leadingSpaces(line);
     const section = [];
     for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
@@ -95,10 +116,15 @@ function hasNonEmptyFrame(line) {
 function parseRequestedSystemBars(windowLines) {
   for (const line of windowLines) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith('mRequestedVisibleTypes=')) continue;
-    const rawValue = trimmed.slice('mRequestedVisibleTypes='.length).trim();
-    if (rawValue === '' || /[a-zA-Z]/.test(rawValue)) {
-      return /\bstatusBars\b/.test(rawValue) && /\bnavigationBars\b/.test(rawValue);
+    if (trimmed.startsWith('mRequestedVisibleTypes=')) {
+      const rawValue = trimmed.slice('mRequestedVisibleTypes='.length).trim();
+      if (rawValue === '' || /[a-zA-Z]/.test(rawValue)) {
+        return /\bstatusBars\b/.test(rawValue) && /\bnavigationBars\b/.test(rawValue);
+      }
+    }
+    if (trimmed.startsWith('Requested non-default-visibility types:')) {
+      const rawValue = trimmed.slice('Requested non-default-visibility types:'.length).trim();
+      return !/\bstatusBars\b/.test(rawValue) && !/\bnavigationBars\b/.test(rawValue);
     }
   }
   return null;
