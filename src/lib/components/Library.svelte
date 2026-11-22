@@ -1847,9 +1847,9 @@
                 style:width={`${progressOf(continueBook)}%`}
               ></div>
             </div>
-            <span class="text-xs tabular-nums text-surface-700-300"
-              >{Math.round(progressOf(continueBook))}%</span
-            >
+            <span class="text-xs tabular-nums text-surface-700-300">
+              {Math.round(progressOf(continueBook))}%
+            </span>
           </div>
         </div>
       </button>
@@ -2098,8 +2098,10 @@
           <button
             type="button"
             class="btn preset-tonal-primary"
-            onclick={() => openProgressProbe?.abort()}>Open offline</button
+            onclick={() => openProgressProbe?.abort()}
           >
+            Open offline
+          </button>
         {/if}
       </div>
     {/if}
@@ -2143,15 +2145,18 @@
               type="button"
               onclick={() => void retryDownloadCleanup()}
               disabled={cleanupInProgress}
-              >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
             >
+              {cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}
+            </button>
           {:else if downloadNeedsRefresh}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
               onclick={() => void refresh()}
-              disabled={refreshing || !credentialReady}>Refresh library</button
+              disabled={refreshing || !credentialReady}
             >
+              Refresh library
+            </button>
           {:else}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
@@ -2160,8 +2165,10 @@
               disabled={Boolean(downloadingBookId) ||
                 offline ||
                 !credentialReady ||
-                downloadFailureBook.remoteAvailable === false}>Retry download</button
+                downloadFailureBook.remoteAvailable === false}
             >
+              Retry download
+            </button>
           {/if}
         {/if}
       </div>
@@ -2676,9 +2683,9 @@
     >
       <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
       <p class="mt-3 text-surface-600-400">
-        This device and Kavita have different reading positions for <strong
-          >{conflict.book.title}</strong
-        >.
+        This device and Kavita have different reading positions for <strong>
+          {conflict.book.title}
+        </strong>.
       </p>
       <dl class="mt-4 grid gap-2 text-sm">
         <div>
@@ -2720,8 +2727,10 @@
             };
             closeConflict();
             void syncProgress(false);
-          }}>Continue from this device</button
+          }}
         >
+          Continue from this device
+        </button>
         <button
           class="btn preset-tonal-primary"
           type="button"
@@ -2730,9 +2739,9 @@
         >
           {acceptingRemoteProgress ? 'Saving choice…' : 'Continue from Kavita'}
         </button>
-        <button class="btn preset-tonal-surface" type="button" onclick={closeConflict}
-          >Cancel</button
-        >
+        <button class="btn preset-tonal-surface" type="button" onclick={closeConflict}>
+          Cancel
+        </button>
       </div>
     </div>
   </div>
@@ -2860,8 +2869,9 @@
         <div
           class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
         >
-          <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span
-          >
+          <span class="min-w-0 flex-1 font-medium text-surface-950-50">
+            Auto-sync furthest read
+          </span>
           <button
             class="switch-button"
             type="button"
@@ -2980,15 +2990,17 @@
           downloads deletes local EPUB files but does not change Kavita.
         </p>
         <div class="mt-3 grid gap-2">
-          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
-            >Clear cover cache</button
-          >
+          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}>
+            Clear cover cache
+          </button>
           <button
             class="btn preset-tonal-error"
             type="button"
             disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-            onclick={removeAllDownloads}>Remove all downloaded books</button
+            onclick={removeAllDownloads}
           >
+            Remove all downloaded books
+          </button>
         </div>
         <dl class="mt-4 text-sm">
           <div class="flex items-center justify-between gap-3">
@@ -3015,11 +3027,13 @@
           <button
             class="btn preset-tonal-surface"
             type="button"
-            onclick={() => void copyDiagnostics()}>Copy diagnostics</button
+            onclick={() => void copyDiagnostics()}
           >
-          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}
-            >Download log</button
-          >
+            Copy diagnostics
+          </button>
+          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
+            Download log
+          </button>
         </div>
         <button
           class="btn preset-tonal-surface mt-2 w-full"
@@ -3041,16 +3055,18 @@
               bind:value={diagnosticsOutput}
               aria-label="Turnleaf diagnostics log"
               onclick={selectDiagnostics}></textarea>
-            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}
-              >Select all text</button
-            >
+            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
+              Select all text
+            </button>
           </div>
         {/if}
         <button
           class="btn preset-tonal-surface mt-2 w-full"
           type="button"
-          onclick={clearDiagnosticLog}>Clear diagnostics</button
+          onclick={clearDiagnosticLog}
         >
+          Clear diagnostics
+        </button>
         {#if diagnosticsMessage}
           <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
         {/if}
