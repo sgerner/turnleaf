@@ -78,6 +78,7 @@
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
@@ -87,6 +88,7 @@
         signal,
         server.id,
         await networkAvailable(),
+        serverOrigin,
       );
     }
     if (offline) throw new Error('Offline');
@@ -852,6 +854,7 @@
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        serverOrigin,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -908,6 +911,10 @@
         } else {
           message = 'The file transfer failed.';
         }
+      } else if (error instanceof KavitaError) {
+        status = error.status;
+        detail = 'download-transfer';
+        message = error.message;
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
