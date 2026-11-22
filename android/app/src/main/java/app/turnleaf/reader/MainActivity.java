@@ -55,24 +55,6 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
-    public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (handleReaderKey(keyCode, event, true)) {
-            return true;
-        }
-
-        return super.onKeyDown(keyCode, event);
-    }
-
-    @Override
-    public boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (handleReaderKey(keyCode, event, false)) {
-            return true;
-        }
-
-        return super.onKeyUp(keyCode, event);
-    }
-
-    @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         int action = event.getAction();
         if (
