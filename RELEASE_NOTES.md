@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- Scope data-mode tokens and make reader EPUB styles accessible across themes
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
