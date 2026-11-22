@@ -1,7 +1,13 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick, untrack, type Snippet } from 'svelte';
+  import { onDestroy, onMount, untrack, type Snippet } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusFirstElement,
+    focusModal,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   let {
     title,
@@ -38,24 +44,18 @@
   let dialogElement = $state<HTMLElement | null>(null);
   let submitting = $state(false);
   let confirmed = false;
-  const capturedOpener = untrack(() =>
-    opener !== undefined
-      ? opener
-      : typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null,
-  );
+  const capturedOpener = untrack(() => (opener !== undefined ? opener : activeElement()));
 
   const isBusy = $derived(busy || submitting);
 
   onMount(() => {
     if (dialogElement) focusFirstElement(dialogElement);
-    else void tick().then(() => focusFirstElement(dialogElement));
+    else focusModal(() => dialogElement);
   });
 
   onDestroy(() => {
     if (!confirmed || restoreFocusOnConfirm) {
-      void tick().then(() => restoreFocus(capturedOpener));
+      restoreModalFocus(capturedOpener);
     }
   });
 
