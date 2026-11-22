@@ -11,7 +11,7 @@ type Row = Record<string, unknown>;
 const SERIES_ENDPOINT = '/api/Series/v2';
 const DETAIL_ENDPOINT = '/api/Series/series-detail';
 // Kavita MangaFormat: Image=0, Archive=1, Unknown=2, Epub=3, Pdf=4.
-const NON_EPUB_FORMATS = new Set([0, 1, 4]);
+const NON_EPUB_FORMATS = new Set([0, 1, 2, 4]);
 
 function actualType(value: unknown): string {
   return value === undefined
