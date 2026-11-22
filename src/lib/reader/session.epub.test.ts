@@ -48,7 +48,7 @@ vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 import { ReaderSession } from './session';
 
 function getRenditionListener(
-  event: 'click' | 'keydown' | 'relocated',
+  event: 'click' | 'displayed' | 'keydown' | 'relocated',
 ): (...args: unknown[]) => void {
   const listener = mockRendition.on.mock.calls.find(([name]) => name === event)?.[1];
   if (typeof listener !== 'function') {
@@ -419,5 +419,112 @@ describe('ReaderSession', () => {
       Array.from({ length: 4 }, () => [['previous'], ['center'], ['next']]).flat(),
     );
     session.destroy();
+  });
+
+  it('waits for deferred initial relocation before running an early page turn', async () => {
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    mockRendition.display.mockImplementationOnce(async () => {
+      getRenditionListener('displayed')();
+    });
+
+    const openPromise = session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    await vi.waitFor(() => {
+      expect(mockRendition.display).toHaveBeenCalledOnce();
+    });
+
+    const relocated = getRenditionListener('relocated');
+    mockRendition.next.mockImplementationOnce(async () => {
+      relocated(location('chapter-2-cfi'));
+    });
+
+    const nextPromise = session.next();
+    await Promise.resolve();
+    expect(mockRendition.next).not.toHaveBeenCalled();
+
+    // Deferred requestAnimationFrame initial relocation from EPUB.js arrives after next() was requested
+    relocated(location('chapter-1-cfi'));
+    await Promise.all([openPromise, nextPromise]);
+
+    expect(mockRendition.next).toHaveBeenCalledOnce();
+    expect(onLocation.mock.calls.map(([loc, origin]) => [loc.cfi, origin])).toEqual([
+      ['chapter-1-cfi', 'restore'],
+      ['chapter-2-cfi', 'navigation'],
+    ]);
+    session.destroy();
+  });
+
+  it('waits for deferred initial relocation before running an early explicit jump', async () => {
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    mockRendition.display.mockImplementationOnce(async () => {
+      getRenditionListener('displayed')();
+    });
+
+    const openPromise = session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    await vi.waitFor(() => {
+      expect(mockRendition.display).toHaveBeenCalledOnce();
+    });
+
+    const relocated = getRenditionListener('relocated');
+    mockRendition.display.mockImplementationOnce(async () => {
+      relocated(location('chapter-2-cfi'));
+    });
+
+    const jumpPromise = session.display('second.xhtml');
+    await Promise.resolve();
+    expect(mockRendition.display).toHaveBeenCalledTimes(1);
+
+    relocated(location('chapter-1-cfi'));
+    await Promise.all([openPromise, jumpPromise]);
+
+    expect(mockRendition.display).toHaveBeenNthCalledWith(2, 'second.xhtml');
+    expect(onLocation.mock.calls.map(([loc, origin]) => [loc.cfi, origin])).toEqual([
+      ['chapter-1-cfi', 'restore'],
+      ['chapter-2-cfi', 'jump'],
+    ]);
+    session.destroy();
+  });
+
+  it('unblocks deferred initial relocation wait and removes the displayed listener on destroy', async () => {
+    const session = new ReaderSession('book.epub');
+    mockRendition.display.mockImplementationOnce(async () => {
+      getRenditionListener('displayed')();
+    });
+
+    const openPromise = session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    await vi.waitFor(() => {
+      expect(mockRendition.display).toHaveBeenCalledOnce();
+    });
+
+    const displayed = getRenditionListener('displayed');
+    session.destroy();
+    await openPromise;
+
+    expect(mockRendition.off).toHaveBeenCalledWith('displayed', displayed);
   });
 });

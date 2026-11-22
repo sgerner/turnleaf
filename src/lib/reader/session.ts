@@ -298,10 +298,13 @@ export class ReaderSession {
   private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
   private rendition: Rendition | null = null;
+  private displayed: (() => void) | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private current: Location | null = null;
+  private openingPromise: Promise<void> | null = null;
+  private resolveInitialRelocation: (() => void) | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
   private userNavigationPending = false;
@@ -378,6 +381,20 @@ export class ReaderSession {
         contents.document.addEventListener('selectionchange', handler);
       });
     }
+    let restoringInitialLocation = true;
+    let pendingInitialRelocation: Promise<void> | null = null;
+    this.displayed = () => {
+      if (!restoringInitialLocation) return;
+      this.resolveInitialRelocation?.();
+      pendingInitialRelocation = new Promise<void>((resolve) => {
+        this.resolveInitialRelocation = () => {
+          this.resolveInitialRelocation = null;
+          pendingInitialRelocation = null;
+          resolve();
+        };
+      });
+    };
+    this.rendition.on('displayed', this.displayed);
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
@@ -399,6 +416,7 @@ export class ReaderSession {
         this.pendingLinkReturnTarget = null;
       }
       this.reportLocation(location, origin, returnTarget);
+      this.resolveInitialRelocation?.();
       if (this.reflowPending) {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
@@ -436,24 +454,39 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
+    const openTask = (async () => {
+      await this.rendition?.started;
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      let restored = false;
+      if (cfi) {
+        try {
+          restored = await this.displayAtGeneration(cfi, restoreGeneration);
+        } catch {
+          // A saved CFI can name a section removed in a newer copy of the EPUB.
+        }
       }
+      if (!restored && serverXPath) {
+        restored = await this.displayXPath(serverXPath, restoreGeneration);
+      }
+      if (!restored && serverPercentage && serverPercentage > 0) {
+        restored = await this.displayPercentage(serverPercentage, restoreGeneration);
+      }
+      if (!restored) {
+        await this.displayAtGeneration(undefined, restoreGeneration);
+      }
+      restoringInitialLocation = false;
+      while (pendingInitialRelocation && this.isCurrentLocationOperation(restoreGeneration)) {
+        await pendingInitialRelocation;
+      }
+    })();
+    this.openingPromise = openTask;
+    try {
+      await openTask;
+    } finally {
+      restoringInitialLocation = false;
+      if (this.openingPromise === openTask) this.openingPromise = null;
+      this.resolveInitialRelocation?.();
     }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -687,6 +720,9 @@ export class ReaderSession {
 
   destroy(): void {
     this.locationGeneration += 1;
+    this.openingPromise = null;
+    this.resolveInitialRelocation?.();
+    if (this.rendition && this.displayed) this.rendition.off('displayed', this.displayed);
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
@@ -696,6 +732,7 @@ export class ReaderSession {
     this.resizeObserver = null;
     this.viewportSize = null;
     this.rendition = null;
+    this.displayed = null;
     this.relocated = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
@@ -795,20 +832,36 @@ export class ReaderSession {
     try {
       await rendition.display(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
+      if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
       if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
       if (!node) return false;
-      const range = contents.document.createRange();
-      range.selectNodeContents(node);
-      await rendition.display(contents.cfiFromRange(range));
+      const cfi = this.cfiFromXPathNode(contents, node);
+      if (!(contents.range(cfi) as Range | null)) return false;
+      await rendition.display(cfi);
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
     }
+  }
+
+  private cfiFromXPathNode(contents: Contents, node: Element): string {
+    const walker = contents.document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+      if (current.parentElement?.localName === 'style') continue;
+      const offset = current.textContent?.search(/\S/) ?? -1;
+      if (offset >= 0) {
+        const range = contents.document.createRange();
+        range.setStart(current, offset);
+        range.collapse(true);
+        return contents.cfiFromRange(range);
+      }
+    }
+    return contents.cfiFromNode(node);
   }
 
   private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
@@ -829,6 +882,8 @@ export class ReaderSession {
     display: () => Promise<unknown>,
     origin: 'navigation' | 'jump' = 'navigation',
   ): Promise<void> {
+    if (this.openingPromise) await this.openingPromise;
+    if (!this.rendition) throw new Error('Reader is not open.');
     const generation = this.beginLocationOperation(true, origin);
     try {
       await display();
