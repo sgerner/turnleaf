@@ -52,7 +52,13 @@
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusModal,
+    restoreFocus,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   let {
     server,
@@ -64,6 +70,7 @@
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
+    onReaderOpenChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -74,6 +81,7 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -342,16 +350,6 @@
     void setPreference('librarySeries', seriesFilter);
   }
 
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
-  }
-
   function insecureServer(): boolean {
     return server.baseUrl.toLowerCase().startsWith('http://');
   }
@@ -536,22 +534,20 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
+          if (!Capacitor.isNativePlatform()) {
+            applyNetworkConnected(connected);
+            return;
           }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          const generation = ++networkStatusGeneration;
+          void Network.getStatus()
+            .then((status) => {
+              if (destroyed || generation !== networkStatusGeneration) return;
+              applyNetworkConnected(status.connected);
+            })
+            .catch(() => {
+              if (destroyed || generation !== networkStatusGeneration) return;
+              applyNetworkConnected(connected);
+            });
         }),
       ),
     );
@@ -593,11 +589,38 @@
     return handle.remove;
   }
 
+  let networkStatusGeneration = 0;
+
+  function applyNetworkConnected(connected: boolean): void {
+    if (destroyed || offline === !connected) return;
+    offline = !connected;
+    if (!connected) {
+      refreshController?.abort();
+      openProgressProbe?.abort();
+    }
+    coverReloadRequest += 1;
+    kavitaUnreachable = false;
+    offlineMessage = connected
+      ? ''
+      : displayableBooks.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.';
+    if (connected) {
+      void syncProgress(false);
+      void refresh()
+        .then(() => syncProgress(false))
+        .catch(() => {});
+    }
+  }
+
   async function networkAvailable(): Promise<boolean> {
-    if (offline || destroyed) return false;
-    if (!Capacitor.isNativePlatform()) return true;
+    if (destroyed) return false;
+    if (!Capacitor.isNativePlatform()) return !offline;
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    if (destroyed) return false;
+    const connected = status?.connected === true;
+    applyNetworkConnected(connected);
+    return !offline && connected;
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -650,6 +673,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -687,7 +711,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (!(await networkAvailable()) || controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -1221,8 +1245,7 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    const readingState = await getReadingState(book.id);
-    await markBookCompleted(book, readingState);
+    await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1294,7 +1317,7 @@
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1355,7 +1378,7 @@
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   function diagnosticsText(): string {
@@ -1588,6 +1611,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}

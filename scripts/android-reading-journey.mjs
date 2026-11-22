@@ -192,6 +192,7 @@ const readerSnapshotExpression = `(() => {
   const progressNow = progressAttr === null || progressAttr === undefined ? NaN : Number(progressAttr);
   const headingEl = doc.querySelector('h1');
   const heading = headingEl?.textContent?.trim() ?? null;
+  if (!heading) return null;
   const viewportRect = viewport.getBoundingClientRect();
   const frameRect = frame.getBoundingClientRect();
   const inViewport = (el) => {
@@ -249,9 +250,25 @@ function isMidChapterTwoSnapshot(snapshot) {
 }
 
 async function advanceToMidChapterTwo(web) {
-  let current = await waitFor('initial reader page snapshot', () =>
-    web.evaluate(readerSnapshotExpression),
-  );
+  let current = await waitFor('settled initial reader page snapshot', async () => {
+    const first = await web.evaluate(`(() => {
+      const rect = document.querySelector('.reader-viewport')?.getBoundingClientRect();
+      const snap = ${readerSnapshotExpression};
+      if (!rect || !snap) return null;
+      return { w: Math.floor(rect.width), h: Math.floor(rect.height), snap };
+    })()`);
+    if (!first || first.w <= 0 || first.h <= 0) return null;
+    await delay(200);
+    const second = await web.evaluate(`(() => {
+      const rect = document.querySelector('.reader-viewport')?.getBoundingClientRect();
+      const snap = ${readerSnapshotExpression};
+      if (!rect || !snap) return null;
+      return { w: Math.floor(rect.width), h: Math.floor(rect.height), snap };
+    })()`);
+    if (!second || second.w !== first.w || second.h !== first.h) return null;
+    if (second.snap.liveText !== first.snap.liveText) return null;
+    return second.snap;
+  });
   for (let step = 0; step < 20; step += 1) {
     if (isMidChapterTwoSnapshot(current)) return current;
     const previousLiveText = current.liveText;
@@ -324,8 +341,8 @@ async function run() {
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
+    await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
       const connected = await web.evaluate(
         'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
