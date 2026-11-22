@@ -292,8 +292,10 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     expect(target.querySelector('.app-ambient')).toBeNull();
 
     target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
-    flushSync();
 
+    await vi.waitFor(() => {
+      expect(target.querySelector('button[aria-label="Use fennec theme"]')).not.toBeNull();
+    });
     target.querySelector<HTMLButtonElement>('button[aria-label="Use fennec theme"]')?.click();
     await vi.waitFor(() => {
       expect(document.documentElement.dataset.theme).toBe('fennec');
@@ -315,41 +317,53 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     });
 
     target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
-    flushSync();
 
-    const changeAddressButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
-      (btn) => btn.textContent?.includes('Change server address'),
-    );
-    expect(changeAddressButton).toBeDefined();
+    let changeAddressButton: HTMLButtonElement | undefined;
+    await vi.waitFor(() => {
+      changeAddressButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find((btn) =>
+        btn.textContent?.includes('Change server address'),
+      );
+      expect(changeAddressButton).toBeDefined();
+    });
     changeAddressButton?.click();
     flushSync();
 
     expect(target.querySelector('.app-ambient')).not.toBeNull();
 
-    const cancelButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find((btn) =>
-      btn.textContent?.includes('Cancel'),
-    );
+    let cancelButton: HTMLButtonElement | undefined;
+    await vi.waitFor(() => {
+      cancelButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find((btn) =>
+        btn.textContent?.includes('Cancel'),
+      );
+      expect(cancelButton).toBeDefined();
+    });
+    expect(target.querySelector('.app-ambient')).not.toBeNull();
     cancelButton?.click();
 
     await vi.waitFor(() => {
       expect(target.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
     });
     target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
-    flushSync();
 
-    const deleteServerButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
-      (btn) => btn.textContent?.trim() === 'Delete server',
-    );
+    let deleteServerButton: HTMLButtonElement | undefined;
+    await vi.waitFor(() => {
+      deleteServerButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+        (btn) => btn.textContent?.trim() === 'Delete server',
+      );
+      expect(deleteServerButton).toBeDefined();
+    });
     deleteServerButton?.click();
     flushSync();
 
     const confirmDeleteButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
       (btn) => btn.textContent?.trim() === 'Delete now',
     );
+    expect(confirmDeleteButton).toBeDefined();
     confirmDeleteButton?.click();
 
     await vi.waitFor(() => {
       expect(removeServerMock).toHaveBeenCalledWith('server-1');
+      expect(target.querySelector('input[autocomplete="url"]')).not.toBeNull();
     });
     flushSync();
     expect(target.querySelector('.app-ambient')).not.toBeNull();
