@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test: parse index.html scripts with DOMParser in themes test
 - Cache boot theme with static swatch tokens
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing

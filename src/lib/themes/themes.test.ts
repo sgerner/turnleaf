@@ -125,12 +125,18 @@ describe('static theme tokens and CSS parity', () => {
 describe('boot theme cache and pre-paint script', () => {
   it('keeps index.html free of inline scripts under script-src self', () => {
     const indexHtml = readFileSync(join(repoRoot, 'index.html'), 'utf8');
-    expect(indexHtml).toContain("script-src 'self'");
-    const scriptTags = [...indexHtml.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
-    expect(scriptTags.length).toBeGreaterThanOrEqual(2);
-    for (const [, attrs, inlineBody] of scriptTags) {
-      expect(attrs).toMatch(/\bsrc=/i);
-      expect(inlineBody?.trim()).toBe('');
+    const parsedDocument = new DOMParser().parseFromString(indexHtml, 'text/html');
+    const cspContent =
+      parsedDocument
+        .querySelector('meta[http-equiv="Content-Security-Policy"]')
+        ?.getAttribute('content') ?? '';
+    expect(cspContent).toContain("script-src 'self'");
+
+    const scriptElements = [...parsedDocument.querySelectorAll('script')];
+    expect(scriptElements.length).toBeGreaterThanOrEqual(2);
+    for (const script of scriptElements) {
+      expect(script.getAttribute('src')?.trim()).toBeTruthy();
+      expect(script.textContent?.trim()).toBe('');
     }
   });
 
