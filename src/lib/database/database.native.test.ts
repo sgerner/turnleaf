@@ -3,16 +3,21 @@ import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
   let databaseVersion = 7;
+  const deleteDatabase = vi.fn(async () => undefined);
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
   const db = {
     close: vi.fn(async () => undefined),
-    execute: vi.fn(async () => ({ changes: { changes: 0 } })),
+    execute: vi.fn<(statements: string, transaction?: boolean) => Promise<capSQLiteChanges>>(
+      async () => ({ changes: { changes: 0 } }),
+    ),
     executeTransaction,
     getVersion: vi.fn(async () => ({ version: databaseVersion })),
     open: vi.fn(async () => undefined),
-    query: vi.fn(async () => ({ values: [] as Record<string, unknown>[] })),
+    query: vi.fn<
+      (statement: string, values?: unknown[]) => Promise<{ values: Record<string, unknown>[] }>
+    >(async () => ({ values: [] as Record<string, unknown>[] })),
     run: vi.fn(async () => ({ changes: { changes: 1 } })),
   };
   const sqlite = {
@@ -22,6 +27,7 @@ const mocks = vi.hoisted(() => {
   };
   return {
     db,
+    deleteDatabase,
     executeTransaction,
     reset() {
       databaseVersion = 7;
@@ -42,7 +48,7 @@ vi.mock('@capacitor/core', () => ({
 
 vi.mock('@capacitor-community/sqlite', () => ({
   CapacitorSQLite: {
-    deleteDatabase: vi.fn(async () => undefined),
+    deleteDatabase: mocks.deleteDatabase,
   },
   SQLiteConnection: class {
     constructor() {
@@ -87,7 +93,9 @@ beforeEach(() => {
 });
 
 it('reads several preferences with one native query', async () => {
-  const { getPreferences } = await import('./database');
+  const { getPreferences, openDatabase } = await import('./database');
+  await openDatabase();
+  mocks.db.query.mockClear();
   mocks.db.query.mockResolvedValueOnce({ values: [{ key: 'uiTheme', value: 'eink' }] });
 
   const values = await getPreferences(['uiTheme', 'uiMode']);
@@ -234,4 +242,125 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
   ]);
+});
+
+it('configures WAL, synchronous mode, foreign keys, and busy timeout outside transactions before migrations', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.reset();
+  mocks.setDatabaseVersion(0);
+
+  const events: string[] = [];
+  mocks.db.open.mockImplementationOnce(async () => {
+    events.push('open');
+  });
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    events.push(`query:${statement}`);
+    return { values: [] };
+  });
+  mocks.db.execute.mockImplementation(async (statement: string, transaction?: boolean) => {
+    events.push(`execute:${String(transaction)}:${statement}`);
+    return { changes: { changes: 0 } };
+  });
+  mocks.db.getVersion.mockImplementationOnce(async () => {
+    events.push('getVersion');
+    return { version: 0 };
+  });
+  mocks.executeTransaction.mockImplementationOnce(async () => {
+    events.push('migrate:1');
+    return { changes: { changes: 0 } };
+  });
+
+  await openDatabase();
+
+  expect(mocks.db.query.mock.calls).toEqual([
+    ['PRAGMA journal_mode = WAL;'],
+    ['PRAGMA busy_timeout = 5000;'],
+  ]);
+  expect(mocks.db.execute.mock.calls).toEqual([
+    ['PRAGMA synchronous = NORMAL;', false],
+    ['PRAGMA foreign_keys = ON;', false],
+  ]);
+  expect(events.slice(0, 7)).toEqual([
+    'open',
+    'query:PRAGMA journal_mode = WAL;',
+    'execute:false:PRAGMA synchronous = NORMAL;',
+    'execute:false:PRAGMA foreign_keys = ON;',
+    'query:PRAGMA busy_timeout = 5000;',
+    'getVersion',
+    'migrate:1',
+  ]);
+});
+
+it('drains queued writes and reverts WAL mode before closing and deleting on reset', async () => {
+  const { openDatabase, resetLocalDatabase, saveLocalProgress } = await import('./database');
+  await openDatabase();
+  mocks.reset();
+
+  const events: string[] = [];
+  let releaseWrite: () => void = () => undefined;
+  const writeGate = new Promise<void>((done) => {
+    releaseWrite = done;
+  });
+  const writeStarted = new Promise<void>((resolve) => {
+    mocks.executeTransaction.mockImplementationOnce(async () => {
+      events.push('write:start');
+      resolve();
+      await writeGate;
+      events.push('write:done');
+      return { changes: { changes: 3 } };
+    });
+  });
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    events.push(`query:${statement}`);
+    return { values: [] };
+  });
+  mocks.db.close.mockImplementationOnce(async () => {
+    events.push('close');
+  });
+  mocks.deleteDatabase.mockImplementationOnce(async () => {
+    events.push('deleteDatabase');
+  });
+
+  const pendingWrite = saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4);
+  await writeStarted;
+  const resetting = resetLocalDatabase();
+  await Promise.resolve();
+  expect(events).toEqual(['write:start']);
+
+  releaseWrite();
+  await Promise.all([pendingWrite, resetting]);
+
+  expect(events).toEqual([
+    'write:start',
+    'write:done',
+    'query:PRAGMA wal_checkpoint(TRUNCATE);',
+    'query:PRAGMA journal_mode = DELETE;',
+    'close',
+    'deleteDatabase',
+  ]);
+  expect(mocks.deleteDatabase).toHaveBeenCalledExactlyOnceWith({
+    database: 'turnleaf',
+    readonly: false,
+  });
+});
+
+it('closes and deletes the database during reset even when WAL cleanup queries fail', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await openDatabase();
+  mocks.reset();
+
+  mocks.db.query.mockRejectedValue(new Error('database disk image is malformed'));
+
+  await expect(resetLocalDatabase()).resolves.toBeUndefined();
+
+  expect(mocks.db.query.mock.calls).toEqual([
+    ['PRAGMA wal_checkpoint(TRUNCATE);'],
+    ['PRAGMA journal_mode = DELETE;'],
+  ]);
+  expect(mocks.db.close).toHaveBeenCalledOnce();
+  expect(mocks.deleteDatabase).toHaveBeenCalledExactlyOnceWith({
+    database: 'turnleaf',
+    readonly: false,
+  });
 });

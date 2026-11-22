@@ -53,6 +53,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 }
 
 let connection: SQLiteDBConnection | null = null;
+let openConnection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
@@ -100,13 +101,6 @@ async function executeNativeRun(
   values: unknown[] = [],
 ): Promise<void> {
   await enqueueNativeWrite(() => db.run(statement, values).then(() => undefined));
-}
-
-async function executeNativeStatement(
-  db: Pick<SQLiteDBConnection, 'execute'>,
-  statement: string,
-): Promise<void> {
-  await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
 }
 
 function createBrowserState(): BrowserDatabaseState {
@@ -196,7 +190,11 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       ? await sqlite.retrieveConnection('turnleaf', false)
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
-  await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
+  openConnection = db;
+  await db.query('PRAGMA journal_mode = WAL;');
+  await db.execute('PRAGMA synchronous = NORMAL;', false);
+  await db.execute('PRAGMA foreign_keys = ON;', false);
+  await db.query('PRAGMA busy_timeout = 5000;');
   await migrate(db);
   return db;
 }
@@ -208,15 +206,40 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 
   try {
-    if (connection) {
+    if (opening) {
       try {
-        await connection.close();
+        await opening;
+      } catch {
+        // Best effort only; reset still cleans up partially opened storage.
+      }
+    }
+    let pending = nativeTransactionQueue;
+    await pending;
+    while (nativeTransactionQueue !== pending) {
+      pending = nativeTransactionQueue;
+      await pending;
+    }
+    const db = connection ?? openConnection;
+    connection = null;
+    openConnection = null;
+    opening = null;
+    if (db) {
+      try {
+        await db.query('PRAGMA wal_checkpoint(TRUNCATE);');
+      } catch {
+        // Best effort only; continue reverting journal mode and closing.
+      }
+      try {
+        await db.query('PRAGMA journal_mode = DELETE;');
+      } catch {
+        // Best effort only; a broken connection can still be closed and removed.
+      }
+      try {
+        await db.close();
       } catch {
         // Best effort only; a broken connection can still be removed.
       }
     }
-    connection = null;
-    opening = null;
     await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });

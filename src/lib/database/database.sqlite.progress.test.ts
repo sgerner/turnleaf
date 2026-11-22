@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -96,9 +96,25 @@ function createAdapter() {
         { user_version?: number } | undefined;
       return { version: Number(row?.user_version ?? 0) };
     },
-    async execute(statement: string): Promise<{ changes: { changes: number } }> {
-      native.database?.exec(statement);
-      return { changes: { changes: 0 } };
+    async execute(
+      statement: string,
+      transaction = true,
+    ): Promise<{ changes: { changes: number } }> {
+      const database = native.database;
+      if (!database) throw new Error('database is not open');
+      if (!transaction) {
+        database.exec(statement);
+        return { changes: { changes: 0 } };
+      }
+      database.exec('BEGIN');
+      try {
+        database.exec(statement);
+        database.exec('COMMIT');
+        return { changes: { changes: 0 } };
+      } catch (error) {
+        database.exec('ROLLBACK');
+        throw error;
+      }
     },
     async run(
       statement: string,
@@ -527,5 +543,109 @@ describe('native progress transactions against SQLite', () => {
     const reopened = await importDatabase();
     await expect(reopened.openDatabase()).resolves.toBeDefined();
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
+  });
+
+  it('enables WAL, NORMAL sync, foreign keys, and busy timeout outside transactions on open', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+
+    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({
+      journal_mode: 'wal',
+    });
+    expect(native.database?.prepare('PRAGMA synchronous').get()).toEqual({
+      synchronous: 1,
+    });
+    expect(native.database?.prepare('PRAGMA foreign_keys').get()).toEqual({
+      foreign_keys: 1,
+    });
+    expect(native.database?.prepare('PRAGMA busy_timeout').get()).toEqual({
+      timeout: 5000,
+    });
+
+    await database.removeServer(server.id);
+    expect(await database.getBooks(server.id)).toEqual([]);
+    expect(await database.getReadingState(book.id)).toBeNull();
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+  });
+
+  it('allows concurrent getBooks, getReadingState, and getPreferences reads during writes without SQLITE_BUSY', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    await database.setPreferences(
+      new Map([
+        ['uiTheme', 'eink'],
+        ['uiMode', 'dark'],
+      ]),
+    );
+
+    const reader = new DatabaseSync(native.databasePath, { timeout: 0 });
+    try {
+      const operations: Promise<unknown>[] = [];
+      for (let step = 1; step <= 10; step += 1) {
+        const percentage = step / 20;
+        operations.push(
+          database.saveLocalProgress(book, `cfi-${step}`, `/p[${step}]`, percentage),
+          database.getBooks(server.id),
+          database.getReadingState(book.id),
+          database.getPreferences(['uiTheme', 'uiMode']),
+        );
+      }
+      await Promise.all(operations);
+
+      const pending = (await database.getPendingSync(server.id))[0];
+      expect(pending).toBeDefined();
+
+      const [, booksSnapshot, readingSnapshot, preferencesSnapshot] = await Promise.all([
+        database.confirmSync(
+          book.id,
+          '2026-01-03T00:00:00.000Z',
+          pending!.revision,
+          pending!.updatedAt,
+        ),
+        database.getBooks(server.id),
+        database.getReadingState(book.id),
+        database.getPreferences(['uiTheme', 'uiMode']),
+      ]);
+
+      expect(booksSnapshot).toHaveLength(1);
+      expect(readingSnapshot?.cfi).toBe('cfi-10');
+      expect(preferencesSnapshot.get('uiTheme')).toBe('eink');
+
+      // Verify a separate connection with zero busy timeout can read a WAL snapshot mid-write.
+      native.database?.exec('BEGIN IMMEDIATE');
+      native.database?.prepare('UPDATE books SET pages_read=? WHERE id=?').run(99, book.id);
+      expect(
+        reader.prepare('SELECT id, pages_read FROM books WHERE server_id=?').all(server.id),
+      ).toEqual([{ id: book.id, pages_read: 50 }]);
+      expect(reader.prepare('SELECT cfi FROM reading_state WHERE book_id=?').get(book.id)).toEqual({
+        cfi: 'cfi-10',
+      });
+      expect(reader.prepare("SELECT value FROM preferences WHERE key='uiTheme'").get()).toEqual({
+        value: 'eink',
+      });
+      native.database?.exec('COMMIT');
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('checkpoints WAL, reverts journal mode to DELETE, and leaves no -wal or -shm files on reset', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    expect(existsSync(`${native.databasePath}-wal`)).toBe(true);
+    expect(existsSync(`${native.databasePath}-shm`)).toBe(true);
+
+    await Promise.all([
+      database.saveLocalProgress(book, 'final-cfi', '/final', 0.9),
+      database.resetLocalDatabase(),
+    ]);
+
+    expect(readdirSync(directory)).toEqual([]);
+
+    await database.saveServer(server);
+    expect(await database.getServer()).toEqual(server);
+    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({
+      journal_mode: 'wal',
+    });
   });
 });
