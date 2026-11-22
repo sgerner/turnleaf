@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
-    "lint": "eslint .",
+    "check": "svelte-check --tsconfig ./tsconfig.app.json --fail-on-warnings && tsc -p tsconfig.node.json",
+    "lint": "eslint --max-warnings=0 .",
     "security:audit": "node scripts/security-audit.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
