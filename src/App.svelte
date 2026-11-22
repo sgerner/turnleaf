@@ -1,11 +1,10 @@
 <script lang="ts">
-  import { Capacitor } from '@capacitor/core';
   import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
-  import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
+  import type OnboardingComponent from './lib/components/Onboarding.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
-  import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
+  import type { ReleaseBanner } from './lib/github/releases';
   import {
     getPreferences,
     getServer,
@@ -21,7 +20,7 @@
   const defaultMode = 'dark';
 
   let server = $state<ServerConfig | null>(null);
-  let booting = $state(Capacitor.isNativePlatform());
+  let booting = $state(true);
   let startupError = $state('');
   let repairing = $state(false);
   let changingServerAddress = $state(false);
@@ -29,6 +28,20 @@
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let onboardingAttempt = $state(0);
+  type OnboardingModule = { default: typeof OnboardingComponent };
+  let onboardingPromise: Promise<OnboardingModule> | null = null;
+
+  function loadOnboarding(): Promise<OnboardingModule> {
+    if (!onboardingPromise) {
+      const loading = import('./lib/components/Onboarding.svelte').catch((error: unknown) => {
+        if (onboardingPromise === loading) onboardingPromise = null;
+        throw error;
+      });
+      onboardingPromise = loading;
+    }
+    return onboardingPromise;
+  }
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -82,8 +95,13 @@
   }
 
   async function checkForRelease(): Promise<void> {
-    const latest = await fetchLatestGithubRelease(__APP_VERSION__);
-    if (latest) releaseBanner = latest;
+    try {
+      const { fetchLatestGithubRelease } = await import('./lib/github/releases');
+      const latest = await fetchLatestGithubRelease(__APP_VERSION__);
+      if (latest) releaseBanner = latest;
+    } catch {
+      // Release banner checks are best-effort and never block startup.
+    }
   }
 
   function displayVersion(version: string): string {
@@ -214,16 +232,54 @@
         </div>
       </div>
     {:else}
-      <Onboarding
-        savedServer={server}
-        editAddress={changingServerAddress}
-        onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
-        onConnected={(connected, key) => {
-          apiKey = key;
-          server = connected;
-          changingServerAddress = false;
-        }}
-      />
+      {#key onboardingAttempt}
+        {#await loadOnboarding()}
+          <main class="grid min-h-full place-items-center" aria-label="Opening setup">
+            <div class="grid justify-items-center gap-4">
+              <TurnleafLogo size={104} />
+              <p class="text-sm tracking-wide text-surface-700-300" role="status">
+                Opening setup...
+              </p>
+            </div>
+          </main>
+        {:then { default: Onboarding }}
+          <Onboarding
+            savedServer={server}
+            editAddress={changingServerAddress}
+            onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
+            onConnected={(connected, key) => {
+              apiKey = key;
+              server = connected;
+              changingServerAddress = false;
+            }}
+          />
+        {:catch}
+          <div
+            class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3"
+            role="alert"
+          >
+            <p>Turnleaf could not load the server setup screen. Retry or reload the app.</p>
+            <div class="flex flex-wrap gap-2">
+              <button
+                class="btn btn-sm preset-filled-error-500 !text-sm"
+                type="button"
+                onclick={() => (onboardingAttempt += 1)}
+              >
+                Retry
+              </button>
+              {#if changingServerAddress}
+                <button
+                  class="btn btn-sm preset-tonal-surface !text-sm"
+                  type="button"
+                  onclick={() => (changingServerAddress = false)}
+                >
+                  Cancel
+                </button>
+              {/if}
+            </div>
+          </div>
+        {/await}
+      {/key}
     {/if}
   </div>
 </div>

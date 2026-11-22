@@ -1,13 +1,15 @@
 import { Capacitor } from '@capacitor/core';
 import {
   CapacitorSQLite,
-  SQLiteConnection,
+  type CapacitorSQLitePlugin,
+  type capSQLiteChanges,
   type capTask,
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
-import { migrations } from './schema';
+
+export const LATEST_SCHEMA_VERSION = 7;
 
 export interface ServerConfig {
   id: string;
@@ -52,8 +54,32 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
   return record;
 }
 
-let connection: SQLiteDBConnection | null = null;
-let opening: Promise<SQLiteDBConnection> | null = null;
+export type NativeSQLiteConnection = Pick<
+  SQLiteDBConnection,
+  'close' | 'execute' | 'executeTransaction' | 'getVersion' | 'open' | 'query' | 'run'
+>;
+
+type NativeSQLiteClient = Pick<
+  CapacitorSQLitePlugin,
+  | 'beginTransaction'
+  | 'checkConnectionsConsistency'
+  | 'close'
+  | 'commitTransaction'
+  | 'createConnection'
+  | 'deleteDatabase'
+  | 'execute'
+  | 'getVersion'
+  | 'open'
+  | 'query'
+  | 'rollbackTransaction'
+  | 'run'
+>;
+
+const NATIVE_DATABASE = 'turnleaf';
+const sqlitePlugin: NativeSQLiteClient = CapacitorSQLite;
+
+let connection: NativeSQLiteConnection | null = null;
+let opening: Promise<NativeSQLiteConnection> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
@@ -171,7 +197,7 @@ function updateBrowserState(mutate: (state: BrowserDatabaseState) => boolean | v
   return true;
 }
 
-export async function openDatabase(): Promise<SQLiteDBConnection> {
+export async function openDatabase(): Promise<NativeSQLiteConnection> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
@@ -187,14 +213,111 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
   }
 }
 
-async function openNativeDatabase(): Promise<SQLiteDBConnection> {
-  const sqlite = new SQLiteConnection(CapacitorSQLite);
-  const consistency = await sqlite.checkConnectionsConsistency();
-  const existing = (await sqlite.isConnection('turnleaf', false)).result;
-  const db =
-    consistency.result && existing
-      ? await sqlite.retrieveConnection('turnleaf', false)
-      : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
+function normalizeQueryRows(
+  values: Record<string, unknown>[] | undefined,
+): Record<string, unknown>[] {
+  if (!values?.length || typeof values[0] !== 'object' || values[0] === null) {
+    return values ?? [];
+  }
+  if (!('ios_columns' in values[0]) || !Array.isArray(values[0].ios_columns)) {
+    return values;
+  }
+  const columns = values[0].ios_columns as string[];
+  return values.slice(1).map((row) => {
+    const ordered: Record<string, unknown> = {};
+    for (const column of columns) {
+      ordered[column] = row[column];
+    }
+    return ordered;
+  });
+}
+
+function createNativeConnection(database: string): NativeSQLiteConnection {
+  return {
+    open: () => sqlitePlugin.open({ database, readonly: false }),
+    close: () => sqlitePlugin.close({ database, readonly: false }),
+    getVersion: () => sqlitePlugin.getVersion({ database, readonly: false }),
+    execute: (statements, transaction = true, isSQL92 = true) =>
+      sqlitePlugin.execute({ database, statements, transaction, readonly: false, isSQL92 }),
+    async query(statement, values, isSQL92 = true) {
+      const queryValues = values && values.length > 0 ? values : [];
+      const result = await sqlitePlugin.query({
+        database,
+        statement,
+        values: queryValues,
+        readonly: false,
+        isSQL92: queryValues.length > 0 ? true : isSQL92,
+      });
+      return {
+        ...result,
+        values: normalizeQueryRows(result.values as Record<string, unknown>[] | undefined),
+      };
+    },
+    run(statement, values, transaction = true, returnMode = 'no', isSQL92 = true) {
+      const runValues = values && values.length > 0 ? values : [];
+      return sqlitePlugin.run({
+        database,
+        statement,
+        values: runValues,
+        transaction,
+        readonly: false,
+        returnMode: returnMode as 'all' | 'one' | 'no',
+        isSQL92: runValues.length > 0 ? true : isSQL92,
+      });
+    },
+    async executeTransaction(tasks, isSQL92 = true): Promise<capSQLiteChanges> {
+      await sqlitePlugin.beginTransaction({ database });
+      let changes = 0;
+      try {
+        for (const task of tasks) {
+          if (task.values && task.values.length > 0) {
+            const returnMode = task.statement.toUpperCase().includes('RETURNING') ? 'all' : 'no';
+            const result = await sqlitePlugin.run({
+              database,
+              statement: task.statement,
+              values: task.values,
+              transaction: false,
+              readonly: false,
+              returnMode,
+              isSQL92,
+            });
+            const count = result.changes?.changes ?? 0;
+            if (count < 0) throw new Error('Error in transaction method run');
+            changes += count;
+          } else {
+            const result = await sqlitePlugin.execute({
+              database,
+              statements: task.statement,
+              transaction: false,
+              readonly: false,
+              isSQL92,
+            });
+            const count = result.changes?.changes ?? 0;
+            if (count < 0) throw new Error('Error in transaction method execute');
+            changes += count;
+          }
+        }
+        const committed = await sqlitePlugin.commitTransaction({ database });
+        changes += committed.changes?.changes ?? 0;
+        return { changes: { changes } };
+      } catch (error) {
+        await sqlitePlugin.rollbackTransaction({ database }).catch(() => {});
+        throw error;
+      }
+    },
+  };
+}
+
+async function openNativeDatabase(): Promise<NativeSQLiteConnection> {
+  await sqlitePlugin.checkConnectionsConsistency({ dbNames: [], openModes: [] });
+  await sqlitePlugin.createConnection({
+    database: NATIVE_DATABASE,
+    encrypted: false,
+    mode: 'no-encryption',
+    version: 1,
+    readonly: false,
+  });
+  const db = createNativeConnection(NATIVE_DATABASE);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
   await migrate(db);
@@ -217,14 +340,16 @@ export async function resetLocalDatabase(): Promise<void> {
     }
     connection = null;
     opening = null;
-    await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+    await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+async function migrate(db: NativeSQLiteConnection): Promise<void> {
   const current = await db.getVersion();
+  if ((current.version ?? 0) >= LATEST_SCHEMA_VERSION) return;
+  const { migrations } = await import('./schema');
   for (const migration of migrations) {
     if (migration.version <= (current.version ?? 0)) continue;
     await executeNativeTransaction(db, [

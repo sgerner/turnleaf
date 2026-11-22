@@ -4,6 +4,8 @@ import { Directory, Filesystem } from '@capacitor/filesystem';
 import { recordDiagnostic } from '../diagnostics/log';
 import { EpubValidationError, validateEpubArchive } from './epub-validation';
 
+export { EpubValidationError };
+
 const BOOK_DIRECTORY = 'books';
 const PARTIAL_SUFFIX = '.partial';
 export const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';

@@ -5,15 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue } from 'node:sqlite';
-import type { capTask } from '@capacitor-community/sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const native = vi.hoisted(() => ({
   databasePath: '',
   database: null as DatabaseSync | null,
   isOpen: false,
+  inTransaction: false,
+  transactionTaskIndex: 0,
   failTransactionAt: null as number | null,
-  createAdapter: null as (() => unknown) | null,
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -24,29 +24,99 @@ vi.mock('@capacitor/core', () => ({
 
 vi.mock('@capacitor-community/sqlite', () => ({
   CapacitorSQLite: {
-    deleteDatabase: async () => {
+    checkConnectionsConsistency: async (): Promise<{ result: boolean }> => ({ result: true }),
+    createConnection: async (): Promise<void> => undefined,
+    open: async (): Promise<void> => {
+      if (!native.database) native.database = new DatabaseSync(native.databasePath);
+      native.isOpen = true;
+    },
+    close: async (): Promise<void> => {
       if (native.database) native.database.close();
       native.database = null;
       native.isOpen = false;
+      native.inTransaction = false;
+    },
+    deleteDatabase: async (): Promise<void> => {
+      if (native.database) native.database.close();
+      native.database = null;
+      native.isOpen = false;
+      native.inTransaction = false;
       rmSync(native.databasePath, { force: true });
     },
-  },
-  SQLiteConnection: class {
-    async checkConnectionsConsistency(): Promise<{ result: boolean }> {
-      return { result: true };
-    }
-
-    async isConnection(): Promise<{ result: boolean }> {
-      return { result: native.isOpen };
-    }
-
-    async retrieveConnection(): Promise<unknown> {
-      return native.createAdapter?.();
-    }
-
-    async createConnection(): Promise<unknown> {
-      return native.createAdapter?.();
-    }
+    getVersion: async (): Promise<{ version: number }> => {
+      const row = native.database?.prepare('PRAGMA user_version').get() as
+        { user_version?: number } | undefined;
+      return { version: Number(row?.user_version ?? 0) };
+    },
+    beginTransaction: async (): Promise<{ changes: { changes: number } }> => {
+      const database = native.database;
+      if (!database) throw new Error('database is not open');
+      database.exec('BEGIN');
+      native.inTransaction = true;
+      native.transactionTaskIndex = 0;
+      return { changes: { changes: 0 } };
+    },
+    commitTransaction: async (): Promise<{ changes: { changes: number } }> => {
+      const database = native.database;
+      if (!database) throw new Error('database is not open');
+      native.inTransaction = false;
+      native.failTransactionAt = null;
+      database.exec('COMMIT');
+      return { changes: { changes: 0 } };
+    },
+    rollbackTransaction: async (): Promise<{ changes: { changes: number } }> => {
+      const database = native.database;
+      native.inTransaction = false;
+      if (database) database.exec('ROLLBACK');
+      return { changes: { changes: 0 } };
+    },
+    execute: async (options: {
+      statements: string;
+      transaction?: boolean;
+    }): Promise<{ changes: { changes: number } }> => {
+      const database = native.database;
+      if (!database) throw new Error('database is not open');
+      if (native.inTransaction && options.transaction === false) {
+        const currentIndex = native.transactionTaskIndex;
+        native.transactionTaskIndex += 1;
+        if (currentIndex === native.failTransactionAt) {
+          native.failTransactionAt = null;
+          throw new Error(`injected transaction failure at ${currentIndex}`);
+        }
+      }
+      database.exec(options.statements);
+      return { changes: { changes: 0 } };
+    },
+    run: async (options: {
+      statement: string;
+      values?: unknown[];
+      transaction?: boolean;
+    }): Promise<{ changes: { changes: number } }> => {
+      const database = native.database;
+      if (!database) throw new Error('database is not open');
+      if (native.inTransaction && options.transaction === false) {
+        const currentIndex = native.transactionTaskIndex;
+        native.transactionTaskIndex += 1;
+        if (currentIndex === native.failTransactionAt) {
+          native.failTransactionAt = null;
+          throw new Error(`injected transaction failure at ${currentIndex}`);
+        }
+      }
+      const result = database
+        .prepare(options.statement)
+        .run(...((options.values ?? []) as SQLInputValue[]));
+      return { changes: { changes: Number(result?.changes ?? 0) } };
+    },
+    query: async (options: {
+      statement: string;
+      values?: unknown[];
+    }): Promise<{ values: Record<string, unknown>[] }> => {
+      const rows = native.database
+        ?.prepare(options.statement)
+        .all(...((options.values ?? []) as SQLInputValue[])) as
+        Record<string, unknown>[] | undefined;
+      return { values: rows ?? [] };
+    },
   },
 }));
 
@@ -79,68 +149,6 @@ const book = {
   downloadStatus: 'none',
   fileSize: null,
 };
-
-function createAdapter() {
-  return {
-    async open(): Promise<void> {
-      if (!native.database) native.database = new DatabaseSync(native.databasePath);
-      native.isOpen = true;
-    },
-    async close(): Promise<void> {
-      if (native.database) native.database.close();
-      native.database = null;
-      native.isOpen = false;
-    },
-    async getVersion(): Promise<{ version: number }> {
-      const row = native.database?.prepare('PRAGMA user_version').get() as
-        { user_version?: number } | undefined;
-      return { version: Number(row?.user_version ?? 0) };
-    },
-    async execute(statement: string): Promise<{ changes: { changes: number } }> {
-      native.database?.exec(statement);
-      return { changes: { changes: 0 } };
-    },
-    async run(
-      statement: string,
-      values: unknown[] = [],
-    ): Promise<{ changes: { changes: number } }> {
-      const result = native.database?.prepare(statement).run(...(values as SQLInputValue[]));
-      return { changes: { changes: Number(result?.changes ?? 0) } };
-    },
-    async query(
-      statement: string,
-      values: unknown[] = [],
-    ): Promise<{ values: Record<string, unknown>[] }> {
-      const rows = native.database?.prepare(statement).all(...(values as SQLInputValue[])) as
-        Record<string, unknown>[] | undefined;
-      return { values: rows ?? [] };
-    },
-    async executeTransaction(tasks: capTask[]): Promise<{ changes: { changes: number } }> {
-      const database = native.database;
-      if (!database) throw new Error('database is not open');
-      const failAt = native.failTransactionAt;
-      native.failTransactionAt = null;
-      database.exec('BEGIN');
-      try {
-        for (const [index, task] of tasks.entries()) {
-          if (index === failAt) throw new Error(`injected transaction failure at ${index}`);
-          if (task.values && task.values.length > 0) {
-            database.prepare(task.statement).run(...(task.values as SQLInputValue[]));
-          } else {
-            database.exec(task.statement);
-          }
-        }
-        database.exec('COMMIT');
-        return { changes: { changes: tasks.length } };
-      } catch (error) {
-        database.exec('ROLLBACK');
-        throw error;
-      }
-    },
-  };
-}
-
-native.createAdapter = createAdapter;
 
 async function importDatabase() {
   vi.resetModules();

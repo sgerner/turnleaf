@@ -14,28 +14,17 @@
     markDownloaded,
     markBookCompleted,
     removeDownload,
-    removeServer,
     reconcileBooks,
     saveLocalProgress,
     saveRemoteProgress,
-    saveServer,
     setPreference,
     type BookRecord,
     type ServerConfig,
     type SyncStatus,
     type StoredReadingState,
   } from '../database/database';
-  import {
-    cacheCover,
-    clearCoverCache,
-    cleanupInterruptedEpubDownloads,
-    deleteDownloadedEpub,
-    downloadEpub,
-    EPUB_DOWNLOAD_ENDPOINT,
-    EpubTransferError,
-    verifyDownloadedEpub,
-  } from '../downloads/native-download';
-  import { EpubValidationError } from '../downloads/epub-validation';
+  import type * as NativeDownloadNamespace from '../downloads/native-download';
+  import type { DownloadedBookFile } from '../downloads/native-download';
   import {
     createSharedCoverLoader,
     loadCoversWithConcurrency,
@@ -45,13 +34,14 @@
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
-  import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
+  import { recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
+  import type LibrarySettingsModalComponent from './LibrarySettingsModal.svelte';
+  import type ReaderComponent from './Reader.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
-  import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import type { SkeletonTheme } from '../themes/themes';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   let {
@@ -77,9 +67,51 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
+  const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
+  type NativeDownloadModule = typeof NativeDownloadNamespace;
+  type ReaderModule = { default: typeof ReaderComponent };
+  type SettingsModalModule = { default: typeof LibrarySettingsModalComponent };
+  let nativeDownloadPromise: Promise<NativeDownloadModule> | null = null;
+  let readerPromise: Promise<ReaderModule> | null = null;
+  let settingsModalPromise: Promise<SettingsModalModule> | null = null;
+
+  function loadNativeDownloads(): Promise<NativeDownloadModule> {
+    if (!nativeDownloadPromise) {
+      const loading = import('../downloads/native-download').catch((error: unknown) => {
+        if (nativeDownloadPromise === loading) nativeDownloadPromise = null;
+        throw error;
+      });
+      nativeDownloadPromise = loading;
+    }
+    return nativeDownloadPromise;
+  }
+
+  function preloadReader(): Promise<ReaderModule> {
+    if (!readerPromise) {
+      const loading = import('./Reader.svelte').catch((error: unknown) => {
+        if (readerPromise === loading) readerPromise = null;
+        throw error;
+      });
+      readerPromise = loading;
+    }
+    return readerPromise;
+  }
+
+  function loadSettingsModal(): Promise<SettingsModalModule> {
+    if (!settingsModalPromise) {
+      const loading = import('./LibrarySettingsModal.svelte').catch((error: unknown) => {
+        if (settingsModalPromise === loading) settingsModalPromise = null;
+        throw error;
+      });
+      settingsModalPromise = loading;
+    }
+    return settingsModalPromise;
+  }
+
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
+      const { cacheCover } = await loadNativeDownloads();
       return cacheCover(
         client.coverUrl(seriesId),
         apiKey,
@@ -221,23 +253,16 @@
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
-  let diagnosticsVisible = $state(false);
-  let diagnosticsOutput = $state('');
+  let settingsAttempt = $state(0);
+  let settingsFallbackDialog = $state<HTMLElement | null>(null);
+  let diagnosticsRevision = $state(0);
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
   let pendingAutoSync = $state(false);
-  let replacementApiKey = $state('');
-  let showReplacementKey = $state(false);
-  let settingsError = $state('');
-  let diagnosticsMessage = $state('');
-  let replacingApiKey = $state(false);
-  let deletingServer = $state(false);
-  let confirmDeleteServer = $state(false);
-  let credentialCleanupComplete = false;
+  let credentialCleanupComplete = $state(false);
   let actionMenuBook = $state<BookRecord | null>(null);
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
-  let settingsDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
@@ -350,10 +375,6 @@
 
   function focusModal(getDialog: () => HTMLElement | null): void {
     void tick().then(() => focusFirstElement(getDialog()));
-  }
-
-  function insecureServer(): boolean {
-    return server.baseUrl.toLowerCase().startsWith('http://');
   }
 
   function isMissingNativeFile(error: unknown): boolean {
@@ -495,7 +516,11 @@
   });
 
   onMount(async () => {
-    void cleanupInterruptedEpubDownloads();
+    if (Capacitor.isNativePlatform()) {
+      void loadNativeDownloads()
+        .then(({ cleanupInterruptedEpubDownloads }) => cleanupInterruptedEpubDownloads())
+        .catch(() => {});
+    }
     const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
     scrollTarget = scrollContainer ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
@@ -742,7 +767,7 @@
         detail:
           cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
       });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
+      diagnosticsRevision += 1;
       const savedBooks = displayableBooks.length
         ? 'Showing your saved library.'
         : 'No saved books are available yet.';
@@ -844,8 +869,10 @@
     downloadNeedsRefresh = false;
     message = `Downloading ${book.title}...`;
     let downloadedPath: string | null = null;
+    let nativeDownloads: NativeDownloadModule | null = null;
     try {
-      const file = await downloadEpub(
+      nativeDownloads = await loadNativeDownloads();
+      const file = await nativeDownloads.downloadEpub(
         client.downloadUrl(book.chapterId),
         apiKey,
         book.id.replaceAll(':', '-'),
@@ -869,7 +896,7 @@
       let detail = 'download-storage';
       let status: number | undefined;
       let cleanupFailed = false;
-      if (downloadedPath) {
+      if (downloadedPath && nativeDownloads) {
         const savedBooks = await getBooks(server.id, { includeDescription: false }).catch(
           () => null,
         );
@@ -883,7 +910,7 @@
         }
         if (savedBooks) {
           try {
-            await deleteDownloadedEpub(downloadedPath);
+            await nativeDownloads.deleteDownloadedEpub(downloadedPath);
             downloadedPath = null;
           } catch {
             cleanupFailed = true;
@@ -894,7 +921,7 @@
         }
       }
 
-      if (error instanceof EpubTransferError) {
+      if (nativeDownloads && error instanceof nativeDownloads.EpubTransferError) {
         status = error.status;
         detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
         if (status === 401) {
@@ -908,7 +935,7 @@
         } else {
           message = 'The file transfer failed.';
         }
-      } else if (error instanceof EpubValidationError) {
+      } else if (nativeDownloads && error instanceof nativeDownloads.EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
       } else {
@@ -923,7 +950,7 @@
           'The download finished, but its saved status could not be checked. Refresh before retrying.';
       }
       recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
+      diagnosticsRevision += 1;
       message += ' Open Settings to copy diagnostics.';
       downloadFailureBook = book;
       return null;
@@ -939,6 +966,7 @@
     cleanupInProgress = true;
     message = 'Removing the leftover local file…';
     try {
+      const { deleteDownloadedEpub } = await loadNativeDownloads();
       await deleteDownloadedEpub(path);
       failedDownloadCleanupPath = null;
       message = 'The leftover local file was removed. You can retry the download.';
@@ -958,6 +986,7 @@
     try {
       if (book.downloadPath) {
         try {
+          const { deleteDownloadedEpub } = await loadNativeDownloads();
           await deleteDownloadedEpub(book.downloadPath);
         } catch (error) {
           if (!isMissingNativeFile(error)) throw error;
@@ -1025,15 +1054,19 @@
       return;
     }
     if (destroyed || reading || conflict || resolvingOpenProgress) return;
+    const downloadPath = book.downloadPath;
+    void preloadReader().catch(() => {});
     resolvingOpenProgress = true;
-    let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
+    let file: DownloadedBookFile | null;
     let local: StoredReadingState | null = null;
     let remote: KavitaProgress | null = null;
     try {
-      const fileCheck = verifyDownloadedEpub(book.downloadPath).then(
-        (verified) => ({ ok: true as const, verified }),
-        (error: unknown) => ({ ok: false as const, error }),
-      );
+      const fileCheck = loadNativeDownloads()
+        .then(({ verifyDownloadedEpub }) => verifyDownloadedEpub(downloadPath))
+        .then(
+          (verified) => ({ ok: true as const, verified }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
       const [verification, progress] = await Promise.all([
         fileCheck,
         checkOpenProgress(book, options.preferFurthest),
@@ -1341,87 +1374,14 @@
   function openSettings(): void {
     settingsOpener = activeElement();
     settingsVisible = true;
-    void Promise.allSettled(skeletonThemes.map(loadTheme));
-    focusModal(() => settingsDialog);
+    void loadSettingsModal();
   }
 
   function closeSettings(): void {
     settingsVisible = false;
-    showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
     void tick().then(() => restoreFocus(opener));
-  }
-
-  function diagnosticsText(): string {
-    return exportDiagnostics({
-      appVersion: __APP_VERSION__,
-      platform: Capacitor.getPlatform(),
-      kavitaVersion: server.kavitaVersion,
-    });
-  }
-
-  async function copyDiagnostics(): Promise<void> {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    try {
-      const text = diagnosticsOutput;
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const field = document.createElement('textarea');
-        field.value = text;
-        field.setAttribute('readonly', '');
-        field.style.position = 'fixed';
-        field.style.opacity = '0';
-        document.body.appendChild(field);
-        let copied = false;
-        try {
-          field.select();
-          copied = document.execCommand('copy');
-        } finally {
-          field.remove();
-        }
-        if (!copied) throw new Error('Clipboard unavailable');
-      }
-      diagnosticsMessage = 'Diagnostics copied. Review them before sharing.';
-    } catch {
-      diagnosticsVisible = true;
-      diagnosticsMessage =
-        'Copy is unavailable here. Open the log below to select and copy it, or download it.';
-    }
-  }
-
-  function downloadDiagnostics(): void {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    const file = new Blob([diagnosticsOutput], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'turnleaf-diagnostics.txt';
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    diagnosticsVisible = true;
-    diagnosticsMessage =
-      'Review the log before sharing. If the file did not download, select and copy it below.';
-  }
-
-  function showDiagnostics(): void {
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsVisible = !diagnosticsVisible;
-  }
-
-  function selectDiagnostics(): void {
-    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-diagnostics-output');
-    field?.focus();
-    field?.select();
-  }
-
-  function clearDiagnosticLog(): void {
-    clearDiagnostics();
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsMessage = 'Diagnostics cleared.';
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -1455,35 +1415,15 @@
     sharedCoverLoader.retain(new Set());
     await sharedCoverLoader.waitForIdle();
     if (destroyed) return;
-    await clearCoverCache();
+    if (Capacitor.isNativePlatform()) {
+      const { clearCoverCache } = await loadNativeDownloads();
+      await clearCoverCache();
+    }
     if (destroyed) return;
     clearCovers();
     coverReloadRequest += 1;
     message = 'Cover cache cleared.';
     closeSettings();
-  }
-
-  async function updateTheme(next: SkeletonTheme): Promise<void> {
-    try {
-      await loadTheme(next);
-    } catch {
-      settingsError = 'The theme could not load. Try again.';
-      return;
-    }
-    pendingTheme = next;
-    onThemeChange(next);
-    await setPreference('uiTheme', next);
-  }
-
-  async function updateMode(next: 'light' | 'dark'): Promise<void> {
-    pendingMode = next;
-    onModeChange(next);
-    await setPreference('uiMode', next);
-  }
-
-  async function updateAutoSync(next: boolean): Promise<void> {
-    pendingAutoSync = next;
-    await setPreference('syncFurthest', String(next));
   }
 
   function handleRelocated(location: ReaderLocation): void {
@@ -1498,75 +1438,36 @@
     };
   }
 
-  async function updateApiKey(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
-    settingsError = '';
-    replacingApiKey = true;
-    try {
-      const nextKey = replacementApiKey.trim();
-      if (!nextKey) throw new Error('Enter a new Kavita auth key.');
-
-      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
-      if (result.bookLibraries.length === 0) {
-        throw new Error(
-          'This account has no book or light novel libraries. Only EPUB books are supported.',
-        );
-      }
-
-      const updatedServer: ServerConfig = {
-        ...server,
-        kavitaVersion: result.version,
-        lastConnectedAt: new Date().toISOString(),
-      };
-      await saveApiKey(server.credentialRef, nextKey);
-      await saveServer(updatedServer);
-      onApiKeyChange(nextKey);
-      replacementApiKey = '';
-      message = 'API key updated.';
-      closeSettings();
-      // An upload started with the previous key may still be finishing.
-      await syncWork;
-      await refresh();
-      await syncProgress(false);
-    } catch (cause) {
-      settingsError =
-        cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
-    } finally {
-      replacingApiKey = false;
-    }
+  async function handleApiKeySaved(nextKey: string): Promise<void> {
+    onApiKeyChange(nextKey);
+    message = 'API key updated.';
+    closeSettings();
+    // An upload started with the previous key may still be finishing.
+    await syncWork;
+    await refresh();
+    await syncProgress(false);
   }
 
-  async function deleteServer(): Promise<void> {
-    settingsError = '';
-    deletingServer = true;
-    try {
-      for (const book of books.filter((item) => item.downloadPath)) await remove(book);
-      cancelCoverLoading();
-      await clearCoverCache().catch(() => {});
-      clearCovers();
-      if (!credentialCleanupComplete) {
-        await removeApiKey(server.credentialRef);
-        credentialCleanupComplete = true;
-      }
-      await removeServer(server.id);
-      onServerDeleted();
-      message = 'Server removed. Add it again to browse the library.';
-      closeSettings();
-    } catch (cause) {
-      settingsError = credentialCleanupComplete
-        ? 'The auth key was removed, but the local server configuration could not be cleared. Retry Delete server to finish cleanup.'
-        : cause instanceof Error
-          ? `Could not remove the server safely: ${cause.message} The connection was left in place; retry Delete server.`
-          : 'Could not remove the server safely. The connection was left in place; retry Delete server.';
-    } finally {
-      deletingServer = false;
-      confirmDeleteServer = false;
+  async function clearServerResources(): Promise<void> {
+    for (const book of books.filter((item) => item.downloadPath)) await remove(book);
+    cancelCoverLoading();
+    if (Capacitor.isNativePlatform()) {
+      await loadNativeDownloads()
+        .then(({ clearCoverCache }) => clearCoverCache())
+        .catch(() => {});
     }
+    clearCovers();
+  }
+
+  function handleServerRemoved(): void {
+    onServerDeleted();
+    message = 'Server removed. Add it again to browse the library.';
+    closeSettings();
   }
 </script>
 
 {#if reading}
-  {#await import('./Reader.svelte')}
+  {#await preloadReader()}
     <p class="m-8" role="status">Opening reader…</p>
   {:then { default: Reader }}
     <Reader
@@ -1622,6 +1523,8 @@
         <button
           class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
+          onpointerenter={() => void loadSettingsModal().catch(() => {})}
+          onfocus={() => void loadSettingsModal().catch(() => {})}
           onclick={openSettings}
           aria-label="Open settings"
           title="Settings"
@@ -2539,398 +2442,92 @@
 {/if}
 
 {#if settingsVisible}
-  <div
-    class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeSettings()}
-  >
-    <div
-      bind:this={settingsDialog}
-      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="library-settings-title"
-      tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
+  {#key settingsAttempt}
+    {#await loadSettingsModal()}
       <div
-        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
+        class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
+        role="presentation"
+        onclick={(event) => event.target === event.currentTarget && closeSettings()}
       >
-        <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
-        <button
-          class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
-          type="button"
-          onclick={closeSettings}
-          aria-label="Close settings"
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path
-              fill="currentColor"
-              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-            />
-          </svg>
-        </button>
-      </div>
-
-      <section class="mt-6" aria-labelledby="library-settings-appearance-title">
-        <h3 id="library-settings-appearance-title" class="text-lg font-medium">
-          Application appearance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Choose the colors and theme that make reading comfortable. Changes apply immediately.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn {pendingMode === 'light'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'light'}
-            onclick={() => void updateMode('light')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
-              />
-            </svg>
-            Light
-          </button>
-          <button
-            class="btn {pendingMode === 'dark'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'dark'}
-            onclick={() => void updateMode('dark')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
-              />
-            </svg>
-            Dark
-          </button>
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
-        <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
-          {#each skeletonThemes as option (option)}
-            <button
-              class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
-              option
-                ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
-                : 'preset-tonal-surface'}"
-              type="button"
-              aria-pressed={pendingTheme === option}
-              aria-label={`Use ${option} theme`}
-              title={option}
-              onclick={() => void updateTheme(option)}
-            >
-              <span class="flex h-full w-full" data-theme={option}>
-                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
-                ></span>
-              </span>
-              {#if pendingTheme === option}
-                <span
-                  class="absolute inset-0 grid place-items-center bg-black/20"
-                  aria-hidden="true"
-                >
-                  <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
-                    <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
-                  </svg>
-                </span>
-              {/if}
-            </button>
-          {/each}
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Turnleaf always saves your latest position on this device. Auto-sync furthest read also
-          lets a newer local position replace an older Kavita position when progress is uploaded.
-        </p>
         <div
-          class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
+          bind:this={settingsFallbackDialog}
+          class="card preset-filled-surface-50-950 w-full max-w-md p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, settingsFallbackDialog!, closeSettings)}
         >
-          <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span
-          >
-          <button
-            class="switch-button"
-            type="button"
-            role="switch"
-            aria-checked={pendingAutoSync}
-            aria-label="Auto-sync furthest read"
-            onclick={() => void updateAutoSync(!pendingAutoSync)}
-          >
-            <span
-              class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
-                pendingAutoSync
-                  ? 'preset-filled-primary-700-300'
-                  : 'preset-filled-secondary-700-300'
-              }`}
-              aria-hidden="true"
-            >
-              <span class="switch-thumb preset-filled-tertiary-100-900"></span>
-            </span>
-          </button>
+          <p class="text-sm text-surface-700-300" role="status">Opening settings…</p>
         </div>
-      </section>
-
-      <section class="mt-7" aria-labelledby="library-settings-connection-title">
-        <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Update the server address or replace the key used to access this library.
-        </p>
-        <dl class="mt-3 space-y-2 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Server</dt>
-            <dd class="truncate text-right">{server.displayName}</dd>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Address</dt>
-            <dd class="truncate text-right">{server.baseUrl}</dd>
-          </div>
-        </dl>
-        <button
-          class="btn preset-tonal-surface mt-3"
-          type="button"
-          disabled={Boolean(downloadingBookId) ||
-            cleanupInProgress ||
-            replacingApiKey ||
-            deletingServer}
-          onclick={onChangeServerAddress}
+      </div>
+    {:then { default: LibrarySettingsModal }}
+      <LibrarySettingsModal
+        {server}
+        {books}
+        {downloadingBookId}
+        {cleanupInProgress}
+        {pendingTheme}
+        {pendingMode}
+        {pendingAutoSync}
+        {credentialCleanupComplete}
+        {diagnosticsRevision}
+        onClose={closeSettings}
+        onThemeSelected={(next) => {
+          pendingTheme = next;
+          onThemeChange(next);
+        }}
+        onModeSelected={(next) => {
+          pendingMode = next;
+          onModeChange(next);
+        }}
+        onAutoSyncSelected={(next) => {
+          pendingAutoSync = next;
+        }}
+        {onChangeServerAddress}
+        onApiKeySaved={handleApiKeySaved}
+        onClearCache={clearCache}
+        onRemoveAllDownloads={removeAllDownloads}
+        onDeleteServerResources={clearServerResources}
+        onCredentialCleanedUp={() => {
+          credentialCleanupComplete = true;
+        }}
+        onServerRemoved={handleServerRemoved}
+      />
+    {:catch}
+      <div
+        class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
+        role="presentation"
+        onclick={(event) => event.target === event.currentTarget && closeSettings()}
+      >
+        <div
+          bind:this={settingsFallbackDialog}
+          class="card preset-filled-surface-50-950 grid w-full max-w-md gap-3 p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, settingsFallbackDialog!, closeSettings)}
         >
-          Change server address
-        </button>
-        {#if insecureServer()}
-          <div class="alert preset-tonal-warning mt-4" role="alert">
-            Plain HTTP is enabled. Anyone on this network may be able to observe your reading
-            traffic and Kavita auth key. HTTPS is strongly recommended.
-          </div>
-        {/if}
-
-        <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
-          <div class="label">
-            <label for="replacement-api-key" class="label-text">Replace API key</label>
-            <div class="flex flex-wrap gap-2">
-              <input
-                id="replacement-api-key"
-                class="input min-w-0 flex-1 max-w-96"
-                type={showReplacementKey ? 'text' : 'password'}
-                spellcheck="false"
-                autocomplete="off"
-                bind:value={replacementApiKey}
-                placeholder="Enter a new Kavita key"
-                aria-invalid={settingsError ? true : undefined}
-                aria-describedby={settingsError ? 'settings-key-error' : undefined}
-                required
-              />
-              <button
-                class="btn preset-tonal-surface"
-                type="button"
-                onclick={() => (showReplacementKey = !showReplacementKey)}
-              >
-                {showReplacementKey ? 'Hide key' : 'Show key'}
-              </button>
-              <button
-                class="btn preset-filled-primary-700-300 shrink-0"
-                type="submit"
-                disabled={replacingApiKey}
-              >
-                {replacingApiKey ? 'Testing...' : 'Save'}
-              </button>
-            </div>
-            <span class="label-text text-xs text-surface-700-300">
-              The new key is tested before it is saved.
-            </span>
-          </div>
-          <div
-            id="settings-key-error"
-            role="alert"
-            class:alert={settingsError}
-            class:preset-tonal-error={settingsError}
-          >
-            {settingsError}
-          </div>
-          <button
-            class="btn preset-tonal-error"
-            type="button"
-            onclick={() => (confirmDeleteServer = true)}
-            disabled={deletingServer}
-          >
-            Delete server
-          </button>
-        </form>
-      </section>
-
-      <section class="mt-7" aria-labelledby="library-settings-storage-title">
-        <h3 id="library-settings-storage-title" class="text-lg font-medium">
-          Storage and maintenance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Downloads and reading progress stay on this device. Clearing covers is safe; removing
-          downloads deletes local EPUB files but does not change Kavita.
-        </p>
-        <div class="mt-3 grid gap-2">
-          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
-            >Clear cover cache</button
-          >
-          <button
-            class="btn preset-tonal-error"
-            type="button"
-            disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-            onclick={removeAllDownloads}>Remove all downloaded books</button
-          >
-        </div>
-        <dl class="mt-4 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Downloaded storage</dt>
-            <dd class="tabular-nums">
-              {(
-                books.reduce(
-                  (sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0),
-                  0,
-                ) / 1_048_576
-              ).toFixed(1)} MB
-            </dd>
-          </div>
-        </dl>
-      </section>
-      <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-        <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Copy or download recent connection and book download details. The log includes API routes,
-          HTTP statuses, and failure categories. It stays in memory until the app closes or you
-          clear it. Review it before sharing.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn preset-tonal-surface"
-            type="button"
-            onclick={() => void copyDiagnostics()}>Copy diagnostics</button
-          >
-          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}
-            >Download log</button
-          >
-        </div>
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={showDiagnostics}
-        >
-          {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-        </button>
-        {#if diagnosticsVisible}
-          <div class="mt-3 grid gap-2">
-            <p class="text-sm text-surface-700-300">
-              If copy or download is unavailable, select all text below, then copy it manually.
-            </p>
-            <textarea
-              id="turnleaf-diagnostics-output"
-              class="input min-h-48 w-full font-mono text-xs"
-              readonly
-              rows="10"
-              bind:value={diagnosticsOutput}
-              aria-label="Turnleaf diagnostics log"
-              onclick={selectDiagnostics}></textarea>
-            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}
-              >Select all text</button
-            >
-          </div>
-        {/if}
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={clearDiagnosticLog}>Clear diagnostics</button
-        >
-        {#if diagnosticsMessage}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-        {/if}
-      </section>
-      {#if confirmDeleteServer}
-        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-          <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
-          </p>
-          <div class="mt-4 flex gap-2">
+          <p role="alert">Turnleaf could not load settings. Retry or reload the app.</p>
+          <div class="flex flex-wrap gap-2">
             <button
-              class="btn preset-outlined-error-500"
+              class="btn btn-sm preset-filled-error-500 !text-sm"
               type="button"
-              onclick={() => void deleteServer()}
-              disabled={deletingServer}
+              onclick={() => (settingsAttempt += 1)}
             >
-              {deletingServer ? 'Deleting...' : 'Delete now'}
+              Retry
             </button>
             <button
-              class="btn preset-tonal-surface"
+              class="btn btn-sm preset-tonal-surface !text-sm"
               type="button"
-              onclick={() => (confirmDeleteServer = false)}
-              disabled={deletingServer}
+              onclick={closeSettings}
             >
-              Cancel
+              Close
             </button>
           </div>
         </div>
-      {/if}
-    </div>
-  </div>
+      </div>
+    {/await}
+  {/key}
 {/if}
-
-<style>
-  .switch-track {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    width: 3rem;
-    height: 1.75rem;
-    flex: none;
-    border-radius: 9999px;
-    border: 1px solid color-mix(in srgb, var(--color-primary-900) 35%, transparent);
-    padding: 0.2rem;
-    box-shadow:
-      inset 0 1px 1px hsl(0 0% 100% / 0.08),
-      0 1px 4px hsl(0 0% 0% / 0.2);
-    cursor: pointer;
-    transition:
-      background-color 160ms ease,
-      border-color 160ms ease,
-      box-shadow 160ms ease;
-  }
-
-  .switch-button {
-    display: inline-grid;
-    width: 3rem;
-    height: 2.75rem;
-    flex: none;
-    place-items: center;
-    border: 0;
-    padding: 0;
-    background: transparent;
-    cursor: pointer;
-  }
-
-  .switch-thumb {
-    width: 1.35rem;
-    height: 1.35rem;
-    border-radius: 9999px;
-    box-shadow:
-      inset 0 1px 1px hsl(0 0% 100% / 0.3),
-      0 1px 2px hsl(0 0% 0% / 0.28);
-    transform: translateX(0);
-    transition: transform 160ms ease;
-  }
-
-  .switch-checked .switch-thumb {
-    transform: translateX(1.2rem);
-  }
-</style>

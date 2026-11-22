@@ -3,34 +3,95 @@ import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
   let databaseVersion = 7;
+  let inTransaction = false;
+  let pendingTasks: capTask[] = [];
+  let failMidTransactionRun: Error | null = null;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
   const db = {
     close: vi.fn(async () => undefined),
-    execute: vi.fn(async () => ({ changes: { changes: 0 } })),
+    execute: vi.fn<(statements: string) => Promise<capSQLiteChanges>>(async () => ({
+      changes: { changes: 0 },
+    })),
     executeTransaction,
     getVersion: vi.fn(async () => ({ version: databaseVersion })),
     open: vi.fn(async () => undefined),
-    query: vi.fn(async () => ({ values: [] as Record<string, unknown>[] })),
-    run: vi.fn(async () => ({ changes: { changes: 1 } })),
+    query: vi.fn<
+      (statement: string, values?: unknown[]) => Promise<{ values: Record<string, unknown>[] }>
+    >(async () => ({ values: [] as Record<string, unknown>[] })),
+    run: vi.fn<(statement: string, values?: unknown[]) => Promise<capSQLiteChanges>>(async () => ({
+      changes: { changes: 1 },
+    })),
   };
-  const sqlite = {
+  const plugin = {
+    beginTransaction: vi.fn(async () => {
+      inTransaction = true;
+      pendingTasks = [];
+      return { changes: { changes: 0 } };
+    }),
     checkConnectionsConsistency: vi.fn(async () => ({ result: true })),
-    createConnection: vi.fn(async () => db),
-    isConnection: vi.fn(async () => ({ result: false })),
+    close: vi.fn(async () => db.close()),
+    commitTransaction: vi.fn(async () => {
+      const tasks = pendingTasks;
+      inTransaction = false;
+      pendingTasks = [];
+      return executeTransaction(tasks);
+    }),
+    createConnection: vi.fn(async () => undefined),
+    deleteDatabase: vi.fn(async () => undefined),
+    execute: vi.fn(async (options: { statements: string; transaction?: boolean }) => {
+      if (inTransaction && options.transaction === false) {
+        pendingTasks.push({ statement: options.statements });
+        return { changes: { changes: 0 } };
+      }
+      return db.execute(options.statements);
+    }),
+    getVersion: vi.fn(async () => db.getVersion()),
+    open: vi.fn(async () => db.open()),
+    query: vi.fn(async (options: { statement: string; values?: unknown[] }) =>
+      db.query(options.statement, options.values),
+    ),
+    rollbackTransaction: vi.fn(async () => {
+      inTransaction = false;
+      pendingTasks = [];
+      return { changes: { changes: 0 } };
+    }),
+    run: vi.fn(
+      async (options: { statement: string; values?: unknown[]; transaction?: boolean }) => {
+        if (inTransaction && options.transaction === false) {
+          if (failMidTransactionRun) {
+            const error = failMidTransactionRun;
+            failMidTransactionRun = null;
+            throw error;
+          }
+          pendingTasks.push({
+            statement: options.statement,
+            ...(options.values ? { values: options.values } : {}),
+          });
+          return { changes: { changes: 1 } };
+        }
+        return db.run(options.statement, options.values);
+      },
+    ),
   };
   return {
     db,
     executeTransaction,
+    failNextTransactionRun(error: Error) {
+      failMidTransactionRun = error;
+    },
+    plugin,
     reset() {
       databaseVersion = 7;
+      inTransaction = false;
+      pendingTasks = [];
+      failMidTransactionRun = null;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
       databaseVersion = version;
     },
-    sqlite,
   };
 });
 
@@ -41,14 +102,7 @@ vi.mock('@capacitor/core', () => ({
 }));
 
 vi.mock('@capacitor-community/sqlite', () => ({
-  CapacitorSQLite: {
-    deleteDatabase: vi.fn(async () => undefined),
-  },
-  SQLiteConnection: class {
-    constructor() {
-      return mocks.sqlite;
-    }
-  },
+  CapacitorSQLite: mocks.plugin,
 }));
 
 const book = {
@@ -234,4 +288,40 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
   ]);
+});
+
+it('rolls back an active native transaction when a statement run fails', async () => {
+  const { saveLocalProgress } = await import('./database');
+  mocks.failNextTransactionRun(new Error('disk full'));
+
+  await expect(saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4)).rejects.toThrow(
+    'disk full',
+  );
+
+  expect(mocks.plugin.beginTransaction).toHaveBeenCalledOnce();
+  expect(mocks.plugin.rollbackTransaction).toHaveBeenCalledOnce();
+  expect(mocks.plugin.commitTransaction).not.toHaveBeenCalled();
+});
+
+it('normalizes iOS ios_columns query payloads before returning rows', async () => {
+  const { getPreferences } = await import('./database');
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      { ios_columns: ['key', 'value'] },
+      { value: 'eink', key: 'uiTheme', extra: 'ignored' },
+    ],
+  });
+
+  const values = await getPreferences(['uiTheme']);
+
+  expect(values.get('uiTheme')).toBe('eink');
+});
+
+it('keeps LATEST_SCHEMA_VERSION aligned with the final schema migration', async () => {
+  const [{ LATEST_SCHEMA_VERSION }, { migrations }] = await Promise.all([
+    import('./database'),
+    import('./schema'),
+  ]);
+
+  expect(LATEST_SCHEMA_VERSION).toBe(migrations.at(-1)?.version);
 });

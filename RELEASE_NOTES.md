@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Preload reader in parallel, trim bundles, and enable Android R8
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops

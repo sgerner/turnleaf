@@ -68,13 +68,64 @@ function kavitaDevProxy(): Plugin {
   };
 }
 
+const EPUBJS_XMLDOM_STUB_ID = '\0turnleaf:epubjs-xmldom-stub';
+const EPUBJS_EMPTY_STUB_ID = '\0turnleaf:epubjs-empty-stub';
+
+function epubjsDeadModuleStubs(): Plugin {
+  return {
+    name: 'turnleaf-epubjs-dead-module-stubs',
+    enforce: 'pre',
+    resolveId(source, importer) {
+      if (source === '@xmldom/xmldom') return EPUBJS_XMLDOM_STUB_ID;
+      if (source === 'localforage') return EPUBJS_EMPTY_STUB_ID;
+
+      const normalizedSource = source.replaceAll('\\', '/');
+      if (
+        normalizedSource === 'epubjs/src/store' ||
+        normalizedSource === 'epubjs/src/store.js' ||
+        normalizedSource.startsWith('epubjs/src/managers/continuous')
+      ) {
+        return EPUBJS_EMPTY_STUB_ID;
+      }
+
+      const normalizedImporter = importer?.replaceAll('\\', '/') ?? '';
+      if (!normalizedImporter.includes('/node_modules/epubjs/')) return null;
+
+      if (normalizedSource === './store' || normalizedSource === './store.js') {
+        return EPUBJS_EMPTY_STUB_ID;
+      }
+      if (
+        normalizedSource === './managers/continuous' ||
+        normalizedSource === './managers/continuous/index' ||
+        normalizedSource === './managers/continuous/index.js'
+      ) {
+        return EPUBJS_EMPTY_STUB_ID;
+      }
+      return null;
+    },
+    load(id) {
+      if (id === EPUBJS_XMLDOM_STUB_ID) {
+        return 'export const DOMParser = globalThis.DOMParser;\nexport const XMLSerializer = globalThis.XMLSerializer;\n';
+      }
+      if (id === EPUBJS_EMPTY_STUB_ID) {
+        return 'export default function UnusedEpubModule() {}\n';
+      }
+      return null;
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [tailwindcss(), svelte(), kavitaDevProxy()],
+  plugins: [epubjsDeadModuleStubs(), tailwindcss(), svelte(), kavitaDevProxy()],
+  ...(process.env.VITEST ? { resolve: { conditions: ['browser'] } } : {}),
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },
   build: {
     target: 'es2022',
     sourcemap: false,
+    modulePreload: {
+      polyfill: false,
+    },
   },
 });
