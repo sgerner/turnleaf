@@ -33,7 +33,7 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
 
 vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 
-import { ReaderSession } from './session';
+import { ReaderSession, resolveReaderKeyboardAction } from './session';
 
 describe('ReaderSession keyboard navigation', () => {
   beforeEach(() => {
@@ -63,6 +63,49 @@ describe('ReaderSession keyboard navigation', () => {
     session.destroy();
     expect(mockRendition.off).toHaveBeenCalledWith('keydown', onKeyboardNavigation);
     expect(mockBook.destroy).toHaveBeenCalledOnce();
+  });
+
+  it('ignores Shift+Arrow selection keys and open panels while clearing selection on Escape', () => {
+    expect(resolveReaderKeyboardAction(new KeyboardEvent('keydown', { key: 'ArrowRight' }))).toBe(
+      'next',
+    );
+    expect(resolveReaderKeyboardAction(new KeyboardEvent('keydown', { key: 'ArrowLeft' }))).toBe(
+      'previous',
+    );
+    expect(
+      resolveReaderKeyboardAction(
+        new KeyboardEvent('keydown', { key: 'ArrowRight', shiftKey: true }),
+      ),
+    ).toBeNull();
+    expect(
+      resolveReaderKeyboardAction(
+        new KeyboardEvent('keydown', { key: 'ArrowLeft', shiftKey: true }),
+      ),
+    ).toBeNull();
+    expect(
+      resolveReaderKeyboardAction(new KeyboardEvent('keydown', { key: ' ', shiftKey: true })),
+    ).toBeNull();
+    expect(
+      resolveReaderKeyboardAction(new KeyboardEvent('keydown', { key: 'ArrowRight' }), {
+        hasOpenPanel: true,
+      }),
+    ).toBeNull();
+    expect(
+      resolveReaderKeyboardAction(new KeyboardEvent('keydown', { key: 'Escape' }), {
+        hasOpenPanel: true,
+        hasSelection: true,
+      }),
+    ).toBeNull();
+
+    const actionButton = document.createElement('button');
+    document.body.append(actionButton);
+    const escapeOnButton = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true });
+    Object.defineProperty(escapeOnButton, 'target', { value: actionButton });
+    expect(resolveReaderKeyboardAction(escapeOnButton, { hasSelection: true })).toBe(
+      'clear-selection',
+    );
+    expect(resolveReaderKeyboardAction(escapeOnButton, { hasSelection: false })).toBeNull();
+    actionButton.remove();
   });
 
   it('turns pages on ordinary content clicks while leaving links and text selection available', async () => {
@@ -130,6 +173,167 @@ describe('ReaderSession keyboard navigation', () => {
 
     session.destroy();
     text.remove();
+  });
+
+  it('keeps the selected passage active when Tab blurs the EPUB iframe', async () => {
+    const session = new ReaderSession('book.epub');
+    const onSelection = vi.fn();
+    const viewport = document.createElement('div');
+    const frame = document.createElement('iframe');
+    const highlightButton = document.createElement('button');
+    viewport.append(frame);
+    document.body.append(viewport, highlightButton);
+
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+      onSelection,
+    );
+
+    const registerSelection = mockRendition.hooks.content.register.mock.calls[1]?.[0];
+    const doc = document.implementation.createHTMLDocument('chapter');
+    const paragraph = doc.createElement('p');
+    paragraph.textContent = 'Selected with Shift+Arrow';
+    doc.body.append(paragraph);
+
+    let collapsed = false;
+    const contentsWindow = new EventTarget() as Window & EventTarget;
+    Object.defineProperties(contentsWindow, {
+      frameElement: { value: frame },
+      getSelection: {
+        value: () =>
+          collapsed
+            ? { isCollapsed: true, rangeCount: 0, toString: () => '' }
+            : {
+                isCollapsed: false,
+                rangeCount: 1,
+                toString: () => 'Selected with Shift+Arrow',
+                getRangeAt: () => {
+                  const range = doc.createRange();
+                  range.selectNodeContents(paragraph);
+                  return range;
+                },
+              },
+      },
+    });
+
+    registerSelection({
+      window: contentsWindow,
+      document: doc,
+      cfiFromRange: () => 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:25)',
+    });
+
+    doc.dispatchEvent(new Event('selectionchange'));
+    expect(onSelection).toHaveBeenLastCalledWith({
+      cfi: 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:25)',
+      text: 'Selected with Shift+Arrow',
+    });
+
+    doc.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }));
+    highlightButton.focus();
+    contentsWindow.dispatchEvent(new Event('blur'));
+    collapsed = true;
+    doc.dispatchEvent(new Event('selectionchange'));
+
+    expect(onSelection).toHaveBeenCalledTimes(1);
+
+    doc.dispatchEvent(new Event('mousedown'));
+    doc.dispatchEvent(new Event('selectionchange'));
+    expect(onSelection).toHaveBeenLastCalledWith(null);
+
+    session.destroy();
+    viewport.remove();
+    highlightButton.remove();
+  });
+
+  it('lists visible block passages and falls back to the current location CFI range for bare text', async () => {
+    const session = new ReaderSession('book.epub');
+    const viewport = document.createElement('div');
+    const container = document.createElement('div');
+    container.className = 'epub-container';
+    const frame = document.createElement('iframe');
+    container.append(frame);
+    viewport.append(container);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
+    vi.spyOn(container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 900, 400));
+
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+    const prepareContents = mockRendition.hooks.content.register.mock.calls[0]?.[0];
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+
+    const doc = document.implementation.createHTMLDocument('chapter');
+    const quote = doc.createElement('blockquote');
+    const first = doc.createElement('p');
+    first.textContent = 'Visible opening passage';
+    vi.spyOn(first, 'getClientRects').mockReturnValue([
+      new DOMRect(24, 20, 240, 40),
+    ] as unknown as DOMRectList);
+    quote.append(first);
+
+    const second = doc.createElement('p');
+    second.textContent = 'Next column passage';
+    vi.spyOn(second, 'getClientRects').mockReturnValue([
+      new DOMRect(340, 20, 240, 40),
+    ] as unknown as DOMRectList);
+    doc.body.append(quote, second);
+
+    await prepareContents({
+      window: { frameElement: frame },
+      document: doc,
+      sectionIndex: 0,
+      cfiFromRange: (range: Range) => `cfi:${range.toString().trim()}`,
+    });
+
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/2/1:0)',
+        displayed: { page: 1, total: 3 },
+      },
+      end: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/2/1:23)',
+        displayed: { page: 1, total: 3 },
+      },
+    });
+
+    expect(session.getVisiblePassages()).toEqual([
+      { cfi: 'cfi:Visible opening passage', text: 'Visible opening passage' },
+    ]);
+
+    // Bare text inside <div> without matching block tags falls back to start.cfi..end.cfi.
+    doc.body.innerHTML = '<div>Bare chapter text without paragraph tags</div>';
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 2, total: 3 },
+      },
+      end: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:40)',
+        displayed: { page: 2, total: 3 },
+      },
+    });
+
+    expect(session.getVisiblePassages()).toEqual([
+      {
+        cfi: 'epubcfi(/6/2!/4/2,/1:0,/1:40)',
+        text: 'Bare chapter text without paragraph tags',
+      },
+    ]);
+
+    session.destroy();
   });
 
   it('indexes the spine once across repeated relocation events', async () => {
