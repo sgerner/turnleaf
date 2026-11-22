@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 export function createCdpClient(socket, { timeoutMs = 5_000 } = {}) {
   let nextId = 0;
   let closed = false;
@@ -100,4 +102,22 @@ export function createCdpClient(socket, { timeoutMs = 5_000 } = {}) {
       socket.close();
     },
   };
+}
+
+// Attaching a CDP session to Android WebView holds a Chromium DevTools display
+// wake lock (FLAG_KEEP_SCREEN_ON), masking the app's own window flags in
+// `dumpsys window` until the debugger socket is closed.
+export async function withoutCdpDebugger(
+  { getClient, setClient, connect, settleDelayMs = 250 },
+  operation,
+) {
+  const current = getClient();
+  if (current) {
+    await current.close();
+    setClient(undefined);
+    if (settleDelayMs > 0) await delay(settleDelayMs);
+  }
+  const result = await operation();
+  setClient(await connect());
+  return result;
 }

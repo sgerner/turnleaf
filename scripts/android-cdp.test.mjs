@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { createCdpClient } from './android-cdp.mjs';
+import { describe, expect, it, vi } from 'vitest';
+import { createCdpClient, withoutCdpDebugger } from './android-cdp.mjs';
 
 class FakeWebSocket extends EventTarget {
   sent = [];
@@ -54,5 +54,63 @@ describe('Android WebView CDP client', () => {
     socket.close();
 
     await expect(evaluation).rejects.toThrow('connection closed');
+  });
+
+  it('detaches the active debugger session during window checks and reconnects afterward', async () => {
+    const events = [];
+    let active = {
+      close: vi.fn(async () => {
+        events.push('closed');
+      }),
+    };
+    const reconnected = { close: vi.fn(async () => {}) };
+
+    const value = await withoutCdpDebugger(
+      {
+        getClient: () => active,
+        setClient: (next) => {
+          active = next;
+          events.push(next ? 'reconnected' : 'cleared');
+        },
+        connect: async () => {
+          events.push('connecting');
+          return reconnected;
+        },
+        settleDelayMs: 0,
+      },
+      async () => {
+        expect(active).toBeUndefined();
+        events.push('checked');
+        return 'window-ok';
+      },
+    );
+
+    expect(value).toBe('window-ok');
+    expect(active).toBe(reconnected);
+    expect(events).toEqual(['closed', 'cleared', 'checked', 'connecting', 'reconnected']);
+  });
+
+  it('keeps the debugger session cleared without reconnecting if the check throws', async () => {
+    let active = { close: vi.fn(async () => {}) };
+    const connect = vi.fn(async () => ({ close: vi.fn() }));
+
+    await expect(
+      withoutCdpDebugger(
+        {
+          getClient: () => active,
+          setClient: (next) => {
+            active = next;
+          },
+          connect,
+          settleDelayMs: 0,
+        },
+        async () => {
+          throw new Error('window check timed out');
+        },
+      ),
+    ).rejects.toThrow('window check timed out');
+
+    expect(active).toBeUndefined();
+    expect(connect).not.toHaveBeenCalled();
   });
 });

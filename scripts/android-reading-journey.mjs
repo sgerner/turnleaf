@@ -15,7 +15,7 @@ import {
   setFontScale,
   setImmersiveModeConfirmations,
 } from './android-adb.mjs';
-import { createCdpClient } from './android-cdp.mjs';
+import { createCdpClient, withoutCdpDebugger } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
 import { resolveDeviceSerial } from './android-device.mjs';
 import { main as smoke } from './android-smoke.mjs';
@@ -24,7 +24,7 @@ const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.deb
 const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
 let deviceSerial;
-const adb = createAdbRunner({ getSerial: () => deviceSerial });
+const adb = createAdbRunner({ getSerial: () => deviceSerial, timeout: 60_000 });
 
 async function waitFor(label, check) {
   const end = Date.now() + 30_000;
@@ -203,6 +203,15 @@ const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).som
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
 
+const revealReaderControls = `(async () => {
+  if (document.querySelector('[data-controls]:not([inert])')) return true;
+  const reveal = document.querySelector('.reader-top-reveal');
+  if (!reveal || reveal.disabled) return false;
+  reveal.click();
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  return Boolean(document.querySelector('[data-controls]:not([inert])'));
+})()`;
+
 let receivedSignal;
 
 function throwIfInterrupted() {
@@ -228,6 +237,20 @@ async function run() {
   let journeyError;
   let cleanupError;
   let journeyPassed = false;
+  const withoutDebugger = (operation) =>
+    withoutCdpDebugger(
+      {
+        getClient: () => web,
+        setClient: (next) => {
+          web = next;
+        },
+        connect: async () => {
+          throwIfInterrupted();
+          return connectWebView();
+        },
+      },
+      operation,
+    );
   try {
     deviceSerial = await resolveDeviceSerial({ emulatorOnly: true });
     throwIfInterrupted();
@@ -267,16 +290,13 @@ async function run() {
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
-    await waitFor('immersive reader window state', async () => {
-      const state = await dumpWindowState(adb, packageName);
-      return state.windowFound && !state.keepScreenOn && state.systemBarsVisible === false;
-    });
-    await waitFor('show reading controls', async () => {
-      if (!(await web.evaluate('Boolean(document.querySelector("[data-controls]"))'))) {
-        await web.evaluate(click('.reader-top-reveal'));
-      }
-      return web.evaluate('Boolean(document.querySelector("[data-controls]"))');
-    });
+    await withoutDebugger(() =>
+      waitFor('immersive reader window state', async () => {
+        const state = await dumpWindowState(adb, packageName);
+        return state.windowFound && !state.keepScreenOn && state.systemBarsVisible === false;
+      }),
+    );
+    await waitFor('show reading controls', () => web.evaluate(revealReaderControls));
     await waitFor('reading appearance panel', async () => {
       if (!(await web.evaluate('Boolean(document.querySelector("#reader-appearance"))'))) {
         await web.evaluate(click('[aria-label="Text, reading appearance"]'));
@@ -289,10 +309,12 @@ async function run() {
     await waitFor('volume buttons toggle', () =>
       web.evaluate(enableReaderCheckbox('Turn pages with volume buttons')),
     );
-    await waitFor('keep-awake flag enabled in dumpsys window', async () => {
-      const state = await dumpWindowState(adb, packageName);
-      return state.windowFound && state.keepScreenOn && state.systemBarsVisible === false;
-    });
+    await withoutDebugger(() =>
+      waitFor('keep-awake flag enabled in dumpsys window', async () => {
+        const state = await dumpWindowState(adb, packageName);
+        return state.windowFound && state.keepScreenOn && state.systemBarsVisible === false;
+      }),
+    );
 
     await sendKeyEvent(adb, KEYCODE_BACK);
     await waitFor('appearance panel dismissed by Android Back', () =>
@@ -329,16 +351,20 @@ async function run() {
     const readerWindowBeforeScale = await dumpWindowState(adb, packageName);
     await setFontScale(adb, '2.0');
     await waitFor('200% Android font scale', async () => (await getFontScale(adb)) === 2);
-    await waitFor('open reader chapter preserved at 200% font scale', async () => {
-      if (!(await web.evaluate(chapter(2)))) return false;
-      const state = await dumpWindowState(adb, packageName);
-      return (
-        state.windowFound &&
-        state.windowToken === readerWindowBeforeScale.windowToken &&
-        state.keepScreenOn &&
-        state.systemBarsVisible === false
-      );
-    });
+    await waitFor('open reader chapter preserved at 200% font scale', () =>
+      web.evaluate(chapter(2)),
+    );
+    await withoutDebugger(() =>
+      waitFor('reader window preserved at 200% font scale', async () => {
+        const state = await dumpWindowState(adb, packageName);
+        return (
+          state.windowFound &&
+          state.windowToken === readerWindowBeforeScale.windowToken &&
+          state.keepScreenOn &&
+          state.systemBarsVisible === false
+        );
+      }),
+    );
 
     await sendKeyEvent(adb, KEYCODE_BACK);
     await waitFor('saved offline progress after single Android Back exit', () =>
@@ -346,10 +372,12 @@ async function run() {
         `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]')) && document.activeElement?.hasAttribute('data-book-open')`,
       ),
     );
-    await waitFor('library window flags and system bars restored at 200% font scale', async () => {
-      const state = await dumpWindowState(adb, packageName);
-      return state.windowFound && !state.keepScreenOn && state.systemBarsVisible === true;
-    });
+    await withoutDebugger(() =>
+      waitFor('library window flags and system bars restored at 200% font scale', async () => {
+        const state = await dumpWindowState(adb, packageName);
+        return state.windowFound && !state.keepScreenOn && state.systemBarsVisible === true;
+      }),
+    );
 
     await web.evaluate(`(() => {
       window.__turnleafJourneyVolumeEvents = 0;
@@ -409,12 +437,9 @@ async function run() {
             progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
         ),
     );
-    await waitFor('show reading controls before two-press Back exit', async () => {
-      if (!(await web.evaluate('Boolean(document.querySelector("[data-controls]"))'))) {
-        await web.evaluate(click('.reader-top-reveal'));
-      }
-      return web.evaluate('Boolean(document.querySelector("[data-controls]"))');
-    });
+    await waitFor('show reading controls before two-press Back exit', () =>
+      web.evaluate(revealReaderControls),
+    );
     await sendKeyEvent(adb, KEYCODE_BACK);
     await waitFor('first Android Back hides reader controls without exiting', async () => {
       if (!(await web.evaluate(chapter(2)))) return false;
@@ -428,10 +453,12 @@ async function run() {
         `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]')) && document.activeElement?.hasAttribute('data-book-open')`,
       ),
     );
-    await waitFor('library window flags restored after reconnect', async () => {
-      const state = await dumpWindowState(adb, packageName);
-      return state.windowFound && !state.keepScreenOn && state.systemBarsVisible === true;
-    });
+    await withoutDebugger(() =>
+      waitFor('library window flags restored after reconnect', async () => {
+        const state = await dumpWindowState(adb, packageName);
+        return state.windowFound && !state.keepScreenOn && state.systemBarsVisible === true;
+      }),
+    );
 
     await waitFor('open library settings', () =>
       web.evaluate(click('[aria-label="Open settings"]')),
