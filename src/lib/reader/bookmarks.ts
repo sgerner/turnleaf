@@ -72,6 +72,10 @@ export function toggleBookmark(
   return [bookmarkLocation(current, savedAt), ...bookmarks].slice(0, MAX_BOOKMARKS);
 }
 
+export function hasCustomBookmarkLabel(bookmark: StoredReaderLocation): boolean {
+  return bookmark.label !== locationLabel(bookmark.percentage, bookmark.href);
+}
+
 export function renameBookmark(
   bookmarks: readonly StoredReaderLocation[],
   id: string,

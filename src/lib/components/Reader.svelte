@@ -35,6 +35,7 @@
     type StoredAnnotation,
   } from '../reader/annotations';
   import {
+    hasCustomBookmarkLabel,
     parseBookmarks,
     parseLocationHistory,
     recordLocation,
@@ -44,12 +45,31 @@
     type StoredReaderLocation,
   } from '../reader/bookmarks';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   type SyncedLocation = {
     xpath: string | null;
     percentage: number | null;
     accept?: () => Promise<void>;
   };
+
+  type ReaderConfirmation =
+    | {
+        kind: 'sync';
+        progress: SyncedLocation;
+        opener: HTMLElement | null;
+      }
+    | {
+        kind: 'delete-annotation';
+        annotation: StoredAnnotation;
+        opener: HTMLElement | null;
+      }
+    | {
+        kind: 'delete-bookmark';
+        bookmark: StoredReaderLocation;
+        source: 'list' | 'current';
+        opener: HTMLElement | null;
+      };
 
   let {
     bookUrl,
@@ -94,13 +114,11 @@
   let bookmarksPanel = $state<HTMLElement | null>(null);
   let annotationsPanel = $state<HTMLElement | null>(null);
   let searchPanel = $state<HTMLElement | null>(null);
-  let syncConfirmationPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
   let bookmarksOpener: HTMLElement | null = null;
   let annotationsOpener: HTMLElement | null = null;
   let searchOpener: HTMLElement | null = null;
-  let syncConfirmationOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
   let previousDocumentTitle = '';
   let bookmarks = $state<StoredReaderLocation[]>([]);
@@ -126,7 +144,7 @@
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
-  let pendingSyncLocation = $state<SyncedLocation | null>(null);
+  let readerConfirm = $state<ReaderConfirmation | null>(null);
   let error = $state('');
   let startupOpenFailed = $state(false);
   let retryingReader = $state(false);
@@ -353,7 +371,7 @@
       bookmarksVisible ||
       annotationsVisible ||
       searchVisible ||
-      pendingSyncLocation !== null
+      readerConfirm !== null
     );
   }
 
@@ -503,17 +521,21 @@
 
   function openSyncConfirmation(progress: SyncedLocation): void {
     pauseChromeHide();
-    syncConfirmationOpener = activeElement();
-    pendingSyncLocation = progress;
-    focusPanel(() => syncConfirmationPanel);
+    readerConfirm = {
+      kind: 'sync',
+      progress,
+      opener: activeElement(),
+    };
   }
 
-  function closeSyncConfirmation(): void {
-    pendingSyncLocation = null;
-    const opener = syncConfirmationOpener;
-    syncConfirmationOpener = null;
-    restorePanelFocus(opener);
+  function cancelReaderConfirm(): void {
+    readerConfirm = null;
     resumeChromeHide();
+  }
+
+  function previewText(value: string, limit: number): string {
+    const normalized = value.trim().replace(/\s+/g, ' ');
+    return normalized.length > limit ? `${normalized.slice(0, limit - 1).trimEnd()}…` : normalized;
   }
 
   function showFooter(): void {
@@ -631,6 +653,18 @@
 
   function toggleCurrentBookmark(): void {
     if (!location) return;
+    const existing = currentBookmark();
+    if (existing && hasCustomBookmarkLabel(existing)) {
+      pauseChromeHide();
+      selectionMessage = '';
+      readerConfirm = {
+        kind: 'delete-bookmark',
+        bookmark: existing,
+        source: 'current',
+        opener: activeElement(),
+      };
+      return;
+    }
     bookmarks = toggleBookmark(bookmarks, readerLocation(location));
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
     showControls();
@@ -650,10 +684,28 @@
   }
 
   function deleteBookmark(bookmark: StoredReaderLocation): void {
+    pauseChromeHide();
+    selectionMessage = '';
+    readerConfirm = {
+      kind: 'delete-bookmark',
+      bookmark,
+      source: 'list',
+      opener: activeElement(),
+    };
+  }
+
+  function confirmDeleteBookmark(bookmark: StoredReaderLocation, source: 'list' | 'current'): void {
     const index = bookmarks.findIndex((entry) => entry.id === bookmark.id);
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
+    readerConfirm = null;
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    selectionMessage = `Bookmark “${bookmark.label}” deleted.`;
+    resumeChromeHide();
+    if (source === 'current') {
+      focusReaderTarget(bookmarksPanel, 'bookmark-current');
+      return;
+    }
     const next = bookmarks[Math.min(Math.max(index, 0), bookmarks.length - 1)];
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
@@ -682,10 +734,27 @@
   }
 
   function deleteAnnotation(annotation: StoredAnnotation): void {
+    pauseChromeHide();
+    selectionMessage = '';
+    readerConfirm = {
+      kind: 'delete-annotation',
+      annotation,
+      opener: activeElement(),
+    };
+  }
+
+  function confirmDeleteAnnotation(annotation: StoredAnnotation): void {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
+    if (editingAnnotationId === annotation.id) {
+      editingAnnotationId = null;
+      annotationDraft = '';
+    }
+    readerConfirm = null;
     session?.updateHighlights(annotations);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    selectionMessage = annotation.note ? 'Highlight and note deleted.' : 'Highlight deleted.';
+    resumeChromeHide();
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
   }
@@ -875,11 +944,11 @@
     }
   }
 
-  async function confirmSyncLocation(): Promise<void> {
-    const progress = pendingSyncLocation;
+  async function confirmSyncLocation(progress: SyncedLocation): Promise<void> {
     const reader = session;
-    closeSyncConfirmation();
-    if (!progress || !reader) return;
+    readerConfirm = null;
+    resumeChromeHide();
+    if (!reader) return;
     try {
       await progress.accept?.();
       if (destroyed || session !== reader) return;
@@ -952,17 +1021,12 @@
       void turn('next');
       return;
     }
-    if (
-      event.key === 'Escape' &&
-      (settingsVisible ||
-        tocVisible ||
-        bookmarksVisible ||
-        annotationsVisible ||
-        searchVisible ||
-        pendingSyncLocation)
-    ) {
+    if (event.key === 'Escape' && hasOpenReaderPanel()) {
       event.preventDefault();
-      if (pendingSyncLocation) closeSyncConfirmation();
+      if (readerConfirm) {
+        cancelReaderConfirm();
+        return;
+      }
       closeSettings();
       closeToc();
       closeBookmarks();
@@ -973,8 +1037,12 @@
   }
 
   function handleBackButton(): boolean {
-    if (pendingSyncLocation) closeSyncConfirmation();
-    else if (settingsVisible) closeSettings();
+    if (readerConfirm) {
+      cancelReaderConfirm();
+      if (!hasOpenReaderPanel()) showControls();
+      return true;
+    }
+    if (settingsVisible) closeSettings();
     else if (tocVisible) closeToc();
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
@@ -1039,18 +1107,7 @@
     Press Escape to close an open reader panel.
   </p>
 
-  <nav
-    class="tap-zones"
-    aria-label="Page navigation"
-    inert={Boolean(
-      settingsVisible ||
-      tocVisible ||
-      bookmarksVisible ||
-      annotationsVisible ||
-      searchVisible ||
-      pendingSyncLocation,
-    )}
-  >
+  <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
     <button
       type="button"
       aria-label="Previous page"
@@ -1176,14 +1233,7 @@
       <header
         bind:this={readerToolbar}
         class="reader-bar reader-top"
-        inert={Boolean(
-          settingsVisible ||
-          tocVisible ||
-          bookmarksVisible ||
-          annotationsVisible ||
-          searchVisible ||
-          pendingSyncLocation,
-        )}
+        inert={hasOpenReaderPanel()}
         transition:fly={{ y: -8, duration: 140 }}
       >
         <div class="reader-toolbar">
@@ -1310,59 +1360,24 @@
         </div>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || pendingSyncLocation}
+      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
+          inert={readerConfirm !== null}
           aria-label="Close reader panel"
           onclick={() =>
-            pendingSyncLocation
-              ? closeSyncConfirmation()
-              : settingsVisible
-                ? closeSettings()
-                : tocVisible
-                  ? closeToc()
-                  : bookmarksVisible
-                    ? closeBookmarks()
-                    : annotationsVisible
-                      ? closeAnnotations()
-                      : closeSearch()}
+            settingsVisible
+              ? closeSettings()
+              : tocVisible
+                ? closeToc()
+                : bookmarksVisible
+                  ? closeBookmarks()
+                  : annotationsVisible
+                    ? closeAnnotations()
+                    : closeSearch()}
         ></button>
-      {/if}
-
-      {#if pendingSyncLocation}
-        <div
-          bind:this={syncConfirmationPanel}
-          class="reader-settings card preset-filled-surface-50-950 relative max-w-sm"
-          role="alertdialog"
-          aria-modal="true"
-          aria-labelledby="reader-sync-confirm-title"
-          aria-describedby="reader-sync-confirm-description"
-          tabindex="-1"
-          onkeydown={(event) =>
-            trapModalKeydown(event, syncConfirmationPanel!, closeSyncConfirmation)}
-          transition:fly={{ y: 12, duration: 150 }}
-        >
-          <h2 id="reader-sync-confirm-title" class="font-serif text-xl">
-            Move to Kavita’s latest position?
-          </h2>
-          <p id="reader-sync-confirm-description" class="mt-3 text-sm text-surface-700-300">
-            Kavita has a different reading position saved. Move this reader there?
-          </p>
-          <div class="mt-5 flex flex-wrap justify-end gap-2">
-            <button class="btn preset-tonal-surface" type="button" onclick={closeSyncConfirmation}>
-              Stay here
-            </button>
-            <button
-              class="btn preset-filled-primary-700-300"
-              type="button"
-              onclick={() => void confirmSyncLocation()}
-            >
-              Go to latest position
-            </button>
-          </div>
-        </div>
       {/if}
 
       {#if settingsVisible}
@@ -1374,6 +1389,7 @@
           aria-modal="true"
           aria-labelledby="reader-appearance-title"
           tabindex="-1"
+          inert={readerConfirm !== null}
           onkeydown={(event) => trapModalKeydown(event, settingsPanel!, closeSettings)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -1565,6 +1581,7 @@
           aria-modal="true"
           aria-labelledby="reader-contents-title"
           tabindex="-1"
+          inert={readerConfirm !== null}
           onkeydown={(event) => trapModalKeydown(event, tocPanel!, closeToc)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -1629,6 +1646,7 @@
           aria-modal="true"
           aria-labelledby="reader-search-title"
           tabindex="-1"
+          inert={readerConfirm !== null}
           onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -1710,6 +1728,7 @@
           aria-modal="true"
           aria-labelledby="reader-bookmarks-title"
           tabindex="-1"
+          inert={readerConfirm !== null}
           onkeydown={(event) => trapModalKeydown(event, bookmarksPanel!, closeBookmarks)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -1850,6 +1869,7 @@
           aria-modal="true"
           aria-labelledby="reader-annotations-title"
           tabindex="-1"
+          inert={readerConfirm !== null}
           onkeydown={(event) => trapModalKeydown(event, annotationsPanel!, closeAnnotations)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -2019,7 +2039,11 @@
   {/if}
 
   {#if footerVisible}
-    <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
+    <footer
+      class="reader-bar reader-bottom"
+      inert={readerConfirm !== null}
+      transition:fly={{ y: 8, duration: 140 }}
+    >
       <span class="truncate text-xs">{currentSectionLabel()}</span>
       <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
     </footer>
@@ -2028,6 +2052,7 @@
   <button
     class="reader-progress-reveal btn btn-sm preset-tonal-surface"
     type="button"
+    inert={readerConfirm !== null}
     aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
     aria-pressed={footerVisible}
     title={footerVisible ? 'Hide reading details' : 'Show reading details'}
@@ -2039,11 +2064,63 @@
   <div
     class="reader-bottom-reveal"
     aria-hidden="true"
+    inert={readerConfirm !== null}
     onpointerdown={handleBottomSwipeStart}
     onpointermove={handleBottomSwipeMove}
     onpointerup={handleBottomSwipeEnd}
     onpointercancel={handleBottomSwipeEnd}
   ></div>
+
+  {#if readerConfirm}
+    {#if readerConfirm.kind === 'sync'}
+      {@const syncProgress = readerConfirm.progress}
+      <ConfirmDialog
+        title="Move to Kavita’s latest position?"
+        description="Kavita has a different reading position saved. Move this reader there?"
+        cancelLabel="Stay here"
+        confirmLabel="Go to latest position"
+        tone="primary"
+        opener={readerConfirm.opener}
+        restoreFocusOnConfirm={true}
+        onCancel={cancelReaderConfirm}
+        onConfirm={() => confirmSyncLocation(syncProgress)}
+      />
+    {:else if readerConfirm.kind === 'delete-annotation'}
+      {@const targetAnnotation = readerConfirm.annotation}
+      <ConfirmDialog
+        title={targetAnnotation.note ? 'Delete highlight and note?' : 'Delete highlight?'}
+        description={targetAnnotation.note
+          ? 'This permanently deletes your saved highlight and note from this device.'
+          : 'This permanently deletes your saved highlight from this device.'}
+        confirmLabel="Delete highlight"
+        opener={readerConfirm.opener}
+        onCancel={cancelReaderConfirm}
+        onConfirm={() => confirmDeleteAnnotation(targetAnnotation)}
+      >
+        <blockquote
+          class="rounded-md preset-tonal-surface p-2.5 text-xs italic text-surface-950-50"
+        >
+          “{previewText(targetAnnotation.excerpt, 180)}”
+        </blockquote>
+        {#if targetAnnotation.note}
+          <p class="rounded-md preset-tonal-surface p-2.5 text-xs text-surface-800-200">
+            Note: {previewText(targetAnnotation.note, 220)}
+          </p>
+        {/if}
+      </ConfirmDialog>
+    {:else}
+      {@const targetBookmark = readerConfirm.bookmark}
+      {@const targetSource = readerConfirm.source}
+      <ConfirmDialog
+        title="Delete bookmark?"
+        description={`Delete bookmark “${previewText(targetBookmark.label, 120)}” from this device? This cannot be undone.`}
+        confirmLabel="Delete bookmark"
+        opener={readerConfirm.opener}
+        onCancel={cancelReaderConfirm}
+        onConfirm={() => confirmDeleteBookmark(targetBookmark, targetSource)}
+      />
+    {/if}
+  {/if}
 </main>
 
 <style>

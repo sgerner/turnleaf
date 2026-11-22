@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  hasCustomBookmarkLabel,
   parseBookmarks,
   recordLocation,
   removeBookmark,
@@ -13,8 +14,10 @@ describe('reader bookmarks and history', () => {
   it('toggles a CFI bookmark and preserves a custom name', () => {
     const added = toggleBookmark([], location, '2026-01-01T00:00:00.000Z');
     expect(added).toHaveLength(1);
+    expect(hasCustomBookmarkLabel(added[0]!)).toBe(false);
     const renamed = renameBookmark(added, added[0]!.id, 'Chapter one');
     expect(renamed[0]?.label).toBe('Chapter one');
+    expect(hasCustomBookmarkLabel(renamed[0]!)).toBe(true);
     expect(toggleBookmark(renamed, location)).toEqual([]);
   });
 

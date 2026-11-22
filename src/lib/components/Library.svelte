@@ -50,6 +50,7 @@
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
@@ -230,9 +231,31 @@
   let showReplacementKey = $state(false);
   let settingsError = $state('');
   let diagnosticsMessage = $state('');
+  type LibraryConfirmation =
+    | {
+        kind: 'mark-done';
+        book: BookRecord;
+        opener: HTMLElement | null;
+      }
+    | {
+        kind: 'remove-book';
+        book: BookRecord;
+        opener: HTMLElement | null;
+      }
+    | {
+        kind: 'remove-all-downloads';
+        count: number;
+        unavailableCount: number;
+        opener: HTMLElement | null;
+      }
+    | {
+        kind: 'delete-server';
+        opener: HTMLElement | null;
+      };
+
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
-  let confirmDeleteServer = $state(false);
+  let libraryConfirm = $state<LibraryConfirmation | null>(null);
   let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
   let actionMenuDialog = $state<HTMLElement | null>(null);
@@ -566,7 +589,8 @@
       await registerListener(
         await App.addListener('backButton', () => {
           if (destroyed) return;
-          if (conflict) closeConflict();
+          if (libraryConfirm) cancelLibraryConfirm();
+          else if (conflict) closeConflict();
           else if (actionMenuBook) closeMenu();
           else if (reading) {
             if (readerBackHandler?.()) return;
@@ -949,9 +973,33 @@
     }
   }
 
-  async function remove(book: BookRecord): Promise<boolean> {
+  function cancelLibraryConfirm(): void {
+    if (deletingServer) return;
+    libraryConfirm = null;
+  }
+
+  function markDoneDescription(book: BookRecord): string {
+    const currentPercent = Math.round(progressOf(book));
+    const progressDetail =
+      currentPercent > 0 && currentPercent < 100
+        ? `This replaces your saved reading position (${currentPercent}% complete) with 100% completion and syncs 100% to Kavita.`
+        : 'This overwrites any saved reading position with 100% completion and syncs 100% to Kavita.';
+    return hideCompleted
+      ? `${progressDetail} Hide completed is active, so this book will be hidden from the current library view.`
+      : `${progressDetail} Hide completed is off, so this book will remain visible in your library.`;
+  }
+
+  async function remove(book: BookRecord, confirmed = false): Promise<boolean> {
     if (downloadingBookId || cleanupInProgress) {
       message = 'Wait for the current download or cleanup to finish before removing a book.';
+      return false;
+    }
+    if (book.remoteAvailable === false && !confirmed) {
+      libraryConfirm = {
+        kind: 'remove-book',
+        book,
+        opener: activeElement(),
+      };
       return false;
     }
     let fileCleared = false;
@@ -983,6 +1031,17 @@
         : item,
     );
     return true;
+  }
+
+  async function removeFromMenu(book: BookRecord, confirmed = false): Promise<void> {
+    if (book.remoteAvailable === false && !confirmed) {
+      void remove(book, false);
+      return;
+    }
+    const removed = await remove(book, true);
+    if (removed) message = `${book.title} removed from this device.`;
+    libraryConfirm = null;
+    closeMenu();
   }
 
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
@@ -1215,16 +1274,24 @@
     }
   }
 
-  async function markDone(book: BookRecord): Promise<void> {
+  async function markDone(book: BookRecord, confirmed = false): Promise<void> {
+    if (!confirmed) {
+      libraryConfirm = {
+        kind: 'mark-done',
+        book,
+        opener: activeElement(),
+      };
+      return;
+    }
     const readingState = await getReadingState(book.id);
     await markBookCompleted(book, readingState);
-    const savedBook = books.find((item) => item.id === book.id);
-    if (savedBook) {
-      savedBook.pagesRead = book.pages;
-      savedBook.lastReadAt = new Date().toISOString();
-    }
+    const now = new Date().toISOString();
+    books = books.map((item) =>
+      item.id === book.id ? { ...item, pagesRead: book.pages, lastReadAt: now } : item,
+    );
     void syncProgress(false);
     message = `${book.title} marked as read.`;
+    libraryConfirm = null;
     closeMenu();
   }
 
@@ -1424,19 +1491,27 @@
     diagnosticsMessage = 'Diagnostics cleared.';
   }
 
+  function requestRemoveAllDownloads(): void {
+    const candidates = books.filter((item) => item.downloadPath);
+    if (!candidates.length || downloadingBookId || cleanupInProgress) return;
+    const unavailableCount = candidates.filter((item) => item.remoteAvailable === false).length;
+    libraryConfirm = {
+      kind: 'remove-all-downloads',
+      count: candidates.length,
+      unavailableCount,
+      opener: activeElement(),
+    };
+  }
+
   async function removeAllDownloads(): Promise<void> {
     const candidates = books.filter((item) => item.downloadPath);
-    if (
-      !candidates.length ||
-      downloadingBookId ||
-      !window.confirm(
-        `Remove ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'} from this device?`,
-      )
-    )
+    if (!candidates.length || downloadingBookId || cleanupInProgress) {
+      libraryConfirm = null;
       return;
+    }
     const failed: string[] = [];
     for (const book of candidates) {
-      if (!(await remove(book))) failed.push(book.title);
+      if (!(await remove(book, true))) failed.push(book.title);
     }
     if (failed.length === 0) {
       message = candidates.length
@@ -1447,6 +1522,7 @@
       const names = failed.slice(0, 2).join(', ');
       message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
     }
+    libraryConfirm = null;
     closeSettings();
   }
 
@@ -1537,10 +1613,11 @@
   }
 
   async function deleteServer(): Promise<void> {
+    const opener = libraryConfirm?.kind === 'delete-server' ? libraryConfirm.opener : null;
     settingsError = '';
     deletingServer = true;
     try {
-      for (const book of books.filter((item) => item.downloadPath)) await remove(book);
+      for (const book of books.filter((item) => item.downloadPath)) await remove(book, true);
       cancelCoverLoading();
       await clearCoverCache().catch(() => {});
       clearCovers();
@@ -1549,6 +1626,7 @@
         credentialCleanupComplete = true;
       }
       await removeServer(server.id);
+      libraryConfirm = null;
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
       closeSettings();
@@ -1558,9 +1636,10 @@
         : cause instanceof Error
           ? `Could not remove the server safely: ${cause.message} The connection was left in place; retry Delete server.`
           : 'Could not remove the server safely. The connection was left in place; retry Delete server.';
+      libraryConfirm = null;
+      void tick().then(() => restoreFocus(opener));
     } finally {
       deletingServer = false;
-      confirmDeleteServer = false;
     }
   }
 </script>
@@ -1597,7 +1676,7 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
-    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
+    inert={Boolean(actionMenuBook || conflict || settingsVisible || libraryConfirm)}
   >
     <a
       href="#library-results"
@@ -2329,6 +2408,7 @@
   <div
     class="fixed inset-0 z-40 grid place-items-center bg-black/45 p-4"
     role="presentation"
+    inert={libraryConfirm !== null}
     transition:fade
     onclick={(event) => event.target === event.currentTarget && closeMenu()}
   >
@@ -2423,9 +2503,7 @@
           class="btn preset-tonal-tertiary justify-start"
           type="button"
           onclick={() => {
-            const book = actionMenuBook;
-            closeMenu();
-            if (book) void markDone(book);
+            if (actionMenuBook) void markDone(actionMenuBook);
           }}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -2438,9 +2516,7 @@
             class="btn preset-outlined-error-500 justify-start"
             type="button"
             onclick={() => {
-              const book = actionMenuBook;
-              closeMenu();
-              if (book) void remove(book);
+              if (actionMenuBook) void removeFromMenu(actionMenuBook);
             }}
           >
             <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -2461,6 +2537,7 @@
   <div
     class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-5"
     role="presentation"
+    inert={libraryConfirm !== null}
     transition:fade
     onclick={(event) => event.target === event.currentTarget && closeConflict()}
   >
@@ -2542,6 +2619,7 @@
   <div
     class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
     role="presentation"
+    inert={libraryConfirm !== null}
     transition:fade
     onclick={(event) => event.target === event.currentTarget && closeSettings()}
   >
@@ -2763,7 +2841,12 @@
           <button
             class="btn preset-tonal-error"
             type="button"
-            onclick={() => (confirmDeleteServer = true)}
+            onclick={() => {
+              libraryConfirm = {
+                kind: 'delete-server',
+                opener: activeElement(),
+              };
+            }}
             disabled={deletingServer}
           >
             Delete server
@@ -2787,7 +2870,7 @@
             class="btn preset-tonal-error"
             type="button"
             disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-            onclick={removeAllDownloads}>Remove all downloaded books</button
+            onclick={requestRemoveAllDownloads}>Remove all downloaded books</button
           >
         </div>
         <dl class="mt-4 text-sm">
@@ -2855,35 +2938,56 @@
           <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
         {/if}
       </section>
-      {#if confirmDeleteServer}
-        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-          <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
-          </p>
-          <div class="mt-4 flex gap-2">
-            <button
-              class="btn preset-outlined-error-500"
-              type="button"
-              onclick={() => void deleteServer()}
-              disabled={deletingServer}
-            >
-              {deletingServer ? 'Deleting...' : 'Delete now'}
-            </button>
-            <button
-              class="btn preset-tonal-surface"
-              type="button"
-              onclick={() => (confirmDeleteServer = false)}
-              disabled={deletingServer}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      {/if}
     </div>
   </div>
+{/if}
+
+{#if libraryConfirm}
+  {#if libraryConfirm.kind === 'mark-done'}
+    {@const targetBook = libraryConfirm.book}
+    <ConfirmDialog
+      title={`Mark “${targetBook.title}” as read?`}
+      description={markDoneDescription(targetBook)}
+      confirmLabel="Mark as read"
+      opener={libraryConfirm.opener}
+      onCancel={cancelLibraryConfirm}
+      onConfirm={() => markDone(targetBook, true)}
+    />
+  {:else if libraryConfirm.kind === 'remove-book'}
+    {@const targetBook = libraryConfirm.book}
+    <ConfirmDialog
+      title={`Remove “${targetBook.title}” permanently?`}
+      description="Kavita no longer serves this book, so Turnleaf cannot re-download this EPUB. Removing the sole local copy permanently removes this book from your library."
+      confirmLabel="Remove permanently"
+      opener={libraryConfirm.opener}
+      onCancel={cancelLibraryConfirm}
+      onConfirm={() => removeFromMenu(targetBook, true)}
+    />
+  {:else if libraryConfirm.kind === 'remove-all-downloads'}
+    {@const totalCount = libraryConfirm.count}
+    {@const missingOnServer = libraryConfirm.unavailableCount}
+    <ConfirmDialog
+      title={`Remove ${totalCount} downloaded book${totalCount === 1 ? '' : 's'}?`}
+      description={missingOnServer > 0
+        ? `This deletes ${totalCount} local EPUB file${totalCount === 1 ? '' : 's'} from this device. ${missingOnServer === 1 ? '1 book is' : `${missingOnServer} books are`} no longer available on Kavita and will be permanently removed from your library.`
+        : `This deletes ${totalCount} local EPUB file${totalCount === 1 ? '' : 's'} from this device. Your reading progress stays saved and Kavita is not changed.`}
+      confirmLabel="Remove downloads"
+      opener={libraryConfirm.opener}
+      onCancel={cancelLibraryConfirm}
+      onConfirm={removeAllDownloads}
+    />
+  {:else}
+    <ConfirmDialog
+      title="Delete this server?"
+      description="This removes the server connection, downloaded books, cached covers, and local progress from this device."
+      confirmLabel="Delete now"
+      busyLabel="Deleting..."
+      busy={deletingServer}
+      opener={libraryConfirm.opener}
+      onCancel={cancelLibraryConfirm}
+      onConfirm={deleteServer}
+    />
+  {/if}
 {/if}
 
 <style>
