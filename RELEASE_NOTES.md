@@ -4,6 +4,7 @@
 
 - test: avoid synchronous disk fsync stalls in SQLite progress tests
 - perf: fetch Kavita series pages concurrently using Pagination headers
+- Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
