@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- Resolve XPath targets with valid node CFIs
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
