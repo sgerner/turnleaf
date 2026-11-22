@@ -68,8 +68,9 @@ function kavitaDevProxy(): Plugin {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   plugins: [tailwindcss(), svelte(), kavitaDevProxy()],
+  resolve: mode === 'test' ? { conditions: ['browser'] } : undefined,
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },
@@ -77,4 +78,4 @@ export default defineConfig({
     target: 'es2022',
     sourcemap: false,
   },
-});
+}));
