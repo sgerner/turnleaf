@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix(reader): coordinate startup viewport resizes on Android
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input

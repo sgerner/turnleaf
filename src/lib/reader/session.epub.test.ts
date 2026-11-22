@@ -266,6 +266,103 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('defers viewport resizes while the rendition is opening and flushes once ready', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveStarted!: () => void;
+    mockRendition.started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+
+    try {
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 891));
+      const session = new ReaderSession('book.epub');
+      const openPromise = session.open(
+        viewport,
+        'epubcfi(/6/2!/4/2:0)',
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      resolveStarted();
+      await openPromise;
+
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(412, 915);
+      session.destroy();
+    } finally {
+      mockRendition.started = Promise.resolve();
+    }
+  });
+
+  it('re-displays the target passage if EPUB.js clears views on resize before location settles', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const internalRendition = mockRendition as typeof mockRendition & {
+      location?: unknown;
+      manager?: { rendered: boolean; stage: object; views: { length: number } };
+    };
+    const views = { length: 1 };
+    internalRendition.location = undefined;
+    internalRendition.manager = { rendered: true, stage: {}, views };
+    mockRendition.resize.mockImplementationOnce(() => {
+      views.length = 0;
+    });
+
+    try {
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 891));
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        viewport,
+        'epubcfi(/6/4!/4/2:0)',
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      mockRendition.display.mockClear();
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+
+      expect(mockRendition.resize).toHaveBeenCalledWith(412, 915);
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2:0)');
+      session.destroy();
+    } finally {
+      delete internalRendition.location;
+      delete internalRendition.manager;
+    }
+  });
+
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const onLocation = vi.fn();
