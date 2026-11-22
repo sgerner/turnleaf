@@ -1,4 +1,4 @@
-import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
+import ePub, { type Book, type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
 import {
   clipReaderSearchExcerpt,
@@ -295,19 +295,43 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
+interface RenditionScrollManager {
+  _onScroll?: (() => void) | undefined;
+  container?: HTMLElement | undefined;
+  ignore?: boolean | undefined;
+  isPaginated?: boolean | undefined;
+  scrollLeft?: number | undefined;
+  layout?:
+    | {
+        delta?: number | undefined;
+        pageWidth?: number | undefined;
+        width?: number | undefined;
+      }
+    | undefined;
+  scrollTo?: ((x: number, y: number, silent?: boolean) => void) | undefined;
+  on?: ((event: string, listener: () => void) => void) | undefined;
+  off?: ((event: string, listener: () => void) => void) | undefined;
+}
+
 export class ReaderSession {
-  private readonly book;
+  private readonly book: Book;
   private readonly stylesheetCache: StylesheetCache = new Map();
   private rendition: Rendition | null = null;
+  private viewportTarget: HTMLElement | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+  private managerScroll: (() => void) | null = null;
+  private targetScroll: ((event: Event) => void) | null = null;
   private current: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
+  private scrollNavigationPending = false;
+  private scrollNavigationStartCfi: string | null = null;
+  private alignedScrollLeft = 0;
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
@@ -322,7 +346,10 @@ export class ReaderSession {
       ) => void)
     | null = null;
 
-  constructor(private readonly bookUrl: string) {
+  constructor(
+    private readonly bookUrl: string,
+    private readonly title = 'Book content',
+  ) {
     this.book = ePub(bookUrl);
   }
 
@@ -341,6 +368,7 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    this.viewportTarget = target;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
@@ -351,7 +379,32 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
-    this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    this.targetScroll = (event: Event) => {
+      const manager = this.getScrollManager();
+      if (typeof manager?._onScroll === 'function') return;
+      const candidate = event.target as HTMLElement | null;
+      const scroller =
+        candidate && typeof candidate.scrollLeft === 'number'
+          ? candidate
+          : (manager?.container ?? target);
+      if (manager?.container && scroller !== manager.container && scroller !== target) return;
+      if (manager?.ignore) {
+        manager.ignore = false;
+        this.alignedScrollLeft = scroller.scrollLeft;
+        return;
+      }
+      this.handleUnignoredScroll(scroller);
+    };
+    target.addEventListener('scroll', this.targetScroll, true);
+    this.attachManagerScroll();
+    this.rendition.hooks.content.register((contents: Contents) => {
+      const frame = contents.window?.frameElement;
+      if (frame) frame.setAttribute('title', this.frameTitle());
+      contents.document?.addEventListener('focusin', (event: FocusEvent) => {
+        this.handleContentFocus(event);
+      });
+      return this.harden(contents);
+    });
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
         const handler = () => {
@@ -376,11 +429,19 @@ export class ReaderSession {
     }
     this.onLocation = onLocation;
     this.relocated = (location) => {
-      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const startCfi =
+        this.userNavigationStartCfi ??
+        this.scrollNavigationStartCfi ??
+        this.current?.start.cfi ??
+        null;
+      const hasPendingNavigation = this.userNavigationPending || this.scrollNavigationPending;
       const isUserNavigation =
-        this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+        hasPendingNavigation && (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const origin = isUserNavigation
+        ? this.userNavigationPending
+          ? this.userNavigationOrigin
+          : 'navigation'
+        : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
@@ -390,6 +451,11 @@ export class ReaderSession {
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
+      this.scrollNavigationPending = false;
+      this.scrollNavigationStartCfi = null;
+      const manager = this.getScrollManager();
+      if (manager?.ignore) manager.ignore = false;
+      if (manager?.container) this.alignedScrollLeft = manager.container.scrollLeft;
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
@@ -430,6 +496,7 @@ export class ReaderSession {
     const restoreGeneration = this.beginLocationOperation(false);
     await this.rendition.started;
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    this.attachManagerScroll();
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -658,6 +725,11 @@ export class ReaderSession {
 
   destroy(): void {
     this.locationGeneration += 1;
+    const manager = this.getScrollManager();
+    if (manager?.off && this.managerScroll) manager.off('scroll', this.managerScroll);
+    if (this.viewportTarget && this.targetScroll) {
+      this.viewportTarget.removeEventListener('scroll', this.targetScroll, true);
+    }
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
@@ -666,20 +738,27 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
+    this.viewportTarget = null;
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
+    this.managerScroll = null;
+    this.targetScroll = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.scrollNavigationPending = false;
+    this.scrollNavigationStartCfi = null;
+    this.alignedScrollLeft = 0;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
     // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
-    const book = this.book as typeof this.book & {
+    const book = this.book as Book & {
       archive?: { urlCache?: Record<string, string> };
       resources?: { replacementUrls?: string[] };
     };
@@ -709,10 +788,110 @@ export class ReaderSession {
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+      this.scrollNavigationPending = false;
+      this.scrollNavigationStartCfi = null;
       this.viewportSize = { width, height };
       this.rendition.resize(width, height);
     });
     this.resizeObserver.observe(target);
+  }
+
+  private frameTitle(): string {
+    return this.title.trim() || 'Book content';
+  }
+
+  private getScrollManager(): RenditionScrollManager | null {
+    return (
+      (this.rendition as (Rendition & { manager?: RenditionScrollManager }) | null)?.manager ?? null
+    );
+  }
+
+  private attachManagerScroll(): void {
+    if (this.managerScroll) return;
+    const manager = this.getScrollManager();
+    if (!manager?.on) return;
+    this.managerScroll = () => {
+      const currentManager = this.getScrollManager();
+      const scroller = currentManager?.container ?? this.viewportTarget;
+      if (scroller) this.handleUnignoredScroll(scroller);
+    };
+    manager.on('scroll', this.managerScroll);
+  }
+
+  private beginScrollNavigation(): void {
+    if (this.userNavigationPending) return;
+    this.scrollNavigationPending = true;
+    this.scrollNavigationStartCfi ??=
+      this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null;
+  }
+
+  private columnDelta(scroller: HTMLElement): number {
+    const manager = this.getScrollManager();
+    if (manager?.isPaginated === false) return 0;
+    const delta =
+      manager?.layout?.delta ||
+      manager?.layout?.pageWidth ||
+      manager?.layout?.width ||
+      scroller.clientWidth ||
+      this.viewportTarget?.getBoundingClientRect().width ||
+      0;
+    return Number.isFinite(delta) && delta > 0 ? delta : 0;
+  }
+
+  private alignScrollOffset(scrollLeft: number, scroller: HTMLElement, delta: number): number {
+    let aligned = Math.round(scrollLeft / delta) * delta;
+    if (scrollLeft > this.alignedScrollLeft && aligned <= this.alignedScrollLeft) {
+      aligned = this.alignedScrollLeft + delta;
+    } else if (scrollLeft < this.alignedScrollLeft && aligned >= this.alignedScrollLeft) {
+      aligned = Math.max(0, this.alignedScrollLeft - delta);
+    }
+    if (scroller.scrollWidth > delta) {
+      aligned = Math.min(aligned, scroller.scrollWidth - delta);
+    }
+    return Math.max(0, aligned);
+  }
+
+  private scrollContainerTo(scroller: HTMLElement, alignedLeft: number): void {
+    const manager = this.getScrollManager();
+    if (manager) manager.scrollLeft = alignedLeft;
+    if (manager?.scrollTo) manager.scrollTo(alignedLeft, scroller.scrollTop, true);
+    else scroller.scrollLeft = alignedLeft;
+    this.alignedScrollLeft = alignedLeft;
+  }
+
+  private handleUnignoredScroll(scroller: HTMLElement): void {
+    const scrollLeft = scroller.scrollLeft;
+    this.beginScrollNavigation();
+    const delta = this.columnDelta(scroller);
+    if (!delta) {
+      this.alignedScrollLeft = scrollLeft;
+      return;
+    }
+    const aligned = this.alignScrollOffset(scrollLeft, scroller, delta);
+    if (aligned !== scrollLeft) this.scrollContainerTo(scroller, aligned);
+    else this.alignedScrollLeft = aligned;
+  }
+
+  private handleContentFocus(event: FocusEvent): void {
+    const node = event.target as Node | null;
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+    const target = node as Element;
+    const tag = target.localName.toLowerCase();
+    if (tag === 'html' || tag === 'body') return;
+    const scroller = this.getScrollManager()?.container ?? this.viewportTarget;
+    if (!scroller) return;
+    const delta = this.columnDelta(scroller);
+    if (!delta) return;
+    const rect = target.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0 && rect.left === 0) return;
+    let columnLeft = Math.max(0, Math.floor(rect.left / delta) * delta);
+    if (scroller.scrollWidth > delta) {
+      columnLeft = Math.min(columnLeft, scroller.scrollWidth - delta);
+    }
+    if (columnLeft === scroller.scrollLeft) return;
+    this.beginScrollNavigation();
+    this.scrollContainerTo(scroller, columnLeft);
+    void this.rendition?.reportLocation?.();
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -812,6 +991,8 @@ export class ReaderSession {
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
+    this.scrollNavigationPending = false;
+    this.scrollNavigationStartCfi = null;
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
@@ -838,6 +1019,8 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
+    this.scrollNavigationPending = false;
+    this.scrollNavigationStartCfi = null;
     void rendition.display(cfi).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });

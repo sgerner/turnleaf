@@ -183,7 +183,7 @@
   });
 
   async function openReaderSession(): Promise<void> {
-    const nextSession = new ReaderSession(bookUrl);
+    const nextSession = new ReaderSession(bookUrl, title);
     session = nextSession;
     await nextSession.open(
       viewport,
@@ -330,8 +330,12 @@
     void tick().then(() => focusFirstElement(getPanel()));
   }
 
-  function restorePanelFocus(opener: HTMLElement | null): void {
-    void tick().then(() => restoreFocus(opener));
+  function restorePanelFocus(opener: HTMLElement | null, fallbackSelector?: string): void {
+    void tick().then(() => {
+      if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
+      else if (fallbackSelector)
+        readerToolbar?.querySelector<HTMLElement>(fallbackSelector)?.focus();
+    });
   }
 
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
@@ -387,7 +391,7 @@
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restorePanelFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-appearance"]');
     resumeChromeHide();
   }
 
@@ -410,7 +414,7 @@
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
-    restorePanelFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-contents"]');
     resumeChromeHide();
   }
 
@@ -434,7 +438,7 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restorePanelFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-bookmarks"]');
     resumeChromeHide();
   }
 
@@ -466,11 +470,7 @@
     exportMessage = '';
     const opener = annotationsOpener;
     annotationsOpener = null;
-    void tick().then(() => {
-      if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
-      else
-        readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-annotations"]')?.focus();
-    });
+    restorePanelFocus(opener, '[aria-controls="reader-annotations"]');
     resumeChromeHide();
   }
 
@@ -497,13 +497,14 @@
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
-    restorePanelFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-search"]');
     resumeChromeHide();
   }
 
   function openSyncConfirmation(progress: SyncedLocation): void {
     pauseChromeHide();
     syncConfirmationOpener = activeElement();
+    controlsVisible = true;
     pendingSyncLocation = progress;
     focusPanel(() => syncConfirmationPanel);
   }
@@ -512,7 +513,7 @@
     pendingSyncLocation = null;
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
-    restorePanelFocus(opener);
+    restorePanelFocus(opener, '[aria-label="Sync latest reading position"]');
     resumeChromeHide();
   }
 
@@ -952,22 +953,14 @@
       void turn('next');
       return;
     }
-    if (
-      event.key === 'Escape' &&
-      (settingsVisible ||
-        tocVisible ||
-        bookmarksVisible ||
-        annotationsVisible ||
-        searchVisible ||
-        pendingSyncLocation)
-    ) {
+    if (event.key === 'Escape' && hasOpenReaderPanel()) {
       event.preventDefault();
       if (pendingSyncLocation) closeSyncConfirmation();
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
+      else if (settingsVisible) closeSettings();
+      else if (tocVisible) closeToc();
+      else if (bookmarksVisible) closeBookmarks();
+      else if (annotationsVisible) closeAnnotations();
+      else if (searchVisible) closeSearch();
       showControls();
     }
   }
@@ -1024,33 +1017,22 @@
 </script>
 
 <main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
-  <h1 class="sr-only">{title}</h1>
-  <div class="reader-viewport" bind:this={viewport}></div>
+  <h1 class="sr-only" inert={hasOpenReaderPanel()}>{title}</h1>
+  <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
-  <p class="sr-only" aria-live="polite" aria-atomic="true">
+  <p class="sr-only" aria-live="polite" aria-atomic="true" inert={hasOpenReaderPanel()}>
     {#if location}
       {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
       {currentProgressLabel()} complete.
     {/if}
   </p>
 
-  <p id="reader-keyboard-help" class="sr-only">
+  <p id="reader-keyboard-help" class="sr-only" inert={hasOpenReaderPanel()}>
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
     Press Escape to close an open reader panel.
   </p>
 
-  <nav
-    class="tap-zones"
-    aria-label="Page navigation"
-    inert={Boolean(
-      settingsVisible ||
-      tocVisible ||
-      bookmarksVisible ||
-      annotationsVisible ||
-      searchVisible ||
-      pendingSyncLocation,
-    )}
-  >
+  <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
     <button
       type="button"
       aria-label="Previous page"
@@ -1086,11 +1068,12 @@
     <p
       class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
       role="status"
+      inert={hasOpenReaderPanel()}
     >
       {readerSyncMessage}
     </p>
   {/if}
-  <p class="sr-only" role="status">{selectionMessage}</p>
+  <p class="sr-only" role="status" inert={hasOpenReaderPanel()}>{selectionMessage}</p>
   {#if selectedText && !hasOpenReaderPanel()}
     <div
       class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
@@ -1125,6 +1108,7 @@
     <div
       class="reader-progress"
       role="progressbar"
+      inert={hasOpenReaderPanel()}
       aria-label="Book reading progress"
       aria-valuemin="0"
       aria-valuemax="100"
@@ -1145,13 +1129,18 @@
       type="button"
       class="reader-top-reveal"
       bind:this={topRevealButton}
+      inert={hasOpenReaderPanel()}
       aria-label="Show reading controls"
       onclick={showControls}
     ></button>
   {/if}
 
   {#if error}
-    <div class="absolute inset-0 grid place-items-center p-8" role="alert">
+    <div
+      class="absolute inset-0 grid place-items-center p-8"
+      role="alert"
+      inert={hasOpenReaderPanel()}
+    >
       <div class="card preset-tonal-error max-w-sm p-6 text-center">
         <p>{error}</p>
         <div class="mt-5 flex flex-wrap justify-center gap-3">
@@ -1176,14 +1165,7 @@
       <header
         bind:this={readerToolbar}
         class="reader-bar reader-top"
-        inert={Boolean(
-          settingsVisible ||
-          tocVisible ||
-          bookmarksVisible ||
-          annotationsVisible ||
-          searchVisible ||
-          pendingSyncLocation,
-        )}
+        inert={hasOpenReaderPanel()}
         transition:fly={{ y: -8, duration: 140 }}
       >
         <div class="reader-toolbar">
@@ -1310,12 +1292,12 @@
         </div>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || pendingSyncLocation}
+      {#if hasOpenReaderPanel()}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
-          aria-label="Close reader panel"
+          aria-hidden="true"
           onclick={() =>
             pendingSyncLocation
               ? closeSyncConfirmation()
@@ -2019,7 +2001,11 @@
   {/if}
 
   {#if footerVisible}
-    <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
+    <footer
+      class="reader-bar reader-bottom"
+      inert={hasOpenReaderPanel()}
+      transition:fly={{ y: 8, duration: 140 }}
+    >
       <span class="truncate text-xs">{currentSectionLabel()}</span>
       <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
     </footer>
@@ -2028,6 +2014,7 @@
   <button
     class="reader-progress-reveal btn btn-sm preset-tonal-surface"
     type="button"
+    inert={hasOpenReaderPanel()}
     aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
     aria-pressed={footerVisible}
     title={footerVisible ? 'Hide reading details' : 'Show reading details'}
@@ -2039,6 +2026,7 @@
   <div
     class="reader-bottom-reveal"
     aria-hidden="true"
+    inert={hasOpenReaderPanel()}
     onpointerdown={handleBottomSwipeStart}
     onpointermove={handleBottomSwipeMove}
     onpointerup={handleBottomSwipeEnd}
@@ -2061,10 +2049,8 @@
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
     --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
-    --reader-safe-bottom: max(
-      1rem,
-      env(safe-area-inset-bottom, 0px),
-      var(--safe-area-inset-bottom, 0px)
+    --reader-safe-bottom: calc(
+      3rem + max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
     );
     --reader-progress-height: 0.25rem;
   }
@@ -2130,10 +2116,17 @@
     top: 0;
     left: 0;
     right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    height: var(--reader-safe-top);
     border: 0;
     background: transparent;
+    pointer-events: none;
     -webkit-tap-highlight-color: transparent;
+  }
+
+  .reader-top-reveal:focus,
+  .reader-top-reveal:focus-visible {
+    height: max(var(--reader-safe-top), 2.75rem);
+    pointer-events: auto;
   }
 
   .reader-bottom-reveal {
@@ -2142,7 +2135,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: var(--reader-safe-bottom);
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
