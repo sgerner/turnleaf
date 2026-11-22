@@ -389,7 +389,6 @@ describe('ReaderSession', () => {
 
       resolveInitialDisplay();
       await openPromise;
-      await Promise.resolve();
 
       expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
         412,

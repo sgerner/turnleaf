@@ -410,7 +410,7 @@ export class ReaderSession {
       this.reportLocation(location, origin, returnTarget);
       if (!this.userNavigationPending && this.pendingViewportSize) {
         this.reflowPending = false;
-        this.flushPendingViewportResize();
+        void this.flushPendingViewportResize();
         return;
       }
       if (this.reflowPending) {
@@ -470,10 +470,14 @@ export class ReaderSession {
       if (!displayed) {
         await this.displayAtGeneration(undefined, restoreGeneration);
       }
+      if (this.rendition && this.isCurrentLocationOperation(restoreGeneration)) {
+        this.readyForResize = true;
+        await this.flushPendingViewportResize();
+      }
     } finally {
       if (this.rendition && this.isCurrentLocationOperation(restoreGeneration)) {
         this.readyForResize = true;
-        this.flushPendingViewportResize();
+        void this.flushPendingViewportResize();
       }
     }
   }
@@ -753,37 +757,37 @@ export class ReaderSession {
         this.pendingViewportSize = { width, height };
         return;
       }
-      this.resizeViewport(width, height);
+      void this.resizeViewport(width, height);
     });
     this.resizeObserver.observe(target);
   }
 
-  private flushPendingViewportResize(): void {
+  private flushPendingViewportResize(): Promise<boolean> | undefined {
     if (
       !this.readyForResize ||
       this.displayInFlight ||
       this.userNavigationPending ||
       !this.pendingViewportSize
     ) {
-      return;
+      return undefined;
     }
     const { width, height } = this.pendingViewportSize;
     this.pendingViewportSize = null;
-    if (!width || !height) return;
-    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-    this.resizeViewport(width, height);
+    if (!width || !height) return undefined;
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return undefined;
+    return this.resizeViewport(width, height);
   }
 
-  private resizeViewport(width: number, height: number): void {
+  private resizeViewport(width: number, height: number): Promise<boolean> | undefined {
     const rendition = this.rendition;
-    if (!rendition) return;
+    if (!rendition) return undefined;
     const internal = rendition as Rendition & {
       resize: (width?: number, height?: number, epubcfi?: string) => void;
       manager?: { rendered?: boolean; stage?: unknown; views?: { length?: number } };
     };
     if (internal.manager && (!internal.manager.rendered || !internal.manager.stage)) {
       this.pendingViewportSize = { width, height };
-      return;
+      return undefined;
     }
     const hadLocation = Boolean(rendition.location?.start?.cfi);
     const cfi =
@@ -796,8 +800,9 @@ export class ReaderSession {
     const viewsAfter = internal.manager?.views?.length ?? 0;
     if (internal.manager && !hadLocation && viewsAfter === 0 && this.hasDisplayedTarget) {
       const generation = this.locationGeneration;
-      void this.displayAtGeneration(fallbackTarget, generation).catch(() => {});
+      return this.displayAtGeneration(fallbackTarget, generation).catch(() => false);
     }
+    return undefined;
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -848,7 +853,7 @@ export class ReaderSession {
       return false;
     } finally {
       this.displayInFlight = false;
-      this.flushPendingViewportResize();
+      void this.flushPendingViewportResize();
     }
   }
 
@@ -888,7 +893,7 @@ export class ReaderSession {
       return false;
     } finally {
       this.displayInFlight = false;
-      this.flushPendingViewportResize();
+      void this.flushPendingViewportResize();
     }
   }
 
@@ -935,7 +940,7 @@ export class ReaderSession {
       throw error;
     } finally {
       this.displayInFlight = false;
-      this.flushPendingViewportResize();
+      void this.flushPendingViewportResize();
     }
   }
 

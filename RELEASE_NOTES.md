@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix(android): prevent cellular fallback flap and retry pending reconnect sync
 - fix(android): prevent offline request leaks and startup viewport resize races
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2

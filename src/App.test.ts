@@ -14,6 +14,9 @@ const {
   getBooksMock,
   getReadingStateMock,
   getSyncStatusMock,
+  getPendingSyncMock,
+  confirmSyncMock,
+  markSyncFailureMock,
   removeServerMock,
   resetLocalDatabaseMock,
   getApiKeyMock,
@@ -32,6 +35,9 @@ const {
   getBooksMock: vi.fn(),
   getReadingStateMock: vi.fn(),
   getSyncStatusMock: vi.fn(),
+  getPendingSyncMock: vi.fn(),
+  confirmSyncMock: vi.fn(),
+  markSyncFailureMock: vi.fn(),
   removeServerMock: vi.fn(),
   resetLocalDatabaseMock: vi.fn(),
   getApiKeyMock: vi.fn(),
@@ -67,6 +73,9 @@ vi.mock('./lib/database/database', () => ({
   getBooks: getBooksMock,
   getReadingState: getReadingStateMock,
   getSyncStatus: getSyncStatusMock,
+  getPendingSync: getPendingSyncMock,
+  confirmSync: confirmSyncMock,
+  markSyncFailure: markSyncFailureMock,
   removeServer: removeServerMock,
   resetLocalDatabase: resetLocalDatabaseMock,
   acceptRemoteProgress: vi.fn(),
@@ -196,6 +205,9 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
       updatedAt: '2026-01-02T00:00:00.000Z',
     });
     getSyncStatusMock.mockResolvedValue({ pendingCount: 0, failedCount: 0 });
+    getPendingSyncMock.mockResolvedValue([]);
+    confirmSyncMock.mockResolvedValue(undefined);
+    markSyncFailureMock.mockResolvedValue(undefined);
     verifyDownloadedEpubMock.mockResolvedValue({
       path: downloadedBook.downloadPath,
       webViewUrl: 'blob:book-1',
@@ -412,6 +424,97 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
       await vi.waitFor(() => {
         expect(libraryFetches).toBe(2);
       });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('retries pending progress uploads across staggered cellular-to-wifi reconnect events without extra catalog refreshes', async () => {
+    const captured: {
+      networkListener: ((status: { connected: boolean; connectionType: string }) => void) | null;
+    } = {
+      networkListener: null,
+    };
+    vi.mocked(Network.getStatus).mockResolvedValue({ connected: false, connectionType: 'none' });
+    vi.mocked(Network.addListener).mockImplementation(async (event, cb) => {
+      if (event === 'networkStatusChange') {
+        captured.networkListener = cb as NonNullable<typeof captured.networkListener>;
+      }
+      return { remove: async () => {} };
+    });
+
+    const pendingItem = {
+      bookId: downloadedBook.id,
+      payload: JSON.stringify({
+        libraryId: 1,
+        seriesId: 10,
+        volumeId: 100,
+        chapterId: 1000,
+        pageNum: 100,
+        bookScrollId: '//body/DocFragment[2]/body/h1[1]',
+      }),
+      revision: 1,
+      updatedAt: '2026-01-03T00:00:00.000Z',
+    };
+    let queued = [pendingItem];
+    getPendingSyncMock.mockImplementation(async () => queued);
+    getSyncStatusMock.mockImplementation(async () => ({
+      pendingCount: queued.length,
+      failedCount: 0,
+    }));
+
+    let libraryFetches = 0;
+    let progressUploads = 0;
+    let failNextUpload = true;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/Series/v2')) {
+        libraryFetches += 1;
+      }
+      if (url.includes('/api/Reader/progress')) {
+        progressUploads += 1;
+        if (failNextUpload) {
+          failNextUpload = false;
+          throw new TypeError('Cellular route still coming up');
+        }
+        queued = [];
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    try {
+      mounted = mount(App, { target });
+
+      await vi.waitFor(() => {
+        expect(captured.networkListener).not.toBeNull();
+      });
+      expect(libraryFetches).toBe(0);
+
+      // Cellular comes up first, upload fails transiently while route settles
+      vi.mocked(Network.getStatus).mockResolvedValue({
+        connected: true,
+        connectionType: 'cellular',
+      });
+      captured.networkListener?.({ connected: true, connectionType: 'cellular' });
+      await vi.waitFor(() => {
+        expect(progressUploads).toBe(1);
+        expect(libraryFetches).toBe(1);
+      });
+
+      // Wi-Fi comes up second while offline is already false; pendingCount > 0 still triggers upload retry
+      vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
+      captured.networkListener?.({ connected: true, connectionType: 'wifi' });
+      await vi.waitFor(() => {
+        expect(progressUploads).toBe(2);
+      });
+      expect(libraryFetches).toBe(1);
     } finally {
       fetchSpy.mockRestore();
     }

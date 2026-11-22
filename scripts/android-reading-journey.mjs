@@ -207,6 +207,7 @@ const revealReaderControls = `(async () => {
   if (document.querySelector('[data-controls]:not([inert])')) return true;
   const reveal = document.querySelector('.reader-top-reveal');
   if (!reveal || reveal.disabled) return false;
+  reveal.focus();
   reveal.click();
   await new Promise((resolve) => requestAnimationFrame(() => resolve()));
   return Boolean(document.querySelector('[data-controls]:not([inert])'));
@@ -330,8 +331,12 @@ async function run() {
     );
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
+    await waitFor(
+      'mobile data disabled',
+      async () => (await adb('shell', 'settings', 'get', 'global', 'mobile_data')) === '0',
+    );
+    await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
       const connected = await web.evaluate(
         'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',

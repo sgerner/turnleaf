@@ -554,10 +554,13 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected && wasOffline)
+          if (connected && wasOffline) {
             void syncProgress(false)
               .then(() => refresh())
               .catch(() => {});
+          } else if (connected && syncStatus.pendingCount > 0) {
+            void syncProgress(false);
+          }
         }),
       ),
     );
@@ -1143,6 +1146,7 @@
       location.percentage,
       location.spineIndex,
     );
+    void refreshSyncStatus();
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
     const savedBook = books.find((item) => item.id === book.id);
@@ -1213,6 +1217,7 @@
 
   async function markDone(book: BookRecord): Promise<void> {
     await markBookCompleted(book);
+    void refreshSyncStatus();
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
