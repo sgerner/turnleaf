@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reserve grid row space for series metadata
 - Cache virtual grid metrics and row heights
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing

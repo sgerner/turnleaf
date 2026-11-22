@@ -10,7 +10,7 @@ export const GRID_ROW_GAP_PX = 32;
 const TITLE_TWO_LINES_REM = 2.75;
 const TEXT_SM_LINE_REM = 1.25;
 const TEXT_XS_LINE_REM = 1;
-const GRID_META_SPACING_REM = 1;
+const GRID_META_SPACING_REM = 1.25;
 const LIST_NON_TEXT_REM = 4.5;
 const LIST_MIN_ROW_REM = 7.25;
 
@@ -56,7 +56,10 @@ export function rowHeightFor(
   const safeColumns = Math.max(1, Math.floor(Number.isFinite(columns) ? columns : 1));
   const cardWidth = Math.max(0, (safeWidth - (safeColumns - 1) * GRID_GAP_PX) / safeColumns);
   const metaHeight =
-    rem * (GRID_META_SPACING_REM + TITLE_TWO_LINES_REM * scale + TEXT_SM_LINE_REM * scaleSquared);
+    rem *
+    (GRID_META_SPACING_REM +
+      TITLE_TWO_LINES_REM * scale +
+      (TEXT_SM_LINE_REM + TEXT_XS_LINE_REM) * scaleSquared);
   return Math.max(1, Math.ceil(cardWidth * 1.5 + metaHeight + GRID_ROW_GAP_PX));
 }
 

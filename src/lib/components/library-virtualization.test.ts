@@ -156,13 +156,13 @@ describe('columnsForWidth, rowHeightFor, and resultsContainerHeight', () => {
 
   it('scales grid row height across 16px and 32px fonts and 1.067 text scaling', () => {
     // 1024px wide, 5 columns -> cardWidth = (1024 - 64) / 5 = 192 -> coverHeight = 288
-    expect(rowHeightFor(1024, 5, 'grid', 16, 1)).toBe(400);
-    expect(rowHeightFor(1024, 5, 'grid', 16, 1.067)).toBe(406);
-    expect(rowHeightFor(1024, 5, 'grid', 32, 1)).toBe(480);
-    expect(rowHeightFor(1024, 5, 'grid', 32, 1.067)).toBe(492);
+    expect(rowHeightFor(1024, 5, 'grid', 16, 1)).toBe(420);
+    expect(rowHeightFor(1024, 5, 'grid', 16, 1.067)).toBe(428);
+    expect(rowHeightFor(1024, 5, 'grid', 32, 1)).toBe(520);
+    expect(rowHeightFor(1024, 5, 'grid', 32, 1.067)).toBe(536);
 
-    // Preserves full 32px row gap above 2-line title + 1-line author at 1.067 scaling
-    const scaledGridCard32 = 288 + 32 * (1 + 2.75 * 1.067 + 1.25 * 1.067 * 1.067);
+    // Reserves spacing for the 2-line title, author, optional series, and a 32px row gap.
+    const scaledGridCard32 = 288 + 32 * (1.25 + 2.75 * 1.067 + 2.25 * 1.067 * 1.067);
     expect(rowHeightFor(1024, 5, 'grid', 32, 1.067) - scaledGridCard32).toBeGreaterThanOrEqual(
       GRID_ROW_GAP_PX,
     );
@@ -184,7 +184,7 @@ describe('columnsForWidth, rowHeightFor, and resultsContainerHeight', () => {
   });
 
   it('normalizes non-finite or non-positive font sizes and text scaling', () => {
-    expect(rowHeightFor(1024, 5, 'grid', 0, Number.NaN)).toBe(400);
+    expect(rowHeightFor(1024, 5, 'grid', 0, Number.NaN)).toBe(420);
     expect(rowHeightFor(1024, 1, 'list', -16, 0)).toBe(152);
   });
 
@@ -377,12 +377,12 @@ describe('Library virtual DOM caching and containment', () => {
 
     const results = stage.querySelector<HTMLElement>('#library-results')!;
     expect(results.style.contain).toBe('layout style');
-    expect(results.style.height).toBe(`${16 * 406 - GRID_ROW_GAP_PX}px`);
+    expect(results.style.height).toBe(`${16 * 428 - GRID_ROW_GAP_PX}px`);
 
     const firstRowEl = results.firstElementChild as HTMLElement;
     expect(firstRowEl.style.contain).toBe('size layout style');
     expect(firstRowEl.style.contain).not.toContain('paint');
-    expect(firstRowEl.style.height).toBe('406px');
+    expect(firstRowEl.style.height).toBe('428px');
 
     const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle');
     const getBoundingClientRectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect');
