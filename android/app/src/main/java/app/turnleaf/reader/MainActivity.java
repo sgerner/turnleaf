@@ -99,24 +99,6 @@ public class MainActivity extends BridgeActivity implements ReaderWindowControll
     }
 
     @Override
-    public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (handleVolumeKey(keyCode, event, true)) {
-            return true;
-        }
-
-        return super.onKeyDown(keyCode, event);
-    }
-
-    @Override
-    public boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (handleVolumeKey(keyCode, event, false)) {
-            return true;
-        }
-
-        return super.onKeyUp(keyCode, event);
-    }
-
-    @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (handleVolumeKey(event.getKeyCode(), event, event.getAction() == KeyEvent.ACTION_DOWN)) {
             return true;
