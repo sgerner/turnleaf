@@ -4,6 +4,7 @@
 
 - Reset corrupt SQLite databases natively and add reading notes backup/restore
 - Reset corrupt native SQLite databases without opening them, retain unavailable remote books with saved bookmarks or notes, reorder server deletion to preserve downloaded EPUBs on failure, harden reader appearance parsing, and add library-wide and reader reading-notes export/restore with restricted-device text fallbacks
+- Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops
