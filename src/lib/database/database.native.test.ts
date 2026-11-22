@@ -193,7 +193,7 @@ it('keeps a failed native progress transaction atomic', async () => {
 it('groups completion and acknowledgement writes separately', async () => {
   const { confirmSync, markBookCompleted } = await import('./database');
 
-  await markBookCompleted(book, readingState);
+  await markBookCompleted(book);
   await confirmSync(book.id, '2026-01-02T00:00:00.000Z', 1, readingState.localUpdatedAt);
 
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
@@ -250,7 +250,7 @@ it('saves secondary EPUB progress locally without inserting into sync_queue', as
   };
 
   await saveLocalProgress(siblingBook, readingState.cfi, readingState.xpath, 0.5, 1);
-  await markBookCompleted(siblingBook, readingState);
+  await markBookCompleted(siblingBook);
 
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
   const [progressTasks, completionTasks] = mocks.executeTransaction.mock.calls;

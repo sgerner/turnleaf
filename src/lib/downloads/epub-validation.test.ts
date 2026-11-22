@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
+import { Blob as NodeBlob } from 'node:buffer';
 import { crc32, deflateRawSync } from 'node:zlib';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   EpubValidationError,
   MAX_EPUB_ENTRIES,
@@ -14,9 +15,11 @@ import {
 interface ZipTestEntry {
   name: string;
   data?: Uint8Array;
+  deflate?: boolean;
   declaredSize?: number;
-  flags?: number;
   compressionMethod?: number;
+  flags?: number;
+  localFlags?: number;
   crc?: number;
 }
 
@@ -33,15 +36,16 @@ function write32(bytes: Uint8Array, offset: number, value: number): void {
 function makeZip(entries: ZipTestEntry[]): Uint8Array {
   const normalized = entries.map((entry) => {
     const rawData = entry.data ?? new Uint8Array();
-    const method = entry.compressionMethod ?? 0;
-    const storedData = method === 8 ? new Uint8Array(deflateRawSync(rawData)) : rawData;
+    const method = entry.compressionMethod ?? (entry.deflate ? 8 : 0);
+    const storedData = entry.deflate ? new Uint8Array(deflateRawSync(rawData)) : rawData;
     return {
       name: new TextEncoder().encode(entry.name),
       data: storedData,
       declaredSize: entry.declaredSize ?? rawData.length,
-      flags: entry.flags ?? 0,
       compressionMethod: method,
-      crc: entry.crc ?? (method === 8 ? crc32(rawData) : 0),
+      flags: entry.flags ?? 0,
+      localFlags: entry.localFlags ?? entry.flags ?? 0,
+      crc: entry.crc ?? (entry.deflate ? crc32(rawData) : 0),
     };
   });
   const localSize = normalized.reduce(
@@ -56,7 +60,7 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     localOffsets.push(offset);
     write32(archive, offset, 0x04034b50);
     write16(archive, offset + 4, 20);
-    write16(archive, offset + 6, entry.flags);
+    write16(archive, offset + 6, entry.localFlags);
     write16(archive, offset + 8, entry.compressionMethod);
     write32(archive, offset + 14, entry.crc);
     write32(archive, offset + 18, entry.data.length);
@@ -113,6 +117,8 @@ async function expectInvalid(archive: Uint8Array, fileSize = archive.length): Pr
 }
 
 describe('EPUB container validation', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it('accepts a valid illustrated EPUB while using bounded range reads', async () => {
     const archive = makeZip(validEntries());
     const reads: Array<{ offset: number; length: number }> = [];
@@ -151,6 +157,82 @@ describe('EPUB container validation', () => {
         ),
       ),
     );
+  });
+
+  it('rejects an encrypted local mimetype header when central directory flags are clear', async () => {
+    for (const localFlags of [0x1, 0x40]) {
+      const archive = makeZip(
+        validEntries().map((entry, index) =>
+          index === 0
+            ? {
+                ...entry,
+                flags: 0,
+                localFlags,
+              }
+            : entry,
+        ),
+      );
+      await expect(
+        validateEpubArchive(archive.length, async (offset, length) =>
+          archive.slice(offset, offset + length),
+        ),
+      ).rejects.toThrow('The EPUB mimetype local header is malformed.');
+      await expectInvalid(archive);
+    }
+  });
+
+  it('validates deflated META-INF/container.xml entries and rejects corrupt deflate streams', async () => {
+    vi.stubGlobal('Blob', NodeBlob);
+    const xml = new TextEncoder().encode(
+      '<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>',
+    );
+    const deflatedValid = makeZip([
+      { name: 'mimetype', data: new TextEncoder().encode('application/epub+zip') },
+      {
+        name: 'META-INF/container.xml',
+        data: new Uint8Array(deflateRawSync(xml)),
+        declaredSize: xml.length,
+        compressionMethod: 8,
+      },
+      { name: 'OEBPS/cover.jpg', data: new Uint8Array(100_000) },
+    ]);
+    await expect(
+      validateEpubArchive(deflatedValid.length, async (offset, length) =>
+        deflatedValid.slice(offset, offset + length),
+      ),
+    ).resolves.toBeUndefined();
+
+    const malformedXml = new TextEncoder().encode('<container>');
+    await expectInvalid(
+      makeZip([
+        { name: 'mimetype', data: new TextEncoder().encode('application/epub+zip') },
+        {
+          name: 'META-INF/container.xml',
+          data: new Uint8Array(deflateRawSync(malformedXml)),
+          declaredSize: malformedXml.length,
+          compressionMethod: 8,
+        },
+      ]),
+    );
+
+    await expectInvalid(
+      makeZip([
+        { name: 'mimetype', data: new TextEncoder().encode('application/epub+zip') },
+        {
+          name: 'META-INF/container.xml',
+          data: new Uint8Array([0xff, 0xff]),
+          declaredSize: xml.length,
+          compressionMethod: 8,
+        },
+      ]),
+    );
+
+    vi.stubGlobal('DecompressionStream', undefined);
+    await expect(
+      validateEpubArchive(deflatedValid.length, async (offset, length) =>
+        deflatedValid.slice(offset, offset + length),
+      ),
+    ).resolves.toBeUndefined();
   });
 
   it('rejects an HTML error body, even when it is larger than the old size check', async () => {
@@ -272,12 +354,14 @@ describe('EPUB container validation', () => {
           name: 'pg16163-images-3/pg16163-images-3.epub',
           data: epubOne,
           compressionMethod: method,
+          deflate: method === 8,
           crc: crc32(epubOne),
         },
         {
           name: 'Vol-3-Media/Vol-3-Media.epub',
           data: epubTwo,
           compressionMethod: method,
+          deflate: method === 8,
           crc: crc32(epubTwo),
         },
       ]);
@@ -315,12 +399,12 @@ describe('EPUB container validation', () => {
       {
         name: 'alpha/alpha.epub',
         data: epubAlpha,
-        compressionMethod: 8,
+        deflate: true,
       },
       {
         name: 'beta/beta.epub',
         data: epubBeta,
-        compressionMethod: 8,
+        deflate: true,
       },
     ]);
     const reader = async (offset: number, length: number) => outer.slice(offset, offset + length);
@@ -365,9 +449,7 @@ describe('EPUB container validation', () => {
     );
 
     // Requested sibling EPUB index missing from archive.
-    const singleOuter = makeZip([
-      { name: 'only/only.epub', data: validInner, compressionMethod: 8 },
-    ]);
+    const singleOuter = makeZip([{ name: 'only/only.epub', data: validInner, deflate: true }]);
     await expect(
       prepareDownloadedEpub(singleOuter.length, readerFor(singleOuter), {
         fileName: 'missing-second.epub',
@@ -378,9 +460,7 @@ describe('EPUB container validation', () => {
 
     // Corrupted inner EPUB payload (not a valid EPUB container).
     const bogusInner = new TextEncoder().encode('not-an-epub-archive-at-all-1234567890');
-    const bogusOuter = makeZip([
-      { name: 'broken/broken.epub', data: bogusInner, compressionMethod: 8 },
-    ]);
+    const bogusOuter = makeZip([{ name: 'broken/broken.epub', data: bogusInner, deflate: true }]);
     await expect(
       prepareDownloadedEpub(bogusOuter.length, readerFor(bogusOuter)),
     ).rejects.toBeInstanceOf(EpubValidationError);
@@ -409,7 +489,7 @@ describe('EPUB container validation', () => {
       {
         name: 'bomb/bomb.epub',
         data: validInner,
-        compressionMethod: 8,
+        deflate: true,
         declaredSize: 64,
       },
     ]);

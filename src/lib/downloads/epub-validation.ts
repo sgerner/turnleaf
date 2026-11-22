@@ -11,7 +11,7 @@ export const MAX_EPUB_FILE_SIZE = 512 * 1024 * 1024;
 export const MAX_EPUB_EXPANDED_SIZE = 1024 * 1024 * 1024;
 /** Keep central-directory inspection bounded even for a hostile entry count. */
 export const MAX_EPUB_ENTRIES = 10_000;
-export const MAX_EPUB_CENTRAL_DIRECTORY_SIZE = 16 * 1024 * 1024;
+const MAX_EPUB_CENTRAL_DIRECTORY_SIZE = 16 * 1024 * 1024;
 const MAX_REPAIR_FILE_SIZE = 16 * 1024 * 1024;
 const CONTAINER_PATH = 'META-INF/container.xml';
 const MAX_CONTAINER_XML_SIZE = 1024 * 1024;
@@ -19,9 +19,8 @@ const ARCHIVE_READ_CHUNK_SIZE = 1024 * 1024;
 const INITIAL_READ_SIZE = 4096;
 const ZIP_TAIL_READ_SIZE = ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH + ZIP_MAX_COMMENT_LENGTH;
 
-export interface EpubArchiveEntry {
+interface EpubArchiveEntry {
   name: string;
-  flags: number;
   compressionMethod: number;
   crc32: number;
   compressedSize: number;
@@ -160,7 +159,6 @@ function parseCentralDirectory(
 
     entries.push({
       name,
-      flags,
       compressionMethod,
       crc32,
       compressedSize,
@@ -181,7 +179,6 @@ function validateMimetypeEntry(head: Uint8Array, entry: EpubArchiveEntry): void 
     entry.name !== 'mimetype' ||
     entry.localHeaderOffset !== 0 ||
     entry.compressionMethod !== 0 ||
-    entry.flags & ZIP_ENCRYPTION_FLAGS ||
     entry.compressedSize !== 20 ||
     entry.uncompressedSize !== 20
   ) {
@@ -307,9 +304,7 @@ async function readXmlEntry(
       const stream = new Blob([new Uint8Array(compressed).buffer as ArrayBuffer])
         .stream()
         .pipeThrough(new DecompressionStream('deflate-raw'));
-      const body = new Response(stream).body;
-      if (!body) throw new EpubValidationError('The EPUB container entry is malformed.');
-      uncompressed = await readBoundedStream(body);
+      uncompressed = await readBoundedStream(stream);
     } catch {
       throw new EpubValidationError('The EPUB container entry is malformed.');
     }
@@ -537,7 +532,6 @@ async function inspectZipArchive(
     entriesOnDisk !== entries ||
     entries === 0 ||
     entries > MAX_EPUB_ENTRIES ||
-    entries === 0xffff ||
     centralDirectorySize > MAX_EPUB_CENTRAL_DIRECTORY_SIZE ||
     centralDirectorySize < entries * 46 ||
     centralDirectoryOffset + centralDirectorySize !== tailOffset + endOffset

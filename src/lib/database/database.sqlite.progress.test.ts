@@ -229,7 +229,7 @@ describe('native progress transactions against SQLite', () => {
     const baselineBook = (await database.getBooks(server.id))[0];
 
     native.failTransactionAt = 2;
-    await expect(database.markBookCompleted(book, baselineReading)).rejects.toThrow(
+    await expect(database.markBookCompleted(book)).rejects.toThrow(
       'injected transaction failure at 2',
     );
 
@@ -586,7 +586,7 @@ describe('native progress transactions against SQLite', () => {
       pagesRead: 2,
     });
 
-    await reopened.markBookCompleted(siblingBook, await reopened.getReadingState(siblingBook.id));
+    await reopened.markBookCompleted(siblingBook);
     expect(await reopened.getPendingSync(server.id)).toEqual([]);
     expect(
       (await reopened.getBooks(server.id)).find((item) => item.id === siblingBook.id)?.pagesRead,
