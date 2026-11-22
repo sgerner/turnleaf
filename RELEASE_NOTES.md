@@ -2,7 +2,9 @@
 
 ## Unreleased
 
+- Fix Android reader relocation/resize and network handover races
 - Add reader external link, footnote, and figure inspectors, accessible highlight overlays, pinch-zoom, and iOS Dynamic Type scaling
+- Stabilize Android reader chrome viewport resizes and multi-transport network handovers
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input

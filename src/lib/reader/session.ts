@@ -703,12 +703,17 @@ export class ReaderSession {
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
+  private userNavigationStartSectionIndex: number | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private pendingViewportSize: { width: number; height: number } | null = null;
+  private displayQueue: Promise<void> = Promise.resolve();
+  private displayInFlightCount = 0;
+  private lastDisplayTarget: string | undefined = undefined;
   private viewportTarget: HTMLElement | null = null;
   private highlightLayer: HTMLDivElement | null = null;
   private highlightButtons = new Map<string, HTMLButtonElement>();
@@ -786,16 +791,25 @@ export class ReaderSession {
     this.rendition.on('rendered', this.rendered);
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const matchesPendingInitialSection =
+        startCfi === null &&
+        this.userNavigationStartSectionIndex !== null &&
+        location.start.index === this.userNavigationStartSectionIndex &&
+        location.start.displayed.page <= 1;
       const isUserNavigation =
         this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+        (startCfi
+          ? startCfi !== location.start.cfi
+          : !this.reflowPending && !matchesPendingInitialSection);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
+      this.lastDisplayTarget = location.start.cfi;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartSectionIndex = null;
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
@@ -834,24 +848,26 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
+    await this.runDisplayOperation(async () => {
+      await this.rendition!.started;
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      if (cfi) {
+        try {
+          if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
+        } catch {
+          // A saved CFI can name a section removed in a newer copy of the EPUB.
+        }
       }
-    }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
+      if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
+      if (
+        serverPercentage &&
+        serverPercentage > 0 &&
+        (await this.displayPercentage(serverPercentage, restoreGeneration))
+      ) {
+        return;
+      }
+      await this.displayAtGeneration(undefined, restoreGeneration);
+    });
   }
 
   private reportLocation(
@@ -1043,11 +1059,13 @@ export class ReaderSession {
   }
 
   displayServerLocation(xpath: string): Promise<boolean> {
-    return this.displayXPath(xpath, this.beginLocationOperation(false));
+    const generation = this.beginLocationOperation(false);
+    return this.runDisplayOperation(() => this.displayXPath(xpath, generation));
   }
 
   displayServerPercentage(percentage: number): Promise<boolean> {
-    return this.displayPercentage(percentage, this.beginLocationOperation(false));
+    const generation = this.beginLocationOperation(false);
+    return this.runDisplayOperation(() => this.displayPercentage(percentage, generation));
   }
 
   applyAppearance(value: Appearance): void {
@@ -1154,6 +1172,10 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
+    this.pendingViewportSize = null;
+    this.displayQueue = Promise.resolve();
+    this.displayInFlightCount = 0;
+    this.lastDisplayTarget = undefined;
     this.viewportTarget = null;
     this.highlightButtons.clear();
     this.highlightAnnotations.clear();
@@ -1168,6 +1190,7 @@ export class ReaderSession {
     this.inspectors = {};
     this.current = null;
     this.userNavigationStartCfi = null;
+    this.userNavigationStartSectionIndex = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1687,12 +1710,99 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
-      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.rendition.resize(width, height);
-      this.syncHighlightOverlays();
+      if (this.viewportSize?.width === width && this.viewportSize.height === height) {
+        this.pendingViewportSize = null;
+        return;
+      }
+      if (this.displayInFlightCount > 0) {
+        this.pendingViewportSize = { width, height };
+        return;
+      }
+      void this.runDisplayOperation(() => this.applyViewportResize(width, height));
     });
     this.resizeObserver.observe(target);
+  }
+
+  private runDisplayOperation<T>(work: () => Promise<T>): Promise<T> {
+    const startImmediately = this.displayInFlightCount === 0;
+    this.displayInFlightCount += 1;
+    const execute = async (): Promise<T> => {
+      try {
+        return await work();
+      } finally {
+        await this.flushPendingViewportResize();
+      }
+    };
+    const run = startImmediately ? execute() : this.displayQueue.then(execute);
+    this.displayQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run.finally(() => {
+      this.displayInFlightCount = Math.max(0, this.displayInFlightCount - 1);
+    });
+  }
+
+  private async flushPendingViewportResize(): Promise<void> {
+    while (this.pendingViewportSize && this.rendition) {
+      const { width, height } = this.pendingViewportSize;
+      this.pendingViewportSize = null;
+      await this.applyViewportResize(width, height);
+    }
+  }
+
+  private async applyViewportResize(width: number, height: number): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition) return;
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    this.viewportSize = { width, height };
+    rendition.resize(width, height);
+    const hasManager = Boolean((rendition as unknown as { manager?: unknown }).manager);
+    if (hasManager) {
+      if (!rendition.location?.start) {
+        const target = this.current?.start.cfi ?? this.lastDisplayTarget;
+        try {
+          if (target === undefined) await rendition.display();
+          else await rendition.display(target);
+        } catch {
+          // Ignore transient resize re-display failure while closing or switching sections.
+        }
+      }
+      await this.settleManagerRelocation(rendition);
+    }
+    this.syncHighlightOverlays();
+  }
+
+  private async settleManagerRelocation(rendition: Rendition): Promise<void> {
+    if (!this.rendition || this.rendition !== rendition) return;
+    const internal = rendition as unknown as {
+      manager?: unknown;
+      q?: { enqueue?: <T>(task: () => T) => Promise<T> };
+    };
+    if (!internal.manager) return;
+    if (typeof internal.q?.enqueue === 'function') {
+      try {
+        await internal.q.enqueue(() => undefined);
+      } catch {
+        return;
+      }
+    }
+    if (!this.rendition || this.rendition !== rendition) return;
+    if (typeof requestAnimationFrame === 'function') {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        const timer = setTimeout(finish, 50);
+        requestAnimationFrame(() => {
+          clearTimeout(timer);
+          finish();
+        });
+      });
+    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -1732,7 +1842,10 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
     if (target === undefined) await rendition.display();
     else await rendition.display(target);
-    return this.isCurrentLocationOperation(generation);
+    this.lastDisplayTarget = target;
+    await this.settleManagerRelocation(rendition);
+    if (!this.isCurrentLocationOperation(generation)) return false;
+    return true;
   }
 
   private async displayXPath(xpath: string, generation: number): Promise<boolean> {
@@ -1744,8 +1857,12 @@ export class ReaderSession {
     if (!section) return false;
     try {
       await rendition.display(section.href);
+      this.lastDisplayTarget = section.href;
       if (!this.isCurrentLocationOperation(generation)) return false;
-      if (target.contentXPath === '/html/body') return true;
+      if (target.contentXPath === '/html/body') {
+        await this.settleManagerRelocation(rendition);
+        return this.isCurrentLocationOperation(generation);
+      }
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
@@ -1755,7 +1872,10 @@ export class ReaderSession {
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
       await rendition.display(cfi);
-      return this.isCurrentLocationOperation(generation);
+      this.lastDisplayTarget = cfi;
+      await this.settleManagerRelocation(rendition);
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      return true;
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
@@ -1792,16 +1912,22 @@ export class ReaderSession {
   }
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {
-    const generation = this.beginLocationOperation(true);
-    try {
-      await display();
-    } catch (error) {
-      if (this.isCurrentLocationOperation(generation)) {
-        this.userNavigationPending = false;
-        this.userNavigationStartCfi = null;
+    await this.runDisplayOperation(async () => {
+      const generation = this.beginLocationOperation(true);
+      try {
+        await display();
+        if (this.rendition) {
+          await this.settleManagerRelocation(this.rendition);
+        }
+      } catch (error) {
+        if (this.isCurrentLocationOperation(generation)) {
+          this.userNavigationPending = false;
+          this.userNavigationStartCfi = null;
+          this.userNavigationStartSectionIndex = null;
+        }
+        throw error;
       }
-      throw error;
-    }
+    });
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
@@ -1809,9 +1935,17 @@ export class ReaderSession {
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
-    this.userNavigationStartCfi = userNavigation
+    const startCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
       : null;
+    this.userNavigationStartCfi = startCfi;
+    if (userNavigation && startCfi === null) {
+      const activeSection = this.getActiveContents()[0]?.sectionIndex;
+      this.userNavigationStartSectionIndex =
+        typeof activeSection === 'number' ? activeSection : null;
+    } else {
+      this.userNavigationStartSectionIndex = null;
+    }
     return this.locationGeneration;
   }
 
@@ -1821,6 +1955,7 @@ export class ReaderSession {
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
+    this.userNavigationStartSectionIndex = null;
     this.userNavigationOrigin = 'link';
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }

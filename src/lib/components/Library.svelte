@@ -215,6 +215,7 @@
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
+  let networkEventSequence = 0;
   let message = $state('');
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
@@ -532,21 +533,36 @@
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', ({ connected }) => {
+        await Network.addListener('networkStatusChange', async ({ connected }) => {
           if (destroyed) return;
-          offline = !connected;
-          if (!connected) {
+          const eventId = ++networkEventSequence;
+          let nextConnected = connected;
+          if (!nextConnected && Capacitor.isNativePlatform()) {
+            const currentStatus = await Network.getStatus().catch(() => null);
+            if (destroyed || eventId !== networkEventSequence) return;
+            nextConnected = currentStatus?.connected === true;
+          }
+          if (destroyed || eventId !== networkEventSequence) return;
+          const wasOffline = offline;
+          offline = !nextConnected;
+          if (!nextConnected) {
             refreshController?.abort();
             openProgressProbe?.abort();
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
           }
+          const shouldReconnect = nextConnected && (wasOffline || kavitaUnreachable);
+          if (wasOffline === !nextConnected && !shouldReconnect) return;
           coverReloadRequest += 1;
           kavitaUnreachable = false;
-          offlineMessage = connected
+          offlineMessage = nextConnected
             ? ''
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
+          if (shouldReconnect)
             void refresh()
               .then(() => syncProgress(false))
               .catch(() => {});

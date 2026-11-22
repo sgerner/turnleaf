@@ -272,6 +272,144 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('defers viewport resizes while initial display is in flight and re-displays when manager views clear before location settles', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveInitialDisplay!: () => void;
+    let displayCallCount = 0;
+    mockRendition.display.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          displayCallCount += 1;
+          if (displayCallCount === 1) {
+            resolveInitialDisplay = resolve;
+          } else {
+            resolve();
+          }
+        }),
+    );
+    const renditionWithManager = mockRendition as typeof mockRendition & {
+      manager?: Record<string, unknown> | undefined;
+      location?: { start?: { cfi: string } } | undefined;
+    };
+    renditionWithManager.manager = {};
+    renditionWithManager.location = undefined;
+
+    try {
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 851));
+
+      const session = new ReaderSession('book.epub');
+      const openPromise = session.open(
+        viewport,
+        'epubcfi(/6/4!/4/2)',
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+
+      await vi.waitFor(() => {
+        expect(mockRendition.display).toHaveBeenCalledTimes(1);
+      });
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      resolveInitialDisplay();
+      await openPromise;
+
+      expect(mockRendition.resize).toHaveBeenCalledWith(412, 915);
+      expect(mockRendition.display).toHaveBeenCalledTimes(2);
+      expect(mockRendition.display).toHaveBeenNthCalledWith(2, 'epubcfi(/6/4!/4/2)');
+      session.destroy();
+    } finally {
+      delete renditionWithManager.manager;
+      delete renditionWithManager.location;
+      mockRendition.display.mockImplementation(async () => {});
+    }
+  });
+
+  it('does not let a delayed initial restore relocation consume pending next-page user navigation', async () => {
+    const renditionWithNext = mockRendition as typeof mockRendition & {
+      next?: () => Promise<void>;
+      getContents?: () => unknown[];
+    };
+    renditionWithNext.next = vi.fn(async () => {});
+    renditionWithNext.getContents = () => [
+      {
+        document,
+        window: { getSelection: () => ({ isCollapsed: true }) },
+        sectionIndex: 0,
+      },
+    ];
+
+    try {
+      const onLocation = vi.fn();
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        onLocation,
+        vi.fn(),
+      );
+
+      const relocated = getRenditionListener('relocated');
+      await session.next();
+
+      // Chapter 1's queued requestAnimationFrame relocation arrives before Chapter 2's relocation.
+      relocated({
+        start: {
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          href: 'first.xhtml',
+          index: 0,
+          percentage: 0,
+          displayed: { page: 1, total: 1 },
+        },
+      } as Location);
+      relocated({
+        start: {
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          href: 'second.xhtml',
+          index: 1,
+          percentage: 0.5,
+          displayed: { page: 1, total: 1 },
+        },
+      } as Location);
+
+      expect(onLocation).toHaveBeenCalledTimes(2);
+      expect(onLocation.mock.calls[0]?.[0]).toMatchObject({
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        spineIndex: 0,
+      });
+      expect(onLocation.mock.calls[0]?.[1]).toBe('restore');
+      expect(onLocation.mock.calls[1]?.[0]).toMatchObject({
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        spineIndex: 1,
+      });
+      expect(onLocation.mock.calls[1]?.[1]).toBe('navigation');
+      session.destroy();
+    } finally {
+      delete renditionWithNext.next;
+      delete renditionWithNext.getContents;
+    }
+  });
+
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const onLocation = vi.fn();
