@@ -2,8 +2,8 @@
 
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
-import { KavitaClient } from './client';
-import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import { KavitaClient, raceAbort } from './client';
+import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from '../diagnostics/log';
 
 const capacitorRuntime = vi.hoisted(() => ({ native: false }));
 
@@ -221,6 +221,96 @@ it('follows native same-origin redirects with redirects disabled on each request
     url: 'https://books.example.com/api/Series/v2/?PageNumber=1&PageSize=500',
     disableRedirects: true,
   });
+});
+
+it('settles pending native CapacitorHttp.request and CapacitorHttp.get calls immediately on abort and swallows late rejections', async () => {
+  capacitorRuntime.native = true;
+  let rejectPendingRequest!: (reason?: unknown) => void;
+  let rejectPendingGet!: (reason?: unknown) => void;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(
+    () =>
+      new Promise((_, reject) => {
+        rejectPendingRequest = reject;
+      }),
+  );
+  vi.mocked(CapacitorHttp.get).mockImplementationOnce(
+    () =>
+      new Promise((_, reject) => {
+        rejectPendingGet = reject;
+      }),
+  );
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  const requestController = new AbortController();
+  const coverController = new AbortController();
+
+  const pendingDetail = client.getSeriesDetail(4, requestController.signal);
+  const pendingCover = client.getCover(4, coverController.signal);
+
+  requestController.abort();
+  coverController.abort();
+
+  await expect(pendingDetail).rejects.toSatisfy(
+    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+  );
+  await expect(pendingCover).rejects.toSatisfy(
+    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+  );
+
+  rejectPendingRequest(new Error('SocketTimeoutException: connect timed out'));
+  rejectPendingGet(new Error('SocketTimeoutException: read timed out'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(getDiagnosticCount()).toBe(0);
+});
+
+it('detaches abort listeners when native calls settle before a shared signal aborts', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request).mockResolvedValue({
+    status: 200,
+    headers: {},
+    data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
+    url: '',
+  });
+  vi.mocked(CapacitorHttp.get).mockResolvedValue({
+    status: 200,
+    headers: {},
+    data: btoa('cover'),
+    url: '',
+  });
+
+  const controller = new AbortController();
+  const addSpy = vi.spyOn(controller.signal, 'addEventListener');
+  const removeSpy = vi.spyOn(controller.signal, 'removeEventListener');
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await client.getSeriesDetail(1, controller.signal);
+  await client.getSeriesDetail(2, controller.signal);
+  await client.getCover(1, controller.signal);
+
+  expect(addSpy).toHaveBeenCalledTimes(3);
+  expect(removeSpy).toHaveBeenCalledTimes(3);
+  for (let index = 0; index < 3; index += 1) {
+    expect(removeSpy.mock.calls[index]?.[0]).toBe('abort');
+    expect(removeSpy.mock.calls[index]?.[1]).toBe(addSpy.mock.calls[index]?.[1]);
+  }
+
+  let lateRejected = false;
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await expect(
+    raceAbort(
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          lateRejected = true;
+          reject(new Error('late failure'));
+        }, 0);
+      }),
+      preAborted.signal,
+    ),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(lateRejected).toBe(true);
 });
 
 it('preserves a Kavita base path in URLs used for covers and downloads', () => {
@@ -523,6 +613,68 @@ it('does not retry a progress read that returns not found', async () => {
   });
 
   expect(fetchMock).toHaveBeenCalledOnce();
+});
+
+it('propagates AbortError immediately from getProgress without retrying or recording network-error', async () => {
+  capacitorRuntime.native = true;
+  let rejectOrphan!: (reason?: unknown) => void;
+  vi.mocked(CapacitorHttp.request).mockImplementation(
+    () =>
+      new Promise((_, reject) => {
+        rejectOrphan = reject;
+      }),
+  );
+
+  const controller = new AbortController();
+  const pending = new KavitaClient('https://books.example.com', 'abc123').getProgress(
+    7,
+    controller.signal,
+  );
+  controller.abort();
+
+  await expect(pending).rejects.toSatisfy(
+    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+  );
+  expect(CapacitorHttp.request).toHaveBeenCalledOnce();
+
+  rejectOrphan(new Error('SocketTimeoutException'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(getDiagnosticCount()).toBe(0);
+});
+
+it('preserves network-error diagnostics for genuine native and browser timeouts when not aborted', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request).mockRejectedValueOnce(
+    new Error('SocketTimeoutException: timeout'),
+  );
+  const activeController = new AbortController();
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await expect(client.getSeriesDetail(4, activeController.signal)).rejects.toMatchObject({
+    kind: 'network',
+  });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain(
+    'request endpoint=/api/Series/series-detail detail=network-error',
+  );
+
+  clearDiagnostics();
+  capacitorRuntime.native = false;
+  vi.useFakeTimers();
+  try {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})) as unknown as typeof fetch);
+    const webTimeoutPromise = client.getSeriesDetail(9, activeController.signal);
+    const assertion = expect(webTimeoutPromise).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita did not respond in time.',
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    await assertion;
+    expect(exportDiagnostics({ appVersion: 'test', platform: 'web' })).toContain(
+      'request endpoint=/api/Series/series-detail detail=network-error',
+    );
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it('normalizes native HTTP JSON strings and exposes field diagnostics without server secrets', async () => {

@@ -41,7 +41,7 @@
     loadCoversWithConcurrency,
     type CoverLoadItem,
   } from '../downloads/cover-loader';
-  import { KavitaClient, KavitaError } from '../kavita/client';
+  import { KavitaClient, KavitaError, raceAbort } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
@@ -677,11 +677,16 @@
     refreshing = true;
     const controller = new AbortController();
     refreshController = controller;
+    const onAbort = () => {
+      if (refreshController === controller) refreshing = false;
+    };
+    controller.signal.addEventListener('abort', onAbort, { once: true });
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
     message = '';
     try {
-      if (!(await networkAvailable()) || controller.signal.aborted) return;
+      if (!(await raceAbort(networkAvailable(), controller.signal)) || controller.signal.aborted)
+        return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
@@ -765,8 +770,11 @@
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
     } finally {
-      refreshController = null;
-      refreshing = false;
+      controller.signal.removeEventListener('abort', onAbort);
+      if (refreshController === controller) {
+        refreshController = null;
+        refreshing = false;
+      }
     }
   }
 
@@ -991,25 +999,19 @@
       if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
         const probe = new AbortController();
         openProgressProbe = probe;
-        const abort = new Promise<null>((resolve) => {
-          probe.signal.addEventListener('abort', () => resolve(null), { once: true });
-        });
         const timer = window.setTimeout(() => probe.abort(), 1_500);
         const upload = syncWork;
         try {
-          remote = await Promise.race([
-            abort,
-            (async () => {
-              // Compare revisions only after any previous upload has settled.
-              await upload;
-              if (probe.signal.aborted) return null;
-              if (!(await networkAvailable()) || probe.signal.aborted) return null;
-              return client.getProgress(book.chapterId, probe.signal).catch(() => null);
-            })(),
-          ]);
+          // Compare revisions only after any previous upload has settled.
+          if (upload) await raceAbort(upload, probe.signal);
+          if (!probe.signal.aborted && (await raceAbort(networkAvailable(), probe.signal))) {
+            remote = await client.getProgress(book.chapterId, probe.signal);
+          }
+        } catch {
+          remote = null;
         } finally {
           window.clearTimeout(timer);
-          openProgressProbe = null;
+          if (openProgressProbe === probe) openProgressProbe = null;
         }
       }
       return { ok: true as const, local: await getReadingState(book.id), remote };
