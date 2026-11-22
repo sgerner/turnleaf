@@ -50,6 +50,11 @@ jobs:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
+      - name: Run Android lint
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
+        run: npm run android:lint
+
       - name: Upload Android debug APK
         uses: actions/upload-artifact@v7
         with:

@@ -24,6 +24,7 @@ export function childEnvironment(sdkPath, environment = process.env) {
 export function gradleTask(mode) {
   if (mode === 'debug') return 'assembleDebug';
   if (mode === 'release') return 'assembleRelease';
+  if (mode === 'lint') return ':app:lintDebug';
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 

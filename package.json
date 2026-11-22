@@ -26,6 +26,7 @@
     "android:open": "node scripts/capacitor-open.mjs android",
     "android:doctor": "node scripts/check-android-sdk.mjs",
     "android:debug": "node scripts/android-build.mjs debug",
+    "android:lint": "node scripts/android-build.mjs lint",
     "android:smoke": "node scripts/android-smoke.mjs",
     "android:journey": "node scripts/android-reading-journey.mjs",
     "android:release": "node scripts/android-build.mjs release",
