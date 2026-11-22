@@ -45,6 +45,36 @@ interface EpubTocItem {
   subitems?: EpubTocItem[];
 }
 
+interface ContentReadiness {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
+interface ExpandableContents {
+  resizeCheck?: (() => void) | undefined;
+}
+
+interface ExpandableView {
+  contents?: Contents | undefined;
+  display?: ((...args: unknown[]) => Promise<unknown>) | undefined;
+  destroy?: ((...args: unknown[]) => unknown) | undefined;
+  expand?: ((force?: boolean) => void) | undefined;
+  pane?: { render?: (() => void) | undefined } | undefined;
+}
+
+interface RenditionViewCollection {
+  forEach?: ((callback: (view: ExpandableView) => void) => void) | undefined;
+}
+
+interface ExpandableRendition {
+  manager?:
+    | {
+        createView?: ((...args: unknown[]) => ExpandableView) | undefined;
+      }
+    | undefined;
+  views?: (() => RenditionViewCollection | null | undefined) | undefined;
+}
+
 const MODE_COLORS = {
   light: {
     background: '--color-surface-50',
@@ -231,6 +261,22 @@ function installEpubContentPolicy(document: Document): void {
   head.prepend(policy);
 }
 
+function clearUnsafeDocument(document: Document): void {
+  const root = document.documentElement ?? document.appendChild(document.createElement('html'));
+  for (const element of [root, document.head, document.body]) {
+    if (!element) continue;
+    for (const attribute of [...element.attributes]) {
+      element.removeAttribute(attribute.name);
+    }
+  }
+  const head = document.head ?? document.createElement('head');
+  const body = document.body ?? document.createElement('body');
+  head.replaceChildren();
+  body.replaceChildren();
+  root.replaceChildren(head, body);
+  installEpubContentPolicy(document);
+}
+
 function isSafeBaseReference(value: string, document: Document): boolean {
   const decoded = decodedReference(value);
   if (!decoded) return false;
@@ -288,8 +334,9 @@ export async function sanitizeEpubDocument(
   });
 
   document.querySelectorAll('style').forEach((style) => {
-    const safeStyle = sanitizeCss(style.textContent ?? '');
-    style.textContent = safeStyle;
+    const current = style.textContent;
+    if (!current) return;
+    style.textContent = sanitizeCss(current);
   });
   await sanitizeStylesheets(document, stylesheetCache);
   installEpubContentPolicy(document);
@@ -298,6 +345,8 @@ export async function sanitizeEpubDocument(
 export class ReaderSession {
   private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
+  private readonly contentReadiness = new WeakMap<Contents, ContentReadiness>();
+  private readonly pendingViewWaits = new Set<() => void>();
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
@@ -430,6 +479,7 @@ export class ReaderSession {
     const restoreGeneration = this.beginLocationOperation(false);
     await this.rendition.started;
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    this.installViewExpansion(this.rendition);
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -658,6 +708,10 @@ export class ReaderSession {
 
   destroy(): void {
     this.locationGeneration += 1;
+    for (const release of [...this.pendingViewWaits]) {
+      release();
+    }
+    this.pendingViewWaits.clear();
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
@@ -693,8 +747,103 @@ export class ReaderSession {
     this.book.destroy();
   }
 
-  private harden(contents: Contents): Promise<void> {
-    return sanitizeEpubDocument(contents.document, this.stylesheetCache);
+  private async harden(contents: Contents): Promise<void> {
+    const readiness = this.getContentReadiness(contents);
+    try {
+      await sanitizeEpubDocument(contents.document, this.stylesheetCache);
+    } catch {
+      try {
+        if (contents.document) clearUnsafeDocument(contents.document);
+      } catch {
+        // Ignore failures when a torn-down iframe document is no longer mutable.
+      }
+    } finally {
+      readiness.resolve();
+    }
+  }
+
+  private getContentReadiness(contents: Contents): ContentReadiness {
+    const existing = this.contentReadiness.get(contents);
+    if (existing) return existing;
+    let resolve: () => void = () => {};
+    const promise = new Promise<void>((res) => {
+      resolve = res;
+    });
+    const created: ContentReadiness = { promise, resolve };
+    this.contentReadiness.set(contents, created);
+    return created;
+  }
+
+  private installViewExpansion(rendition: Rendition): void {
+    const manager = (rendition as unknown as ExpandableRendition).manager;
+    if (!manager || typeof manager.createView !== 'function') return;
+    const createView = manager.createView.bind(manager);
+    manager.createView = (...args: unknown[]) => {
+      const view = createView(...args);
+      if (view && typeof view === 'object') {
+        this.wrapViewLifecycle(view);
+      }
+      return view;
+    };
+  }
+
+  private wrapViewLifecycle(view: ExpandableView): void {
+    let destroyed = false;
+    let releaseWait: () => void = () => {};
+    const destroyedPromise = new Promise<void>((resolve) => {
+      releaseWait = resolve;
+    });
+    const markDestroyed = () => {
+      if (destroyed) return;
+      destroyed = true;
+      releaseWait();
+    };
+
+    if (typeof view.destroy === 'function') {
+      const destroy = view.destroy.bind(view);
+      view.destroy = (...args: unknown[]) => {
+        markDestroyed();
+        return destroy(...args);
+      };
+    }
+
+    if (typeof view.display === 'function') {
+      const display = view.display.bind(view);
+      view.display = async (...args: unknown[]) => {
+        const displayed = await display(...args);
+        if (!destroyed && this.rendition && view.contents) {
+          const readiness = this.getContentReadiness(view.contents);
+          this.pendingViewWaits.add(markDestroyed);
+          try {
+            await Promise.race([readiness.promise, destroyedPromise]);
+          } finally {
+            this.pendingViewWaits.delete(markDestroyed);
+          }
+          if (!destroyed && this.rendition && view.contents) {
+            this.expandStyledView(view);
+          }
+        }
+        return displayed;
+      };
+    }
+  }
+
+  private expandStyledView(view: ExpandableView): void {
+    if (!view.contents) return;
+    (view.contents as unknown as ExpandableContents).resizeCheck?.();
+    view.expand?.();
+    view.pane?.render?.();
+  }
+
+  private expandActiveViews(rendition: Rendition): void {
+    const views = (rendition as unknown as ExpandableRendition).views?.();
+    if (views && typeof views.forEach === 'function') {
+      views.forEach((view) => {
+        if (view && typeof view === 'object') {
+          this.expandStyledView(view);
+        }
+      });
+    }
   }
 
   private observeViewport(target: HTMLElement): void {
@@ -838,6 +987,7 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
+    this.expandActiveViews(rendition);
     void rendition.display(cfi).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
