@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Persist series metadata, chapter covers, book details, and continuation
+- fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
