@@ -9,23 +9,19 @@ import type {
   TocItem,
 } from '../reader/session';
 
-vi.mock('svelte', () => {
-  const clientEntry: string = '../../../node_modules/svelte/src/index-client.js';
-  return import(/* @vite-ignore */ clientEntry);
-});
-
-vi.mock('svelte/reactivity', () => {
-  const reactivityClientEntry: string =
-    '../../../node_modules/svelte/src/reactivity/index-client.js';
-  return import(/* @vite-ignore */ reactivityClientEntry);
-});
-
 vi.mock('svelte/transition', () => ({
   fade: () => ({ duration: 0 }),
   fly: () => ({ duration: 0 }),
 }));
 
-const { sessionInstances, preferencesStore } = vi.hoisted(() => {
+const {
+  sessionInstances,
+  preferencesStore,
+  getPreferencesMock,
+  setPreferencesMock,
+  openSessionMock,
+  destroySessionMock,
+} = vi.hoisted(() => {
   type CapturedSession = {
     bookUrl: string;
     title?: string | undefined;
@@ -46,21 +42,16 @@ const { sessionInstances, preferencesStore } = vi.hoisted(() => {
   return {
     sessionInstances: [] as CapturedSession[],
     preferencesStore: new Map<string, string>(),
+    getPreferencesMock: vi.fn(),
+    setPreferencesMock: vi.fn(),
+    openSessionMock: vi.fn(),
+    destroySessionMock: vi.fn(),
   };
 });
 
 vi.mock('../database/database', () => ({
-  getPreferences: vi.fn(async (keys: string[]) => {
-    const result = new Map<string, string>();
-    for (const key of keys) {
-      const value = preferencesStore.get(key);
-      if (value !== undefined) result.set(key, value);
-    }
-    return result;
-  }),
-  setPreferences: vi.fn(async (entries: Map<string, string>) => {
-    for (const [key, value] of entries) preferencesStore.set(key, value);
-  }),
+  getPreferences: getPreferencesMock,
+  setPreferences: setPreferencesMock,
 }));
 
 vi.mock('../reader/session', () => {
@@ -77,7 +68,7 @@ vi.mock('../reader/session', () => {
     displayServerPercentage = vi.fn(async () => true);
     applyAppearance = vi.fn();
     updateHighlights = vi.fn();
-    destroy = vi.fn();
+    destroy = destroySessionMock;
 
     constructor(
       public readonly bookUrl: string,
@@ -87,11 +78,11 @@ vi.mock('../reader/session', () => {
     }
 
     async open(
-      _target: HTMLElement,
-      _cfi: string | null,
-      _serverXPath: string | null,
-      _serverPercentage: number | null,
-      _appearance: unknown,
+      target: HTMLElement,
+      cfi: string | null,
+      serverXPath: string | null,
+      serverPercentage: number | null,
+      appearance: unknown,
       onLocation: (
         location: ReaderLocation,
         origin: ReaderLocationOrigin,
@@ -101,17 +92,14 @@ vi.mock('../reader/session', () => {
     ): Promise<void> {
       this.onLocation = onLocation;
       this.onTap = onTap;
-      onLocation(
-        {
-          cfi: 'epubcfi(/6/2!/4/2/1:0)',
-          xpath: '//body/DocFragment[1]/body/p[1]',
-          href: 'chapter-1.xhtml',
-          percentage: 0.25,
-          spineIndex: 0,
-          pageIndex: 0,
-          pageCount: 4,
-        },
-        'restore',
+      await openSessionMock(
+        target,
+        cfi,
+        serverXPath,
+        serverPercentage,
+        appearance,
+        onLocation,
+        onTap,
       );
     }
 
@@ -132,14 +120,162 @@ async function settle(): Promise<void> {
   await tick();
 }
 
+describe('Reader mount lifecycle', () => {
+  let target: HTMLDivElement;
+  let mounted: Record<string, unknown> | null = null;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionInstances.length = 0;
+    getPreferencesMock.mockResolvedValue(new Map());
+    setPreferencesMock.mockResolvedValue(undefined);
+    openSessionMock.mockResolvedValue(undefined);
+    target = document.createElement('div');
+    document.body.append(target);
+  });
+
+  afterEach(async () => {
+    if (mounted) {
+      await unmount(mounted);
+      mounted = null;
+    }
+    target.remove();
+  });
+
+  it('reports true on mount and false on destroy through onMountChange', async () => {
+    const onMountChange = vi.fn<(isMounted: boolean) => void>();
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-1',
+        title: 'Test Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onMountChange,
+      },
+    });
+    flushSync();
+
+    expect(target.querySelector('.reader-shell')).not.toBeNull();
+    expect(onMountChange).toHaveBeenCalledTimes(1);
+    expect(onMountChange).toHaveBeenNthCalledWith(1, true);
+
+    await vi.waitFor(() => {
+      expect(openSessionMock).toHaveBeenCalledOnce();
+    });
+
+    await unmount(mounted);
+    mounted = null;
+
+    expect(onMountChange).toHaveBeenCalledTimes(2);
+    expect(onMountChange).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it('still reports mount and destroy transitions when opening the EPUB fails', async () => {
+    openSessionMock.mockRejectedValueOnce(new Error('corrupt epub'));
+    const onMountChange = vi.fn<(isMounted: boolean) => void>();
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:broken-book',
+        bookId: 'book-2',
+        title: 'Broken Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onMountChange,
+      },
+    });
+    flushSync();
+
+    expect(onMountChange).toHaveBeenCalledWith(true);
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+        'This EPUB could not be opened.',
+      );
+    });
+    expect(onMountChange).toHaveBeenCalledTimes(1);
+
+    await unmount(mounted);
+    mounted = null;
+
+    expect(onMountChange).toHaveBeenCalledTimes(2);
+    expect(onMountChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('mounts and unmounts cleanly when onMountChange is omitted', async () => {
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:optional-book',
+        bookId: 'book-3',
+        title: 'Optional Callback Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    flushSync();
+
+    await vi.waitFor(() => {
+      expect(openSessionMock).toHaveBeenCalledOnce();
+    });
+
+    await unmount(mounted);
+    mounted = null;
+    expect(destroySessionMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe('Reader accessibility, sync confirmation, and edge insets', () => {
   let host: HTMLDivElement;
   let component: Record<string, unknown> | null = null;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     vi.useFakeTimers();
     sessionInstances.length = 0;
     preferencesStore.clear();
+    getPreferencesMock.mockImplementation(async (keys: string[]) => {
+      const result = new Map<string, string>();
+      for (const key of keys) {
+        const value = preferencesStore.get(key);
+        if (value !== undefined) result.set(key, value);
+      }
+      return result;
+    });
+    setPreferencesMock.mockImplementation(async (entries: Map<string, string>) => {
+      for (const [key, value] of entries) preferencesStore.set(key, value);
+    });
+    openSessionMock.mockImplementation(
+      async (
+        _target: HTMLElement,
+        _cfi: string | null,
+        _serverXPath: string | null,
+        _serverPercentage: number | null,
+        _appearance: unknown,
+        onLocation: (
+          location: ReaderLocation,
+          origin: ReaderLocationOrigin,
+          returnTarget?: ReaderLinkReturnTarget,
+        ) => void,
+      ) => {
+        onLocation(
+          {
+            cfi: 'epubcfi(/6/2!/4/2/1:0)',
+            xpath: '//body/DocFragment[1]/body/p[1]',
+            href: 'chapter-1.xhtml',
+            percentage: 0.25,
+            spineIndex: 0,
+            pageIndex: 0,
+            pageCount: 4,
+          },
+          'restore',
+        );
+      },
+    );
     host = document.createElement('div');
     document.body.append(host);
   });
