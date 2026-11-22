@@ -1,4 +1,9 @@
-import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
+import ePub, {
+  type Contents,
+  type EpubCFI as EpubCfiInstance,
+  type Location,
+  type Rendition,
+} from 'epubjs';
 import type { Appearance } from './appearance';
 import {
   clipReaderSearchExcerpt,
@@ -24,7 +29,29 @@ export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
 export interface ReaderSelection {
   cfi: string;
   text: string;
+  href?: string;
+  prefix?: string;
+  suffix?: string;
 }
+
+export interface ReaderHighlightInput {
+  id?: string;
+  cfi: string;
+  excerpt?: string;
+  href?: string | undefined;
+  prefix?: string | undefined;
+  suffix?: string | undefined;
+}
+
+export interface ReaderHighlightResolution {
+  repaired: Array<{ id: string; cfi: string; href: string }>;
+  missingIds: string[];
+}
+
+export type ReaderAnnotationDisplayResult =
+  | { status: 'displayed'; cfi: string; href: string }
+  | { status: 'repaired'; cfi: string; href: string }
+  | { status: 'missing' };
 
 export interface TocItem {
   label: string;
@@ -33,10 +60,79 @@ export interface TocItem {
 }
 
 interface SpineSection {
+  id?: string | null;
+  idref?: string | null;
+  cfiBase?: string;
   href: string;
   index: number;
+  contents?: unknown;
+  document?: Document;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
+}
+
+interface RuntimeCfiStep {
+  type: 'element' | 'text';
+  index: number;
+  id: string | null;
+}
+
+interface RuntimeCfiComponent {
+  steps: Array<RuntimeCfiStep | undefined>;
+  terminal: {
+    offset: number | null;
+    assertion: string | null;
+  } | null;
+}
+
+interface RuntimeParsedCfi {
+  spinePos: number;
+  range: boolean;
+  base: RuntimeCfiComponent;
+  path: RuntimeCfiComponent;
+  start: RuntimeCfiComponent | null;
+  end: RuntimeCfiComponent | null;
+}
+
+interface EpubCfiConstructor {
+  new (
+    cfiFrom?: string | Range | Node,
+    base?: string | object,
+    ignoreClass?: string,
+  ): EpubCfiInstance;
+}
+
+interface RenderedViewContents {
+  document: Document;
+  sectionIndex?: number;
+  cfiBase?: string;
+  range: (cfi: string, ignoreClass?: string) => Range | null;
+  cfiFromRange: (range: Range, ignoreClass?: string) => string;
+  cfiFromNode?: (node: Node, ignoreClass?: string) => string;
+}
+
+interface RenderedEpubView {
+  index: number;
+  displayed?: boolean;
+  section?: { href: string; index: number; cfiBase?: string };
+  contents?: RenderedViewContents;
+}
+
+interface TextMapPosition {
+  node: Text;
+  offset: number;
+}
+
+interface DocumentTextMap {
+  text: string;
+  lowerText: string;
+  starts: TextMapPosition[];
+  ends: TextMapPosition[];
+}
+
+interface ClaimedTextSpan {
+  start: number;
+  end: number;
 }
 
 interface EpubTocItem {
@@ -295,6 +391,439 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
+const SELECTION_CONTEXT_CHARS = 64;
+const IGNORED_TEXT_CONTAINERS = new Set(['head', 'noscript', 'script', 'style', 'title']);
+const BLOCK_ELEMENTS = new Set([
+  'address',
+  'article',
+  'aside',
+  'blockquote',
+  'dd',
+  'div',
+  'dl',
+  'dt',
+  'figcaption',
+  'figure',
+  'footer',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'li',
+  'main',
+  'nav',
+  'ol',
+  'p',
+  'pre',
+  'section',
+  'table',
+  'td',
+  'th',
+  'tr',
+  'ul',
+]);
+
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeSpineHref(href: string): string {
+  return href.split('#', 1)[0]?.trim() ?? '';
+}
+
+function getEpubCfiConstructor(rendition?: Rendition | null): EpubCfiConstructor | null {
+  const fromModule = (ePub as unknown as { CFI?: EpubCfiConstructor }).CFI;
+  if (typeof fromModule === 'function') return fromModule;
+  const fromRendition = (rendition as unknown as { epubcfi?: { constructor?: EpubCfiConstructor } })
+    ?.epubcfi?.constructor;
+  return typeof fromRendition === 'function' ? fromRendition : null;
+}
+
+function parseRuntimeCfi(
+  cfi: string,
+  CfiClass: EpubCfiConstructor | null,
+): RuntimeParsedCfi | null {
+  const trimmed = cfi.trim();
+  if (!trimmed || !trimmed.includes('!') || !CfiClass) return null;
+  try {
+    const checker = new CfiClass();
+    if (!checker.isCfiString(trimmed)) return null;
+    const parsed = new CfiClass(trimmed) as unknown as RuntimeParsedCfi;
+    if (!Number.isInteger(parsed.spinePos) || parsed.spinePos < 0) return null;
+    if (!Array.isArray(parsed.base?.steps) || !Array.isArray(parsed.path?.steps)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+interface ResolvedCfiEndpoint {
+  node: Node;
+  offset: number;
+  clamped: boolean;
+  elementOnly: boolean;
+}
+
+function resolveCfiStepsInDocument(
+  doc: Document,
+  steps: Array<RuntimeCfiStep | undefined>,
+  terminalOffset: number | null,
+): ResolvedCfiEndpoint | null {
+  const root = doc.documentElement;
+  if (!root || steps.length === 0) return null;
+  let current: Node | null = root;
+
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    if (!step || !Number.isInteger(step.index) || step.index < 0) return null;
+
+    if (step.type === 'element') {
+      if (current.nodeType !== Node.ELEMENT_NODE) return null;
+      const element = current as Element;
+      if (step.id) {
+        const indexedChild = element.children[step.index];
+        if (indexedChild && indexedChild.getAttribute('id') === step.id) {
+          current = indexedChild;
+        } else {
+          const byId = doc.getElementById(step.id);
+          if (!byId || !root.contains(byId)) return null;
+          current = byId;
+        }
+      } else {
+        current = element.children[step.index] ?? null;
+        if (!current) return null;
+      }
+      continue;
+    }
+
+    if (index !== steps.length - 1 || current.nodeType !== Node.ELEMENT_NODE) return null;
+    const textNodes = [...current.childNodes].filter(
+      (node): node is Text => node.nodeType === Node.TEXT_NODE,
+    );
+    const textNode = textNodes[step.index];
+    if (!textNode) return null;
+    const rawOffset = terminalOffset ?? 0;
+    const clampedOffset = Math.max(0, Math.min(rawOffset, textNode.data.length));
+    return {
+      node: textNode,
+      offset: clampedOffset,
+      clamped: clampedOffset !== rawOffset,
+      elementOnly: false,
+    };
+  }
+
+  if (terminalOffset === null) {
+    return { node: current, offset: 0, clamped: false, elementOnly: true };
+  }
+  const maxOffset = current.childNodes.length;
+  const clampedOffset = Math.max(0, Math.min(terminalOffset, maxOffset));
+  return {
+    node: current,
+    offset: clampedOffset,
+    clamped: clampedOffset !== terminalOffset,
+    elementOnly: false,
+  };
+}
+
+function cfiFromEndpoint(
+  doc: Document,
+  endpoint: ResolvedCfiEndpoint,
+  cfiBase: string,
+  CfiClass: EpubCfiConstructor,
+): string | null {
+  try {
+    if (endpoint.elementOnly || endpoint.node.nodeType === Node.ELEMENT_NODE) {
+      const targetNode =
+        !endpoint.elementOnly && endpoint.node.childNodes.length > 0
+          ? (endpoint.node.childNodes[
+              Math.min(endpoint.offset, endpoint.node.childNodes.length - 1)
+            ] ?? endpoint.node)
+          : endpoint.node;
+      if (targetNode.nodeType === Node.TEXT_NODE) {
+        const range = doc.createRange();
+        range.setStart(targetNode, 0);
+        range.collapse(true);
+        return new CfiClass(range, cfiBase).toString();
+      }
+      return new CfiClass(targetNode, cfiBase).toString();
+    }
+    const range = doc.createRange();
+    range.setStart(endpoint.node, endpoint.offset);
+    range.collapse(true);
+    return new CfiClass(range, cfiBase).toString();
+  } catch {
+    return null;
+  }
+}
+
+function validateAndClampReadingCfi(
+  doc: Document,
+  parsed: RuntimeParsedCfi,
+  originalCfi: string,
+  cfiBase: string | undefined,
+  CfiClass: EpubCfiConstructor,
+): string | null {
+  if (!parsed.range) {
+    const endpoint = resolveCfiStepsInDocument(
+      doc,
+      parsed.path.steps,
+      parsed.path.terminal?.offset ?? null,
+    );
+    if (!endpoint) return null;
+    if (!cfiBase) return endpoint.clamped ? null : originalCfi;
+    return cfiFromEndpoint(doc, endpoint, cfiBase, CfiClass);
+  }
+
+  const startSteps = [...parsed.path.steps, ...(parsed.start?.steps ?? [])];
+  const endSteps = [...parsed.path.steps, ...(parsed.end?.steps ?? [])];
+  const start = resolveCfiStepsInDocument(doc, startSteps, parsed.start?.terminal?.offset ?? null);
+  if (!start) return null;
+  const end = resolveCfiStepsInDocument(doc, endSteps, parsed.end?.terminal?.offset ?? null);
+  if (!cfiBase) return start.clamped || end?.clamped ? null : originalCfi;
+
+  if (end && start.node.nodeType === Node.TEXT_NODE && end.node.nodeType === Node.TEXT_NODE) {
+    try {
+      const range = doc.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset);
+      if (!range.collapsed) return new CfiClass(range, cfiBase).toString();
+    } catch {
+      // Fall back to the validated start position when the end offset collapsed.
+    }
+  }
+  return cfiFromEndpoint(doc, start, cfiBase, CfiClass);
+}
+
+function rangeMatchesExcerpt(
+  rangeText: string,
+  expectedExcerpt: string,
+  excerptWasTruncated: boolean,
+): boolean {
+  const normalizedRange = normalizeWhitespace(rangeText);
+  const normalizedExcerpt = normalizeWhitespace(expectedExcerpt);
+  if (!normalizedRange || !normalizedExcerpt) return false;
+  if (normalizedRange === normalizedExcerpt) return true;
+  if (excerptWasTruncated && normalizedRange.startsWith(normalizedExcerpt)) return true;
+  const compactRange = normalizedRange.replace(/\s+/g, '');
+  const compactExcerpt = normalizedExcerpt.replace(/\s+/g, '');
+  if (compactRange === compactExcerpt) return true;
+  return excerptWasTruncated && compactRange.startsWith(compactExcerpt);
+}
+
+function isIgnoredTextNode(node: Text): boolean {
+  let parent = node.parentElement;
+  while (parent) {
+    if (IGNORED_TEXT_CONTAINERS.has(parent.localName.toLowerCase())) return true;
+    parent = parent.parentElement;
+  }
+  return false;
+}
+
+function closestBlockElement(node: Node): Element | null {
+  let current = node.parentElement;
+  while (current) {
+    if (BLOCK_ELEMENTS.has(current.localName.toLowerCase())) return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function buildDocumentTextMap(doc: Document): DocumentTextMap {
+  const root = doc.body ?? doc.documentElement;
+  if (!root) return { text: '', lowerText: '', starts: [], ends: [] };
+  const chars: string[] = [];
+  const starts: TextMapPosition[] = [];
+  const ends: TextMapPosition[] = [];
+  let lastBlock: Element | null = null;
+
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let currentNode = walker.nextNode();
+  while (currentNode) {
+    const textNode = currentNode as Text;
+    currentNode = walker.nextNode();
+    if (!textNode.data || isIgnoredTextNode(textNode)) continue;
+    const block = closestBlockElement(textNode);
+    if (chars.length > 0 && block !== lastBlock && chars[chars.length - 1] !== ' ') {
+      const previousEnd = ends[ends.length - 1]!;
+      chars.push(' ');
+      starts.push(previousEnd);
+      ends.push({ node: textNode, offset: 0 });
+    }
+    if (block) lastBlock = block;
+
+    const data = textNode.data;
+    for (let offset = 0; offset < data.length; offset += 1) {
+      const character = data[offset]!;
+      if (/\s/.test(character)) {
+        if (chars.length === 0 || chars[chars.length - 1] === ' ') continue;
+        chars.push(' ');
+        starts.push({ node: textNode, offset });
+        ends.push({ node: textNode, offset: offset + 1 });
+      } else {
+        chars.push(character);
+        starts.push({ node: textNode, offset });
+        ends.push({ node: textNode, offset: offset + 1 });
+      }
+    }
+  }
+
+  if (chars[chars.length - 1] === ' ') {
+    chars.pop();
+    starts.pop();
+    ends.pop();
+  }
+  const text = chars.join('');
+  return { text, lowerText: text.toLowerCase(), starts, ends };
+}
+
+function scoreContextAffix(actual: string, expected: string, fromEnd: boolean): number {
+  if (!actual || !expected) return 0;
+  const actualLower = actual.toLowerCase();
+  const expectedLower = expected.toLowerCase();
+  const limit = Math.min(actualLower.length, expectedLower.length);
+  let matched = 0;
+  for (let index = 0; index < limit; index += 1) {
+    const actualChar = fromEnd ? actualLower[actualLower.length - 1 - index] : actualLower[index];
+    const expectedChar = fromEnd
+      ? expectedLower[expectedLower.length - 1 - index]
+      : expectedLower[index];
+    if (actualChar !== expectedChar) break;
+    matched += 1;
+  }
+  return matched;
+}
+
+function recordRangeInTextMap(
+  map: DocumentTextMap,
+  range: Range,
+  claimedSpans: ClaimedTextSpan[],
+): void {
+  const startIndex = map.starts.findIndex(
+    (entry) => entry.node === range.startContainer && entry.offset >= range.startOffset,
+  );
+  if (startIndex < 0) return;
+  for (let index = startIndex; index < map.ends.length; index += 1) {
+    const entry = map.ends[index]!;
+    if (entry.node === range.endContainer && entry.offset >= range.endOffset) {
+      claimedSpans.push({ start: startIndex, end: index + 1 });
+      return;
+    }
+  }
+}
+
+export function findExcerptRangeInDocument(
+  doc: Document,
+  excerpt: string,
+  options?: {
+    prefix?: string | undefined;
+    suffix?: string | undefined;
+    textMap?: DocumentTextMap | undefined;
+    claimedSpans?: ClaimedTextSpan[] | undefined;
+  },
+): Range | null {
+  const query = normalizeWhitespace(excerpt);
+  if (!query) return null;
+  const map = options?.textMap ?? buildDocumentTextMap(doc);
+  if (!map.text) return null;
+
+  const candidates: ClaimedTextSpan[] = [];
+  let searchFrom = 0;
+  while (searchFrom <= map.text.length - query.length) {
+    const found = map.text.indexOf(query, searchFrom);
+    if (found < 0) break;
+    candidates.push({ start: found, end: found + query.length });
+    searchFrom = found + 1;
+  }
+
+  if (candidates.length === 0) {
+    const lowerQuery = query.toLowerCase();
+    searchFrom = 0;
+    while (searchFrom <= map.lowerText.length - lowerQuery.length) {
+      const found = map.lowerText.indexOf(lowerQuery, searchFrom);
+      if (found < 0) break;
+      candidates.push({ start: found, end: found + lowerQuery.length });
+      searchFrom = found + 1;
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  const prefix = options?.prefix ? normalizeWhitespace(options.prefix) : '';
+  const suffix = options?.suffix ? normalizeWhitespace(options.suffix) : '';
+  const claimed = options?.claimedSpans ?? [];
+
+  let chosen = candidates[0]!;
+  if (candidates.length > 1) {
+    let bestScore = -1;
+    let bestUnclaimed = false;
+    for (const candidate of candidates) {
+      const before = prefix
+        ? map.text
+            .slice(Math.max(0, candidate.start - prefix.length - 8), candidate.start)
+            .trimEnd()
+        : '';
+      const after = suffix
+        ? map.text
+            .slice(candidate.end, Math.min(map.text.length, candidate.end + suffix.length + 8))
+            .trimStart()
+        : '';
+      const score =
+        scoreContextAffix(before, prefix, true) + scoreContextAffix(after, suffix, false);
+      const isUnclaimed = !claimed.some(
+        (span) => candidate.start < span.end && candidate.end > span.start,
+      );
+      if (score > bestScore || (score === bestScore && isUnclaimed && !bestUnclaimed)) {
+        bestScore = score;
+        bestUnclaimed = isUnclaimed;
+        chosen = candidate;
+      }
+    }
+  }
+
+  const startPos = map.starts[chosen.start];
+  const endPos = map.ends[chosen.end - 1];
+  if (!startPos || !endPos) return null;
+  try {
+    const range = doc.createRange();
+    range.setStart(startPos.node, startPos.offset);
+    range.setEnd(endPos.node, endPos.offset);
+    if (range.collapsed) return null;
+    options?.claimedSpans?.push(chosen);
+    return range;
+  } catch {
+    return null;
+  }
+}
+
+function extractSelectionContext(
+  doc: Document,
+  range: Range,
+): { prefix?: string; suffix?: string } {
+  const root = doc.body ?? doc.documentElement;
+  if (!root) return {};
+  try {
+    const beforeRange = doc.createRange();
+    beforeRange.selectNodeContents(root);
+    beforeRange.setEnd(range.startContainer, range.startOffset);
+    const prefix = normalizeWhitespace(beforeRange.toString()).slice(-SELECTION_CONTEXT_CHARS);
+
+    const afterRange = doc.createRange();
+    afterRange.selectNodeContents(root);
+    afterRange.setStart(range.endContainer, range.endOffset);
+    const suffix = normalizeWhitespace(afterRange.toString()).slice(0, SELECTION_CONTEXT_CHARS);
+
+    return {
+      ...(prefix ? { prefix } : {}),
+      ...(suffix ? { suffix } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
 export class ReaderSession {
   private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
@@ -314,6 +843,10 @@ export class ReaderSession {
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
+  private storedHighlights: ReaderHighlightInput[] = [];
+  private reportedMissingHighlightIds = new Set<string>();
+  private renderedListener: (() => void) | null = null;
+  private onHighlightResolution: ((resolution: ReaderHighlightResolution) => void) | null = null;
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -340,7 +873,9 @@ export class ReaderSession {
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
+    onHighlightResolution?: (resolution: ReaderHighlightResolution) => void,
   ): Promise<void> {
+    this.onHighlightResolution = onHighlightResolution ?? null;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
@@ -351,7 +886,10 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
-    this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    this.rendition.hooks.content.register(async (contents: Contents) => {
+      await this.harden(contents);
+      this.syncRenderedHighlights();
+    });
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
         const handler = () => {
@@ -366,7 +904,19 @@ export class ReaderSession {
             return;
           }
           try {
-            onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
+            const range = selection.getRangeAt(0);
+            const sectionIndex = (contents as unknown as { sectionIndex?: number }).sectionIndex;
+            const href =
+              typeof sectionIndex === 'number'
+                ? this.getSpine().sections[sectionIndex]?.href
+                : undefined;
+            const context = extractSelectionContext(contents.document, range);
+            onSelection({
+              cfi: contents.cfiFromRange(range),
+              text,
+              ...(href ? { href } : {}),
+              ...context,
+            });
           } catch {
             // Selection can change while a section is being replaced.
           }
@@ -374,6 +924,8 @@ export class ReaderSession {
         contents.document.addEventListener('selectionchange', handler);
       });
     }
+    this.renderedListener = () => this.syncRenderedHighlights();
+    this.rendition.on('displayed', this.renderedListener);
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
@@ -431,11 +983,7 @@ export class ReaderSession {
     await this.rendition.started;
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
     if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
-      }
+      if (await this.displaySavedCfi(cfi, restoreGeneration)) return;
     }
     if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
     if (
@@ -497,32 +1045,86 @@ export class ReaderSession {
     return mapItems(this.book.navigation.toc);
   }
 
-  updateHighlights(annotations: Array<{ cfi: string }>): void {
-    const rendition = this.rendition;
-    if (!rendition) return;
+  updateHighlights(annotations: readonly ReaderHighlightInput[]): void {
+    this.storedHighlights = annotations.map((annotation) => ({ ...annotation }));
+    const activeIds = new Set(
+      annotations
+        .map((annotation) => annotation.id)
+        .filter((id): id is string => typeof id === 'string'),
+    );
+    for (const id of [...this.reportedMissingHighlightIds]) {
+      if (!activeIds.has(id)) this.reportedMissingHighlightIds.delete(id);
+    }
+    this.syncRenderedHighlights();
+  }
 
-    const next = new Set(annotations.map((annotation) => annotation.cfi));
-    for (const cfi of this.highlightCfis) {
-      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+  async displayAnnotation(
+    annotation: ReaderHighlightInput,
+  ): Promise<ReaderAnnotationDisplayResult> {
+    if (!this.rendition) return { status: 'missing' };
+    const CfiClass = getEpubCfiConstructor(this.rendition);
+    if (!CfiClass) return { status: 'missing' };
+
+    const parsed = parseRuntimeCfi(annotation.cfi, CfiClass);
+    const primarySection =
+      (annotation.href ? this.findSpineSectionByHref(annotation.href) : null) ??
+      (parsed ? this.resolveSpineSectionForCfi(parsed) : null);
+
+    if (primarySection) {
+      const outcome = await this.resolveAnnotationInSection(
+        annotation,
+        parsed,
+        primarySection,
+        CfiClass,
+      );
+      if (outcome) {
+        try {
+          await this.navigate(() => this.awaitRenditionDisplay(outcome.cfi));
+          this.recordRepairedHighlight(annotation.id, outcome.cfi, primarySection.href);
+          return {
+            status: outcome.repaired ? 'repaired' : 'displayed',
+            cfi: outcome.cfi,
+            href: primarySection.href,
+          };
+        } catch {
+          return { status: 'missing' };
+        }
+      }
     }
 
-    const applied = new Set<string>();
-    for (const cfi of next) {
-      if (this.highlightCfis.has(cfi)) {
-        applied.add(cfi);
-        continue;
-      }
-      try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
-          fill: '#facc15',
-          'fill-opacity': '0.38',
+    if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
+      const { sections } = this.getSpine();
+      for (const section of sections) {
+        if (primarySection && section.index === primarySection.index) continue;
+        const loaded = await this.loadSectionDocument(section);
+        if (!loaded) continue;
+        const matchedRange = findExcerptRangeInDocument(loaded.document, annotation.excerpt, {
+          prefix: annotation.prefix,
+          suffix: annotation.suffix,
         });
-        applied.add(cfi);
-      } catch {
-        // A saved CFI can stop matching after an EPUB is replaced or changed.
+        if (!matchedRange || !loaded.cfiBase) {
+          loaded.unloadAfterFailure();
+          continue;
+        }
+        let freshCfi: string;
+        try {
+          freshCfi = new CfiClass(matchedRange, loaded.cfiBase).toString();
+        } catch {
+          loaded.unloadAfterFailure();
+          continue;
+        }
+        try {
+          await this.navigate(() => this.awaitRenditionDisplay(freshCfi));
+          this.recordRepairedHighlight(annotation.id, freshCfi, section.href);
+          return { status: 'repaired', cfi: freshCfi, href: section.href };
+        } catch {
+          loaded.unloadAfterFailure();
+          return { status: 'missing' };
+        }
       }
     }
-    this.highlightCfis = applied;
+
+    return { status: 'missing' };
   }
 
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
@@ -562,13 +1164,50 @@ export class ReaderSession {
 
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.display(href));
+    await this.navigate(() => this.awaitRenditionDisplay(href));
   }
 
-  async displayCfi(cfi: string): Promise<boolean> {
+  async displayHref(href: string): Promise<boolean> {
     if (!this.rendition) return false;
+    const section = this.findSpineSectionByHref(href);
+    if (!section) return false;
+    let target = section.href;
+    const fragment = href.includes('#') ? href.slice(href.indexOf('#') + 1).trim() : '';
+    if (fragment) {
+      const loaded = await this.loadSectionDocument(section);
+      if (loaded?.document.getElementById(fragment)) {
+        target = `${section.href}#${fragment}`;
+      }
+    }
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
+      await this.navigate(() => this.awaitRenditionDisplay(target));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async displayCfi(cfi: string, fallbackHref?: string): Promise<boolean> {
+    if (!this.rendition) return false;
+    const resolvedCfi = await this.resolveValidCfi(cfi, fallbackHref);
+    if (!resolvedCfi || !this.rendition) return false;
+    try {
+      await this.navigate(() => this.awaitRenditionDisplay(resolvedCfi));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async displayPercentageLocation(percentage: number): Promise<boolean> {
+    if (!this.rendition || !Number.isFinite(percentage) || percentage < 0) return false;
+    const { sections } = this.getSpine();
+    if (!sections.length) return false;
+    const position = Math.max(0, Math.min(0.999, percentage));
+    const section = sections[Math.floor(position * sections.length)];
+    if (!section) return false;
+    try {
+      await this.navigate(() => this.awaitRenditionDisplay(section.href));
       return true;
     } catch {
       return false;
@@ -659,6 +1298,8 @@ export class ReaderSession {
   destroy(): void {
     this.locationGeneration += 1;
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
+    if (this.rendition && this.renderedListener)
+      this.rendition.off('displayed', this.renderedListener);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
@@ -668,13 +1309,17 @@ export class ReaderSession {
     this.viewportSize = null;
     this.rendition = null;
     this.relocated = null;
+    this.renderedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
+    this.onHighlightResolution = null;
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
+    this.storedHighlights = [];
+    this.reportedMissingHighlightIds.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
@@ -750,9 +1395,49 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    if (target === undefined) await rendition.display();
-    else await rendition.display(target);
+    await this.awaitRenditionDisplay(target);
     return this.isCurrentLocationOperation(generation);
+  }
+
+  private async displaySavedCfi(
+    cfi: string,
+    generation: number,
+    fallbackHref?: string,
+  ): Promise<boolean> {
+    if (!this.rendition || !this.isCurrentLocationOperation(generation)) return false;
+    const resolvedCfi = await this.resolveValidCfi(cfi, fallbackHref);
+    if (!resolvedCfi || !this.isCurrentLocationOperation(generation)) return false;
+    try {
+      return await this.displayAtGeneration(resolvedCfi, generation);
+    } catch {
+      return false;
+    }
+  }
+
+  private async awaitRenditionDisplay(target?: string): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition) throw new Error('Reader is not open.');
+    const canListenForError =
+      typeof rendition.on === 'function' && typeof rendition.off === 'function';
+    if (!canListenForError) {
+      if (target === undefined) await rendition.display();
+      else await rendition.display(target);
+      return;
+    }
+
+    let onError: ((error: unknown) => void) | null = null;
+    const errorPromise = new Promise<never>((_, reject) => {
+      onError = (error: unknown) => {
+        reject(error instanceof Error ? error : new Error('Failed to display EPUB section.'));
+      };
+      rendition.on('displayError', onError);
+    });
+    try {
+      const displayPromise = target === undefined ? rendition.display() : rendition.display(target);
+      await Promise.race([displayPromise, errorPromise]);
+    } finally {
+      if (onError) rendition.off('displayError', onError);
+    }
   }
 
   private async displayXPath(xpath: string, generation: number): Promise<boolean> {
@@ -763,17 +1448,31 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      await rendition.display(section.href);
+      await this.awaitRenditionDisplay(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
-      const contents = (rendition.getContents() as unknown as Contents[]).find(
+      const contents = (rendition.getContents() as unknown as RenderedViewContents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
       if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
       if (!node) return false;
-      const range = contents.document.createRange();
-      range.selectNodeContents(node);
-      await rendition.display(contents.cfiFromRange(range));
+      const firstTextNode = [...node.childNodes].find(
+        (child): child is Text => child.nodeType === Node.TEXT_NODE,
+      );
+      let targetCfi: string;
+      if (firstTextNode) {
+        const range = contents.document.createRange();
+        range.setStart(firstTextNode, 0);
+        range.collapse(true);
+        targetCfi = contents.cfiFromRange(range);
+      } else if (typeof contents.cfiFromNode === 'function') {
+        targetCfi = contents.cfiFromNode(node);
+      } else {
+        const range = contents.document.createRange();
+        range.selectNodeContents(node);
+        targetCfi = contents.cfiFromRange(range);
+      }
+      await this.awaitRenditionDisplay(targetCfi);
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -838,9 +1537,476 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    void rendition.display(cfi).catch(() => {
-      // The current passage may disappear while a reflow is being applied.
+    void this.resolveValidCfi(cfi)
+      .then((resolvedCfi) => {
+        if (
+          !resolvedCfi ||
+          !this.isCurrentLocationOperation(generation) ||
+          this.userNavigationPending
+        ) {
+          return;
+        }
+        return this.awaitRenditionDisplay(resolvedCfi);
+      })
+      .catch(() => {
+        // The current passage may disappear while a reflow is being applied.
+      });
+  }
+
+  private findSpineSectionByHref(href: string): SpineSection | null {
+    const clean = normalizeSpineHref(href);
+    if (!clean) return null;
+    const { sections, indexes } = this.getSpine();
+    const candidates = [clean];
+    try {
+      const decoded = decodeURIComponent(clean);
+      if (decoded !== clean) candidates.push(decoded);
+    } catch {
+      // Ignore malformed URI escapes.
+    }
+    const encoded = encodeURI(clean);
+    if (encoded !== clean) candidates.push(encoded);
+
+    for (const candidate of candidates) {
+      const index = indexes.get(candidate);
+      if (index !== undefined) return sections[index] ?? null;
+    }
+    const spine = this.book.spine as unknown as {
+      get?: (target: string) => SpineSection | null;
+    };
+    if (typeof spine?.get === 'function') {
+      const found = spine.get(clean);
+      if (found && typeof found.href === 'string') return found;
+    }
+    return null;
+  }
+
+  private resolveSpineSectionForCfi(
+    parsed: RuntimeParsedCfi,
+    fallbackHref?: string,
+  ): SpineSection | null {
+    if (fallbackHref) {
+      const byHref = this.findSpineSectionByHref(fallbackHref);
+      if (byHref) return byHref;
+    }
+    const { sections } = this.getSpine();
+    const spineStep = parsed.base.steps[1];
+    if (spineStep?.id) {
+      const byId = sections.find(
+        (section) => section.id === spineStep.id || section.idref === spineStep.id,
+      );
+      if (byId) return byId;
+      const atPos = sections[parsed.spinePos];
+      if (atPos && !atPos.id && !atPos.idref) return atPos;
+      return null;
+    }
+    return sections[parsed.spinePos] ?? null;
+  }
+
+  private getRenderedViews(): RenderedEpubView[] {
+    const rendition = this.rendition as unknown as {
+      views?: () => { forEach?: (visit: (view: RenderedEpubView) => void) => void };
+    } | null;
+    if (!rendition || typeof rendition.views !== 'function') return [];
+    const collection = rendition.views();
+    if (!collection || typeof collection.forEach !== 'function') return [];
+    const rendered: RenderedEpubView[] = [];
+    collection.forEach((view) => {
+      if (view && view.displayed !== false && view.contents?.document) {
+        rendered.push(view);
+      }
     });
+    return rendered;
+  }
+
+  private async loadSectionDocument(section: SpineSection): Promise<{
+    document: Document;
+    cfiBase: string | undefined;
+    unloadAfterFailure: () => void;
+  } | null> {
+    const targetSection = this.findSpineSectionByHref(section.href) ?? section;
+    const rendered = this.getRenderedViews().find((view) => view.index === targetSection.index);
+    if (rendered?.contents?.document) {
+      return {
+        document: rendered.contents.document,
+        cfiBase: rendered.contents.cfiBase ?? rendered.section?.cfiBase ?? targetSection.cfiBase,
+        unloadAfterFailure: () => {},
+      };
+    }
+
+    const bookLoader = (this.book as unknown as { load?: (url: string) => Promise<Document> }).load;
+    if (typeof targetSection.load !== 'function' || typeof bookLoader !== 'function') return null;
+    const wasLoaded = Boolean(targetSection.contents && targetSection.document);
+    try {
+      await targetSection.load(bookLoader.bind(this.book));
+      const rawDoc = targetSection.document;
+      if (!rawDoc?.documentElement) {
+        if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
+        return null;
+      }
+      const hasBodyUnsafeNodes = Boolean(
+        rawDoc.querySelector(
+          'body script, body iframe, body object, body embed, body form, body meta[http-equiv]',
+        ),
+      );
+      let document = rawDoc;
+      if (hasBodyUnsafeNodes) {
+        document = rawDoc.cloneNode(true) as Document;
+        document
+          .querySelectorAll('script, iframe, object, embed, form, meta[http-equiv]')
+          .forEach((node) => node.remove());
+      }
+      return {
+        document,
+        cfiBase: targetSection.cfiBase,
+        unloadAfterFailure: () => {
+          if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
+        },
+      };
+    } catch {
+      if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
+      return null;
+    }
+  }
+
+  private async resolveValidCfi(cfi: string, fallbackHref?: string): Promise<string | null> {
+    const CfiClass = getEpubCfiConstructor(this.rendition);
+    const parsed = parseRuntimeCfi(cfi, CfiClass);
+    if (!parsed || !CfiClass) return null;
+    const section = this.resolveSpineSectionForCfi(parsed, fallbackHref);
+    if (!section) return null;
+    const loaded = await this.loadSectionDocument(section);
+    if (!loaded) return null;
+    const validated = validateAndClampReadingCfi(
+      loaded.document,
+      parsed,
+      cfi,
+      loaded.cfiBase,
+      CfiClass,
+    );
+    if (!validated) {
+      loaded.unloadAfterFailure();
+      return null;
+    }
+    return validated;
+  }
+
+  private async resolveAnnotationInSection(
+    annotation: ReaderHighlightInput,
+    parsed: RuntimeParsedCfi | null,
+    section: SpineSection,
+    CfiClass: EpubCfiConstructor,
+  ): Promise<{ cfi: string; repaired: boolean } | null> {
+    const loaded = await this.loadSectionDocument(section);
+    if (!loaded) return null;
+    const direct =
+      parsed && parsed.spinePos === section.index
+        ? this.validateHighlightRangeInDocument(
+            loaded.document,
+            parsed,
+            annotation,
+            loaded.cfiBase,
+            CfiClass,
+          )
+        : null;
+    if (direct) {
+      return { cfi: direct.cfi, repaired: direct.repaired };
+    }
+    if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
+      const matched = findExcerptRangeInDocument(loaded.document, annotation.excerpt, {
+        prefix: annotation.prefix,
+        suffix: annotation.suffix,
+      });
+      if (matched && loaded.cfiBase) {
+        try {
+          const freshCfi = new CfiClass(matched, loaded.cfiBase).toString();
+          return { cfi: freshCfi, repaired: freshCfi !== annotation.cfi };
+        } catch {
+          // Fall through and unload temporary section.
+        }
+      }
+    }
+    loaded.unloadAfterFailure();
+    return null;
+  }
+
+  private validateHighlightRangeInDocument(
+    doc: Document,
+    parsed: RuntimeParsedCfi,
+    annotation: ReaderHighlightInput,
+    cfiBase: string | undefined,
+    CfiClass: EpubCfiConstructor,
+  ): { cfi: string; range: Range; repaired: boolean } | null {
+    const range = doc.createRange();
+    let clamped: boolean;
+    if (parsed.range) {
+      const startSteps = [...parsed.path.steps, ...(parsed.start?.steps ?? [])];
+      const endSteps = [...parsed.path.steps, ...(parsed.end?.steps ?? [])];
+      const start = resolveCfiStepsInDocument(
+        doc,
+        startSteps,
+        parsed.start?.terminal?.offset ?? null,
+      );
+      const end = resolveCfiStepsInDocument(doc, endSteps, parsed.end?.terminal?.offset ?? null);
+      if (!start || !end) return null;
+      try {
+        range.setStart(start.node, start.offset);
+        range.setEnd(end.node, end.offset);
+      } catch {
+        return null;
+      }
+      clamped = start.clamped || end.clamped;
+    } else {
+      const endpoint = resolveCfiStepsInDocument(
+        doc,
+        parsed.path.steps,
+        parsed.path.terminal?.offset ?? null,
+      );
+      if (!endpoint) return null;
+      try {
+        range.selectNodeContents(endpoint.node);
+      } catch {
+        return null;
+      }
+      clamped = endpoint.clamped;
+    }
+
+    if (range.collapsed) return null;
+    const rangeText = range.toString();
+    if (!normalizeWhitespace(rangeText)) return null;
+    if (
+      annotation.excerpt !== undefined &&
+      !rangeMatchesExcerpt(rangeText, annotation.excerpt, annotation.excerpt.length >= 500)
+    ) {
+      return null;
+    }
+
+    if (!clamped) {
+      return { cfi: annotation.cfi, range, repaired: false };
+    }
+    if (!cfiBase) return null;
+    try {
+      const freshCfi = new CfiClass(range, cfiBase).toString();
+      return { cfi: freshCfi, range, repaired: freshCfi !== annotation.cfi };
+    } catch {
+      return null;
+    }
+  }
+
+  private isHighlightCandidateForView(
+    annotation: ReaderHighlightInput,
+    parsed: RuntimeParsedCfi | null,
+    viewIndex: number,
+    viewHref: string,
+  ): { matches: boolean; authoritative: boolean } {
+    if (annotation.href) {
+      const byHref = this.findSpineSectionByHref(annotation.href);
+      if (byHref) {
+        const same = byHref.index === viewIndex || normalizeSpineHref(viewHref) === byHref.href;
+        return { matches: same, authoritative: same };
+      }
+    }
+    if (!parsed) {
+      return { matches: Boolean(annotation.excerpt), authoritative: false };
+    }
+    const targetSection = this.resolveSpineSectionForCfi(parsed);
+    if (!targetSection) {
+      return { matches: Boolean(annotation.excerpt), authoritative: false };
+    }
+    const same = targetSection.index === viewIndex;
+    return { matches: same, authoritative: same };
+  }
+
+  private isRangeUsableOnView(view: RenderedEpubView, cfi: string): boolean {
+    if (!view.contents || typeof view.contents.range !== 'function') return false;
+    try {
+      const resolved = view.contents.range(cfi);
+      return Boolean(resolved && !resolved.collapsed);
+    } catch {
+      return false;
+    }
+  }
+
+  private recordRepairedHighlight(id: string | undefined, cfi: string, href: string): void {
+    if (!id) return;
+    this.reportedMissingHighlightIds.delete(id);
+    this.storedHighlights = this.storedHighlights.map((item) =>
+      item.id === id ? { ...item, cfi, href } : item,
+    );
+  }
+
+  private syncRenderedHighlights(): void {
+    const rendition = this.rendition;
+    if (!rendition) return;
+
+    const hasViewsMethod =
+      typeof (rendition as unknown as { views?: unknown }).views === 'function';
+    if (!hasViewsMethod) {
+      const next = new Set(this.storedHighlights.map((annotation) => annotation.cfi));
+      for (const cfi of this.highlightCfis) {
+        if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+      }
+      const applied = new Set<string>();
+      for (const cfi of next) {
+        if (this.highlightCfis.has(cfi)) {
+          applied.add(cfi);
+          continue;
+        }
+        try {
+          rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
+            fill: '#facc15',
+            'fill-opacity': '0.38',
+          });
+          applied.add(cfi);
+        } catch {
+          // A saved CFI can stop matching after an EPUB is replaced or changed.
+        }
+      }
+      this.highlightCfis = applied;
+      return;
+    }
+
+    const renderedViews = this.getRenderedViews();
+    if (renderedViews.length === 0) return;
+
+    const CfiClass = getEpubCfiConstructor(rendition);
+    const desired = new Set<string>();
+    const repaired: Array<{ id: string; cfi: string; href: string }> = [];
+    const newlyMissingIds: string[] = [];
+
+    for (const view of renderedViews) {
+      const contents = view.contents;
+      if (!contents?.document) continue;
+      const viewHref = view.section?.href ?? this.getSpine().sections[view.index]?.href ?? '';
+      const cfiBase = contents.cfiBase ?? view.section?.cfiBase;
+      const claimedSpans: ClaimedTextSpan[] = [];
+      let cachedMap: DocumentTextMap | null = null;
+      const getTextMap = (): DocumentTextMap => {
+        if (!cachedMap) cachedMap = buildDocumentTextMap(contents.document);
+        return cachedMap;
+      };
+
+      for (const annotation of this.storedHighlights) {
+        const parsed = CfiClass ? parseRuntimeCfi(annotation.cfi, CfiClass) : null;
+        const candidate = this.isHighlightCandidateForView(
+          annotation,
+          parsed,
+          view.index,
+          viewHref,
+        );
+        if (!candidate.matches) continue;
+
+        let resolvedCfi: string | null = null;
+        let wasRepaired = false;
+
+        if (parsed && CfiClass && parsed.spinePos === view.index) {
+          const validated = this.validateHighlightRangeInDocument(
+            contents.document,
+            parsed,
+            annotation,
+            cfiBase,
+            CfiClass,
+          );
+          if (validated) {
+            if (this.isRangeUsableOnView(view, validated.cfi)) {
+              resolvedCfi = validated.cfi;
+              wasRepaired = validated.repaired;
+              if (annotation.excerpt) {
+                recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
+              }
+            } else if (typeof contents.cfiFromRange === 'function') {
+              try {
+                const regenerated = contents.cfiFromRange(validated.range);
+                if (this.isRangeUsableOnView(view, regenerated)) {
+                  resolvedCfi = regenerated;
+                  wasRepaired = regenerated !== annotation.cfi;
+                  if (annotation.excerpt) {
+                    recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
+                  }
+                }
+              } catch {
+                // Fall back to excerpt search below.
+              }
+            }
+          }
+        }
+
+        if (!resolvedCfi && annotation.excerpt && typeof contents.cfiFromRange === 'function') {
+          const matchedRange = findExcerptRangeInDocument(contents.document, annotation.excerpt, {
+            prefix: annotation.prefix,
+            suffix: annotation.suffix,
+            textMap: getTextMap(),
+            claimedSpans,
+          });
+          if (matchedRange) {
+            try {
+              const freshCfi = contents.cfiFromRange(matchedRange);
+              if (this.isRangeUsableOnView(view, freshCfi)) {
+                resolvedCfi = freshCfi;
+                wasRepaired = freshCfi !== annotation.cfi || annotation.href !== viewHref;
+              }
+            } catch {
+              resolvedCfi = null;
+            }
+          }
+        }
+
+        if (resolvedCfi) {
+          desired.add(resolvedCfi);
+          if (annotation.id) this.reportedMissingHighlightIds.delete(annotation.id);
+          if (wasRepaired && annotation.id && viewHref) {
+            repaired.push({ id: annotation.id, cfi: resolvedCfi, href: viewHref });
+          }
+        } else if (
+          candidate.authoritative &&
+          annotation.id &&
+          !this.reportedMissingHighlightIds.has(annotation.id)
+        ) {
+          this.reportedMissingHighlightIds.add(annotation.id);
+          newlyMissingIds.push(annotation.id);
+        }
+      }
+    }
+
+    for (const cfi of this.highlightCfis) {
+      if (!desired.has(cfi)) {
+        try {
+          rendition.annotations.remove(cfi, 'highlight');
+        } catch {
+          // Ignore removal errors on destroyed views.
+        }
+      }
+    }
+
+    const applied = new Set<string>();
+    for (const cfi of desired) {
+      if (this.highlightCfis.has(cfi)) {
+        applied.add(cfi);
+        continue;
+      }
+      try {
+        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
+          fill: '#facc15',
+          'fill-opacity': '0.38',
+        });
+        applied.add(cfi);
+      } catch {
+        // Skip unrenderable ranges without aborting remaining chapter highlights.
+      }
+    }
+    this.highlightCfis = applied;
+
+    if (repaired.length > 0) {
+      const repairById = new Map(repaired.map((entry) => [entry.id, entry]));
+      this.storedHighlights = this.storedHighlights.map((item) => {
+        const repair = item.id ? repairById.get(item.id) : undefined;
+        return repair ? { ...item, cfi: repair.cfi, href: repair.href } : item;
+      });
+    }
+
+    if ((repaired.length > 0 || newlyMissingIds.length > 0) && this.onHighlightResolution) {
+      this.onHighlightResolution({ repaired, missingIds: newlyMissingIds });
+    }
   }
 
   private getSpine(): NonNullable<ReaderSession['spine']> {

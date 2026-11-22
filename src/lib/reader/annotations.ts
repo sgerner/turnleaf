@@ -1,9 +1,40 @@
+export interface AnnotationMetadata {
+  href?: string | undefined;
+  prefix?: string | undefined;
+  suffix?: string | undefined;
+}
+
+export interface AnnotationRepair {
+  id: string;
+  cfi: string;
+  href?: string | undefined;
+}
+
 export interface StoredAnnotation {
   id: string;
   cfi: string;
   excerpt: string;
   note: string;
   createdAt: string;
+  href?: string;
+  prefix?: string;
+  suffix?: string;
+}
+
+const MAX_CONTEXT_LENGTH = 120;
+
+function optionalText(value: string | undefined, maxLength?: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  return maxLength !== undefined ? normalized.slice(0, maxLength) : normalized;
+}
+
+function optionalPrefix(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  return normalized.slice(-MAX_CONTEXT_LENGTH);
 }
 
 function isAnnotation(value: unknown): value is StoredAnnotation {
@@ -14,7 +45,10 @@ function isAnnotation(value: unknown): value is StoredAnnotation {
     typeof annotation.cfi === 'string' &&
     typeof annotation.excerpt === 'string' &&
     typeof annotation.note === 'string' &&
-    typeof annotation.createdAt === 'string'
+    typeof annotation.createdAt === 'string' &&
+    (annotation.href === undefined || typeof annotation.href === 'string') &&
+    (annotation.prefix === undefined || typeof annotation.prefix === 'string') &&
+    (annotation.suffix === undefined || typeof annotation.suffix === 'string')
   );
 }
 
@@ -34,14 +68,25 @@ export function addAnnotation(
   excerpt: string,
   note: string,
   createdAt = new Date().toISOString(),
+  metadata?: AnnotationMetadata,
 ): StoredAnnotation[] {
   const trimmedCfi = cfi.trim();
   const trimmedExcerpt = excerpt.trim();
   if (!trimmedCfi || !trimmedExcerpt) return annotations;
+  const href = optionalText(metadata?.href?.split('#', 1)[0]);
+  const prefix = optionalPrefix(metadata?.prefix);
+  const suffix = optionalText(metadata?.suffix, MAX_CONTEXT_LENGTH);
+  const optionalFields: Partial<Pick<StoredAnnotation, 'href' | 'prefix' | 'suffix'>> = {
+    ...(href ? { href } : {}),
+    ...(prefix ? { prefix } : {}),
+    ...(suffix ? { suffix } : {}),
+  };
   const existing = annotations.find((annotation) => annotation.cfi === trimmedCfi);
   if (existing) {
     return annotations.map((annotation) =>
-      annotation.id === existing.id ? { ...annotation, note: note.trim() } : annotation,
+      annotation.id === existing.id
+        ? { ...annotation, ...optionalFields, note: note.trim().slice(0, 2000) }
+        : annotation,
     );
   }
   return [
@@ -52,8 +97,33 @@ export function addAnnotation(
       excerpt: trimmedExcerpt.slice(0, 500),
       note: note.trim().slice(0, 2000),
       createdAt,
+      ...optionalFields,
     },
   ].slice(-200);
+}
+
+export function repairAnnotations(
+  annotations: StoredAnnotation[],
+  repairs: readonly AnnotationRepair[],
+): StoredAnnotation[] {
+  if (!repairs.length) return annotations;
+  const byId = new Map(repairs.map((repair) => [repair.id, repair]));
+  let changed = false;
+  const next = annotations.map((annotation) => {
+    const repair = byId.get(annotation.id);
+    if (!repair) return annotation;
+    const trimmedCfi = repair.cfi.trim();
+    if (!trimmedCfi) return annotation;
+    const href = optionalText(repair.href?.split('#', 1)[0]) ?? annotation.href;
+    if (trimmedCfi === annotation.cfi && href === annotation.href) return annotation;
+    changed = true;
+    return {
+      ...annotation,
+      cfi: trimmedCfi,
+      ...(href ? { href } : {}),
+    };
+  });
+  return changed ? next : annotations;
 }
 
 export function updateAnnotation(
