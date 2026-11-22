@@ -89,6 +89,7 @@
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
+    onReaderOpenChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -99,6 +100,7 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
@@ -718,6 +720,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1697,6 +1700,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
