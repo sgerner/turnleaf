@@ -2,10 +2,10 @@
 
 - Native auth keys never enter localStorage, SQLite, diagnostics, or logs.
 - Native credentials use `@aparajita/capacitor-secure-storage`: Android AES-GCM with a Keystore key and iOS Keychain without iCloud synchronization.
-- API keys use the `x-api-key` header and are not placed in Kavita cover or download URLs.
-- EPUBs and SQLite live in app-private storage.
+- API keys use the `x-api-key` header and are not placed in Kavita cover or download URLs; native API, cover, and EPUB download requests enforce same-origin redirect limits and block HTTPS-to-HTTP downgrades before forwarding credentials.
+- EPUBs, cached covers, and SQLite live in app-private storage, and merged Android manifests declare only `INTERNET` and `ACCESS_NETWORK_STATE` with zero external storage permissions across Android 7 through 16.
 - Android backup and device-transfer extraction are disabled for app data so downloaded books, cached covers, and local reading state are not copied into Android cloud backup.
-- The Android `FileProvider` is not exported and is limited to a private cache subdirectory.
+- The Android `FileProvider` is not exported and is limited to the private `shared/` cache subdirectory used only when staging temporary Markdown note exports for the system share sheet.
 - The application CSP disallows inline scripts, objects, forms, and arbitrary script origins.
 - EPUB rendition iframes omit `allow-scripts`; content hooks remove scripts, nested frames, objects, embeds, and forms and block external link activation.
 - `allow-same-origin` is required for semantic range/CFI access. With scripts disabled, book content cannot execute code through that origin.

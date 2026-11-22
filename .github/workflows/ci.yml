@@ -61,6 +61,10 @@ jobs:
     needs: web-and-android-checks
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [29, 36]
 
     steps:
       - name: Check out source
@@ -95,13 +99,14 @@ jobs:
             sudo chmod g+rw /dev/kvm
           fi
 
-      - name: Verify the Android reading journey
+      - name: Verify the Android reading journey (API ${{ matrix.api-level }})
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 36
+          api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64
           profile: pixel_6
+          avd-name: turnleaf_api${{ matrix.api-level }}
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
           force-avd-creation: true
           emulator-boot-timeout: 900

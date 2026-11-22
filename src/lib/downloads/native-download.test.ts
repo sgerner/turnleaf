@@ -1,12 +1,27 @@
 // @vitest-environment node
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  ALLOWED_ANDROID_PERMISSIONS,
+  assertMergedManifestPermissions,
+  extractManifestPermissions,
+  mergedManifestPath,
+} from '../../../scripts/check-android-manifest.mjs';
 
 const native = vi.hoisted(() => ({
   body: new Uint8Array(),
   deleted: [] as string[],
   renamed: false,
+  progressListener: null as
+    | ((event: {
+        transferId?: string;
+        url: string;
+        bytes: number;
+        contentLength: number;
+        lengthComputable: boolean;
+      }) => void)
+    | null,
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -16,9 +31,11 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
-vi.mock('@capacitor/file-transfer', () => ({
-  FileTransfer: {
+vi.mock('../native/private-transfer', () => ({
+  PRIVATE_TRANSFER_CONNECTION_FAILED: 'PRIVATE_TRANSFER_CONNECTION_FAILED',
+  PrivateTransfer: {
     downloadFile: vi.fn(),
+    addListener: vi.fn(),
   },
 }));
 
@@ -29,14 +46,17 @@ vi.mock('@capacitor/filesystem', () => ({
     mkdir: vi.fn(),
     getUri: vi.fn(),
     readFile: vi.fn(),
+    writeFile: vi.fn(),
     rename: vi.fn(),
     deleteFile: vi.fn(),
+    readdir: vi.fn(),
+    rmdir: vi.fn(),
   },
 }));
 
-import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import { PRIVATE_TRANSFER_CONNECTION_FAILED, PrivateTransfer } from '../native/private-transfer';
 import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
@@ -48,10 +68,18 @@ beforeEach(() => {
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
-  vi.mocked(FileTransfer.downloadFile)
+  native.progressListener = null;
+  vi.mocked(PrivateTransfer.downloadFile)
     .mockReset()
-    .mockResolvedValue({} as never);
+    .mockResolvedValue({ status: 200, bytesWritten: 64 });
+  vi.mocked(PrivateTransfer.addListener)
+    .mockReset()
+    .mockImplementation(async (_event, listener) => {
+      native.progressListener = listener;
+      return { remove: vi.fn(async () => {}) };
+    });
   vi.mocked(Filesystem.mkdir).mockReset().mockResolvedValue(undefined);
+  vi.mocked(Filesystem.readdir).mockReset().mockResolvedValue({ files: [] });
   vi.mocked(Filesystem.rename)
     .mockReset()
     .mockImplementation(async () => {
@@ -90,32 +118,36 @@ afterEach(() => vi.useRealTimers());
 
 describe('native EPUB download boundary', () => {
   it.each([
-    { code: 'OS-PLUG-FLTR-0008' },
+    { reject: { code: PRIVATE_TRANSFER_CONNECTION_FAILED }, expectedStatus: undefined },
     {
-      code: 'OS-PLUG-FLTR-0010',
-      data: { httpStatus: 503, body: 'private book title', source: 'https://private.example' },
+      resolve: { status: 503, bytesWritten: 0 },
+      expectedStatus: 503,
     },
-  ])('retries a transient transfer failure and validates the replacement', async (error) => {
+  ])('retries a transient transfer failure and validates the replacement', async (scenario) => {
     vi.useFakeTimers();
-    vi.mocked(FileTransfer.downloadFile)
-      .mockRejectedValueOnce(error)
-      .mockImplementationOnce(async () => {
-        expect(native.deleted).toEqual(['books/server-book.epub.partial']);
-        native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
-        return {};
-      });
+    if ('reject' in scenario && scenario.reject) {
+      vi.mocked(PrivateTransfer.downloadFile).mockRejectedValueOnce(scenario.reject);
+    } else if ('resolve' in scenario && scenario.resolve) {
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce(scenario.resolve);
+    }
+    vi.mocked(PrivateTransfer.downloadFile).mockImplementationOnce(async () => {
+      expect(native.deleted).toEqual(['books/server-book.epub.partial']);
+      const epubBytes = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+      native.body = epubBytes;
+      return { status: 200, bytesWritten: epubBytes.length };
+    });
 
     const result = expect(
       downloadEpub('https://private.example/download', 'secret', 'server-book'),
     ).resolves.toMatchObject({ relativePath: 'books/server-book.epub' });
     await Promise.all([result, vi.runAllTimersAsync()]);
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(2);
     expect(native.renamed).toBe(true);
     const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
     expect(log).toContain('endpoint=/api/Download/chapter');
     expect(log).toContain('detail=download-retry');
-    if (error.data) expect(log).toContain('status=503');
+    if (scenario.expectedStatus) expect(log).toContain(`status=${scenario.expectedStatus}`);
     expect(log).not.toMatch(/private|secret|server-book/);
   });
 
@@ -124,18 +156,130 @@ describe('native EPUB download boundary', () => {
     { status: 503, attempts: 2 },
   ])('stops after $attempts attempt(s) on HTTP $status', async ({ status, attempts }) => {
     vi.useFakeTimers();
-    vi.mocked(FileTransfer.downloadFile).mockRejectedValue({
-      code: 'OS-PLUG-FLTR-0010',
-      data: { httpStatus: status },
+    vi.mocked(PrivateTransfer.downloadFile).mockResolvedValue({
+      status,
+      bytesWritten: 0,
     });
     const result = expect(
       downloadEpub('https://books.example.com/download', 'secret', 'server-book'),
     ).rejects.toMatchObject({ status });
     await Promise.all([result, vi.runAllTimersAsync()]);
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(attempts);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(attempts);
     expect(native.deleted).toHaveLength(attempts);
     expect(native.renamed).toBe(false);
+  });
+
+  it('follows same-origin redirects and preserves byte progress updates', async () => {
+    const epubBytes = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+    native.body = epubBytes;
+    const progressUpdates: number[] = [];
+
+    vi.mocked(PrivateTransfer.downloadFile)
+      .mockResolvedValueOnce({
+        status: 302,
+        location: '/kavita/api/Download/chapter?chapterId=9',
+        bytesWritten: 0,
+      })
+      .mockImplementationOnce(async (options) => {
+        native.progressListener?.({
+          ...(options.transferId ? { transferId: options.transferId } : {}),
+          url: options.url,
+          bytes: Math.ceil(epubBytes.length / 2),
+          contentLength: epubBytes.length,
+          lengthComputable: true,
+        });
+        native.progressListener?.({
+          ...(options.transferId ? { transferId: options.transferId } : {}),
+          url: options.url,
+          bytes: epubBytes.length,
+          contentLength: epubBytes.length,
+          lengthComputable: true,
+        });
+        return { status: 200, bytesWritten: epubBytes.length };
+      });
+
+    await expect(
+      downloadEpub('https://books.example.com/download', 'secret', 'server-book', (percent) => {
+        progressUpdates.push(percent);
+      }),
+    ).resolves.toMatchObject({
+      relativePath: 'books/server-book.epub',
+      size: epubBytes.length,
+    });
+
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[0]?.[0]).toMatchObject({
+      url: 'https://books.example.com/download',
+      relativePath: 'books/server-book.epub.partial',
+      headers: { 'x-api-key': 'secret' },
+    });
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[1]?.[0]).toMatchObject({
+      url: 'https://books.example.com/kavita/api/Download/chapter?chapterId=9',
+      relativePath: 'books/server-book.epub.partial',
+      headers: { 'x-api-key': 'secret' },
+    });
+    expect(progressUpdates).toEqual([50, 100]);
+    expect(native.renamed).toBe(true);
+  });
+
+  it.each([
+    {
+      label: 'cross-origin redirect',
+      location: 'https://evil.example.com/steal.epub',
+      expectedMessage: /different server/i,
+    },
+    {
+      label: 'HTTPS-to-HTTP downgrade',
+      location: 'http://books.example.com/download',
+      expectedMessage: /HTTPS to HTTP/i,
+    },
+    {
+      label: 'sensitive query parameter redirect',
+      location: 'https://books.example.com/download?apiKey=leaked',
+      expectedMessage: /different server/i,
+    },
+  ])(
+    'blocks $label before forwarding credentials and cleans up partial files',
+    async ({ location, expectedMessage }) => {
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+        status: 302,
+        location,
+        bytesWritten: 0,
+      });
+
+      await expect(
+        downloadEpub('https://books.example.com/download', 'secret', 'server-book'),
+      ).rejects.toThrow(expectedMessage);
+
+      expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
+      expect(native.renamed).toBe(false);
+      expect(native.deleted).toEqual(['books/server-book.epub.partial']);
+    },
+  );
+
+  it('rejects redirect loops and enforces the 5-redirect cap without retrying', async () => {
+    vi.mocked(PrivateTransfer.downloadFile)
+      .mockResolvedValueOnce({ status: 302, location: '/step-1' })
+      .mockResolvedValueOnce({ status: 302, location: '/download' });
+
+    await expect(
+      downloadEpub('https://books.example.com/download', 'secret', 'server-book'),
+    ).rejects.toThrow(/redirected in a loop/i);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(2);
+
+    vi.mocked(PrivateTransfer.downloadFile).mockReset();
+    for (let step = 1; step <= 6; step += 1) {
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+        status: 302,
+        location: `/hop-${step}`,
+      });
+    }
+
+    await expect(
+      downloadEpub('https://books.example.com/start', 'secret', 'server-book'),
+    ).rejects.toThrow(/redirected too many times/i);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(6);
   });
 
   it('removes an HTML/error body from the partial path before rename', async () => {
@@ -145,7 +289,7 @@ describe('native EPUB download boundary', () => {
 
     expect(native.renamed).toBe(false);
     expect(native.deleted).toContain('books/server-book.epub.partial');
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
   });
 
   it('does not inspect or delete a path outside the private books directory', async () => {
@@ -201,6 +345,121 @@ describe('native cover cache', () => {
       directory: 'DATA',
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('streams a missing cover into app-private storage and renames atomically', async () => {
+    vi.mocked(Filesystem.stat)
+      .mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' })
+      .mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' })
+      .mockResolvedValueOnce({
+        type: 'file',
+        size: 128,
+        name: 'covers/server_1/7.img.partial',
+        mtime: 0,
+        uri: 'file://covers/server_1/7.img.partial',
+      });
+
+    await expect(
+      cacheCover('https://books.example.com/cover', 'secret', 7, undefined, 'server:1'),
+    ).resolves.toBe('web://file://covers/server_1/7.img');
+
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledExactlyOnceWith({
+      url: 'https://books.example.com/cover',
+      relativePath: 'covers/server_1/7.img.partial',
+      headers: { 'x-api-key': 'secret' },
+      connectTimeout: 5_000,
+      readTimeout: 5_000,
+    });
+    expect(Filesystem.rename).toHaveBeenCalledExactlyOnceWith({
+      from: 'covers/server_1/7.img.partial',
+      to: 'covers/server_1/7.img',
+      directory: 'DATA',
+    });
+  });
+
+  it('blocks HTTPS-to-HTTP downgrade redirects on cover fetches before sending credentials', async () => {
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+      status: 301,
+      location: 'http://books.example.com/cover',
+      bytesWritten: 0,
+    });
+
+    await expect(cacheCover('https://books.example.com/cover', 'secret', 7)).rejects.toThrow(
+      /HTTPS to HTTP/i,
+    );
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(native.deleted).toContain('covers/default/7.img.partial');
+  });
+});
+
+describe('Android manifest and storage permission bounds', () => {
+  it('omits @capacitor/file-transfer and preserves SDK 24-36 and unexported cache FileProvider bounds', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    expect(packageJson.dependencies).not.toHaveProperty('@capacitor/file-transfer');
+    expect(packageJson.devDependencies).not.toHaveProperty('@capacitor/file-transfer');
+
+    const variablesGradle = readFileSync('android/variables.gradle', 'utf8');
+    expect(variablesGradle).toMatch(/\bminSdkVersion\s*=\s*24\b/);
+    expect(variablesGradle).toMatch(/\btargetSdkVersion\s*=\s*36\b/);
+
+    const filePathsXml = readFileSync('android/app/src/main/res/xml/file_paths.xml', 'utf8');
+    expect(filePathsXml).toContain('<cache-path name="shared_cache" path="shared/" />');
+    expect(filePathsXml).not.toMatch(
+      /external-path|external-files-path|external-cache-path|root-path/,
+    );
+
+    const sourceManifest = readFileSync('android/app/src/main/AndroidManifest.xml', 'utf8');
+    expect(extractManifestPermissions(sourceManifest)).toEqual(['android.permission.INTERNET']);
+    expect(sourceManifest).toContain('android:name="androidx.core.content.FileProvider"');
+    expect(sourceManifest).toContain('android:exported="false"');
+  });
+
+  it('enforces that merged Android manifests declare only INTERNET and ACCESS_NETWORK_STATE', () => {
+    const validMergedManifest = `<?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="app.turnleaf.reader">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <uses-permission android:name="app.turnleaf.reader.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+      </manifest>`;
+    expect(assertMergedManifestPermissions(validMergedManifest)).toEqual(
+      ALLOWED_ANDROID_PERMISSIONS,
+    );
+
+    const legacyStorageManifest = `<?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="app.turnleaf.reader">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+      </manifest>`;
+    expect(() => assertMergedManifestPermissions(legacyStorageManifest)).toThrow(
+      /READ_EXTERNAL_STORAGE/,
+    );
+
+    const unexpectedPermissionManifest = `<?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="app.turnleaf.reader">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+      </manifest>`;
+    expect(() => assertMergedManifestPermissions(unexpectedPermissionManifest)).toThrow(
+      /USE_BIOMETRIC/,
+    );
+
+    for (const variant of ['debug', 'release'] as const) {
+      const path = mergedManifestPath(variant);
+      if (existsSync(path)) {
+        expect(assertMergedManifestPermissions(readFileSync(path, 'utf8'), variant)).toEqual(
+          ALLOWED_ANDROID_PERMISSIONS,
+        );
+      }
+    }
   });
 });

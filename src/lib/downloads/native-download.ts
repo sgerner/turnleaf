@@ -1,7 +1,12 @@
 import { Capacitor } from '@capacitor/core';
-import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { recordDiagnostic } from '../diagnostics/log';
+import { KavitaError, assertRedirectLimit, redirectTarget } from '../kavita/client';
+import {
+  PRIVATE_TRANSFER_CONNECTION_FAILED,
+  PrivateTransfer,
+  type PrivateDownloadResult,
+} from '../native/private-transfer';
 import { EpubValidationError, validateEpubArchive } from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
@@ -9,6 +14,7 @@ const PARTIAL_SUFFIX = '.partial';
 export const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 500, 502, 503, 504]);
 let interruptedDownloadCleanup: Promise<void> | undefined;
+let nextTransferSequence = 0;
 
 export class EpubTransferError extends Error {
   constructor(
@@ -49,11 +55,12 @@ function assertSafeBookId(bookId: string): void {
 
 function assertSafeBookPath(path: string): void {
   const segments = path.split('/');
+  const leaf = segments[segments.length - 1];
   if (
     !path.startsWith(`${BOOK_DIRECTORY}/`) ||
     segments.some((segment) => !segment || segment === '.' || segment === '..') ||
     path.includes('\\') ||
-    segments.at(-1)?.toLowerCase().endsWith('.epub') !== true
+    leaf?.toLowerCase().endsWith('.epub') !== true
   ) {
     throw new Error('Invalid downloaded EPUB path.');
   }
@@ -78,6 +85,66 @@ async function ensureDataDirectory(path: string): Promise<void> {
     await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true });
   } catch (error) {
     if ((error as { code?: unknown } | null)?.code !== 'OS-PLUG-FILE-0010') throw error;
+  }
+}
+
+async function downloadWithSafeRedirects(options: {
+  url: string;
+  relativePath: string;
+  apiKey: string;
+  connectTimeout?: number;
+  readTimeout?: number;
+  progress?: boolean;
+  transferId?: string;
+  signal?: AbortSignal;
+  onHopUrl?: (url: string) => void;
+}): Promise<PrivateDownloadResult> {
+  let initial: URL;
+  try {
+    initial = new URL(options.url);
+  } catch {
+    throw new Error('Invalid Kavita download address.');
+  }
+  if (initial.protocol !== 'http:' && initial.protocol !== 'https:') {
+    throw new Error('Invalid Kavita download address.');
+  }
+  const serverOrigin = initial.origin;
+  let currentUrl = initial.toString();
+  const visited = new Set([currentUrl]);
+  let redirectCount = 0;
+
+  while (true) {
+    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    options.onHopUrl?.(currentUrl);
+    const response = await PrivateTransfer.downloadFile({
+      url: currentUrl,
+      relativePath: options.relativePath,
+      headers: { 'x-api-key': options.apiKey },
+      ...(options.connectTimeout !== undefined ? { connectTimeout: options.connectTimeout } : {}),
+      ...(options.readTimeout !== undefined ? { readTimeout: options.readTimeout } : {}),
+      ...(options.progress ? { progress: true } : {}),
+      ...(options.transferId ? { transferId: options.transferId } : {}),
+    });
+    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+    const nextUrl = redirectTarget(
+      response.status,
+      response.location ?? null,
+      currentUrl,
+      serverOrigin,
+      'GET',
+    );
+    if (!nextUrl) return response;
+    assertRedirectLimit(++redirectCount, response.status);
+    if (visited.has(nextUrl)) {
+      throw new KavitaError(
+        'Kavita redirected in a loop. Check the saved server address.',
+        'server',
+        response.status,
+      );
+    }
+    visited.add(nextUrl);
+    currentUrl = nextUrl;
   }
 }
 
@@ -116,12 +183,15 @@ export async function downloadEpub(
   await ensureDataDirectory(BOOK_DIRECTORY);
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}${PARTIAL_SUFFIX}`;
-  const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+  const transferId = `epub-${++nextTransferSequence}`;
+  let activeUrl = downloadUrl;
   const listener = onProgress
-    ? await FileTransfer.addListener('progress', (event) => {
+    ? await PrivateTransfer.addListener('progress', (event) => {
+        const matchesTransfer = event.transferId
+          ? event.transferId === transferId
+          : event.url === activeUrl;
         if (
-          event.type === 'download' &&
-          event.url === downloadUrl &&
+          matchesTransfer &&
           event.lengthComputable &&
           event.contentLength > 0 &&
           Number.isFinite(event.bytes)
@@ -136,24 +206,31 @@ export async function downloadEpub(
   try {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        await FileTransfer.downloadFile({
+        const response = await downloadWithSafeRedirects({
           url: downloadUrl,
-          path: destination.uri,
-          headers: { 'x-api-key': apiKey },
-          ...(listener ? { progress: true } : {}),
+          relativePath: temporaryPath,
+          apiKey,
+          onHopUrl: (url) => {
+            activeUrl = url;
+          },
+          ...(listener ? { progress: true, transferId } : {}),
         });
-        break;
-      } catch (error) {
-        const failure = error as { code?: unknown; data?: { httpStatus?: unknown } } | null;
-        const httpStatus = failure?.data?.httpStatus;
         const status =
-          typeof httpStatus === 'number' &&
-          Number.isInteger(httpStatus) &&
-          httpStatus >= 100 &&
-          httpStatus <= 599
-            ? httpStatus
+          Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+            ? response.status
             : undefined;
-        const connectionFailed = failure?.code === 'OS-PLUG-FLTR-0008';
+        if (status !== undefined && status >= 200 && status < 300) {
+          break;
+        }
+        throw new EpubTransferError(status, false);
+      } catch (error) {
+        if (error instanceof KavitaError) throw error;
+        const status = error instanceof EpubTransferError ? error.status : undefined;
+        const code = (error as { code?: unknown } | null)?.code;
+        const connectionFailed =
+          error instanceof EpubTransferError
+            ? error.connectionFailed
+            : code === PRIVATE_TRANSFER_CONNECTION_FAILED;
         const retryable =
           status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
         if (attempt > 0 || !retryable) throw new EpubTransferError(status, connectionFailed);
@@ -266,15 +343,19 @@ export async function cacheCover(
     if (!allowDownload) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
-    const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
     try {
-      await FileTransfer.downloadFile({
+      const response = await downloadWithSafeRedirects({
         url: downloadUrl,
-        path: temporary.uri,
-        headers: { 'x-api-key': apiKey },
+        relativePath: temporaryPath,
+        apiKey,
         connectTimeout: 5_000,
         readTimeout: 5_000,
+        ...(signal ? { signal } : {}),
       });
+      if (response.status < 200 || response.status >= 300) {
+        throw new EpubTransferError(response.status, false);
+      }
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)
         throw new Error('Kavita returned an empty cover.');

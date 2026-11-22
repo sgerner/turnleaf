@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { tick, onDestroy, onMount } from 'svelte';
@@ -8,6 +7,7 @@
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
+  import { exportAnnotationsMarkdown, type AnnotationExportMode } from '../native/note-export';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
   import { createReaderNativeFeatures } from '../native/reader-native-features';
@@ -702,40 +702,16 @@
     }
   }
 
-  async function exportAnnotations(copy = false): Promise<void> {
+  async function exportAnnotations(mode: AnnotationExportMode = 'save'): Promise<void> {
     if (!annotations.length || exporting) return;
     exportMessage = '';
-    exportFallback = '';
+    if (mode === 'copy') exportFallback = '';
     exporting = true;
     const markdown = annotationsMarkdown(title, annotations);
-    const name = title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'book';
     try {
-      if (copy) {
-        await navigator.clipboard.writeText(markdown);
-        exportMessage = 'Markdown copied.';
-      } else if (Capacitor.isNativePlatform()) {
-        const filename = `${name}-notes-${Date.now()}.md`;
-        await Filesystem.writeFile({
-          path: filename,
-          data: markdown,
-          directory: Directory.Documents,
-          encoding: Encoding.UTF8,
-        });
-        exportMessage = `Saved to Documents as ${filename}.`;
-      } else {
-        const blob = new Blob([markdown], { type: 'text/markdown' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${name}-notes.md`;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      }
-    } catch {
-      exportFallback = markdown;
-      exportMessage = 'Copy the Markdown from the field below.';
+      const outcome = await exportAnnotationsMarkdown(title, markdown, mode);
+      exportMessage = outcome.message;
+      exportFallback = outcome.fallback;
     } finally {
       exporting = false;
     }
@@ -1914,15 +1890,25 @@
             <button
               class="btn btn-sm preset-tonal-surface"
               type="button"
-              onclick={() => void exportAnnotations()}
+              onclick={() => void exportAnnotations('save')}
               disabled={annotations.length === 0 || exporting}
             >
               Export Markdown
             </button>
+            {#if Capacitor.isNativePlatform()}
+              <button
+                class="btn btn-sm preset-tonal-surface"
+                type="button"
+                onclick={() => void exportAnnotations('share')}
+                disabled={annotations.length === 0 || exporting}
+              >
+                Share Markdown
+              </button>
+            {/if}
             <button
               class="btn btn-sm preset-tonal-surface"
               type="button"
-              onclick={() => void exportAnnotations(true)}
+              onclick={() => void exportAnnotations('copy')}
               disabled={annotations.length === 0 || exporting}
             >
               Copy Markdown

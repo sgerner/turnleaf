@@ -1,5 +1,6 @@
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mergedManifestPath, verifyMergedManifestFile } from './check-android-manifest.mjs';
 import { runCommand } from './run-command.mjs';
 import {
   detectJavaCompatibility,
@@ -27,14 +28,21 @@ export function gradleTask(mode) {
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 
+export function gradleTasks(mode) {
+  const primary = gradleTask(mode);
+  return mode === 'debug'
+    ? [primary, 'processReleaseMainManifest']
+    : [primary, 'processDebugMainManifest'];
+}
+
 export function canReuseWebBuild(environment = process.env) {
   return environment.TURNLEAF_REUSE_WEB_BUILD === 'true';
 }
 
 export async function main(mode = process.argv[2]) {
-  let task;
+  let tasks;
   try {
-    task = gradleTask(mode);
+    tasks = gradleTasks(mode);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
@@ -67,7 +75,16 @@ export async function main(mode = process.argv[2]) {
       cwd: projectRoot,
       env,
     });
-    await runCommand(gradle, [task], { cwd: androidDirectory, env });
+    await runCommand(gradle, tasks, { cwd: androidDirectory, env });
+    for (const variant of ['debug', 'release']) {
+      const permissions = verifyMergedManifestFile(
+        mergedManifestPath(variant, projectRoot),
+        `${variant} merged AndroidManifest.xml`,
+      );
+      console.log(
+        `Verified ${variant} merged AndroidManifest.xml permissions: ${permissions.join(', ')}.`,
+      );
+    }
   } catch (error) {
     console.error(error.message);
     process.exitCode = error.exitCode ?? 1;

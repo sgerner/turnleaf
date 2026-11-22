@@ -14,6 +14,8 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(ReaderChromePlugin.class);
         registerPlugin(VolumeButtonsPlugin.class);
         registerPlugin(KeepAwakePlugin.class);
+        registerPlugin(PrivateTransferPlugin.class);
+        registerPlugin(NoteExportPlugin.class);
         super.onCreate(savedInstanceState);
     }
 

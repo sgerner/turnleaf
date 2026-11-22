@@ -49,7 +49,7 @@ function normalizePayload<T>(endpoint: string, read: () => T, context = ''): T {
   }
 }
 
-function redirectTarget(
+export function redirectTarget(
   status: number,
   location: string | null,
   currentUrl: string,
@@ -98,7 +98,9 @@ function redirectTarget(
     const message =
       current.protocol === 'http:' && destination.protocol === 'https:'
         ? 'Kavita redirected from HTTP to HTTPS. Update the saved address to its final HTTPS address.'
-        : 'Kavita redirected to a different server. Update the saved address to its final address.';
+        : current.protocol === 'https:' && destination.protocol === 'http:'
+          ? 'Kavita redirected from HTTPS to HTTP. Refusing to send credentials over an unencrypted redirect.'
+          : 'Kavita redirected to a different server. Update the saved address to its final address.';
     throw new KavitaError(message, 'server', status);
   }
 
@@ -119,7 +121,7 @@ function nativeHeader(headers: Record<string, string>, name: string): string | n
   );
 }
 
-function assertRedirectLimit(count: number, status: number): void {
+export function assertRedirectLimit(count: number, status: number): void {
   if (count > MAX_REDIRECTS) {
     throw new KavitaError(
       'Kavita redirected too many times. Check the saved server address.',

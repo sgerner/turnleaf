@@ -11,9 +11,10 @@ npm ci
 npm run verify
 npm run android:debug
 npm run android:smoke
+npm run android:journey
 ```
 
-`npm run verify` runs the same web quality gates used by pull-request CI. `android:smoke` installs the debug APK as `app.turnleaf.reader.debug`, starts its main activity, and verifies that the application process stays alive. The `.debug` application ID lets contributors test alongside a signed production install without replacing it. The CI emulator job runs the same script on an API 29 default x86 Nexus 5 image.
+`npm run verify` runs the same web quality gates used by pull-request CI. `android:debug` builds the debug APK and verifies that merged debug and release manifests declare only `INTERNET` and `ACCESS_NETWORK_STATE` (no `READ_EXTERNAL_STORAGE` or `WRITE_EXTERNAL_STORAGE`). `android:smoke` installs the debug APK as `app.turnleaf.reader.debug`, starts its main activity, and verifies that the application process stays alive alongside any signed production install. `android:journey` exercises onboarding, cover caching, EPUB download, system Markdown note export, offline restart, and progress sync; CI and release workflows run emulator checks on both API 29 and API 36 Google APIs `x86_64` images.
 
 ## Android accessibility pass
 

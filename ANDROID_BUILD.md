@@ -3,13 +3,13 @@
 ## Verified environment
 
 - OpenJDK 21
-- Android SDK API 36
+- Android SDK API 36 (`minSdkVersion = 24`, `targetSdkVersion = 36`)
 - Android Build Tools 36.0.0
-- Capacitor Android 8.4.1
+- Capacitor Android 8.6.0
 
-The generated project targets API 36, has only the Internet permission, uses app-private storage, and contains adaptive icon and splash placeholders from Capacitor.
+The generated project supports Android 7 through 16 (API 24 through 36), declares only `INTERNET` and `ACCESS_NETWORK_STATE` in merged debug and release manifests (zero external storage permissions), streams EPUBs and covers directly to app-private storage, exports Markdown notes through the Android system picker or unexported `FileProvider` `shared/` cache directory, and contains adaptive icon and splash placeholders from Capacitor.
 
-Verified on Linux with the `turnleaf_api36` Google APIs x86_64 emulator: install, secure credential persistence, live library browsing, native download, paginated reading, force-stop persistence, airplane-mode cached browsing, and offline CFI reopen.
+Automated CI and release workflows run the Android reading journey and APK checks on both API 29 (`turnleaf_api29`) and API 36 (`turnleaf_api36`) Google APIs `x86_64` emulators: install, manifest permission bounds, secure credential persistence, live library browsing, cached covers, native EPUB download, system note export, paginated reading, force-stop persistence, offline reopen, and progress sync.
 
 ## Commands
 

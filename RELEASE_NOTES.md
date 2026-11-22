@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Use app-private streaming downloads and system Markdown note export across Android 7 through 16 without storage permissions
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops

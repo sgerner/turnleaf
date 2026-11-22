@@ -26,7 +26,7 @@ jobs:
        github.event.workflow_run.head_branch == 'master' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 55
     permissions:
       contents: read
     env:
@@ -107,7 +107,22 @@ jobs:
             sudo chmod g+rw /dev/kvm
           fi
 
-      - name: Verify manually dispatched revision with reading journey
+      - name: Verify manually dispatched revision with reading journey (API 29)
+        if: github.event_name == 'workflow_dispatch'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: turnleaf_manual_api29
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: true
+          script: npm run android:journey
+
+      - name: Verify manually dispatched revision with reading journey (API 36)
         if: github.event_name == 'workflow_dispatch'
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -115,6 +130,7 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
+          avd-name: turnleaf_manual_api36
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
           force-avd-creation: true
           emulator-boot-timeout: 900
@@ -177,7 +193,24 @@ jobs:
             sudo chmod g+rw /dev/kvm
           fi
 
-      - name: Smoke-test signed release APK
+      - name: Smoke-test signed release APK (API 29)
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          ANDROID_PACKAGE_NAME: app.turnleaf.reader
+          ANDROID_APK_PATH: android/app/build/outputs/apk/release/app-release.apk
+        with:
+          api-level: 29
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          avd-name: turnleaf_release_api29
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: true
+          script: npm run android:smoke
+
+      - name: Smoke-test signed release APK (API 36)
         uses: reactivecircus/android-emulator-runner@v2
         env:
           ANDROID_PACKAGE_NAME: app.turnleaf.reader
@@ -187,6 +220,7 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
+          avd-name: turnleaf_release_api36
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
           force-avd-creation: true
           emulator-boot-timeout: 900

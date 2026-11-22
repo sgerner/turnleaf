@@ -12,6 +12,11 @@ import { main as smoke } from './android-smoke.mjs';
 const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
+const uiDumpRemotePath = '/data/local/tmp/turnleaf-ui.xml';
+const coverPng = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64',
+);
 let deviceSerial;
 const adb = async (...args) =>
   (
@@ -37,6 +42,81 @@ async function waitFor(label, check) {
     await delay(250);
   } while (Date.now() < end);
   throw new Error(`Timed out waiting for ${label}.`, { cause: lastError });
+}
+
+async function isAppResumed() {
+  const activities = await adb('shell', 'dumpsys', 'activity', 'activities');
+  return activities
+    .split('\n')
+    .some(
+      (line) =>
+        /(?:topResumedActivity|mResumedActivity)/.test(line) && line.includes(`${packageName}/`),
+    );
+}
+
+function parseUiNodes(xml) {
+  const nodes = [];
+  const nodePattern = /<node\b([^>]*?)\/?>/g;
+  for (const match of xml.matchAll(nodePattern)) {
+    const attrs = match[1] ?? '';
+    const readAttr = (name) => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1] ?? '';
+    const boundsMatch = /^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/.exec(readAttr('bounds'));
+    if (!boundsMatch) continue;
+    const x1 = Number(boundsMatch[1]);
+    const y1 = Number(boundsMatch[2]);
+    const x2 = Number(boundsMatch[3]);
+    const y2 = Number(boundsMatch[4]);
+    if (x2 <= x1 || y2 <= y1) continue;
+    nodes.push({
+      resourceId: readAttr('resource-id'),
+      text: readAttr('text'),
+      contentDesc: readAttr('content-desc'),
+      enabled: readAttr('enabled') !== 'false',
+      centerX: Math.round((x1 + x2) / 2),
+      centerY: Math.round((y1 + y2) / 2),
+    });
+  }
+  return nodes;
+}
+
+async function tapNode(node) {
+  await adb('shell', 'input', 'tap', String(node.centerX), String(node.centerY));
+}
+
+async function cancelSystemExportSheet() {
+  await waitFor('system export sheet to open', async () => !(await isAppResumed()));
+  await waitFor('system export sheet cancellation', async () => {
+    if (await isAppResumed()) return true;
+    await adb('shell', 'input', 'keyevent', 'KEYCODE_BACK');
+    return false;
+  });
+}
+
+async function completeSystemExportSheet() {
+  await waitFor('system export sheet to open', async () => !(await isAppResumed()));
+  await waitFor('system export completion', async () => {
+    if (await isAppResumed()) return true;
+    await adb('shell', 'uiautomator', 'dump', uiDumpRemotePath);
+    const xml = await adb('shell', 'cat', uiDumpRemotePath);
+    const nodes = parseUiNodes(xml).filter((node) => node.enabled);
+    const saveButton = nodes.find(
+      (node) => node.resourceId === 'android:id/button1' || /^save$/i.test(node.text.trim()),
+    );
+    if (saveButton) {
+      await tapNode(saveButton);
+      return false;
+    }
+    const downloadsRoot = nodes.find((node) => /^downloads?$/i.test(node.text.trim()));
+    if (downloadsRoot) {
+      await tapNode(downloadsRoot);
+      return false;
+    }
+    const showRoots = nodes.find((node) => /show roots/i.test(node.contentDesc));
+    if (showRoots) {
+      await tapNode(showRoots);
+    }
+    return false;
+  });
 }
 
 async function connectWebView() {
@@ -72,6 +152,7 @@ async function startFixture() {
   );
   const uploads = [];
   let downloads = 0;
+  let covers = 0;
   let offline = false;
   const offlineRequests = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
@@ -119,6 +200,15 @@ async function startFixture() {
           ],
         };
         break;
+      case '/api/Image/series-cover':
+        covers += 1;
+        response
+          .writeHead(200, {
+            'Content-Type': 'image/png',
+            'Content-Length': coverPng.length,
+          })
+          .end(coverPng);
+        return;
       case '/api/Download/chapter':
         downloads += 1;
         response
@@ -157,6 +247,9 @@ async function startFixture() {
     get downloads() {
       return downloads;
     },
+    get covers() {
+      return covers;
+    },
     offlineRequests,
     setOffline(value) {
       offline = value;
@@ -170,6 +263,17 @@ async function startFixture() {
 const click = (selector) => `(() => {
   const button = document.querySelector(${JSON.stringify(selector)});
   if (!button || button.disabled) return false;
+  button.click();
+  return true;
+})()`;
+
+const clickByText = (containerSelector, label) => `(() => {
+  const root = document.querySelector(${JSON.stringify(containerSelector)});
+  if (!root) return false;
+  const button = Array.from(root.querySelectorAll('button')).find(
+    item => !item.disabled && item.textContent.trim() === ${JSON.stringify(label)}
+  );
+  if (!button) return false;
   button.click();
   return true;
 })()`;
@@ -216,6 +320,12 @@ async function run() {
       serial: deviceSerial,
     });
     throwIfInterrupted();
+
+    const packageInfo = await adb('shell', 'dumpsys', 'package', packageName);
+    if (/android\.permission\.(?:READ|WRITE|MANAGE)_EXTERNAL_STORAGE/.test(packageInfo)) {
+      throw new Error(`${packageName} declared forbidden external storage permissions.`);
+    }
+
     web = await connectWebView();
     await waitFor('onboarding', () => web.evaluate("!!document.querySelector('input[type=url]')"));
     await web.evaluate(`(() => {
@@ -229,9 +339,62 @@ async function run() {
     })()`);
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
     await web.evaluate(click('button[type=submit]'));
+    await waitFor(
+      'cached library cover',
+      async () =>
+        fixture.covers >= 1 &&
+        (await web.evaluate(
+          "Array.from(document.querySelectorAll('img')).some(img => img.src.includes('_capacitor_file_') && img.complete && img.naturalWidth > 0)",
+        )),
+    );
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
+
+    await waitFor('selected passage in first chapter', () =>
+      web.evaluate(`(() => {
+        const frame = Array.from(document.querySelectorAll('iframe')).find(
+          item => item.contentDocument?.querySelector('h1')?.textContent === 'Chapter 1'
+        );
+        const heading = frame?.contentDocument?.querySelector('h1');
+        if (!frame || !heading) return false;
+        const range = frame.contentDocument.createRange();
+        range.selectNodeContents(heading);
+        const selection = frame.contentWindow.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        frame.contentDocument.dispatchEvent(new Event('selectionchange'));
+        return true;
+      })()`),
+    );
+    await waitFor('add-note action', () =>
+      web.evaluate(clickByText('[aria-label="Selected text"]', 'Add note')),
+    );
+    await waitFor('save highlight button', () =>
+      web.evaluate(click('#reader-annotations button[type="submit"]')),
+    );
+    await waitFor('export markdown trigger (cancel check)', () =>
+      web.evaluate(clickByText('#reader-annotations', 'Export Markdown')),
+    );
+    await cancelSystemExportSheet();
+    await waitFor('markdown copy fallback after cancel', () =>
+      web.evaluate(
+        `Boolean(document.querySelector('#reader-annotations textarea[readonly]')?.value?.includes(${JSON.stringify(`# Notes for ${title}`)}))`,
+      ),
+    );
+
+    await waitFor('export markdown trigger (save check)', () =>
+      web.evaluate(clickByText('#reader-annotations', 'Export Markdown')),
+    );
+    await completeSystemExportSheet();
+    await waitFor('saved note export confirmation', () =>
+      web.evaluate(
+        "Boolean(document.querySelector('#reader-annotations [role=\"status\"]')?.textContent?.includes('Saved notes as')) && !document.querySelector('#reader-annotations textarea[readonly]')",
+      ),
+    );
+    await waitFor('close highlights and notes panel', () =>
+      web.evaluate(click('[aria-label="Close highlights and notes"]')),
+    );
 
     disabledNetwork = true;
     await adb('shell', 'svc', 'wifi', 'disable');
@@ -244,7 +407,11 @@ async function run() {
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
-    await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
+    await waitFor('next-page control', async () => {
+      if (await web.evaluate(click('[aria-label="Next page"]'))) return true;
+      await web.evaluate(click('[aria-label="Show reading controls"]'));
+      return false;
+    });
     await waitFor('second chapter', () => web.evaluate(chapter(2)));
     await waitFor('reader position in the second chapter', () =>
       web.evaluate(
@@ -275,6 +442,11 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
+    await waitFor('offline cached cover after restart', () =>
+      web.evaluate(
+        "Array.from(document.querySelectorAll('img')).some(img => img.src.includes('_capacitor_file_') && img.complete && img.naturalWidth > 0)",
+      ),
+    );
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
     if (fixture.offlineRequests.length > 0) {
@@ -315,6 +487,9 @@ async function run() {
     }
   } finally {
     const cleanup = [];
+    if (deviceSerial) {
+      cleanup.push(['remove temporary UI dump', () => adb('shell', 'rm', '-f', uiDumpRemotePath)]);
+    }
     if (disabledNetwork) {
       cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);
       cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);
@@ -339,7 +514,9 @@ async function run() {
     throw journeyError;
   }
   if (cleanupError) throw cleanupError;
-  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+  console.log(
+    'Android reading journey passed: connect, cache cover, download, export notes, read, restart offline, sync.',
+  );
 }
 
 await run().catch((error) => {

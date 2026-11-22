@@ -911,6 +911,10 @@
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
+      } else if (error instanceof KavitaError) {
+        status = error.status;
+        detail = 'download-transfer';
+        message = error.message;
       } else {
         message = 'Turnleaf could not save the book on this device.';
       }
