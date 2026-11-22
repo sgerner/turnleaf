@@ -19,7 +19,7 @@ export interface ReaderLocation {
 
 export type ReaderLinkReturnTarget = Pick<ReaderLocation, 'cfi' | 'href'>;
 
-export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
+export type ReaderLocationOrigin = 'jump' | 'link' | 'navigation' | 'restore';
 
 export interface ReaderSelection {
   cfi: string;
@@ -314,6 +314,7 @@ export class ReaderSession {
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
+  private contents = new Set<Contents>();
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -351,9 +352,13 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
-    this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    this.rendition.hooks.content.register((contents: Contents) => {
+      this.contents.add(contents);
+      return this.harden(contents);
+    });
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
+        this.contents.add(contents);
         const handler = () => {
           const selection = contents.window.getSelection();
           if (!selection || selection.isCollapsed || !selection.rangeCount) {
@@ -379,12 +384,16 @@ export class ReaderSession {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
       const isUserNavigation =
         this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+        (this.userNavigationOrigin === 'jump'
+          ? !this.reflowPending
+          : startCfi
+            ? startCfi !== location.start.cfi
+            : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
+      if (isUserNavigation || this.userNavigationOrigin !== 'navigation') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
         this.userNavigationOrigin = 'navigation';
@@ -560,15 +569,36 @@ export class ReaderSession {
     return results;
   }
 
+  clearSelection(): void {
+    const activeContents = new Set<Contents>(this.contents);
+    const renditionContents = (
+      this.rendition as (Rendition & { getContents?: () => unknown }) | null
+    )?.getContents?.();
+    if (Array.isArray(renditionContents)) {
+      for (const item of renditionContents as Contents[]) activeContents.add(item);
+    }
+    for (const contents of activeContents) {
+      if (!contents.window || contents.window.closed) {
+        this.contents.delete(contents);
+        continue;
+      }
+      try {
+        contents.window.getSelection?.()?.removeAllRanges();
+      } catch {
+        // Selection ranges may fail to collapse while a frame is unloading.
+      }
+    }
+  }
+
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.display(href));
+    await this.navigate(() => this.rendition!.display(href), 'jump');
   }
 
   async displayCfi(cfi: string): Promise<boolean> {
     if (!this.rendition) return false;
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
+      await this.navigate(() => this.rendition!.display(cfi), 'jump');
       return true;
     } catch {
       return false;
@@ -675,6 +705,7 @@ export class ReaderSession {
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
+    this.contents.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
@@ -795,23 +826,30 @@ export class ReaderSession {
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
-    const generation = this.beginLocationOperation(true);
+  private async navigate(
+    display: () => Promise<unknown>,
+    origin: 'navigation' | 'jump' = 'navigation',
+  ): Promise<void> {
+    const generation = this.beginLocationOperation(true, origin);
     try {
       await display();
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
       }
       throw error;
     }
   }
 
-  private beginLocationOperation(userNavigation: boolean): number {
+  private beginLocationOperation(
+    userNavigation: boolean,
+    origin: 'navigation' | 'jump' = 'navigation',
+  ): number {
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
-    this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
+    this.userNavigationOrigin = userNavigation ? origin : 'restore';
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
