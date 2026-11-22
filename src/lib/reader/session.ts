@@ -45,6 +45,93 @@ interface EpubTocItem {
   subitems?: EpubTocItem[];
 }
 
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const SELECTION_DEBOUNCE_MS = 120;
+
+interface EpubRuntimeContents {
+  document: Document;
+  window: Window;
+  sectionIndex?: number;
+  range: (cfi: string, ignoreClass?: string) => Range | null;
+  cfiFromRange: (range: Range, ignoreClass?: string) => string;
+  resizeCheck?: () => void;
+  removeSelectionListeners?: () => void;
+  selectionEndTimeout?: ReturnType<typeof setTimeout> | undefined;
+}
+
+interface EpubHighlightView {
+  index?: number;
+  displayed?: boolean;
+  section?: { index?: number };
+  element?: HTMLElement;
+  iframe?: HTMLIFrameElement;
+  contents?: EpubRuntimeContents;
+  on?: (event: string, listener: () => void) => void;
+  off?: (event: string, listener: () => void) => void;
+}
+
+interface ActiveHighlightViewState {
+  sectionIndex: number | null;
+  overlay: SVGSVGElement | null;
+  doc: Document | null;
+  onResize: (() => void) | null;
+}
+
+interface SelectionObserverState {
+  cancelPending: () => void;
+  dispose: () => void;
+}
+
+function parseCfiSectionIndex(cfi: string): number | null {
+  const trimmed = cfi.trim();
+  if (!trimmed.startsWith('epubcfi(') || !trimmed.endsWith(')')) return null;
+  const inner = trimmed.slice(8, -1);
+  const chapterPart = inner.split('!')[0] ?? '';
+  const stepPart = chapterPart.split(':')[0] ?? '';
+  const steps = stepPart.split('/').filter(Boolean);
+  const spineStep = steps[1];
+  if (!spineStep) return null;
+  const stepNumber = Number.parseInt(spineStep, 10);
+  if (!Number.isFinite(stepNumber) || stepNumber <= 0) return null;
+  return stepNumber % 2 === 0 ? stepNumber / 2 - 1 : (stepNumber - 1) / 2;
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function filterClientRects(rects: DOMRect[]): DOMRect[] {
+  const nonEmpty = rects.filter((rect) => rect.width > 0 && rect.height > 0);
+  return nonEmpty.filter(
+    (box, boxIndex) =>
+      !nonEmpty.some(
+        (other, otherIndex) =>
+          otherIndex !== boxIndex &&
+          box.left >= other.left &&
+          box.right <= other.right &&
+          box.top >= other.top &&
+          box.bottom <= other.bottom &&
+          (otherIndex < boxIndex ||
+            box.left > other.left ||
+            box.right < other.right ||
+            box.top > other.top ||
+            box.bottom < other.bottom),
+      ),
+  );
+}
+
+function disableEpubSelectionListeners(contents: EpubRuntimeContents): void {
+  if (contents.selectionEndTimeout !== undefined) {
+    clearTimeout(contents.selectionEndTimeout);
+    contents.selectionEndTimeout = undefined;
+  }
+  contents.removeSelectionListeners?.();
+}
+
 const MODE_COLORS = {
   light: {
     background: '--color-surface-50',
@@ -302,6 +389,12 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+  private viewRendered:
+    | ((section: { index?: number } | undefined, view: EpubHighlightView | undefined) => void)
+    | null = null;
+  private viewRemoved: ((section: unknown, view: EpubHighlightView | undefined) => void) | null =
+    null;
+  private renditionResized: (() => void) | null = null;
   private current: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
@@ -313,7 +406,10 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
-  private highlightCfis = new Set<string>();
+  private highlightsBySection = new Map<number, string[]>();
+  private readonly activeViews = new Map<EpubHighlightView, ActiveHighlightViewState>();
+  private readonly resizingViews = new Set<EpubHighlightView>();
+  private readonly selectionObservers = new Map<Document, SelectionObserverState>();
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -351,29 +447,27 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
-    this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    this.rendition.hooks.content.register((contents: Contents) => {
+      disableEpubSelectionListeners(contents as unknown as EpubRuntimeContents);
+      return this.harden(contents);
+    });
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
-        const handler = () => {
-          const selection = contents.window.getSelection();
-          if (!selection || selection.isCollapsed || !selection.rangeCount) {
-            onSelection(null);
-            return;
-          }
-          const text = selection.toString().replace(/\s+/g, ' ').trim();
-          if (!text) {
-            onSelection(null);
-            return;
-          }
-          try {
-            onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
-          } catch {
-            // Selection can change while a section is being replaced.
-          }
-        };
-        contents.document.addEventListener('selectionchange', handler);
+        this.observeSelection(contents as unknown as EpubRuntimeContents, onSelection);
       });
     }
+    this.viewRendered = (section, view) => {
+      this.handleViewRendered(section, view);
+    };
+    this.viewRemoved = (_section, view) => {
+      this.disposeHighlightView(view);
+    };
+    this.renditionResized = () => {
+      this.syncActiveHighlights(true);
+    };
+    this.rendition.on('rendered', this.viewRendered);
+    this.rendition.on('removed', this.viewRemoved);
+    this.rendition.on('resized', this.renditionResized);
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
@@ -382,7 +476,10 @@ export class ReaderSession {
         (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (startCfi !== location.start.cfi) onSelection?.(null);
+      if (startCfi !== location.start.cfi) {
+        this.cancelPendingSelections();
+        onSelection?.(null);
+      }
       this.current = location;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
@@ -498,31 +595,46 @@ export class ReaderSession {
   }
 
   updateHighlights(annotations: Array<{ cfi: string }>): void {
-    const rendition = this.rendition;
-    if (!rendition) return;
-
-    const next = new Set(annotations.map((annotation) => annotation.cfi));
-    for (const cfi of this.highlightCfis) {
-      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+    const nextBySection = new Map<number, string[]>();
+    const seen = new Set<string>();
+    for (const annotation of annotations) {
+      const cfi = annotation.cfi.trim();
+      if (!cfi || seen.has(cfi)) continue;
+      const sectionIndex = parseCfiSectionIndex(cfi);
+      if (sectionIndex === null) continue;
+      seen.add(cfi);
+      const bucket = nextBySection.get(sectionIndex);
+      if (bucket) bucket.push(cfi);
+      else nextBySection.set(sectionIndex, [cfi]);
     }
 
-    const applied = new Set<string>();
-    for (const cfi of next) {
-      if (this.highlightCfis.has(cfi)) {
-        applied.add(cfi);
+    const changedSections = new Set<number>();
+    for (const [sectionIndex, prevList] of this.highlightsBySection) {
+      const nextList = nextBySection.get(sectionIndex);
+      if (!nextList || !sameStringList(prevList, nextList)) {
+        changedSections.add(sectionIndex);
+      }
+    }
+    for (const [sectionIndex, nextList] of nextBySection) {
+      const prevList = this.highlightsBySection.get(sectionIndex);
+      if (!prevList || !sameStringList(prevList, nextList)) {
+        changedSections.add(sectionIndex);
+      }
+    }
+
+    this.highlightsBySection = nextBySection;
+    if (!this.rendition || changedSections.size === 0) return;
+
+    this.collectActiveViews();
+    for (const [view, state] of this.activeViews) {
+      if (!this.isViewAlive(view)) {
+        this.disposeHighlightView(view);
         continue;
       }
-      try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
-          fill: '#facc15',
-          'fill-opacity': '0.38',
-        });
-        applied.add(cfi);
-      } catch {
-        // A saved CFI can stop matching after an EPUB is replaced or changed.
+      if (state.sectionIndex !== null && changedSections.has(state.sectionIndex)) {
+        this.renderViewHighlights(view, state);
       }
     }
-    this.highlightCfis = applied;
   }
 
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
@@ -647,6 +759,7 @@ export class ReaderSession {
     });
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
+    this.syncActiveHighlights(true);
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
@@ -662,6 +775,17 @@ export class ReaderSession {
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
+    if (this.rendition && this.viewRendered) this.rendition.off('rendered', this.viewRendered);
+    if (this.rendition && this.viewRemoved) this.rendition.off('removed', this.viewRemoved);
+    if (this.rendition && this.renditionResized)
+      this.rendition.off('resized', this.renditionResized);
+    for (const view of [...this.activeViews.keys()]) {
+      this.disposeHighlightView(view);
+    }
+    for (const observer of [...this.selectionObservers.values()]) {
+      observer.dispose();
+    }
+    this.resizingViews.clear();
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -670,11 +794,14 @@ export class ReaderSession {
     this.relocated = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
+    this.viewRendered = null;
+    this.viewRemoved = null;
+    this.renditionResized = null;
     this.onLocation = null;
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
-    this.highlightCfis.clear();
+    this.highlightsBySection.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
@@ -691,6 +818,306 @@ export class ReaderSession {
       if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
     }
     this.book.destroy();
+  }
+
+  private observeSelection(
+    contents: EpubRuntimeContents,
+    onSelection: (selection: ReaderSelection | null) => void,
+  ): void {
+    disableEpubSelectionListeners(contents);
+    const doc = contents.document;
+    for (const [existingDoc, observer] of [...this.selectionObservers.entries()]) {
+      if (existingDoc === doc || existingDoc.defaultView === null) {
+        observer.dispose();
+      }
+    }
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cancelPending = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const emitCurrentSelection = () => {
+      const selection = contents.window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount) {
+        onSelection(null);
+        return;
+      }
+      const text = selection.toString().replace(/\s+/g, ' ').trim();
+      if (!text) {
+        onSelection(null);
+        return;
+      }
+      try {
+        onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
+      } catch {
+        // Selection can change while a section is being replaced.
+      }
+    };
+
+    const onSelectionChange = () => {
+      const selection = contents.window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.rangeCount) {
+        cancelPending();
+        onSelection(null);
+        return;
+      }
+      const text = selection.toString().replace(/\s+/g, ' ').trim();
+      if (!text) {
+        cancelPending();
+        onSelection(null);
+        return;
+      }
+      cancelPending();
+      timer = setTimeout(() => {
+        timer = null;
+        emitCurrentSelection();
+      }, SELECTION_DEBOUNCE_MS);
+    };
+
+    const flushPending = () => {
+      if (timer === null) return;
+      cancelPending();
+      emitCurrentSelection();
+    };
+
+    const dispose = () => {
+      cancelPending();
+      doc.removeEventListener('selectionchange', onSelectionChange);
+      doc.removeEventListener('pointerup', flushPending);
+      doc.removeEventListener('mouseup', flushPending);
+      doc.removeEventListener('touchend', flushPending);
+      if (this.selectionObservers.get(doc)?.dispose === dispose) {
+        this.selectionObservers.delete(doc);
+      }
+    };
+
+    doc.addEventListener('selectionchange', onSelectionChange, { passive: true });
+    doc.addEventListener('pointerup', flushPending, { passive: true });
+    doc.addEventListener('mouseup', flushPending, { passive: true });
+    doc.addEventListener('touchend', flushPending, { passive: true });
+    this.selectionObservers.set(doc, { cancelPending, dispose });
+  }
+
+  private cancelPendingSelections(): void {
+    for (const observer of this.selectionObservers.values()) {
+      observer.cancelPending();
+    }
+  }
+
+  private isViewAlive(view: EpubHighlightView): boolean {
+    return Boolean(view.element && view.contents && view.displayed !== false);
+  }
+
+  private resolveViewSectionIndex(
+    view: EpubHighlightView,
+    section?: { index?: number },
+  ): number | null {
+    const index =
+      view.index ?? section?.index ?? view.section?.index ?? view.contents?.sectionIndex;
+    return typeof index === 'number' && Number.isFinite(index) ? index : null;
+  }
+
+  private registerHighlightView(
+    view: EpubHighlightView,
+    section?: { index?: number },
+  ): ActiveHighlightViewState {
+    const sectionIndex = this.resolveViewSectionIndex(view, section);
+    const existing = this.activeViews.get(view);
+    if (existing) {
+      if (sectionIndex !== null) existing.sectionIndex = sectionIndex;
+      if (view.contents?.document) existing.doc = view.contents.document;
+      return existing;
+    }
+    const onResize =
+      typeof view.on === 'function'
+        ? () => {
+            if (this.resizingViews.has(view) || !this.isViewAlive(view)) return;
+            const currentState = this.activeViews.get(view);
+            if (currentState) this.renderViewHighlights(view, currentState);
+          }
+        : null;
+    const state: ActiveHighlightViewState = {
+      sectionIndex,
+      overlay: null,
+      doc: view.contents?.document ?? null,
+      onResize,
+    };
+    this.activeViews.set(view, state);
+    if (onResize) view.on?.('resized', onResize);
+    return state;
+  }
+
+  private collectActiveViews(): void {
+    const rendition = this.rendition as unknown as {
+      views?: () =>
+        EpubHighlightView[] | { forEach?: (callback: (view: EpubHighlightView) => void) => void };
+    } | null;
+    const views = rendition?.views?.();
+    if (!views) return;
+    if (Array.isArray(views)) {
+      for (const view of views) {
+        if (view && this.isViewAlive(view)) this.registerHighlightView(view);
+      }
+      return;
+    }
+    views.forEach?.((view: EpubHighlightView) => {
+      if (view && this.isViewAlive(view)) this.registerHighlightView(view);
+    });
+  }
+
+  private handleViewRendered(
+    section: { index?: number } | undefined,
+    view: EpubHighlightView | undefined,
+  ): void {
+    for (const existingView of [...this.activeViews.keys()]) {
+      if (existingView !== view && !this.isViewAlive(existingView)) {
+        this.disposeHighlightView(existingView);
+      }
+    }
+    if (!view || !this.isViewAlive(view)) return;
+    const state = this.registerHighlightView(view, section);
+    this.syncViewHighlights(view, state, true);
+  }
+
+  private syncActiveHighlights(checkResize: boolean): void {
+    this.collectActiveViews();
+    for (const [view, state] of [...this.activeViews.entries()]) {
+      if (!this.isViewAlive(view)) {
+        this.disposeHighlightView(view);
+        continue;
+      }
+      this.syncViewHighlights(view, state, checkResize);
+    }
+  }
+
+  private syncViewHighlights(
+    view: EpubHighlightView,
+    state: ActiveHighlightViewState,
+    checkResize: boolean,
+  ): void {
+    if (checkResize && view.contents?.resizeCheck) {
+      this.resizingViews.add(view);
+      try {
+        view.contents.resizeCheck();
+      } finally {
+        this.resizingViews.delete(view);
+      }
+    }
+    this.renderViewHighlights(view, state);
+  }
+
+  private renderViewHighlights(view: EpubHighlightView, state: ActiveHighlightViewState): void {
+    const container = view.element;
+    const contents = view.contents;
+    const cfis =
+      state.sectionIndex !== null ? this.highlightsBySection.get(state.sectionIndex) : undefined;
+    if (!container || !contents || !cfis || cfis.length === 0) {
+      state.overlay?.remove();
+      state.overlay = null;
+      return;
+    }
+
+    const containerRect = container.getBoundingClientRect?.();
+    const iframeRect = view.iframe?.getBoundingClientRect?.();
+    const offsetLeft = iframeRect && containerRect ? iframeRect.left - containerRect.left : 0;
+    const offsetTop = iframeRect && containerRect ? iframeRect.top - containerRect.top : 0;
+    const overlayWidth = Math.max(
+      iframeRect?.width ?? 0,
+      view.iframe?.scrollWidth ?? 0,
+      container.scrollWidth ?? 0,
+      Number.parseFloat(view.iframe?.style.width ?? '') || 0,
+      Number.parseFloat(container.style.width ?? '') || 0,
+    );
+    const overlayHeight = Math.max(
+      iframeRect?.height ?? 0,
+      view.iframe?.scrollHeight ?? 0,
+      container.scrollHeight ?? 0,
+      Number.parseFloat(view.iframe?.style.height ?? '') || 0,
+      Number.parseFloat(container.style.height ?? '') || 0,
+    );
+    const scrollX = contents.window?.scrollX ?? 0;
+    const scrollY = contents.window?.scrollY ?? 0;
+
+    const marks: Array<{ cfi: string; rects: DOMRect[] }> = [];
+    for (const cfi of cfis) {
+      let range: Range | null | undefined;
+      try {
+        range = contents.range(cfi);
+      } catch {
+        continue;
+      }
+      if (!range) continue;
+      let rects: DOMRect[];
+      try {
+        rects = filterClientRects(Array.from(range.getClientRects()));
+      } catch {
+        continue;
+      }
+      if (rects.length > 0) {
+        marks.push({ cfi, rects });
+      }
+    }
+
+    if (marks.length === 0) {
+      state.overlay?.remove();
+      state.overlay = null;
+      return;
+    }
+
+    const doc = container.ownerDocument;
+    const overlay = state.overlay ?? doc.createElementNS(SVG_NS, 'svg');
+    overlay.classList.add('turnleaf-highlight-layer');
+    overlay.setAttribute('aria-hidden', 'true');
+    overlay.setAttribute('focusable', 'false');
+    overlay.setAttribute('pointer-events', 'none');
+    overlay.style.position = 'absolute';
+    overlay.style.top = `${offsetTop}px`;
+    overlay.style.left = `${offsetLeft}px`;
+    overlay.style.width = overlayWidth > 0 ? `${overlayWidth}px` : '100%';
+    overlay.style.height = overlayHeight > 0 ? `${overlayHeight}px` : '100%';
+    overlay.style.pointerEvents = 'none';
+
+    const fragment = doc.createDocumentFragment();
+    for (const mark of marks) {
+      const group = doc.createElementNS(SVG_NS, 'g');
+      group.classList.add('turnleaf-highlight');
+      group.dataset.epubcfi = mark.cfi;
+      group.setAttribute('fill', '#facc15');
+      group.setAttribute('fill-opacity', '0.38');
+      for (const rect of mark.rects) {
+        const node = doc.createElementNS(SVG_NS, 'rect');
+        node.setAttribute('x', String(rect.left + scrollX));
+        node.setAttribute('y', String(rect.top + scrollY));
+        node.setAttribute('width', String(rect.width));
+        node.setAttribute('height', String(rect.height));
+        group.appendChild(node);
+      }
+      fragment.appendChild(group);
+    }
+
+    overlay.replaceChildren(fragment);
+    if (overlay.parentNode !== container) {
+      container.appendChild(overlay);
+    }
+    state.overlay = overlay;
+  }
+
+  private disposeHighlightView(view: EpubHighlightView | undefined): void {
+    if (!view) return;
+    this.resizingViews.delete(view);
+    const state = this.activeViews.get(view);
+    if (state) {
+      if (state.onResize) view.off?.('resized', state.onResize);
+      state.overlay?.remove();
+      if (state.doc) this.selectionObservers.get(state.doc)?.dispose();
+      this.activeViews.delete(view);
+    }
+    const doc = view.contents?.document;
+    if (doc) this.selectionObservers.get(doc)?.dispose();
   }
 
   private harden(contents: Contents): Promise<void> {
