@@ -334,4 +334,72 @@ describe('ReaderSession', () => {
     );
     session.destroy();
   });
+
+  it('preserves navigation origin when next() starts before initial queued open relocation fires', async () => {
+    let resolveNext!: () => void;
+    const queuedRendition = {
+      ...mockRendition,
+      q: {
+        running: false,
+        length: () => 0,
+        enqueue: vi.fn((task: () => Promise<void>) => Promise.resolve().then(task)),
+      },
+      next: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveNext = resolve;
+          }),
+      ),
+    };
+    mockBook.renderTo.mockReturnValueOnce(queuedRendition as unknown as typeof mockRendition);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+
+    const relocated = getRenditionListener('relocated');
+    const nextPromise = session.next();
+
+    // Initial open()'s requestAnimationFrame-deferred relocation arrives while next() is still queued.
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 1 },
+      },
+    });
+
+    resolveNext();
+    await nextPromise;
+
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        href: 'second.xhtml',
+        index: 1,
+        percentage: 0.5,
+        displayed: { page: 1, total: 1 },
+      },
+    });
+
+    expect(onLocation.mock.calls.map(([, origin]) => origin)).toEqual(['restore', 'navigation']);
+    expect(onLocation.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        href: 'second.xhtml',
+        percentage: 0.5,
+      }),
+    );
+    session.destroy();
+  });
 });
