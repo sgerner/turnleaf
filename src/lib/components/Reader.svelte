@@ -2097,6 +2097,7 @@
   .reader-shell {
     position: fixed;
     inset: 0;
+    z-index: 30;
     overflow: hidden;
     background: var(--reader-background);
     color: var(--reader-text);
