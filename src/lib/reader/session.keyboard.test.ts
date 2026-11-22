@@ -7,7 +7,10 @@ type TestTocItem = { label: string; href: string; subitems?: TestTocItem[] };
 
 const { mockBook, mockRendition } = vi.hoisted(() => {
   const rendition = {
-    hooks: { content: { register: vi.fn() } },
+    hooks: {
+      render: { register: vi.fn() },
+      content: { register: vi.fn() },
+    },
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
@@ -434,5 +437,75 @@ describe('ReaderSession keyboard navigation', () => {
       session.destroy();
       frame.remove();
     }
+  });
+
+  it('applies theme CSS and expands views synchronously in hooks.render before multi-page CFI positioning', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      'epubcfi(/6/2!/4/2/4/1:264)',
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    const renderHook = mockRendition.hooks.render.register.mock.calls[0]?.[0];
+    expect(renderHook).toBeTypeOf('function');
+
+    const callOrder: string[] = [];
+    const addStylesheetCss = vi.fn((css: string, key: string) => {
+      callOrder.push(`addStylesheetCss:${key}:${css.includes('font-size: 18px !important;')}`);
+      return true;
+    });
+    const expand = vi.fn(() => {
+      callOrder.push('expand');
+    });
+
+    renderHook({
+      contents: { addStylesheetCss },
+      expand,
+    });
+
+    expect(callOrder).toEqual(['addStylesheetCss:turnleaf:true', 'expand']);
+    session.destroy();
+  });
+
+  it('realigns an active multi-page CFI if async EPUB stylesheet sanitization expands column width', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      'epubcfi(/6/2!/4/2/4/1:264)',
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    mockRendition.display.mockClear();
+
+    const hardenHook = mockRendition.hooks.content.register.mock.calls[0]?.[0];
+    const epubDoc = new DOMParser().parseFromString(
+      '<html><head><link rel="stylesheet" href="data:text/css,body%7Bline-height:2%7D" /></head><body><p>Page two</p></body></html>',
+      'text/html',
+    );
+    let currentWidth = 364;
+    const addStylesheetCss = vi.fn(() => true);
+    const expand = vi.fn(() => {
+      currentWidth = 728;
+    });
+
+    await hardenHook({
+      document: epubDoc,
+      addStylesheetCss,
+      expand,
+      textWidth: () => currentWidth,
+    });
+
+    expect(addStylesheetCss).toHaveBeenCalledWith(expect.any(String), 'turnleaf');
+    expect(expand).toHaveBeenCalledOnce();
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/4/1:264)');
+    session.destroy();
   });
 });
