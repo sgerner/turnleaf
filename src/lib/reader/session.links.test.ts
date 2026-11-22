@@ -10,7 +10,7 @@ const { book, rendition } = vi.hoisted(() => {
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
-    themes: { register: vi.fn(), select: vi.fn() },
+    themes: { registerCss: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
     resize: vi.fn(),

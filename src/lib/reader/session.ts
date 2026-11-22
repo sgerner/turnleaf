@@ -1,4 +1,5 @@
-import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
+import ePub, { type Book, type Contents, type Location, type Rendition } from 'epubjs';
+import type { RenditionOptions } from 'epubjs/types/rendition';
 import type { Appearance } from './appearance';
 import {
   clipReaderSearchExcerpt,
@@ -44,6 +45,16 @@ interface EpubTocItem {
   href: string;
   subitems?: EpubTocItem[];
 }
+
+type PaginatedRenditionOptions = RenditionOptions & {
+  gap?: number;
+};
+
+type ResizableRendition = Rendition & {
+  resize: (width: number, height: number, epubcfi?: string) => void;
+};
+
+const RESIZE_DEBOUNCE_MS = 120;
 
 const MODE_COLORS = {
   light: {
@@ -312,6 +323,7 @@ export class ReaderSession {
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  private resizeTimer: ReturnType<typeof setTimeout> | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
   private onLocation:
@@ -341,15 +353,21 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
-    this.rendition = this.book.renderTo(target, {
+    const options: PaginatedRenditionOptions = {
       width: '100%',
       height: '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
+      gap: 0,
       resizeOnOrientationChange: true,
       allowScriptedContent: false,
-    });
+    };
+    this.rendition = (
+      this.book as Book & {
+        renderTo: (element: Element, options?: PaginatedRenditionOptions) => Rendition;
+      }
+    ).renderTo(target, options);
     this.observeViewport(target);
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     if (onSelection) {
@@ -414,7 +432,8 @@ export class ReaderSession {
         return;
       }
       const frame = contents.window.frameElement;
-      const viewport = target.getBoundingClientRect();
+      const tapSurface = target.closest('.reader-shell') ?? target;
+      const viewport = tapSurface.getBoundingClientRect();
       if (!frame || viewport.width === 0) return;
       // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
       const position =
@@ -604,47 +623,12 @@ export class ReaderSession {
       (previous.fontFamily !== value.fontFamily ||
         previous.fontSize !== value.fontSize ||
         previous.lineHeight !== value.lineHeight ||
-        previous.margin !== value.margin ||
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
         previous.hyphenation !== value.hyphenation);
     if (!themeChanged) return;
-    const colors = MODE_COLORS[value.mode];
-    const family =
-      value.fontFamily === 'book'
-        ? 'Iowan Old Style, Georgia, serif'
-        : value.fontFamily === 'accessible'
-          ? 'Atkinson Hyperlegible, Verdana, sans-serif'
-          : 'Avenir Next, Segoe UI, sans-serif';
-    rendition.themes.register('turnleaf', {
-      html: {
-        background: `${this.resolveToken(colors.background)} !important`,
-        'box-sizing': 'border-box',
-      },
-      body: {
-        color: `${this.resolveToken(colors.text)} !important`,
-        background: `${this.resolveToken(colors.background)} !important`,
-        'font-family': `${family} !important`,
-        'font-size': `${value.fontSize}px !important`,
-        'line-height': `${value.lineHeight} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
-        'box-sizing': 'border-box',
-      },
-      p: {
-        'margin-bottom': `${value.paragraphSpacing}em !important`,
-        'text-align': `${value.alignment} !important`,
-        hyphens: value.hyphenation ? 'auto' : 'none',
-      },
-      'img, svg, video, canvas, table, pre, blockquote': {
-        'max-width': '100% !important',
-      },
-      img: {
-        height: 'auto !important',
-      },
-      a: { color: `${this.resolveToken(colors.link)} !important` },
-      '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
-    });
+    rendition.themes.registerCss('turnleaf', this.buildThemeCss(value));
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
@@ -662,6 +646,10 @@ export class ReaderSession {
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
+    if (this.resizeTimer !== null) {
+      clearTimeout(this.resizeTimer);
+      this.resizeTimer = null;
+    }
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -693,8 +681,38 @@ export class ReaderSession {
     this.book.destroy();
   }
 
-  private harden(contents: Contents): Promise<void> {
-    return sanitizeEpubDocument(contents.document, this.stylesheetCache);
+  private async harden(contents: Contents): Promise<void> {
+    await sanitizeEpubDocument(contents.document, this.stylesheetCache);
+    if (this.appearance) {
+      (
+        contents as Contents & {
+          addStylesheetCss?: (serializedCss: string, key: string) => boolean;
+        }
+      ).addStylesheetCss?.(this.buildThemeCss(this.appearance), 'turnleaf');
+    }
+  }
+
+  private buildThemeCss(value: Appearance): string {
+    const colors = MODE_COLORS[value.mode];
+    const background = this.resolveToken(colors.background);
+    const text = this.resolveToken(colors.text);
+    const link = this.resolveToken(colors.link);
+    const selection = this.resolveToken(colors.selection);
+    const family =
+      value.fontFamily === 'book'
+        ? 'Iowan Old Style, Georgia, serif'
+        : value.fontFamily === 'accessible'
+          ? 'Atkinson Hyperlegible, Verdana, sans-serif'
+          : 'Avenir Next, Segoe UI, sans-serif';
+    return [
+      `html { background: ${background} !important; box-sizing: border-box; }`,
+      `body { color: ${text} !important; background: ${background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; padding-top: 0.5rem !important; padding-right: 0 !important; padding-bottom: ${value.bottomMargin}px !important; padding-left: 0 !important; box-sizing: border-box; }`,
+      `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${value.hyphenation ? 'auto' : 'none'}; }`,
+      `img, svg, video, canvas, table, pre, blockquote { max-width: 100% !important; }`,
+      `img { height: auto !important; }`,
+      `a { color: ${link} !important; }`,
+      `::selection { background: ${selection} !important; }`,
+    ].join('\n');
   }
 
   private observeViewport(target: HTMLElement): void {
@@ -708,9 +726,32 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
+      if (this.resizeTimer !== null) {
+        clearTimeout(this.resizeTimer);
+        this.resizeTimer = null;
+      }
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.rendition.resize(width, height);
+      this.resizeTimer = setTimeout(() => {
+        this.resizeTimer = null;
+        const rendition = this.rendition;
+        if (!rendition) return;
+        if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+        this.viewportSize = { width, height };
+        const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi;
+        if (this.userNavigationPending) {
+          this.reflowPending = true;
+          rendition.resize(width, height);
+          return;
+        }
+        if (cfi) {
+          (rendition as ResizableRendition).resize(width, height, cfi);
+          if (!rendition.location?.start) {
+            this.preserveCfi(cfi, this.locationGeneration);
+          }
+        } else {
+          rendition.resize(width, height);
+        }
+      }, RESIZE_DEBOUNCE_MS);
     });
     this.resizeObserver.observe(target);
   }

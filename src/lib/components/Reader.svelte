@@ -1023,7 +1023,12 @@
   });
 </script>
 
-<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+<main
+  class="reader-shell"
+  data-mode={appearance.mode}
+  style:--reader-margin={`${appearance.margin}px`}
+  aria-describedby="reader-keyboard-help"
+>
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport}></div>
 
@@ -1073,7 +1078,7 @@
 
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
+      class="reader-link-return z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
       type="button"
       aria-label="Return to the location before this link"
       onclick={() => void returnToLink()}
@@ -1084,7 +1089,7 @@
 
   {#if readerSyncMessage && controlsVisible}
     <p
-      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
+      class="reader-banner reader-sync-banner z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
       role="status"
     >
       {readerSyncMessage}
@@ -1093,7 +1098,7 @@
   <p class="sr-only" role="status">{selectionMessage}</p>
   {#if selectedText && !hasOpenReaderPanel()}
     <div
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      class="reader-banner reader-selection-banner z-30 mx-auto flex w-fit flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
       role="group"
       aria-label="Selected text"
     >
@@ -2060,23 +2065,46 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
-    --reader-safe-bottom: max(
-      1rem,
+    --reader-inset-top: max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+    --reader-inset-right: max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
+    --reader-inset-bottom: max(
       env(safe-area-inset-bottom, 0px),
       var(--safe-area-inset-bottom, 0px)
     );
+    --reader-inset-left: max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
+    --reader-safe-top: max(0.5rem, var(--reader-inset-top));
+    --reader-safe-right: max(1rem, var(--reader-inset-right));
+    --reader-safe-bottom: max(1rem, var(--reader-inset-bottom));
+    --reader-safe-left: max(1rem, var(--reader-inset-left));
+    --reader-bottom-gutter: 3rem;
     --reader-progress-height: 0.25rem;
   }
 
   .reader-viewport {
     position: absolute;
-    inset: var(--reader-safe-top) 0 var(--reader-safe-bottom) 0;
+    top: var(--reader-safe-top);
+    bottom: calc(var(--reader-safe-bottom) + var(--reader-bottom-gutter));
+    left: max(
+      var(--reader-inset-left),
+      min(
+        var(--reader-margin, 24px),
+        max(0px, calc((100% - 120px) / 2)),
+        max(0px, calc(100% - 120px - var(--reader-inset-right)))
+      )
+    );
+    right: max(
+      var(--reader-inset-right),
+      min(
+        var(--reader-margin, 24px),
+        max(0px, calc((100% - 120px) / 2)),
+        max(0px, calc(100% - 120px - var(--reader-inset-left)))
+      )
+    );
     overflow: hidden;
-    width: 100%;
+    width: auto;
     height: auto;
     min-width: 0;
-    max-width: 100%;
+    max-width: none;
     contain: layout paint;
   }
 
@@ -2130,7 +2158,7 @@
     top: 0;
     left: 0;
     right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    height: max(4rem, calc(var(--reader-inset-top) + 3rem));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2142,7 +2170,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: max(2.5rem, calc(var(--reader-inset-bottom) + 1.5rem));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2181,13 +2209,14 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding-inline: max(1rem, env(safe-area-inset-left));
+    padding-inline-start: var(--reader-safe-left);
+    padding-inline-end: var(--reader-safe-right);
     color: var(--reader-bar-text);
   }
 
   .reader-top {
     top: 0;
-    padding-top: env(safe-area-inset-top);
+    padding-top: var(--reader-inset-top);
   }
 
   .reader-toolbar {
@@ -2250,6 +2279,7 @@
 
     .reader-toolbar-actions {
       width: 100%;
+      grid-template-columns: repeat(auto-fit, minmax(2.75rem, 1fr));
       gap: 0.25rem;
     }
 
@@ -2267,22 +2297,41 @@
     }
   }
 
-  @media (max-width: 22.5rem) {
-    .reader-toolbar-actions {
-      grid-template-columns: repeat(4, minmax(2.75rem, 1fr));
-    }
-  }
-
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    bottom: calc(var(--reader-progress-height) + max(3rem, var(--reader-inset-bottom) + 2.75rem));
     justify-content: space-between;
     padding-bottom: 0;
   }
 
+  .reader-link-return {
+    position: absolute;
+    left: var(--reader-safe-left);
+    right: var(--reader-safe-right);
+    bottom: calc(var(--reader-safe-bottom) + var(--reader-bottom-gutter));
+    margin-left: auto;
+    width: fit-content;
+    max-width: calc(100% - var(--reader-safe-left) - var(--reader-safe-right));
+  }
+
+  .reader-banner {
+    position: absolute;
+    left: var(--reader-safe-left);
+    right: var(--reader-safe-right);
+    max-width: calc(100% - var(--reader-safe-left) - var(--reader-safe-right));
+  }
+
+  .reader-sync-banner {
+    bottom: calc(var(--reader-safe-bottom) + var(--reader-bottom-gutter));
+  }
+
+  .reader-selection-banner {
+    bottom: max(3.25rem, calc(var(--reader-inset-bottom) + 3rem));
+  }
+
   .reader-progress {
     position: absolute;
-    left: 0;
-    right: 0;
+    left: var(--reader-inset-left);
+    right: var(--reader-inset-right);
     bottom: 0;
     z-index: 18;
     pointer-events: none;
@@ -2304,22 +2353,29 @@
 
   .reader-progress-reveal {
     position: absolute;
-    right: max(1rem, env(safe-area-inset-right));
-    bottom: max(0.25rem, env(safe-area-inset-bottom));
+    right: var(--reader-safe-right);
+    bottom: max(0.25rem, var(--reader-inset-bottom));
     z-index: 19;
     min-width: 3rem;
-    min-height: 2.75rem;
+    min-height: max(44px, 2.75rem);
+    padding-block: 0.25rem;
+    line-height: 1;
     color: var(--reader-bar-text);
   }
 
   .reader-settings {
     position: absolute;
-    left: 1rem;
-    right: 1rem;
-    bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    left: var(--reader-safe-left);
+    right: var(--reader-safe-right);
+    bottom: max(4rem, calc(var(--reader-inset-bottom) + 3rem));
     margin-inline: auto;
     max-width: 30rem;
-    max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    max-height: min(
+      75dvh,
+      calc(
+        100dvh - max(4rem, var(--reader-inset-bottom) + 3rem) - max(1rem, var(--reader-inset-top))
+      )
+    );
     overflow: auto;
     padding: 1.25rem;
     z-index: 1;

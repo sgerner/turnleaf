@@ -1,9 +1,12 @@
 package app.turnleaf.reader;
 
 import com.getcapacitor.BridgeActivity;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.KeyEvent;
 import android.view.Window;
+import android.view.WindowManager;
+import androidx.annotation.RequiresApi;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -36,6 +39,9 @@ public class MainActivity extends BridgeActivity {
             () -> {
                 Window window = getWindow();
                 WindowCompat.setDecorFitsSystemWindows(window, !enabled);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    applyDisplayCutoutMode(window, enabled);
+                }
                 WindowInsetsControllerCompat controller =
                     WindowCompat.getInsetsController(window, window.getDecorView());
                 if (controller == null) {
@@ -52,6 +58,26 @@ public class MainActivity extends BridgeActivity {
                 }
             }
         );
+    }
+
+    @RequiresApi(Build.VERSION_CODES.P)
+    static int displayCutoutModeForReaderChrome(boolean enabled) {
+        return enabled
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+    }
+
+    @RequiresApi(Build.VERSION_CODES.P)
+    static void applyDisplayCutoutMode(Window window, boolean enabled) {
+        WindowManager.LayoutParams attributes = window.getAttributes();
+        if (attributes == null) {
+            return;
+        }
+        int cutoutMode = displayCutoutModeForReaderChrome(enabled);
+        if (attributes.layoutInDisplayCutoutMode != cutoutMode) {
+            attributes.layoutInDisplayCutoutMode = cutoutMode;
+            window.setAttributes(attributes);
+        }
     }
 
     @Override

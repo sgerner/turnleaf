@@ -11,7 +11,7 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
-    themes: { register: vi.fn(), select: vi.fn() },
+    themes: { registerCss: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
     resize: vi.fn(),
@@ -41,7 +41,10 @@ describe('ReaderSession keyboard navigation', () => {
     mockBook.navigation.toc = [];
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
 
   it('forwards EPUB iframe key events to the reader and removes the listener on destroy', async () => {
     const onKeyboardNavigation = vi.fn();
@@ -204,7 +207,8 @@ describe('ReaderSession keyboard navigation', () => {
     session.destroy();
   });
 
-  it('reflows the rendition when the reader viewport changes size', async () => {
+  it('debounces ResizeObserver callbacks during drags and restores the active CFI once settled', async () => {
+    vi.useFakeTimers();
     const resizeCallbacks: ResizeObserverCallback[] = [];
     class TestResizeObserver {
       constructor(callback: ResizeObserverCallback) {
@@ -215,22 +219,111 @@ describe('ReaderSession keyboard navigation', () => {
     }
     vi.stubGlobal('ResizeObserver', TestResizeObserver);
 
+    const viewport = document.createElement('div');
     const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      null,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-    );
-    resizeCallbacks[0]?.(
-      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
-      {} as ResizeObserver,
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+
+    expect(mockBook.renderTo).toHaveBeenCalledWith(
+      viewport,
+      expect.objectContaining({
+        gap: 0,
+        flow: 'paginated',
+        spread: 'none',
+        allowScriptedContent: false,
+      }),
     );
 
-    expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/8:0)',
+        displayed: { page: 3, total: 6 },
+      },
+    });
+    mockRendition.display.mockClear();
+
+    for (const width of [340, 324, 308, 292, 278]) {
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width, height: 640 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      vi.advanceTimersByTime(40);
+    }
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(100);
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+      278,
+      640,
+      'epubcfi(/6/2!/4/2/8:0)',
+    );
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/8:0)');
     session.destroy();
+  });
+
+  it('replaces #epubjs-inserted-css-turnleaf with 7 rules and zero duplicates across 10 slider ticks', async () => {
+    const frame = document.createElement('iframe');
+    document.body.append(frame);
+    const epubDoc = frame.contentDocument!;
+    const addStylesheetCss = (serializedCss: string, key: string) => {
+      const id = `epubjs-inserted-css-${key}`;
+      let styleEl = epubDoc.getElementById(id) as HTMLStyleElement | null;
+      if (!styleEl) {
+        styleEl = epubDoc.createElement('style');
+        styleEl.id = id;
+        epubDoc.head.appendChild(styleEl);
+      }
+      styleEl.innerHTML = serializedCss;
+      return true;
+    };
+    mockRendition.themes.registerCss.mockImplementation((name: string, css: string) => {
+      addStylesheetCss(css, name);
+    });
+
+    const session = new ReaderSession('book.epub');
+    try {
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+
+      for (let tick = 1; tick <= 10; tick += 1) {
+        session.applyAppearance({
+          ...defaultAppearance,
+          margin: 8 + tick * 4,
+          bottomMargin: tick * 4,
+          fontSize: 16 + tick,
+          paragraphSpacing: Number((tick * 0.1).toFixed(1)),
+        });
+      }
+
+      const styleNodes = epubDoc.querySelectorAll('#epubjs-inserted-css-turnleaf');
+      expect(styleNodes).toHaveLength(1);
+      const styleEl = styleNodes[0] as HTMLStyleElement;
+      expect(styleEl.textContent).not.toContain('safe-area-inset');
+      expect(styleEl.textContent).toContain('padding-bottom: 40px !important;');
+
+      const sheet = styleEl.sheet!;
+      expect(sheet.cssRules).toHaveLength(7);
+      for (const rule of Array.from(sheet.cssRules)) {
+        const declarations = rule.cssText
+          .slice(rule.cssText.indexOf('{') + 1, rule.cssText.lastIndexOf('}'))
+          .split(';')
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+          .map((entry) => entry.slice(0, entry.indexOf(':')).trim());
+        expect(new Set(declarations).size).toBe(declarations.length);
+      }
+    } finally {
+      session.destroy();
+      frame.remove();
+    }
   });
 });
