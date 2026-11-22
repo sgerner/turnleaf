@@ -1,8 +1,8 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
-  import { onMount, tick, untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { focusFirstElement, trapModalKeydown } from '../a11y/modal-focus';
+  import { focusModal, trapModalKeydown } from '../a11y/modal-focus';
   import {
     removeServer,
     saveServer,
@@ -72,7 +72,7 @@
 
   onMount(() => {
     void Promise.allSettled(skeletonThemes.map(loadTheme));
-    void tick().then(() => focusFirstElement(settingsDialog));
+    focusModal(() => settingsDialog);
   });
 
   $effect(() => {

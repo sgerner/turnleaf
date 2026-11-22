@@ -237,7 +237,7 @@ describe('native progress transactions against SQLite', () => {
     const baselineBook = (await database.getBooks(server.id))[0];
 
     native.failTransactionAt = 2;
-    await expect(database.markBookCompleted(book, baselineReading)).rejects.toThrow(
+    await expect(database.markBookCompleted(book)).rejects.toThrow(
       'injected transaction failure at 2',
     );
 
