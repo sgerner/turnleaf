@@ -1,24 +1,43 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
-  import { onMount } from 'svelte';
+  import { Network } from '@capacitor/network';
+  import { onMount, tick } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
   import {
+    getBooks,
     getPreferences,
     getServer,
     resetLocalDatabase,
+    type BookRecord,
     type ServerConfig,
   } from './lib/database/database';
-  import { getApiKey } from './lib/native/credentials';
+  import { getApiKey, prepare as prepareCredentials } from './lib/native/credentials';
   import { loadTheme } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
+  const startupPreferenceKeys = [
+    themePreferenceKey,
+    modePreferenceKey,
+    'syncFurthest',
+    'librarySort',
+    'libraryAuthor',
+    'librarySeries',
+    'libraryView',
+  ] as const;
   const defaultTheme = 'fennec';
   const defaultMode = 'dark';
+
+  type StartupLibraryHydration = {
+    serverId: string;
+    books: BookRecord[];
+    preferences: ReadonlyMap<string, string>;
+    offline: boolean;
+  };
 
   let server = $state<ServerConfig | null>(null);
   let booting = $state(Capacitor.isNativePlatform());
@@ -29,42 +48,94 @@
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let startupLibrary = $state.raw<StartupLibraryHydration | null>(null);
+  let destroyed = false;
+  let loadGeneration = 0;
 
   async function loadLocalData(): Promise<void> {
+    const generation = ++loadGeneration;
     booting = true;
     startupError = '';
     server = null;
     apiKey = null;
-    void checkForRelease();
+    startupLibrary = null;
+
+    const credentialsReady = prepareCredentials();
+    void credentialsReady.catch(() => {});
+    const networkStatusPromise = Network.getStatus().catch(() => null);
+
     try {
       const [saved, preferences] = await Promise.all([
         getServer(),
-        getPreferences([themePreferenceKey, modePreferenceKey]),
+        getPreferences(startupPreferenceKeys),
       ]);
+      if (destroyed || generation !== loadGeneration) return;
+
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
       const theme = savedTheme ?? defaultTheme;
-      uiTheme = (await loadTheme(theme).catch(() => false)) ? theme : defaultTheme;
       uiMode = savedMode === 'light' ? 'light' : 'dark';
+
       if (saved) {
+        let credentialFailed = false;
+        const [themeLoaded, loadedKey, savedBooks, networkStatus] = await Promise.all([
+          loadTheme(theme).catch(() => false),
+          credentialsReady
+            .then(() => getApiKey(saved.credentialRef))
+            .catch(() => {
+              credentialFailed = true;
+              return null;
+            }),
+          getBooks(saved.id, { includeDescription: false }),
+          networkStatusPromise,
+        ]);
+        if (destroyed || generation !== loadGeneration) return;
+
+        uiTheme = themeLoaded ? theme : defaultTheme;
         server = saved;
-        try {
-          apiKey = await getApiKey(saved.credentialRef);
-        } catch {
+        apiKey = loadedKey;
+        startupLibrary = {
+          serverId: saved.id,
+          books: savedBooks,
+          preferences,
+          offline: !networkStatus?.connected,
+        };
+        if (credentialFailed) {
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
+      } else {
+        const [themeLoaded] = await Promise.all([
+          loadTheme(theme).catch(() => false),
+          networkStatusPromise,
+        ]);
+        if (destroyed || generation !== loadGeneration) return;
+        uiTheme = themeLoaded ? theme : defaultTheme;
       }
     } catch {
+      if (destroyed || generation !== loadGeneration) return;
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
-      booting = false;
+      if (!destroyed && generation === loadGeneration) {
+        booting = false;
+      }
+    }
+
+    if (!destroyed && generation === loadGeneration && !releaseBanner) {
+      void tick().then(() => {
+        if (!destroyed && generation === loadGeneration && !releaseBanner) {
+          void checkForRelease();
+        }
+      });
     }
   }
 
   onMount(() => {
     void loadLocalData();
+    return () => {
+      destroyed = true;
+    };
   });
 
   async function repairLocalData(): Promise<void> {
@@ -159,16 +230,24 @@
         </div>
       </main>
     {:else if server && apiKey && !changingServerAddress}
+      {@const preloaded = startupLibrary?.serverId === server.id ? startupLibrary : undefined}
       <Library
         {server}
         {apiKey}
         theme={uiTheme}
         mode={uiMode}
+        initialBooks={preloaded?.books}
+        initialPreferences={preloaded?.preferences}
+        initialOffline={preloaded?.offline}
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
-        onChangeServerAddress={() => (changingServerAddress = true)}
+        onChangeServerAddress={() => {
+          startupLibrary = null;
+          changingServerAddress = true;
+        }}
         onServerDeleted={() => {
+          startupLibrary = null;
           server = null;
           apiKey = null;
         }}
@@ -219,6 +298,7 @@
         editAddress={changingServerAddress}
         onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
         onConnected={(connected, key) => {
+          startupLibrary = null;
           apiKey = key;
           server = connected;
           changingServerAddress = false;

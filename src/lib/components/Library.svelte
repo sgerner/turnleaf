@@ -59,6 +59,9 @@
     apiKey,
     theme,
     mode,
+    initialBooks,
+    initialPreferences,
+    initialOffline,
     onThemeChange,
     onModeChange,
     onApiKeyChange,
@@ -69,6 +72,9 @@
     apiKey: string;
     theme: string;
     mode: 'light' | 'dark';
+    initialBooks?: BookRecord[] | undefined;
+    initialPreferences?: ReadonlyMap<string, string> | undefined;
+    initialOffline?: boolean | undefined;
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
     onApiKeyChange: (apiKey: string) => void;
@@ -77,6 +83,21 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
+  const preloadedStartup = untrack(
+    () =>
+      initialBooks !== undefined &&
+      initialPreferences !== undefined &&
+      initialOffline !== undefined,
+  );
+  function offlineStartupNotice(isOffline: boolean, items: readonly BookRecord[]): string {
+    if (!isOffline) return '';
+    const hasDisplayable = items.some(
+      (book) => book.remoteAvailable !== false || Boolean(book.downloadPath),
+    );
+    return hasDisplayable
+      ? 'No network connection. Showing your saved library.'
+      : 'No network connection. Connect to Kavita to load your library.';
+  }
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
@@ -94,20 +115,36 @@
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
   });
-  let books = $state<BookRecord[]>([]);
+  let books = $state<BookRecord[]>(untrack(() => (preloadedStartup ? (initialBooks ?? []) : [])));
   let displayableBooks = $derived(
     books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
   );
   let query = $state('');
-  let offlineMessage = $state('');
+  let offlineMessage = $state(
+    untrack(() =>
+      preloadedStartup ? offlineStartupNotice(initialOffline ?? false, initialBooks ?? []) : '',
+    ),
+  );
   let downloadedOnly = $state(false);
   let hideCompleted = $state(true);
   let queryTerms = $derived(normalizeLibrarySearch(query).split(' ').filter(Boolean));
-  let sortOrder = $state<LibrarySortOrder>('title');
-  let authorFilter = $state('');
-  let seriesFilter = $state('');
+  let sortOrder = $state<LibrarySortOrder>(
+    untrack(() =>
+      preloadedStartup ? parseSortOrder(initialPreferences?.get('librarySort') ?? null) : 'title',
+    ),
+  );
+  let authorFilter = $state(
+    untrack(() => (preloadedStartup ? (initialPreferences?.get('libraryAuthor') ?? '') : '')),
+  );
+  let seriesFilter = $state(
+    untrack(() => (preloadedStartup ? (initialPreferences?.get('librarySeries') ?? '') : '')),
+  );
   let filtersVisible = $state(false);
-  let viewMode = $state<LibraryViewMode>('grid');
+  let viewMode = $state<LibraryViewMode>(
+    untrack(() =>
+      preloadedStartup ? parseViewMode(initialPreferences?.get('libraryView') ?? null) : 'grid',
+    ),
+  );
   let advancedFiltersActive = $derived(
     sortOrder !== 'title' || Boolean(authorFilter) || Boolean(seriesFilter),
   );
@@ -196,7 +233,7 @@
   let conflictError = $state('');
   const covers = new SvelteMap<number, string>();
   let coverReloadRequest = $state(0);
-  let loading = $state(true);
+  let loading = $state(!preloadedStartup);
   let refreshing = $state(false);
   let refreshWork: Promise<void> | null = null;
   let refreshController: AbortController | null = null;
@@ -206,7 +243,7 @@
   let downloadFailureBook = $state<BookRecord | null>(null);
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
-  let offline = $state(false);
+  let offline = $state(untrack(() => (preloadedStartup ? (initialOffline ?? false) : false)));
   let message = $state('');
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
@@ -223,9 +260,15 @@
   let settingsVisible = $state(false);
   let diagnosticsVisible = $state(false);
   let diagnosticsOutput = $state('');
-  let pendingTheme = $state<SkeletonTheme>('vintage');
-  let pendingMode = $state<'light' | 'dark'>('dark');
-  let pendingAutoSync = $state(false);
+  let pendingTheme = $state<SkeletonTheme>(
+    untrack(() => (preloadedStartup ? (theme as SkeletonTheme) : 'vintage')),
+  );
+  let pendingMode = $state<'light' | 'dark'>(untrack(() => (preloadedStartup ? mode : 'dark')));
+  let pendingAutoSync = $state(
+    untrack(() =>
+      preloadedStartup ? (initialPreferences?.get('syncFurthest') ?? 'true') === 'true' : false,
+    ),
+  );
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
   let settingsError = $state('');
@@ -495,42 +538,43 @@
   });
 
   onMount(async () => {
-    void cleanupInterruptedEpubDownloads();
     const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
     scrollTarget = scrollContainer ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
     window.addEventListener('resize', scheduleVirtualWindow);
     scheduleVirtualWindow();
 
-    const [preferences, savedBooks] = await Promise.all([
-      getPreferences([
-        'syncFurthest',
-        'librarySort',
-        'libraryAuthor',
-        'librarySeries',
-        'libraryView',
-      ]),
-      getBooks(server.id, { includeDescription: false }),
-    ]);
+    if (!preloadedStartup) {
+      const [preferences, savedBooks, networkStatus] = await Promise.all([
+        getPreferences([
+          'syncFurthest',
+          'librarySort',
+          'libraryAuthor',
+          'librarySeries',
+          'libraryView',
+        ]),
+        getBooks(server.id, { includeDescription: false }),
+        Network.getStatus().catch(() => null),
+      ]);
+      if (destroyed) return;
+      pendingTheme = theme as SkeletonTheme;
+      pendingMode = mode;
+      pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
+      sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
+      authorFilter = preferences.get('libraryAuthor') ?? '';
+      seriesFilter = preferences.get('librarySeries') ?? '';
+      viewMode = parseViewMode(preferences.get('libraryView') ?? null);
+      offline = !networkStatus?.connected;
+      books = savedBooks;
+      retainCoversFor(books);
+      loading = false;
+      offlineMessage = offlineStartupNotice(offline, books);
+    }
+
+    await tick();
     if (destroyed) return;
-    pendingTheme = theme as SkeletonTheme;
-    pendingMode = mode;
-    pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
-    sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
-    authorFilter = preferences.get('libraryAuthor') ?? '';
-    seriesFilter = preferences.get('librarySeries') ?? '';
-    viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    offline = !(await Network.getStatus().catch(() => null))?.connected;
-    if (destroyed) return;
-    books = savedBooks;
-    retainCoversFor(books);
-    loading = false;
+    void cleanupInterruptedEpubDownloads();
     void refreshSyncStatus();
-    offlineMessage = offline
-      ? displayableBooks.length
-        ? 'No network connection. Showing your saved library.'
-        : 'No network connection. Connect to Kavita to load your library.'
-      : '';
     if (destroyed) return;
     cleanups.push(
       await registerListener(
