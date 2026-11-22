@@ -1120,20 +1120,26 @@
         onclick={() => {
           saveAnnotation();
           selectionMessage = 'Highlight saved.';
-        }}>Highlight</button
+        }}
       >
+        Highlight
+      </button>
       <button
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}>Add note</button
+        onclick={openAnnotations}
       >
+        Add note
+      </button>
       <button
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={() => void copySelection()}>Copy text</button
+        onclick={() => void copySelection()}
       >
+        Copy text
+      </button>
     </div>
   {/if}
 
@@ -1415,8 +1421,10 @@
                 class="btn preset-outlined-surface-300-700 capitalize"
                 type="button"
                 aria-pressed={appearance.mode === mode}
-                onclick={() => updateAppearance({ mode: mode as ReadingMode })}>{mode}</button
+                onclick={() => updateAppearance({ mode: mode as ReadingMode })}
               >
+                {mode}
+              </button>
             {/each}
           </div>
           <label class="label mt-5">
@@ -1613,8 +1621,10 @@
                     onclick={() => {
                       void session?.display(item.href);
                       closeToc();
-                    }}>{item.label}</button
+                    }}
                   >
+                    {item.label}
+                  </button>
                   {#if item.children.length > 0}
                     <div class="ml-4 border-l border-surface-300/50 pl-2">
                       {@render contentsList(item.children)}
@@ -1786,9 +1796,9 @@
                           data-reader-focus-id={bookmark.id}
                           bind:value={bookmarkDraft}
                         />
-                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit"
-                          >Save</button
-                        >
+                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
+                          Save
+                        </button>
                       </form>
                     {:else}
                       <div class="flex items-center gap-2">
