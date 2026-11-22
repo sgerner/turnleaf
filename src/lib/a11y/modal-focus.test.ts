@@ -8,6 +8,7 @@ let first: HTMLButtonElement;
 let last: HTMLButtonElement;
 
 beforeEach(() => {
+  document.body.innerHTML = '';
   dialog = document.createElement('div');
   dialog.tabIndex = -1;
   first = document.createElement('button');
@@ -62,4 +63,51 @@ it('closes on Escape and restores focus to a connected opener', () => {
   expect(close).toHaveBeenCalledOnce();
   expect(event.defaultPrevented).toBe(true);
   expect(document.activeElement).toBe(opener);
+});
+
+it('falls back when opener is disabled, disconnected, document.body, or inside an inert ancestor', () => {
+  const fallback = document.createElement('button');
+  document.body.append(fallback);
+
+  const disabledOpener = document.createElement('button');
+  disabledOpener.disabled = true;
+  document.body.append(disabledOpener);
+  first.focus();
+  restoreFocus(disabledOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const disconnectedOpener = document.createElement('button');
+  first.focus();
+  restoreFocus(disconnectedOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  first.focus();
+  restoreFocus(document.body, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const inertWrapper = document.createElement('div');
+  inertWrapper.setAttribute('inert', '');
+  const inertOpener = document.createElement('button');
+  inertWrapper.append(inertOpener);
+  document.body.append(inertWrapper);
+  first.focus();
+  restoreFocus(inertOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const propertyInertWrapper = document.createElement('div');
+  propertyInertWrapper.inert = true;
+  const propertyInertOpener = document.createElement('button');
+  propertyInertWrapper.append(propertyInertOpener);
+  document.body.append(propertyInertWrapper);
+  first.focus();
+  restoreFocus(propertyInertOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const toolbarFallback = document.createElement('header');
+  const toolbarButton = document.createElement('button');
+  toolbarFallback.append(toolbarButton);
+  document.body.append(toolbarFallback);
+  first.focus();
+  restoreFocus(document.body, toolbarFallback);
+  expect(document.activeElement).toBe(toolbarButton);
 });
