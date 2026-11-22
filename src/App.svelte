@@ -29,6 +29,7 @@
   let apiKey = $state<string | null>(null);
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
+  let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let appStage = $state<HTMLDivElement | null>(null);
 
@@ -37,6 +38,7 @@
     startupError = '';
     server = null;
     apiKey = null;
+    readerOpen = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -101,13 +103,14 @@
 <svelte:window onkeydown={(event) => forwardStageScrollKey(event, appStage)} />
 
 <div class="app-shell">
-  <div class="app-ambient" aria-hidden="true">
-    <div class="orb orb-primary"></div>
-    <div class="orb orb-secondary"></div>
-    <div class="orb orb-tertiary"></div>
-    <div class="mesh"></div>
-    <div class="vignette"></div>
-  </div>
+  {#if !readerOpen && uiTheme !== 'eink'}
+    <div class="app-ambient" aria-hidden="true">
+      <div class="orb orb-primary"></div>
+      <div class="orb orb-secondary"></div>
+      <div class="orb orb-tertiary"></div>
+      <div class="vignette"></div>
+    </div>
+  {/if}
 
   <div class="app-stage" bind:this={appStage}>
     {#if releaseBanner}
@@ -171,8 +174,13 @@
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
-        onChangeServerAddress={() => (changingServerAddress = true)}
+        onReaderOpenChange={(open) => (readerOpen = open)}
+        onChangeServerAddress={() => {
+          readerOpen = false;
+          changingServerAddress = true;
+        }}
         onServerDeleted={() => {
+          readerOpen = false;
           server = null;
           apiKey = null;
         }}
@@ -311,8 +319,6 @@
     position: absolute;
     border-radius: 9999px;
     opacity: 0.66;
-    transform: translate3d(0, 0, 0);
-    will-change: transform;
   }
 
   .orb-primary {
@@ -349,27 +355,6 @@
       color-mix(in oklab, var(--color-tertiary-300-700) 52%, var(--color-surface-50-950) 48%),
       transparent 68%
     );
-  }
-
-  .mesh {
-    position: absolute;
-    inset: 0;
-    background-image:
-      linear-gradient(
-        to bottom,
-        color-mix(in oklab, var(--color-surface-100-900) 8%, transparent) 1px,
-        transparent 1px
-      ),
-      linear-gradient(
-        to right,
-        color-mix(in oklab, var(--color-surface-100-900) 6%, transparent) 1px,
-        transparent 1px
-      );
-    background-size:
-      100% 100%,
-      100% 100%;
-    opacity: 0.12;
-    mask-image: radial-gradient(circle at center, black 44%, transparent 100%);
   }
 
   .vignette {
@@ -419,11 +404,6 @@
     );
   }
 
-  :global([data-mode='dark']) .mesh {
-    opacity: 0.06;
-    mask-image: radial-gradient(circle at center, black 46%, transparent 100%);
-  }
-
   :global([data-mode='dark']) .vignette {
     background: radial-gradient(
       circle at center,
@@ -432,51 +412,7 @@
     );
   }
 
-  @media (prefers-reduced-motion: no-preference) {
-    .orb-primary {
-      animation: drift-primary 42s ease-in-out infinite alternate;
-    }
-
-    .orb-secondary {
-      animation: drift-secondary 56s ease-in-out infinite alternate;
-    }
-
-    .orb-tertiary {
-      animation: drift-tertiary 64s ease-in-out infinite alternate;
-    }
-  }
-
   :global([data-theme='eink']) .app-ambient {
     display: none;
-  }
-
-  @keyframes drift-primary {
-    from {
-      transform: translate3d(0, 0, 0) scale(1);
-    }
-
-    to {
-      transform: translate3d(2rem, 1.25rem, 0) scale(1.05);
-    }
-  }
-
-  @keyframes drift-secondary {
-    from {
-      transform: translate3d(0, 0, 0) scale(1);
-    }
-
-    to {
-      transform: translate3d(-1.5rem, 1rem, 0) scale(1.04);
-    }
-  }
-
-  @keyframes drift-tertiary {
-    from {
-      transform: translate3d(0, 0, 0) scale(1);
-    }
-
-    to {
-      transform: translate3d(1rem, -1.25rem, 0) scale(1.03);
-    }
   }
 </style>
