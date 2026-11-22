@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Preserve keyboard focus across view switches, conditional controls, and modals
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops

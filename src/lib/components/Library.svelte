@@ -52,7 +52,12 @@
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    focusAfterUnmount,
+    focusViewEntry,
+    modalFocusTrap,
+    restoreFocus,
+  } from '../a11y/modal-focus';
 
   let {
     server,
@@ -235,9 +240,6 @@
   let confirmDeleteServer = $state(false);
   let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
-  let actionMenuDialog = $state<HTMLElement | null>(null);
-  let conflictDialog = $state<HTMLElement | null>(null);
-  let settingsDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
@@ -346,10 +348,6 @@
     return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-  }
-
-  function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
   }
 
   function insecureServer(): boolean {
@@ -1256,7 +1254,6 @@
   function openMenu(book: BookRecord): void {
     actionMenuOpener = activeElement();
     actionMenuBook = book;
-    focusModal(() => actionMenuDialog);
   }
 
   function closeMenu(): void {
@@ -1276,7 +1273,6 @@
     conflictOpener = activeElement();
     conflictError = '';
     conflict = next;
-    focusModal(() => conflictDialog);
   }
 
   function closeConflict(): void {
@@ -1342,12 +1338,12 @@
     settingsOpener = activeElement();
     settingsVisible = true;
     void Promise.allSettled(skeletonThemes.map(loadTheme));
-    focusModal(() => settingsDialog);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
     showReplacementKey = false;
+    confirmDeleteServer = false;
     const opener = settingsOpener;
     settingsOpener = null;
     void tick().then(() => restoreFocus(opener));
@@ -1567,7 +1563,7 @@
 
 {#if reading}
   {#await import('./Reader.svelte')}
-    <p class="m-8" role="status">Opening reader…</p>
+    <p class="m-8" role="status" tabindex="-1" use:focusViewEntry>Opening reader…</p>
   {:then { default: Reader }}
     <Reader
       bookUrl={reading.url}
@@ -1587,7 +1583,9 @@
     />
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
-      <p role="alert">Turnleaf could not load the reader. Reload the app to try again.</p>
+      <p role="alert" tabindex="-1" use:focusViewEntry>
+        Turnleaf could not load the reader. Reload the app to try again.
+      </p>
       <button class="btn preset-tonal-surface" type="button" onclick={() => void closeReader()}>
         Back to library
       </button>
@@ -1615,7 +1613,13 @@
       <div class="flex min-w-0 items-center gap-3">
         <TurnleafLogo size={36} wordmark={false} />
         <div class="min-w-0 leading-tight">
-          <h1 class="truncate font-serif text-3xl text-primary-950-50">Turnleaf</h1>
+          <h1
+            tabindex="-1"
+            use:focusViewEntry
+            class="truncate font-serif text-3xl text-primary-950-50"
+          >
+            Turnleaf
+          </h1>
         </div>
       </div>
       <div class="card preset-tonal-surface flex shrink-0 gap-1 p-1">
@@ -1728,6 +1732,7 @@
           <button
             type="button"
             class="btn btn-sm absolute right-1 top-1/2 h-11 w-11 -translate-y-1/2 p-0 preset-filled-surface-200-800"
+            use:focusAfterUnmount={'#library-search'}
             onclick={() => (query = '')}
             aria-label="Clear search"
             title="Clear search"
@@ -1796,6 +1801,7 @@
           <button
             class="btn btn-sm h-11 w-11 !p-0 rounded-none preset-tonal-surface"
             type="button"
+            use:focusAfterUnmount={'#library-results'}
             onclick={clearFilters}
             aria-label="Clear library filters"
             title="Clear filters"
@@ -1909,6 +1915,7 @@
           <button
             type="button"
             class="btn preset-tonal-primary"
+            use:focusAfterUnmount={['.reader-shell', '#library-results']}
             onclick={() => openProgressProbe?.abort()}>Open offline</button
           >
         {/if}
@@ -1952,6 +1959,7 @@
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
+              use:focusAfterUnmount={'#library-results'}
               onclick={() => void retryDownloadCleanup()}
               disabled={cleanupInProgress}
               >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
@@ -1960,6 +1968,7 @@
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
+              use:focusAfterUnmount={'#library-results'}
               onclick={() => void refresh()}
               disabled={refreshing}>Refresh library</button
             >
@@ -1967,6 +1976,7 @@
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
+              use:focusAfterUnmount={'#library-results'}
               onclick={() => void download(downloadFailureBook!)}
               disabled={Boolean(downloadingBookId) ||
                 offline ||
@@ -1994,6 +2004,7 @@
         <button
           class="btn btn-sm preset-tonal-warning h-10 shrink-0"
           type="button"
+          use:focusAfterUnmount={'#library-results'}
           onclick={() => void syncProgress()}
           disabled={syncing || offline}
         >
@@ -2035,6 +2046,7 @@
         <button
           class="btn preset-tonal-surface mt-2 h-11"
           type="button"
+          use:focusAfterUnmount={'#library-results'}
           onclick={() => void refresh()}
           disabled={refreshing || offline}
         >
@@ -2056,7 +2068,12 @@
         </svg>
         <p>No books match your search.</p>
         {#if libraryFiltersActive}
-          <button class="btn preset-tonal-surface mt-2 h-11" type="button" onclick={clearFilters}>
+          <button
+            class="btn preset-tonal-surface mt-2 h-11"
+            type="button"
+            use:focusAfterUnmount={'#library-results'}
+            onclick={clearFilters}
+          >
             Clear search and filters
           </button>
         {/if}
@@ -2333,13 +2350,12 @@
     onclick={(event) => event.target === event.currentTarget && closeMenu()}
   >
     <div
-      bind:this={actionMenuDialog}
       class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
       tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, actionMenuDialog!, closeMenu)}
+      use:modalFocusTrap={closeMenu}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <div class="flex items-start justify-between gap-4">
@@ -2465,13 +2481,12 @@
     onclick={(event) => event.target === event.currentTarget && closeConflict()}
   >
     <div
-      bind:this={conflictDialog}
       class="card preset-filled-surface-50-950 w-full max-w-sm p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="sync-conflict-title"
       tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, conflictDialog!, closeConflict)}
+      use:modalFocusTrap={closeConflict}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
@@ -2546,13 +2561,12 @@
     onclick={(event) => event.target === event.currentTarget && closeSettings()}
   >
     <div
-      bind:this={settingsDialog}
       class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="library-settings-title"
       tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
+      use:modalFocusTrap={closeSettings}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <div
@@ -2761,13 +2775,59 @@
             {settingsError}
           </div>
           <button
+            id="delete-server-button"
             class="btn preset-tonal-error"
             type="button"
-            onclick={() => (confirmDeleteServer = true)}
+            aria-expanded={confirmDeleteServer}
+            aria-controls={confirmDeleteServer ? 'delete-server-confirm' : undefined}
+            onclick={() => {
+              confirmDeleteServer = true;
+              document.getElementById('delete-server-confirm')?.focus({ preventScroll: true });
+            }}
             disabled={deletingServer}
           >
             Delete server
           </button>
+          {#if confirmDeleteServer}
+            <div
+              id="delete-server-confirm"
+              class="rounded-xl border border-error-500/35 p-4"
+              role="group"
+              aria-labelledby="delete-server-confirm-title"
+              aria-describedby="delete-server-confirm-description"
+              tabindex="-1"
+              use:focusViewEntry={{ force: true }}
+              transition:fade
+            >
+              <p id="delete-server-confirm-title" class="text-sm font-medium text-error-700-300">
+                Delete this server?
+              </p>
+              <p id="delete-server-confirm-description" class="mt-2 text-sm text-surface-700-300">
+                This removes the server connection, downloaded books, cached covers, and local
+                progress from this device.
+              </p>
+              <div class="mt-4 flex gap-2">
+                <button
+                  class="btn preset-outlined-error-500"
+                  type="button"
+                  use:focusAfterUnmount={'#delete-server-button'}
+                  onclick={() => void deleteServer()}
+                  disabled={deletingServer}
+                >
+                  {deletingServer ? 'Deleting...' : 'Delete now'}
+                </button>
+                <button
+                  class="btn preset-tonal-surface"
+                  type="button"
+                  use:focusAfterUnmount={'#delete-server-button'}
+                  onclick={() => (confirmDeleteServer = false)}
+                  disabled={deletingServer}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          {/if}
         </form>
       </section>
 
@@ -2855,33 +2915,6 @@
           <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
         {/if}
       </section>
-      {#if confirmDeleteServer}
-        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-          <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
-          </p>
-          <div class="mt-4 flex gap-2">
-            <button
-              class="btn preset-outlined-error-500"
-              type="button"
-              onclick={() => void deleteServer()}
-              disabled={deletingServer}
-            >
-              {deletingServer ? 'Deleting...' : 'Delete now'}
-            </button>
-            <button
-              class="btn preset-tonal-surface"
-              type="button"
-              onclick={() => (confirmDeleteServer = false)}
-              disabled={deletingServer}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      {/if}
     </div>
   </div>
 {/if}
