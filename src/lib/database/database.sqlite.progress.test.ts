@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue } from 'node:sqlite';
 import type { capTask } from '@capacitor-community/sqlite';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const native = vi.hoisted(() => ({
   databasePath: '',
@@ -80,10 +80,16 @@ const book = {
   fileSize: null,
 };
 
+function openTestDatabase(path: string): DatabaseSync {
+  const database = new DatabaseSync(path);
+  database.exec('PRAGMA synchronous = OFF;');
+  return database;
+}
+
 function createAdapter() {
   return {
     async open(): Promise<void> {
-      if (!native.database) native.database = new DatabaseSync(native.databasePath);
+      if (!native.database) native.database = openTestDatabase(native.databasePath);
       native.isOpen = true;
     },
     async close(): Promise<void> {
@@ -161,6 +167,10 @@ async function seedDatabase(database: Awaited<ReturnType<typeof importDatabase>>
 
 describe('native progress transactions against SQLite', () => {
   let directory = '';
+
+  beforeAll(async () => {
+    await import('./database');
+  });
 
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), 'turnleaf-r2-'));
@@ -455,7 +465,7 @@ describe('native progress transactions against SQLite', () => {
 
   it('seeds the persistent progress revision when upgrading a pending version-6 queue', async () => {
     const updatedAt = '2026-01-01T00:00:00.000Z';
-    native.database = new DatabaseSync(native.databasePath);
+    native.database = openTestDatabase(native.databasePath);
     native.database.exec(`
       CREATE TABLE books (
         id TEXT PRIMARY KEY NOT NULL,

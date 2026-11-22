@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test: avoid synchronous disk fsync stalls in SQLite progress tests
 - perf: fetch Kavita series pages concurrently using Pagination headers
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
