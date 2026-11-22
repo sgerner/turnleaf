@@ -4,6 +4,7 @@
 
 - test: avoid synchronous disk fsync stalls in SQLite progress tests
 - perf: fetch Kavita series pages concurrently using Pagination headers
+- fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
