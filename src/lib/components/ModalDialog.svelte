@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, tick, untrack, type Snippet } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import { activeElement, focusModal, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   let {
     open,
@@ -33,10 +33,7 @@
 
   $effect.pre(() => {
     if (open && !wasOpen) {
-      opener =
-        typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null;
+      opener = activeElement();
     }
   });
 
@@ -44,9 +41,7 @@
     if (open && !wasOpen) {
       wasOpen = true;
       untrack(() => {
-        void tick().then(() => {
-          if (open) focusFirstElement(dialogElement);
-        });
+        focusModal(() => (open ? dialogElement : null));
       });
     } else if (!open && wasOpen) {
       wasOpen = false;
