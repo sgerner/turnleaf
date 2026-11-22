@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- Parallelize startup hydration with native vector splashes
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
