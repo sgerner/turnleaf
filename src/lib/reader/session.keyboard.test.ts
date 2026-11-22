@@ -14,6 +14,8 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
     themes: { registerCss: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    next: vi.fn(async () => {}),
+    prev: vi.fn(async () => {}),
     resize: vi.fn(),
     destroy: vi.fn(),
   };
@@ -260,6 +262,113 @@ describe('ReaderSession keyboard navigation', () => {
       'epubcfi(/6/2!/4/2/8:0)',
     );
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/8:0)');
+    session.destroy();
+  });
+
+  it('defers ResizeObserver reflow until initial relocation arrives so unlocated views are not cleared', async () => {
+    vi.useFakeTimers();
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 780));
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+    expect(mockBook.renderTo).toHaveBeenCalledWith(
+      viewport,
+      expect.objectContaining({
+        width: 360,
+        height: 780,
+        resizeOnOrientationChange: false,
+      }),
+    );
+    mockRendition.display.mockClear();
+
+    // SystemBars / safe-area inset resize arrives after display() resolved, before rAF relocated.
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 360, height: 748 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    vi.advanceTimersByTime(150);
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/2:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+      360,
+      748,
+      'epubcfi(/6/2!/4/2/2:0)',
+    );
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/2:0)');
+    session.destroy();
+  });
+
+  it('defers ResizeObserver reflow while user navigation is pending and preserves the destination CFI', async () => {
+    vi.useFakeTimers();
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 780));
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/2:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+    mockRendition.display.mockClear();
+
+    await session.next();
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 360, height: 748 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    vi.advanceTimersByTime(150);
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    relocated({
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/2/2:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+      360,
+      748,
+      'epubcfi(/6/4!/4/2/2:0)',
+    );
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/2:0)');
     session.destroy();
   });
 
