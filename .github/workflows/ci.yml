@@ -45,6 +45,18 @@ jobs:
       - name: Run web quality gates
         run: npm run verify
 
+      - name: Verify iOS Capacitor sync and manifests
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
+        run: npm run ios:check
+
+      - name: Upload web build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: dist
+          if-no-files-found: error
+
       - name: Build Android debug APK
         env:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
@@ -56,6 +68,43 @@ jobs:
           name: android-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+  ios-simulator-build:
+    needs: web-and-android-checks
+    runs-on: macos-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Cache SwiftPM packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/turnleaf-spm
+          key: spm-${{ runner.os }}-${{ hashFiles('ios/App/CapApp-SPM/Package.swift', 'package-lock.json') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download web build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: dist
+
+      - name: Build unsigned iOS Simulator app
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
+        run: npm run ios:simulator
 
   android-emulator-smoke:
     needs: web-and-android-checks

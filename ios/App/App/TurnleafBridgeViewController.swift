@@ -198,7 +198,7 @@ final class TurnleafReaderChromeController {
     static let shared = TurnleafReaderChromeController()
 
     private weak var bridge: CAPBridgeProtocol?
-    private var enabled = false
+    fileprivate var enabled = false
 
     func attach(to bridge: CAPBridgeProtocol?) {
         self.bridge = bridge
