@@ -1,3 +1,5 @@
+import { tick } from 'svelte';
+
 const FOCUSABLE_SELECTOR = [
   'a[href]',
   'area[href]',
@@ -37,10 +39,20 @@ function canRestoreFocusTarget(element: HTMLElement | null | undefined): element
   );
 }
 
+export function activeElement(): HTMLElement | null {
+  return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+}
+
 export function focusFirstElement(container: HTMLElement | null): void {
   if (!container) return;
   const first = getFocusableElements(container)[0];
   (first ?? container).focus();
+}
+
+export function focusModal(getContainer: () => HTMLElement | null): void {
+  void tick().then(() => focusFirstElement(getContainer()));
 }
 
 export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement | null): void {
@@ -54,6 +66,15 @@ export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement
     return;
   }
   focusFirstElement(fallback);
+}
+
+export function restoreModalFocus(
+  element: HTMLElement | null,
+  fallback?: HTMLElement | null | (() => HTMLElement | null),
+): void {
+  void tick().then(() =>
+    restoreFocus(element, typeof fallback === 'function' ? fallback() : fallback),
+  );
 }
 
 export function trapModalKeydown(
