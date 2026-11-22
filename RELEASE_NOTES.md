@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix(android): prevent offline journey relocation, resize, and request races
 - fix(reader): coordinate startup viewport resizes on Android
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2

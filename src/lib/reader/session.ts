@@ -322,6 +322,7 @@ export class ReaderSession {
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
+  private userNavigationStartPage: { index: number; page: number } | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
@@ -330,7 +331,7 @@ export class ReaderSession {
   private windowResizeHandler: (() => void) | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private pendingViewportSize: { width: number; height: number } | null = null;
-  private opening = false;
+  private readyForResize = false;
   private displayInFlight = false;
   private lastDisplayedTarget: string | undefined = undefined;
   private hasDisplayedTarget = false;
@@ -370,7 +371,7 @@ export class ReaderSession {
     this.pendingViewportSize = null;
     this.lastDisplayedTarget = undefined;
     this.hasDisplayedTarget = false;
-    this.opening = true;
+    this.readyForResize = false;
     this.rendition = this.book.renderTo(target, {
       width: initialWidth > 0 ? initialWidth : '100%',
       height: initialHeight > 0 ? initialHeight : '100%',
@@ -407,22 +408,32 @@ export class ReaderSession {
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-      const isUserNavigation =
-        this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const startPage = this.userNavigationStartPage;
+      const movedCfi = startCfi ? startCfi !== location.start.cfi : !this.reflowPending;
+      const movedPage = startPage
+        ? startPage.index !== location.start.index ||
+          startPage.page !== location.start.displayed.page
+        : false;
+      const isUserNavigation = this.userNavigationPending && (movedCfi || movedPage);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (startCfi !== location.start.cfi) onSelection?.(null);
+      if (startCfi !== location.start.cfi || movedPage) onSelection?.(null);
       this.current = location;
       this.lastDisplayedTarget = location.start.cfi;
       this.hasDisplayedTarget = true;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
       this.reportLocation(location, origin, returnTarget);
+      if (!this.userNavigationPending && this.pendingViewportSize) {
+        this.reflowPending = false;
+        this.flushPendingViewportResize();
+        return;
+      }
       if (this.reflowPending) {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
@@ -480,11 +491,14 @@ export class ReaderSession {
       if (!displayed) {
         await this.displayAtGeneration(undefined, restoreGeneration);
       }
+      if (this.isCurrentLocationOperation(restoreGeneration)) {
+        this.readyForResize = true;
+        this.flushPendingViewportResize();
+      }
     } finally {
-      this.opening = false;
-    }
-    if (this.isCurrentLocationOperation(restoreGeneration)) {
-      this.flushPendingViewportResize();
+      if (this.rendition && this.isCurrentLocationOperation(restoreGeneration)) {
+        this.readyForResize = true;
+      }
     }
   }
 
@@ -814,7 +828,7 @@ export class ReaderSession {
     });
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    const cfi = this.liveLocation()?.start.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
       this.reflowPending = true;
@@ -838,7 +852,7 @@ export class ReaderSession {
     this.windowResizeHandler = null;
     this.viewportSize = null;
     this.pendingViewportSize = null;
-    this.opening = false;
+    this.readyForResize = false;
     this.displayInFlight = false;
     this.lastDisplayedTarget = undefined;
     this.hasDisplayedTarget = false;
@@ -848,7 +862,9 @@ export class ReaderSession {
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.userNavigationStartPage = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.activeSearchCfi = null;
@@ -881,7 +897,7 @@ export class ReaderSession {
         this.pendingViewportSize = null;
         return;
       }
-      if (this.opening || this.displayInFlight) {
+      if (!this.readyForResize || this.displayInFlight || this.userNavigationPending) {
         this.pendingViewportSize = { width, height };
         return;
       }
@@ -908,7 +924,14 @@ export class ReaderSession {
   }
 
   private flushPendingViewportResize(): void {
-    if (this.opening || this.displayInFlight || !this.pendingViewportSize) return;
+    if (
+      !this.readyForResize ||
+      this.displayInFlight ||
+      this.userNavigationPending ||
+      !this.pendingViewportSize
+    ) {
+      return;
+    }
     const { width, height } = this.pendingViewportSize;
     this.pendingViewportSize = null;
     if (!width || !height) return;
@@ -920,6 +943,7 @@ export class ReaderSession {
     const rendition = this.rendition;
     if (!rendition) return;
     const internal = rendition as Rendition & {
+      resize: (width?: number, height?: number, epubcfi?: string) => void;
       manager?: { rendered?: boolean; stage?: unknown; views?: { length?: number } };
     };
     if (internal.manager && (!internal.manager.rendered || !internal.manager.stage)) {
@@ -927,9 +951,11 @@ export class ReaderSession {
       return;
     }
     const hadLocation = Boolean(rendition.location?.start?.cfi);
-    const fallbackTarget = this.current?.start.cfi ?? this.lastDisplayedTarget;
+    const cfi = this.liveLocation()?.start.cfi;
+    const fallbackTarget = cfi ?? this.lastDisplayedTarget;
     this.viewportSize = { width, height };
-    rendition.resize(width, height);
+    if (cfi) internal.resize(width, height, cfi);
+    else internal.resize(width, height);
     const viewsAfter = internal.manager?.views?.length ?? 0;
     if (internal.manager && !hadLocation && viewsAfter === 0 && this.hasDisplayedTarget) {
       const generation = this.locationGeneration;
@@ -990,6 +1016,7 @@ export class ReaderSession {
       if (target === undefined) await rendition.display();
       else await rendition.display(target);
       if (this.isCurrentLocationOperation(generation)) {
+        if (!this.current) this.current = this.liveLocation();
         this.lastDisplayedTarget = target;
         this.hasDisplayedTarget = true;
         return true;
@@ -1012,6 +1039,7 @@ export class ReaderSession {
     try {
       await rendition.display(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
+      if (!this.current) this.current = this.liveLocation();
       this.lastDisplayedTarget = section.href;
       this.hasDisplayedTarget = true;
       if (target.contentXPath === '/html/body') return true;
@@ -1025,6 +1053,7 @@ export class ReaderSession {
       if (!(contents.range(cfi) as Range | null)) return false;
       await rendition.display(cfi);
       if (this.isCurrentLocationOperation(generation)) {
+        this.current = this.liveLocation() ?? this.current;
         this.lastDisplayedTarget = cfi;
         this.hasDisplayedTarget = true;
         return true;
@@ -1077,6 +1106,7 @@ export class ReaderSession {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
       }
       throw error;
     } finally {
@@ -1085,23 +1115,41 @@ export class ReaderSession {
     }
   }
 
+  private liveLocation(): Location | null {
+    const currentLocation: unknown = (
+      this.rendition as { currentLocation?: () => unknown } | null
+    )?.currentLocation?.();
+    if (
+      currentLocation &&
+      typeof currentLocation === 'object' &&
+      'start' in currentLocation &&
+      (currentLocation as Location).start?.cfi
+    ) {
+      return currentLocation as Location;
+    }
+    return this.current ?? this.rendition?.location ?? null;
+  }
+
   private beginLocationOperation(userNavigation: boolean): number {
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
-    this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
+    const start = userNavigation ? this.liveLocation()?.start : null;
+    this.userNavigationStartCfi = start?.cfi ?? null;
+    this.userNavigationStartPage = start
+      ? { index: start.index, page: start.displayed.page }
       : null;
     return this.locationGeneration;
   }
 
   private beginLinkedNavigation(): void {
-    const start = this.current?.start ?? this.rendition?.location?.start;
+    const start = this.liveLocation()?.start;
     if (!start) return;
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
+    this.userNavigationStartPage = { index: start.index, page: start.displayed.page };
     this.userNavigationOrigin = 'link';
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }

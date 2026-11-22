@@ -94,7 +94,7 @@
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        networkAvailable,
       );
     }
     if (offline) throw new Error('Offline');
@@ -262,8 +262,11 @@
     if (focusedRow > lastRow) rows.push(focusedRow);
     return rows;
   });
+  let suppressCovers = $derived(
+    Boolean(reading || downloadingBookId || resolvingOpenProgress || conflict),
+  );
   let visibleCoverKey = $derived.by(() => {
-    if (reading) return `${coverReloadRequest}:`;
+    if (suppressCovers) return `${coverReloadRequest}:`;
     const firstIndex = virtualWindow.startIndex;
     const endIndex = virtualWindow.endIndex;
     const viewportBooks =
@@ -276,6 +279,8 @@
   let scrollTarget: HTMLElement | Window | null = null;
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  let reconnectTimer: number | null = null;
+  let refreshAfterReading = false;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -534,22 +539,46 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          const wasOffline = offline;
           offline = !connected;
           if (!connected) {
+            if (reconnectTimer !== null) {
+              window.clearTimeout(reconnectTimer);
+              reconnectTimer = null;
+            }
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
             refreshController?.abort();
             openProgressProbe?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
           }
-          coverReloadRequest += 1;
+          if (!suppressCovers) coverReloadRequest += 1;
           kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          if (connected && wasOffline) {
+            if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+            reconnectTimer = window.setTimeout(() => {
+              reconnectTimer = null;
+              void (async () => {
+                if (!(await networkAvailable())) return;
+                await syncProgress(false);
+                if (!(await networkAvailable())) return;
+                if (reading || downloadingBookId || resolvingOpenProgress || conflict) {
+                  refreshAfterReading = true;
+                  return;
+                }
+                refreshAfterReading = false;
+                await refresh();
+              })().catch(() => {});
+            }, 150);
+          }
         }),
       ),
     );
@@ -626,7 +655,7 @@
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client, server.id);
+      await flushProgress(client, server.id, networkAvailable);
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
       if (
@@ -650,6 +679,7 @@
     destroyed = true;
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', scheduleVirtualWindow);
@@ -686,7 +716,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !(await networkAvailable())) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -701,7 +731,7 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !(await networkAvailable())) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -806,6 +836,10 @@
       covers.delete(seriesId);
     }
     cancelCoverLoading();
+    if (suppressCovers || items.length === 0) {
+      sharedCoverLoader.cancel();
+      return;
+    }
     sharedCoverLoader.retain(visibleSeriesIds);
     const controller = new AbortController();
     const generation = coverLoadGeneration;
@@ -1018,6 +1052,8 @@
   }
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
+    cancelCoverLoading();
+    sharedCoverLoader.cancel();
     if (!book.downloadPath) {
       const refreshed = await download(book);
       if (refreshed) await open(refreshed, options);
@@ -1172,7 +1208,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, networkAvailable);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
@@ -1234,6 +1270,12 @@
   async function closeReader(): Promise<void> {
     const bookId = reading?.book.id;
     reading = null;
+    if (refreshAfterReading && !offline) {
+      refreshAfterReading = false;
+      void syncProgress(false)
+        .then(() => refresh())
+        .catch(() => {});
+    }
     await tick();
     if (reading || !libraryMain) return;
 
