@@ -168,4 +168,31 @@ describe('reader native features', () => {
 
     expect(setKeepAwake.mock.calls.map(([enabled]) => enabled)).toEqual([true, false]);
   });
+
+  it('serializes reader bar style updates and restores shell bar style on teardown', async () => {
+    const calls: string[] = [];
+    const oldReader = createReaderNativeFeatures(
+      actions({
+        setBarStyle: async (style) => void calls.push(`old:${style}`),
+        restoreBarStyle: async () => void calls.push('restore:shell'),
+        showStatusBar: async () => void calls.push('show'),
+      }),
+    );
+    const newReader = createReaderNativeFeatures(
+      actions({
+        setBarStyle: async (style) => void calls.push(`new:${style}`),
+      }),
+    );
+
+    await oldReader.setBarStyle('DARK' as Parameters<typeof oldReader.setBarStyle>[0]);
+    const closing = oldReader.disable();
+    const staleStyle = oldReader.setBarStyle(
+      'LIGHT' as Parameters<typeof oldReader.setBarStyle>[0],
+    );
+    const reopening = newReader.setBarStyle('LIGHT' as Parameters<typeof newReader.setBarStyle>[0]);
+    await Promise.all([closing, staleStyle, reopening]);
+
+    expect(calls).toEqual(['old:DARK', 'restore:shell', 'show', 'new:LIGHT']);
+    await newReader.disable();
+  });
 });

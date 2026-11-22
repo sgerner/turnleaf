@@ -1,13 +1,18 @@
+import type { SystemBarsStyle } from '@capacitor/core';
+
 export interface ReaderNativeFeatureActions {
   hideStatusBar: () => Promise<void>;
   showStatusBar: () => Promise<void>;
   setReaderChrome: (enabled: boolean) => Promise<void>;
   setVolumeButtons: (enabled: boolean) => Promise<void>;
   setKeepAwake: (enabled: boolean) => Promise<void>;
+  setBarStyle?: (style: SystemBarsStyle) => Promise<void>;
+  restoreBarStyle?: () => Promise<void>;
 }
 
 export interface ReaderNativeFeatures {
   enable: (keepAwake: boolean, volumeButtons?: boolean) => Promise<void>;
+  setBarStyle: (style: SystemBarsStyle) => Promise<void>;
   setKeepAwake: (enabled: boolean) => Promise<void>;
   setVolumeButtons: (enabled: boolean) => Promise<void>;
   restore: () => Promise<void>;
@@ -18,15 +23,19 @@ export interface ReaderNativeFeatures {
 // finish before a newly opened reader enables them.
 let queue = Promise.resolve();
 
+export function enqueueNativeOperation(operation: () => Promise<void>): Promise<void> {
+  const next = queue.then(operation, operation);
+  queue = next.catch(() => undefined);
+  return next;
+}
+
 export function createReaderNativeFeatures(
   actions: ReaderNativeFeatureActions,
 ): ReaderNativeFeatures {
   let active = true;
 
   function enqueue(operation: () => Promise<void>): Promise<void> {
-    const next = queue.then(operation, operation);
-    queue = next.catch(() => undefined);
-    return next;
+    return enqueueNativeOperation(operation);
   }
 
   async function attempt(operation: () => Promise<void>): Promise<void> {
@@ -35,6 +44,13 @@ export function createReaderNativeFeatures(
     } catch {
       // Native reader helpers are optional and must not prevent reading.
     }
+  }
+
+  async function restoreChrome(): Promise<void> {
+    await attempt(actions.showStatusBar);
+    await attempt(() => actions.setReaderChrome(false));
+    await attempt(() => actions.setVolumeButtons(false));
+    await attempt(() => actions.setKeepAwake(false));
   }
 
   function enable(keepAwake: boolean, volumeButtons = false): Promise<void> {
@@ -48,6 +64,13 @@ export function createReaderNativeFeatures(
       await attempt(() => actions.setVolumeButtons(volumeButtons));
       if (!active) return;
       await attempt(() => actions.setKeepAwake(keepAwake));
+    });
+  }
+
+  function setBarStyle(style: SystemBarsStyle): Promise<void> {
+    return enqueue(async () => {
+      if (!active || !actions.setBarStyle) return;
+      await attempt(() => actions.setBarStyle!(style));
     });
   }
 
@@ -66,19 +89,19 @@ export function createReaderNativeFeatures(
   }
 
   function restore(): Promise<void> {
-    return enqueue(async () => {
-      await attempt(actions.showStatusBar);
-      await attempt(() => actions.setReaderChrome(false));
-      await attempt(() => actions.setVolumeButtons(false));
-      await attempt(() => actions.setKeepAwake(false));
-    });
+    return enqueue(restoreChrome);
   }
 
   function disable(): Promise<void> {
     if (!active) return queue;
     active = false;
-    return restore();
+    return enqueue(async () => {
+      if (actions.restoreBarStyle) {
+        await attempt(actions.restoreBarStyle);
+      }
+      await restoreChrome();
+    });
   }
 
-  return { enable, setKeepAwake, setVolumeButtons, restore, disable };
+  return { enable, setBarStyle, setKeepAwake, setVolumeButtons, restore, disable };
 }

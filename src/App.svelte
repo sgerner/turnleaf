@@ -13,6 +13,7 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+  import { syncShellSystemBars } from './lib/native/system-bars';
   import { loadTheme } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
@@ -29,6 +30,8 @@
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let readerOpen = $state(false);
+  let modalOpen = $state(false);
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -93,6 +96,9 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
+    if (!readerOpen) {
+      void syncShellSystemBars(uiMode);
+    }
   });
 </script>
 
@@ -107,7 +113,11 @@
 
   <div class="app-stage">
     {#if releaseBanner}
-      <div class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
+      <div
+        class="release-banner sticky top-0 z-20 mx-auto w-full max-w-4xl"
+        inert={readerOpen || modalOpen}
+        transition:fade
+      >
         <div
           class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
         >
@@ -152,7 +162,7 @@
     {/if}
 
     {#if booting}
-      <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
+      <main class="boot-stage grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
           <TurnleafLogo size={104} />
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
@@ -167,6 +177,10 @@
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
+        onOverlayChange={({ reading, modal }) => {
+          readerOpen = reading;
+          modalOpen = modal;
+        }}
         onChangeServerAddress={() => (changingServerAddress = true)}
         onServerDeleted={() => {
           server = null;
@@ -174,43 +188,45 @@
         }}
       />
     {:else if startupError}
-      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
-        <p>{startupError}</p>
-        <div class="flex flex-wrap gap-2">
-          <button
-            class="btn btn-sm preset-filled-error-500 !text-sm"
-            type="button"
-            onclick={() => void loadLocalData()}
-            disabled={repairing}
-          >
-            Retry
-          </button>
-          {#if server}
+      <div class="startup-error-shell mx-auto max-w-lg">
+        <div class="alert preset-tonal-error flex flex-col gap-3" role="alert">
+          <p>{startupError}</p>
+          <div class="flex flex-wrap gap-2">
             <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
+              class="btn btn-sm preset-filled-error-500 !text-sm"
               type="button"
-              onclick={() => (startupError = '')}
-            >
-              Enter auth key
-            </button>
-          {:else}
-            <button
-              class="btn btn-sm preset-tonal-error !text-sm"
-              type="button"
+              onclick={() => void loadLocalData()}
               disabled={repairing}
-              onclick={() => {
-                if (
-                  window.confirm(
-                    'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
-                  )
-                ) {
-                  void repairLocalData();
-                }
-              }}
             >
-              {repairing ? 'Resetting...' : 'Reset local data'}
+              Retry
             </button>
-          {/if}
+            {#if server}
+              <button
+                class="btn btn-sm preset-tonal-surface !text-sm"
+                type="button"
+                onclick={() => (startupError = '')}
+              >
+                Enter auth key
+              </button>
+            {:else}
+              <button
+                class="btn btn-sm preset-tonal-error !text-sm"
+                type="button"
+                disabled={repairing}
+                onclick={() => {
+                  if (
+                    window.confirm(
+                      'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
+                    )
+                  ) {
+                    void repairLocalData();
+                  }
+                }}
+              >
+                {repairing ? 'Resetting...' : 'Reset local data'}
+              </button>
+            {/if}
+          </div>
         </div>
       </div>
     {:else}
@@ -385,6 +401,65 @@
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     z-index: 1;
+  }
+
+  .release-banner {
+    padding-top: max(
+      1rem,
+      calc(
+        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
+          0.5rem
+      )
+    );
+    padding-inline-start: max(
+      1rem,
+      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
+    );
+    padding-inline-end: max(
+      1rem,
+      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
+    );
+  }
+
+  .boot-stage {
+    padding-top: max(
+      1.5rem,
+      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
+    );
+    padding-inline-start: max(
+      1rem,
+      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
+    );
+    padding-inline-end: max(
+      1rem,
+      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
+    );
+    padding-bottom: max(
+      1.5rem,
+      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
+    );
+  }
+
+  .startup-error-shell {
+    padding-top: max(
+      1.5rem,
+      calc(
+        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
+          0.5rem
+      )
+    );
+    padding-inline-start: max(
+      1rem,
+      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
+    );
+    padding-inline-end: max(
+      1rem,
+      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
+    );
+    padding-bottom: max(
+      1.5rem,
+      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
+    );
   }
 
   :global([data-mode='dark']) .orb {

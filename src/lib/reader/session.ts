@@ -341,15 +341,17 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    const gap = appearance.margin * 2;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
+      gap,
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
       resizeOnOrientationChange: true,
       allowScriptedContent: false,
-    });
+    } as Rendition['settings'] & { gap: number });
     this.observeViewport(target);
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     if (onSelection) {
@@ -610,6 +612,14 @@ export class ReaderSession {
         previous.alignment !== value.alignment ||
         previous.hyphenation !== value.hyphenation);
     if (!themeChanged) return;
+    const gap = value.margin * 2;
+    const renditionWithLayout = rendition as Rendition & {
+      settings?: Rendition['settings'] & { gap?: number };
+      manager?: { settings?: { gap?: number }; updateLayout?: () => void };
+    };
+    if (renditionWithLayout.settings) {
+      renditionWithLayout.settings.gap = gap;
+    }
     const colors = MODE_COLORS[value.mode];
     const family =
       value.fontFamily === 'book'
@@ -628,7 +638,8 @@ export class ReaderSession {
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
+        'padding-top': '0.5rem !important',
+        'padding-bottom': `${value.bottomMargin}px !important`,
         'box-sizing': 'border-box',
       },
       p: {
@@ -646,6 +657,10 @@ export class ReaderSession {
       '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
     });
     rendition.themes.select('turnleaf');
+    if (previous && previous.margin !== value.margin && renditionWithLayout.manager?.settings) {
+      renditionWithLayout.manager.settings.gap = gap;
+      renditionWithLayout.manager.updateLayout?.();
+    }
     if (!layoutChanged) return;
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;

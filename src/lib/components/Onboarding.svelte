@@ -137,7 +137,7 @@
 </script>
 
 <main
-  class="mx-auto flex min-h-full max-w-5xl flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))] sm:px-8 lg:grid lg:min-h-full lg:grid-cols-2 lg:items-center lg:gap-16 lg:py-16 xl:gap-24"
+  class="onboarding-main mx-auto flex min-h-full w-full max-w-5xl flex-col lg:grid lg:min-h-full lg:grid-cols-2 lg:items-center lg:gap-16 xl:gap-24"
 >
   <header class="flex flex-col lg:pr-4" in:fly={{ y: 12, duration: 280 }}>
     <TurnleafLogo size={80} />
@@ -319,3 +319,68 @@
     </aside>
   </div>
 </main>
+
+<style>
+  .onboarding-main {
+    padding-top: max(
+      3rem,
+      calc(
+        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
+          0.5rem
+      )
+    );
+    padding-inline-start: max(
+      1.5rem,
+      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
+    );
+    padding-inline-end: max(
+      1.5rem,
+      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
+    );
+    padding-bottom: max(
+      2.5rem,
+      calc(
+        var(
+            --safe-bottom,
+            max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
+          ) +
+          1rem
+      )
+    );
+  }
+
+  @media (min-width: 40rem) {
+    .onboarding-main {
+      padding-inline-start: max(
+        2rem,
+        var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
+      );
+      padding-inline-end: max(
+        2rem,
+        var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
+      );
+    }
+  }
+
+  @media (min-width: 64rem) {
+    .onboarding-main {
+      padding-top: max(
+        4rem,
+        calc(
+          var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
+            1rem
+        )
+      );
+      padding-bottom: max(
+        4rem,
+        calc(
+          var(
+              --safe-bottom,
+              max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
+            ) +
+            1rem
+        )
+      );
+    }
+  }
+</style>
