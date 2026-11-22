@@ -471,14 +471,18 @@
         <button
           class="btn preset-outlined-error-500"
           type="button"
-          onclick={() => void onClearCache()}>Clear cover cache</button
+          onclick={() => void onClearCache()}
         >
+          Clear cover cache
+        </button>
         <button
           class="btn preset-tonal-error"
           type="button"
           disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-          onclick={() => void onRemoveAllDownloads()}>Remove all downloaded books</button
+          onclick={() => void onRemoveAllDownloads()}
         >
+          Remove all downloaded books
+        </button>
       </div>
       <dl class="mt-4 text-sm">
         <div class="flex items-center justify-between gap-3">
@@ -503,11 +507,13 @@
         <button
           class="btn preset-tonal-surface"
           type="button"
-          onclick={() => void copyDiagnostics()}>Copy diagnostics</button
+          onclick={() => void copyDiagnostics()}
         >
-        <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}
-          >Download log</button
-        >
+          Copy diagnostics
+        </button>
+        <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
+          Download log
+        </button>
       </div>
       <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
         {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
@@ -525,16 +531,18 @@
             bind:value={diagnosticsOutput}
             aria-label="Turnleaf diagnostics log"
             onclick={selectDiagnostics}></textarea>
-          <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}
-            >Select all text</button
-          >
+          <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
+            Select all text
+          </button>
         </div>
       {/if}
       <button
         class="btn preset-tonal-surface mt-2 w-full"
         type="button"
-        onclick={clearDiagnosticLog}>Clear diagnostics</button
+        onclick={clearDiagnosticLog}
       >
+        Clear diagnostics
+      </button>
       {#if diagnosticsMessage}
         <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
       {/if}

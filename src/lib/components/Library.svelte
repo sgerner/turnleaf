@@ -1599,9 +1599,9 @@
                 style:width={`${progressOf(continueBook)}%`}
               ></div>
             </div>
-            <span class="text-xs tabular-nums text-surface-700-300"
-              >{Math.round(progressOf(continueBook))}%</span
-            >
+            <span class="text-xs tabular-nums text-surface-700-300">
+              {Math.round(progressOf(continueBook))}%
+            </span>
           </div>
         </div>
       </button>
@@ -1812,8 +1812,10 @@
           <button
             type="button"
             class="btn preset-tonal-primary"
-            onclick={() => openProgressProbe?.abort()}>Open offline</button
+            onclick={() => openProgressProbe?.abort()}
           >
+            Open offline
+          </button>
         {/if}
       </div>
     {/if}
@@ -1857,15 +1859,18 @@
               type="button"
               onclick={() => void retryDownloadCleanup()}
               disabled={cleanupInProgress}
-              >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
             >
+              {cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}
+            </button>
           {:else if downloadNeedsRefresh}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
               onclick={() => void refresh()}
-              disabled={refreshing}>Refresh library</button
+              disabled={refreshing}
             >
+              Refresh library
+            </button>
           {:else}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
@@ -1873,8 +1878,10 @@
               onclick={() => void download(downloadFailureBook!)}
               disabled={Boolean(downloadingBookId) ||
                 offline ||
-                downloadFailureBook.remoteAvailable === false}>Retry download</button
+                downloadFailureBook.remoteAvailable === false}
             >
+              Retry download
+            </button>
           {/if}
         {/if}
       </div>
@@ -2379,9 +2386,9 @@
     >
       <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
       <p class="mt-3 text-surface-600-400">
-        This device and Kavita have different reading positions for <strong
-          >{conflict.book.title}</strong
-        >.
+        This device and Kavita have different reading positions for <strong>
+          {conflict.book.title}
+        </strong>.
       </p>
       <dl class="mt-4 grid gap-2 text-sm">
         <div>
@@ -2423,8 +2430,10 @@
             };
             closeConflict();
             void syncProgress(false);
-          }}>Continue from this device</button
+          }}
         >
+          Continue from this device
+        </button>
         <button
           class="btn preset-tonal-primary"
           type="button"
@@ -2433,9 +2442,9 @@
         >
           {acceptingRemoteProgress ? 'Saving choice…' : 'Continue from Kavita'}
         </button>
-        <button class="btn preset-tonal-surface" type="button" onclick={closeConflict}
-          >Cancel</button
-        >
+        <button class="btn preset-tonal-surface" type="button" onclick={closeConflict}>
+          Cancel
+        </button>
       </div>
     </div>
   </div>
