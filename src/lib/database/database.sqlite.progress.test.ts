@@ -229,7 +229,7 @@ describe('native progress transactions against SQLite', () => {
     const baselineBook = (await database.getBooks(server.id))[0];
 
     native.failTransactionAt = 2;
-    await expect(database.markBookCompleted(book, baselineReading)).rejects.toThrow(
+    await expect(database.markBookCompleted(book)).rejects.toThrow(
       'injected transaction failure at 2',
     );
 
@@ -548,8 +548,7 @@ describe('native progress transactions against SQLite', () => {
       bookScrollId: '//body/p[3]',
     });
 
-    const beforeComplete = await reopenedCh0.getReadingState(book.id);
-    await reopenedCh0.markBookCompleted(book, beforeComplete);
+    await reopenedCh0.markBookCompleted(book);
     const reopenedDone = await reopenDatabase(reopenedCh0);
     expect(await reopenedDone.getReadingState(book.id)).toMatchObject({
       pageNum: book.pages,

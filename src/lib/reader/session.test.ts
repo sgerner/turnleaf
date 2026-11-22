@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Contents as EpubContents } from 'epubjs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
 import {
   parseKavitaXPath,
@@ -9,12 +10,20 @@ import {
   toKavitaXPath,
 } from './kavita-xpath';
 
-const { mockBook, mockRendition, resetSpineSections } = vi.hoisted(() => {
-  let sections = [
-    { href: 'chapter-1.xhtml', load: vi.fn(), unload: vi.fn() },
-    { href: 'chapter-2.xhtml', load: vi.fn(), unload: vi.fn() },
-    { href: 'chapter-3.xhtml', load: vi.fn(), unload: vi.fn() },
-  ];
+const PAGE_WIDTH = 300;
+
+const { testState, mockBook, mockRendition } = vi.hoisted(() => {
+  const state = {
+    sections: [] as Array<{
+      href: string;
+      index: number;
+      contents?: EpubContents;
+      load?: () => void;
+      unload?: () => void;
+    }>,
+    activeSectionIndex: 0,
+    displayedPage: 1,
+  };
   const rendition = {
     hooks: { content: { register: vi.fn() } },
     on: vi.fn(),
@@ -22,42 +31,93 @@ const { mockBook, mockRendition, resetSpineSections } = vi.hoisted(() => {
     started: Promise.resolve(),
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
-    display: vi.fn(async () => {}),
-    getContents: vi.fn(() => []),
     getRange: vi.fn(),
+    getContents: vi.fn(() => {
+      const active = state.sections[state.activeSectionIndex];
+      return active?.contents ? [active.contents] : [];
+    }),
+    display: vi.fn(async (target?: string) => {
+      if (!target) {
+        state.activeSectionIndex = 0;
+        state.displayedPage = 1;
+        return;
+      }
+      if (target.startsWith('epubcfi(')) {
+        const active = state.sections[state.activeSectionIndex];
+        if (!active?.contents) throw new Error('No active section');
+        const offset = await active.contents.locationOf(target);
+        state.displayedPage = Math.floor(offset.left / PAGE_WIDTH) + 1;
+        return;
+      }
+      const found = state.sections.find((section) => section.href === target);
+      if (!found) throw new Error(`Unknown section: ${target}`);
+      state.activeSectionIndex = found.index;
+      state.displayedPage = 1;
+    }),
     resize: vi.fn(),
     destroy: vi.fn(),
   };
   const book = {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
-    load: vi.fn(),
     spine: {
       each: vi.fn(
-        (visit: (section: { href: string; load: () => void; unload: () => void }) => void) => {
-          for (const section of sections) visit(section);
+        (
+          visit: (section: {
+            href: string;
+            index: number;
+            load?: (() => void) | undefined;
+            unload?: (() => void) | undefined;
+          }) => void,
+        ) => {
+          for (const section of state.sections) {
+            visit({
+              href: section.href,
+              index: section.index,
+              load: section.load,
+              unload: section.unload,
+            });
+          }
         },
       ),
     },
     navigation: { toc: [] },
   };
+  return { testState: state, mockBook: book, mockRendition: rendition };
+});
+
+vi.mock('epubjs', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
   return {
-    mockBook: book,
-    mockRendition: rendition,
-    resetSpineSections(count = 3) {
-      sections = Array.from({ length: count }, (_, index) => ({
-        href: `chapter-${index + 1}.xhtml`,
-        load: vi.fn(),
-        unload: vi.fn(),
-      }));
-      return sections;
-    },
+    ...actual,
+    default: vi.fn(() => mockBook),
   };
 });
 
-vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
-
+import { Contents } from 'epubjs';
 import { ReaderSession } from './session';
+
+function createSectionContents(
+  xhtml: string,
+  index: number,
+  pagePositions: Record<string, number> = {},
+): EpubContents {
+  const doc = new DOMParser().parseFromString(xhtml, 'application/xhtml+xml');
+  Object.defineProperty(doc, 'defaultView', { value: window, configurable: true });
+  for (const [selector, page] of Object.entries(pagePositions)) {
+    const element = doc.querySelector(selector);
+    if (!element) throw new Error(`Missing selector in test fixture: ${selector}`);
+    vi.spyOn(element, 'getBoundingClientRect').mockReturnValue(
+      new DOMRect((page - 1) * PAGE_WIDTH, 0, PAGE_WIDTH, 400),
+    );
+  }
+  const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockReturnValue(0);
+  try {
+    return new Contents(doc, doc.body, `/6/${(index + 1) * 2}[section-${index + 1}]`, index);
+  } finally {
+    rafSpy.mockRestore();
+  }
+}
 
 describe('Kavita EPUB locations', () => {
   it('serializes active EPUB elements as chapter-scoped Kavita body paths without DocFragment', () => {
@@ -167,27 +227,310 @@ describe('Kavita EPUB locations', () => {
   });
 });
 
-describe('ReaderSession Kavita restoration and matching', () => {
+describe('ReaderSession XPath restoration', () => {
+  const originalRangeRect = Range.prototype.getBoundingClientRect;
+  let createdContents: EpubContents[] = [];
+
   beforeEach(() => {
     vi.clearAllMocks();
-    resetSpineSections(3);
-    mockRendition.display.mockImplementation(async () => {});
-    mockRendition.getContents.mockReturnValue([]);
+    testState.activeSectionIndex = 0;
+    testState.displayedPage = 1;
+    Range.prototype.getBoundingClientRect = function (this: Range): DOMRect {
+      const container =
+        this.startContainer.nodeType === Node.ELEMENT_NODE
+          ? (this.startContainer as Element)
+          : this.startContainer.parentElement;
+      return container?.getBoundingClientRect() ?? new DOMRect(0, 0, 0, 0);
+    };
+
+    const chapterOne = createSectionContents(
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+        <section id="main">
+          <p id="opening">Page one opening</p>
+          <p id="plain-p">Second page paragraph</p>
+          <p id="styled-p"><em id="nested-em"><span>Third page emphasis</span></em></p>
+          <blockquote id="quote-block">
+            <p id="quote-p">Fourth page quote</p>
+          </blockquote>
+          <figure id="media-figure">
+            <img src="map.png" alt="World map" />
+          </figure>
+          <hr id="scene-break" />
+        </section>
+        <section id="nested-section">
+          <h2 id="section-heading">Seventh page section</h2>
+        </section>
+        <section id="ornament-section">
+          <img src="ornament.png" alt="" />
+        </section>
+      </body></html>`,
+      0,
+      {
+        '#opening': 1,
+        '#plain-p': 2,
+        '#nested-em span': 3,
+        '#quote-p': 4,
+        '#media-figure': 5,
+        '#scene-break': 6,
+        '#section-heading': 7,
+        '#ornament-section': 8,
+      },
+    );
+
+    const chapterTwo = createSectionContents(
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+        <figure id="hero-image"><img src="hero.png" alt="" /></figure>
+        <p id="after-hero">Page two chapter body text</p>
+      </body></html>`,
+      1,
+      {
+        '#hero-image': 1,
+        '#after-hero': 2,
+      },
+    );
+
+    const chapterThree = createSectionContents(
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Chapter three</p></body></html>`,
+      2,
+    );
+
+    const chapterFour = createSectionContents(
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Chapter four fallback</p></body></html>`,
+      3,
+    );
+
+    createdContents = [chapterOne, chapterTwo, chapterThree, chapterFour];
+    testState.sections = [
+      { href: 'chapter-one.xhtml', index: 0, contents: chapterOne },
+      { href: 'chapter-two.xhtml', index: 1, contents: chapterTwo },
+      { href: 'chapter-three.xhtml', index: 2, contents: chapterThree },
+      { href: 'chapter-four.xhtml', index: 3, contents: chapterFour },
+    ];
+  });
+
+  afterEach(() => {
+    for (const contents of createdContents) {
+      contents.destroy();
+    }
+    createdContents = [];
+    testState.sections = [];
+    if (originalRangeRect) {
+      Range.prototype.getBoundingClientRect = originalRangeRect;
+    } else {
+      Reflect.deleteProperty(Range.prototype, 'getBoundingClientRect');
+    }
+  });
+
+  it.each([
+    {
+      label: '<p>',
+      xpath: '//body/DocFragment[1]/body/section[1]/p[2]',
+      expectedPage: 2,
+      expectedTextStep: true,
+    },
+    {
+      label: '<p> wrapping <em>',
+      xpath: '//body/DocFragment[1]/body/section[1]/p[3]',
+      expectedPage: 3,
+      expectedTextStep: true,
+    },
+    {
+      label: '<em>',
+      xpath: '//body/DocFragment[1]/body/section[1]/p[3]/em[1]',
+      expectedPage: 3,
+      expectedTextStep: true,
+    },
+    {
+      label: '<blockquote>',
+      xpath: '//body/DocFragment[1]/body/section[1]/blockquote[1]',
+      expectedPage: 4,
+      expectedTextStep: true,
+    },
+    {
+      label: '<figure>',
+      xpath: '//body/DocFragment[1]/body/section[1]/figure[1]',
+      expectedPage: 5,
+      expectedTextStep: false,
+    },
+    {
+      label: '<hr>',
+      xpath: '//body/DocFragment[1]/body/section[1]/hr[1]',
+      expectedPage: 6,
+      expectedTextStep: false,
+    },
+    {
+      label: '<section> with nested text',
+      xpath: '//body/DocFragment[1]/body/section[2]',
+      expectedPage: 7,
+      expectedTextStep: true,
+    },
+    {
+      label: '<section> without text',
+      xpath: '//body/DocFragment[1]/body/section[3]',
+      expectedPage: 8,
+      expectedTextStep: false,
+    },
+  ])(
+    'restores multi-page chapters via displayServerLocation and Contents.locationOf for $label',
+    async ({ xpath, expectedPage, expectedTextStep }) => {
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      mockRendition.display.mockClear();
+
+      const restored = await session.displayServerLocation(xpath);
+      expect(restored).toBe(true);
+      expect(mockRendition.display).toHaveBeenCalledTimes(2);
+      expect(mockRendition.display).toHaveBeenNthCalledWith(1, 'chapter-one.xhtml');
+
+      const cfi = mockRendition.display.mock.calls[1]?.[0] as string;
+      expect(cfi).toMatch(/^epubcfi\(/);
+      if (expectedTextStep) {
+        expect(cfi).toMatch(/\/1:\d+\)$/);
+      } else {
+        expect(cfi).not.toContain('/1:0');
+      }
+
+      const chapterOneContents = testState.sections[0]!.contents!;
+      expect(chapterOneContents.range(cfi)).not.toBeNull();
+      expect(await chapterOneContents.locationOf(cfi)).toEqual({
+        left: (expectedPage - 1) * PAGE_WIDTH,
+        top: 0,
+      });
+      expect(testState.displayedPage).toBe(expectedPage);
+
+      session.destroy();
+    },
+  );
+
+  it('restores multi-page XPath targets during open without falling back to serverPercentage', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      '//body/DocFragment[1]/body/section[1]/figure[1]',
+      0.85,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    expect(testState.activeSectionIndex).toBe(0);
+    expect(testState.displayedPage).toBe(5);
+    expect(mockRendition.display).not.toHaveBeenCalledWith('chapter-four.xhtml');
+    session.destroy();
+  });
+
+  it('keeps /html/body chapter-root targets on page one without secondary CFI navigation', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      '//body/DocFragment[2]/body',
+      0.85,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-two.xhtml');
+    expect(testState.activeSectionIndex).toBe(1);
+    expect(testState.displayedPage).toBe(1);
+
+    mockRendition.display.mockClear();
+    await expect(session.displayServerLocation('//body/DocFragment[2]/body/')).resolves.toBe(true);
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-two.xhtml');
+    expect(testState.displayedPage).toBe(1);
+
+    session.destroy();
+  });
+
+  it('returns false for missing XPath nodes and falls back to serverPercentage during open', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      '//body/DocFragment[1]/body/section[1]/p[99]',
+      0.85,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    expect(mockRendition.display).toHaveBeenLastCalledWith('chapter-four.xhtml');
+    expect(testState.activeSectionIndex).toBe(3);
+
+    mockRendition.display.mockClear();
+    await expect(
+      session.displayServerLocation('//body/DocFragment[1]/body/section[1]/p[99]'),
+    ).resolves.toBe(false);
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-one.xhtml');
+
+    session.destroy();
+  });
+
+  it('returns false when contents.range(cfi) resolves to null and falls back to serverPercentage', async () => {
+    const chapterOneContents = testState.sections[0]!.contents!;
+    const rangeSpy = vi
+      .spyOn(chapterOneContents, 'range')
+      .mockReturnValue(null as unknown as Range);
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      '//body/DocFragment[1]/body/section[1]/p[2]',
+      0.85,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    expect(rangeSpy).toHaveBeenCalledOnce();
+    expect(mockRendition.display.mock.calls).toEqual([
+      ['chapter-one.xhtml'],
+      ['chapter-four.xhtml'],
+    ]);
+    expect(testState.activeSectionIndex).toBe(3);
+
+    mockRendition.display.mockClear();
+    await expect(
+      session.displayServerLocation('//body/DocFragment[1]/body/section[1]/p[2]'),
+    ).resolves.toBe(false);
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-one.xhtml');
+
+    session.destroy();
   });
 
   it('restores chapter-scoped and ID-anchored Kavita locations using zero-based serverPageNum without loading extra chapters', async () => {
-    const sections = resetSpineSections(3);
-    const chapterDoc = new DOMParser().parseFromString(
-      '<html><body><div id="intro"><p>first</p><p>target</p></div></body></html>',
-      'text/html',
-    );
-    mockRendition.getContents.mockReturnValue([
+    const chapterTwo = createSectionContents(
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+        <div id="intro">
+          <p id="first">first</p>
+          <p id="target">target</p>
+        </div>
+      </body></html>`,
+      1,
       {
-        sectionIndex: 1,
-        document: chapterDoc,
-        cfiFromRange: vi.fn(() => 'epubcfi(/6/4!/4/2/4)'),
-      } as never,
-    ]);
+        '#first': 1,
+        '#target': 2,
+      },
+    );
+    createdContents.push(chapterTwo);
+    const loadCh1 = vi.fn();
+    const loadCh3 = vi.fn();
+    testState.sections = [
+      { href: 'chapter-1.xhtml', index: 0, contents: createdContents[0]!, load: loadCh1 },
+      { href: 'chapter-2.xhtml', index: 1, contents: chapterTwo, load: vi.fn() },
+      { href: 'chapter-3.xhtml', index: 2, contents: createdContents[2]!, load: loadCh3 },
+    ];
 
     const session = new ReaderSession('book.epub');
     await session.open(
@@ -204,14 +547,25 @@ describe('ReaderSession Kavita restoration and matching', () => {
     );
 
     expect(mockRendition.display).toHaveBeenNthCalledWith(1, 'chapter-2.xhtml');
-    expect(mockRendition.display).toHaveBeenNthCalledWith(2, 'epubcfi(/6/4!/4/2/4)');
-    expect(sections[0]?.load).not.toHaveBeenCalled();
-    expect(sections[2]?.load).not.toHaveBeenCalled();
+    expect(mockRendition.display.mock.calls[1]?.[0]).toMatch(/^epubcfi\(/);
+    expect(testState.activeSectionIndex).toBe(1);
+    expect(testState.displayedPage).toBe(2);
+    expect(loadCh1).not.toHaveBeenCalled();
+    expect(loadCh3).not.toHaveBeenCalled();
+
+    mockRendition.display.mockClear();
+    await expect(session.displayServerLocation('//body/div[1]/p[2]', 1)).resolves.toBe(true);
+    expect(testState.activeSectionIndex).toBe(1);
+    expect(testState.displayedPage).toBe(2);
+
     session.destroy();
   });
 
   it('maps zero-based chapter percentages accurately across small and large spine counts', async () => {
-    resetSpineSections(49);
+    testState.sections = Array.from({ length: 49 }, (_, index) => ({
+      href: `chapter-${index + 1}.xhtml`,
+      index,
+    }));
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
@@ -226,7 +580,10 @@ describe('ReaderSession Kavita restoration and matching', () => {
     session.destroy();
 
     vi.clearAllMocks();
-    resetSpineSections(2000);
+    testState.sections = Array.from({ length: 2000 }, (_, index) => ({
+      href: `chapter-${index + 1}.xhtml`,
+      index,
+    }));
     const largeSession = new ReaderSession('large.epub');
     await largeSession.open(
       document.createElement('div'),
@@ -242,24 +599,18 @@ describe('ReaderSession Kavita restoration and matching', () => {
   });
 
   it('matches active chapter elements against both canonical body paths and ID-anchored locators', async () => {
-    resetSpineSections(3);
-    const chapterDoc = new DOMParser().parseFromString(
-      '<html><body><section id="sec-1"><p>first</p><p id="para-2">second</p></section></body></html>',
-      'text/html',
-    );
-    const secondParagraph = chapterDoc.getElementById('para-2')!;
+    const chapterOneContents = testState.sections[0]!.contents!;
+    const secondParagraph = chapterOneContents.document.getElementById('plain-p')!;
+    const range = chapterOneContents.document.createRange();
+    range.setStart(secondParagraph.firstChild!, 0);
+    range.collapse(true);
+    const cfi = chapterOneContents.cfiFromRange(range);
     mockRendition.getRange.mockReturnValue({ startContainer: secondParagraph });
-    mockRendition.getContents.mockReturnValue([
-      {
-        sectionIndex: 0,
-        document: chapterDoc,
-      } as never,
-    ]);
 
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
-      'epubcfi(/6/2!/4/2/4)',
+      cfi,
       null,
       null,
       defaultAppearance,
@@ -269,17 +620,18 @@ describe('ReaderSession Kavita restoration and matching', () => {
     const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
     relocated?.({
       start: {
-        cfi: 'epubcfi(/6/2!/4/2/4)',
-        href: 'chapter-1.xhtml',
+        cfi,
+        href: 'chapter-one.xhtml',
         index: 0,
-        displayed: { page: 1, total: 3 },
+        displayed: { page: 2, total: 8 },
       },
     });
 
     expect(session.matchesServerLocation('//body/section[1]/p[2]', 0)).toBe(true);
-    expect(session.matchesServerLocation('id("para-2")', 0)).toBe(true);
-    expect(session.matchesServerLocation('id("sec-1")/p[2]', 0)).toBe(true);
+    expect(session.matchesServerLocation('id("plain-p")', 0)).toBe(true);
+    expect(session.matchesServerLocation('id("main")/p[2]', 0)).toBe(true);
     expect(session.matchesServerLocation('//body/section[1]/p[2]', 1)).toBe(false);
+
     session.destroy();
   });
 });
