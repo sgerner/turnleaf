@@ -7,12 +7,17 @@ const config: CapacitorConfig = {
   appName: APP_NAME,
   webDir: 'dist',
   loggingBehavior: 'none',
+  zoomEnabled: true,
   server: {
     androidScheme: 'https',
   },
   android: {
     // Kavita may be hosted on a local HTTP address; onboarding requires explicit confirmation.
     allowMixedContent: true,
+    zoomEnabled: true,
+  },
+  ios: {
+    zoomEnabled: true,
   },
 };
 

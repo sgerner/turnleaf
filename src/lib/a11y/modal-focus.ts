@@ -26,7 +26,13 @@ export function focusFirstElement(container: HTMLElement | null): void {
 }
 
 export function restoreFocus(element: HTMLElement | null): void {
-  if (element?.isConnected && !element.hasAttribute('disabled')) element.focus();
+  if (!element?.isConnected || element.hasAttribute('disabled')) return;
+  const view = element.ownerDocument?.defaultView;
+  if (view && view !== window) {
+    const frame = view.frameElement;
+    if (frame && 'focus' in frame && typeof frame.focus === 'function') frame.focus();
+  }
+  element.focus();
 }
 
 export function trapModalKeydown(

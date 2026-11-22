@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add reader external link, footnote, and figure inspectors, accessible highlight overlays, pinch-zoom, and iOS Dynamic Type scaling
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops

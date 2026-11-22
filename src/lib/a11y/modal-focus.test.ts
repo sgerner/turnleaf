@@ -63,3 +63,18 @@ it('closes on Escape and restores focus to a connected opener', () => {
   expect(event.defaultPrevented).toBe(true);
   expect(document.activeElement).toBe(opener);
 });
+
+it('restores focus to an opener inside a child iframe', () => {
+  const iframe = document.createElement('iframe');
+  document.body.append(iframe);
+  const childDoc = iframe.contentDocument!;
+  const childLink = childDoc.createElement('a');
+  childLink.setAttribute('role', 'link');
+  childLink.tabIndex = 0;
+  childDoc.body.append(childLink);
+
+  restoreFocus(childLink);
+
+  expect(childDoc.activeElement).toBe(childLink);
+  iframe.remove();
+});

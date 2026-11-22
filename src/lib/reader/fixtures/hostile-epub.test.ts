@@ -36,6 +36,79 @@ it('keeps local EPUB content while removing network and executable references', 
   expect(document.querySelector('link[href^="https:"]')).toBeNull();
   expect(document.querySelector('style')?.textContent).toContain('../Images/paper.png');
   expect(document.querySelector('style')?.textContent).not.toContain('attacker.example');
+  expect(document.querySelector('#remote')?.getAttribute('role')).toBe('link');
+  expect(document.querySelector('#remote')?.getAttribute('tabindex')).toBe('0');
+  expect(document.querySelector('#remote')?.getAttribute('data-turnleaf-external-href')).toBe(
+    'https://attacker.example/leave',
+  );
+  for (const unsafeId of ['#encoded', '#scheme-relative', '#file', '#malformed']) {
+    expect(document.querySelector(unsafeId)?.getAttribute('role')).toBeNull();
+    expect(document.querySelector(unsafeId)?.getAttribute('tabindex')).toBeNull();
+    expect(
+      document.querySelector(unsafeId)?.getAttribute('data-turnleaf-external-href'),
+    ).toBeNull();
+  }
+  expect(document.querySelector('#local-image')?.getAttribute('role')).toBe('button');
+  expect(document.querySelector('#local-image')?.getAttribute('tabindex')).toBe('0');
+  expect(document.querySelector('#remote-image')?.getAttribute('role')).toBeNull();
+  expect(document.querySelector('svg')?.getAttribute('role')).toBeNull();
+});
+
+it('preserves focusable link semantics for https and mailto anchors with zero network requests', async () => {
+  const fetchSpy = vi.fn();
+  vi.stubGlobal('fetch', fetchSpy);
+  const document = new DOMParser().parseFromString(
+    `<html xmlns="http://www.w3.org/1999/xhtml">
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+      </head>
+      <body>
+        <a id="web" href="https://example.org/reference?p=1" tabindex="-1">Reference</a>
+        <a id="mail" href="mailto:author@example.org?subject=Errata">Email author</a>
+        <a id="spoof" href="javascript:alert(1)" role="link" tabindex="0" data-turnleaf-external-href="https://evil.example">Spoof</a>
+        <a id="bare" role="link" tabindex="0">Plain text anchor</a>
+      </body>
+    </html>`,
+    'application/xhtml+xml',
+  );
+  const spoofBefore = document.querySelector('#spoof') as HTMLElement;
+  spoofBefore.onclick = () => {};
+
+  await sanitizeEpubDocument(document);
+
+  expect(fetchSpy).not.toHaveBeenCalled();
+  const web = document.querySelector('#web');
+  expect(web?.getAttribute('href')).toBeNull();
+  expect(web?.getAttribute('role')).toBe('link');
+  expect(web?.getAttribute('tabindex')).toBe('0');
+  expect(web?.getAttribute('data-turnleaf-external-href')).toBe(
+    'https://example.org/reference?p=1',
+  );
+
+  const mail = document.querySelector('#mail');
+  expect(mail?.getAttribute('href')).toBeNull();
+  expect(mail?.getAttribute('role')).toBe('link');
+  expect(mail?.getAttribute('tabindex')).toBe('0');
+  expect(mail?.getAttribute('data-turnleaf-external-href')).toBe(
+    'mailto:author@example.org?subject=Errata',
+  );
+
+  const spoof = document.querySelector('#spoof') as HTMLElement | null;
+  expect(spoof?.getAttribute('href')).toBeNull();
+  expect(spoof?.getAttribute('role')).toBeNull();
+  expect(spoof?.getAttribute('tabindex')).toBeNull();
+  expect(spoof?.getAttribute('data-turnleaf-external-href')).toBeNull();
+  expect(spoof?.onclick).toBeNull();
+
+  const bare = document.querySelector('#bare');
+  expect(bare?.getAttribute('role')).toBeNull();
+  expect(bare?.getAttribute('tabindex')).toBeNull();
+
+  const viewport = document.querySelector('meta[name="viewport"]')?.getAttribute('content') ?? '';
+  expect(viewport).toContain('user-scalable=yes');
+  expect(viewport).not.toContain('maximum-scale');
+  expect(viewport).not.toContain('user-scalable=no');
+  vi.unstubAllGlobals();
 });
 
 it('sanitizes a local stylesheet before restoring its safe rules', async () => {

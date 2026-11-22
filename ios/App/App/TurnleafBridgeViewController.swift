@@ -2,9 +2,23 @@ import AVFoundation
 import Capacitor
 import MediaPlayer
 import UIKit
+import WebKit
 
 @objc(TurnleafBridgeViewController)
 final class TurnleafBridgeViewController: CAPBridgeViewController {
+    private var contentSizeObserver: NSObjectProtocol?
+
+    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
+        let configuration = super.webViewConfiguration(for: instanceConfiguration)
+        let script = WKUserScript(
+            source: Self.dynamicTypeScript(for: resolvedContentSizeCategory()),
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        configuration.userContentController.addUserScript(script)
+        return configuration
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         if bridge?.plugin(withName: "VolumeButtons") == nil {
@@ -16,6 +30,79 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         if bridge?.plugin(withName: "KeepAwake") == nil {
             bridge?.registerPluginInstance(TurnleafKeepAwakePlugin())
         }
+        contentSizeObserver = NotificationCenter.default.addObserver(
+            forName: UIContentSizeCategory.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyDynamicTypeScale()
+        }
+        if #available(iOS 17.0, *) {
+            registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
+                self.applyDynamicTypeScale()
+            }
+        }
+        applyDynamicTypeScale()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        applyDynamicTypeScale()
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        if previousTraitCollection?.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory {
+            applyDynamicTypeScale()
+        }
+    }
+
+    deinit {
+        if let contentSizeObserver {
+            NotificationCenter.default.removeObserver(contentSizeObserver)
+        }
+    }
+
+    private func resolvedContentSizeCategory() -> UIContentSizeCategory {
+        let traitCategory = traitCollection.preferredContentSizeCategory
+        if traitCategory != .unspecified {
+            return traitCategory
+        }
+        return UIApplication.shared.preferredContentSizeCategory
+    }
+
+    private static func dynamicTypeScale(for category: UIContentSizeCategory) -> CGFloat {
+        let resolved = category == .unspecified ? .large : category
+        let basePoints: CGFloat = 17.0
+        let scaledPoints = UIFontMetrics(forTextStyle: .body).scaledValue(
+            for: basePoints,
+            compatibleWith: UITraitCollection(preferredContentSizeCategory: resolved)
+        )
+        return min(2.0, max(0.85, scaledPoints / basePoints))
+    }
+
+    private static func dynamicTypeScript(for category: UIContentSizeCategory) -> String {
+        let resolved = category == .unspecified ? .large : category
+        let scale = String(format: "%.3f", dynamicTypeScale(for: resolved))
+        return """
+        (() => {
+          const root = document.documentElement;
+          if (!root) return;
+          root.style.setProperty('--turnleaf-text-scale', '\(scale)');
+          root.dataset.contentSizeCategory = '\(resolved.rawValue)';
+        })();
+        """
+    }
+
+    private func applyDynamicTypeScale() {
+        let category = resolvedContentSizeCategory()
+        let resolved = category == .unspecified ? .large : category
+        let scale = String(format: "%.3f", Self.dynamicTypeScale(for: resolved))
+        webView?.evaluateJavaScript(Self.dynamicTypeScript(for: resolved), completionHandler: nil)
+        bridge?.triggerWindowJSEvent(
+            eventName: "turnleafDynamicType",
+            data: #"{"scale":\#(scale),"category":"\#(resolved.rawValue)"}"#
+        )
     }
 
     override var prefersStatusBarHidden: Bool {

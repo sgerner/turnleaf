@@ -5,13 +5,17 @@
 @custom-variant dark (&:where([data-mode='dark'], [data-mode='dark'] *));
 
 :root {
+  --turnleaf-text-scale: 1;
   color-scheme: light;
   @variant dark {
     color-scheme: dark;
   }
+  font-size: calc(100% * var(--turnleaf-text-scale, 1));
   font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 [data-theme='vintage'] {

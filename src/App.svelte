@@ -64,7 +64,21 @@
   }
 
   onMount(() => {
+    const handleDynamicType = (event: Event) => {
+      const detail = (event as CustomEvent<{ scale?: number; category?: string }>).detail;
+      if (typeof detail?.scale === 'number' && Number.isFinite(detail.scale) && detail.scale > 0) {
+        const clamped = Math.min(2, Math.max(0.85, detail.scale));
+        document.documentElement.style.setProperty('--turnleaf-text-scale', clamped.toFixed(3));
+      }
+      if (typeof detail?.category === 'string' && detail.category) {
+        document.documentElement.dataset.contentSizeCategory = detail.category;
+      }
+    };
+    window.addEventListener('turnleafDynamicType', handleDynamicType);
     void loadLocalData();
+    return () => {
+      window.removeEventListener('turnleafDynamicType', handleDynamicType);
+    };
   });
 
   async function repairLocalData(): Promise<void> {

@@ -25,8 +25,10 @@
   .turnleaf-logo {
     --turnleaf-logo-size: 3.5rem;
     display: inline-flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.85rem;
+    gap: 14px;
+    max-width: 100%;
   }
 
   .turnleaf-image {
@@ -34,6 +36,7 @@
     height: var(--turnleaf-logo-size);
     object-fit: contain;
     display: block;
+    flex-shrink: 0;
   }
 
   .turnleaf-wordmark {
@@ -41,5 +44,7 @@
     font-size: calc(var(--turnleaf-logo-size) * 0.65);
     line-height: 1;
     letter-spacing: 0.02em;
+    max-width: 100%;
+    overflow-wrap: anywhere;
   }
 </style>

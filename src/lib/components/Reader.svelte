@@ -13,6 +13,7 @@
   import { createReaderNativeFeatures } from '../native/reader-native-features';
   import {
     defaultAppearance,
+    defaultReaderFontSize,
     parseAppearance,
     serializeAppearance,
     type Appearance,
@@ -20,6 +21,11 @@
   } from '../reader/appearance';
   import {
     ReaderSession,
+    validateExternalBrowserUrl,
+    validateExternalLaunchUrl,
+    type ReaderExternalLink,
+    type ReaderFigurePreview,
+    type ReaderFootnotePreview,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
@@ -95,12 +101,36 @@
   let annotationsPanel = $state<HTMLElement | null>(null);
   let searchPanel = $state<HTMLElement | null>(null);
   let syncConfirmationPanel = $state<HTMLElement | null>(null);
+  let externalLinkPanel = $state<HTMLElement | null>(null);
+  let footnotePanel = $state<HTMLElement | null>(null);
+  let figurePanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
   let bookmarksOpener: HTMLElement | null = null;
   let annotationsOpener: HTMLElement | null = null;
   let searchOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
+  let externalLinkOpener: HTMLElement | null = null;
+  let footnoteOpener: HTMLElement | null = null;
+  let figureOpener: HTMLElement | null = null;
+  let pendingExternalLink = $state<ReaderExternalLink | null>(null);
+  let externalLinkMessage = $state('');
+  let activeFootnote = $state<ReaderFootnotePreview | null>(null);
+  let activeFigure = $state<ReaderFigurePreview | null>(null);
+  let figureZoom = $state(1);
+  let figurePan = $state({ x: 0, y: 0 });
+  const figurePointers = new SvelteMap<number, { x: number; y: number }>();
+  let figurePinchStart: { distance: number; zoom: number } | null = null;
+  let figureDragStart: {
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+    startX: number;
+    startY: number;
+  } | null = null;
+  let visiblePassages = $state<ReaderSelection[]>([]);
+  let activeAnnotationId = $state<string | null>(null);
+  let hasCustomAppearance = false;
   let toc = $state<TocItem[]>([]);
   let previousDocumentTitle = '';
   let bookmarks = $state<StoredReaderLocation[]>([]);
@@ -154,6 +184,7 @@
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
+    window.addEventListener('turnleafDynamicType', handleDynamicTypeChange);
     const preferences = await getPreferences([
       'appearance',
       `readerBookmarks:${bookId}`,
@@ -162,7 +193,14 @@
     ]);
     if (destroyed) return;
     const saved = preferences.get('appearance');
-    appearance = saved ? parseAppearance(saved) : { ...defaultAppearance, mode: defaultMode };
+    hasCustomAppearance = Boolean(saved);
+    appearance = saved
+      ? parseAppearance(saved)
+      : {
+          ...defaultAppearance,
+          mode: defaultMode,
+          fontSize: defaultReaderFontSize(),
+        };
     bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
@@ -225,6 +263,20 @@
         }
       },
       handleKeyboardNavigation,
+      {
+        onExternalLink: (link, opener) => {
+          if (!destroyed) openExternalLinkDialog(link, opener);
+        },
+        onFootnote: (footnote, opener) => {
+          if (!destroyed) openFootnoteDialog(footnote, opener);
+        },
+        onHighlight: (cfi, opener) => {
+          if (!destroyed) openAnnotationFromHighlight(cfi, opener);
+        },
+        onFigure: (figure, opener) => {
+          if (!destroyed) openFigureDialog(figure, opener);
+        },
+      },
     );
     if (!destroyed) {
       toc = nextSession.tableOfContents();
@@ -302,6 +354,7 @@
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
+    window.removeEventListener('turnleafDynamicType', handleDynamicTypeChange);
     document.title = previousDocumentTitle;
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     flushPendingPreferences();
@@ -346,6 +399,10 @@
     });
   }
 
+  function hasOpenInspectorModal(): boolean {
+    return pendingExternalLink !== null || activeFootnote !== null || activeFigure !== null;
+  }
+
   function hasOpenReaderPanel(): boolean {
     return (
       settingsVisible ||
@@ -353,8 +410,39 @@
       bookmarksVisible ||
       annotationsVisible ||
       searchVisible ||
-      pendingSyncLocation !== null
+      pendingSyncLocation !== null ||
+      hasOpenInspectorModal()
     );
+  }
+
+  function clearInspectorModals(): void {
+    pendingExternalLink = null;
+    externalLinkMessage = '';
+    externalLinkOpener = null;
+    activeFootnote = null;
+    footnoteOpener = null;
+    activeFigure = null;
+    figureOpener = null;
+    figureDragStart = null;
+    figurePinchStart = null;
+    figurePointers.clear();
+  }
+
+  function clearToolbarPanels(): void {
+    settingsVisible = false;
+    tocVisible = false;
+    bookmarksVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
+    activeAnnotationId = null;
+    searchController?.abort();
+    searchController = null;
+    searching = false;
   }
 
   function pauseChromeHide(): void {
@@ -370,16 +458,11 @@
 
   function openSettings(): void {
     pauseChromeHide();
-    settingsOpener = activeElement();
+    clearInspectorModals();
+    const opener = activeElement();
+    clearToolbarPanels();
+    settingsOpener = opener;
     settingsVisible = true;
-    tocVisible = false;
-    bookmarksVisible = false;
-    annotationsVisible = false;
-    searchVisible = false;
-    tocOpener = null;
-    bookmarksOpener = null;
-    annotationsOpener = null;
-    searchOpener = null;
     focusPanel(() => settingsPanel);
   }
 
@@ -393,16 +476,11 @@
 
   function openToc(): void {
     pauseChromeHide();
-    tocOpener = activeElement();
+    clearInspectorModals();
+    const opener = activeElement();
+    clearToolbarPanels();
+    tocOpener = opener;
     tocVisible = true;
-    settingsVisible = false;
-    bookmarksVisible = false;
-    annotationsVisible = false;
-    searchVisible = false;
-    settingsOpener = null;
-    bookmarksOpener = null;
-    annotationsOpener = null;
-    searchOpener = null;
     focusPanel(() => tocPanel);
   }
 
@@ -416,16 +494,11 @@
 
   function openBookmarks(): void {
     pauseChromeHide();
-    bookmarksOpener = activeElement();
+    clearInspectorModals();
+    const opener = activeElement();
+    clearToolbarPanels();
+    bookmarksOpener = opener;
     bookmarksVisible = true;
-    settingsVisible = false;
-    tocVisible = false;
-    annotationsVisible = false;
-    searchVisible = false;
-    settingsOpener = null;
-    tocOpener = null;
-    annotationsOpener = null;
-    searchOpener = null;
     focusPanel(() => bookmarksPanel);
   }
 
@@ -441,25 +514,42 @@
   function openAnnotations(): void {
     controlsVisible = true;
     pauseChromeHide();
-    annotationsOpener = activeElement();
+    clearInspectorModals();
+    const opener = activeElement();
+    clearToolbarPanels();
+    annotationsOpener = opener;
+    visiblePassages = session?.getVisiblePassages() ?? [];
     annotationsVisible = true;
-    settingsVisible = false;
-    tocVisible = false;
-    bookmarksVisible = false;
-    searchVisible = false;
-    settingsOpener = null;
-    tocOpener = null;
-    bookmarksOpener = null;
-    searchOpener = null;
-    searchController?.abort();
-    searchController = null;
-    searching = false;
     focusPanel(() => annotationsPanel);
+  }
+
+  function openAnnotationFromHighlight(cfi: string, opener: HTMLElement | null): void {
+    const matched = annotations.find((entry) => entry.cfi === cfi) ?? null;
+    controlsVisible = true;
+    pauseChromeHide();
+    clearInspectorModals();
+    clearToolbarPanels();
+    annotationsOpener = opener ?? activeElement();
+    activeAnnotationId = matched?.id ?? null;
+    visiblePassages = session?.getVisiblePassages() ?? [];
+    annotationsVisible = true;
+    if (matched) {
+      void tick().then(() => {
+        const cards =
+          annotationsPanel?.querySelectorAll<HTMLElement>('[data-annotation-card]') ?? [];
+        const card = [...cards].find((node) => node.dataset.annotationCard === matched.id);
+        card?.scrollIntoView?.({ block: 'nearest' });
+        focusReaderTarget(annotationsPanel, 'annotation-edit', matched.id);
+      });
+    } else {
+      focusPanel(() => annotationsPanel);
+    }
   }
 
   function closeAnnotations(): void {
     annotationsVisible = false;
     editingAnnotationId = null;
+    activeAnnotationId = null;
     selectedText = null;
     annotationDraft = '';
     exportFallback = '';
@@ -474,18 +564,19 @@
     resumeChromeHide();
   }
 
+  function selectVisiblePassage(passage: ReaderSelection): void {
+    selectedText = passage;
+    annotationDraft = '';
+    focusReaderTarget(annotationsPanel, 'new-annotation-note');
+  }
+
   function openSearch(): void {
     pauseChromeHide();
-    searchOpener = activeElement();
+    clearInspectorModals();
+    const opener = activeElement();
+    clearToolbarPanels();
+    searchOpener = opener;
     searchVisible = true;
-    settingsVisible = false;
-    tocVisible = false;
-    bookmarksVisible = false;
-    annotationsVisible = false;
-    settingsOpener = null;
-    tocOpener = null;
-    bookmarksOpener = null;
-    annotationsOpener = null;
     searchError = '';
     focusPanel(() => searchPanel);
   }
@@ -503,6 +594,7 @@
 
   function openSyncConfirmation(progress: SyncedLocation): void {
     pauseChromeHide();
+    clearInspectorModals();
     syncConfirmationOpener = activeElement();
     pendingSyncLocation = progress;
     focusPanel(() => syncConfirmationPanel);
@@ -514,6 +606,192 @@
     syncConfirmationOpener = null;
     restorePanelFocus(opener);
     resumeChromeHide();
+  }
+
+  function openExternalLinkDialog(link: ReaderExternalLink, opener: HTMLElement | null): void {
+    pauseChromeHide();
+    clearToolbarPanels();
+    clearInspectorModals();
+    externalLinkOpener = opener ?? activeElement();
+    pendingExternalLink = link;
+    focusPanel(() => externalLinkPanel);
+  }
+
+  function closeExternalLinkDialog(): void {
+    pendingExternalLink = null;
+    externalLinkMessage = '';
+    const opener = externalLinkOpener;
+    externalLinkOpener = null;
+    restorePanelFocus(opener);
+    resumeChromeHide();
+  }
+
+  async function copyExternalLink(): Promise<void> {
+    if (!pendingExternalLink) return;
+    try {
+      await navigator.clipboard.writeText(pendingExternalLink.href);
+      externalLinkMessage = 'Link copied.';
+    } catch {
+      externalLinkMessage = 'Turnleaf could not copy the link.';
+    }
+  }
+
+  function launchExternalLink(): void {
+    const link = pendingExternalLink;
+    if (!link) return;
+    const validated =
+      link.scheme === 'mailto:'
+        ? validateExternalLaunchUrl(link.href)
+        : validateExternalBrowserUrl(link.href);
+    if (!validated) {
+      externalLinkMessage = 'This external link is not safe to open.';
+      return;
+    }
+    window.open(validated, '_blank', 'noopener,noreferrer');
+    closeExternalLinkDialog();
+  }
+
+  function openFootnoteDialog(footnote: ReaderFootnotePreview, opener: HTMLElement | null): void {
+    pauseChromeHide();
+    clearToolbarPanels();
+    clearInspectorModals();
+    footnoteOpener = opener ?? activeElement();
+    activeFootnote = footnote;
+    focusPanel(() => footnotePanel);
+  }
+
+  function closeFootnoteDialog(): void {
+    activeFootnote = null;
+    const opener = footnoteOpener;
+    footnoteOpener = null;
+    restorePanelFocus(opener);
+    resumeChromeHide();
+  }
+
+  function openFigureDialog(figure: ReaderFigurePreview, opener: HTMLElement | null): void {
+    pauseChromeHide();
+    clearToolbarPanels();
+    clearInspectorModals();
+    figureOpener = opener ?? activeElement();
+    figureZoom = 1;
+    figurePan = { x: 0, y: 0 };
+    activeFigure = figure;
+    focusPanel(() => figurePanel);
+  }
+
+  function closeFigureDialog(): void {
+    activeFigure = null;
+    figureDragStart = null;
+    figurePinchStart = null;
+    figurePointers.clear();
+    const opener = figureOpener;
+    figureOpener = null;
+    restorePanelFocus(opener);
+    resumeChromeHide();
+  }
+
+  function setFigureZoom(value: number): void {
+    const next = Math.min(4, Math.max(1, Math.round(value * 100) / 100));
+    figureZoom = next;
+    if (next <= 1) figurePan = { x: 0, y: 0 };
+  }
+
+  function adjustFigureZoom(delta: number): void {
+    setFigureZoom(figureZoom + delta);
+  }
+
+  function resetFigureTransform(): void {
+    figureZoom = 1;
+    figurePan = { x: 0, y: 0 };
+  }
+
+  function pointerDistance(): number {
+    const points = [...figurePointers.values()];
+    if (points.length < 2) return 0;
+    return Math.hypot(points[0]!.x - points[1]!.x, points[0]!.y - points[1]!.y);
+  }
+
+  function handleFigurePointerDown(event: PointerEvent): void {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    figurePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
+    if (figurePointers.size === 2) {
+      figureDragStart = null;
+      const distance = pointerDistance();
+      if (distance > 0) figurePinchStart = { distance, zoom: figureZoom };
+      return;
+    }
+    if (figureZoom <= 1) return;
+    figureDragStart = {
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+      startX: figurePan.x,
+      startY: figurePan.y,
+    };
+  }
+
+  function handleFigurePointerMove(event: PointerEvent): void {
+    if (figurePointers.has(event.pointerId)) {
+      figurePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    }
+    if (figurePointers.size === 2 && figurePinchStart) {
+      const distance = pointerDistance();
+      if (distance > 0) {
+        setFigureZoom(figurePinchStart.zoom * (distance / figurePinchStart.distance));
+      }
+      return;
+    }
+    if (!figureDragStart || figureDragStart.pointerId !== event.pointerId) return;
+    figurePan = {
+      x: figureDragStart.startX + (event.clientX - figureDragStart.clientX),
+      y: figureDragStart.startY + (event.clientY - figureDragStart.clientY),
+    };
+  }
+
+  function handleFigurePointerUp(event: PointerEvent): void {
+    figurePointers.delete(event.pointerId);
+    if (figurePointers.size < 2) figurePinchStart = null;
+    if (figureDragStart?.pointerId === event.pointerId) {
+      figureDragStart = null;
+    }
+  }
+
+  function handleFigureWheel(event: WheelEvent): void {
+    if (!event.ctrlKey && Math.abs(event.deltaY) < 4) return;
+    event.preventDefault();
+    adjustFigureZoom(event.deltaY < 0 ? 0.25 : -0.25);
+  }
+
+  function handleFigureKeydown(event: KeyboardEvent): void {
+    if (!figurePanel) return;
+    trapModalKeydown(event, figurePanel, closeFigureDialog);
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key === '+' || event.key === '=') {
+      event.preventDefault();
+      adjustFigureZoom(0.5);
+    } else if (event.key === '-' || event.key === '_') {
+      event.preventDefault();
+      adjustFigureZoom(-0.5);
+    } else if (event.key === '0') {
+      event.preventDefault();
+      resetFigureTransform();
+    } else if (figureZoom > 1) {
+      const step = 32;
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        figurePan = { ...figurePan, x: figurePan.x + step };
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        figurePan = { ...figurePan, x: figurePan.x - step };
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        figurePan = { ...figurePan, y: figurePan.y + step };
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        figurePan = { ...figurePan, y: figurePan.y - step };
+      }
+    }
   }
 
   function showFooter(): void {
@@ -571,7 +849,17 @@
     }, 5_000);
   }
 
+  function handleDynamicTypeChange(): void {
+    if (destroyed || hasCustomAppearance) return;
+    const nextFontSize = defaultReaderFontSize();
+    if (appearance.fontSize !== nextFontSize) {
+      appearance = { ...appearance, fontSize: nextFontSize };
+      session?.applyAppearance(appearance);
+    }
+  }
+
   function updateAppearance(patch: Partial<Appearance>): void {
+    hasCustomAppearance = true;
     appearance = { ...appearance, ...patch };
     session?.applyAppearance(appearance);
     if (patch.keepAwake !== undefined) {
@@ -664,11 +952,13 @@
     session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
+    visiblePassages = session?.getVisiblePassages() ?? [];
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
   function editAnnotation(annotation: StoredAnnotation): void {
     annotations = updateAnnotation(annotations, annotation.id, annotationDraft);
+    session?.updateHighlights(annotations);
     editingAnnotationId = null;
     annotationDraft = '';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
@@ -935,11 +1225,46 @@
     }
   }
 
+  function closeActiveModal(fromBackButton = false): boolean {
+    if (pendingExternalLink) {
+      closeExternalLinkDialog();
+      return true;
+    }
+    if (activeFootnote) {
+      closeFootnoteDialog();
+      return true;
+    }
+    if (activeFigure) {
+      closeFigureDialog();
+      return true;
+    }
+    if (pendingSyncLocation) closeSyncConfirmation();
+    else if (settingsVisible) closeSettings();
+    else if (tocVisible) closeToc();
+    else if (bookmarksVisible) closeBookmarks();
+    else if (annotationsVisible) closeAnnotations();
+    else if (searchVisible) closeSearch();
+    else return false;
+
+    if (fromBackButton || controlsVisible) showControls();
+    return true;
+  }
+
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed || event.defaultPrevented) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key === 'Escape' && hasOpenReaderPanel()) {
+      event.preventDefault();
+      closeActiveModal(false);
+      return;
+    }
+    if (hasOpenReaderPanel() || event.shiftKey) return;
     const target = event.target as Element | null;
-    if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
+    if (
+      target?.closest?.(
+        'button, a, input, select, textarea, [contenteditable="true"], [role="button"], [role="link"]',
+      )
+    ) {
       return;
     }
     if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
@@ -950,46 +1275,24 @@
     if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
       event.preventDefault();
       void turn('next');
-      return;
-    }
-    if (
-      event.key === 'Escape' &&
-      (settingsVisible ||
-        tocVisible ||
-        bookmarksVisible ||
-        annotationsVisible ||
-        searchVisible ||
-        pendingSyncLocation)
-    ) {
-      event.preventDefault();
-      if (pendingSyncLocation) closeSyncConfirmation();
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
-      showControls();
     }
   }
 
   function handleBackButton(): boolean {
-    if (pendingSyncLocation) closeSyncConfirmation();
-    else if (settingsVisible) closeSettings();
-    else if (tocVisible) closeToc();
-    else if (bookmarksVisible) closeBookmarks();
-    else if (annotationsVisible) closeAnnotations();
-    else if (searchVisible) closeSearch();
-    else if (linkReturnTarget) void returnToLink();
-    else if (controlsVisible) {
+    if (closeActiveModal(true)) return true;
+    if (linkReturnTarget) {
+      void returnToLink();
+      showControls();
+      return true;
+    }
+    if (controlsVisible) {
       controlsVisible = false;
       footerVisible = false;
       pauseChromeHide();
       void tick().then(() => topRevealButton?.focus());
-    } else {
-      onBack();
       return true;
     }
-    showControls();
+    onBack();
     return true;
   }
 
@@ -1025,7 +1328,7 @@
 
 <main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
   <h1 class="sr-only">{title}</h1>
-  <div class="reader-viewport" bind:this={viewport}></div>
+  <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
   <p class="sr-only" aria-live="polite" aria-atomic="true">
     {#if location}
@@ -1039,18 +1342,7 @@
     Press Escape to close an open reader panel.
   </p>
 
-  <nav
-    class="tap-zones"
-    aria-label="Page navigation"
-    inert={Boolean(
-      settingsVisible ||
-      tocVisible ||
-      bookmarksVisible ||
-      annotationsVisible ||
-      searchVisible ||
-      pendingSyncLocation,
-    )}
-  >
+  <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
     <button
       type="button"
       aria-label="Previous page"
@@ -1171,164 +1463,323 @@
     </div>
   {/if}
 
-  {#if controlsVisible}
+  {#if controlsVisible || hasOpenInspectorModal()}
     <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
-      <header
-        bind:this={readerToolbar}
-        class="reader-bar reader-top"
-        inert={Boolean(
-          settingsVisible ||
-          tocVisible ||
-          bookmarksVisible ||
-          annotationsVisible ||
-          searchVisible ||
-          pendingSyncLocation,
-        )}
-        transition:fly={{ y: -8, duration: 140 }}
-      >
-        <div class="reader-toolbar">
-          <div class="reader-toolbar-actions">
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={onBack}
-              aria-label="Back to library"
-              title="Back to library"
-            >
-              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
-                <path
-                  fill="currentColor"
-                  d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2Z"
-                />
-              </svg>
-              <span class="reader-toolbar-label">Back</span>
-            </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => (tocVisible ? closeToc() : openToc())}
-              aria-label="Contents"
-              aria-expanded={tocVisible}
-              aria-controls="reader-contents"
-              title="Contents"
-            >
-              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
-                <path fill="currentColor" d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z" />
-              </svg>
-              <span class="reader-toolbar-label">Contents</span>
-            </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => (settingsVisible ? closeSettings() : openSettings())}
-              aria-label="Text, reading appearance"
-              aria-expanded={settingsVisible}
-              aria-controls="reader-appearance"
-              title="Reading appearance"
-            >
-              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
-                <path fill="currentColor" d="M5 4h14v2h-6v14h-2V6H5V4Z" />
-              </svg>
-              <span class="reader-toolbar-label">Text</span>
-            </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
-              aria-label="Marks, bookmarks and history"
-              aria-expanded={bookmarksVisible}
-              aria-controls="reader-bookmarks"
-              title="Open bookmarks and history"
-            >
-              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
-                <path
-                  fill="currentColor"
-                  d="m12 3 2.78 5.63 6.22.9-4.5 4.38 1.06 6.2L12 17.18l-5.56 2.93 1.06-6.2L3 9.53l6.22-.9L12 3Z"
-                />
-              </svg>
-              <span class="reader-toolbar-label">Marks</span>
-            </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
-              aria-label="Notes: highlights and annotations"
-              aria-expanded={annotationsVisible}
-              aria-controls="reader-annotations"
-              title="Open highlights and notes"
-            >
-              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
-                <path
-                  fill="currentColor"
-                  d="m4 17.25 9.67-9.67 2.75 2.75L6.75 20H4v-2.75ZM17.12 6.13l.75-.75a1.5 1.5 0 0 1 2.12 0l.63.63a1.5 1.5 0 0 1 0 2.12l-.75.75-2.75-2.75Z"
-                />
-              </svg>
-              <span class="reader-toolbar-label">Notes</span>
-            </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => (searchVisible ? closeSearch() : openSearch())}
-              aria-label="Search this book"
-              aria-expanded={searchVisible}
-              aria-controls="reader-search"
-              title="Search this book"
-            >
-              <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
-                <path
-                  fill="currentColor"
-                  d="m15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5ZM9.5 14A4.5 4.5 0 1 1 9.5 5a4.5 4.5 0 0 1 0 9Z"
-                />
-              </svg>
-              <span class="reader-toolbar-label">Search</span>
-            </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => syncLatestLocation()}
-              aria-label="Sync latest reading position"
-              title="Sync latest reading position"
-              disabled={syncingLatest}
-            >
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                class:animate-spin={syncingLatest}
-                class="reader-toolbar-icon reader-toolbar-icon-always"
+      {#if controlsVisible}
+        <header
+          bind:this={readerToolbar}
+          class="reader-bar reader-top"
+          inert={hasOpenReaderPanel()}
+          transition:fly={{ y: -8, duration: 140 }}
+        >
+          <div class="reader-toolbar">
+            <div class="reader-toolbar-actions">
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={onBack}
+                aria-label="Back to library"
+                title="Back to library"
               >
-                <path
-                  fill="currentColor"
-                  d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
-                />
-              </svg>
-              <span class="reader-toolbar-label">Sync</span>
-            </button>
+                <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path
+                    fill="currentColor"
+                    d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2Z"
+                  />
+                </svg>
+                <span class="reader-toolbar-label">Back</span>
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={() => (tocVisible ? closeToc() : openToc())}
+                aria-label="Contents"
+                aria-expanded={tocVisible}
+                aria-controls="reader-contents"
+                title="Contents"
+              >
+                <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path fill="currentColor" d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z" />
+                </svg>
+                <span class="reader-toolbar-label">Contents</span>
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={() => (settingsVisible ? closeSettings() : openSettings())}
+                aria-label="Text, reading appearance"
+                aria-expanded={settingsVisible}
+                aria-controls="reader-appearance"
+                title="Reading appearance"
+              >
+                <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path fill="currentColor" d="M5 4h14v2h-6v14h-2V6H5V4Z" />
+                </svg>
+                <span class="reader-toolbar-label">Text</span>
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
+                aria-label="Marks, bookmarks and history"
+                aria-expanded={bookmarksVisible}
+                aria-controls="reader-bookmarks"
+                title="Open bookmarks and history"
+              >
+                <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path
+                    fill="currentColor"
+                    d="m12 3 2.78 5.63 6.22.9-4.5 4.38 1.06 6.2L12 17.18l-5.56 2.93 1.06-6.2L3 9.53l6.22-.9L12 3Z"
+                  />
+                </svg>
+                <span class="reader-toolbar-label">Marks</span>
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
+                aria-label="Notes: highlights and annotations"
+                aria-expanded={annotationsVisible}
+                aria-controls="reader-annotations"
+                title="Open highlights and notes"
+              >
+                <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path
+                    fill="currentColor"
+                    d="m4 17.25 9.67-9.67 2.75 2.75L6.75 20H4v-2.75ZM17.12 6.13l.75-.75a1.5 1.5 0 0 1 2.12 0l.63.63a1.5 1.5 0 0 1 0 2.12l-.75.75-2.75-2.75Z"
+                  />
+                </svg>
+                <span class="reader-toolbar-label">Notes</span>
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={() => (searchVisible ? closeSearch() : openSearch())}
+                aria-label="Search this book"
+                aria-expanded={searchVisible}
+                aria-controls="reader-search"
+                title="Search this book"
+              >
+                <svg class="reader-toolbar-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <path
+                    fill="currentColor"
+                    d="m15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5ZM9.5 14A4.5 4.5 0 1 1 9.5 5a4.5 4.5 0 0 1 0 9Z"
+                  />
+                </svg>
+                <span class="reader-toolbar-label">Search</span>
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-[44px] min-w-[44px]"
+                type="button"
+                onclick={() => syncLatestLocation()}
+                aria-label="Sync latest reading position"
+                title="Sync latest reading position"
+                disabled={syncingLatest}
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  class:animate-spin={syncingLatest}
+                  class="reader-toolbar-icon reader-toolbar-icon-always"
+                >
+                  <path
+                    fill="currentColor"
+                    d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
+                  />
+                </svg>
+                <span class="reader-toolbar-label">Sync</span>
+              </button>
+            </div>
+            <p class="reader-toolbar-title">
+              {title}
+            </p>
           </div>
-          <p class="reader-toolbar-title">
-            {title}
-          </p>
-        </div>
-      </header>
+        </header>
+      {/if}
 
-      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || pendingSyncLocation}
+      {#if hasOpenReaderPanel()}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
-          onclick={() =>
-            pendingSyncLocation
-              ? closeSyncConfirmation()
-              : settingsVisible
-                ? closeSettings()
-                : tocVisible
-                  ? closeToc()
-                  : bookmarksVisible
-                    ? closeBookmarks()
-                    : annotationsVisible
-                      ? closeAnnotations()
-                      : closeSearch()}
+          onclick={() => closeActiveModal(false)}
         ></button>
+      {/if}
+
+      {#if pendingExternalLink}
+        <div
+          bind:this={externalLinkPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-w-md"
+          id="reader-external-link"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="reader-external-link-title"
+          aria-describedby="reader-external-link-url"
+          tabindex="-1"
+          onkeydown={(event) =>
+            trapModalKeydown(event, externalLinkPanel!, closeExternalLinkDialog)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <h2 id="reader-external-link-title" class="font-serif text-xl">
+            {pendingExternalLink.scheme === 'mailto:' ? 'External email link' : 'External link'}
+          </h2>
+          {#if pendingExternalLink.label && pendingExternalLink.label !== pendingExternalLink.href}
+            <p class="mt-2 text-sm text-surface-700-300">“{pendingExternalLink.label}”</p>
+          {/if}
+          <p
+            id="reader-external-link-url"
+            class="mt-3 rounded-lg preset-tonal-surface p-3 font-mono text-xs break-all"
+          >
+            {pendingExternalLink.href}
+          </p>
+          {#if externalLinkMessage}
+            <p class="mt-2 text-sm text-surface-700-300" role="status">{externalLinkMessage}</p>
+          {/if}
+          <div class="mt-5 flex flex-wrap justify-end gap-2">
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              onclick={() => void copyExternalLink()}
+            >
+              Copy link
+            </button>
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              onclick={closeExternalLinkDialog}
+            >
+              Cancel
+            </button>
+            <button
+              class="btn preset-filled-primary-700-300"
+              type="button"
+              onclick={launchExternalLink}
+            >
+              {pendingExternalLink.scheme === 'mailto:' ? 'Open email' : 'Open in browser'}
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      {#if activeFootnote}
+        <div
+          bind:this={footnotePanel}
+          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          id="reader-footnote"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-footnote-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, footnotePanel!, closeFootnoteDialog)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <button
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
+            type="button"
+            onclick={closeFootnoteDialog}
+            aria-label="Close footnote"
+            title="Close"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+              <path
+                fill="currentColor"
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+              />
+            </svg>
+          </button>
+          <h2 id="reader-footnote-title" class="pr-[52px] font-serif text-xl">
+            {activeFootnote.title}
+          </h2>
+          <div class="mt-3 grid gap-2 text-sm leading-relaxed">
+            {#each activeFootnote.paragraphs as paragraph, index (index)}
+              <p>{paragraph}</p>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#if activeFigure}
+        <div
+          bind:this={figurePanel}
+          class="reader-settings reader-figure-dialog card preset-filled-surface-50-950 relative flex flex-col gap-3"
+          id="reader-figure-viewer"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-figure-title"
+          tabindex="-1"
+          onkeydown={handleFigureKeydown}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 id="reader-figure-title" class="min-w-0 flex-1 truncate font-serif text-xl">
+              {activeFigure.alt || 'Figure viewer'}
+            </h2>
+            <div class="flex flex-wrap items-center gap-1" role="group" aria-label="Figure zoom">
+              <button
+                class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] px-2"
+                type="button"
+                aria-label="Zoom out"
+                disabled={figureZoom <= 1}
+                onclick={() => adjustFigureZoom(-0.5)}
+              >
+                −
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface min-h-[44px] px-3 tabular-nums"
+                type="button"
+                aria-label={`Reset zoom, currently ${Math.round(figureZoom * 100)}%`}
+                onclick={resetFigureTransform}
+              >
+                {Math.round(figureZoom * 100)}%
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] px-2"
+                type="button"
+                aria-label="Zoom in"
+                disabled={figureZoom >= 4}
+                onclick={() => adjustFigureZoom(0.5)}
+              >
+                +
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] p-0"
+                type="button"
+                onclick={closeFigureDialog}
+                aria-label="Close figure viewer"
+                title="Close"
+              >
+                <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                  <path
+                    fill="currentColor"
+                    d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+                  />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div
+            class="reader-figure-stage rounded-lg preset-tonal-surface"
+            class:is-zoomed={figureZoom > 1}
+            role="region"
+            aria-label="Zoomable figure canvas"
+            onpointerdown={handleFigurePointerDown}
+            onpointermove={handleFigurePointerMove}
+            onpointerup={handleFigurePointerUp}
+            onpointercancel={handleFigurePointerUp}
+            onwheel={handleFigureWheel}
+          >
+            <img
+              src={activeFigure.src}
+              alt={activeFigure.alt}
+              draggable="false"
+              style:transform={`translate3d(${figurePan.x}px, ${figurePan.y}px, 0) scale(${figureZoom})`}
+            />
+          </div>
+          {#if activeFigure.caption}
+            <p class="text-sm text-surface-700-300">{activeFigure.caption}</p>
+          {/if}
+        </div>
       {/if}
 
       {#if pendingSyncLocation}
@@ -1378,7 +1829,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
             type="button"
             onclick={closeSettings}
             aria-label="Close reading appearance"
@@ -1391,7 +1842,9 @@
               />
             </svg>
           </button>
-          <h2 id="reader-appearance-title" class="font-serif text-xl">Reading appearance</h2>
+          <h2 id="reader-appearance-title" class="pr-[52px] font-serif text-xl">
+            Reading appearance
+          </h2>
           <div class="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
               <button
@@ -1569,7 +2022,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
             type="button"
             onclick={closeToc}
             aria-label="Close table of contents"
@@ -1582,7 +2035,7 @@
               />
             </svg>
           </button>
-          <h2 id="reader-contents-title" class="font-serif text-xl">Contents</h2>
+          <h2 id="reader-contents-title" class="pr-[52px] font-serif text-xl">Contents</h2>
           {#snippet contentsList(items: TocItem[])}
             <ul class="mt-2 grid list-none gap-1 p-0">
               {#each items as item, index (`${item.href}-${index}`)}
@@ -1633,7 +2086,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
             type="button"
             onclick={closeSearch}
             aria-label="Close book search"
@@ -1646,9 +2099,9 @@
               />
             </svg>
           </button>
-          <h2 id="reader-search-title" class="font-serif text-xl">Search this book</h2>
+          <h2 id="reader-search-title" class="pr-[52px] font-serif text-xl">Search this book</h2>
           <form
-            class="mt-4 flex gap-2"
+            class="mt-4 flex flex-wrap gap-2"
             onsubmit={(event) => {
               event.preventDefault();
               void runSearch();
@@ -1657,7 +2110,7 @@
             <label class="sr-only" for="reader-search-query">Search this book</label>
             <input
               id="reader-search-query"
-              class="input min-w-0 flex-1"
+              class="input min-w-0 basis-40 flex-1"
               type="search"
               bind:value={searchQuery}
               placeholder="Find a word or phrase"
@@ -1714,7 +2167,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
             type="button"
             onclick={closeBookmarks}
             aria-label="Close bookmarks and history"
@@ -1727,7 +2180,9 @@
               />
             </svg>
           </button>
-          <h2 id="reader-bookmarks-title" class="font-serif text-xl">Bookmarks and history</h2>
+          <h2 id="reader-bookmarks-title" class="pr-[52px] font-serif text-xl">
+            Bookmarks and history
+          </h2>
           <p class="mt-2 text-sm text-surface-700-300">
             Saved on this device with EPUB locations. They are not sent to Kavita.
           </p>
@@ -1854,7 +2309,7 @@
           transition:fly={{ y: 12, duration: 150 }}
         >
           <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
             type="button"
             onclick={closeAnnotations}
             aria-label="Close highlights and notes"
@@ -1867,7 +2322,9 @@
               />
             </svg>
           </button>
-          <h2 id="reader-annotations-title" class="font-serif text-xl">Highlights and notes</h2>
+          <h2 id="reader-annotations-title" class="pr-[52px] font-serif text-xl">
+            Highlights and notes
+          </h2>
           <p class="mt-2 text-sm text-surface-700-300">
             Saved on this device. Select text in the book to add a highlight and an optional note.
           </p>
@@ -1883,9 +2340,12 @@
               <p class="text-sm italic">“{selectedText.text}”</p>
               <label class="label mt-3">
                 <span class="label-text">Note (optional)</span>
-                <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+                <textarea
+                  class="textarea min-h-20"
+                  data-reader-focus="new-annotation-note"
+                  bind:value={annotationDraft}></textarea>
               </label>
-              <div class="mt-3 flex gap-2">
+              <div class="mt-3 flex flex-wrap gap-2">
                 <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
                   Save highlight
                 </button>
@@ -1901,6 +2361,28 @@
                 </button>
               </div>
             </form>
+          {:else if visiblePassages.length > 0}
+            <section class="mt-4" aria-labelledby="reader-visible-passages-title">
+              <h3
+                id="reader-visible-passages-title"
+                class="text-sm font-semibold uppercase tracking-wide"
+              >
+                Passages on this page
+              </h3>
+              <ul class="mt-2 grid max-h-40 list-none gap-1 overflow-auto p-0">
+                {#each visiblePassages as passage (passage.cfi)}
+                  <li>
+                    <button
+                      class="btn w-full justify-start text-left text-sm"
+                      type="button"
+                      onclick={() => selectVisiblePassage(passage)}
+                    >
+                      <span class="line-clamp-2">{passage.text}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            </section>
           {/if}
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
@@ -1940,7 +2422,11 @@
           {:else}
             <div class="mt-2 grid gap-2">
               {#each annotations as annotation (annotation.id)}
-                <article class="rounded-lg preset-tonal-surface p-3">
+                <article
+                  class="rounded-lg preset-tonal-surface p-3"
+                  class:active-mode={activeAnnotationId === annotation.id}
+                  data-annotation-card={annotation.id}
+                >
                   <button
                     class="w-full text-left text-sm italic"
                     type="button"
@@ -2053,7 +2539,7 @@
     overflow: hidden;
     background: var(--reader-background);
     color: var(--reader-text);
-    touch-action: pan-y;
+    touch-action: manipulation;
     user-select: none;
     --reader-background: var(--color-surface-50);
     --reader-text: var(--color-surface-950);
@@ -2094,6 +2580,13 @@
     border: 0 !important;
   }
 
+  .reader-viewport :global(.turnleaf-highlight-target:focus-visible) {
+    outline: 3px solid
+      light-dark(var(--color-primary-700, currentColor), var(--color-primary-300, currentColor));
+    outline-offset: 2px;
+    background: color-mix(in oklab, #facc15 24%, transparent);
+  }
+
   .reader-shell[data-mode='dark'] {
     --reader-background: var(--color-surface-950);
     --reader-text: var(--color-surface-50);
@@ -2130,7 +2623,7 @@
     top: 0;
     left: 0;
     right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    height: max(48px, calc(env(safe-area-inset-top) + 36px));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2142,7 +2635,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: max(36px, calc(env(safe-area-inset-bottom) + 24px));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2167,7 +2660,7 @@
   .reader-settings :global(button),
   .reader-settings :global(input),
   .reader-settings :global(select) {
-    min-height: 2.75rem;
+    min-height: 44px;
   }
 
   .reader-settings :global(input[type='range']) {
@@ -2180,8 +2673,8 @@
     right: 0;
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    padding-inline: max(1rem, env(safe-area-inset-left));
+    gap: 8px;
+    padding-inline: max(8px, env(safe-area-inset-left));
     color: var(--reader-bar-text);
   }
 
@@ -2202,13 +2695,14 @@
     display: grid;
     min-width: 0;
     flex: 1 1 auto;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(44px, 1fr));
     gap: 0.5rem;
   }
 
   .reader-toolbar-actions :global(button) {
-    min-width: 2.75rem;
-    min-height: 2.75rem;
+    min-width: 44px;
+    min-height: 44px;
+    padding-inline: 0.375rem;
     overflow: hidden;
   }
 
@@ -2250,6 +2744,7 @@
 
     .reader-toolbar-actions {
       width: 100%;
+      grid-template-columns: repeat(auto-fit, minmax(44px, 1fr));
       gap: 0.25rem;
     }
 
@@ -2264,12 +2759,6 @@
 
     .reader-toolbar-title {
       display: none;
-    }
-  }
-
-  @media (max-width: 22.5rem) {
-    .reader-toolbar-actions {
-      grid-template-columns: repeat(4, minmax(2.75rem, 1fr));
     }
   }
 
@@ -2314,15 +2803,49 @@
 
   .reader-settings {
     position: absolute;
-    left: 1rem;
-    right: 1rem;
-    bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    left: max(8px, env(safe-area-inset-left));
+    right: max(8px, env(safe-area-inset-right));
+    bottom: max(52px, calc(env(safe-area-inset-bottom) + 44px));
     margin-inline: auto;
-    max-width: 30rem;
-    max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    max-width: min(30rem, calc(100vw - 16px));
+    max-height: min(78dvh, calc(100dvh - max(52px, env(safe-area-inset-bottom) + 44px) - 12px));
     overflow: auto;
-    padding: 1.25rem;
+    padding: clamp(12px, 4vw, 20px);
     z-index: 1;
+  }
+
+  .reader-figure-dialog {
+    max-width: min(44rem, calc(100vw - 16px));
+  }
+
+  .reader-figure-stage {
+    position: relative;
+    display: grid;
+    place-items: center;
+    min-height: 160px;
+    max-height: 55dvh;
+    overflow: hidden;
+    padding: 8px;
+    touch-action: none;
+  }
+
+  .reader-figure-stage.is-zoomed {
+    cursor: grab;
+    touch-action: none;
+  }
+
+  .reader-figure-stage.is-zoomed:active {
+    cursor: grabbing;
+  }
+
+  .reader-figure-stage img {
+    max-width: 100%;
+    max-height: 50dvh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    transform-origin: center center;
+    user-select: none;
   }
 
   .reader-panel-backdrop {
