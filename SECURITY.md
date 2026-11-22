@@ -6,8 +6,8 @@
 - EPUBs and SQLite live in app-private storage.
 - Android backup and device-transfer extraction are disabled for app data so downloaded books, cached covers, and local reading state are not copied into Android cloud backup.
 - The Android `FileProvider` is not exported and is limited to a private cache subdirectory.
-- The application CSP disallows inline scripts, objects, forms, and arbitrary script origins.
-- EPUB rendition iframes omit `allow-scripts`; content hooks remove scripts, nested frames, objects, embeds, and forms and block external link activation.
+- The application CSP disallows inline scripts, objects, forms, arbitrary script origins, and remote HTTP/HTTPS image sources.
+- EPUB rendition iframes omit `allow-scripts`; spine hooks sanitize chapter markup, subresource attributes, inline styles, and packaged stylesheets and inject a local-only chapter CSP before iframe serialization, with rendition content hooks kept as defense in depth and external link activation blocked.
 - `allow-same-origin` is required for semantic range/CFI access. With scripts disabled, book content cannot execute code through that origin.
 - External navigation must pass an explicit `http:`/`https:` validator and user action before a system browser is added.
 - Kavita HTML descriptions must be passed through DOMPurify before rendering. No component currently renders server HTML.
