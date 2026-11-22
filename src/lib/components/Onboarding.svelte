@@ -263,7 +263,7 @@
           <span class="label-text">
             Library name <span class="text-surface-600-400">Optional</span></span
           >
-          <input class="input" autocomplete="organization" bind:value={displayName} />
+          <input class="input" autocomplete="off" bind:value={displayName} />
         </label>
       {/if}
 
