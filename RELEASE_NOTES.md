@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Keep server config when download cleanup fails
-- Use raw catalog state and batched cleanup
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
