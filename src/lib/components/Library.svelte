@@ -59,7 +59,14 @@
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusFirstElement,
+    focusModal,
+    restoreFocus,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   let {
     server,
@@ -71,6 +78,7 @@
     onApiKeyChange,
     onServerChange,
     onServerDeleted,
+    onReaderOpenChange,
     registerBackHandler,
   }: {
     server: ServerConfig;
@@ -82,6 +90,7 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerChange: (server: ServerConfig, apiKey: string) => void;
     onServerDeleted: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
     registerBackHandler?: ((handler: () => boolean) => () => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
@@ -359,18 +368,6 @@
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
-  }
-
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' &&
-      document.activeElement instanceof HTMLElement &&
-      document.activeElement !== document.body
-      ? document.activeElement
-      : null;
-  }
-
-  function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
   }
 
   function insecureServer(): boolean {
@@ -704,6 +701,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1270,8 +1268,7 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    const readingState = await getReadingState(book.id);
-    await markBookCompleted(book, readingState);
+    await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1343,7 +1340,7 @@
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1393,7 +1390,8 @@
   }
 
   function openSettings(): void {
-    settingsOpener = activeElement() ?? settingsTriggerButton;
+    const active = activeElement();
+    settingsOpener = active && active !== document.body ? active : settingsTriggerButton;
     settingsVisible = true;
     void Promise.allSettled(skeletonThemes.map(loadTheme));
     focusModal(() => settingsDialog);
@@ -1410,7 +1408,7 @@
     showReplacementKey = false;
     const opener = settingsOpener ?? settingsTriggerButton;
     settingsOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   function openServerAddressEdit(): void {
@@ -1737,6 +1735,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
