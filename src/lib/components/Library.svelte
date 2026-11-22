@@ -201,8 +201,13 @@
   let refreshWork: Promise<void> | null = null;
   let refreshController: AbortController | null = null;
   let downloadingBookId = $state<string | null>(null);
+  let downloadingBookTitle = $state('');
   let downloadPercent = $state<number | null>(null);
+  let downloadController: AbortController | null = null;
+  let activeDownloadBook: BookRecord | null = null;
+  let activeDownloadToken = 0;
   let cleanupInProgress = $state(false);
+  let downloadFailureMessage = $state('');
   let downloadFailureBook = $state<BookRecord | null>(null);
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
@@ -358,6 +363,63 @@
 
   function isMissingNativeFile(error: unknown): boolean {
     return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
+  }
+
+  function isAbortError(error: unknown): boolean {
+    return (error as { name?: unknown } | null)?.name === 'AbortError';
+  }
+
+  function clearDownloadFailure(): void {
+    downloadFailureMessage = '';
+    downloadFailureBook = null;
+    failedDownloadCleanupPath = null;
+    downloadNeedsRefresh = false;
+  }
+
+  function setDownloadFailure(
+    alertMessage: string,
+    book: BookRecord | null,
+    options: { cleanupPath?: string | null; needsRefresh?: boolean } = {},
+  ): void {
+    downloadFailureMessage = alertMessage;
+    downloadFailureBook = book;
+    failedDownloadCleanupPath = options.cleanupPath ?? null;
+    downloadNeedsRefresh = options.needsRefresh ?? false;
+  }
+
+  function cancelActiveDownload(reason: 'user' | 'disconnect' | 'exit'): void {
+    const controller = downloadController;
+    const interruptedBook = activeDownloadBook;
+    if (!controller && !downloadingBookId) return;
+
+    activeDownloadToken += 1;
+    downloadController = null;
+    activeDownloadBook = null;
+    downloadingBookId = null;
+    downloadingBookTitle = '';
+    downloadPercent = null;
+    controller?.abort();
+
+    if (reason === 'user') {
+      message = interruptedBook
+        ? `Cancelled download for ${interruptedBook.title}.`
+        : 'Download cancelled.';
+      return;
+    }
+
+    if (interruptedBook) {
+      setDownloadFailure(
+        reason === 'disconnect'
+          ? `Connection lost while downloading ${interruptedBook.title}. Retry when Kavita is available.`
+          : `Download of ${interruptedBook.title} was interrupted. Retry download when ready.`,
+        interruptedBook,
+      );
+    }
+  }
+
+  function enterReader(next: NonNullable<typeof reading>): void {
+    if (downloadingBookId) cancelActiveDownload('exit');
+    reading = next;
   }
 
   function columnsForWidth(width: number): number {
@@ -540,6 +602,7 @@
           if (!connected) {
             refreshController?.abort();
             openProgressProbe?.abort();
+            cancelActiveDownload('disconnect');
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -649,6 +712,7 @@
   }
 
   onDestroy(() => {
+    cancelActiveDownload('exit');
     destroyed = true;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
@@ -711,15 +775,25 @@
       books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);
       coverReloadRequest += 1;
-      if (downloadNeedsRefresh && downloadFailureBook) {
+      if (downloadFailureBook) {
         const refreshedFailure = books.find((item) => item.id === downloadFailureBook?.id) ?? null;
-        downloadNeedsRefresh = false;
-        if (refreshedFailure?.downloadPath) {
-          downloadFailureBook = null;
-          message = `${refreshedFailure.title} is ready offline.`;
+        const stillDisplayable =
+          refreshedFailure !== null &&
+          (refreshedFailure.remoteAvailable !== false || Boolean(refreshedFailure.downloadPath));
+        if (!stillDisplayable) {
+          clearDownloadFailure();
+        } else if (refreshedFailure.downloadPath) {
+          const neededRefresh = downloadNeedsRefresh;
+          clearDownloadFailure();
+          if (neededRefresh) {
+            message = `${refreshedFailure.title} is ready offline.`;
+          }
         } else {
-          if (refreshedFailure) downloadFailureBook = refreshedFailure;
-          message = 'Library state refreshed. You can retry the download.';
+          downloadFailureBook = refreshedFailure;
+          if (downloadNeedsRefresh) {
+            downloadNeedsRefresh = false;
+            downloadFailureMessage = 'Library state refreshed. You can retry the download.';
+          }
         }
       }
       kavitaUnreachable = false;
@@ -837,12 +911,33 @@
       message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
+    if (book.remoteAvailable === false) {
+      setDownloadFailure('This book is no longer available from Kavita.', null);
+      return null;
+    }
+    if (!(await networkAvailable())) {
+      if (!destroyed) {
+        setDownloadFailure('No network connection. Connect to Kavita to download this book.', book);
+      }
+      return null;
+    }
+    if (destroyed) return null;
+    if (downloadingBookId || cleanupInProgress) {
+      message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
+      return null;
+    }
+
+    const controller = new AbortController();
+    activeDownloadToken += 1;
+    const token = activeDownloadToken;
+    downloadController = controller;
+    activeDownloadBook = book;
     downloadingBookId = book.id;
+    downloadingBookTitle = book.title;
     downloadPercent = null;
-    downloadFailureBook = null;
-    failedDownloadCleanupPath = null;
-    downloadNeedsRefresh = false;
-    message = `Downloading ${book.title}...`;
+    if (downloadFailureBook?.id === book.id) {
+      clearDownloadFailure();
+    }
     let downloadedPath: string | null = null;
     try {
       const file = await downloadEpub(
@@ -850,9 +945,16 @@
         apiKey,
         book.id.replaceAll(':', '-'),
         (percent) => {
-          if (downloadingBookId === book.id) downloadPercent = percent;
+          if (activeDownloadToken === token && downloadingBookId === book.id) {
+            downloadPercent = percent;
+          }
         },
+        controller.signal,
       );
+      if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
+        await deleteDownloadedEpub(file.relativePath).catch(() => {});
+        return null;
+      }
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
       downloadedPath = null;
@@ -863,12 +965,26 @@
         fileSize: file.size,
       };
       books = books.map((item) => (item.id === book.id ? refreshed : item));
+      if (downloadFailureBook?.id === book.id) {
+        clearDownloadFailure();
+      }
       message = `${book.title} is ready offline.`;
       return refreshed;
     } catch (error) {
+      if (isAbortError(error) || controller.signal.aborted || activeDownloadToken !== token) {
+        if (downloadedPath) {
+          await deleteDownloadedEpub(downloadedPath).catch(() => {});
+        }
+        if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
+        return null;
+      }
       let detail = 'download-storage';
       let status: number | undefined;
       let cleanupFailed = false;
+      let cleanupPath: string | null = null;
+      let needsRefresh = false;
+      let failureText: string;
+      let alreadyRecorded = false;
       if (downloadedPath) {
         const savedBooks = await getBooks(server.id, { includeDescription: false }).catch(
           () => null,
@@ -878,6 +994,9 @@
           null;
         if (persistedBook && savedBooks) {
           books = savedBooks;
+          if (downloadFailureBook?.id === book.id) {
+            clearDownloadFailure();
+          }
           message = `${book.title} is ready offline.`;
           return persistedBook;
         }
@@ -887,49 +1006,72 @@
             downloadedPath = null;
           } catch {
             cleanupFailed = true;
-            failedDownloadCleanupPath = downloadedPath;
+            cleanupPath = downloadedPath;
           }
         } else {
-          downloadNeedsRefresh = true;
+          needsRefresh = true;
         }
       }
 
       if (error instanceof EpubTransferError) {
         status = error.status;
-        detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
+        detail = error.timedOut
+          ? 'download-timeout'
+          : error.connectionFailed
+            ? 'download-connection'
+            : 'download-transfer';
+        alreadyRecorded = error.timedOut;
         if (status === 401) {
-          message = 'Kavita rejected authentication for this download. Check your API key.';
+          failureText = 'Kavita rejected authentication for this download. Check your API key.';
         } else if (status === 403) {
-          message = 'Kavita denied the download. Check your account’s download permissions.';
+          failureText = 'Kavita denied the download. Check your account’s download permissions.';
         } else if (status !== undefined) {
-          message = `Kavita returned HTTP ${status} during the download.`;
+          failureText = `Kavita returned HTTP ${status} during the download.`;
+        } else if (error.timedOut) {
+          failureText = 'The book download timed out before Kavita finished responding.';
         } else if (error.connectionFailed) {
-          message = 'Turnleaf could not connect to Kavita to download this book.';
+          failureText = 'Turnleaf could not connect to Kavita to download this book.';
         } else {
-          message = 'The file transfer failed.';
+          failureText = 'The file transfer failed.';
         }
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
-        message = error.message;
+        failureText = error.message;
       } else {
-        message = 'Turnleaf could not save the book on this device.';
+        failureText = 'Turnleaf could not save the book on this device.';
       }
       if (cleanupFailed) {
         detail = 'download-storage-cleanup';
-        message = 'Turnleaf could not save the book or remove its local file. Retry cleanup.';
-      } else if (downloadNeedsRefresh) {
+        alreadyRecorded = false;
+        failureText = 'Turnleaf could not save the book or remove its local file. Retry cleanup.';
+      } else if (needsRefresh) {
         detail = 'download-status-unconfirmed';
-        message =
+        alreadyRecorded = false;
+        failureText =
           'The download finished, but its saved status could not be checked. Refresh before retrying.';
       }
-      recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
+      if (!alreadyRecorded) {
+        recordDiagnostic({
+          category: 'download',
+          endpoint: EPUB_DOWNLOAD_ENDPOINT,
+          status,
+          detail,
+        });
+      }
       if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
-      message += ' Open Settings to copy diagnostics.';
-      downloadFailureBook = book;
+      setDownloadFailure(`${failureText} Open Settings to copy diagnostics.`, book, {
+        cleanupPath,
+        needsRefresh,
+      });
       return null;
     } finally {
-      downloadingBookId = null;
-      downloadPercent = null;
+      if (activeDownloadToken === token) {
+        downloadController = null;
+        activeDownloadBook = null;
+        downloadingBookId = null;
+        downloadingBookTitle = '';
+        downloadPercent = null;
+      }
     }
   }
 
@@ -937,13 +1079,14 @@
     const path = failedDownloadCleanupPath;
     if (!path || downloadingBookId || cleanupInProgress) return;
     cleanupInProgress = true;
-    message = 'Removing the leftover local file…';
+    downloadFailureMessage = 'Removing the leftover local file…';
     try {
       await deleteDownloadedEpub(path);
       failedDownloadCleanupPath = null;
-      message = 'The leftover local file was removed. You can retry the download.';
+      downloadFailureMessage = 'The leftover local file was removed. You can retry the download.';
     } catch {
-      message = 'Turnleaf still could not remove the local file. Try cleanup again later.';
+      downloadFailureMessage =
+        'Turnleaf still could not remove the local file. Try cleanup again later.';
     } finally {
       cleanupInProgress = false;
     }
@@ -982,6 +1125,9 @@
           }
         : item,
     );
+    if (downloadFailureBook?.id === book.id) {
+      clearDownloadFailure();
+    }
     return true;
   }
 
@@ -1058,10 +1204,28 @@
     if (destroyed) return;
     if (!file) {
       await removeDownload(book.id);
-      message = 'The downloaded file is missing. Download it again.';
       books = await getBooks(server.id, { includeDescription: false });
+      if (destroyed) return;
       const refreshed = books.find((item) => item.id === book.id) ?? null;
-      if (refreshed) await open(refreshed, options);
+      if (!refreshed || refreshed.remoteAvailable === false) {
+        setDownloadFailure(
+          'The downloaded file is missing and this book is no longer available from Kavita.',
+          null,
+        );
+        return;
+      }
+      if (!(await networkAvailable())) {
+        if (!destroyed) {
+          setDownloadFailure(
+            'The downloaded file is missing. Connect to Kavita to download it again.',
+            refreshed,
+          );
+        }
+        return;
+      }
+      if (destroyed) return;
+      message = 'The downloaded file is missing. Downloading it again…';
+      await open(refreshed, options);
       return;
     }
     const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
@@ -1081,23 +1245,23 @@
         resolvingOpenProgress = false;
       }
       if (destroyed) return;
-      reading = {
+      enterReader({
         book,
         url: file.webViewUrl,
         cfi: null,
         xpath: remote.bookScrollId ?? null,
         percentage: remotePercentage(remote, book),
-      };
+      });
       return;
     }
     if (openProgress === 'local') {
-      reading = {
+      enterReader({
         book,
         url: file.webViewUrl,
         cfi: local?.cfi || null,
         xpath: local?.xpath ?? null,
         percentage: local?.percentage ?? null,
-      };
+      });
       if (preferFurthest) void syncProgress(false);
       return;
     }
@@ -1105,7 +1269,7 @@
       openConflict({ book, url: file.webViewUrl, local, remote });
       return;
     }
-    reading = {
+    enterReader({
       book,
       url: file.webViewUrl,
       cfi: local?.cfi ?? null,
@@ -1116,7 +1280,7 @@
           : !local
             ? metadataPercentage(book)
             : null,
-    };
+    });
   }
 
   async function retryReaderDownload(): Promise<void> {
@@ -1234,6 +1398,7 @@
   }
 
   async function closeReader(): Promise<void> {
+    if (downloadingBookId) cancelActiveDownload('exit');
     const bookId = reading?.book.id;
     reading = null;
     await tick();
@@ -1321,13 +1486,13 @@
       books = books.map((book) =>
         book.id === current.book.id ? { ...book, pagesRead, lastReadAt } : book,
       );
-      reading = {
+      enterReader({
         book: current.book,
         url: current.url,
         cfi: null,
         xpath: current.remote.bookScrollId ?? null,
         percentage: remotePercentage(current.remote, current.book),
-      };
+      });
       dismissConflict();
       void refreshSyncStatus();
     } catch {
@@ -1606,7 +1771,10 @@
       Skip to library books
     </a>
     <p class="sr-only" role="status">
-      {offlineMessage || message || (refreshing ? 'Refreshing library' : '')}
+      {offlineMessage ||
+        (downloadingBookId ? `Downloading ${downloadingBookTitle}...` : '') ||
+        message ||
+        (refreshing ? 'Refreshing library' : '')}
       {#if !loading && !refreshing}
         {visibleBooks.length} of {displayableBooks.length} books.
       {/if}
@@ -1908,27 +2076,26 @@
         {#if openProgressProbe}
           <button
             type="button"
-            class="btn preset-tonal-primary"
+            class="btn btn-sm preset-tonal-primary h-11 min-h-[44px] min-w-[44px] px-3"
             onclick={() => openProgressProbe?.abort()}>Open offline</button
           >
         {/if}
       </div>
     {/if}
-    {#if message}
+    {#if downloadingBookId}
       <div
         class="alert preset-tonal-surface mt-4 flex flex-wrap items-center justify-between gap-3"
-        role={downloadFailureBook ? 'alert' : 'status'}
+        role="status"
+        data-banner="active-download"
         transition:fade
       >
-        <p class="min-w-0 flex-1">{message}</p>
-        {#if downloadingBookId}
-          {@const downloadingTitle =
-            books.find((book) => book.id === downloadingBookId)?.title ?? 'book'}
-          <div class="flex shrink-0 items-center gap-2">
+        <p class="min-w-0 flex-1">Downloading {downloadingBookTitle}...</p>
+        <div class="flex shrink-0 flex-wrap items-center gap-3">
+          <div class="flex items-center gap-2">
             <div
               class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
               role="progressbar"
-              aria-label={`Download progress for ${downloadingTitle}`}
+              aria-label={`Download progress for ${downloadingBookTitle}`}
               aria-valuemin="0"
               aria-valuemax="100"
               aria-valuenow={downloadPercent ?? undefined}
@@ -1946,34 +2113,71 @@
               {downloadPercent === null ? '…' : `${downloadPercent}%`}
             </span>
           </div>
-        {/if}
-        {#if downloadFailureBook}
-          {#if failedDownloadCleanupPath}
-            <button
-              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
-              type="button"
-              onclick={() => void retryDownloadCleanup()}
-              disabled={cleanupInProgress}
-              >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
-            >
-          {:else if downloadNeedsRefresh}
-            <button
-              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
-              type="button"
-              onclick={() => void refresh()}
-              disabled={refreshing}>Refresh library</button
-            >
-          {:else}
-            <button
-              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
-              type="button"
-              onclick={() => void download(downloadFailureBook!)}
-              disabled={Boolean(downloadingBookId) ||
-                offline ||
-                downloadFailureBook.remoteAvailable === false}>Retry download</button
-            >
+          <button
+            class="btn btn-sm preset-tonal-error h-11 min-h-[44px] min-w-[44px] shrink-0 px-3"
+            type="button"
+            onclick={() => cancelActiveDownload('user')}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if downloadFailureMessage}
+      <div
+        class="alert preset-tonal-error mt-4 flex flex-wrap items-center justify-between gap-3"
+        role="alert"
+        data-banner="download-failure"
+        transition:fade
+      >
+        <p class="min-w-0 flex-1">{downloadFailureMessage}</p>
+        <div class="flex shrink-0 flex-wrap items-center gap-2">
+          {#if downloadFailureBook}
+            {#if failedDownloadCleanupPath}
+              <button
+                class="btn btn-sm preset-tonal-surface h-11 min-h-[44px] min-w-[44px] shrink-0 px-3"
+                type="button"
+                onclick={() => void retryDownloadCleanup()}
+                disabled={cleanupInProgress}
+                >{cleanupInProgress ? 'Cleaning up…' : 'Retry cleanup'}</button
+              >
+            {:else if downloadNeedsRefresh}
+              <button
+                class="btn btn-sm preset-tonal-surface h-11 min-h-[44px] min-w-[44px] shrink-0 px-3"
+                type="button"
+                onclick={() => void refresh()}
+                disabled={refreshing}>Refresh library</button
+              >
+            {:else}
+              <button
+                class="btn btn-sm preset-tonal-surface h-11 min-h-[44px] min-w-[44px] shrink-0 px-3"
+                type="button"
+                onclick={() => void download(downloadFailureBook!)}
+                disabled={Boolean(downloadingBookId) ||
+                  offline ||
+                  downloadFailureBook.remoteAvailable === false}>Retry download</button
+              >
+            {/if}
           {/if}
-        {/if}
+          <button
+            class="btn btn-sm preset-tonal-surface h-11 min-h-[44px] min-w-[44px] shrink-0 px-3"
+            type="button"
+            onclick={clearDownloadFailure}
+            disabled={cleanupInProgress}
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+    {/if}
+    {#if message}
+      <div
+        class="alert preset-tonal-surface mt-4 flex flex-wrap items-center justify-between gap-3"
+        role="status"
+        data-banner="status-message"
+        transition:fade
+      >
+        <p class="min-w-0 flex-1">{message}</p>
       </div>
     {/if}
     {#if syncStatus.pendingCount > 0}
@@ -1992,7 +2196,7 @@
           {/if}
         </div>
         <button
-          class="btn btn-sm preset-tonal-warning h-10 shrink-0"
+          class="btn btn-sm preset-tonal-warning h-11 min-h-[44px] min-w-[44px] shrink-0 px-3"
           type="button"
           onclick={() => void syncProgress()}
           disabled={syncing || offline}
@@ -2388,6 +2592,7 @@
             class="btn preset-tonal-surface justify-start"
             type="button"
             disabled={Boolean(downloadingBookId) ||
+              cleanupInProgress ||
               offline ||
               actionMenuBook.remoteAvailable === false}
             onclick={() => {
@@ -2437,6 +2642,7 @@
           <button
             class="btn preset-outlined-error-500 justify-start"
             type="button"
+            disabled={Boolean(downloadingBookId) || cleanupInProgress}
             onclick={() => {
               const book = actionMenuBook;
               closeMenu();
@@ -2511,13 +2717,13 @@
           type="button"
           disabled={acceptingRemoteProgress}
           onclick={() => {
-            reading = {
+            enterReader({
               book: conflict!.book,
               url: conflict!.url,
               cfi: conflict!.local.cfi || null,
               xpath: conflict!.local.xpath,
               percentage: conflict!.local.percentage,
-            };
+            });
             closeConflict();
             void syncProgress(false);
           }}>Continue from this device</button

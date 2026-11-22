@@ -7,16 +7,85 @@ import { EpubValidationError, validateEpubArchive } from './epub-validation';
 const BOOK_DIRECTORY = 'books';
 const PARTIAL_SUFFIX = '.partial';
 export const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
+export const EPUB_CONNECT_TIMEOUT_MS = 10_000;
+export const EPUB_READ_TIMEOUT_MS = 10_000;
 const RETRYABLE_HTTP_STATUSES = new Set([408, 500, 502, 503, 504]);
 let interruptedDownloadCleanup: Promise<void> | undefined;
+let transferAttemptCounter = 0;
+const latestAttemptByBook = new Map<string, number>();
 
 export class EpubTransferError extends Error {
   constructor(
     readonly status: number | undefined,
     readonly connectionFailed: boolean,
+    readonly timedOut = false,
   ) {
     super('The EPUB transfer failed.');
   }
+}
+
+function createAbortError(): DOMException {
+  return new DOMException('Aborted', 'AbortError');
+}
+
+function isAbortError(error: unknown): boolean {
+  return (error as { name?: unknown } | null)?.name === 'AbortError';
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw createAbortError();
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(createAbortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      reject(createAbortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(createAbortError());
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createAbortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function isTimeoutFailure(
+  failure: {
+    code?: unknown;
+    message?: unknown;
+    data?: { exception?: unknown };
+  } | null,
+): boolean {
+  const text = `${typeof failure?.message === 'string' ? failure.message : ''} ${
+    typeof failure?.data?.exception === 'string' ? failure.data.exception : ''
+  }`;
+  return /timed?\s*out|timeout/i.test(text);
 }
 
 function decodeNativeBytes(data: string | Blob): Uint8Array {
@@ -107,44 +176,99 @@ export async function downloadEpub(
   apiKey: string,
   bookId: string,
   onProgress?: (percent: number) => void,
+  signal?: AbortSignal,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
   assertSafeBookId(bookId);
 
-  await cleanupInterruptedEpubDownloads();
-  await ensureDataDirectory(BOOK_DIRECTORY);
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
-  const temporaryPath = `${finalPath}${PARTIAL_SUFFIX}`;
-  const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
-  const listener = onProgress
-    ? await FileTransfer.addListener('progress', (event) => {
-        if (
-          event.type === 'download' &&
-          event.url === downloadUrl &&
-          event.lengthComputable &&
-          event.contentLength > 0 &&
-          Number.isFinite(event.bytes)
-        ) {
-          onProgress(
-            Math.max(0, Math.min(100, Math.floor((event.bytes / event.contentLength) * 100))),
-          );
-        }
-      }).catch(() => null)
-    : null;
+  let temporaryPath: string | null = null;
+  let activeAttemptId = 0;
+  let listener: { remove: () => Promise<void> } | null = null;
 
   try {
+    throwIfAborted(signal);
+    await raceWithAbort(cleanupInterruptedEpubDownloads(), signal);
+    await raceWithAbort(ensureDataDirectory(BOOK_DIRECTORY), signal);
+    throwIfAborted(signal);
+
+    listener =
+      onProgress && typeof FileTransfer.addListener === 'function'
+        ? await raceWithAbort(
+            FileTransfer.addListener('progress', (event) => {
+              if (
+                !signal?.aborted &&
+                latestAttemptByBook.get(bookId) === activeAttemptId &&
+                event.type === 'download' &&
+                event.url === downloadUrl &&
+                event.lengthComputable &&
+                event.contentLength > 0 &&
+                Number.isFinite(event.bytes)
+              ) {
+                onProgress(
+                  Math.max(0, Math.min(100, Math.floor((event.bytes / event.contentLength) * 100))),
+                );
+              }
+            }).catch(() => null),
+            signal,
+          )
+        : null;
+
     for (let attempt = 0; ; attempt += 1) {
+      throwIfAborted(signal);
+      transferAttemptCounter += 1;
+      const attemptId = transferAttemptCounter;
+      activeAttemptId = attemptId;
+      latestAttemptByBook.set(bookId, attemptId);
+      const attemptPath = `${BOOK_DIRECTORY}/${bookId}.${Date.now().toString(36)}-${attemptId}.epub${PARTIAL_SUFFIX}`;
+      temporaryPath = attemptPath;
+
       try {
-        await FileTransfer.downloadFile({
+        const destination = await raceWithAbort(
+          Filesystem.getUri({ path: attemptPath, directory: Directory.Data }),
+          signal,
+        );
+        let attemptAbandoned = false;
+        let transferSettled = false;
+        const transfer = FileTransfer.downloadFile({
           url: downloadUrl,
           path: destination.uri,
           headers: { 'x-api-key': apiKey },
+          connectTimeout: EPUB_CONNECT_TIMEOUT_MS,
+          readTimeout: EPUB_READ_TIMEOUT_MS,
           ...(listener ? { progress: true } : {}),
         });
+        void transfer
+          .finally(() => {
+            transferSettled = true;
+            if (attemptAbandoned) {
+              return Filesystem.deleteFile({ path: attemptPath, directory: Directory.Data }).catch(
+                () => {},
+              );
+            }
+          })
+          .catch(() => {});
+
+        try {
+          await raceWithAbort(transfer, signal);
+        } catch (transferError) {
+          if (isAbortError(transferError) || signal?.aborted) {
+            if (!transferSettled) attemptAbandoned = true;
+            throw createAbortError();
+          }
+          throw transferError;
+        }
         break;
       } catch (error) {
-        const failure = error as { code?: unknown; data?: { httpStatus?: unknown } } | null;
+        if (isAbortError(error) || signal?.aborted) {
+          throw createAbortError();
+        }
+        const failure = error as {
+          code?: unknown;
+          message?: unknown;
+          data?: { httpStatus?: unknown; exception?: unknown };
+        } | null;
         const httpStatus = failure?.data?.httpStatus;
         const status =
           typeof httpStatus === 'number' &&
@@ -153,51 +277,92 @@ export async function downloadEpub(
           httpStatus <= 599
             ? httpStatus
             : undefined;
+        const timedOut = status === undefined && isTimeoutFailure(failure);
         const connectionFailed = failure?.code === 'OS-PLUG-FLTR-0008';
         const retryable =
-          status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
-        if (attempt > 0 || !retryable) throw new EpubTransferError(status, connectionFailed);
+          status === undefined ? connectionFailed || timedOut : RETRYABLE_HTTP_STATUSES.has(status);
+        if (attempt > 0 || !retryable) {
+          if (timedOut) {
+            recordDiagnostic({
+              category: 'download',
+              endpoint: EPUB_DOWNLOAD_ENDPOINT,
+              detail: 'download-timeout',
+            });
+          }
+          throw new EpubTransferError(status, connectionFailed, timedOut);
+        }
 
-        await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
+        await Filesystem.deleteFile({ path: attemptPath, directory: Directory.Data }).catch(
           () => {},
         );
+        temporaryPath = null;
         recordDiagnostic({
           category: 'download',
           endpoint: EPUB_DOWNLOAD_ENDPOINT,
           status,
           detail: 'download-retry',
         });
-        await new Promise((resolve) => setTimeout(resolve, 750));
+        await delayWithAbort(750, signal);
       }
     }
-    const stat = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
+
+    if (!temporaryPath) throw createAbortError();
+    const verifiedPath = temporaryPath;
+    throwIfAborted(signal);
+    const stat = await raceWithAbort(
+      Filesystem.stat({ path: verifiedPath, directory: Directory.Data }),
+      signal,
+    );
     if (stat.type !== 'file') throw new EpubValidationError('Kavita did not return an EPUB file.');
     const readRange = (offset: number, length: number) =>
-      readNativeRange(temporaryPath, offset, length);
-    const repaired = await validateEpubArchive(stat.size, readRange, true);
+      readNativeRange(verifiedPath, offset, length);
+    const repaired = await raceWithAbort(validateEpubArchive(stat.size, readRange, true), signal);
     if (repaired) {
+      throwIfAborted(signal);
       let binary = '';
       for (let offset = 0; offset < repaired.length; offset += 8192) {
         binary += String.fromCharCode(...repaired.subarray(offset, offset + 8192));
       }
-      await Filesystem.writeFile({
-        path: temporaryPath,
-        directory: Directory.Data,
-        data: btoa(binary),
-      });
-      const written = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
+      await raceWithAbort(
+        Filesystem.writeFile({
+          path: verifiedPath,
+          directory: Directory.Data,
+          data: btoa(binary),
+        }),
+        signal,
+      );
+      const written = await raceWithAbort(
+        Filesystem.stat({ path: verifiedPath, directory: Directory.Data }),
+        signal,
+      );
       if (written.type !== 'file' || written.size !== repaired.length) {
         throw new Error('The repaired EPUB could not be saved.');
       }
-      await validateEpubArchive(written.size, readRange);
+      await raceWithAbort(validateEpubArchive(written.size, readRange), signal);
     }
-    const final = await Filesystem.getUri({ path: finalPath, directory: Directory.Data });
+    if (signal?.aborted || latestAttemptByBook.get(bookId) !== activeAttemptId) {
+      throw createAbortError();
+    }
+    const final = await raceWithAbort(
+      Filesystem.getUri({ path: finalPath, directory: Directory.Data }),
+      signal,
+    );
+    if (signal?.aborted || latestAttemptByBook.get(bookId) !== activeAttemptId) {
+      throw createAbortError();
+    }
     const webViewUrl = Capacitor.convertFileSrc(final.uri);
     await Filesystem.rename({
-      from: temporaryPath,
+      from: verifiedPath,
       to: finalPath,
       directory: Directory.Data,
     });
+    temporaryPath = null;
+    if (signal?.aborted) {
+      if (latestAttemptByBook.get(bookId) === activeAttemptId) {
+        await Filesystem.deleteFile({ path: finalPath, directory: Directory.Data }).catch(() => {});
+      }
+      throw createAbortError();
+    }
     return {
       relativePath: finalPath,
       nativeUri: final.uri,
@@ -205,9 +370,23 @@ export async function downloadEpub(
       size: repaired?.length ?? stat.size,
     };
   } catch (error) {
-    await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
+    if (temporaryPath) {
+      await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
+        () => {},
+      );
+    }
+    if (isAbortError(error)) {
+      recordDiagnostic({
+        category: 'download',
+        endpoint: EPUB_DOWNLOAD_ENDPOINT,
+        detail: 'download-cancelled',
+      });
+    }
     throw error;
   } finally {
+    if (latestAttemptByBook.get(bookId) === activeAttemptId) {
+      latestAttemptByBook.delete(bookId);
+    }
     await listener?.remove().catch(() => {});
   }
 }

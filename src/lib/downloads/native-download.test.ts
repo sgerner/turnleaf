@@ -37,7 +37,13 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
-import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
+import {
+  cacheCover,
+  downloadEpub,
+  EPUB_CONNECT_TIMEOUT_MS,
+  EPUB_READ_TIMEOUT_MS,
+  verifyDownloadedEpub,
+} from './native-download';
 
 function encoded(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
@@ -100,7 +106,9 @@ describe('native EPUB download boundary', () => {
     vi.mocked(FileTransfer.downloadFile)
       .mockRejectedValueOnce(error)
       .mockImplementationOnce(async () => {
-        expect(native.deleted).toEqual(['books/server-book.epub.partial']);
+        expect(native.deleted).toEqual([
+          expect.stringMatching(/^books\/server-book\.[a-z0-9-]+\.epub\.partial$/),
+        ]);
         native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
         return {};
       });
@@ -111,6 +119,15 @@ describe('native EPUB download boundary', () => {
     await Promise.all([result, vi.runAllTimersAsync()]);
 
     expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    for (const [options] of vi.mocked(FileTransfer.downloadFile).mock.calls) {
+      expect(options).toMatchObject({
+        connectTimeout: EPUB_CONNECT_TIMEOUT_MS,
+        readTimeout: EPUB_READ_TIMEOUT_MS,
+      });
+    }
+    expect(vi.mocked(FileTransfer.downloadFile).mock.calls[0]?.[0].path).not.toBe(
+      vi.mocked(FileTransfer.downloadFile).mock.calls[1]?.[0].path,
+    );
     expect(native.renamed).toBe(true);
     const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
     expect(log).toContain('endpoint=/api/Download/chapter');
@@ -144,8 +161,113 @@ describe('native EPUB download boundary', () => {
     ).rejects.toThrow(/EPUB|ZIP|container/i);
 
     expect(native.renamed).toBe(false);
-    expect(native.deleted).toContain('books/server-book.epub.partial');
+    expect(native.deleted).toEqual([
+      expect.stringMatching(/^books\/server-book\.[a-z0-9-]+\.epub\.partial$/),
+    ]);
     expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes explicit bounded timeouts and records redacted timeout diagnostics', async () => {
+    vi.useFakeTimers();
+    vi.mocked(FileTransfer.downloadFile).mockRejectedValue({
+      code: 'OS-PLUG-FLTR-0011',
+      message:
+        'The operation failed with an error - Read timed out at https://private.example/secret-book',
+      data: { exception: 'SocketTimeoutException: connect timed out' },
+    });
+
+    const result = expect(
+      downloadEpub(
+        'https://private.example/api/Download/chapter?chapterId=9&apiKey=secret-key',
+        'secret-key',
+        'secret-book-title',
+      ),
+    ).rejects.toMatchObject({ timedOut: true });
+    await Promise.all([result, vi.runAllTimersAsync()]);
+
+    expect(EPUB_CONNECT_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
+    expect(EPUB_READ_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(FileTransfer.downloadFile).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        connectTimeout: 10_000,
+        readTimeout: 10_000,
+      }),
+    );
+    const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(log).toContain('detail=download-timeout');
+    expect(log).not.toMatch(/private\.example|secret-key|secret-book/);
+  });
+
+  it('rejects immediately with AbortError when cancelled mid-transfer and isolates attempt files', async () => {
+    let resolveStalledTransfer: ((value: unknown) => void) | undefined;
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveStalledTransfer = resolve;
+        }) as never,
+    );
+
+    const controller = new AbortController();
+    const stalledPromise = downloadEpub(
+      'https://private.example/download',
+      'secret-api-key',
+      'Secret-Book',
+      undefined,
+      controller.signal,
+    );
+
+    await vi.waitFor(() => expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1));
+    const cancelledAttemptUri = vi.mocked(FileTransfer.downloadFile).mock.calls[0]?.[0].path;
+    controller.abort();
+
+    await expect(stalledPromise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(native.renamed).toBe(false);
+
+    // Start a fresh download before the stalled native transfer settles.
+    native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+    vi.mocked(FileTransfer.downloadFile).mockResolvedValueOnce({} as never);
+    await expect(
+      downloadEpub('https://private.example/download', 'secret-api-key', 'Secret-Book'),
+    ).resolves.toMatchObject({ relativePath: 'books/Secret-Book.epub' });
+
+    const secondAttemptUri = vi.mocked(FileTransfer.downloadFile).mock.calls[1]?.[0].path;
+    expect(secondAttemptUri).not.toBe(cancelledAttemptUri);
+
+    // When the stalled native transfer finally settles, only its isolated partial path is deleted.
+    resolveStalledTransfer?.({});
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(native.deleted).not.toContain('books/Secret-Book.epub');
+    expect(
+      native.deleted.filter((path) => `file://${path}` === cancelledAttemptUri).length,
+    ).toBeGreaterThanOrEqual(2);
+
+    const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(log).toContain('detail=download-cancelled');
+    expect(log).not.toMatch(/private\.example|secret-api-key|Secret-Book/i);
+  });
+
+  it('skips the retry delay and exits immediately when cancelled during backoff', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({ code: 'OS-PLUG-FLTR-0008' });
+
+    const pending = downloadEpub(
+      'https://books.example.com/download',
+      'secret',
+      'server-book',
+      undefined,
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1));
+    controller.abort();
+
+    // Rejects without advancing the 750 ms retry timer and without making a second attempt.
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.runAllTimersAsync();
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(native.renamed).toBe(false);
   });
 
   it('does not inspect or delete a path outside the private books directory', async () => {

@@ -4,7 +4,7 @@
 
 - SQLite database: Capacitor Community SQLite app-private database named `turnleaf`.
 - EPUB files: `Directory.Data/books/<book-id>.epub`.
-- Incomplete files: the same path with `.partial`; deleted on failure.
+- Incomplete files: isolated per-attempt `Directory.Data/books/<book-id>.<attempt>.epub.partial` paths; deleted on failure, cancellation, or next startup.
 - Credentials: Android Keystore-backed encrypted SharedPreferences or iOS Keychain, under the `turnleaf_` prefix.
 - Covers: server-scoped app-private cache under `Directory.Data/covers`; browser previews use revocable object URLs.
 

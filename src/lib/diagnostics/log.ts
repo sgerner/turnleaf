@@ -95,9 +95,13 @@ function sanitizeActualType(value: string | undefined): string | undefined {
 
 const ALLOWED = new Set([
   'authentication',
+  'download-cancelled',
   'download-connection',
   'download-retry',
+  'download-status-unconfirmed',
   'download-storage',
+  'download-storage-cleanup',
+  'download-timeout',
   'download-transfer',
   'download-validation',
   'invalid-field',

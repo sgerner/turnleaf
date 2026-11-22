@@ -92,6 +92,30 @@ describe('diagnostic log', () => {
     expect(getDiagnosticCount()).toBe(0);
   });
 
+  it('retains timed-out and cancelled download details while redacting sensitive context', () => {
+    recordDiagnostic({
+      category: 'download',
+      endpoint:
+        'https://private.example/kavita/api/Download/chapter?chapterId=42&apiKey=secret-key',
+      detail: 'download-timeout',
+      source: 'https://private.example/kavita',
+      bookTitle: 'Secret Book Title',
+    } as never);
+    recordDiagnostic({
+      category: 'download',
+      endpoint:
+        'https://private.example/kavita/api/Download/chapter?chapterId=42&apiKey=secret-key',
+      detail: 'download-cancelled',
+      apiKey: 'secret-key',
+      bookTitle: 'Secret Book Title',
+    } as never);
+
+    const text = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(text).toContain('download endpoint=/api/Download/chapter detail=download-timeout');
+    expect(text).toContain('download endpoint=/api/Download/chapter detail=download-cancelled');
+    expect(text).not.toMatch(/private\.example|secret-key|Secret Book Title|chapterId/);
+  });
+
   it('caps exported text even if unusually long routes and field paths are supplied', () => {
     for (let index = 0; index < 100; index += 1) {
       recordDiagnostic({
