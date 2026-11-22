@@ -20,6 +20,13 @@ describe('appearance serialization', () => {
     expect(parseAppearance('{"bottomMargin":-4}').bottomMargin).toBe(0);
   });
 
+  it('defaults publisher styles on while preserving an explicit opt-out', () => {
+    expect(defaultAppearance.publisherStyles).toBe(true);
+    expect(parseAppearance('{}').publisherStyles).toBe(true);
+    expect(parseAppearance('{"publisherStyles":null}').publisherStyles).toBe(true);
+    expect(parseAppearance('{"publisherStyles":false}').publisherStyles).toBe(false);
+  });
+
   it('defaults the progress bar on', () => {
     expect(parseAppearance('{}').progressBar).toBe(true);
     expect(parseAppearance('{"progressBar":false}').progressBar).toBe(false);

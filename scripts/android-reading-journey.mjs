@@ -178,6 +178,45 @@ const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).som
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
 
+const installCspMonitor = `(() => {
+  if (!window.__turnleafCspViolations) {
+    window.__turnleafCspViolations = [];
+    document.addEventListener('securitypolicyviolation', (event) => {
+      window.__turnleafCspViolations.push(\`\${event.effectiveDirective}:\${event.blockedURI}\`);
+    });
+  }
+  return true;
+})()`;
+
+const styledChapter = (number) => `(async () => {
+  if ((window.__turnleafCspViolations?.length ?? 0) > 0) {
+    throw new Error('CSP violations: ' + window.__turnleafCspViolations.join(', '));
+  }
+  for (const frame of document.querySelectorAll('iframe')) {
+    const doc = frame.contentDocument;
+    const win = frame.contentWindow;
+    const heading = doc?.querySelector('h1');
+    const lead = doc?.querySelector('p.lead');
+    if (!doc || !win || heading?.textContent !== 'Chapter ${number}' || !lead) continue;
+    const headingStyle = win.getComputedStyle(heading);
+    const leadStyle = win.getComputedStyle(lead);
+    if (
+      headingStyle.borderBottomWidth !== '2px' ||
+      leadStyle.borderLeftWidth !== '3px' ||
+      !headingStyle.fontFamily.includes('TurnleafSample')
+    ) {
+      return false;
+    }
+    await doc.fonts.ready;
+    await doc.fonts.load('16px TurnleafSample');
+    return Array.from(doc.fonts).some(
+      (face) =>
+        face.family.replace(/['"]/g, '') === 'TurnleafSample' && face.status === 'loaded',
+    );
+  }
+  return false;
+})()`;
+
 let receivedSignal;
 
 function throwIfInterrupted() {
@@ -217,6 +256,7 @@ async function run() {
     });
     throwIfInterrupted();
     web = await connectWebView();
+    await web.evaluate(installCspMonitor);
     await waitFor('onboarding', () => web.evaluate("!!document.querySelector('input[type=url]')"));
     await web.evaluate(`(() => {
       const fill = (selector, value) => {
@@ -231,6 +271,7 @@ async function run() {
     await web.evaluate(click('button[type=submit]'));
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
+    await waitFor('manifest stylesheet and embedded font', () => web.evaluate(styledChapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
@@ -246,6 +287,7 @@ async function run() {
     const uploadCount = fixture.uploads.length;
     await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
     await waitFor('second chapter', () => web.evaluate(chapter(2)));
+    await waitFor('styled second chapter offline', () => web.evaluate(styledChapter(2)));
     await waitFor('reader position in the second chapter', () =>
       web.evaluate(
         'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
@@ -275,8 +317,10 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
+    await web.evaluate(installCspMonitor);
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
+    await waitFor('offline styles restored after restart', () => web.evaluate(styledChapter(2)));
     if (fixture.offlineRequests.length > 0) {
       throw new Error(
         `Turnleaf sent authenticated requests offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
