@@ -48,7 +48,7 @@
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
-  import { flushProgress } from '../sync/sync';
+  import { cancelProgressFlush, flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
@@ -216,6 +216,9 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let syncController: AbortController | null = null;
+  let settlingSync = false;
+  let deferredSync: { showFeedback: boolean } | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
@@ -540,6 +543,8 @@
           if (!connected) {
             refreshController?.abort();
             openProgressProbe?.abort();
+            syncController?.abort();
+            cancelProgressFlush(server.id);
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -609,28 +614,60 @@
     }
   }
 
+  function replayDeferredSync(): void {
+    if (
+      !deferredSync ||
+      destroyed ||
+      syncWork ||
+      conflict ||
+      resolvingOpenProgress ||
+      acceptingRemoteProgress
+    ) {
+      return;
+    }
+    const { showFeedback } = deferredSync;
+    deferredSync = null;
+    void syncProgress(showFeedback);
+  }
+
   function syncProgress(showFeedback = true): Promise<void> {
+    if (destroyed) return Promise.resolve();
+    if (syncWork && (syncController?.signal.aborted || settlingSync)) {
+      return syncWork.then(() => syncProgress(showFeedback));
+    }
     if (syncWork) return syncWork;
-    if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+    if (conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+      deferredSync = { showFeedback: Boolean(deferredSync?.showFeedback || showFeedback) };
       return Promise.resolve();
     }
+    deferredSync = null;
     syncWork = runProgressSync(showFeedback).finally(() => {
       syncWork = null;
+      replayDeferredSync();
     });
     return syncWork;
   }
 
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    settlingSync = false;
+    const controller = new AbortController();
+    syncController = controller;
     try {
-      if (!(await networkAvailable())) {
-        if (showFeedback)
+      if (!(await networkAvailable()) || controller.signal.aborted) {
+        if (showFeedback && offline)
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client, server.id);
+      await flushProgress(client, server.id, controller.signal);
+      if (controller.signal.aborted || destroyed || offline) {
+        if (showFeedback && offline)
+          message = 'Offline. Reading progress will retry when Kavita is available.';
+        return;
+      }
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
+      if (controller.signal.aborted || destroyed) return;
       if (
         error instanceof AggregateError &&
         error.errors.some(
@@ -643,19 +680,25 @@
         message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
       }
     } finally {
+      settlingSync = true;
+      if (syncController === controller) syncController = null;
       await refreshSyncStatus();
+      settlingSync = false;
       syncing = false;
     }
   }
 
   onDestroy(() => {
     destroyed = true;
+    deferredSync = null;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', scheduleVirtualWindow);
     openProgressProbe?.abort();
     refreshController?.abort();
+    syncController?.abort();
+    cancelProgressFlush(server.id);
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -1025,98 +1068,103 @@
       return;
     }
     if (destroyed || reading || conflict || resolvingOpenProgress) return;
-    resolvingOpenProgress = true;
-    let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
-    let local: StoredReadingState | null = null;
-    let remote: KavitaProgress | null = null;
     try {
-      const fileCheck = verifyDownloadedEpub(book.downloadPath).then(
-        (verified) => ({ ok: true as const, verified }),
-        (error: unknown) => ({ ok: false as const, error }),
-      );
-      const [verification, progress] = await Promise.all([
-        fileCheck,
-        checkOpenProgress(book, options.preferFurthest),
-      ]);
-      if (!verification.ok) {
-        message =
-          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
-        return;
-      }
-      file = verification.verified;
-      if (file && !progress.ok) {
-        message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
-        return;
-      }
-      if (file && progress.ok) [local, remote] = [progress.local, progress.remote];
-    } catch {
-      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
-      return;
-    } finally {
-      resolvingOpenProgress = false;
-    }
-    if (destroyed) return;
-    if (!file) {
-      await removeDownload(book.id);
-      message = 'The downloaded file is missing. Download it again.';
-      books = await getBooks(server.id, { includeDescription: false });
-      const refreshed = books.find((item) => item.id === book.id) ?? null;
-      if (refreshed) await open(refreshed, options);
-      return;
-    }
-    const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
-    const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
-    if (openProgress === 'remote' && remote) {
       resolvingOpenProgress = true;
+      let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
+      let local: StoredReadingState | null = null;
+      let remote: KavitaProgress | null = null;
       try {
-        if (!(await saveRemoteProgress(book, remote, local))) {
-          message = 'The saved reading position changed. Open the book again.';
+        const fileCheck = verifyDownloadedEpub(book.downloadPath).then(
+          (verified) => ({ ok: true as const, verified }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        const [verification, progress] = await Promise.all([
+          fileCheck,
+          checkOpenProgress(book, options.preferFurthest),
+        ]);
+        if (!verification.ok) {
+          message =
+            'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
           return;
         }
-        updateRemoteBookProgress(book, remote);
+        file = verification.verified;
+        if (file && !progress.ok) {
+          message =
+            'Turnleaf could not load the saved reading position. Try opening the book again.';
+          return;
+        }
+        if (file && progress.ok) [local, remote] = [progress.local, progress.remote];
       } catch {
-        message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
+        message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
         return;
       } finally {
         resolvingOpenProgress = false;
       }
       if (destroyed) return;
+      if (!file) {
+        await removeDownload(book.id);
+        message = 'The downloaded file is missing. Download it again.';
+        books = await getBooks(server.id, { includeDescription: false });
+        const refreshed = books.find((item) => item.id === book.id) ?? null;
+        if (refreshed) await open(refreshed, options);
+        return;
+      }
+      const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
+      const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
+      if (openProgress === 'remote' && remote) {
+        resolvingOpenProgress = true;
+        try {
+          if (!(await saveRemoteProgress(book, remote, local))) {
+            message = 'The saved reading position changed. Open the book again.';
+            return;
+          }
+          updateRemoteBookProgress(book, remote);
+        } catch {
+          message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
+          return;
+        } finally {
+          resolvingOpenProgress = false;
+        }
+        if (destroyed) return;
+        reading = {
+          book,
+          url: file.webViewUrl,
+          cfi: null,
+          xpath: remote.bookScrollId ?? null,
+          percentage: remotePercentage(remote, book),
+        };
+        return;
+      }
+      if (openProgress === 'local') {
+        reading = {
+          book,
+          url: file.webViewUrl,
+          cfi: local?.cfi || null,
+          xpath: local?.xpath ?? null,
+          percentage: local?.percentage ?? null,
+        };
+        if (preferFurthest) void syncProgress(false);
+        return;
+      }
+      if (openProgress === 'conflict' && local && remote) {
+        openConflict({ book, url: file.webViewUrl, local, remote });
+        return;
+      }
       reading = {
         book,
         url: file.webViewUrl,
-        cfi: null,
-        xpath: remote.bookScrollId ?? null,
-        percentage: remotePercentage(remote, book),
+        cfi: local?.cfi ?? null,
+        xpath: local ? null : (remote?.bookScrollId ?? null),
+        percentage:
+          !local && remote
+            ? remotePercentage(remote, book)
+            : !local
+              ? metadataPercentage(book)
+              : null,
       };
-      return;
+    } finally {
+      replayDeferredSync();
     }
-    if (openProgress === 'local') {
-      reading = {
-        book,
-        url: file.webViewUrl,
-        cfi: local?.cfi || null,
-        xpath: local?.xpath ?? null,
-        percentage: local?.percentage ?? null,
-      };
-      if (preferFurthest) void syncProgress(false);
-      return;
-    }
-    if (openProgress === 'conflict' && local && remote) {
-      openConflict({ book, url: file.webViewUrl, local, remote });
-      return;
-    }
-    reading = {
-      book,
-      url: file.webViewUrl,
-      cfi: local?.cfi ?? null,
-      xpath: local ? null : (remote?.bookScrollId ?? null),
-      percentage:
-        !local && remote
-          ? remotePercentage(remote, book)
-          : !local
-            ? metadataPercentage(book)
-            : null,
-    };
   }
 
   async function retryReaderDownload(): Promise<void> {
@@ -1154,8 +1202,13 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
+    if (destroyed) return;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    syncTimer = window.setTimeout(() => {
+      syncTimer = null;
+      void syncProgress(false);
+    }, 2_500);
+    await refreshSyncStatus();
   }
 
   async function syncLatestForReader(
@@ -1202,6 +1255,7 @@
           void refreshSyncStatus();
         } finally {
           acceptingRemoteProgress = false;
+          replayDeferredSync();
         }
       },
     };
@@ -1223,6 +1277,7 @@
       savedBook.pagesRead = book.pages;
       savedBook.lastReadAt = new Date().toISOString();
     }
+    await refreshSyncStatus();
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
@@ -1289,6 +1344,7 @@
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
+    replayDeferredSync();
     void tick().then(() => restoreFocus(opener));
   }
 
@@ -1335,6 +1391,7 @@
         'Turnleaf could not confirm that choice. Reopen the book to check its saved position.';
     } finally {
       acceptingRemoteProgress = false;
+      replayDeferredSync();
     }
   }
 
@@ -1524,7 +1581,9 @@
       replacementApiKey = '';
       message = 'API key updated.';
       closeSettings();
-      // An upload started with the previous key may still be finishing.
+      // Abort any stalled upload started with the previous key before syncing again.
+      syncController?.abort();
+      cancelProgressFlush(server.id);
       await syncWork;
       await refresh();
       await syncProgress(false);

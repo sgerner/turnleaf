@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import * as database from '../database/database';
 import { saveLocalProgress } from '../database/database';
-import { flushProgress } from './sync';
+import { cancelProgressFlush, flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
 
@@ -73,6 +74,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -129,6 +131,7 @@ it('keeps and uploads a newer local relocation when an older upload completes', 
   expect(saveProgress).toHaveBeenNthCalledWith(
     2,
     expect.objectContaining({ pageNum: 20, bookScrollId: 'xpath-b' }),
+    expect.any(AbortSignal),
   );
   const acknowledged = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof first;
   expect(acknowledged.syncQueue['book-1']).toBeUndefined();
@@ -226,4 +229,194 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('aborts a stalled upload and syncs via the new client when the client instance changes', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T01:00:00.000Z', '{"pageNum":3}')),
+  );
+
+  let stalledSignal: AbortSignal | undefined;
+  let resolveStalledStarted!: () => void;
+  const stalledStarted = new Promise<void>((resolve) => {
+    resolveStalledStarted = resolve;
+  });
+  const oldSave = vi.fn((_progress: unknown, signal?: AbortSignal) => {
+    stalledSignal = signal;
+    resolveStalledStarted();
+    return new Promise<void>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+  const newSave = vi.fn().mockResolvedValue(undefined);
+
+  const staleFlush = flushProgress({ saveProgress: oldSave } as never, 'primary-test');
+  // Re-populate under primary-test serverId to mirror preserved primary server ID.
+  const state = pendingState('2026-09-07T01:00:00.000Z', '{"pageNum":3}');
+  state.books[0]!.serverId = 'primary-test';
+  state.syncQueue['book-1'].serverId = 'primary-test';
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  // Start stalled upload on oldClient, then replace with newClient on the same serverId.
+  await staleFlush;
+  const activeStale = flushProgress({ saveProgress: oldSave } as never, 'primary-test');
+  await stalledStarted;
+  expect(stalledSignal?.aborted).toBe(false);
+
+  const nextFlush = flushProgress({ saveProgress: newSave } as never, 'primary-test');
+  expect(stalledSignal?.aborted).toBe(true);
+
+  await Promise.all([activeStale, nextFlush]);
+
+  expect(newSave).toHaveBeenCalledOnce();
+  expect(newSave).toHaveBeenCalledWith(
+    expect.objectContaining({ pageNum: 3 }),
+    expect.any(AbortSignal),
+  );
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']).toBeUndefined();
+  expect(saved.readingState['book-1']?.pendingSync).toBe(false);
+});
+
+it('never increments retry counts on caller cancellation while recording timeouts', async () => {
+  const updatedAt = '2026-09-07T02:00:00.000Z';
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(pendingState(updatedAt, '{"pageNum":4}')));
+
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const cancellableSave = vi.fn((_progress: unknown, signal?: AbortSignal) => {
+    resolveStarted();
+    return new Promise<void>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+
+  const cancelledFlush = flushProgress({ saveProgress: cancellableSave } as never, 'server');
+  await started;
+  cancelProgressFlush('server');
+  await expect(cancelledFlush).resolves.toBeUndefined();
+
+  const afterCancel = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(afterCancel.syncQueue['book-1']).toMatchObject({
+    attemptCount: 0,
+    lastError: null,
+  });
+
+  const timedOutSave = vi.fn().mockRejectedValueOnce(new Error('Kavita did not respond in time.'));
+  await expect(flushProgress({ saveProgress: timedOutSave } as never, 'server')).rejects.toThrow(
+    '1 reading progress item failed to sync.',
+  );
+
+  const afterTimeout = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(afterTimeout.syncQueue['book-1']).toMatchObject({
+    attemptCount: 1,
+    lastError: 'Kavita did not respond in time.',
+  });
+});
+
+it('isolates SQLITE_BUSY during confirmSync and confirms locally on retry without duplicate uploads', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T03:00:00.000Z', '{"pageNum":5}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T03:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":6}',
+    createdAt: '2026-09-07T03:00:01.000Z',
+    updatedAt: '2026-09-07T03:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const realConfirm = database.confirmSync;
+  const confirmSpy = vi
+    .spyOn(database, 'confirmSync')
+    .mockRejectedValueOnce(new Error('SQLITE_BUSY: database is locked'))
+    .mockImplementation(realConfirm);
+  const markFailureSpy = vi.spyOn(database, 'markSyncFailure');
+  const saveProgress = vi.fn().mockResolvedValue(undefined);
+
+  await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
+    '1 reading progress item failed to sync.',
+  );
+
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  expect(markFailureSpy).not.toHaveBeenCalled();
+
+  const afterBusy = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(afterBusy.syncQueue['book-1']?.attemptCount).toBe(0);
+  expect(afterBusy.syncQueue['book-1']?.lastError).toBeNull();
+  expect(afterBusy.syncQueue['book-2']).toBeUndefined();
+  expect(afterBusy.readingState['book-2']?.pendingSync).toBe(false);
+
+  // Retry confirms book-1 locally from memory without sending a duplicate saveProgress request.
+  await expect(flushProgress({ saveProgress } as never, 'server')).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  expect(confirmSpy).toHaveBeenCalledTimes(3);
+
+  const afterRetry = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(afterRetry.syncQueue['book-1']).toBeUndefined();
+  expect(afterRetry.readingState['book-1']?.pendingSync).toBe(false);
+});
+
+it('continues syncing remaining books when markSyncFailure throws SQLITE_BUSY', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T04:00:00.000Z', '{"pageNum":7}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T04:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":8}',
+    createdAt: '2026-09-07T04:00:01.000Z',
+    updatedAt: '2026-09-07T04:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  vi.spyOn(database, 'markSyncFailure').mockRejectedValueOnce(
+    new Error('SQLITE_BUSY: database is locked'),
+  );
+  const saveProgress = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('network error'))
+    .mockResolvedValueOnce(undefined);
+
+  await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
+    '1 reading progress item failed to sync.',
+  );
+
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']).toBeDefined();
+  expect(saved.syncQueue['book-2']).toBeUndefined();
+  expect(saved.readingState['book-2']?.pendingSync).toBe(false);
 });

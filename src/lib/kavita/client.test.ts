@@ -602,3 +602,61 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+it('propagates caller cancellation in saveProgress without recording a network error', async () => {
+  const controller = new AbortController();
+  vi.mocked(fetch).mockImplementationOnce(
+    (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('Aborted', 'AbortError')),
+          { once: true },
+        );
+      }),
+  );
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  const pending = client.saveProgress(
+    { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 10 },
+    controller.signal,
+  );
+  controller.abort();
+
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  const log = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+  expect(log).toContain('Events: 0');
+});
+
+it('preserves REQUEST_TIMEOUT_MS timeout errors for active saveProgress requests', async () => {
+  vi.useFakeTimers();
+  try {
+    const controller = new AbortController();
+    vi.mocked(fetch).mockImplementationOnce(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Timed out', 'AbortError')),
+            { once: true },
+          );
+        }),
+    );
+
+    const client = new KavitaClient('https://books.example.com', 'abc123');
+    const pending = expect(
+      client.saveProgress(
+        { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 10 },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita did not respond in time.',
+    });
+
+    await vi.advanceTimersByTimeAsync(12_000);
+    await pending;
+  } finally {
+    vi.useRealTimers();
+  }
+});
