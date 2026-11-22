@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Advance journey through paginated EPUB chapters
 - Frame reader margins and chrome in outer viewport
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
