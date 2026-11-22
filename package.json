@@ -29,6 +29,7 @@
     "android:smoke": "node scripts/android-smoke.mjs",
     "android:journey": "node scripts/android-reading-journey.mjs",
     "android:release": "node scripts/android-build.mjs release",
+    "android:verify-release": "node scripts/verify-release-apk.mjs",
     "ios:sync": "npm run build && cap sync ios",
     "ios:open": "node scripts/capacitor-open.mjs ios",
     "postinstall": "node scripts/install-githooks.mjs"
