@@ -761,10 +761,7 @@ export async function saveLocalProgress(
   ]);
 }
 
-export async function markBookCompleted(
-  book: BookRecord,
-  readingState: StoredReadingState | null = null,
-): Promise<void> {
+export async function markBookCompleted(book: BookRecord): Promise<void> {
   const now = new Date().toISOString();
   const payload: PendingProgressPayload = {
     libraryId: book.libraryId,
@@ -790,7 +787,7 @@ export async function markBookCompleted(
             }
           : item,
       );
-      const previous = state.readingState[book.id] ?? readingState;
+      const previous = state.readingState[book.id];
       state.readingState[book.id] = {
         cfi: '',
         xpath: null,
