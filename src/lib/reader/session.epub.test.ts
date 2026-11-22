@@ -1,11 +1,17 @@
 // @vitest-environment jsdom
 
+import type { Contents, Location } from 'epubjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
 
 type TestTocItem = { label: string; href: string; subitems?: TestTocItem[] };
+type TestSpineSection = { href: string; index: number };
 
-const { mockBook, mockRendition } = vi.hoisted(() => {
+const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
+  const defaultSpineSections: TestSpineSection[] = [
+    { href: 'first.xhtml', index: 0 },
+    { href: 'second.xhtml', index: 1 },
+  ];
   const rendition = {
     hooks: { content: { register: vi.fn() } },
     on: vi.fn(),
@@ -17,28 +23,54 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
     resize: vi.fn(),
     destroy: vi.fn(),
   };
+  const spine = {
+    sections: [...defaultSpineSections],
+    each: vi.fn((visit: (section: TestSpineSection) => void) => {
+      for (const section of spine.sections) {
+        visit(section);
+      }
+    }),
+  };
   const book = {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
-    spine: {
-      each: vi.fn((visit: (section: { href: string }) => void) => {
-        visit({ href: 'first.xhtml' });
-        visit({ href: 'second.xhtml' });
-      }),
-    },
+    spine,
     navigation: { toc: [] as TestTocItem[] },
   };
-  return { mockBook: book, mockRendition: rendition };
+  return { defaultSpineSections, mockBook: book, mockRendition: rendition };
 });
 
 vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 
 import { ReaderSession } from './session';
 
-describe('ReaderSession keyboard navigation', () => {
+function getRenditionListener(
+  event: 'click' | 'keydown' | 'relocated',
+): (...args: unknown[]) => void {
+  const listener = mockRendition.on.mock.calls.find(([name]) => name === event)?.[1];
+  if (typeof listener !== 'function') {
+    throw new Error(`Expected rendition listener for "${event}"`);
+  }
+  return listener;
+}
+
+function location(cfi: string): Location {
+  return {
+    start: {
+      cfi,
+      href: 'chapter.xhtml',
+      index: 0,
+      percentage: 0.2,
+      displayed: { page: 2, total: 10 },
+    },
+  } as Location;
+}
+
+describe('ReaderSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockBook.navigation.toc = [];
+    mockBook.spine.sections = [...defaultSpineSections];
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -71,7 +103,7 @@ describe('ReaderSession keyboard navigation', () => {
     const viewport = document.createElement('div');
     vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
     await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), onTap);
-    const click = mockRendition.on.mock.calls.find(([name]) => name === 'click')?.[1];
+    const click = getRenditionListener('click');
     const frame = document.createElement('iframe');
     vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
     const contents = {
@@ -144,7 +176,7 @@ describe('ReaderSession keyboard navigation', () => {
       onLocation,
       vi.fn(),
     );
-    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    const relocated = getRenditionListener('relocated');
     const start = { href: 'second.xhtml', index: 1, cfi: '', displayed: { page: 1, total: 4 } };
     relocated({ start });
     relocated({ start: { ...start, displayed: { page: 2, total: 4 } } });
@@ -329,5 +361,74 @@ describe('ReaderSession keyboard navigation', () => {
       delete internalRendition.location;
       delete internalRendition.manager;
     }
+  });
+
+  it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
+    mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = getRenditionListener('relocated');
+    const click = getRenditionListener('click');
+    const contents = {
+      window: { getSelection: () => ({ isCollapsed: true }) },
+    };
+    const source = location('source-cfi');
+    const destination = location('destination-cfi');
+    relocated(source);
+
+    const internalLink = document.createElement('a');
+    internalLink.setAttribute('href', '#footnote');
+    click({ target: internalLink, clientX: 100 }, contents);
+    relocated(destination);
+
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('link');
+    expect(onLocation.mock.calls.at(-1)?.[2]).toEqual({
+      cfi: 'source-cfi',
+      href: 'chapter.xhtml',
+    });
+
+    const externalLink = document.createElement('a');
+    externalLink.setAttribute('href', 'https://example.org');
+    click({ target: externalLink, clientX: 100 }, contents);
+    relocated(location('later-cfi'));
+
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    expect(onLocation.mock.calls.at(-1)).toHaveLength(2);
+    session.destroy();
+  });
+
+  it('keeps the tap zones in the same places as the EPUB iframe scrolls', async () => {
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(20, 0, 300, 400));
+    const frame = document.createElement('iframe');
+    const frameRect = vi.spyOn(frame, 'getBoundingClientRect');
+    const contents = {
+      window: { frameElement: frame, innerWidth: 1200, getSelection: () => null },
+    } as unknown as Contents;
+    const onTap = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), onTap);
+    const click = getRenditionListener('click');
+
+    for (const offset of [0, 300, 600, 900]) {
+      frameRect.mockReturnValue(new DOMRect(20 - offset, 0, 1200, 400));
+      for (const x of [20, 150, 280]) {
+        click(new MouseEvent('click', { clientX: offset + x }), contents);
+      }
+    }
+
+    expect(onTap.mock.calls).toEqual(
+      Array.from({ length: 4 }, () => [['previous'], ['center'], ['next']]).flat(),
+    );
+    session.destroy();
   });
 });
