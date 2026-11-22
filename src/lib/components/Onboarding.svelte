@@ -192,10 +192,10 @@
             transition:fade
           >
             <input class="checkbox mt-0.5" type="checkbox" bind:checked={allowHttp} />
-            <span
-              >Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
-              and auth key.</span
-            >
+            <span>
+              Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
+              and auth key.
+            </span>
           </label>
         {/if}
       {:else}
@@ -258,9 +258,9 @@
       {#if !savedServer}
         <label class="label">
           <span class="label-text">
-            Library name <span class="text-surface-600-400">Optional</span></span
-          >
-          <input class="input" autocomplete="organization" bind:value={displayName} />
+            Library name <span class="text-surface-600-400">Optional</span>
+          </span>
+          <input class="input" autocomplete="off" bind:value={displayName} />
         </label>
       {/if}
 

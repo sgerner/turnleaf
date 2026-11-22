@@ -3,6 +3,9 @@
 ## Unreleased
 
 - Allow scoped blob CSP for sanitized EPUB styles
+- fix: format Svelte components with plugin 4.2
+- Set autocomplete off on library name input
+- Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops
