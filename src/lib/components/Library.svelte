@@ -50,9 +50,13 @@
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
-  import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
+  import ModalDialog from './ModalDialog.svelte';
+  import {
+    calculateVirtualWindow,
+    columnsForLibraryWidth,
+    type VirtualWindow,
+  } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   let {
     server,
@@ -235,18 +239,15 @@
   let confirmDeleteServer = $state(false);
   let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
-  let actionMenuDialog = $state<HTMLElement | null>(null);
-  let conflictDialog = $state<HTMLElement | null>(null);
-  let settingsDialog = $state<HTMLElement | null>(null);
-  let actionMenuOpener: HTMLElement | null = null;
-  let conflictOpener: HTMLElement | null = null;
-  let settingsOpener: HTMLElement | null = null;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
   let rowHeight = $state(400);
   let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
   let focusedRow = $state(-1);
+  let measuredCardHeight = 0;
+  let measuredLayoutKey = '';
+  let cardResizeObserver: ResizeObserver | null = null;
   const renderedRows = $derived.by(() => {
     const { firstRow, lastRow } = virtualWindow;
     const rows = Array.from({ length: lastRow - firstRow + 1 }, (_, offset) => firstRow + offset);
@@ -273,6 +274,7 @@
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const GRID_GAP_PX = 16;
   const GRID_ROW_GAP_PX = 32;
+  const LIST_ROW_GAP_PX = 16;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
@@ -342,16 +344,6 @@
     void setPreference('librarySeries', seriesFilter);
   }
 
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
-  }
-
   function insecureServer(): boolean {
     return server.baseUrl.toLowerCase().startsWith('http://');
   }
@@ -360,16 +352,29 @@
     return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
   }
 
-  function columnsForWidth(width: number): number {
-    if (viewMode === 'list') return 1;
-    if (width >= 1024) return 5;
-    if (width >= 768) return 4;
-    if (width >= 640) return 3;
-    return 2;
+  function currentRemPx(): number {
+    if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return 16;
+    return Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
   }
 
-  function rowHeightFor(width: number, columns: number): number {
-    const rem = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  function rowGapPx(): number {
+    return viewMode === 'list' ? LIST_ROW_GAP_PX : GRID_ROW_GAP_PX;
+  }
+
+  function observeBookCard(node: HTMLElement): { destroy: () => void } {
+    cardResizeObserver?.observe(node);
+    return {
+      destroy() {
+        cardResizeObserver?.unobserve(node);
+      },
+    };
+  }
+
+  function columnsForWidth(width: number, rem = currentRemPx()): number {
+    return columnsForLibraryWidth(width, viewMode, rem, GRID_GAP_PX);
+  }
+
+  function rowHeightFor(width: number, columns: number, rem = currentRemPx()): number {
     if (viewMode === 'list') return Math.ceil(rem * 9.5);
     const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
     return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 5 + GRID_ROW_GAP_PX));
@@ -393,8 +398,28 @@
   function updateVirtualWindow(): void {
     if (destroyed || !virtualGrid) return;
     const width = virtualGrid.clientWidth;
-    const nextColumns = width > 0 ? columnsForWidth(width) : gridColumns;
-    const nextRowHeight = width > 0 ? rowHeightFor(width, nextColumns) : rowHeight;
+    const rem = currentRemPx();
+    const nextColumns = width > 0 ? columnsForWidth(width, rem) : gridColumns;
+    const layoutKey = `${viewMode}:${nextColumns}:${width}:${rem}`;
+    if (layoutKey !== measuredLayoutKey) {
+      measuredLayoutKey = layoutKey;
+      measuredCardHeight = 0;
+    }
+
+    let maxRenderedCardHeight = 0;
+    for (const card of virtualGrid.querySelectorAll<HTMLElement>('[data-book-index]')) {
+      const cardHeight = card.getBoundingClientRect().height || card.offsetHeight;
+      if (cardHeight > maxRenderedCardHeight) {
+        maxRenderedCardHeight = cardHeight;
+      }
+    }
+    if (maxRenderedCardHeight > 0) {
+      measuredCardHeight = Math.max(measuredCardHeight, Math.ceil(maxRenderedCardHeight));
+    }
+
+    const estimatedRowHeight = width > 0 ? rowHeightFor(width, nextColumns, rem) : rowHeight;
+    const nextRowHeight =
+      measuredCardHeight > 0 ? Math.max(1, measuredCardHeight + rowGapPx()) : estimatedRowHeight;
     if (gridColumns !== nextColumns) gridColumns = nextColumns;
     if (rowHeight !== nextRowHeight) rowHeight = nextRowHeight;
 
@@ -489,9 +514,16 @@
   $effect(() => {
     if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => scheduleVirtualWindow());
+    cardResizeObserver = observer;
     observer.observe(virtualGrid);
+    for (const card of virtualGrid.querySelectorAll<HTMLElement>('[data-book-index]')) {
+      observer.observe(card);
+    }
     scheduleVirtualWindow();
-    return () => observer.disconnect();
+    return () => {
+      if (cardResizeObserver === observer) cardResizeObserver = null;
+      observer.disconnect();
+    };
   });
 
   onMount(async () => {
@@ -1254,29 +1286,23 @@
   }
 
   function openMenu(book: BookRecord): void {
-    actionMenuOpener = activeElement();
     actionMenuBook = book;
-    focusModal(() => actionMenuDialog);
   }
 
   function closeMenu(): void {
     actionMenuBook = null;
-    const opener = actionMenuOpener;
-    actionMenuOpener = null;
-    void tick().then(() => {
-      if (reading || actionMenuBook || !libraryMain) return;
-      restoreFocus(opener);
-      if (!libraryMain.contains(document.activeElement)) {
-        libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
-      }
-    });
+  }
+
+  function ensureLibraryFocusAfterMenuClose(): void {
+    if (reading || actionMenuBook || conflict || settingsVisible || !libraryMain) return;
+    if (!libraryMain.contains(document.activeElement)) {
+      libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+    }
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
-    conflictOpener = activeElement();
     conflictError = '';
     conflict = next;
-    focusModal(() => conflictDialog);
   }
 
   function closeConflict(): void {
@@ -1287,9 +1313,6 @@
   function dismissConflict(): void {
     conflict = null;
     conflictError = '';
-    const opener = conflictOpener;
-    conflictOpener = null;
-    void tick().then(() => restoreFocus(opener));
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1339,18 +1362,13 @@
   }
 
   function openSettings(): void {
-    settingsOpener = activeElement();
     settingsVisible = true;
     void Promise.allSettled(skeletonThemes.map(loadTheme));
-    focusModal(() => settingsDialog);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
     showReplacementKey = false;
-    const opener = settingsOpener;
-    settingsOpener = null;
-    void tick().then(() => restoreFocus(opener));
   }
 
   function diagnosticsText(): string {
@@ -1658,7 +1676,7 @@
 
     {#if continueBook}
       <button
-        class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
+        class="card preset-tonal-surface mt-6 flex w-full cursor-pointer flex-wrap items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
         type="button"
         aria-label={`Continue reading ${continueBook.title}, ${Math.round(progressOf(continueBook))}% complete`}
         onclick={() => void open(continueBook!)}
@@ -1678,9 +1696,11 @@
             aria-hidden="true"
           ></div>
         {/if}
-        <div class="min-w-0 flex-1">
+        <div class="min-w-[min(100%,10rem)] flex-1">
           <p class="text-xs uppercase tracking-wider text-surface-700-300">Continue reading</p>
-          <h2 class="mt-0.5 truncate font-serif text-xl leading-tight text-surface-950-50">
+          <h2
+            class="mt-0.5 line-clamp-2 break-words font-serif text-xl leading-tight text-surface-950-50"
+          >
             {continueBook.title}
           </h2>
           <p class="mt-0.5 truncate text-sm text-surface-700-300">
@@ -1704,8 +1724,8 @@
       </button>
     {/if}
 
-    <div class="mt-5 flex flex-col sm:flex-row sm:items-center">
-      <div class="relative grow">
+    <div class="mt-5 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+      <div class="relative min-w-[min(100%,14rem)] flex-1">
         <label class="sr-only" for="library-search">Search your library</label>
         <svg
           aria-hidden="true"
@@ -1719,7 +1739,7 @@
         </svg>
         <input
           id="library-search"
-          class="input preset-tonal-surface h-11 pl-10 pr-14 text-sm"
+          class="input preset-tonal-surface min-h-11 pl-10 pr-14 text-sm"
           type="search"
           placeholder="Search books or authors"
           bind:value={query}
@@ -1727,7 +1747,7 @@
         {#if query}
           <button
             type="button"
-            class="btn btn-sm absolute right-1 top-1/2 h-11 w-11 -translate-y-1/2 p-0 preset-filled-surface-200-800"
+            class="btn btn-sm absolute right-1 top-1/2 min-h-11 min-w-11 -translate-y-1/2 p-0 preset-filled-surface-200-800"
             onclick={() => (query = '')}
             aria-label="Clear search"
             title="Clear search"
@@ -1741,13 +1761,9 @@
           </button>
         {/if}
       </div>
-      <div
-        class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]"
-        role="group"
-        aria-label="Library filters"
-      >
+      <div class="flex flex-wrap items-stretch gap-1.5" role="group" aria-label="Library filters">
         <button
-          class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {downloadedOnly
+          class="btn btn-sm btn-multiline min-h-11 flex-1 basis-auto px-3 py-1.5 !text-xs sm:flex-initial sm:!text-sm {downloadedOnly
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1761,7 +1777,7 @@
           <span class="hidden sm:inline">Downloaded Only</span>
         </button>
         <button
-          class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {hideCompleted
+          class="btn btn-sm btn-multiline min-h-11 flex-1 basis-auto px-3 py-1.5 !text-xs sm:flex-initial sm:!text-sm {hideCompleted
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1778,7 +1794,7 @@
           <span class="hidden sm:inline">Hide completed</span>
         </button>
         <button
-          class="btn btn-sm h-11 w-11 !p-0 rounded-none {filtersVisible || advancedFiltersActive
+          class="btn btn-sm min-h-11 min-w-11 shrink-0 !p-0 {filtersVisible || advancedFiltersActive
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1794,7 +1810,7 @@
         </button>
         {#if libraryFiltersActive}
           <button
-            class="btn btn-sm h-11 w-11 !p-0 rounded-none preset-tonal-surface"
+            class="btn btn-sm min-h-11 min-w-11 shrink-0 !p-0 preset-tonal-surface"
             type="button"
             onclick={clearFilters}
             aria-label="Clear library filters"
@@ -1872,9 +1888,9 @@
         class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-surface-700-300"
       >
         <p>{visibleBooks.length} of {displayableBooks.length} books</p>
-        <div class="flex items-center gap-1" role="group" aria-label="Library view">
+        <div class="flex flex-wrap items-center gap-1" role="group" aria-label="Library view">
           <button
-            class="btn btn-sm h-11 {viewMode === 'grid'
+            class="btn btn-sm btn-multiline min-h-11 {viewMode === 'grid'
               ? 'preset-filled-primary-700-300'
               : 'preset-tonal-surface'}"
             type="button"
@@ -1884,7 +1900,7 @@
             Grid
           </button>
           <button
-            class="btn btn-sm h-11 {viewMode === 'list'
+            class="btn btn-sm btn-multiline min-h-11 {viewMode === 'list'
               ? 'preset-filled-primary-700-300'
               : 'preset-tonal-surface'}"
             type="button"
@@ -1992,7 +2008,7 @@
           {/if}
         </div>
         <button
-          class="btn btn-sm preset-tonal-warning h-10 shrink-0"
+          class="btn btn-sm btn-multiline preset-tonal-warning min-h-11 shrink-0"
           type="button"
           onclick={() => void syncProgress()}
           disabled={syncing || offline}
@@ -2066,7 +2082,7 @@
         id="library-results"
         bind:this={virtualGrid}
         class="relative mt-8"
-        style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
+        style={`height: ${Math.max(0, virtualWindow.totalHeight - rowGapPx())}px`}
         tabindex="-1"
         aria-label="Books"
         onfocusin={scheduleVirtualWindow}
@@ -2076,13 +2092,14 @@
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
-            class="absolute inset-x-0 grid gap-x-4"
-            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
+            class="absolute inset-x-0 grid items-start gap-x-4"
+            style={`top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}
               <article
-                class="relative text-left"
+                use:observeBookCard
+                class="relative min-w-0 text-left"
                 data-book-id={book.id}
                 data-book-index={bookIndex}
                 oncontextmenu={(event) => {
@@ -2091,9 +2108,9 @@
                 }}
               >
                 {#if viewMode === 'list'}
-                  <div class="group relative">
+                  <div class="library-list-card group relative">
                     <div
-                      class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
+                      class="library-list-card-inner preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                     >
                       <div
                         class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
@@ -2133,9 +2150,9 @@
                           </span>
                         {/if}
                       </div>
-                      <div class="min-w-0 flex-1">
+                      <div class="library-list-card-body min-w-0 flex-1">
                         <h2
-                          class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
+                          class="line-clamp-2 break-words font-serif text-base leading-snug text-surface-950-50"
                         >
                           {book.title}
                         </h2>
@@ -2325,566 +2342,538 @@
   </main>
 {/if}
 
-{#if actionMenuBook}
-  <div
-    class="fixed inset-0 z-40 grid place-items-center bg-black/45 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeMenu()}
-  >
-    <div
-      bind:this={actionMenuDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="book-actions-title"
-      tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, actionMenuDialog!, closeMenu)}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <div class="flex items-start justify-between gap-4">
-        <div class="min-w-0">
-          <p class="text-xs uppercase tracking-wider text-surface-700-300">Book actions</p>
-          <h2 id="book-actions-title" class="mt-1 truncate font-serif text-2xl text-surface-950-50">
-            {actionMenuBook.title}
-          </h2>
-          <p class="truncate text-sm text-surface-700-300">
-            {actionMenuBook.author ?? 'Unknown author'}
-          </p>
-        </div>
-        <button
-          class="btn btn-sm h-11 w-11 !p-0"
-          type="button"
-          onclick={closeMenu}
-          aria-label="Close book actions"
-          title="Close"
+<ModalDialog
+  open={Boolean(actionMenuBook)}
+  labelledBy="book-actions-title"
+  maxWidthClass="max-w-md"
+  panelClass="p-4"
+  backdropClass="z-40 bg-black/45"
+  onClose={closeMenu}
+  onAfterClose={ensureLibraryFocusAfterMenuClose}
+>
+  {#if actionMenuBook}
+    <div class="flex items-start justify-between gap-3">
+      <div class="min-w-0 flex-1">
+        <p class="text-xs uppercase tracking-wider text-surface-700-300">Book actions</p>
+        <h2
+          id="book-actions-title"
+          class="mt-1 line-clamp-2 break-words font-serif text-2xl text-surface-950-50"
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path
-              fill="currentColor"
-              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-            />
-          </svg>
-        </button>
+          {actionMenuBook.title}
+        </h2>
+        <p class="truncate text-sm text-surface-700-300">
+          {actionMenuBook.author ?? 'Unknown author'}
+        </p>
       </div>
-
-      <div class="mt-4 grid gap-2">
-        <button
-          class="btn preset-filled-primary-700-300 justify-start"
-          type="button"
-          onclick={() => {
-            const book = actionMenuBook;
-            closeMenu();
-            if (book) void open(book);
-          }}
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path fill="currentColor" d="M8 5v14l11-7z" />
-          </svg>
-          <span>{actionMenuBook.downloadPath ? 'Open book' : 'Download and open'}</span>
-        </button>
-        {#if !actionMenuBook.downloadPath}
-          <button
-            class="btn preset-tonal-surface justify-start"
-            type="button"
-            disabled={Boolean(downloadingBookId) ||
-              offline ||
-              actionMenuBook.remoteAvailable === false}
-            onclick={() => {
-              const book = actionMenuBook;
-              closeMenu();
-              if (book) void download(book);
-            }}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
-            </svg>
-            <span>Download for offline</span>
-          </button>
-        {/if}
-        <button
-          class="btn preset-tonal-primary justify-start"
-          type="button"
-          onclick={() => {
-            const book = actionMenuBook;
-            closeMenu();
-            if (book) void syncFurthest(book);
-          }}
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path
-              fill="currentColor"
-              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
-            />
-          </svg>
-          <span>Sync furthest read</span>
-        </button>
-        <button
-          class="btn preset-tonal-tertiary justify-start"
-          type="button"
-          onclick={() => {
-            const book = actionMenuBook;
-            closeMenu();
-            if (book) void markDone(book);
-          }}
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path fill="currentColor" d="M9 16.17 4.83 12l-1.42 1.41L9 19l12-12-1.41-1.41z" />
-          </svg>
-          <span>Mark as read</span>
-        </button>
-        {#if actionMenuBook.downloadPath}
-          <button
-            class="btn preset-outlined-error-500 justify-start"
-            type="button"
-            onclick={() => {
-              const book = actionMenuBook;
-              closeMenu();
-              if (book) void remove(book);
-            }}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-            <span>Remove download</span>
-          </button>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if conflict}
-  <div
-    class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-5"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeConflict()}
-  >
-    <div
-      bind:this={conflictDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-sm p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="sync-conflict-title"
-      tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, conflictDialog!, closeConflict)}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
-      <p class="mt-3 text-surface-600-400">
-        This device and Kavita have different reading positions for <strong
-          >{conflict.book.title}</strong
-        >.
-      </p>
-      <dl class="mt-4 grid gap-2 text-sm">
-        <div>
-          <dt class="font-medium">This device</dt>
-          <dd>
-            {Math.round(conflict.local.percentage * 100)}% ·
-            {new Date(conflict.local.localUpdatedAt).toLocaleString()}
-          </dd>
-        </div>
-        <div>
-          <dt class="font-medium">Kavita</dt>
-          <dd>
-            {#if conflict.book.pages > 0}
-              Page {conflict.remote.pageNum} of {conflict.book.pages}
-            {:else}
-              Page {conflict.remote.pageNum}
-            {/if}
-            {#if conflict.remote.lastModifiedUtc}
-              · {new Date(conflict.remote.lastModifiedUtc).toLocaleString()}
-            {/if}
-          </dd>
-        </div>
-      </dl>
-      <div class="mt-6 grid gap-3">
-        {#if conflictError}
-          <p class="text-sm text-error-700-300" role="alert">{conflictError}</p>
-        {/if}
-        <button
-          class="btn preset-filled-primary-700-300"
-          type="button"
-          disabled={acceptingRemoteProgress}
-          onclick={() => {
-            reading = {
-              book: conflict!.book,
-              url: conflict!.url,
-              cfi: conflict!.local.cfi || null,
-              xpath: conflict!.local.xpath,
-              percentage: conflict!.local.percentage,
-            };
-            closeConflict();
-            void syncProgress(false);
-          }}>Continue from this device</button
-        >
-        <button
-          class="btn preset-tonal-primary"
-          type="button"
-          disabled={acceptingRemoteProgress}
-          onclick={() => void continueFromKavita()}
-        >
-          {acceptingRemoteProgress ? 'Saving choice…' : 'Continue from Kavita'}
-        </button>
-        <button class="btn preset-tonal-surface" type="button" onclick={closeConflict}
-          >Cancel</button
-        >
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if settingsVisible}
-  <div
-    class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeSettings()}
-  >
-    <div
-      bind:this={settingsDialog}
-      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="library-settings-title"
-      tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <div
-        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
+      <button
+        class="btn btn-sm h-11 w-11 shrink-0 !p-0"
+        type="button"
+        onclick={closeMenu}
+        aria-label="Close book actions"
+        title="Close"
       >
-        <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path
+            fill="currentColor"
+            d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+          />
+        </svg>
+      </button>
+    </div>
+
+    <div class="mt-4 grid gap-2">
+      <button
+        class="btn btn-multiline min-h-11 preset-filled-primary-700-300 justify-start text-left"
+        type="button"
+        onclick={() => {
+          const book = actionMenuBook;
+          closeMenu();
+          if (book) void open(book);
+        }}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path fill="currentColor" d="M8 5v14l11-7z" />
+        </svg>
+        <span>{actionMenuBook.downloadPath ? 'Open book' : 'Download and open'}</span>
+      </button>
+      {#if !actionMenuBook.downloadPath}
         <button
-          class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
-          type="button"
-          onclick={closeSettings}
-          aria-label="Close settings"
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path
-              fill="currentColor"
-              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-            />
-          </svg>
-        </button>
-      </div>
-
-      <section class="mt-6" aria-labelledby="library-settings-appearance-title">
-        <h3 id="library-settings-appearance-title" class="text-lg font-medium">
-          Application appearance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Choose the colors and theme that make reading comfortable. Changes apply immediately.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn {pendingMode === 'light'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'light'}
-            onclick={() => void updateMode('light')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
-              />
-            </svg>
-            Light
-          </button>
-          <button
-            class="btn {pendingMode === 'dark'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'dark'}
-            onclick={() => void updateMode('dark')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
-              />
-            </svg>
-            Dark
-          </button>
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
-        <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
-          {#each skeletonThemes as option (option)}
-            <button
-              class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
-              option
-                ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
-                : 'preset-tonal-surface'}"
-              type="button"
-              aria-pressed={pendingTheme === option}
-              aria-label={`Use ${option} theme`}
-              title={option}
-              onclick={() => void updateTheme(option)}
-            >
-              <span class="flex h-full w-full" data-theme={option}>
-                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
-                ></span>
-              </span>
-              {#if pendingTheme === option}
-                <span
-                  class="absolute inset-0 grid place-items-center bg-black/20"
-                  aria-hidden="true"
-                >
-                  <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
-                    <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
-                  </svg>
-                </span>
-              {/if}
-            </button>
-          {/each}
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Turnleaf always saves your latest position on this device. Auto-sync furthest read also
-          lets a newer local position replace an older Kavita position when progress is uploaded.
-        </p>
-        <div
-          class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
-        >
-          <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span
-          >
-          <button
-            class="switch-button"
-            type="button"
-            role="switch"
-            aria-checked={pendingAutoSync}
-            aria-label="Auto-sync furthest read"
-            onclick={() => void updateAutoSync(!pendingAutoSync)}
-          >
-            <span
-              class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
-                pendingAutoSync
-                  ? 'preset-filled-primary-700-300'
-                  : 'preset-filled-secondary-700-300'
-              }`}
-              aria-hidden="true"
-            >
-              <span class="switch-thumb preset-filled-tertiary-100-900"></span>
-            </span>
-          </button>
-        </div>
-      </section>
-
-      <section class="mt-7" aria-labelledby="library-settings-connection-title">
-        <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Update the server address or replace the key used to access this library.
-        </p>
-        <dl class="mt-3 space-y-2 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Server</dt>
-            <dd class="truncate text-right">{server.displayName}</dd>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Address</dt>
-            <dd class="truncate text-right">{server.baseUrl}</dd>
-          </div>
-        </dl>
-        <button
-          class="btn preset-tonal-surface mt-3"
+          class="btn btn-multiline min-h-11 preset-tonal-surface justify-start text-left"
           type="button"
           disabled={Boolean(downloadingBookId) ||
-            cleanupInProgress ||
-            replacingApiKey ||
-            deletingServer}
-          onclick={onChangeServerAddress}
+            offline ||
+            actionMenuBook.remoteAvailable === false}
+          onclick={() => {
+            const book = actionMenuBook;
+            closeMenu();
+            if (book) void download(book);
+          }}
         >
-          Change server address
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+          </svg>
+          <span>Download for offline</span>
         </button>
-        {#if insecureServer()}
-          <div class="alert preset-tonal-warning mt-4" role="alert">
-            Plain HTTP is enabled. Anyone on this network may be able to observe your reading
-            traffic and Kavita auth key. HTTPS is strongly recommended.
-          </div>
-        {/if}
-
-        <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
-          <div class="label">
-            <label for="replacement-api-key" class="label-text">Replace API key</label>
-            <div class="flex flex-wrap gap-2">
-              <input
-                id="replacement-api-key"
-                class="input min-w-0 flex-1 max-w-96"
-                type={showReplacementKey ? 'text' : 'password'}
-                spellcheck="false"
-                autocomplete="off"
-                bind:value={replacementApiKey}
-                placeholder="Enter a new Kavita key"
-                aria-invalid={settingsError ? true : undefined}
-                aria-describedby={settingsError ? 'settings-key-error' : undefined}
-                required
-              />
-              <button
-                class="btn preset-tonal-surface"
-                type="button"
-                onclick={() => (showReplacementKey = !showReplacementKey)}
-              >
-                {showReplacementKey ? 'Hide key' : 'Show key'}
-              </button>
-              <button
-                class="btn preset-filled-primary-700-300 shrink-0"
-                type="submit"
-                disabled={replacingApiKey}
-              >
-                {replacingApiKey ? 'Testing...' : 'Save'}
-              </button>
-            </div>
-            <span class="label-text text-xs text-surface-700-300">
-              The new key is tested before it is saved.
-            </span>
-          </div>
-          <div
-            id="settings-key-error"
-            role="alert"
-            class:alert={settingsError}
-            class:preset-tonal-error={settingsError}
-          >
-            {settingsError}
-          </div>
-          <button
-            class="btn preset-tonal-error"
-            type="button"
-            onclick={() => (confirmDeleteServer = true)}
-            disabled={deletingServer}
-          >
-            Delete server
-          </button>
-        </form>
-      </section>
-
-      <section class="mt-7" aria-labelledby="library-settings-storage-title">
-        <h3 id="library-settings-storage-title" class="text-lg font-medium">
-          Storage and maintenance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Downloads and reading progress stay on this device. Clearing covers is safe; removing
-          downloads deletes local EPUB files but does not change Kavita.
-        </p>
-        <div class="mt-3 grid gap-2">
-          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
-            >Clear cover cache</button
-          >
-          <button
-            class="btn preset-tonal-error"
-            type="button"
-            disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-            onclick={removeAllDownloads}>Remove all downloaded books</button
-          >
-        </div>
-        <dl class="mt-4 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Downloaded storage</dt>
-            <dd class="tabular-nums">
-              {(
-                books.reduce(
-                  (sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0),
-                  0,
-                ) / 1_048_576
-              ).toFixed(1)} MB
-            </dd>
-          </div>
-        </dl>
-      </section>
-      <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-        <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Copy or download recent connection and book download details. The log includes API routes,
-          HTTP statuses, and failure categories. It stays in memory until the app closes or you
-          clear it. Review it before sharing.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn preset-tonal-surface"
-            type="button"
-            onclick={() => void copyDiagnostics()}>Copy diagnostics</button
-          >
-          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}
-            >Download log</button
-          >
-        </div>
+      {/if}
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-primary justify-start text-left"
+        type="button"
+        onclick={() => {
+          const book = actionMenuBook;
+          closeMenu();
+          if (book) void syncFurthest(book);
+        }}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path fill="currentColor" d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z" />
+        </svg>
+        <span>Sync furthest read</span>
+      </button>
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-tertiary justify-start text-left"
+        type="button"
+        onclick={() => {
+          const book = actionMenuBook;
+          closeMenu();
+          if (book) void markDone(book);
+        }}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path fill="currentColor" d="M9 16.17 4.83 12l-1.42 1.41L9 19l12-12-1.41-1.41z" />
+        </svg>
+        <span>Mark as read</span>
+      </button>
+      {#if actionMenuBook.downloadPath}
         <button
-          class="btn preset-tonal-surface mt-2 w-full"
+          class="btn btn-multiline min-h-11 preset-outlined-error-500 justify-start text-left"
           type="button"
-          onclick={showDiagnostics}
+          onclick={() => {
+            const book = actionMenuBook;
+            closeMenu();
+            if (book) void remove(book);
+          }}
         >
-          {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+          <span>Remove download</span>
         </button>
-        {#if diagnosticsVisible}
-          <div class="mt-3 grid gap-2">
-            <p class="text-sm text-surface-700-300">
-              If copy or download is unavailable, select all text below, then copy it manually.
-            </p>
-            <textarea
-              id="turnleaf-diagnostics-output"
-              class="input min-h-48 w-full font-mono text-xs"
-              readonly
-              rows="10"
-              bind:value={diagnosticsOutput}
-              aria-label="Turnleaf diagnostics log"
-              onclick={selectDiagnostics}></textarea>
-            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}
-              >Select all text</button
-            >
-          </div>
-        {/if}
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={clearDiagnosticLog}>Clear diagnostics</button
-        >
-        {#if diagnosticsMessage}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-        {/if}
-      </section>
-      {#if confirmDeleteServer}
-        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-          <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
-          </p>
-          <div class="mt-4 flex gap-2">
-            <button
-              class="btn preset-outlined-error-500"
-              type="button"
-              onclick={() => void deleteServer()}
-              disabled={deletingServer}
-            >
-              {deletingServer ? 'Deleting...' : 'Delete now'}
-            </button>
-            <button
-              class="btn preset-tonal-surface"
-              type="button"
-              onclick={() => (confirmDeleteServer = false)}
-              disabled={deletingServer}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
       {/if}
     </div>
+  {/if}
+</ModalDialog>
+
+<ModalDialog
+  open={Boolean(conflict)}
+  labelledBy="sync-conflict-title"
+  maxWidthClass="max-w-sm"
+  panelClass="p-4 sm:p-6"
+  backdropClass="z-40 bg-black/55"
+  onClose={closeConflict}
+>
+  {#if conflict}
+    <h2 id="sync-conflict-title" class="break-words font-serif text-2xl">
+      Choose where to continue
+    </h2>
+    <p class="mt-3 break-words text-surface-600-400">
+      This device and Kavita have different reading positions for <strong class="break-words"
+        >{conflict.book.title}</strong
+      >.
+    </p>
+    <dl class="mt-4 grid gap-2 text-sm">
+      <div>
+        <dt class="font-medium">This device</dt>
+        <dd class="break-words">
+          {Math.round(conflict.local.percentage * 100)}% ·
+          {new Date(conflict.local.localUpdatedAt).toLocaleString()}
+        </dd>
+      </div>
+      <div>
+        <dt class="font-medium">Kavita</dt>
+        <dd class="break-words">
+          {#if conflict.book.pages > 0}
+            Page {conflict.remote.pageNum} of {conflict.book.pages}
+          {:else}
+            Page {conflict.remote.pageNum}
+          {/if}
+          {#if conflict.remote.lastModifiedUtc}
+            · {new Date(conflict.remote.lastModifiedUtc).toLocaleString()}
+          {/if}
+        </dd>
+      </div>
+    </dl>
+    <div class="mt-6 grid gap-3">
+      {#if conflictError}
+        <p class="break-words text-sm text-error-700-300" role="alert">{conflictError}</p>
+      {/if}
+      <button
+        class="btn btn-multiline min-h-11 preset-filled-primary-700-300"
+        type="button"
+        disabled={acceptingRemoteProgress}
+        onclick={() => {
+          reading = {
+            book: conflict!.book,
+            url: conflict!.url,
+            cfi: conflict!.local.cfi || null,
+            xpath: conflict!.local.xpath,
+            percentage: conflict!.local.percentage,
+          };
+          closeConflict();
+          void syncProgress(false);
+        }}>Continue from this device</button
+      >
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-primary"
+        type="button"
+        disabled={acceptingRemoteProgress}
+        onclick={() => void continueFromKavita()}
+      >
+        {acceptingRemoteProgress ? 'Saving choice…' : 'Continue from Kavita'}
+      </button>
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-surface"
+        type="button"
+        onclick={closeConflict}>Cancel</button
+      >
+    </div>
+  {/if}
+</ModalDialog>
+
+<ModalDialog
+  open={settingsVisible}
+  labelledBy="library-settings-title"
+  maxWidthClass="max-w-md"
+  panelClass="p-4 sm:p-6"
+  backdropClass="z-50 bg-black/55"
+  onClose={closeSettings}
+>
+  <div
+    class="settings-modal-header z-10 -mx-4 -mt-4 mb-6 flex items-center justify-between gap-3 bg-inherit px-4 pb-3 pt-4 sm:-mx-6 sm:-mt-6 sm:px-6 sm:pt-6"
+  >
+    <h2 id="library-settings-title" class="min-w-0 break-words font-serif text-3xl">Settings</h2>
+    <button
+      class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
+      type="button"
+      onclick={closeSettings}
+      aria-label="Close settings"
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+        <path
+          fill="currentColor"
+          d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+        />
+      </svg>
+    </button>
   </div>
-{/if}
+
+  <section class="mt-6" aria-labelledby="library-settings-appearance-title">
+    <h3 id="library-settings-appearance-title" class="text-lg font-medium">
+      Application appearance
+    </h3>
+    <p class="mt-1 text-sm text-surface-700-300">
+      Choose the colors and theme that make reading comfortable. Changes apply immediately.
+    </p>
+    <div class="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,6.5rem),1fr))] gap-2">
+      <button
+        class="btn btn-multiline min-h-11 {pendingMode === 'light'
+          ? 'preset-filled-primary-700-300'
+          : 'preset-tonal-surface'}"
+        type="button"
+        aria-pressed={pendingMode === 'light'}
+        onclick={() => void updateMode('light')}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path
+            fill="currentColor"
+            d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
+          />
+        </svg>
+        Light
+      </button>
+      <button
+        class="btn btn-multiline min-h-11 {pendingMode === 'dark'
+          ? 'preset-filled-primary-700-300'
+          : 'preset-tonal-surface'}"
+        type="button"
+        aria-pressed={pendingMode === 'dark'}
+        onclick={() => void updateMode('dark')}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path
+            fill="currentColor"
+            d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
+          />
+        </svg>
+        Dark
+      </button>
+    </div>
+
+    <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
+    <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
+      {#each skeletonThemes as option (option)}
+        <button
+          class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
+          option
+            ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
+            : 'preset-tonal-surface'}"
+          type="button"
+          aria-pressed={pendingTheme === option}
+          aria-label={`Use ${option} theme`}
+          title={option}
+          onclick={() => void updateTheme(option)}
+        >
+          <span class="flex h-full w-full" data-theme={option}>
+            <span class="h-full flex-1" style:background-color="var(--color-primary-500)"></span>
+            <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"></span>
+            <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"></span>
+          </span>
+          {#if pendingTheme === option}
+            <span class="absolute inset-0 grid place-items-center bg-black/20" aria-hidden="true">
+              <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
+                <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
+              </svg>
+            </span>
+          {/if}
+        </button>
+      {/each}
+    </div>
+
+    <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
+    <p class="mt-1 text-sm text-surface-700-300">
+      Turnleaf always saves your latest position on this device. Auto-sync furthest read also lets a
+      newer local position replace an older Kavita position when progress is uploaded.
+    </p>
+    <div
+      class="mt-2 flex min-h-12 flex-wrap items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
+    >
+      <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span>
+      <button
+        class="switch-button"
+        type="button"
+        role="switch"
+        aria-checked={pendingAutoSync}
+        aria-label="Auto-sync furthest read"
+        onclick={() => void updateAutoSync(!pendingAutoSync)}
+      >
+        <span
+          class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
+            pendingAutoSync ? 'preset-filled-primary-700-300' : 'preset-filled-secondary-700-300'
+          }`}
+          aria-hidden="true"
+        >
+          <span class="switch-thumb preset-filled-tertiary-100-900"></span>
+        </span>
+      </button>
+    </div>
+  </section>
+
+  <section class="mt-7" aria-labelledby="library-settings-connection-title">
+    <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
+    <p class="mt-1 text-sm text-surface-700-300">
+      Update the server address or replace the key used to access this library.
+    </p>
+    <dl class="mt-3 space-y-2 text-sm">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <dt class="text-surface-700-300">Server</dt>
+        <dd class="break-url sm:text-right">{server.displayName}</dd>
+      </div>
+      <div class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <dt class="text-surface-700-300">Address</dt>
+        <dd class="break-url sm:text-right">{server.baseUrl}</dd>
+      </div>
+    </dl>
+    <button
+      class="btn btn-multiline min-h-11 preset-tonal-surface mt-3"
+      type="button"
+      disabled={Boolean(downloadingBookId) ||
+        cleanupInProgress ||
+        replacingApiKey ||
+        deletingServer}
+      onclick={onChangeServerAddress}
+    >
+      Change server address
+    </button>
+    {#if insecureServer()}
+      <div class="alert preset-tonal-warning mt-4" role="alert">
+        Plain HTTP is enabled. Anyone on this network may be able to observe your reading traffic
+        and Kavita auth key. HTTPS is strongly recommended.
+      </div>
+    {/if}
+
+    <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
+      <div class="label">
+        <label for="replacement-api-key" class="label-text">Replace API key</label>
+        <div class="responsive-input-row">
+          <input
+            id="replacement-api-key"
+            class="input min-w-0 flex-1"
+            type={showReplacementKey ? 'text' : 'password'}
+            spellcheck="false"
+            autocomplete="off"
+            bind:value={replacementApiKey}
+            placeholder="Enter a new Kavita key"
+            aria-invalid={settingsError ? true : undefined}
+            aria-describedby={settingsError ? 'settings-key-error' : undefined}
+            required
+          />
+          <button
+            class="btn btn-multiline min-h-11 preset-tonal-surface"
+            type="button"
+            onclick={() => (showReplacementKey = !showReplacementKey)}
+          >
+            {showReplacementKey ? 'Hide key' : 'Show key'}
+          </button>
+          <button
+            class="btn btn-multiline min-h-11 preset-filled-primary-700-300"
+            type="submit"
+            disabled={replacingApiKey}
+          >
+            {replacingApiKey ? 'Testing...' : 'Save'}
+          </button>
+        </div>
+        <span class="label-text text-xs text-surface-700-300">
+          The new key is tested before it is saved.
+        </span>
+      </div>
+      <div
+        id="settings-key-error"
+        role="alert"
+        class="break-words"
+        class:alert={settingsError}
+        class:preset-tonal-error={settingsError}
+      >
+        {settingsError}
+      </div>
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-error"
+        type="button"
+        onclick={() => (confirmDeleteServer = true)}
+        disabled={deletingServer}
+      >
+        Delete server
+      </button>
+    </form>
+  </section>
+
+  <section class="mt-7" aria-labelledby="library-settings-storage-title">
+    <h3 id="library-settings-storage-title" class="text-lg font-medium">Storage and maintenance</h3>
+    <p class="mt-1 text-sm text-surface-700-300">
+      Downloads and reading progress stay on this device. Clearing covers is safe; removing
+      downloads deletes local EPUB files but does not change Kavita.
+    </p>
+    <div class="mt-3 grid gap-2">
+      <button
+        class="btn btn-multiline min-h-11 preset-outlined-error-500"
+        type="button"
+        onclick={clearCache}>Clear cover cache</button
+      >
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-error"
+        type="button"
+        disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+        onclick={removeAllDownloads}>Remove all downloaded books</button
+      >
+    </div>
+    <dl class="mt-4 text-sm">
+      <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <dt class="text-surface-700-300">Downloaded storage</dt>
+        <dd class="tabular-nums">
+          {(
+            books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
+            1_048_576
+          ).toFixed(1)} MB
+        </dd>
+      </div>
+    </dl>
+  </section>
+  <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
+    <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
+    <p class="mt-1 text-sm text-surface-700-300">
+      Copy or download recent connection and book download details. The log includes API routes,
+      HTTP statuses, and failure categories. It stays in memory until the app closes or you clear
+      it. Review it before sharing.
+    </p>
+    <div class="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,8rem),1fr))] gap-2">
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-surface"
+        type="button"
+        onclick={() => void copyDiagnostics()}>Copy diagnostics</button
+      >
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-surface"
+        type="button"
+        onclick={downloadDiagnostics}>Download log</button
+      >
+    </div>
+    <button
+      class="btn btn-multiline min-h-11 preset-tonal-surface mt-2 w-full"
+      type="button"
+      onclick={showDiagnostics}
+    >
+      {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
+    </button>
+    {#if diagnosticsVisible}
+      <div class="mt-3 grid gap-2">
+        <p class="text-sm text-surface-700-300">
+          If copy or download is unavailable, select all text below, then copy it manually.
+        </p>
+        <textarea
+          id="turnleaf-diagnostics-output"
+          class="input min-h-48 w-full font-mono text-xs"
+          readonly
+          rows="10"
+          bind:value={diagnosticsOutput}
+          aria-label="Turnleaf diagnostics log"
+          onclick={selectDiagnostics}></textarea>
+        <button
+          class="btn btn-multiline min-h-11 preset-tonal-surface"
+          type="button"
+          onclick={selectDiagnostics}>Select all text</button
+        >
+      </div>
+    {/if}
+    <button
+      class="btn btn-multiline min-h-11 preset-tonal-surface mt-2 w-full"
+      type="button"
+      onclick={clearDiagnosticLog}>Clear diagnostics</button
+    >
+    {#if diagnosticsMessage}
+      <p class="mt-2 break-words text-sm text-surface-700-300" role="status">
+        {diagnosticsMessage}
+      </p>
+    {/if}
+  </section>
+  {#if confirmDeleteServer}
+    <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
+      <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
+      <p class="mt-2 text-sm text-surface-700-300">
+        This removes the server connection, downloaded books, cached covers, and local progress from
+        this device.
+      </p>
+      <div class="mt-4 flex flex-wrap gap-2">
+        <button
+          class="btn btn-multiline min-h-11 preset-outlined-error-500"
+          type="button"
+          onclick={() => void deleteServer()}
+          disabled={deletingServer}
+        >
+          {deletingServer ? 'Deleting...' : 'Delete now'}
+        </button>
+        <button
+          class="btn btn-multiline min-h-11 preset-tonal-surface"
+          type="button"
+          onclick={() => (confirmDeleteServer = false)}
+          disabled={deletingServer}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  {/if}
+</ModalDialog>
 
 <style>
   .switch-track {
@@ -2932,5 +2921,28 @@
 
   .switch-checked .switch-thumb {
     transform: translateX(1.2rem);
+  }
+
+  .library-list-card {
+    container-type: inline-size;
+  }
+
+  @container (max-width: 18rem) {
+    .library-list-card-inner {
+      flex-wrap: wrap;
+      align-items: flex-start;
+      padding-right: 0.75rem;
+    }
+
+    .library-list-card-body {
+      flex-basis: 100%;
+    }
+  }
+
+  @media (min-height: 32rem) {
+    .settings-modal-header {
+      position: sticky;
+      top: 0;
+    }
   }
 </style>

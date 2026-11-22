@@ -107,13 +107,13 @@
 
   <div class="app-stage">
     {#if releaseBanner}
-      <div class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
+      <div class="release-banner mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
         <div
           class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
         >
           <div class="min-w-0">
             <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
-            <p class="mt-1 font-medium text-surface-950-50">
+            <p class="mt-1 break-words font-medium text-surface-950-50">
               Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
                 ? ` · ${releaseBanner.title}`
                 : ''}
@@ -123,7 +123,7 @@
           <div class="flex flex-wrap items-center gap-2">
             {#if releaseBanner.downloadUrl}
               <a
-                class="btn btn-sm preset-filled-success-500 !text-sm"
+                class="btn btn-sm btn-multiline min-h-11 preset-filled-success-500 !text-sm"
                 href={releaseBanner.downloadUrl}
                 target="_blank"
                 rel="noreferrer"
@@ -132,7 +132,7 @@
               </a>
             {/if}
             <a
-              class="btn btn-sm preset-filled-tertiary-500 !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-filled-tertiary-500 !text-sm"
               href={releaseBanner.releaseUrl}
               target="_blank"
               rel="noreferrer"
@@ -140,7 +140,7 @@
               Release notes <span class="sr-only">(opens in a new tab)</span>
             </a>
             <button
-              class="btn btn-sm preset-tonal-error !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-tonal-error !text-sm"
               type="button"
               onclick={() => (releaseBanner = null)}
             >
@@ -174,11 +174,14 @@
         }}
       />
     {:else if startupError}
-      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
-        <p>{startupError}</p>
+      <div
+        class="alert preset-tonal-error mx-4 mt-6 flex max-w-lg flex-col gap-3 sm:mx-auto"
+        role="alert"
+      >
+        <p class="break-words">{startupError}</p>
         <div class="flex flex-wrap gap-2">
           <button
-            class="btn btn-sm preset-filled-error-500 !text-sm"
+            class="btn btn-sm btn-multiline min-h-11 preset-filled-error-500 !text-sm"
             type="button"
             onclick={() => void loadLocalData()}
             disabled={repairing}
@@ -187,7 +190,7 @@
           </button>
           {#if server}
             <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface !text-sm"
               type="button"
               onclick={() => (startupError = '')}
             >
@@ -195,7 +198,7 @@
             </button>
           {:else}
             <button
-              class="btn btn-sm preset-tonal-error !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-tonal-error !text-sm"
               type="button"
               disabled={repairing}
               onclick={() => {
@@ -385,6 +388,18 @@
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     z-index: 1;
+  }
+
+  .release-banner {
+    position: relative;
+    z-index: 20;
+  }
+
+  @media (min-height: 40rem) {
+    .release-banner {
+      position: sticky;
+      top: 0;
+    }
   }
 
   :global([data-mode='dark']) .orb {

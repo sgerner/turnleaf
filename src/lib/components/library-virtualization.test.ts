@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { calculateVirtualWindow } from './library-virtualization';
+import { calculateVirtualWindow, columnsForLibraryWidth } from './library-virtualization';
 
 describe('calculateVirtualWindow', () => {
   it('returns an empty window for an empty library', () => {
@@ -61,5 +61,27 @@ describe('calculateVirtualWindow', () => {
       totalRows: 3,
       totalHeight: 300,
     });
+  });
+});
+
+describe('columnsForLibraryWidth', () => {
+  it('always uses 1 column in list view', () => {
+    expect(columnsForLibraryWidth(1200, 'list', 16)).toBe(1);
+    expect(columnsForLibraryWidth(320, 'list', 32)).toBe(1);
+  });
+
+  it('preserves standard grid columns at 16px root font size', () => {
+    expect(columnsForLibraryWidth(288, 'grid', 16)).toBe(2);
+    expect(columnsForLibraryWidth(640, 'grid', 16)).toBe(3);
+    expect(columnsForLibraryWidth(768, 'grid', 16)).toBe(4);
+    expect(columnsForLibraryWidth(1024, 'grid', 16)).toBe(5);
+  });
+
+  it('reduces grid columns at 200% text size before card overlays overlap', () => {
+    expect(columnsForLibraryWidth(288, 'grid', 32)).toBe(1);
+    expect(columnsForLibraryWidth(380, 'grid', 32)).toBe(1);
+    expect(columnsForLibraryWidth(520, 'grid', 32)).toBe(2);
+    expect(columnsForLibraryWidth(720, 'grid', 32)).toBe(3);
+    expect(columnsForLibraryWidth(976, 'grid', 32)).toBe(4);
   });
 });

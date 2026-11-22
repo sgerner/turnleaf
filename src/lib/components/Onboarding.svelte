@@ -137,12 +137,12 @@
 </script>
 
 <main
-  class="mx-auto flex min-h-full max-w-5xl flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))] sm:px-8 lg:grid lg:min-h-full lg:grid-cols-2 lg:items-center lg:gap-16 lg:py-16 xl:gap-24"
+  class="mx-auto flex min-h-full max-w-5xl flex-col px-4 pb-10 pt-[max(3rem,env(safe-area-inset-top))] sm:px-8 lg:grid lg:min-h-full lg:grid-cols-2 lg:items-center lg:gap-16 lg:py-16 xl:gap-24"
 >
-  <header class="flex flex-col lg:pr-4" in:fly={{ y: 12, duration: 280 }}>
+  <header class="flex min-w-0 flex-col lg:pr-4" in:fly={{ y: 12, duration: 280 }}>
     <TurnleafLogo size={80} />
     <h1
-      class="mt-6 font-serif text-4xl leading-[1.05] tracking-tight text-surface-950-50 sm:text-5xl lg:mt-10 lg:text-6xl"
+      class="mt-6 break-words font-serif text-[clamp(1.75rem,8vw,2.25rem)] leading-[1.08] tracking-tight text-surface-950-50 sm:text-5xl lg:mt-10 lg:text-6xl"
     >
       {#if savedServer}
         Reconnect to Kavita
@@ -155,7 +155,8 @@
         {#if changeServerAddress}
           Enter a new auth key for the server address below to reopen your saved library.
         {:else}
-          Enter a new auth key for {savedServer.baseUrl} to reopen your saved library.
+          Enter a new auth key for <span class="break-url">{savedServer.baseUrl}</span> to reopen your
+          saved library.
         {/if}
       {:else}
         Connect directly to Kavita. Download EPUB books and keep your place across devices.
@@ -163,9 +164,12 @@
     </p>
   </header>
 
-  <div class="mt-10 flex flex-col gap-5 lg:mt-0" in:fly={{ y: 12, duration: 280, delay: 80 }}>
+  <div
+    class="mt-10 flex min-w-0 flex-col gap-5 lg:mt-0"
+    in:fly={{ y: 12, duration: 280, delay: 80 }}
+  >
     <form
-      class="card preset-filled-surface-50-950 space-y-5 p-6 shadow-2xl sm:p-8"
+      class="card preset-filled-surface-50-950 space-y-5 p-4 shadow-2xl sm:p-8"
       onsubmit={connect}
     >
       {#if !savedServer || changeServerAddress}
@@ -199,15 +203,15 @@
           </label>
         {/if}
       {:else}
-        <div class="label">
+        <div class="label min-w-0">
           <span class="label-text">Kavita server address</span>
-          <span class="text-sm text-surface-700-300">{savedServer.baseUrl}</span>
+          <span class="break-url text-sm text-surface-700-300">{savedServer.baseUrl}</span>
         </div>
       {/if}
 
       {#if savedServer && !editAddress}
         <button
-          class="btn btn-sm preset-tonal-surface h-11 self-start"
+          class="btn btn-sm btn-multiline preset-tonal-surface min-h-11 self-start"
           type="button"
           disabled={busy}
           onclick={() => {
@@ -229,7 +233,7 @@
 
       <div class="label">
         <label class="label-text" for="kavita-auth-key">Auth key</label>
-        <div class="flex gap-2">
+        <div class="responsive-input-row">
           <input
             id="kavita-auth-key"
             class="input min-w-0 flex-1"
@@ -242,7 +246,7 @@
             required
           />
           <button
-            class="btn preset-tonal-surface"
+            class="btn btn-multiline min-h-11 preset-tonal-surface"
             type="button"
             onclick={() => (showKey = !showKey)}
           >
@@ -267,6 +271,7 @@
       <div
         id="connection-error"
         role="alert"
+        class="break-words"
         class:card={error}
         class:p-4={error}
         class:preset-tonal-error={error}
@@ -274,7 +279,11 @@
         {error}
       </div>
 
-      <button class="btn btn-lg preset-filled-primary-700-300 w-full" type="submit" disabled={busy}>
+      <button
+        class="btn btn-lg btn-multiline min-h-11 preset-filled-primary-700-300 w-full"
+        type="submit"
+        disabled={busy}
+      >
         {#if busy}
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5 animate-spin">
             <path
@@ -292,7 +301,7 @@
       </button>
       {#if onCancel}
         <button
-          class="btn preset-tonal-surface w-full"
+          class="btn btn-multiline min-h-11 preset-tonal-surface w-full"
           type="button"
           onclick={onCancel}
           disabled={busy}

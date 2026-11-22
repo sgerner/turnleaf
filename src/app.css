@@ -43,6 +43,49 @@ input {
   font: inherit;
 }
 
+.responsive-input-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.responsive-input-row > .input {
+  flex: 1 1 10rem;
+  min-width: min(100%, max(7.5rem, 120px));
+}
+
+.responsive-input-row > .btn {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 2.75rem;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.btn-multiline {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 2.75rem;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+  padding-block: 0.5rem;
+}
+
+.btn-multiline > :where(svg) {
+  flex-shrink: 0;
+}
+
+.break-url {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 :focus-visible {
   outline: 3px solid
     light-dark(var(--color-primary-700, currentColor), var(--color-primary-300, currentColor));
