@@ -56,7 +56,7 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (handleVolumeKey(keyCode, event, true)) {
+        if (handleReaderKey(keyCode, event, true)) {
             return true;
         }
 
@@ -65,7 +65,7 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (handleVolumeKey(keyCode, event, false)) {
+        if (handleReaderKey(keyCode, event, false)) {
             return true;
         }
 
@@ -74,35 +74,50 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
-        if (handleVolumeKey(event.getKeyCode(), event, event.getAction() == KeyEvent.ACTION_DOWN)) {
+        int action = event.getAction();
+        if (
+            (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) &&
+            handleReaderKey(event.getKeyCode(), event, action == KeyEvent.ACTION_DOWN)
+        ) {
             return true;
         }
 
         return super.dispatchKeyEvent(event);
     }
 
-    private boolean handleVolumeKey(int keyCode, KeyEvent event, boolean down) {
-        if (!VolumeButtonsPlugin.enabled || getBridge() == null) {
+    private boolean handleReaderKey(int keyCode, KeyEvent event, boolean down) {
+        if (getBridge() == null) {
             return false;
         }
 
-        if (keyCode != KeyEvent.KEYCODE_VOLUME_UP && keyCode != KeyEvent.KEYCODE_VOLUME_DOWN) {
-            return false;
-        }
-
-        if (!down) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (!VolumeButtonsPlugin.enabled) {
+                return false;
+            }
+            if (down && event.getRepeatCount() == 0) {
+                String direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP ? "previous" : "next";
+                getBridge().triggerWindowJSEvent(
+                    "turnleafVolumeButton",
+                    "{\"direction\":\"" + direction + "\"}"
+                );
+            }
             return true;
         }
 
-        if (event.getRepeatCount() != 0) {
+        if (keyCode == KeyEvent.KEYCODE_PAGE_UP || keyCode == KeyEvent.KEYCODE_PAGE_DOWN) {
+            if (!ReaderChromePlugin.enabled || !event.hasNoModifiers()) {
+                return false;
+            }
+            if (down && event.getRepeatCount() == 0) {
+                String direction = keyCode == KeyEvent.KEYCODE_PAGE_UP ? "previous" : "next";
+                getBridge().triggerWindowJSEvent(
+                    "turnleafPageButton",
+                    "{\"direction\":\"" + direction + "\"}"
+                );
+            }
             return true;
         }
 
-        String direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP ? "previous" : "next";
-        getBridge().triggerWindowJSEvent(
-            "turnleafVolumeButton",
-            "{\"direction\":\"" + direction + "\"}"
-        );
-        return true;
+        return false;
     }
 }

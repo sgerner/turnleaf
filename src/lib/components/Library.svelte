@@ -330,6 +330,11 @@
     scheduleVirtualWindow();
   }
 
+  function clearSearch(): void {
+    query = '';
+    activeElement()?.blur();
+  }
+
   function clearFilters(): void {
     query = '';
     downloadedOnly = false;
@@ -337,6 +342,7 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
+    activeElement()?.blur();
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
@@ -1567,7 +1573,7 @@
 
 {#if reading}
   {#await import('./Reader.svelte')}
-    <p class="m-8" role="status">Opening reader…</p>
+    <p class="m-8" role="status" data-reader-opening>Opening reader…</p>
   {:then { default: Reader }}
     <Reader
       bookUrl={reading.url}
@@ -1728,7 +1734,7 @@
           <button
             type="button"
             class="btn btn-sm absolute right-1 top-1/2 h-11 w-11 -translate-y-1/2 p-0 preset-filled-surface-200-800"
-            onclick={() => (query = '')}
+            onclick={clearSearch}
             aria-label="Clear search"
             title="Clear search"
           >

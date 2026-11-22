@@ -43,8 +43,12 @@ describe('ReaderSession keyboard navigation', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it('forwards EPUB iframe key events to the reader and removes the listener on destroy', async () => {
-    const onKeyboardNavigation = vi.fn();
+  it('registers a non-passive EPUB iframe keydown listener so preventDefault works and removes it on destroy', async () => {
+    const onKeyboardNavigation = vi.fn((event: KeyboardEvent) => {
+      if (event.key === 'ArrowDown' || event.key === 'PageDown') {
+        event.preventDefault();
+      }
+    });
     const session = new ReaderSession('book.epub');
 
     await session.open(
@@ -59,10 +63,46 @@ describe('ReaderSession keyboard navigation', () => {
       onKeyboardNavigation,
     );
 
-    expect(mockRendition.on).toHaveBeenCalledWith('keydown', onKeyboardNavigation);
+    expect(mockRendition.on).not.toHaveBeenCalledWith('keydown', expect.anything());
+    const registerKeydown = mockRendition.hooks.content.register.mock.calls[1]?.[0] as
+      ((contents: { document: Document }) => void) | undefined;
+    expect(registerKeydown).toBeTypeOf('function');
+
+    const iframe = document.createElement('iframe');
+    document.body.append(iframe);
+    const iframeDoc = iframe.contentDocument!;
+    const addListenerSpy = vi.spyOn(iframeDoc, 'addEventListener');
+    const removeListenerSpy = vi.spyOn(iframeDoc, 'removeEventListener');
+
+    registerKeydown!({ document: iframeDoc });
+    expect(addListenerSpy).toHaveBeenCalledWith('keydown', onKeyboardNavigation, {
+      passive: false,
+    });
+
+    const arrowDown = new KeyboardEvent('keydown', {
+      key: 'ArrowDown',
+      bubbles: true,
+      cancelable: true,
+      view: iframe.contentWindow,
+    });
+    iframeDoc.body.dispatchEvent(arrowDown);
+    expect(onKeyboardNavigation).toHaveBeenCalledOnce();
+    expect(arrowDown.defaultPrevented).toBe(true);
+
     session.destroy();
-    expect(mockRendition.off).toHaveBeenCalledWith('keydown', onKeyboardNavigation);
+    expect(removeListenerSpy).toHaveBeenCalledWith('keydown', onKeyboardNavigation);
     expect(mockBook.destroy).toHaveBeenCalledOnce();
+
+    onKeyboardNavigation.mockClear();
+    const afterDestroy = new KeyboardEvent('keydown', {
+      key: 'PageDown',
+      bubbles: true,
+      cancelable: true,
+      view: iframe.contentWindow,
+    });
+    iframeDoc.body.dispatchEvent(afterDestroy);
+    expect(onKeyboardNavigation).not.toHaveBeenCalled();
+    iframe.remove();
   });
 
   it('turns pages on ordinary content clicks while leaving links and text selection available', async () => {

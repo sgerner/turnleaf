@@ -302,6 +302,7 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+  private readonly keydownDocuments = new Set<Document>();
   private current: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
@@ -424,7 +425,19 @@ export class ReaderSession {
     this.rendition.on('click', this.contentClick);
     if (onKeyboardNavigation) {
       this.keyboardNavigation = onKeyboardNavigation;
-      this.rendition.on('keydown', this.keyboardNavigation);
+      this.rendition.hooks.content.register((contents: Contents) => {
+        const listener = this.keyboardNavigation;
+        const doc = contents.document;
+        if (!doc || !listener) return;
+        for (const existing of this.keydownDocuments) {
+          if (!existing.defaultView) {
+            existing.removeEventListener('keydown', listener);
+            this.keydownDocuments.delete(existing);
+          }
+        }
+        doc.addEventListener('keydown', listener, { passive: false });
+        this.keydownDocuments.add(doc);
+      });
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
@@ -660,8 +673,12 @@ export class ReaderSession {
     this.locationGeneration += 1;
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
-    if (this.rendition && this.keyboardNavigation)
-      this.rendition.off('keydown', this.keyboardNavigation);
+    if (this.keyboardNavigation) {
+      for (const doc of this.keydownDocuments) {
+        doc.removeEventListener('keydown', this.keyboardNavigation);
+      }
+    }
+    this.keydownDocuments.clear();
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;

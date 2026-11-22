@@ -13,6 +13,7 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+  import { forwardStageScrollKey } from './lib/a11y/stage-scroll';
   import { loadTheme } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
@@ -29,6 +30,7 @@
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let appStage = $state<HTMLDivElement | null>(null);
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -96,6 +98,8 @@
   });
 </script>
 
+<svelte:window onkeydown={(event) => forwardStageScrollKey(event, appStage)} />
+
 <div class="app-shell">
   <div class="app-ambient" aria-hidden="true">
     <div class="orb orb-primary"></div>
@@ -105,7 +109,7 @@
     <div class="vignette"></div>
   </div>
 
-  <div class="app-stage">
+  <div class="app-stage" bind:this={appStage}>
     {#if releaseBanner}
       <div class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
         <div
