@@ -44,11 +44,13 @@
     type StoredReaderLocation,
   } from '../reader/bookmarks';
   import {
+    activeElement,
     focusAfterUnmount,
     focusFirstElement,
     focusViewEntry,
     modalFocusTrap,
     restoreFocus,
+    restoreModalFocus,
   } from '../a11y/modal-focus';
 
   type SyncedLocation = {
@@ -322,16 +324,6 @@
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
   }
 
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function restorePanelFocus(opener: HTMLElement | null): void {
-    void tick().then(() => restoreFocus(opener));
-  }
-
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
     void tick().then(() => {
       const controls = panel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
@@ -384,7 +376,7 @@
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -406,7 +398,7 @@
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -429,7 +421,7 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -490,7 +482,7 @@
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -504,7 +496,7 @@
     pendingSyncLocation = null;
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 

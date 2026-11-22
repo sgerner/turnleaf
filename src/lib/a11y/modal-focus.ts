@@ -1,3 +1,4 @@
+import { tick } from 'svelte';
 import type { ActionReturn } from 'svelte/action';
 
 const FOCUSABLE_SELECTOR = [
@@ -116,14 +117,28 @@ function getFocusableElements(container: HTMLElement): HTMLElement[] {
   );
 }
 
+export function activeElement(): HTMLElement | null {
+  return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+}
+
 export function focusFirstElement(container: HTMLElement | null): void {
   if (!container) return;
   const first = getFocusableElements(container)[0];
   focusElement(first ?? container);
 }
 
+export function focusModal(getContainer: () => HTMLElement | null): void {
+  void tick().then(() => focusFirstElement(getContainer()));
+}
+
 export function restoreFocus(element: HTMLElement | null): void {
   focusElement(element);
+}
+
+export function restoreModalFocus(element: HTMLElement | null): void {
+  void tick().then(() => restoreFocus(element));
 }
 
 export function trapModalKeydown(

@@ -1,12 +1,16 @@
 // @vitest-environment jsdom
 
+import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  activeElement,
   focusAfterUnmount,
   focusFirstElement,
+  focusModal,
   focusViewEntry,
   modalFocusTrap,
   restoreFocus,
+  restoreModalFocus,
   trapModalKeydown,
 } from './modal-focus';
 
@@ -21,6 +25,11 @@ beforeEach(() => {
   last = document.createElement('button');
   dialog.append(first, last);
   document.body.append(dialog);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 it('focuses the first available control when a modal opens', () => {
@@ -69,6 +78,59 @@ it('closes on Escape and restores focus to a connected opener', () => {
   expect(close).toHaveBeenCalledOnce();
   expect(event.defaultPrevented).toBe(true);
   expect(document.activeElement).toBe(opener);
+});
+
+it('returns the focused HTMLElement and null for non-HTML targets or missing document', () => {
+  first.focus();
+  expect(activeElement()).toBe(first);
+
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  vi.spyOn(document, 'activeElement', 'get').mockReturnValue(svg);
+  expect(activeElement()).toBeNull();
+
+  vi.stubGlobal('document', undefined);
+  expect(activeElement()).toBeNull();
+});
+
+it('defers modal focus placement until after tick and ignores unmounted containers', async () => {
+  const opener = document.createElement('button');
+  document.body.append(opener);
+  opener.focus();
+
+  let mountedDialog: HTMLElement | null = null;
+  focusModal(() => mountedDialog);
+  expect(document.activeElement).toBe(opener);
+
+  mountedDialog = dialog;
+  await tick();
+  expect(document.activeElement).toBe(first);
+
+  focusModal(() => null);
+  await tick();
+  expect(document.activeElement).toBe(first);
+});
+
+it('defers focus restoration to connected enabled openers and skips disconnected or disabled ones', async () => {
+  const opener = document.createElement('button');
+  document.body.append(opener);
+  first.focus();
+
+  restoreModalFocus(opener);
+  expect(document.activeElement).toBe(first);
+  await tick();
+  expect(document.activeElement).toBe(opener);
+
+  first.focus();
+  opener.disabled = true;
+  restoreModalFocus(opener);
+  await tick();
+  expect(document.activeElement).toBe(first);
+
+  opener.disabled = false;
+  opener.remove();
+  restoreModalFocus(opener);
+  await tick();
+  expect(document.activeElement).toBe(first);
 });
 
 describe('declarative focus actions', () => {
