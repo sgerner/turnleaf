@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
+  import { handleOnboardingBack, type RegisterBackHandler } from '../native/back-button';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
@@ -11,11 +12,13 @@
     savedServer = null,
     editAddress = false,
     onCancel,
+    registerBackHandler,
     onConnected,
   }: {
     savedServer?: ServerConfig | null;
     editAddress?: boolean;
     onCancel?: (() => void) | undefined;
+    registerBackHandler?: RegisterBackHandler | undefined;
     onConnected: (server: ServerConfig, key: string) => void;
   } = $props();
 
@@ -28,6 +31,15 @@
   let error = $state('');
   let invalidField = $state<'address' | 'key' | null>(null);
   let showKey = $state(false);
+
+  onMount(() =>
+    registerBackHandler?.(() =>
+      handleOnboardingBack({
+        busy,
+        onCancel,
+      }),
+    ),
+  );
 
   async function saveConnection(
     server: ServerConfig,

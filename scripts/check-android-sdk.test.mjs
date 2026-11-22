@@ -10,7 +10,7 @@ import {
   validateJavaCompatibility,
   validateAndroidSdk,
 } from './check-android-sdk.mjs';
-import { childEnvironment, gradleTask } from './android-build.mjs';
+import { childEnvironment, gradleTask, gradleTasks } from './android-build.mjs';
 
 describe('Android SDK preflight', () => {
   it('parses a project SDK path from local.properties', () => {
@@ -137,5 +137,7 @@ describe('Android SDK preflight', () => {
     });
     expect(gradleTask('debug')).toBe('assembleDebug');
     expect(gradleTask('release')).toBe('assembleRelease');
+    expect(gradleTasks('debug')).toEqual(['testDebugUnitTest', 'assembleDebug']);
+    expect(gradleTasks('release')).toEqual(['testDebugUnitTest', 'assembleRelease']);
   });
 });

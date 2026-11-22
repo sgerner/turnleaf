@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { Capacitor } from '@capacitor/core';
-  import { onMount } from 'svelte';
+  import { App } from '@capacitor/app';
+  import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
+  import { onDestroy, onMount } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
+  import { createBackButtonStack } from './lib/native/back-button';
   import {
     getPreferences,
     getServer,
@@ -29,6 +31,11 @@
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let destroyed = false;
+  let backButtonHandle: PluginListenerHandle | null = null;
+  const backStack = createBackButtonStack({
+    exitApp: () => void App.exitApp(),
+  });
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -65,6 +72,24 @@
 
   onMount(() => {
     void loadLocalData();
+    void App.addListener('backButton', () => {
+      if (!destroyed) backStack.dispatch();
+    })
+      .then(async (handle) => {
+        if (destroyed) {
+          await handle.remove();
+          return;
+        }
+        backButtonHandle = handle;
+      })
+      .catch(() => {});
+  });
+
+  onDestroy(() => {
+    destroyed = true;
+    const handle = backButtonHandle;
+    backButtonHandle = null;
+    void handle?.remove();
   });
 
   async function repairLocalData(): Promise<void> {
@@ -172,6 +197,7 @@
           server = null;
           apiKey = null;
         }}
+        registerBackHandler={backStack.register}
       />
     {:else if startupError}
       <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
@@ -218,6 +244,7 @@
         savedServer={server}
         editAddress={changingServerAddress}
         onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
+        registerBackHandler={backStack.register}
         onConnected={(connected, key) => {
           apiKey = key;
           server = connected;

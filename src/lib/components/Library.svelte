@@ -46,6 +46,7 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { handleLibraryBack, type RegisterBackHandler } from '../native/back-button';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
@@ -64,6 +65,7 @@
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
+    registerBackHandler,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -74,6 +76,7 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    registerBackHandler?: RegisterBackHandler | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -186,7 +189,7 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
-  let readerBackHandler: (() => boolean) | null = null;
+  let removeBackHandler: (() => void) | null = null;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -495,6 +498,7 @@
   });
 
   onMount(async () => {
+    if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     void cleanupInterruptedEpubDownloads();
     const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
     scrollTarget = scrollContainer ?? window;
@@ -559,21 +563,6 @@
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
           if (!destroyed && !isActive) void syncProgress(false);
-        }),
-      ),
-    );
-    cleanups.push(
-      await registerListener(
-        await App.addListener('backButton', () => {
-          if (destroyed) return;
-          if (conflict) closeConflict();
-          else if (actionMenuBook) closeMenu();
-          else if (reading) {
-            if (readerBackHandler?.()) return;
-            void closeReader();
-          } else if (settingsVisible) closeSettings();
-          else if (filtersVisible) filtersVisible = false;
-          else void App.exitApp();
         }),
       ),
     );
@@ -650,6 +639,8 @@
 
   onDestroy(() => {
     destroyed = true;
+    removeBackHandler?.();
+    removeBackHandler = null;
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1491,11 +1482,27 @@
     void relocated(reading.book, location);
   }
 
-  function registerReaderBackHandler(handler: () => boolean): () => void {
-    readerBackHandler = handler;
-    return () => {
-      if (readerBackHandler === handler) readerBackHandler = null;
-    };
+  function handleBackButton(): boolean {
+    if (destroyed) return false;
+    return handleLibraryBack(
+      {
+        hasConflict: conflict !== null,
+        acceptingRemoteProgress,
+        hasActionMenu: actionMenuBook !== null,
+        hasOpenReader: reading !== null,
+        settingsVisible,
+        filtersVisible,
+      },
+      {
+        closeConflict,
+        closeMenu,
+        closeReader: () => void closeReader(),
+        closeSettings,
+        hideFilters: () => {
+          filtersVisible = false;
+        },
+      },
+    );
   }
 
   async function updateApiKey(event: SubmitEvent): Promise<void> {
@@ -1583,7 +1590,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
-      registerBackHandler={registerReaderBackHandler}
+      {registerBackHandler}
     />
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">

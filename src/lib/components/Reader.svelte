@@ -8,6 +8,8 @@
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
+  import type { RegisterBackHandler } from '../native/back-button';
+  import { handleReaderBack } from '../native/reader-back';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
   import { createReaderNativeFeatures } from '../native/reader-native-features';
@@ -76,7 +78,7 @@
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
-    registerBackHandler?: (handler: () => boolean) => () => void;
+    registerBackHandler?: RegisterBackHandler | undefined;
   } = $props();
 
   let viewport: HTMLDivElement;
@@ -973,24 +975,38 @@
   }
 
   function handleBackButton(): boolean {
-    if (pendingSyncLocation) closeSyncConfirmation();
-    else if (settingsVisible) closeSettings();
-    else if (tocVisible) closeToc();
-    else if (bookmarksVisible) closeBookmarks();
-    else if (annotationsVisible) closeAnnotations();
-    else if (searchVisible) closeSearch();
-    else if (linkReturnTarget) void returnToLink();
-    else if (controlsVisible) {
-      controlsVisible = false;
-      footerVisible = false;
-      pauseChromeHide();
-      void tick().then(() => topRevealButton?.focus());
-    } else {
-      onBack();
-      return true;
-    }
-    showControls();
-    return true;
+    return handleReaderBack(
+      {
+        pendingSyncLocation: pendingSyncLocation !== null,
+        settingsVisible,
+        tocVisible,
+        bookmarksVisible,
+        annotationsVisible,
+        searchVisible,
+        hasLinkReturnTarget: linkReturnTarget !== null,
+        controlsVisible,
+        footerVisible,
+      },
+      {
+        closeSyncConfirmation,
+        closeSettings,
+        closeToc,
+        closeBookmarks,
+        closeAnnotations,
+        closeSearch,
+        returnToLink: () => void returnToLink(),
+        hideChrome: () => {
+          controlsVisible = false;
+          footerVisible = false;
+        },
+        pauseChromeHide,
+        focusTopReveal: () => {
+          void tick().then(() => topRevealButton?.focus());
+        },
+        showControls,
+        onBack,
+      },
+    );
   }
 
   function handleBottomSwipeStart(event: PointerEvent): void {

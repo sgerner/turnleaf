@@ -1,14 +1,23 @@
 package app.turnleaf.reader;
 
-import com.getcapacitor.BridgeActivity;
 import android.os.Bundle;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.Window;
+import android.view.WindowManager;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import com.getcapacitor.BridgeActivity;
 
-public class MainActivity extends BridgeActivity {
+public class MainActivity extends BridgeActivity implements ReaderWindowController {
+    private final ReaderWindowState windowState = new ReaderWindowState();
+
+    @Override
+    public ReaderWindowState getReaderWindowState() {
+        return windowState;
+    }
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(ReaderChromePlugin.class);
@@ -20,24 +29,42 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onResume() {
         super.onResume();
-        applyReaderChrome(ReaderChromePlugin.enabled);
+        applyReaderChrome(windowState.isReaderChromeEnabled());
+        applyKeepAwake(windowState.isKeepAwakeEnabled());
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
-            applyReaderChrome(ReaderChromePlugin.enabled);
+            applyReaderChrome(windowState.isReaderChromeEnabled());
         }
     }
 
-    void applyReaderChrome(boolean enabled) {
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        windowState.reset();
+    }
+
+    @Override
+    public void applyReaderChrome(boolean enabled) {
         runOnUiThread(
             () -> {
                 Window window = getWindow();
+                if (window == null) {
+                    return;
+                }
+                View decorView = window.peekDecorView();
+                if (decorView == null && enabled) {
+                    decorView = window.getDecorView();
+                }
+                if (decorView == null) {
+                    return;
+                }
                 WindowCompat.setDecorFitsSystemWindows(window, !enabled);
                 WindowInsetsControllerCompat controller =
-                    WindowCompat.getInsetsController(window, window.getDecorView());
+                    WindowCompat.getInsetsController(window, decorView);
                 if (controller == null) {
                     return;
                 }
@@ -49,6 +76,23 @@ public class MainActivity extends BridgeActivity {
                     );
                 } else {
                     controller.show(WindowInsetsCompat.Type.systemBars());
+                }
+            }
+        );
+    }
+
+    @Override
+    public void applyKeepAwake(boolean enabled) {
+        runOnUiThread(
+            () -> {
+                Window window = getWindow();
+                if (window == null) {
+                    return;
+                }
+                if (enabled) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                 }
             }
         );
@@ -82,27 +126,22 @@ public class MainActivity extends BridgeActivity {
     }
 
     private boolean handleVolumeKey(int keyCode, KeyEvent event, boolean down) {
-        if (!VolumeButtonsPlugin.enabled || getBridge() == null) {
-            return false;
-        }
-
-        if (keyCode != KeyEvent.KEYCODE_VOLUME_UP && keyCode != KeyEvent.KEYCODE_VOLUME_DOWN) {
-            return false;
-        }
-
-        if (!down) {
-            return true;
-        }
-
-        if (event.getRepeatCount() != 0) {
-            return true;
-        }
-
-        String direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP ? "previous" : "next";
-        getBridge().triggerWindowJSEvent(
-            "turnleafVolumeButton",
-            "{\"direction\":\"" + direction + "\"}"
+        ReaderWindowState.VolumeKeyResult result = windowState.onVolumeKey(
+            keyCode,
+            down,
+            event.getRepeatCount(),
+            getBridge() != null
         );
+        if (!result.consumed) {
+            return false;
+        }
+
+        if (result.direction != null) {
+            getBridge().triggerWindowJSEvent(
+                "turnleafVolumeButton",
+                "{\"direction\":\"" + result.direction + "\"}"
+            );
+        }
         return true;
     }
 }

@@ -27,14 +27,18 @@ export function gradleTask(mode) {
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 
+export function gradleTasks(mode) {
+  return ['testDebugUnitTest', gradleTask(mode)];
+}
+
 export function canReuseWebBuild(environment = process.env) {
   return environment.TURNLEAF_REUSE_WEB_BUILD === 'true';
 }
 
 export async function main(mode = process.argv[2]) {
-  let task;
+  let tasks;
   try {
-    task = gradleTask(mode);
+    tasks = gradleTasks(mode);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
@@ -67,7 +71,7 @@ export async function main(mode = process.argv[2]) {
       cwd: projectRoot,
       env,
     });
-    await runCommand(gradle, [task], { cwd: androidDirectory, env });
+    await runCommand(gradle, tasks, { cwd: androidDirectory, env });
   } catch (error) {
     console.error(error.message);
     process.exitCode = error.exitCode ?? 1;
