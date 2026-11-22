@@ -1,7 +1,18 @@
+import { createRequire } from 'node:module';
 import { render } from 'svelte/server';
 import { describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '../database/database';
 import Onboarding from './Onboarding.svelte';
+
+const require = createRequire(import.meta.url);
+const { JSDOM } = require('jsdom') as {
+  JSDOM: new (html: string) => {
+    window: {
+      document: Document;
+      HTMLInputElement: typeof HTMLInputElement;
+    };
+  };
+};
 
 const savedServer: ServerConfig = {
   id: 'primary',
@@ -17,94 +28,78 @@ function renderOnboarding(
     savedServer?: ServerConfig | null;
     editAddress?: boolean;
   } = {},
-): string {
-  return render(Onboarding, {
+): { document: Document; InputElement: typeof HTMLInputElement } {
+  const { body } = render(Onboarding, {
     props: {
       ...props,
       onConnected: vi.fn(),
     },
-  }).body;
+  });
+  const { window } = new JSDOM(body);
+  return { document: window.document, InputElement: window.HTMLInputElement };
 }
 
-function parseAttributes(tag: string): Record<string, string> {
-  const attributes: Record<string, string> = {};
-  const inner = tag.replace(/^<[a-zA-Z0-9-]+\b/, '').replace(/\/?>$/, '');
-  const attrPattern = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:="([^"]*)")?/g;
-  for (const match of inner.matchAll(attrPattern)) {
-    const name = match[1];
-    if (name) {
-      attributes[name] = match[2] ?? '';
-    }
-  }
-  return attributes;
-}
-
-function stripTags(html: string): string {
-  return html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function findInputById(html: string, id: string): Record<string, string> | null {
-  for (const match of html.matchAll(/<input\b[^>]*>/gi)) {
-    const attrs = parseAttributes(match[0]);
-    if (attrs.id === id) {
-      return attrs;
-    }
-  }
-  return null;
-}
-
-function findLabeledInput(html: string, labelPrefix: string): Record<string, string> | null {
-  for (const match of html.matchAll(/<label\b[^>]*>([\s\S]*?)<\/label>/gi)) {
-    const fullLabel = match[0];
-    const content = match[1] ?? '';
-    if (!stripTags(content).startsWith(labelPrefix)) {
+function findLabeledInput(
+  doc: Document,
+  InputElement: typeof HTMLInputElement,
+  labelPrefix: string,
+): HTMLInputElement | null {
+  for (const label of doc.querySelectorAll('label')) {
+    const text = (label.textContent ?? '').replace(/\s+/g, ' ').trim();
+    if (!text.startsWith(labelPrefix)) {
       continue;
     }
-    const labelOpenTag = fullLabel.match(/^<label\b[^>]*>/i)?.[0] ?? '';
-    const forId = parseAttributes(labelOpenTag).for;
-    if (forId) {
-      return findInputById(html, forId);
+    const htmlFor = label.getAttribute('for');
+    if (htmlFor) {
+      const target = doc.getElementById(htmlFor);
+      return target instanceof InputElement ? target : null;
     }
-    const inputMatch = content.match(/<input\b[^>]*>/i);
-    return inputMatch ? parseAttributes(inputMatch[0]) : null;
+    return label.querySelector('input');
   }
   return null;
 }
 
 describe('Onboarding autocomplete attributes', () => {
   it('sets autocomplete attributes and defaults library name to Books during initial setup', () => {
-    const body = renderOnboarding();
+    const { document: doc, InputElement } = renderOnboarding();
 
-    const serverAddressInput = findLabeledInput(body, 'Kavita server address');
+    const serverAddressInput = findLabeledInput(doc, InputElement, 'Kavita server address');
     expect(serverAddressInput).not.toBeNull();
-    expect(serverAddressInput?.autocomplete).toBe('url');
+    expect(serverAddressInput?.getAttribute('autocomplete')).toBe('url');
 
-    const authKeyInput = findInputById(body, 'kavita-auth-key');
-    expect(authKeyInput).not.toBeNull();
-    expect(authKeyInput?.autocomplete).toBe('off');
+    const authKeyInput = doc.getElementById('kavita-auth-key');
+    expect(authKeyInput).toBeInstanceOf(InputElement);
+    expect(authKeyInput?.getAttribute('autocomplete')).toBe('off');
 
-    const libraryNameInput = findLabeledInput(body, 'Library name Optional');
+    const libraryNameInput = findLabeledInput(doc, InputElement, 'Library name Optional');
     expect(libraryNameInput).not.toBeNull();
-    expect(libraryNameInput?.class).toBe('input');
-    expect(libraryNameInput?.autocomplete).toBe('off');
+    expect(libraryNameInput?.getAttribute('class')).toBe('input');
+    expect(libraryNameInput?.getAttribute('autocomplete')).toBe('off');
     expect(libraryNameInput?.value).toBe('Books');
-    expect(body).not.toContain('autocomplete="organization"');
+    expect(doc.querySelector('[autocomplete="organization"]')).toBeNull();
   });
 
   it('hides the library name input during reconnect while preserving autocomplete attributes', () => {
-    const reconnectBody = renderOnboarding({ savedServer });
-    expect(findLabeledInput(reconnectBody, 'Library name')).toBeNull();
-    expect(findInputById(reconnectBody, 'kavita-auth-key')?.autocomplete).toBe('off');
-
-    const editAddressBody = renderOnboarding({ savedServer, editAddress: true });
-    expect(findLabeledInput(editAddressBody, 'Library name')).toBeNull();
-    expect(findLabeledInput(editAddressBody, 'New Kavita server address')?.autocomplete).toBe(
-      'url',
+    const { document: reconnectDoc, InputElement: ReconnectInput } = renderOnboarding({
+      savedServer,
+    });
+    expect(findLabeledInput(reconnectDoc, ReconnectInput, 'Library name')).toBeNull();
+    expect(reconnectDoc.getElementById('kavita-auth-key')?.getAttribute('autocomplete')).toBe(
+      'off',
     );
-    expect(findInputById(editAddressBody, 'kavita-auth-key')?.autocomplete).toBe('off');
+
+    const { document: editAddressDoc, InputElement: EditInput } = renderOnboarding({
+      savedServer,
+      editAddress: true,
+    });
+    expect(findLabeledInput(editAddressDoc, EditInput, 'Library name')).toBeNull();
+    expect(
+      findLabeledInput(editAddressDoc, EditInput, 'New Kavita server address')?.getAttribute(
+        'autocomplete',
+      ),
+    ).toBe('url');
+    expect(editAddressDoc.getElementById('kavita-auth-key')?.getAttribute('autocomplete')).toBe(
+      'off',
+    );
   });
 });
