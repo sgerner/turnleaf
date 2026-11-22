@@ -305,8 +305,11 @@ export class ReaderSession {
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private current: Location | null = null;
   private openingPromise: Promise<void> | null = null;
+  private resizingPromise: Promise<void> | null = null;
   private restoringInitialLocation = false;
   private resolveInitialRelocation: (() => void) | null = null;
+  private resolveResizeRelocation: (() => void) | null = null;
+  private onResizeTriggered: (() => void) | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
   private userNavigationPending = false;
@@ -399,6 +402,13 @@ export class ReaderSession {
       this.resolveInitialRelocation?.();
       pendingInitialRelocation = new Promise<void>((resolve) => {
         const timer = setTimeout(() => {
+          if (!this.current) {
+            const fallback = this.readCurrentLocation();
+            if (fallback) {
+              this.current = fallback;
+              this.reportLocation(fallback, 'restore');
+            }
+          }
           this.resolveInitialRelocation?.();
         }, 1_000);
         this.resolveInitialRelocation = () => {
@@ -414,6 +424,7 @@ export class ReaderSession {
     };
     this.rendition.on('displayed', this.displayed);
     this.resized = () => {
+      this.onResizeTriggered?.();
       if (applyingPendingResize) {
         pendingResizeTriggered = true;
         return;
@@ -453,6 +464,7 @@ export class ReaderSession {
       }
       this.reportLocation(location, origin, returnTarget);
       this.resolveInitialRelocation?.();
+      this.resolveResizeRelocation?.();
       if (this.pendingResize && !this.restoringInitialLocation) {
         const nextSize = this.pendingResize;
         this.pendingResize = null;
@@ -526,7 +538,8 @@ export class ReaderSession {
         const nextSize = this.consumePendingResize();
         if (!nextSize && !needsInitialRedisplay) break;
         needsInitialRedisplay = false;
-        const targetCfi = this.current?.start.cfi ?? this.rendition?.location?.start.cfi;
+        const targetCfi =
+          this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? cfi ?? undefined;
         if (nextSize) {
           this.viewportSize = nextSize;
           const hasRenditionLocation = Boolean(this.rendition?.location?.start);
@@ -800,9 +813,12 @@ export class ReaderSession {
   destroy(): void {
     this.locationGeneration += 1;
     this.openingPromise = null;
+    this.resizingPromise = null;
     this.restoringInitialLocation = false;
     this.pendingResize = null;
+    this.onResizeTriggered = null;
     this.resolveInitialRelocation?.();
+    this.resolveResizeRelocation?.();
     if (this.rendition && this.displayed) this.rendition.off('displayed', this.displayed);
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.resized) this.rendition.off('resized', this.resized);
@@ -866,7 +882,7 @@ export class ReaderSession {
         this.pendingResize = null;
         return;
       }
-      if (this.restoringInitialLocation || this.userNavigationPending) {
+      if (this.restoringInitialLocation || this.userNavigationPending || this.resizingPromise) {
         this.pendingResize = { width, height };
         return;
       }
@@ -882,6 +898,49 @@ export class ReaderSession {
     return nextSize;
   }
 
+  private readCurrentLocation(): Location | null {
+    const rendition = this.rendition;
+    if (!rendition) return null;
+    if (rendition.location?.start?.cfi) return rendition.location;
+    try {
+      const current = (
+        rendition as unknown as { currentLocation?: () => unknown }
+      ).currentLocation?.();
+      if (
+        current &&
+        typeof current === 'object' &&
+        !(current instanceof Promise) &&
+        'start' in current
+      ) {
+        const candidate = current as Location;
+        if (candidate.start?.cfi) return candidate;
+      }
+    } catch {
+      // EPUB.js can throw if layout metrics are not ready yet.
+    }
+    return null;
+  }
+
+  private armResizeRelocation(): void {
+    this.resolveResizeRelocation?.();
+    this.resizingPromise = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        const fallback = this.readCurrentLocation();
+        if (fallback) {
+          this.current = fallback;
+          this.reportLocation(fallback, 'restore');
+        }
+        this.resolveResizeRelocation?.();
+      }, 1_000);
+      this.resolveResizeRelocation = () => {
+        clearTimeout(timer);
+        this.resolveResizeRelocation = null;
+        this.resizingPromise = null;
+        resolve();
+      };
+    });
+  }
+
   private resizeRendition(width: number, height: number, epubcfi?: string): void {
     const rendition = this.rendition as
       (Rendition & { resize: (width: number, height: number, epubcfi?: string) => void }) | null;
@@ -895,9 +954,21 @@ export class ReaderSession {
     if (!rendition) return;
     this.viewportSize = { width, height };
     const targetCfi = this.current?.start.cfi ?? rendition.location?.start.cfi;
-    this.resizeRendition(width, height, targetCfi);
-    if (targetCfi && !rendition.location?.start) {
+    const hadRenditionLocation = Boolean(rendition.location?.start);
+    let resizeTriggered = false;
+    this.onResizeTriggered = () => {
+      resizeTriggered = true;
+    };
+    try {
+      this.resizeRendition(width, height, targetCfi);
+    } finally {
+      this.onResizeTriggered = null;
+    }
+    if (targetCfi && !hadRenditionLocation) {
       this.preserveCfi(targetCfi, this.locationGeneration);
+    }
+    if (resizeTriggered && targetCfi) {
+      this.armResizeRelocation();
     }
   }
 
@@ -1002,6 +1073,7 @@ export class ReaderSession {
     origin: 'navigation' | 'jump' = 'navigation',
   ): Promise<void> {
     if (this.openingPromise) await this.openingPromise;
+    if (this.resizingPromise) await this.resizingPromise;
     if (!this.rendition) throw new Error('Reader is not open.');
     const generation = this.beginLocationOperation(true, origin);
     try {

@@ -705,4 +705,100 @@ describe('ReaderSession', () => {
       vi.useRealTimers();
     }
   });
+
+  it('seeds initial location from currentLocation on slow rAF so next() still saves Chapter 2 as navigation', async () => {
+    vi.useFakeTimers();
+    try {
+      const onLocation = vi.fn();
+      const session = new ReaderSession('book.epub');
+      const chapter1Loc = location('chapter-1-cfi');
+      const chapter2Loc = location('chapter-2-cfi');
+      (
+        mockRendition as typeof mockRendition & { currentLocation?: () => Location }
+      ).currentLocation = () => chapter1Loc;
+      mockRendition.display.mockImplementationOnce(async () => {
+        getRenditionListener('displayed')();
+      });
+
+      const openPromise = session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        onLocation,
+        vi.fn(),
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      await openPromise;
+
+      const relocated = getRenditionListener('relocated');
+      mockRendition.next.mockImplementationOnce(async () => {
+        // Delayed Chapter 1 rAF arrives before Chapter 2 relocation
+        relocated(chapter1Loc);
+        relocated(chapter2Loc);
+      });
+
+      await session.next();
+
+      expect(onLocation.mock.calls.map(([loc, origin]) => [loc.cfi, origin])).toEqual([
+        ['chapter-1-cfi', 'restore'],
+        ['chapter-1-cfi', 'restore'],
+        ['chapter-2-cfi', 'navigation'],
+      ]);
+      session.destroy();
+    } finally {
+      delete (mockRendition as { currentLocation?: unknown }).currentLocation;
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits for an in-flight post-open viewport resize redisplay before starting next()', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 850));
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+    relocated(location('page-1-cfi'));
+
+    mockRendition.resize.mockImplementationOnce(() => {
+      getRenditionListener('resized')();
+    });
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    mockRendition.next.mockImplementationOnce(async () => {
+      relocated(location('page-2-cfi'));
+    });
+
+    const nextPromise = session.next();
+    await Promise.resolve();
+    expect(mockRendition.next).not.toHaveBeenCalled();
+
+    // Reflowed page 1 CFI arrives from the resize redisplay before next() runs
+    relocated(location('page-1-reflowed-cfi'));
+    await nextPromise;
+
+    expect(mockRendition.next).toHaveBeenCalledOnce();
+    expect(onLocation.mock.calls.map(([loc, origin]) => [loc.cfi, origin])).toEqual([
+      ['page-1-cfi', 'restore'],
+      ['page-1-reflowed-cfi', 'restore'],
+      ['page-2-cfi', 'navigation'],
+    ]);
+    session.destroy();
+  });
 });

@@ -113,6 +113,7 @@ vi.mock('./lib/reader/session', () => ({
   },
 }));
 
+import { Network } from '@capacitor/network';
 import App from './App.svelte';
 
 const savedServer: ServerConfig = {
@@ -353,5 +354,69 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     });
     flushSync();
     expect(target.querySelector('.app-ambient')).not.toBeNull();
+  });
+
+  it('ignores duplicate online networkStatusChange events and aborts cover transfers on disconnect', async () => {
+    const captured: {
+      networkListener: ((status: { connected: boolean; connectionType: string }) => void) | null;
+      coverSignal: AbortSignal | undefined;
+    } = {
+      networkListener: null,
+      coverSignal: undefined,
+    };
+    vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
+    vi.mocked(Network.addListener).mockImplementation(async (event, cb) => {
+      if (event === 'networkStatusChange') {
+        captured.networkListener = cb as NonNullable<typeof captured.networkListener>;
+      }
+      return { remove: async () => {} };
+    });
+
+    let libraryFetches = 0;
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async (input, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes('/api/Series/v2')) {
+          libraryFetches += 1;
+        }
+        if (url.includes('/api/Image/series-cover')) {
+          captured.coverSignal = init?.signal ?? undefined;
+          return new Promise<Response>(() => {});
+        }
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+    try {
+      mounted = mount(App, { target });
+
+      await vi.waitFor(() => {
+        expect(captured.networkListener).not.toBeNull();
+        expect(libraryFetches).toBe(1);
+        expect(captured.coverSignal).toBeDefined();
+      });
+
+      // Wi-Fi -> Cellular handoff while already online should not trigger another catalog refresh
+      captured.networkListener?.({ connected: true, connectionType: 'cellular' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(libraryFetches).toBe(1);
+
+      // Going offline should abort any active cover request
+      vi.mocked(Network.getStatus).mockResolvedValue({ connected: false, connectionType: 'none' });
+      captured.networkListener?.({ connected: false, connectionType: 'none' });
+      expect(captured.coverSignal?.aborted).toBe(true);
+
+      // Reconnecting from offline should refresh again
+      vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
+      captured.networkListener?.({ connected: true, connectionType: 'wifi' });
+      await vi.waitFor(() => {
+        expect(libraryFetches).toBe(2);
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
