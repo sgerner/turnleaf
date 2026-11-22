@@ -339,4 +339,126 @@ describe('ReaderSession keyboard navigation', () => {
     ]);
     session.destroy();
   });
+
+  it('defers viewport resizes until initial display finishes and re-displays the active CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveStarted!: () => void;
+    mockRendition.started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    const chapterOne = {
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 1 },
+      },
+      atEnd: false,
+    };
+    mockRendition.currentLocation = () => chapterOne;
+
+    const session = new ReaderSession('book.epub');
+    const opening = session.open(
+      document.createElement('div'),
+      'epubcfi(/6/2!/4/2/1:0)',
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 914 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    resolveStarted();
+    await opening;
+    mockRendition.started = Promise.resolve();
+
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+      411,
+      914,
+      'epubcfi(/6/2!/4/2/1:0)',
+    );
+    expect(mockRendition.display).toHaveBeenNthCalledWith(1, 'epubcfi(/6/2!/4/2/1:0)');
+    expect(mockRendition.display).toHaveBeenNthCalledWith(2, 'epubcfi(/6/2!/4/2/1:0)');
+    session.destroy();
+  });
+
+  it('defers viewport resizes during next() until relocation settles on the destination chapter', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const chapterOne = {
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 1 },
+      },
+      atEnd: false,
+    };
+    const chapterTwo = {
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        displayed: { page: 1, total: 1 },
+      },
+      atEnd: true,
+    };
+    let live = chapterOne;
+    mockRendition.currentLocation = () => live;
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated(chapterOne);
+
+    mockRendition.next.mockImplementationOnce(async () => {
+      live = chapterTwo;
+    });
+    await expect(session.next()).resolves.toBe(true);
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 890 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    relocated(chapterTwo);
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+      411,
+      890,
+      'epubcfi(/6/4!/4/2/1:0)',
+    );
+    session.destroy();
+  });
 });

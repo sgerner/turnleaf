@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: guard Android reader viewport resize and offline network handoff
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
