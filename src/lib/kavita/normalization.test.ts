@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import {
   KavitaPayloadError,
   normalizeLibraries,
@@ -459,5 +460,83 @@ describe('normalizeSeriesDetail', () => {
       'string',
       secret,
     );
+  });
+
+  it('normalizes optional chapter and volume sequence metadata and propagates volume numbers', () => {
+    const normalized = normalizeSeriesDetail(
+      detail({
+        volumes: [
+          {
+            id: '15',
+            minNumber: '2',
+            maxNumber: 2,
+            number: 2,
+            name: '2',
+            chapters: [
+              chapter({
+                id: 25,
+                volumeId: undefined,
+                sortOrder: '2.5',
+                minNumber: '2',
+                maxNumber: 2,
+                volumeTitle: 'Vol. 2',
+                hasCoverImage: true,
+                isSpecial: false,
+              }),
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(normalized.volumes![0]).toMatchObject({
+      id: 15,
+      minNumber: 2,
+      maxNumber: 2,
+      number: 2,
+      name: '2',
+    });
+    expect(normalized.volumes![0]!.chapters[0]).toMatchObject({
+      id: 25,
+      volumeId: 15,
+      sortOrder: 2.5,
+      minNumber: 2,
+      maxNumber: 2,
+      volumeTitle: 'Vol. 2',
+      hasCoverImage: true,
+      isSpecial: false,
+    });
+  });
+
+  it('defaults malformed optional sequence fields to null without leaking values', () => {
+    clearDiagnostics();
+    const secret = 'SECRET-SORT-VALUE';
+    const normalized = normalizeSeriesDetail(
+      detail({
+        volumes: [
+          {
+            id: 18,
+            minNumber: secret,
+            chapters: [
+              chapter({
+                sortOrder: { bad: secret },
+                hasCoverImage: 'yes',
+                isSpecial: 1,
+              }),
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(normalized.volumes![0]!.minNumber).toBeUndefined();
+    expect(normalized.volumes![0]!.chapters[0]!.sortOrder).toBeUndefined();
+    expect(normalized.volumes![0]!.chapters[0]!.hasCoverImage).toBeUndefined();
+    expect(normalized.volumes![0]!.chapters[0]!.isSpecial).toBeUndefined();
+    const log = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+    expect(log).toContain('path=$.volumes[0].minNumber');
+    expect(log).toContain('path=$.volumes[0].chapters[0].sortOrder');
+    expect(log).not.toContain(secret);
+    expect(JSON.stringify(normalized)).not.toContain(secret);
   });
 });

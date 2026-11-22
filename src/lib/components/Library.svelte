@@ -7,6 +7,7 @@
   import { fade, fly } from 'svelte/transition';
   import {
     getBooks,
+    getBookDescription,
     getReadingState,
     getPreferences,
     getSyncStatus,
@@ -26,7 +27,7 @@
     type StoredReadingState,
   } from '../database/database';
   import {
-    cacheCover,
+    cacheBookCover,
     clearCoverCache,
     cleanupInterruptedEpubDownloads,
     deleteDownloadedEpub,
@@ -38,11 +39,23 @@
   import { EpubValidationError } from '../downloads/epub-validation';
   import {
     createSharedCoverLoader,
+    evictOffscreenCovers,
     loadCoversWithConcurrency,
     type CoverLoadItem,
   } from '../downloads/cover-loader';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
+  import {
+    findNextSeriesBook,
+    formatFileSize,
+    formatSeriesLabel,
+    isBookAccessible,
+    isBookCompleted,
+    sanitizeSynopsisToPlainText,
+    selectContinueBook,
+    sortLibraryBooks,
+    type LibrarySortOrder,
+  } from '../library/series-metadata';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
@@ -75,25 +88,31 @@
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
   } = $props();
-  type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
-  const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
-    if (Capacitor.isNativePlatform()) {
-      return cacheCover(
-        client.coverUrl(seriesId),
-        apiKey,
-        seriesId,
-        signal,
-        server.id,
-        await networkAvailable(),
-      );
-    }
-    if (offline) throw new Error('Offline');
-    const blob = await client.getCover(seriesId, signal);
-    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-    return blob;
-  });
+  const coverMetaByBookId = new SvelteMap<string, { chapterId: number; seriesId: number }>();
+  const sharedCoverLoader = createSharedCoverLoader<string | Blob, string>(
+    async (bookId, signal) => {
+      const meta = coverMetaByBookId.get(bookId);
+      if (!meta) throw new Error('Unknown book cover');
+      if (Capacitor.isNativePlatform()) {
+        return cacheBookCover({
+          chapterCoverUrl: client.chapterCoverUrl(meta.chapterId),
+          seriesCoverUrl: client.coverUrl(meta.seriesId),
+          apiKey,
+          chapterId: meta.chapterId,
+          seriesId: meta.seriesId,
+          signal,
+          cacheNamespace: server.id,
+          allowDownload: await networkAvailable(),
+        });
+      }
+      if (offline) throw new Error('Offline');
+      const blob = await client.getBookCover(meta.chapterId, meta.seriesId, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      return blob;
+    },
+  );
   let books = $state<BookRecord[]>([]);
   let displayableBooks = $derived(
     books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
@@ -140,26 +159,10 @@
       ]),
     ),
   );
-  const sortedBooks = $derived(
-    [...displayableBooks].sort((a, b) => {
-      if (sortOrder === 'recent') {
-        return (
-          (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? '') || a.title.localeCompare(b.title)
-        );
-      }
-      if (sortOrder === 'author') {
-        return (
-          (a.author ?? '').localeCompare(b.author ?? '') ||
-          a.title.localeCompare(b.title) ||
-          a.id.localeCompare(b.id)
-        );
-      }
-      return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
-    }),
-  );
+  const sortedBooks = $derived(sortLibraryBooks(displayableBooks, sortOrder));
   const visibleBooks = $derived(
     sortedBooks.filter((book) => {
-      const completed = book.pages > 0 && book.pagesRead >= book.pages;
+      const completed = isBookCompleted(book);
       return (
         queryTerms.every((term) => searchableText.get(book.id)?.includes(term)) &&
         (!downloadedOnly || Boolean(book.downloadPath)) &&
@@ -169,16 +172,10 @@
       );
     }),
   );
-  // Surface the most recently read, downloaded, in-progress book as a one-tap resume.
-  let continueBook = $derived.by(() => {
-    let latest: BookRecord | null = null;
-    for (const book of displayableBooks) {
-      if (!book.downloadPath || book.pages <= 0 || book.pagesRead >= book.pages || !book.lastReadAt)
-        continue;
-      if (!latest || book.lastReadAt.localeCompare(latest.lastReadAt ?? '') > 0) latest = book;
-    }
-    return latest;
-  });
+  let offline = $state(false);
+  // Surface the latest in-progress book (including remote when online) or next unread sequel.
+  let continueSelection = $derived(selectContinueBook(displayableBooks, offline));
+  let continueBook = $derived(continueSelection?.book ?? null);
   let reading = $state<{
     book: BookRecord;
     url: string;
@@ -186,6 +183,9 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
+  let nextReaderBook = $derived(
+    reading ? findNextSeriesBook(displayableBooks, reading.book, { offline: false }) : null,
+  );
   let readerBackHandler: (() => boolean) | null = null;
   let conflict = $state<{
     book: BookRecord;
@@ -194,7 +194,7 @@
     remote: KavitaProgress;
   } | null>(null);
   let conflictError = $state('');
-  const covers = new SvelteMap<number, string>();
+  const covers = new SvelteMap<string, string>();
   let coverReloadRequest = $state(0);
   let loading = $state(true);
   let refreshing = $state(false);
@@ -206,7 +206,6 @@
   let downloadFailureBook = $state<BookRecord | null>(null);
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
-  let offline = $state(false);
   let message = $state('');
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
@@ -235,6 +234,9 @@
   let confirmDeleteServer = $state(false);
   let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
+  let actionMenuSynopsis = $state('');
+  let actionMenuSynopsisLoading = $state(false);
+  let actionMenuDescriptionRequest = 0;
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
@@ -255,7 +257,7 @@
     return rows;
   });
   let visibleCoverKey = $derived.by(() => {
-    if (reading) return `${coverReloadRequest}:`;
+    if (reading) return `${coverReloadRequest}\n`;
     const firstIndex = virtualWindow.startIndex;
     const endIndex = virtualWindow.endIndex;
     const viewportBooks =
@@ -263,7 +265,7 @@
         ? visibleBooks.slice(firstIndex, endIndex)
         : visibleBooks.slice(0, Math.min(visibleBooks.length, gridColumns * 3));
     const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
-    return `${coverReloadRequest}:${[...new Set(booksToCover.map((book) => book.seriesId))].join(',')}`;
+    return `${coverReloadRequest}\n${[...new Set(booksToCover.map((book) => book.id))].join('\n')}`;
   });
   let scrollTarget: HTMLElement | Window | null = null;
   let virtualizationFrame: number | null = null;
@@ -294,10 +296,12 @@
   }
 
   function openBookLabel(book: BookRecord, includeProgress = true): string {
+    const seriesLabel = formatSeriesLabel(book);
+    const seriesPart = seriesLabel ? `, ${seriesLabel}` : '';
     const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
     const progress =
       includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
-    return `Open ${book.title}${downloaded}${progress}`;
+    return `Open ${book.title}${seriesPart}${downloaded}${progress}`;
   }
 
   function parseSortOrder(value: string | null): LibrarySortOrder {
@@ -370,9 +374,9 @@
 
   function rowHeightFor(width: number, columns: number): number {
     const rem = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-    if (viewMode === 'list') return Math.ceil(rem * 9.5);
+    if (viewMode === 'list') return Math.ceil(rem * 10.5);
     const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
-    return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 5 + GRID_ROW_GAP_PX));
+    return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 7.75 + GRID_ROW_GAP_PX));
   }
 
   function scheduleVirtualWindow(): void {
@@ -476,10 +480,24 @@
   });
 
   $effect(() => {
-    const [, ids] = visibleCoverKey.split(':');
+    const [, ...rawIds] = visibleCoverKey.split('\n');
     if (loading) return;
-    const items = ids ? ids.split(',').map((id) => ({ seriesId: Number(id) })) : [];
-    untrack(() => void loadCovers(items));
+    const ids = rawIds.filter(Boolean);
+    untrack(() => {
+      const byId = new Map(books.map((book) => [book.id, book]));
+      const items: CoverLoadItem<string>[] = [];
+      for (const id of ids) {
+        const book = byId.get(id);
+        if (!book) continue;
+        coverMetaByBookId.set(book.id, { chapterId: book.chapterId, seriesId: book.seriesId });
+        items.push({
+          key: book.id,
+          seriesId: book.seriesId,
+          chapterId: book.chapterId,
+        });
+      }
+      void loadCovers(items);
+    });
   });
 
   $effect(() => {
@@ -786,28 +804,30 @@
   }
 
   function retainCoversFor(items: BookRecord[]): void {
-    const seriesIds = new Set(items.map((item) => item.seriesId));
-    for (const [seriesId, cover] of covers) {
-      if (seriesIds.has(seriesId)) continue;
+    const bookIds = new Set(items.map((item) => item.id));
+    for (const item of items) {
+      coverMetaByBookId.set(item.id, { chapterId: item.chapterId, seriesId: item.seriesId });
+    }
+    for (const id of coverMetaByBookId.keys()) {
+      if (!bookIds.has(id)) coverMetaByBookId.delete(id);
+    }
+    for (const [bookId, cover] of covers) {
+      if (bookIds.has(bookId)) continue;
       revokeBrowserCover(cover);
-      covers.delete(seriesId);
+      covers.delete(bookId);
     }
   }
 
-  async function loadCovers(items: CoverLoadItem[]): Promise<void> {
+  async function loadCovers(items: CoverLoadItem<string>[]): Promise<void> {
     if (destroyed) return;
-    const visibleSeriesIds = new Set(items.map((item) => item.seriesId));
-    const offscreen = [...covers.keys()].filter((seriesId) => !visibleSeriesIds.has(seriesId));
-    for (const seriesId of offscreen.slice(
-      0,
-      Math.max(0, offscreen.length - OFFSCREEN_COVER_LIMIT),
-    )) {
-      const cover = covers.get(seriesId);
-      if (cover) revokeBrowserCover(cover);
-      covers.delete(seriesId);
-    }
+    const visibleBookIds = new Set(
+      items.map((item) => item.key).filter((key): key is string => Boolean(key)),
+    );
+    evictOffscreenCovers(covers, visibleBookIds, OFFSCREEN_COVER_LIMIT, (cover) =>
+      revokeBrowserCover(cover),
+    );
     cancelCoverLoading();
-    sharedCoverLoader.retain(visibleSeriesIds);
+    sharedCoverLoader.retain(visibleBookIds);
     const controller = new AbortController();
     const generation = coverLoadGeneration;
     coverLoadController = controller;
@@ -815,16 +835,16 @@
       await loadCoversWithConcurrency(items, {
         signal: controller.signal,
         concurrency: COVER_LOAD_CONCURRENCY,
-        hasCover: (seriesId) => Boolean(covers.get(seriesId)),
-        load: (seriesId) => sharedCoverLoader.load(seriesId),
-        onLoaded: (seriesId, cover) => {
+        hasCover: (bookId) => Boolean(covers.get(bookId)),
+        load: (bookId) => sharedCoverLoader.load(bookId),
+        onLoaded: (bookId, cover) => {
           if (destroyed || controller.signal.aborted || generation !== coverLoadGeneration) {
             return;
           }
           const displayCover = typeof cover === 'string' ? cover : URL.createObjectURL(cover);
-          const previous = covers.get(seriesId);
+          const previous = covers.get(bookId);
           if (previous && previous !== displayCover) revokeBrowserCover(previous);
-          covers.set(seriesId, displayCover);
+          covers.set(bookId, displayCover);
         },
       });
     } finally {
@@ -978,7 +998,6 @@
             ...item,
             downloadPath: null,
             downloadStatus: 'none',
-            fileSize: null,
           }
         : item,
     );
@@ -1215,7 +1234,90 @@
     }
   }
 
+  async function markReaderBookCompleted(book: BookRecord): Promise<void> {
+    if (book.pages <= 0) return;
+    const readingState = await getReadingState(book.id);
+    await markBookCompleted(book, readingState);
+    const savedBook = books.find((item) => item.id === book.id);
+    const completedAt = new Date().toISOString();
+    if (savedBook) {
+      savedBook.pagesRead = book.pages;
+      savedBook.lastReadAt = completedAt;
+    }
+    if (reading?.book.id === book.id) {
+      reading.book = { ...reading.book, pagesRead: book.pages, lastReadAt: completedAt };
+    }
+    void syncProgress(false);
+  }
+
+  async function openNextFromReader(nextBook: BookRecord): Promise<void> {
+    let target = books.find((item) => item.id === nextBook.id) ?? nextBook;
+    if (!target.downloadPath) {
+      if (offline || target.remoteAvailable === false) {
+        throw new Error('Connect to Kavita to download the next volume.');
+      }
+      const downloaded = await download(target);
+      if (!downloaded) {
+        throw new Error(message || 'Turnleaf could not download the next volume.');
+      }
+      target = downloaded;
+    }
+    reading = null;
+    await tick();
+    await open(target);
+  }
+
+  async function restoreLibraryBookFocus(
+    targetBook: BookRecord | null,
+    opener: HTMLElement | null = null,
+  ): Promise<void> {
+    await tick();
+    if (reading || actionMenuBook || conflict || !libraryMain) return;
+
+    if (opener?.isConnected && libraryMain.contains(opener)) {
+      restoreFocus(opener);
+      if (libraryMain.contains(document.activeElement)) return;
+    }
+
+    if (targetBook && virtualGrid) {
+      let index = visibleBooks.findIndex((item) => item.id === targetBook.id);
+      if (index < 0) {
+        const nextInSeries = findNextSeriesBook(displayableBooks, targetBook, {
+          offline,
+          unreadOnly: hideCompleted,
+        });
+        if (nextInSeries) {
+          index = visibleBooks.findIndex((item) => item.id === nextInSeries.id);
+        }
+      }
+      if (index >= 0) {
+        const card = await scrollToBook(index);
+        const control =
+          card?.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
+          card?.querySelector<HTMLElement>('[data-book-actions]');
+        if (control) {
+          control.focus();
+          return;
+        }
+      }
+    }
+
+    const continueButton = libraryMain.querySelector<HTMLElement>('[data-continue-reading]');
+    if (continueButton) {
+      continueButton.focus();
+      return;
+    }
+
+    libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+  }
+
   async function markDone(book: BookRecord): Promise<void> {
+    const opener = actionMenuOpener;
+    actionMenuBook = null;
+    actionMenuOpener = null;
+    actionMenuSynopsis = '';
+    actionMenuSynopsisLoading = false;
+    actionMenuDescriptionRequest += 1;
     const readingState = await getReadingState(book.id);
     await markBookCompleted(book, readingState);
     const savedBook = books.find((item) => item.id === book.id);
@@ -1225,7 +1327,7 @@
     }
     void syncProgress(false);
     message = `${book.title} marked as read.`;
-    closeMenu();
+    await restoreLibraryBookFocus(savedBook ?? book, opener);
   }
 
   async function syncFurthest(book: BookRecord): Promise<void> {
@@ -1234,42 +1336,62 @@
   }
 
   async function closeReader(): Promise<void> {
-    const bookId = reading?.book.id;
+    const previousBook = reading?.book ?? null;
+    const targetBook =
+      (previousBook ? books.find((book) => book.id === previousBook.id) : null) ?? previousBook;
     reading = null;
-    await tick();
-    if (reading || !libraryMain) return;
-
-    const index = visibleBooks.findIndex((book) => book.id === bookId);
-    if (index >= 0 && virtualGrid) {
-      const card = await scrollToBook(index);
-      const control =
-        card?.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
-        card?.querySelector<HTMLElement>('[data-book-actions]');
-      if (control) {
-        control.focus();
-        return;
-      }
-    }
-    libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+    await restoreLibraryBookFocus(targetBook);
   }
 
   function openMenu(book: BookRecord): void {
     actionMenuOpener = activeElement();
-    actionMenuBook = book;
+    const latestBook = books.find((item) => item.id === book.id) ?? book;
+    actionMenuBook = latestBook;
+    actionMenuSynopsis = '';
+    const requestId = ++actionMenuDescriptionRequest;
+    actionMenuSynopsisLoading = true;
     focusModal(() => actionMenuDialog);
+    void getBookDescription(latestBook.id)
+      .then((rawHtml) => {
+        if (
+          destroyed ||
+          requestId !== actionMenuDescriptionRequest ||
+          actionMenuBook?.id !== latestBook.id
+        ) {
+          return;
+        }
+        actionMenuSynopsis = sanitizeSynopsisToPlainText(rawHtml);
+      })
+      .catch(() => {
+        if (
+          destroyed ||
+          requestId !== actionMenuDescriptionRequest ||
+          actionMenuBook?.id !== latestBook.id
+        ) {
+          return;
+        }
+        actionMenuSynopsis = '';
+      })
+      .finally(() => {
+        if (
+          !destroyed &&
+          requestId === actionMenuDescriptionRequest &&
+          actionMenuBook?.id === latestBook.id
+        ) {
+          actionMenuSynopsisLoading = false;
+        }
+      });
   }
 
   function closeMenu(): void {
+    const previousBook = actionMenuBook;
     actionMenuBook = null;
+    actionMenuSynopsis = '';
+    actionMenuSynopsisLoading = false;
+    actionMenuDescriptionRequest += 1;
     const opener = actionMenuOpener;
     actionMenuOpener = null;
-    void tick().then(() => {
-      if (reading || actionMenuBook || !libraryMain) return;
-      restoreFocus(opener);
-      if (!libraryMain.contains(document.activeElement)) {
-        libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
-      }
-    });
+    void restoreLibraryBookFocus(previousBook, opener);
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
@@ -1569,22 +1691,34 @@
   {#await import('./Reader.svelte')}
     <p class="m-8" role="status">Opening reader…</p>
   {:then { default: Reader }}
-    <Reader
-      bookUrl={reading.url}
-      bookId={reading.book.id}
-      title={reading.book.title}
-      defaultMode={mode}
-      initialCfi={reading.cfi}
-      initialXPath={reading.xpath}
-      initialPercentage={reading.percentage}
-      onBack={() => void closeReader()}
-      onRelocated={handleRelocated}
-      onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
-      onRetryDownload={offline || reading.book.remoteAvailable === false
-        ? undefined
-        : retryReaderDownload}
-      registerBackHandler={registerReaderBackHandler}
-    />
+    {#key reading.book.id}
+      <Reader
+        bookUrl={reading.url}
+        bookId={reading.book.id}
+        title={reading.book.title}
+        defaultMode={mode}
+        initialCfi={reading.cfi}
+        initialXPath={reading.xpath}
+        initialPercentage={reading.percentage}
+        nextBook={nextReaderBook
+          ? {
+              title: nextReaderBook.title,
+              seriesLabel: formatSeriesLabel(nextReaderBook),
+              downloaded: Boolean(nextReaderBook.downloadPath),
+              available: isBookAccessible(nextReaderBook, offline),
+            }
+          : null}
+        onBack={() => void closeReader()}
+        onRelocated={handleRelocated}
+        onBookCompleted={() => void markReaderBookCompleted(reading!.book)}
+        onOpenNextBook={nextReaderBook ? () => openNextFromReader(nextReaderBook!) : undefined}
+        onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
+        onRetryDownload={offline || reading.book.remoteAvailable === false
+          ? undefined
+          : retryReaderDownload}
+        registerBackHandler={registerReaderBackHandler}
+      />
+    {/key}
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
       <p role="alert">Turnleaf could not load the reader. Reload the app to try again.</p>
@@ -1657,17 +1791,23 @@
     </header>
 
     {#if continueBook}
+      {@const continueSeries = formatSeriesLabel(continueBook)}
+      {@const continueProgress = Math.round(progressOf(continueBook))}
       <button
         class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
         type="button"
-        aria-label={`Continue reading ${continueBook.title}, ${Math.round(progressOf(continueBook))}% complete`}
+        data-continue-reading
+        aria-label={continueSelection?.reason === 'next-in-series'
+          ? `Continue reading series with ${continueBook.title}${continueSeries ? `, ${continueSeries}` : ''}${continueBook.downloadPath ? '' : ', download required'}`
+          : `Continue reading ${continueBook.title}${continueSeries ? `, ${continueSeries}` : ''}, ${continueProgress}% complete${continueBook.downloadPath ? '' : ', download required'}`}
         onclick={() => void open(continueBook!)}
+        disabled={downloadingBookId === continueBook.id}
         transition:fade
       >
-        {#if covers.get(continueBook.seriesId)}
+        {#if covers.get(continueBook.id)}
           <img
             class="h-24 w-16 shrink-0 rounded-lg object-cover shadow-md sm:h-28 sm:w-20"
-            src={covers.get(continueBook.seriesId)}
+            src={covers.get(continueBook.id)}
             loading="lazy"
             decoding="async"
             alt=""
@@ -1679,27 +1819,43 @@
           ></div>
         {/if}
         <div class="min-w-0 flex-1">
-          <p class="text-xs uppercase tracking-wider text-surface-700-300">Continue reading</p>
+          <p class="text-xs uppercase tracking-wider text-surface-700-300">
+            {continueSelection?.reason === 'next-in-series'
+              ? 'Continue reading · Next volume'
+              : 'Continue reading'}
+          </p>
           <h2 class="mt-0.5 truncate font-serif text-xl leading-tight text-surface-950-50">
             {continueBook.title}
           </h2>
           <p class="mt-0.5 truncate text-sm text-surface-700-300">
             {continueBook.author ?? 'Unknown author'}
           </p>
-          <div class="mt-2 flex items-center gap-2">
-            <div
-              class="h-2 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800"
-              aria-hidden="true"
-            >
+          {#if continueSeries}
+            <p class="mt-0.5 truncate text-xs text-surface-700-300">{continueSeries}</p>
+          {/if}
+          {#if continueProgress > 0}
+            <div class="mt-2 flex items-center gap-2">
               <div
-                class="h-full preset-filled-primary-600-400"
-                style:width={`${progressOf(continueBook)}%`}
-              ></div>
+                class="h-2 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800"
+                aria-hidden="true"
+              >
+                <div
+                  class="h-full preset-filled-primary-600-400"
+                  style:width={`${progressOf(continueBook)}%`}
+                ></div>
+              </div>
+              <span class="text-xs tabular-nums text-surface-700-300">{continueProgress}%</span>
+              {#if !continueBook.downloadPath}
+                <span class="text-xs text-primary-700-300">· Download to resume</span>
+              {/if}
             </div>
-            <span class="text-xs tabular-nums text-surface-700-300"
-              >{Math.round(progressOf(continueBook))}%</span
-            >
-          </div>
+          {:else}
+            <p class="mt-2 text-xs text-primary-700-300">
+              {continueBook.downloadPath
+                ? 'Ready offline · Start next volume'
+                : 'Download and start next volume'}
+            </p>
+          {/if}
         </div>
       </button>
     {/if}
@@ -2081,6 +2237,7 @@
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}
+              {@const seriesLabel = formatSeriesLabel(book)}
               <article
                 class="relative text-left"
                 data-book-id={book.id}
@@ -2099,10 +2256,10 @@
                         class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
                         aria-hidden="true"
                       >
-                        {#if covers.get(book.seriesId)}
+                        {#if covers.get(book.id)}
                           <img
                             class="h-full w-full object-cover"
-                            src={covers.get(book.seriesId)}
+                            src={covers.get(book.id)}
                             loading="lazy"
                             decoding="async"
                             alt=""
@@ -2142,8 +2299,8 @@
                         <p class="mt-1 truncate text-sm text-surface-700-300">
                           {book.author ?? 'Unknown author'}
                         </p>
-                        {#if book.series}
-                          <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                        {#if seriesLabel}
+                          <p class="mt-1 truncate text-xs text-surface-700-300">{seriesLabel}</p>
                         {/if}
                         {#if downloadingBookId === book.id}
                           <div
@@ -2215,10 +2372,10 @@
                     <div
                       class="preset-tonal-surface relative aspect-[2/3] overflow-hidden rounded-lg shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                     >
-                      {#if covers.get(book.seriesId)}
+                      {#if covers.get(book.id)}
                         <img
                           class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
-                          src={covers.get(book.seriesId)}
+                          src={covers.get(book.id)}
                           loading="lazy"
                           decoding="async"
                           alt=""
@@ -2313,6 +2470,14 @@
                       <p class="mt-1 truncate text-sm text-surface-700-300">
                         {book.author ?? 'Unknown author'}
                       </p>
+                      {#if seriesLabel}
+                        <p
+                          class="mt-1 line-clamp-2 text-xs leading-snug text-surface-700-300"
+                          data-book-series
+                        >
+                          {seriesLabel}
+                        </p>
+                      {/if}
                     </div>
                   </div>
                 {/if}
@@ -2326,6 +2491,8 @@
 {/if}
 
 {#if actionMenuBook}
+  {@const actionMenuSeries = formatSeriesLabel(actionMenuBook)}
+  {@const actionMenuSize = formatFileSize(actionMenuBook.fileSize)}
   <div
     class="fixed inset-0 z-40 grid place-items-center bg-black/45 p-4"
     role="presentation"
@@ -2334,7 +2501,7 @@
   >
     <div
       bind:this={actionMenuDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
+      class="card preset-filled-surface-50-950 flex max-h-[min(85dvh,42rem)] w-full max-w-md flex-col overflow-hidden p-4 shadow-2xl"
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
@@ -2351,9 +2518,24 @@
           <p class="truncate text-sm text-surface-700-300">
             {actionMenuBook.author ?? 'Unknown author'}
           </p>
+          {#if actionMenuSeries || actionMenuSize}
+            <p
+              class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-surface-700-300"
+            >
+              {#if actionMenuSeries}
+                <span data-action-series>{actionMenuSeries}</span>
+              {/if}
+              {#if actionMenuSeries && actionMenuSize}
+                <span aria-hidden="true">·</span>
+              {/if}
+              {#if actionMenuSize}
+                <span data-action-filesize>EPUB · {actionMenuSize}</span>
+              {/if}
+            </p>
+          {/if}
         </div>
         <button
-          class="btn btn-sm h-11 w-11 !p-0"
+          class="btn btn-sm h-11 w-11 shrink-0 !p-0"
           type="button"
           onclick={closeMenu}
           aria-label="Close book actions"
@@ -2367,6 +2549,17 @@
           </svg>
         </button>
       </div>
+
+      {#if actionMenuSynopsisLoading}
+        <p class="mt-3 text-xs text-surface-700-300" role="status">Loading synopsis…</p>
+      {:else if actionMenuSynopsis}
+        <div
+          class="preset-tonal-surface mt-3 max-h-40 overflow-y-auto rounded-lg p-3 text-sm leading-relaxed whitespace-pre-line text-surface-800-200"
+          data-action-synopsis
+        >
+          {actionMenuSynopsis}
+        </div>
+      {/if}
 
       <div class="mt-4 grid gap-2">
         <button
@@ -2424,7 +2617,6 @@
           type="button"
           onclick={() => {
             const book = actionMenuBook;
-            closeMenu();
             if (book) void markDone(book);
           }}
         >

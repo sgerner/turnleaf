@@ -211,8 +211,36 @@ export class KavitaClient {
     return this.resolveUrl(`/api/Image/series-cover?seriesId=${seriesId}`);
   }
 
+  chapterCoverUrl(chapterId: number): string {
+    return this.resolveUrl(`/api/Image/chapter-cover?chapterId=${chapterId}`);
+  }
+
   async getCover(seriesId: number, signal?: AbortSignal): Promise<Blob> {
-    const url = this.coverUrl(seriesId);
+    return this.fetchCoverBlob(this.coverUrl(seriesId), signal);
+  }
+
+  async getChapterCover(chapterId: number, signal?: AbortSignal): Promise<Blob> {
+    return this.fetchCoverBlob(this.chapterCoverUrl(chapterId), signal);
+  }
+
+  async getBookCover(chapterId: number, seriesId: number, signal?: AbortSignal): Promise<Blob> {
+    try {
+      const blob = await this.getChapterCover(chapterId, signal);
+      if (blob.size > 0) return blob;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (
+        error instanceof KavitaError &&
+        (error.kind === 'authentication' || error.kind === 'network')
+      ) {
+        throw error;
+      }
+      if (!(error instanceof KavitaError)) throw error;
+    }
+    return this.getCover(seriesId, signal);
+  }
+
+  private async fetchCoverBlob(url: string, signal?: AbortSignal): Promise<Blob> {
     if (Capacitor.isNativePlatform()) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const response = await this.nativeGetWithRedirects(url, signal);

@@ -15,6 +15,7 @@ export interface ReaderLocation {
   spineIndex: number;
   pageIndex: number;
   pageCount: number;
+  atEnd?: boolean;
 }
 
 export type ReaderLinkReturnTarget = Pick<ReaderLocation, 'cfi' | 'href'>;
@@ -467,6 +468,7 @@ export class ReaderSession {
       spineIndex: start.index,
       pageIndex,
       pageCount: start.displayed.total,
+      atEnd: this.isLocationAtEnd(location),
       xpath: this.cfiToXPath(start.cfi, start.index),
     };
     if (returnTarget) {
@@ -476,9 +478,50 @@ export class ReaderSession {
     }
   }
 
-  async next(): Promise<void> {
+  private isLocationAtEnd(location: Location | null | undefined): boolean {
+    if (!location) return false;
+    if (location.atEnd === true) return true;
+    const start = location.start;
+    if (!start) return false;
+    const { sections, indexes } = this.getSpine();
+    if (sections.length === 0) return false;
+    const sectionIndex = indexes.get(start.href) ?? start.index ?? 0;
+    const pageIndex = this.pageIndex(start.displayed.page);
+    const pageCount = Math.max(1, start.displayed.total);
+    return sectionIndex >= sections.length - 1 && pageIndex >= pageCount - 1;
+  }
+
+  async next(): Promise<boolean> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.next());
+    const beforeLocation = this.current ?? this.rendition.location ?? null;
+    const beforeCfi = beforeLocation?.start?.cfi ?? null;
+    const beforePage = beforeLocation?.start?.displayed?.page ?? null;
+    const beforeHref = beforeLocation?.start?.href ?? null;
+    const wasAtEnd = this.isLocationAtEnd(beforeLocation);
+    const generation = this.beginLocationOperation(true);
+    try {
+      await this.rendition.next();
+    } catch (error) {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+      }
+      throw error;
+    }
+    const afterLocation = this.current ?? this.rendition.location ?? null;
+    const afterCfi = afterLocation?.start?.cfi ?? null;
+    const afterPage = afterLocation?.start?.displayed?.page ?? null;
+    const afterHref = afterLocation?.start?.href ?? null;
+    const unchanged =
+      afterCfi === beforeCfi && afterPage === beforePage && afterHref === beforeHref;
+    if (wasAtEnd && unchanged) {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+      }
+      return false;
+    }
+    return true;
   }
 
   async previous(): Promise<void> {

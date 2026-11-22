@@ -37,6 +37,9 @@ export interface BookRecord {
   downloadPath: string | null;
   downloadStatus: string;
   fileSize: number | null;
+  sortOrder?: number | null;
+  minNumber?: number | null;
+  volumeNumber?: number | null;
   /** False means Kavita no longer advertises the book; local retention may keep it. */
   remoteAvailable?: boolean;
   /** False means Kavita omitted usable progress fields from this metadata snapshot. */
@@ -351,7 +354,11 @@ export async function reconcileBooks(
         remoteAvailable: true,
         downloadPath: previous.downloadPath,
         downloadStatus: previous.downloadStatus,
-        fileSize: previous.fileSize,
+        fileSize: previous.downloadPath
+          ? (previous.fileSize ?? (book.fileSize && book.fileSize > 0 ? book.fileSize : null))
+          : book.fileSize && book.fileSize > 0
+            ? book.fileSize
+            : previous.fileSize,
         pagesRead: preserveProgress ? previous.pagesRead : book.pagesRead,
         lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
       };
@@ -385,18 +392,24 @@ const preserveReadingProgress = `EXISTS (
 const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
    description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
-   pages, pages_read, created_at, last_read_at, remote_available)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   pages, pages_read, created_at, last_read_at, remote_available,
+   sort_order, min_number, volume_number)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
    library_id=excluded.library_id, series_id=excluded.series_id,
    volume_id=excluded.volume_id, chapter_id=excluded.chapter_id,
    title=excluded.title, author=excluded.author, series=excluded.series,
    description_html=excluded.description_html, format=excluded.format,
-   metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
+   metadata_refreshed_at=excluded.metadata_refreshed_at,
+   file_size=CASE WHEN books.download_path IS NOT NULL THEN COALESCE(books.file_size, NULLIF(excluded.file_size, 0)) ELSE COALESCE(NULLIF(excluded.file_size, 0), books.file_size) END,
+   pages=excluded.pages,
    pages_read=CASE WHEN ?=0 OR ${preserveReadingProgress} THEN books.pages_read ELSE excluded.pages_read END,
    created_at=excluded.created_at,
    last_read_at=CASE WHEN ?=0 OR ?=0 OR ${preserveReadingProgress} THEN books.last_read_at ELSE excluded.last_read_at END,
-   remote_available=excluded.remote_available`;
+   remote_available=excluded.remote_available,
+   sort_order=excluded.sort_order,
+   min_number=excluded.min_number,
+   volume_number=excluded.volume_number`;
 
 function replaceBookTask(
   serverId: string,
@@ -427,6 +440,9 @@ function replaceBookTask(
       book.createdAt,
       book.lastReadAt,
       book.remoteAvailable !== false ? 1 : 0,
+      book.sortOrder ?? null,
+      book.minNumber ?? null,
+      book.volumeNumber ?? null,
       book.remoteProgressKnown === false ? 0 : 1,
       snapshotStartedAt,
       snapshotStartedAt,
@@ -504,7 +520,7 @@ export async function getBooks(
   const result = await db.query(
     `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
       format, pages, pages_read, created_at, last_read_at, download_path, download_status,
-      file_size, remote_available${includeDescription ? ', description_html' : ''}
+      file_size, remote_available, sort_order, min_number, volume_number${includeDescription ? ', description_html' : ''}
       FROM books WHERE server_id = ? ORDER BY title`,
     [serverId],
   );
@@ -527,8 +543,24 @@ export async function getBooks(
     downloadPath: row.download_path ? String(row.download_path) : null,
     downloadStatus: String(row.download_status),
     fileSize: row.file_size == null ? null : Number(row.file_size),
+    sortOrder: row.sort_order == null ? null : Number(row.sort_order),
+    minNumber: row.min_number == null ? null : Number(row.min_number),
+    volumeNumber: row.volume_number == null ? null : Number(row.volume_number),
     remoteAvailable: Number(row.remote_available ?? 1) !== 0,
   }));
+}
+
+export async function getBookDescription(bookId: string): Promise<string | null> {
+  if (!Capacitor.isNativePlatform()) {
+    const book = readBrowserState().books.find((entry) => entry.id === bookId);
+    return book?.descriptionHtml ?? null;
+  }
+  const db = await openDatabase();
+  const result = await db.query('SELECT description_html FROM books WHERE id = ? LIMIT 1', [
+    bookId,
+  ]);
+  const row = result.values?.[0] as Record<string, unknown> | undefined;
+  return row?.description_html ? String(row.description_html) : null;
 }
 
 export async function markDownloaded(bookId: string, path: string, size: number): Promise<void> {
@@ -1152,9 +1184,7 @@ export async function removeDownload(bookId: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
     state.books = state.books.map((book) =>
-      book.id === bookId
-        ? { ...book, downloadPath: null, downloadStatus: 'none', fileSize: null }
-        : book,
+      book.id === bookId ? { ...book, downloadPath: null, downloadStatus: 'none' } : book,
     );
     writeBrowserState(state);
     return;
@@ -1162,7 +1192,7 @@ export async function removeDownload(bookId: string): Promise<void> {
   const db = await openDatabase();
   await executeNativeRun(
     db,
-    "UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id=?",
+    "UPDATE books SET download_path=NULL,download_status='none' WHERE id=?",
     [bookId],
   );
 }

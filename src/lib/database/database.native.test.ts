@@ -214,7 +214,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(7);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(8);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -224,6 +224,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN sort_order'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -233,5 +234,6 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 5;',
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
+    'PRAGMA user_version = 8;',
   ]);
 });

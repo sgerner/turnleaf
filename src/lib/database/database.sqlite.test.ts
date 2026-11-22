@@ -304,4 +304,96 @@ describe('native metadata transactions against SQLite', () => {
 
     expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
   });
+
+  it('migrates a populated v7 database to v8 without losing downloads, reading state, or sync queue and persists sequence metadata', async () => {
+    db = new DatabaseSync(':memory:');
+    db.exec('PRAGMA foreign_keys = ON;');
+    for (const migration of migrations.filter((item) => item.version <= 7)) {
+      db.exec(migration.statements);
+    }
+    db.prepare(
+      `INSERT INTO server_config
+        (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'server',
+      'Test server',
+      'https://books.example.com',
+      'credential',
+      null,
+      baseBook.createdAt,
+    );
+    db.prepare(
+      `INSERT INTO books
+        (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+         description_html, format, download_path, download_status, file_size, pages, pages_read,
+         created_at, last_read_at, metadata_refreshed_at, remote_available)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+    ).run(
+      baseBook.id,
+      baseBook.serverId,
+      baseBook.libraryId,
+      baseBook.seriesId,
+      baseBook.volumeId,
+      baseBook.chapterId,
+      baseBook.title,
+      baseBook.author,
+      baseBook.series,
+      baseBook.descriptionHtml,
+      baseBook.format,
+      baseBook.downloadPath,
+      baseBook.downloadStatus,
+      baseBook.fileSize,
+      baseBook.pages,
+      baseBook.pagesRead,
+      baseBook.createdAt,
+      baseBook.lastReadAt,
+      baseBook.createdAt,
+    );
+    db.prepare(
+      `INSERT INTO reading_state
+        (book_id, cfi, kavita_xpath, percentage, local_updated_at, synced_local_updated_at, server_updated_at, pending_sync)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, 1)`,
+    ).run(baseBook.id, 'epubcfi(/6/2!/4/2/1:0)', '/body/div[1]/p[1]', 0.4, baseBook.createdAt);
+    db.prepare(
+      `INSERT INTO sync_queue
+        (book_id, payload_json, attempt_count, last_attempt_at, last_error, created_at, updated_at, revision)
+        VALUES (?, ?, 0, NULL, NULL, ?, ?, 1)`,
+    ).run(baseBook.id, '{"pageNum":40}', baseBook.createdAt, baseBook.createdAt);
+
+    const v8 = migrations.find((item) => item.version === 8)!;
+    db.exec(v8.statements);
+
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      download_path: baseBook.downloadPath,
+      download_status: 'available',
+      file_size: baseBook.fileSize,
+      sort_order: null,
+      min_number: null,
+      volume_number: null,
+    });
+    expect(
+      db.prepare('SELECT cfi, pending_sync FROM reading_state WHERE book_id=?').get(baseBook.id),
+    ).toEqual({
+      cfi: 'epubcfi(/6/2!/4/2/1:0)',
+      pending_sync: 1,
+    });
+    expect(
+      db.prepare('SELECT payload_json FROM sync_queue WHERE book_id=?').get(baseBook.id),
+    ).toEqual({
+      payload_json: '{"pageNum":40}',
+    });
+
+    const adapter = createAdapter(db);
+    await replaceBooksInTransaction(adapter, 'server', [
+      { ...baseBook, sortOrder: 2.5, minNumber: 2, volumeNumber: 2 },
+    ]);
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      download_path: baseBook.downloadPath,
+      file_size: baseBook.fileSize,
+      sort_order: 2.5,
+      min_number: 2,
+      volume_number: 2,
+    });
+  });
 });

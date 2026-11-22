@@ -37,7 +37,7 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
-import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
+import { cacheBookCover, cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
@@ -202,5 +202,74 @@ describe('native cover cache', () => {
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('caches distinct chapter covers and falls back to series covers on 404 or offline cache hit', async () => {
+    const existing = new Set<string>(['covers/default/4.img']);
+    vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+      if (!existing.has(path)) throw { code: 'OS-PLUG-FILE-0008' };
+      return {
+        type: 'file',
+        size: 128,
+        name: path,
+        mtime: 0,
+        uri: `file://${path}`,
+      };
+    });
+    vi.mocked(FileTransfer.downloadFile)
+      .mockImplementationOnce(async ({ path }) => {
+        existing.add(path.replace(/^file:\/\//, ''));
+        return {};
+      })
+      .mockRejectedValueOnce({
+        code: 'OS-PLUG-FLTR-0010',
+        data: { httpStatus: 404 },
+      })
+      .mockRejectedValueOnce({
+        code: 'OS-PLUG-FLTR-0010',
+        data: { httpStatus: 401 },
+      });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=41',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 41,
+        seriesId: 4,
+      }),
+    ).resolves.toBe('web://file://covers/default/chapter-41.img');
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=42',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 42,
+        seriesId: 4,
+      }),
+    ).resolves.toBe('web://file://covers/default/4.img');
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=43',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 43,
+        seriesId: 4,
+        cacheNamespace: 'default',
+        allowDownload: false,
+      }),
+    ).resolves.toBe('web://file://covers/default/4.img');
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=44',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 44,
+        seriesId: 4,
+      }),
+    ).rejects.toMatchObject({ data: { httpStatus: 401 } });
   });
 });

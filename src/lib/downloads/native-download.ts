@@ -247,10 +247,10 @@ export async function deleteDownloadedEpub(relativePath: string): Promise<void> 
   await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data });
 }
 
-export async function cacheCover(
+async function cacheCoverAtKey(
   downloadUrl: string,
   apiKey: string,
-  seriesId: number,
+  fileKey: string,
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload = true,
@@ -258,7 +258,7 @@ export async function cacheCover(
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const namespace = safeCoverNamespace(cacheNamespace);
   const directory = `covers/${namespace}`;
-  const path = `${directory}/${seriesId}.img`;
+  const path = `${directory}/${fileKey}.img`;
   const temporaryPath = `${path}.partial`;
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
@@ -296,6 +296,66 @@ export async function cacheCover(
   }
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   return Capacitor.convertFileSrc(existing.uri);
+}
+
+export async function cacheCover(
+  downloadUrl: string,
+  apiKey: string,
+  seriesId: number,
+  signal?: AbortSignal,
+  cacheNamespace = 'default',
+  allowDownload = true,
+): Promise<string> {
+  return cacheCoverAtKey(
+    downloadUrl,
+    apiKey,
+    String(seriesId),
+    signal,
+    cacheNamespace,
+    allowDownload,
+  );
+}
+
+export interface CacheBookCoverOptions {
+  chapterCoverUrl: string;
+  seriesCoverUrl: string;
+  apiKey: string;
+  chapterId: number;
+  seriesId: number;
+  signal?: AbortSignal;
+  cacheNamespace?: string;
+  allowDownload?: boolean;
+}
+
+export async function cacheBookCover({
+  chapterCoverUrl,
+  seriesCoverUrl,
+  apiKey,
+  chapterId,
+  seriesId,
+  signal,
+  cacheNamespace = 'default',
+  allowDownload = true,
+}: CacheBookCoverOptions): Promise<string> {
+  const chapterKey = `chapter-${chapterId}`;
+  try {
+    return await cacheCoverAtKey(
+      chapterCoverUrl,
+      apiKey,
+      chapterKey,
+      signal,
+      cacheNamespace,
+      allowDownload,
+    );
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    const failure = error as { code?: unknown; data?: { httpStatus?: unknown } } | null;
+    const httpStatus = failure?.data?.httpStatus;
+    if (httpStatus === 401 || httpStatus === 403 || failure?.code === 'OS-PLUG-FLTR-0008') {
+      throw error;
+    }
+    return cacheCover(seriesCoverUrl, apiKey, seriesId, signal, cacheNamespace, allowDownload);
+  }
 }
 
 export async function clearCoverCache(): Promise<void> {

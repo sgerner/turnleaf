@@ -292,3 +292,67 @@ it('maps EPUBs when Kavita omits optional names, covers, or file extensions', ()
     },
   ]);
 });
+
+it('resolves volumeNumber from parent volumes even when chapters also appear in flat arrays and filters sentinels', () => {
+  const series = {
+    id: 50,
+    name: 'Chronicles',
+    libraryId: 1,
+    format: 3,
+    pages: 200,
+    pagesRead: 0,
+    created: '2026-09-05',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: 'cover.png',
+  } satisfies KavitaSeries;
+  const flatChapter = {
+    id: 501,
+    title: 'Second Volume',
+    titleName: 'Second Volume',
+    volumeId: 52,
+    pages: 100,
+    pagesRead: 0,
+    summary: '',
+    format: 3,
+    sortOrder: 2,
+    minNumber: -100_000,
+    files: [{ id: 501, bytes: 2048, extension: '.epub', format: 3 }],
+    writers: [{ name: 'Author' }],
+  };
+  const specialChapter = {
+    id: 502,
+    title: 'Side Story',
+    titleName: 'Side Story',
+    volumeId: 53,
+    pages: 40,
+    pagesRead: 0,
+    summary: '',
+    format: 3,
+    sortOrder: 100_000,
+    minNumber: 100_000,
+    isSpecial: true,
+    files: [{ id: 502, bytes: 1024, extension: '.epub', format: 3 }],
+    writers: [{ name: 'Author' }],
+  };
+  const detail = {
+    chapters: [flatChapter],
+    specials: [specialChapter],
+    volumes: [{ id: 52, minNumber: 2, number: 2, chapters: [flatChapter] }],
+    storylineChapters: [],
+  } satisfies KavitaSeriesDetail;
+
+  expect(mapSeriesToBooks('primary', series, detail)).toMatchObject([
+    {
+      chapterId: 501,
+      volumeNumber: 2,
+      sortOrder: 2,
+      minNumber: null,
+    },
+    {
+      chapterId: 502,
+      volumeNumber: null,
+      sortOrder: null,
+      minNumber: null,
+    },
+  ]);
+});

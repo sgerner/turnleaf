@@ -105,4 +105,12 @@ export const migrations = [
       );
     `,
   },
+  {
+    version: 8,
+    statements: `
+      ALTER TABLE books ADD COLUMN sort_order REAL;
+      ALTER TABLE books ADD COLUMN min_number REAL;
+      ALTER TABLE books ADD COLUMN volume_number REAL;
+    `,
+  },
 ] as const;

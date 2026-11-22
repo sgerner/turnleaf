@@ -5,10 +5,12 @@ import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 import {
   acceptRemoteProgress,
   confirmSync,
+  getBookDescription,
   getBooks,
   getPendingSync,
   getSyncStatus,
   reconcileBooks,
+  removeDownload,
   replaceBooksInTransaction,
   saveLocalProgress,
   type BookRecord,
@@ -885,4 +887,49 @@ it('accepts the selected browser server progress and drops only the displayed lo
   const newer = await getPendingSync('server');
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
+});
+
+it('retains remote fileSize when removing a download and loads synopsis HTML on demand', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const bookWithSequence: BookRecord = {
+    ...existingBook,
+    descriptionHtml: '<p>Stored synopsis</p>',
+    fileSize: 987654,
+    sortOrder: 3,
+    minNumber: 2,
+    volumeNumber: 2,
+  };
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [bookWithSequence],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  const startupBooks = await getBooks('server', { includeDescription: false });
+  expect(startupBooks[0]).toMatchObject({
+    id: existingBook.id,
+    descriptionHtml: null,
+    fileSize: 987654,
+    sortOrder: 3,
+    minNumber: 2,
+    volumeNumber: 2,
+  });
+  await expect(getBookDescription(existingBook.id)).resolves.toBe('<p>Stored synopsis</p>');
+
+  await removeDownload(existingBook.id);
+  const afterRemove = await getBooks('server', { includeDescription: false });
+  expect(afterRemove[0]).toMatchObject({
+    id: existingBook.id,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 987654,
+  });
 });

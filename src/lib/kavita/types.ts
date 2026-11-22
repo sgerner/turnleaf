@@ -54,11 +54,22 @@ export interface KavitaChapter {
   files: KavitaFile[];
   writers: KavitaPerson[];
   lastReadingProgressUtc?: string | null;
+  sortOrder?: number | null;
+  minNumber?: number | null;
+  maxNumber?: number | null;
+  volumeNumber?: number | null;
+  volumeTitle?: string | null;
+  hasCoverImage?: boolean | null;
+  isSpecial?: boolean | null;
 }
 
 export interface KavitaVolume {
   id: number;
   chapters: KavitaChapter[];
+  minNumber?: number | null;
+  maxNumber?: number | null;
+  number?: number | null;
+  name?: string | null;
 }
 
 export interface KavitaSeriesDetail {

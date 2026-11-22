@@ -95,6 +95,30 @@ function progressFields(value: unknown, endpoint: string, path: string): { pages
   return pagesRead === undefined ? {} : { pagesRead };
 }
 
+function optionalFiniteNumber(value: unknown, endpoint: string, path: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  fallback(endpoint, path, value, 'number');
+  return undefined;
+}
+
+function optionalBoolean(value: unknown, endpoint: string, path: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'boolean') return value;
+  fallback(endpoint, path, value, 'boolean');
+  return undefined;
+}
+
+function optionalString(value: unknown, endpoint: string, path: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') return value;
+  fallback(endpoint, path, value, 'string');
+  return undefined;
+}
+
 export function normalizeLibraries(payload: unknown): KavitaLibrary[] {
   if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
   return payload.map((value, index) => {
@@ -154,6 +178,7 @@ function chapters(
   path: string,
   markIncomplete: (path: string, value: unknown) => void,
   parentVolumeId?: number,
+  parentVolumeNumber?: number,
 ): KavitaChapter[] {
   return values.flatMap((value, index) => {
     const p = `${path}[${index}]`,
@@ -204,6 +229,12 @@ function chapters(
           return [];
         })
       : [];
+    const sortOrder = optionalFiniteNumber(row.sortOrder, DETAIL_ENDPOINT, `${p}.sortOrder`);
+    const minNumber = optionalFiniteNumber(row.minNumber, DETAIL_ENDPOINT, `${p}.minNumber`);
+    const maxNumber = optionalFiniteNumber(row.maxNumber, DETAIL_ENDPOINT, `${p}.maxNumber`);
+    const volumeTitle = optionalString(row.volumeTitle, DETAIL_ENDPOINT, `${p}.volumeTitle`);
+    const hasCoverImage = optionalBoolean(row.hasCoverImage, DETAIL_ENDPOINT, `${p}.hasCoverImage`);
+    const isSpecial = optionalBoolean(row.isSpecial, DETAIL_ENDPOINT, `${p}.isSpecial`);
     return [
       {
         id: id(row.id, `${p}.id`),
@@ -216,6 +247,13 @@ function chapters(
         summary: text(row.summary, DETAIL_ENDPOINT, `${p}.summary`),
         pages: count(row.pages, DETAIL_ENDPOINT, `${p}.pages`),
         ...progressFields(row.pagesRead, DETAIL_ENDPOINT, `${p}.pagesRead`),
+        ...(sortOrder !== undefined ? { sortOrder } : {}),
+        ...(minNumber !== undefined ? { minNumber } : {}),
+        ...(maxNumber !== undefined ? { maxNumber } : {}),
+        ...(parentVolumeNumber !== undefined ? { volumeNumber: parentVolumeNumber } : {}),
+        ...(volumeTitle !== undefined ? { volumeTitle } : {}),
+        ...(hasCoverImage !== undefined ? { hasCoverImage } : {}),
+        ...(isSpecial !== undefined ? { isSpecial } : {}),
         lastReadingProgressUtc:
           date(row.lastReadingProgressUtc, DETAIL_ENDPOINT, `${p}.lastReadingProgressUtc`, true) ||
           null,
@@ -250,15 +288,30 @@ export function normalizeSeriesDetail(payload: unknown): KavitaSeriesDetail {
       const p = `$.volumes[${index}]`,
         volume = object(value, p);
       const volumeId = integer(volume.id);
+      const minNumber = optionalFiniteNumber(volume.minNumber, DETAIL_ENDPOINT, `${p}.minNumber`);
+      const maxNumber = optionalFiniteNumber(volume.maxNumber, DETAIL_ENDPOINT, `${p}.maxNumber`);
+      const number = optionalFiniteNumber(volume.number, DETAIL_ENDPOINT, `${p}.number`);
+      const name = optionalString(volume.name, DETAIL_ENDPOINT, `${p}.name`);
+      const parentVolumeNumber = minNumber ?? number;
       if (volume.chapters == null) markIncomplete(`${p}.chapters`, volume.chapters);
       const items = chapters(
         collection(volume, 'chapters', p),
         `${p}.chapters`,
         markIncomplete,
         volumeId,
+        parentVolumeNumber,
       );
       if (!items.length) return [];
-      return [{ id: id(volume.id, `${p}.id`), chapters: items }];
+      return [
+        {
+          id: id(volume.id, `${p}.id`),
+          chapters: items,
+          ...(minNumber !== undefined ? { minNumber } : {}),
+          ...(maxNumber !== undefined ? { maxNumber } : {}),
+          ...(number !== undefined ? { number } : {}),
+          ...(name !== undefined ? { name } : {}),
+        },
+      ];
     }),
   };
   if (incomplete) detail.incomplete = true;

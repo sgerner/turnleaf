@@ -1,5 +1,6 @@
 import type { BookRecord } from '../database/database';
-import type { KavitaChapter, KavitaSeries, KavitaSeriesDetail } from './types';
+import { usableSequenceNumber } from '../library/series-metadata';
+import type { KavitaChapter, KavitaSeries, KavitaSeriesDetail, KavitaVolume } from './types';
 
 const EMPTY_DATE = '0001-01-01T00:00:00';
 
@@ -8,6 +9,10 @@ export function mapSeriesToBooks(
   series: KavitaSeries,
   detail: KavitaSeriesDetail,
 ): BookRecord[] {
+  const volumesById = new Map<number, KavitaVolume>(
+    (detail.volumes ?? []).map((volume) => [volume.id, volume]),
+  );
+  const specialIds = new Set(detail.specials.map((chapter) => chapter.id));
   // Keep flat arrays first so their representation wins if Kavita exposes the
   // same chapter both flat and nested. IDs include the chapter ID, so existing
   // local records remain matched regardless of this ordering.
@@ -25,7 +30,15 @@ export function mapSeriesToBooks(
       seen.add(chapter.id);
       return true;
     })
-    .map((chapter) => mapChapterToBook(serverId, series, chapter));
+    .map((chapter) =>
+      mapChapterToBook(
+        serverId,
+        series,
+        chapter,
+        volumesById.get(chapter.volumeId),
+        specialIds.has(chapter.id) || chapter.isSpecial === true,
+      ),
+    );
   if (books.length > 1 && series.name) {
     for (const book of books) book.series = series.name;
   }
@@ -36,9 +49,23 @@ function mapChapterToBook(
   serverId: string,
   series: KavitaSeries,
   chapter: KavitaChapter,
+  volume: KavitaVolume | undefined,
+  isSpecial: boolean,
 ): BookRecord {
   const file = chapter.files.find(isEpubFile);
   if (!file) throw new Error('An EPUB chapter did not include an EPUB file.');
+  const rawVolumeNumber =
+    usableSequenceNumber(volume?.minNumber) ??
+    usableSequenceNumber(volume?.number) ??
+    usableSequenceNumber(chapter.volumeNumber);
+  const volumeNumber = isSpecial ? null : rawVolumeNumber;
+  const sortOrder = isSpecial ? null : usableSequenceNumber(chapter.sortOrder);
+  const minNumber = isSpecial ? null : usableSequenceNumber(chapter.minNumber);
+  const title = chapter.titleName || chapter.title || series.name || `Book ${chapter.id}`;
+  const hasDistinctSeries =
+    Boolean(series.name) &&
+    ((Boolean(chapter.titleName) && chapter.titleName !== series.name) ||
+      (title !== series.name && volumeNumber !== null && volumeNumber > 0));
   return {
     id: `${serverId}:${series.id}:${chapter.id}`,
     serverId,
@@ -46,10 +73,9 @@ function mapChapterToBook(
     seriesId: series.id,
     volumeId: chapter.volumeId,
     chapterId: chapter.id,
-    title: chapter.titleName || chapter.title || series.name || `Book ${chapter.id}`,
+    title,
     author: chapter.writers.map((writer) => writer.name).join(', ') || null,
-    series:
-      chapter.titleName && series.name && chapter.titleName !== series.name ? series.name : null,
+    series: hasDistinctSeries && series.name ? series.name : null,
     descriptionHtml: chapter.summary || null,
     format: 'epub',
     pages: chapter.pages || series.pages,
@@ -61,6 +87,9 @@ function mapChapterToBook(
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
+    sortOrder,
+    minNumber,
+    volumeNumber,
     remoteAvailable: true,
   };
 }

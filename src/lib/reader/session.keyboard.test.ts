@@ -14,6 +14,8 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    next: vi.fn(async () => {}),
+    prev: vi.fn(async () => {}),
     resize: vi.fn(),
     destroy: vi.fn(),
   };
@@ -231,6 +233,51 @@ describe('ReaderSession keyboard navigation', () => {
     );
 
     expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+    session.destroy();
+  });
+
+  it('returns false from next() on the final page and reports atEnd in ReaderLocation', async () => {
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+
+    relocated({
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        displayed: { page: 1, total: 2 },
+      },
+      atEnd: false,
+    });
+    mockRendition.next.mockImplementationOnce(async () => {
+      relocated({
+        start: {
+          href: 'second.xhtml',
+          index: 1,
+          cfi: 'epubcfi(/6/4!/4/2/1:20)',
+          displayed: { page: 2, total: 2 },
+        },
+        atEnd: true,
+      });
+    });
+
+    await expect(session.next()).resolves.toBe(true);
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ atEnd: true, percentage: 0.75 }),
+      'navigation',
+    );
+
+    await expect(session.next()).resolves.toBe(false);
     session.destroy();
   });
 });
