@@ -272,4 +272,47 @@ describe('native cover cache', () => {
       }),
     ).rejects.toMatchObject({ data: { httpStatus: 401 } });
   });
+
+  it('re-checks connectivity before starting chapter or fallback series cover transfers', async () => {
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    let connected = true;
+    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
+      connected = false;
+      return { uri: `file://${path}` };
+    });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=51',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=5',
+        apiKey: 'secret',
+        chapterId: 51,
+        seriesId: 5,
+        canDownload: () => connected,
+      }),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    connected = true;
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      connected = false;
+      throw { code: 'OS-PLUG-FLTR-0010', data: { httpStatus: 404 } };
+    });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=52',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=5',
+        apiKey: 'secret',
+        chapterId: 52,
+        seriesId: 5,
+        canDownload: () => connected,
+      }),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        url: 'https://books.example.com/api/Image/chapter-cover?chapterId=52',
+      }),
+    );
+  });
 });

@@ -308,6 +308,7 @@ export class ReaderSession {
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
+  private userNavigationStartPage: number | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
@@ -378,9 +379,12 @@ export class ReaderSession {
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const pageChanged =
+        this.userNavigationStartPage !== null &&
+        this.userNavigationStartPage !== location.start.displayed?.page;
       const isUserNavigation =
         this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+        (startCfi ? startCfi !== location.start.cfi || pageChanged : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
@@ -388,6 +392,7 @@ export class ReaderSession {
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
@@ -493,7 +498,7 @@ export class ReaderSession {
 
   async next(): Promise<boolean> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    const beforeLocation = this.current ?? this.rendition.location ?? null;
+    const beforeLocation = this.liveLocation();
     const beforeCfi = beforeLocation?.start?.cfi ?? null;
     const beforePage = beforeLocation?.start?.displayed?.page ?? null;
     const beforeHref = beforeLocation?.start?.href ?? null;
@@ -505,10 +510,11 @@ export class ReaderSession {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
       }
       throw error;
     }
-    const afterLocation = this.current ?? this.rendition.location ?? null;
+    const afterLocation = this.liveLocation();
     const afterCfi = afterLocation?.start?.cfi ?? null;
     const afterPage = afterLocation?.start?.displayed?.page ?? null;
     const afterHref = afterLocation?.start?.href ?? null;
@@ -518,6 +524,7 @@ export class ReaderSession {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
       }
       return false;
     }
@@ -716,6 +723,7 @@ export class ReaderSession {
     this.onLocation = null;
     this.current = null;
     this.userNavigationStartCfi = null;
+    this.userNavigationStartPage = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -795,6 +803,7 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
     if (target === undefined) await rendition.display();
     else await rendition.display(target);
+    if (!this.current) this.current = this.liveLocation();
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -817,6 +826,7 @@ export class ReaderSession {
       const range = contents.document.createRange();
       range.selectNodeContents(node);
       await rendition.display(contents.cfiFromRange(range));
+      if (!this.current) this.current = this.liveLocation();
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -846,28 +856,47 @@ export class ReaderSession {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
       }
       throw error;
     }
   }
 
+  private liveLocation(): Location | null {
+    const currentLocation = (
+      this.rendition as (Rendition & { currentLocation?: () => unknown }) | null
+    )?.currentLocation;
+    if (typeof currentLocation === 'function') {
+      try {
+        const resolved = currentLocation.call(this.rendition);
+        if (resolved && typeof resolved === 'object' && 'start' in resolved) {
+          return resolved as Location;
+        }
+      } catch {
+        // Mocked or uninitialized renditions may not expose currentLocation().
+      }
+    }
+    return this.current ?? this.rendition?.location ?? null;
+  }
+
   private beginLocationOperation(userNavigation: boolean): number {
+    const start = userNavigation ? this.liveLocation()?.start : null;
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
-    this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
-      : null;
+    this.userNavigationStartCfi = start?.cfi ?? null;
+    this.userNavigationStartPage = start?.displayed?.page ?? null;
     return this.locationGeneration;
   }
 
   private beginLinkedNavigation(): void {
-    const start = this.current?.start ?? this.rendition?.location?.start;
+    const start = this.liveLocation()?.start;
     if (!start) return;
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
+    this.userNavigationStartPage = start.displayed?.page ?? null;
     this.userNavigationOrigin = 'link';
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }

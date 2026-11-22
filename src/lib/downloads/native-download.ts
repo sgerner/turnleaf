@@ -247,6 +247,20 @@ export async function deleteDownloadedEpub(relativePath: string): Promise<void> 
   await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data });
 }
 
+async function assertCoverDownloadAllowed(
+  allowDownload: boolean,
+  canDownload?: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  if (!allowDownload) throw new Error('Offline');
+  if (canDownload && !(await canDownload())) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    throw new Error('Offline');
+  }
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+}
+
 async function cacheCoverAtKey(
   downloadUrl: string,
   apiKey: string,
@@ -254,6 +268,7 @@ async function cacheCoverAtKey(
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload = true,
+  canDownload?: () => boolean | Promise<boolean>,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const namespace = safeCoverNamespace(cacheNamespace);
@@ -262,11 +277,11 @@ async function cacheCoverAtKey(
   const temporaryPath = `${path}.partial`;
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!allowDownload) throw new Error('Offline');
+    await assertCoverDownloadAllowed(allowDownload, canDownload, signal);
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    await assertCoverDownloadAllowed(allowDownload, canDownload, signal);
     try {
       await FileTransfer.downloadFile({
         url: downloadUrl,
@@ -305,6 +320,7 @@ export async function cacheCover(
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload = true,
+  canDownload?: () => boolean | Promise<boolean>,
 ): Promise<string> {
   return cacheCoverAtKey(
     downloadUrl,
@@ -313,6 +329,7 @@ export async function cacheCover(
     signal,
     cacheNamespace,
     allowDownload,
+    canDownload,
   );
 }
 
@@ -325,6 +342,7 @@ export interface CacheBookCoverOptions {
   signal?: AbortSignal;
   cacheNamespace?: string;
   allowDownload?: boolean;
+  canDownload?: () => boolean | Promise<boolean>;
 }
 
 export async function cacheBookCover({
@@ -336,6 +354,7 @@ export async function cacheBookCover({
   signal,
   cacheNamespace = 'default',
   allowDownload = true,
+  canDownload,
 }: CacheBookCoverOptions): Promise<string> {
   const chapterKey = `chapter-${chapterId}`;
   try {
@@ -346,6 +365,7 @@ export async function cacheBookCover({
       signal,
       cacheNamespace,
       allowDownload,
+      canDownload,
     );
   } catch (error) {
     if (signal?.aborted) throw error;
@@ -354,7 +374,15 @@ export async function cacheBookCover({
     if (httpStatus === 401 || httpStatus === 403 || failure?.code === 'OS-PLUG-FLTR-0008') {
       throw error;
     }
-    return cacheCover(seriesCoverUrl, apiKey, seriesId, signal, cacheNamespace, allowDownload);
+    return cacheCover(
+      seriesCoverUrl,
+      apiKey,
+      seriesId,
+      signal,
+      cacheNamespace,
+      allowDownload,
+      canDownload,
+    );
   }
 }
 

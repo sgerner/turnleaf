@@ -16,6 +16,7 @@ const { mockBook, mockRendition } = vi.hoisted(() => {
     display: vi.fn(async () => {}),
     next: vi.fn(async () => {}),
     prev: vi.fn(async () => {}),
+    currentLocation: undefined as (() => unknown) | undefined,
     resize: vi.fn(),
     destroy: vi.fn(),
   };
@@ -41,6 +42,7 @@ describe('ReaderSession keyboard navigation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockBook.navigation.toc = [];
+    mockRendition.currentLocation = undefined;
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -278,6 +280,63 @@ describe('ReaderSession keyboard navigation', () => {
     );
 
     await expect(session.next()).resolves.toBe(false);
+    session.destroy();
+  });
+
+  it('preserves navigation origin when next() runs before initial deferred relocated fires', async () => {
+    const onLocation = vi.fn();
+    let live = {
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 1 },
+      },
+      atEnd: false,
+    };
+    mockRendition.currentLocation = () => live;
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+
+    const chapterOneLocation = live;
+    const chapterTwoLocation = {
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        displayed: { page: 1, total: 1 },
+      },
+      atEnd: true,
+    };
+    mockRendition.next.mockImplementationOnce(async () => {
+      live = chapterTwoLocation;
+    });
+
+    await expect(session.next()).resolves.toBe(true);
+    relocated(chapterOneLocation);
+    relocated(chapterTwoLocation);
+
+    expect(onLocation.mock.calls).toEqual([
+      [expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)', percentage: 0 }), 'restore'],
+      [
+        expect.objectContaining({
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          percentage: 0.5,
+          atEnd: true,
+        }),
+        'navigation',
+      ],
+    ]);
     session.destroy();
   });
 });

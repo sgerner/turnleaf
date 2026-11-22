@@ -104,12 +104,12 @@
           seriesId: meta.seriesId,
           signal,
           cacheNamespace: server.id,
-          allowDownload: await networkAvailable(),
+          canDownload: networkAvailable,
         });
       }
-      if (offline) throw new Error('Offline');
+      if (!(await networkAvailable())) throw new Error('Offline');
       const blob = await client.getBookCover(meta.chapterId, meta.seriesId, signal);
-      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (signal.aborted || offline) throw new DOMException('Aborted', 'AbortError');
       return blob;
     },
   );
@@ -558,6 +558,8 @@
           if (!connected) {
             refreshController?.abort();
             openProgressProbe?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -827,6 +829,10 @@
       revokeBrowserCover(cover),
     );
     cancelCoverLoading();
+    if (reading) {
+      sharedCoverLoader.cancel();
+      return;
+    }
     sharedCoverLoader.retain(visibleBookIds);
     const controller = new AbortController();
     const generation = coverLoadGeneration;
