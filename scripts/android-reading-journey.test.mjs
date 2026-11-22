@@ -63,6 +63,16 @@ describe('Android reading journey fixture', () => {
     expect(fixture.coverRedirects).toBe(1);
     expect(fixture.downloadRedirects).toBe(1);
     expect(fixture.foreignRequests).toEqual([]);
-    expect(fixture.foreignApiKeys).toEqual([]);
+    expect(fixture.foreignAuthHeaders).toBe(0);
+
+    await fetch(`http://127.0.0.1:${fixture.foreignPort}/probe`);
+    expect(fixture.foreignRequests).toEqual(['/probe']);
+    expect(fixture.foreignAuthHeaders).toBe(0);
+
+    await fetch(`http://127.0.0.1:${fixture.foreignPort}/probe-auth`, {
+      headers: { 'x-api-key': 'turnleaf-ci-only' },
+    });
+    expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
+    expect(fixture.foreignAuthHeaders).toBe(1);
   });
 });

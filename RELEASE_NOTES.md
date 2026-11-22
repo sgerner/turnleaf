@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Count foreign auth headers without storing raw keys in journey fixture
 - Guard FileTransfer redirects and prune cover code
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in

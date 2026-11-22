@@ -81,18 +81,18 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   let covers = 0;
   let coverRedirects = 0;
   let downloadRedirects = 0;
+  let foreignAuthHeaders = 0;
   let offline = false;
   let redirectCrossOrigin = crossOriginRedirects;
   const offlineRequests = [];
   const notFoundPaths = [];
   const foreignRequests = [];
-  const foreignApiKeys = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
 
   const foreignServer = createServer((request, response) => {
     foreignRequests.push(new URL(request.url, 'http://localhost').pathname);
     if (request.headers['x-api-key']) {
-      foreignApiKeys.push(request.headers['x-api-key']);
+      foreignAuthHeaders += 1;
     }
     response.writeHead(200, { 'Content-Type': 'application/octet-stream' }).end('foreign');
   });
@@ -223,10 +223,12 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     get downloadRedirects() {
       return downloadRedirects;
     },
+    get foreignAuthHeaders() {
+      return foreignAuthHeaders;
+    },
     offlineRequests,
     notFoundPaths,
     foreignRequests,
-    foreignApiKeys,
     setOffline(value) {
       offline = value;
     },
@@ -267,9 +269,9 @@ function throwIfInterrupted() {
 }
 
 function assertRedirectIsolation(fixture) {
-  if (fixture.foreignRequests.length > 0 || fixture.foreignApiKeys.length > 0) {
+  if (fixture.foreignRequests.length > 0 || fixture.foreignAuthHeaders > 0) {
     throw new Error(
-      `Cross-origin redirect received ${fixture.foreignRequests.length} request(s) and ${fixture.foreignApiKeys.length} x-api-key header(s).`,
+      `Cross-origin redirect received ${fixture.foreignRequests.length} request(s) and ${fixture.foreignAuthHeaders} x-api-key header(s).`,
     );
   }
 }
