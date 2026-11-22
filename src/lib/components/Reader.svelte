@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { tick, onDestroy, onMount } from 'svelte';
@@ -35,6 +34,7 @@
     type StoredAnnotation,
   } from '../reader/annotations';
   import {
+    bookmarksMarkdown,
     parseBookmarks,
     parseLocationHistory,
     recordLocation,
@@ -43,6 +43,13 @@
     toggleBookmark,
     type StoredReaderLocation,
   } from '../reader/bookmarks';
+  import {
+    bookReadingNotesMarkdown,
+    exportTextDocument,
+    noteMetaPreferenceKey,
+    safeExportSlug,
+    serializeReadingNotesBackup,
+  } from '../reader/notes-backup';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   type SyncedLocation = {
@@ -55,6 +62,8 @@
     bookUrl,
     bookId,
     title,
+    author = null,
+    series = null,
     defaultMode = defaultAppearance.mode,
     initialCfi = null,
     initialXPath = null,
@@ -68,6 +77,8 @@
     bookUrl: string;
     bookId: string;
     title: string;
+    author?: string | null;
+    series?: string | null;
     defaultMode?: Appearance['mode'];
     initialCfi?: string | null;
     initialXPath?: string | null;
@@ -112,6 +123,12 @@
   let exportMessage = $state('');
   let exportFallback = $state('');
   let exporting = $state(false);
+  let bookmarkExportMessage = $state('');
+  let bookmarkExportFallback = $state('');
+  let exportingBookmarks = $state(false);
+  let errorExportMessage = $state('');
+  let errorExportFallback = $state('');
+  let exportingErrorNotes = $state(false);
   let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
   let editingAnnotationId = $state<string | null>(null);
@@ -277,6 +294,8 @@
       await onRetryDownload();
       if (destroyed) return;
       error = '';
+      errorExportMessage = '';
+      errorExportFallback = '';
       await enableNativeReaderChrome();
       await openReaderSession();
       if (destroyed) return;
@@ -432,6 +451,8 @@
   function closeBookmarks(): void {
     bookmarksVisible = false;
     editingBookmarkId = null;
+    bookmarkExportMessage = '';
+    bookmarkExportFallback = '';
     const opener = bookmarksOpener;
     bookmarksOpener = null;
     restorePanelFocus(opener);
@@ -629,10 +650,16 @@
     return bookmarks.find((bookmark) => bookmark.id === id) ?? null;
   }
 
+  function queueNoteMetadata(): void {
+    if (!bookmarks.length && !annotations.length) return;
+    queuePreference(noteMetaPreferenceKey(bookId), JSON.stringify({ title, author, series }));
+  }
+
   function toggleCurrentBookmark(): void {
     if (!location) return;
     bookmarks = toggleBookmark(bookmarks, readerLocation(location));
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    queueNoteMetadata();
     showControls();
   }
 
@@ -646,6 +673,7 @@
     bookmarks = renameBookmark(bookmarks, bookmark.id, bookmarkDraft);
     editingBookmarkId = null;
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    queueNoteMetadata();
     focusReaderTarget(bookmarksPanel, 'bookmark-rename', bookmark.id);
   }
 
@@ -665,6 +693,7 @@
     annotationDraft = '';
     selectedText = null;
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    queueNoteMetadata();
   }
 
   function editAnnotation(annotation: StoredAnnotation): void {
@@ -672,6 +701,7 @@
     editingAnnotationId = null;
     annotationDraft = '';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    queueNoteMetadata();
     focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
@@ -708,36 +738,86 @@
     exportFallback = '';
     exporting = true;
     const markdown = annotationsMarkdown(title, annotations);
-    const name = title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'book';
+    const name = safeExportSlug(title);
     try {
-      if (copy) {
-        await navigator.clipboard.writeText(markdown);
-        exportMessage = 'Markdown copied.';
-      } else if (Capacitor.isNativePlatform()) {
-        const filename = `${name}-notes-${Date.now()}.md`;
-        await Filesystem.writeFile({
-          path: filename,
-          data: markdown,
-          directory: Directory.Documents,
-          encoding: Encoding.UTF8,
-        });
-        exportMessage = `Saved to Documents as ${filename}.`;
-      } else {
-        const blob = new Blob([markdown], { type: 'text/markdown' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${name}-notes.md`;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      }
-    } catch {
-      exportFallback = markdown;
-      exportMessage = 'Copy the Markdown from the field below.';
+      const filename = Capacitor.isNativePlatform()
+        ? `${name}-notes-${Date.now()}.md`
+        : `${name}-notes.md`;
+      const result = await exportTextDocument({
+        filename,
+        content: markdown,
+        mimeType: 'text/markdown',
+        copy,
+        copiedLabel: 'Markdown copied.',
+      });
+      exportMessage = result.message;
+      exportFallback = result.fallbackText;
     } finally {
       exporting = false;
+    }
+  }
+
+  async function exportBookmarks(copy = false): Promise<void> {
+    if (!bookmarks.length || exportingBookmarks) return;
+    bookmarkExportMessage = '';
+    bookmarkExportFallback = '';
+    exportingBookmarks = true;
+    const markdown = bookmarksMarkdown(title, bookmarks);
+    const name = safeExportSlug(title);
+    try {
+      const filename = Capacitor.isNativePlatform()
+        ? `${name}-bookmarks-${Date.now()}.md`
+        : `${name}-bookmarks.md`;
+      const result = await exportTextDocument({
+        filename,
+        content: markdown,
+        mimeType: 'text/markdown',
+        copy,
+        copiedLabel: 'Markdown copied.',
+      });
+      bookmarkExportMessage = result.message;
+      bookmarkExportFallback = result.fallbackText;
+    } finally {
+      exportingBookmarks = false;
+    }
+  }
+
+  async function exportReaderErrorNotes(format: 'markdown' | 'json', copy = false): Promise<void> {
+    if ((!bookmarks.length && !annotations.length) || exportingErrorNotes) return;
+    errorExportMessage = '';
+    errorExportFallback = '';
+    exportingErrorNotes = true;
+    const name = safeExportSlug(title);
+    const content =
+      format === 'json'
+        ? serializeReadingNotesBackup([
+            {
+              bookId,
+              title,
+              author,
+              series,
+              bookmarks,
+              annotations,
+            },
+          ])
+        : bookReadingNotesMarkdown(title, bookmarks, annotations, { author, series });
+    const ext = format === 'json' ? 'json' : 'md';
+    const mimeType = format === 'json' ? 'application/json' : 'text/markdown';
+    try {
+      const filename = Capacitor.isNativePlatform()
+        ? `${name}-reading-notes-${Date.now()}.${ext}`
+        : `${name}-reading-notes.${ext}`;
+      const result = await exportTextDocument({
+        filename,
+        content,
+        mimeType,
+        copy,
+        copiedLabel: format === 'json' ? 'JSON copied.' : 'Markdown copied.',
+      });
+      errorExportMessage = result.message;
+      errorExportFallback = result.fallbackText;
+    } finally {
+      exportingErrorNotes = false;
     }
   }
 
@@ -1151,9 +1231,51 @@
   {/if}
 
   {#if error}
-    <div class="absolute inset-0 grid place-items-center p-8" role="alert">
-      <div class="card preset-tonal-error max-w-sm p-6 text-center">
+    <div class="absolute inset-0 z-30 grid place-items-center p-8" role="alert">
+      <div class="card preset-tonal-error max-h-[85dvh] max-w-md overflow-auto p-6 text-center">
         <p>{error}</p>
+        {#if bookmarks.length > 0 || annotations.length > 0}
+          <div class="mt-4 rounded-lg preset-tonal-surface p-3 text-left">
+            <p class="text-sm text-surface-950-50">
+              Saved bookmarks or notes for this book are still stored on this device.
+            </p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                class="btn btn-sm preset-tonal-primary"
+                type="button"
+                disabled={exportingErrorNotes}
+                onclick={() => void exportReaderErrorNotes('markdown')}
+              >
+                Export Markdown
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface"
+                type="button"
+                disabled={exportingErrorNotes}
+                onclick={() => void exportReaderErrorNotes('json')}
+              >
+                Export JSON
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface"
+                type="button"
+                disabled={exportingErrorNotes}
+                onclick={() => void exportReaderErrorNotes('markdown', true)}
+              >
+                Copy Markdown
+              </button>
+            </div>
+            {#if errorExportMessage}
+              <p class="mt-2 text-sm" role="status">{errorExportMessage}</p>
+            {/if}
+            {#if errorExportFallback}
+              <label class="label mt-2">
+                <span class="label-text">Exported reading notes</span>
+                <textarea class="textarea min-h-24" readonly value={errorExportFallback}></textarea>
+              </label>
+            {/if}
+          </div>
+        {/if}
         <div class="mt-5 flex flex-wrap justify-center gap-3">
           {#if startupOpenFailed && onRetryDownload}
             <button
@@ -1743,12 +1865,40 @@
           {/if}
 
           <section class="mt-5" aria-labelledby="reader-bookmark-list-title">
-            <h3
-              id="reader-bookmark-list-title"
-              class="text-sm font-semibold uppercase tracking-wide"
-            >
-              Bookmarks
-            </h3>
+            <div class="flex flex-wrap items-center gap-2">
+              <h3
+                id="reader-bookmark-list-title"
+                class="text-sm font-semibold uppercase tracking-wide"
+              >
+                Bookmarks
+              </h3>
+              <button
+                class="btn btn-sm preset-tonal-surface"
+                type="button"
+                onclick={() => void exportBookmarks()}
+                disabled={bookmarks.length === 0 || exportingBookmarks}
+              >
+                Export Markdown
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface"
+                type="button"
+                onclick={() => void exportBookmarks(true)}
+                disabled={bookmarks.length === 0 || exportingBookmarks}
+              >
+                Copy Markdown
+              </button>
+            </div>
+            {#if bookmarkExportMessage}
+              <p class="mt-1 text-sm" role="status">{bookmarkExportMessage}</p>
+            {/if}
+            {#if bookmarkExportFallback}
+              <label class="label mt-2">
+                <span class="label-text">Exported bookmarks Markdown</span>
+                <textarea class="textarea min-h-24" readonly value={bookmarkExportFallback}
+                ></textarea>
+              </label>
+            {/if}
             {#if bookmarks.length === 0}
               <p class="mt-2 text-sm text-surface-700-300">No bookmarks yet.</p>
             {:else}

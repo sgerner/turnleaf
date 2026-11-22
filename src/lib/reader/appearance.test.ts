@@ -36,4 +36,18 @@ describe('appearance serialization', () => {
     expect(parseAppearance('{"volumeButtons":true}').volumeButtons).toBe(true);
     expect(parseAppearance('{"volumeButtons":false}').volumeButtons).toBe(false);
   });
+
+  it('returns defaultAppearance without throwing on truncated or malformed JSON', () => {
+    expect(() => parseAppearance('{"fontSize":22,"mode":"da')).not.toThrow();
+    expect(parseAppearance('{"fontSize":22,"mode":"da')).toEqual(defaultAppearance);
+    expect(parseAppearance('')).toEqual(defaultAppearance);
+    expect(parseAppearance('null')).toEqual(defaultAppearance);
+    expect(parseAppearance('[]')).toEqual(defaultAppearance);
+    expect(parseAppearance('"dark"')).toEqual(defaultAppearance);
+    expect(
+      parseAppearance(
+        '{"mode":"sepia","fontFamily":"comic","fontSize":"big","lineHeight":null,"marginWidth":{}}',
+      ),
+    ).toEqual(defaultAppearance);
+  });
 });

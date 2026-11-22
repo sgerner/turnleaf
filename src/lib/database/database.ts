@@ -7,6 +7,12 @@ import {
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
+import { hasNativeSqliteResetPlugin, SqliteReset } from '../native/sqlite-reset';
+import {
+  hasSavedNotesInPreferences,
+  READING_NOTE_PREFERENCE_PREFIXES,
+  type BookNoteMetadata,
+} from '../reader/notes-backup';
 import { migrations } from './schema';
 
 export interface ServerConfig {
@@ -207,17 +213,30 @@ export async function resetLocalDatabase(): Promise<void> {
     return;
   }
 
+  await opening?.catch(() => undefined);
+  await nativeTransactionQueue.catch(() => undefined);
+
   try {
-    if (connection) {
+    const activeConnection = connection;
+    connection = null;
+    opening = null;
+    if (activeConnection) {
       try {
-        await connection.close();
+        await activeConnection.close();
       } catch {
         // Best effort only; a broken connection can still be removed.
       }
     }
-    connection = null;
-    opening = null;
-    await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+    try {
+      await CapacitorSQLite.closeConnection?.({ database: 'turnleaf', readonly: false });
+    } catch {
+      // Best effort only; no native connection may be registered yet.
+    }
+    if (hasNativeSqliteResetPlugin()) {
+      await SqliteReset.deleteDatabase({ database: 'turnleaf' });
+    } else {
+      await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+    }
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
   }
@@ -329,7 +348,8 @@ export async function reconcileBooks(
               Boolean(book.downloadPath) ||
               book.downloadStatus === 'available' ||
               Boolean(state.syncQueue[book.id]) ||
-              Boolean(state.readingState[book.id]),
+              Boolean(state.readingState[book.id]) ||
+              hasSavedNotesInPreferences(state.preferences, book.id),
           )
           .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
     const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
@@ -458,7 +478,12 @@ export async function replaceBooksInTransaction(
 
 const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
   OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id)
-  OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
+  OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id)
+  OR EXISTS (
+    SELECT 1 FROM preferences
+    WHERE preferences.key IN ('readerBookmarks:' || books.id, 'readerAnnotations:' || books.id)
+      AND TRIM(preferences.value) NOT IN ('', '[]', 'null')
+  ))`;
 
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
 export async function reconcileBooksInTransaction(
@@ -1184,6 +1209,87 @@ export async function getPreferences(keys: readonly string[]): Promise<Map<strin
     [...keys],
   );
   return new Map((result.values ?? []).map((row) => [String(row.key), String(row.value)]));
+}
+
+function escapeSqlLikePrefix(prefix: string): string {
+  return `${prefix.replace(/[\\%_]/g, '\\$&')}%`;
+}
+
+async function queryPreferencesByPrefixOnConnection(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  prefixes: readonly string[],
+): Promise<Map<string, string>> {
+  const clauses = prefixes.map(() => "key LIKE ? ESCAPE '\\'").join(' OR ');
+  const result = await db.query(
+    `SELECT key, value FROM preferences WHERE ${clauses}`,
+    prefixes.map(escapeSqlLikePrefix),
+  );
+  return new Map((result.values ?? []).map((row) => [String(row.key), String(row.value)]));
+}
+
+export async function getPreferencesByPrefix(
+  prefixes: readonly string[],
+): Promise<Map<string, string>> {
+  if (prefixes.length === 0) return new Map();
+  if (!Capacitor.isNativePlatform()) {
+    const { preferences } = readBrowserState();
+    const values = new Map<string, string>();
+    for (const [key, value] of Object.entries(preferences)) {
+      if (typeof value === 'string' && prefixes.some((prefix) => key.startsWith(prefix))) {
+        values.set(key, value);
+      }
+    }
+    return values;
+  }
+  const db = await openDatabase();
+  return queryPreferencesByPrefixOnConnection(db, prefixes);
+}
+
+async function queryBookNoteMetadataOnConnection(
+  db: Pick<SQLiteDBConnection, 'query'>,
+): Promise<BookNoteMetadata[]> {
+  const result = await db.query('SELECT id, title, author, series FROM books ORDER BY title');
+  return (result.values ?? []).map((row) => ({
+    id: String(row.id),
+    title: String(row.title),
+    author: row.author ? String(row.author) : null,
+    series: row.series ? String(row.series) : null,
+  }));
+}
+
+export async function getAllBookNoteMetadata(): Promise<BookNoteMetadata[]> {
+  if (!Capacitor.isNativePlatform()) {
+    return readBrowserState().books.map((book) => ({
+      id: book.id,
+      title: book.title,
+      author: book.author,
+      series: book.series,
+    }));
+  }
+  const db = await openDatabase();
+  return queryBookNoteMetadataOnConnection(db);
+}
+
+export async function salvageOpenReadingNotePreferences(): Promise<{
+  preferences: Map<string, string>;
+  books: BookNoteMetadata[];
+} | null> {
+  if (!Capacitor.isNativePlatform()) {
+    const preferences = await getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES);
+    const books = await getAllBookNoteMetadata();
+    return { preferences, books };
+  }
+  if (!connection) return null;
+  try {
+    const preferences = await queryPreferencesByPrefixOnConnection(
+      connection,
+      READING_NOTE_PREFERENCE_PREFIXES,
+    );
+    const books = await queryBookNoteMetadataOnConnection(connection).catch(() => []);
+    return { preferences, books };
+  } catch {
+    return null;
+  }
 }
 
 export async function setPreference(key: string, value: string): Promise<void> {

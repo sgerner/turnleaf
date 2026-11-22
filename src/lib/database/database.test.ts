@@ -886,3 +886,66 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
+
+it('retains unavailable remote books in browser storage when bookmarks or annotations exist', async () => {
+  const { getPreferencesByPrefix } = await import('./database');
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const notedBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:90',
+    chapterId: 90,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  const emptyNotesBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:91',
+    chapterId: 91,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [notedBook, emptyNotesBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {
+        [`readerBookmarks:${notedBook.id}`]: JSON.stringify([
+          {
+            id: 'epubcfi(/6/2)|ch1.xhtml',
+            cfi: 'epubcfi(/6/2)',
+            href: 'ch1.xhtml',
+            percentage: 0.25,
+            label: 'Saved bookmark',
+            savedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ]),
+        [`readerBookmarks:${emptyNotesBook.id}`]: '[]',
+        uiTheme: 'fennec',
+      },
+    }),
+  );
+
+  await reconcileBooks('server', []);
+
+  const retained = await getBooks('server');
+  expect(retained).toHaveLength(1);
+  expect(retained[0]).toMatchObject({
+    id: notedBook.id,
+    remoteAvailable: false,
+  });
+
+  const notePrefs = await getPreferencesByPrefix(['readerBookmarks:', 'readerAnnotations:']);
+  expect([...notePrefs.keys()]).toEqual([
+    `readerBookmarks:${notedBook.id}`,
+    `readerBookmarks:${emptyNotesBook.id}`,
+  ]);
+});

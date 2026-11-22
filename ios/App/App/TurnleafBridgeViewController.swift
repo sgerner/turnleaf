@@ -16,6 +16,9 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         if bridge?.plugin(withName: "KeepAwake") == nil {
             bridge?.registerPluginInstance(TurnleafKeepAwakePlugin())
         }
+        if bridge?.plugin(withName: "SqliteReset") == nil {
+            bridge?.registerPluginInstance(TurnleafSqliteResetPlugin())
+        }
     }
 
     override var prefersStatusBarHidden: Bool {
@@ -191,6 +194,131 @@ public final class TurnleafKeepAwakePlugin: CAPPlugin, CAPBridgedPlugin {
             UIApplication.shared.isIdleTimerDisabled = enabled
         }
         call.resolve()
+    }
+}
+
+@objc(TurnleafSqliteResetPlugin)
+public final class TurnleafSqliteResetPlugin: CAPPlugin, CAPBridgedPlugin {
+    private static let databaseFile = "turnleafSQLite.db"
+    private static let allowedFiles = [
+        databaseFile,
+        "\(databaseFile)-wal",
+        "\(databaseFile)-shm",
+        "\(databaseFile)-journal",
+    ]
+
+    public let identifier = "TurnleafSqliteResetPlugin"
+    public let jsName = "SqliteReset"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "deleteDatabase", returnType: CAPPluginReturnPromise),
+    ]
+
+    @objc func deleteDatabase(_ call: CAPPluginCall) {
+        let requested = call.getString("database") ?? "turnleaf"
+        guard requested == "turnleaf" || requested == Self.databaseFile else {
+            call.reject("Unsupported database name.")
+            return
+        }
+
+        let configuredLocation =
+            bridge?.config.getPluginConfig("CapacitorSQLite").getString("iosDatabaseLocation")
+            ?? "Documents"
+
+        do {
+            let directoryURL = try Self.resolveDatabaseDirectory(location: configuredLocation)
+            let fileManager = FileManager.default
+            for fileName in Self.allowedFiles {
+                let targetURL = directoryURL.appendingPathComponent(fileName)
+                guard fileManager.fileExists(atPath: targetURL.path) else {
+                    continue
+                }
+                do {
+                    try fileManager.removeItem(at: targetURL)
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain
+                    && error.code == NSFileNoSuchFileError
+                {
+                    continue
+                }
+            }
+            call.resolve()
+        } catch {
+            call.reject("Could not delete local SQLite files: \(error.localizedDescription)")
+        }
+    }
+
+    private static func resolveDatabaseDirectory(location: String) throws -> URL {
+        let parts = location.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let rootPart = parts.first, !rootPart.isEmpty else {
+            throw NSError(
+                domain: "TurnleafSqliteResetPlugin",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid database location."]
+            )
+        }
+
+        let root = String(rootPart)
+        let fileManager = FileManager.default
+        let baseURL: URL
+        if root == "Documents" || root == "default" {
+            guard let url = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+                throw NSError(
+                    domain: "TurnleafSqliteResetPlugin",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Documents directory is unavailable."]
+                )
+            }
+            baseURL = url
+        } else if root == "Library" {
+            guard let url = fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first else {
+                throw NSError(
+                    domain: "TurnleafSqliteResetPlugin",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Library directory is unavailable."]
+                )
+            }
+            baseURL = url
+        } else if root == "Applications" {
+            guard let url = fileManager.urls(for: .applicationDirectory, in: .userDomainMask).first else {
+                throw NSError(
+                    domain: "TurnleafSqliteResetPlugin",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Application directory is unavailable."]
+                )
+            }
+            baseURL = url
+        } else if root == "tmp" {
+            baseURL = fileManager.temporaryDirectory
+        } else if root.caseInsensitiveCompare("cache") == .orderedSame {
+            guard let url = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+                throw NSError(
+                    domain: "TurnleafSqliteResetPlugin",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Caches directory is unavailable."]
+                )
+            }
+            baseURL = url
+        } else {
+            throw NSError(
+                domain: "TurnleafSqliteResetPlugin",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Unsupported database location."]
+            )
+        }
+
+        guard parts.count > 1 else {
+            return baseURL
+        }
+
+        let subsegments = parts[1].split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        if subsegments.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) {
+            throw NSError(
+                domain: "TurnleafSqliteResetPlugin",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid database subpath."]
+            )
+        }
+
+        return subsegments.reduce(baseURL) { $0.appendingPathComponent($1) }
     }
 }
 

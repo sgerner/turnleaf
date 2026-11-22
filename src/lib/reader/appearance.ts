@@ -36,23 +36,58 @@ export function serializeAppearance(value: Appearance): string {
   return JSON.stringify(value);
 }
 
+function boundedNumber(value: unknown, fallback: number, min: number, max: number): number {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') {
+    return fallback;
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
 export function parseAppearance(value: string): Appearance {
-  const parsed = JSON.parse(value) as Partial<Appearance>;
-  const mode = parsed.mode === 'dark' ? 'dark' : 'light';
+  let raw: unknown;
+  try {
+    raw = JSON.parse(value);
+  } catch {
+    return { ...defaultAppearance };
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ...defaultAppearance };
+  }
+  const parsed = raw as Partial<Record<keyof Appearance, unknown>>;
+  const mode: ReadingMode = parsed.mode === 'dark' ? 'dark' : 'light';
+  const fontFamily: Appearance['fontFamily'] =
+    parsed.fontFamily === 'book' ||
+    parsed.fontFamily === 'sans' ||
+    parsed.fontFamily === 'accessible'
+      ? parsed.fontFamily
+      : defaultAppearance.fontFamily;
+  const alignment: Appearance['alignment'] =
+    parsed.alignment === 'start' || parsed.alignment === 'justify'
+      ? parsed.alignment
+      : defaultAppearance.alignment;
   return {
-    ...defaultAppearance,
-    ...parsed,
     mode,
-    fontSize: Math.min(34, Math.max(14, Number(parsed.fontSize ?? defaultAppearance.fontSize))),
-    lineHeight: Math.min(
-      2,
-      Math.max(1.2, Number(parsed.lineHeight ?? defaultAppearance.lineHeight)),
+    fontFamily,
+    fontSize: boundedNumber(parsed.fontSize, defaultAppearance.fontSize, 14, 34),
+    lineHeight: boundedNumber(parsed.lineHeight, defaultAppearance.lineHeight, 1.2, 2),
+    paragraphSpacing: boundedNumber(
+      parsed.paragraphSpacing,
+      defaultAppearance.paragraphSpacing,
+      0,
+      1.5,
     ),
-    bottomMargin: Math.min(
-      64,
-      Math.max(0, Number(parsed.bottomMargin ?? defaultAppearance.bottomMargin)),
-    ),
+    margin: boundedNumber(parsed.margin, defaultAppearance.margin, 8, 56),
+    bottomMargin: boundedNumber(parsed.bottomMargin, defaultAppearance.bottomMargin, 0, 64),
+    alignment,
+    publisherStyles:
+      typeof parsed.publisherStyles === 'boolean'
+        ? parsed.publisherStyles
+        : defaultAppearance.publisherStyles,
+    hyphenation: parsed.hyphenation === true,
     progressBar: parsed.progressBar !== false,
+    keepAwake: parsed.keepAwake === true,
     volumeButtons: parsed.volumeButtons === true,
   };
 }

@@ -6,9 +6,11 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import {
+    getAllBookNoteMetadata,
     getBooks,
     getReadingState,
     getPreferences,
+    getPreferencesByPrefix,
     getSyncStatus,
     acceptRemoteProgress,
     markDownloaded,
@@ -20,6 +22,7 @@
     saveRemoteProgress,
     saveServer,
     setPreference,
+    setPreferences,
     type BookRecord,
     type ServerConfig,
     type SyncStatus,
@@ -53,6 +56,22 @@
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import { parseAnnotations } from '../reader/annotations';
+  import { parseBookmarks } from '../reader/bookmarks';
+  import {
+    annotationsPreferenceKey,
+    bookIdsWithSavedNotes,
+    bookmarksPreferenceKey,
+    bookReadingNotesMarkdown,
+    buildRestorePreferencesUpdate,
+    collectLibraryReadingNotes,
+    exportTextDocument,
+    parseReadingNotesBackup,
+    READING_NOTE_PREFERENCE_PREFIXES,
+    readingNotesBackupMarkdown,
+    safeExportSlug,
+    serializeReadingNotesBackup,
+  } from '../reader/notes-backup';
 
   let {
     server,
@@ -95,8 +114,14 @@
     return blob;
   });
   let books = $state<BookRecord[]>([]);
+  let booksWithSavedNotes = $state<ReadonlySet<string>>(new Set());
   let displayableBooks = $derived(
-    books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
+    books.filter(
+      (book) =>
+        book.remoteAvailable !== false ||
+        Boolean(book.downloadPath) ||
+        booksWithSavedNotes.has(book.id),
+    ),
   );
   let query = $state('');
   let offlineMessage = $state('');
@@ -234,6 +259,18 @@
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
   let credentialCleanupComplete = false;
+  let serverCleanupComplete = $state(false);
+  let pendingServerCleanupBooks = $state<BookRecord[] | null>(null);
+  let notesBackupBusy = $state(false);
+  let notesBackupMessage = $state('');
+  let notesBackupError = $state('');
+  let notesBackupFallback = $state('');
+  let showPasteRestore = $state(false);
+  let pasteRestoreText = $state('');
+  let restoreFileInput = $state<HTMLInputElement | null>(null);
+  let bookExportBusy = $state(false);
+  let bookExportMessage = $state('');
+  let bookExportFallback = $state('');
   let actionMenuBook = $state<BookRecord | null>(null);
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
@@ -294,7 +331,11 @@
   }
 
   function openBookLabel(book: BookRecord, includeProgress = true): string {
-    const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
+    const downloaded = book.downloadPath
+      ? ', downloaded for offline reading'
+      : book.remoteAvailable === false
+        ? ', unavailable on Kavita'
+        : '';
     const progress =
       includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
     return `Open ${book.title}${downloaded}${progress}`;
@@ -502,7 +543,7 @@
     window.addEventListener('resize', scheduleVirtualWindow);
     scheduleVirtualWindow();
 
-    const [preferences, savedBooks] = await Promise.all([
+    const [preferences, savedBooks, savedNotePreferences] = await Promise.all([
       getPreferences([
         'syncFurthest',
         'librarySort',
@@ -511,6 +552,9 @@
         'libraryView',
       ]),
       getBooks(server.id, { includeDescription: false }),
+      getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES).catch(
+        () => new Map<string, string>(),
+      ),
     ]);
     if (destroyed) return;
     pendingTheme = theme as SkeletonTheme;
@@ -522,6 +566,7 @@
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     offline = !(await Network.getStatus().catch(() => null))?.connected;
     if (destroyed) return;
+    booksWithSavedNotes = bookIdsWithSavedNotes(savedNotePreferences);
     books = savedBooks;
     retainCoversFor(books);
     loading = false;
@@ -598,6 +643,17 @@
     if (!Capacitor.isNativePlatform()) return true;
     const status = await Network.getStatus().catch(() => null);
     return !offline && !destroyed && status?.connected === true;
+  }
+
+  async function refreshSavedNotesIndex(): Promise<void> {
+    try {
+      const notePreferences = await getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES);
+      if (!destroyed) {
+        booksWithSavedNotes = bookIdsWithSavedNotes(notePreferences);
+      }
+    } catch {
+      // A note-index read must not block library interactions.
+    }
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -707,6 +763,8 @@
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
       await reconcileBooks(server.id, mapped, { preserveMissing: incomplete, snapshotStartedAt });
+      if (destroyed) return;
+      await refreshSavedNotesIndex();
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);
@@ -982,6 +1040,7 @@
           }
         : item,
     );
+    await refreshSavedNotesIndex();
     return true;
   }
 
@@ -1020,6 +1079,15 @@
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
     if (!book.downloadPath) {
+      if (book.remoteAvailable === false) {
+        message = booksWithSavedNotes.has(book.id)
+          ? `${book.title} is no longer available on Kavita. Export your saved bookmarks and notes from Book actions.`
+          : `${book.title} is no longer available on Kavita.`;
+        if (booksWithSavedNotes.has(book.id)) {
+          openMenu(book);
+        }
+        return;
+      }
       const refreshed = await download(book);
       if (refreshed) await open(refreshed, options);
       return;
@@ -1236,6 +1304,7 @@
   async function closeReader(): Promise<void> {
     const bookId = reading?.book.id;
     reading = null;
+    await refreshSavedNotesIndex();
     await tick();
     if (reading || !libraryMain) return;
 
@@ -1255,12 +1324,16 @@
 
   function openMenu(book: BookRecord): void {
     actionMenuOpener = activeElement();
+    bookExportMessage = '';
+    bookExportFallback = '';
     actionMenuBook = book;
     focusModal(() => actionMenuDialog);
   }
 
   function closeMenu(): void {
     actionMenuBook = null;
+    bookExportMessage = '';
+    bookExportFallback = '';
     const opener = actionMenuOpener;
     actionMenuOpener = null;
     void tick().then(() => {
@@ -1536,19 +1609,229 @@
     }
   }
 
+  async function exportSingleBookNotes(
+    book: BookRecord,
+    format: 'markdown' | 'json',
+    copy = false,
+  ): Promise<void> {
+    if (bookExportBusy) return;
+    bookExportBusy = true;
+    bookExportMessage = '';
+    bookExportFallback = '';
+    try {
+      const prefs = await getPreferences([
+        bookmarksPreferenceKey(book.id),
+        annotationsPreferenceKey(book.id),
+      ]);
+      const bookmarks = parseBookmarks(prefs.get(bookmarksPreferenceKey(book.id)) ?? null);
+      const annotations = parseAnnotations(prefs.get(annotationsPreferenceKey(book.id)) ?? null);
+      if (!bookmarks.length && !annotations.length) {
+        bookExportMessage = 'No saved bookmarks or highlights for this book.';
+        return;
+      }
+      const name = safeExportSlug(book.title);
+      const content =
+        format === 'json'
+          ? serializeReadingNotesBackup([
+              {
+                bookId: book.id,
+                title: book.title,
+                author: book.author,
+                series: book.series,
+                bookmarks,
+                annotations,
+              },
+            ])
+          : bookReadingNotesMarkdown(book.title, bookmarks, annotations, {
+              author: book.author,
+              series: book.series,
+            });
+      const ext = format === 'json' ? 'json' : 'md';
+      const mimeType = format === 'json' ? 'application/json' : 'text/markdown';
+      const filename = Capacitor.isNativePlatform()
+        ? `${name}-reading-notes-${Date.now()}.${ext}`
+        : `${name}-reading-notes.${ext}`;
+      const result = await exportTextDocument({
+        filename,
+        content,
+        mimeType,
+        copy,
+        copiedLabel: format === 'json' ? 'JSON copied.' : 'Markdown copied.',
+      });
+      bookExportMessage = result.message;
+      bookExportFallback = result.fallbackText;
+    } catch (cause) {
+      bookExportMessage =
+        cause instanceof Error ? cause.message : 'Could not export bookmarks and notes.';
+    } finally {
+      bookExportBusy = false;
+    }
+  }
+
+  async function loadLibraryNotesBackupItems() {
+    const [notePreferences, metadata] = await Promise.all([
+      getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES),
+      getAllBookNoteMetadata(),
+    ]);
+    const combinedBooks = new SvelteMap(metadata.map((item) => [item.id, item]));
+    for (const book of books) {
+      if (!combinedBooks.has(book.id)) {
+        combinedBooks.set(book.id, {
+          id: book.id,
+          title: book.title,
+          author: book.author,
+          series: book.series,
+        });
+      }
+    }
+    return collectLibraryReadingNotes(notePreferences, [...combinedBooks.values()]);
+  }
+
+  async function exportLibraryNotes(format: 'json' | 'markdown', copy = false): Promise<void> {
+    if (notesBackupBusy) return;
+    notesBackupBusy = true;
+    notesBackupMessage = '';
+    notesBackupError = '';
+    notesBackupFallback = '';
+    try {
+      const items = await loadLibraryNotesBackupItems();
+      if (items.length === 0) {
+        notesBackupMessage = 'No saved bookmarks or highlights to export yet.';
+        return;
+      }
+      const content =
+        format === 'json' ? serializeReadingNotesBackup(items) : readingNotesBackupMarkdown(items);
+      const ext = format === 'json' ? 'json' : 'md';
+      const mimeType = format === 'json' ? 'application/json' : 'text/markdown';
+      const stamp = new Date().toISOString().slice(0, 10);
+      const filename = Capacitor.isNativePlatform()
+        ? `turnleaf-reading-notes-${Date.now()}.${ext}`
+        : `turnleaf-reading-notes-${stamp}.${ext}`;
+      const result = await exportTextDocument({
+        filename,
+        content,
+        mimeType,
+        copy,
+        copiedLabel:
+          format === 'json'
+            ? 'Reading notes JSON copied to clipboard.'
+            : 'Reading notes Markdown copied to clipboard.',
+      });
+      notesBackupMessage = result.message;
+      notesBackupFallback = result.fallbackText;
+    } catch (cause) {
+      notesBackupError =
+        cause instanceof Error
+          ? cause.message
+          : 'Turnleaf could not read saved bookmarks and notes.';
+    } finally {
+      notesBackupBusy = false;
+    }
+  }
+
+  function selectNotesBackupOutput(): void {
+    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-notes-backup-output');
+    field?.focus();
+    field?.select();
+  }
+
+  async function restoreNotesFromRawJson(raw: string): Promise<void> {
+    if (notesBackupBusy) return;
+    notesBackupBusy = true;
+    notesBackupMessage = '';
+    notesBackupError = '';
+    try {
+      const parsed = parseReadingNotesBackup(raw);
+      if (parsed.books.length === 0) {
+        notesBackupMessage = 'The backup file did not contain any bookmarks or highlights.';
+        return;
+      }
+      const existingPreferences = await getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES);
+      const { updates, restoredBookCount } = buildRestorePreferencesUpdate(
+        parsed,
+        existingPreferences,
+      );
+      if (updates.size > 0) {
+        await setPreferences(updates);
+      }
+      await refreshSavedNotesIndex();
+      notesBackupMessage = `Restored bookmarks and notes for ${restoredBookCount} book${restoredBookCount === 1 ? '' : 's'}.`;
+      pasteRestoreText = '';
+      showPasteRestore = false;
+    } catch (cause) {
+      notesBackupError =
+        cause instanceof Error
+          ? cause.message
+          : 'Turnleaf could not restore the reading notes backup.';
+    } finally {
+      notesBackupBusy = false;
+    }
+  }
+
+  async function handleRestoreFileSelected(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      await restoreNotesFromRawJson(text);
+    } catch {
+      notesBackupError = 'Could not read the selected backup file.';
+    }
+  }
+
+  function finishServerRemovalAfterCleanupFailure(): void {
+    pendingServerCleanupBooks = null;
+    onServerDeleted();
+    message = 'Server removed. Some downloaded EPUB files remained on device storage.';
+    closeSettings();
+  }
+
   async function deleteServer(): Promise<void> {
+    if (downloadingBookId || cleanupInProgress) {
+      settingsError =
+        'Wait for the current download or cleanup to finish before deleting the server.';
+      return;
+    }
     settingsError = '';
     deletingServer = true;
+    const booksToClean =
+      pendingServerCleanupBooks ?? books.filter((item) => Boolean(item.downloadPath));
     try {
-      for (const book of books.filter((item) => item.downloadPath)) await remove(book);
-      cancelCoverLoading();
-      await clearCoverCache().catch(() => {});
-      clearCovers();
       if (!credentialCleanupComplete) {
         await removeApiKey(server.credentialRef);
         credentialCleanupComplete = true;
       }
-      await removeServer(server.id);
+      if (!serverCleanupComplete) {
+        await removeServer(server.id);
+        serverCleanupComplete = true;
+        pendingServerCleanupBooks = booksToClean;
+      }
+      cancelCoverLoading();
+      await clearCoverCache().catch(() => {});
+      clearCovers();
+      const failedBooks: BookRecord[] = [];
+      for (const book of booksToClean) {
+        if (!book.downloadPath) continue;
+        try {
+          await deleteDownloadedEpub(book.downloadPath);
+        } catch (fileError) {
+          if (!isMissingNativeFile(fileError)) {
+            failedBooks.push(book);
+          }
+        }
+      }
+      if (failedBooks.length > 0) {
+        pendingServerCleanupBooks = failedBooks;
+        const names = failedBooks
+          .slice(0, 2)
+          .map((item) => item.title)
+          .join(', ');
+        settingsError = `Server connection removed, but ${failedBooks.length} downloaded EPUB file${failedBooks.length === 1 ? '' : 's'} could not be deleted (${names}${failedBooks.length > 2 ? ', …' : ''}). Retry Delete server to remove the remaining files, or continue to Onboarding.`;
+        return;
+      }
+      pendingServerCleanupBooks = null;
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
       closeSettings();
@@ -1573,6 +1856,8 @@
       bookUrl={reading.url}
       bookId={reading.book.id}
       title={reading.book.title}
+      author={reading.book.author}
+      series={reading.book.series}
       defaultMode={mode}
       initialCfi={reading.cfi}
       initialXPath={reading.xpath}
@@ -2120,7 +2405,7 @@
                             </svg>
                           </span>
                         {/if}
-                        {#if book.remoteAvailable === false && book.downloadPath}
+                        {#if book.remoteAvailable === false}
                           <span
                             class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
                           >
@@ -2236,7 +2521,7 @@
                           </svg>
                         </span>
                       {/if}
-                      {#if book.remoteAvailable === false && book.downloadPath}
+                      {#if book.remoteAvailable === false}
                         <span
                           class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
@@ -2334,7 +2619,7 @@
   >
     <div
       bind:this={actionMenuDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
+      class="card preset-filled-surface-50-950 max-h-[85dvh] w-full max-w-md overflow-auto p-4 shadow-2xl"
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
@@ -2372,6 +2657,7 @@
         <button
           class="btn preset-filled-primary-700-300 justify-start"
           type="button"
+          disabled={!actionMenuBook.downloadPath && actionMenuBook.remoteAvailable === false}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
@@ -2401,6 +2687,43 @@
             </svg>
             <span>Download for offline</span>
           </button>
+        {/if}
+        {#if booksWithSavedNotes.has(actionMenuBook.id)}
+          <button
+            class="btn preset-tonal-surface justify-start"
+            type="button"
+            disabled={bookExportBusy}
+            onclick={() => actionMenuBook && void exportSingleBookNotes(actionMenuBook, 'markdown')}
+          >
+            <span>Export notes (Markdown)</span>
+          </button>
+          <button
+            class="btn preset-tonal-surface justify-start"
+            type="button"
+            disabled={bookExportBusy}
+            onclick={() => actionMenuBook && void exportSingleBookNotes(actionMenuBook, 'json')}
+          >
+            <span>Export notes (JSON)</span>
+          </button>
+          <button
+            class="btn preset-tonal-surface justify-start"
+            type="button"
+            disabled={bookExportBusy}
+            onclick={() =>
+              actionMenuBook && void exportSingleBookNotes(actionMenuBook, 'markdown', true)}
+          >
+            <span>Copy notes</span>
+          </button>
+          {#if bookExportMessage}
+            <p class="text-sm text-surface-700-300" role="status">{bookExportMessage}</p>
+          {/if}
+          {#if bookExportFallback}
+            <label class="label">
+              <span class="label-text text-xs">Exported reading notes</span>
+              <textarea class="textarea min-h-24 text-xs" readonly value={bookExportFallback}
+              ></textarea>
+            </label>
+          {/if}
         {/if}
         <button
           class="btn preset-tonal-primary justify-start"
@@ -2760,6 +3083,16 @@
           >
             {settingsError}
           </div>
+          {#if serverCleanupComplete && pendingServerCleanupBooks?.length}
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              onclick={finishServerRemovalAfterCleanupFailure}
+              disabled={deletingServer}
+            >
+              Continue to onboarding
+            </button>
+          {/if}
           <button
             class="btn preset-tonal-error"
             type="button"
@@ -2803,6 +3136,111 @@
             </dd>
           </div>
         </dl>
+
+        <div class="mt-5 rounded-xl preset-tonal-surface p-4">
+          <h4 class="text-sm font-medium">Reading notes backup</h4>
+          <p class="mt-1 text-sm text-surface-700-300">
+            Bookmarks, highlights, and notes stay on this device and are not sent to Kavita. Export
+            them as JSON or Markdown, or restore a JSON backup.
+          </p>
+          <input
+            bind:this={restoreFileInput}
+            class="sr-only"
+            type="file"
+            accept=".json,application/json"
+            aria-label="Import reading notes JSON backup"
+            onchange={(event) => void handleRestoreFileSelected(event)}
+          />
+          <div class="mt-3 grid grid-cols-2 gap-2">
+            <button
+              class="btn preset-tonal-primary"
+              type="button"
+              disabled={notesBackupBusy}
+              onclick={() => void exportLibraryNotes('json')}
+            >
+              Export JSON backup
+            </button>
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              disabled={notesBackupBusy}
+              onclick={() => void exportLibraryNotes('markdown')}
+            >
+              Export Markdown
+            </button>
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              disabled={notesBackupBusy}
+              onclick={() => void exportLibraryNotes('json', true)}
+            >
+              Copy JSON
+            </button>
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              disabled={notesBackupBusy}
+              onclick={() => restoreFileInput?.click()}
+            >
+              Restore JSON backup
+            </button>
+          </div>
+          <button
+            class="btn preset-tonal-surface mt-2 w-full"
+            type="button"
+            disabled={notesBackupBusy}
+            onclick={() => (showPasteRestore = !showPasteRestore)}
+          >
+            {showPasteRestore ? 'Hide JSON paste restore' : 'Paste JSON backup'}
+          </button>
+          {#if showPasteRestore}
+            <div class="mt-3 grid gap-2">
+              <label class="label">
+                <span class="label-text text-xs">Paste Turnleaf reading notes JSON</span>
+                <textarea
+                  class="textarea min-h-28 font-mono text-xs"
+                  bind:value={pasteRestoreText}
+                  placeholder={'{"format":"turnleaf-reading-notes","version":1,"books":[]}'}
+                ></textarea>
+              </label>
+              <button
+                class="btn preset-filled-primary-700-300"
+                type="button"
+                disabled={notesBackupBusy || !pasteRestoreText.trim()}
+                onclick={() => void restoreNotesFromRawJson(pasteRestoreText)}
+              >
+                Restore pasted JSON
+              </button>
+            </div>
+          {/if}
+          {#if notesBackupMessage}
+            <p class="mt-2 text-sm text-surface-700-300" role="status">{notesBackupMessage}</p>
+          {/if}
+          {#if notesBackupError}
+            <p class="mt-2 text-sm text-error-700-300" role="alert">{notesBackupError}</p>
+          {/if}
+          {#if notesBackupFallback}
+            <div class="mt-3 grid gap-2">
+              <label class="label">
+                <span class="label-text text-xs">Exported reading notes</span>
+                <textarea
+                  id="turnleaf-notes-backup-output"
+                  class="input min-h-36 w-full font-mono text-xs"
+                  readonly
+                  rows="8"
+                  value={notesBackupFallback}
+                  onclick={selectNotesBackupOutput}></textarea>
+              </label>
+              <button
+                class="btn preset-tonal-surface"
+                type="button"
+                onclick={selectNotesBackupOutput}
+              >
+                Select all text
+              </button>
+            </div>
+          {/if}
+        </div>
       </section>
       <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
         <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
@@ -2860,9 +3298,38 @@
           <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
           <p class="mt-2 text-sm text-surface-700-300">
             This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
+            from this device. Export your bookmarks and reading notes first if you want a backup
+            copy.
           </p>
-          <div class="mt-4 flex gap-2">
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button
+              class="btn btn-sm preset-tonal-primary"
+              type="button"
+              disabled={deletingServer || notesBackupBusy}
+              onclick={() => void exportLibraryNotes('json')}
+            >
+              Export JSON backup
+            </button>
+            <button
+              class="btn btn-sm preset-tonal-surface"
+              type="button"
+              disabled={deletingServer || notesBackupBusy}
+              onclick={() => void exportLibraryNotes('markdown')}
+            >
+              Export Markdown
+            </button>
+          </div>
+          {#if notesBackupMessage}
+            <p class="mt-2 text-sm text-surface-700-300" role="status">{notesBackupMessage}</p>
+          {/if}
+          {#if notesBackupFallback}
+            <label class="label mt-2">
+              <span class="label-text text-xs">Exported reading notes</span>
+              <textarea class="textarea min-h-24 text-xs" readonly value={notesBackupFallback}
+              ></textarea>
+            </label>
+          {/if}
+          <div class="mt-4 flex flex-wrap gap-2">
             <button
               class="btn preset-outlined-error-500"
               type="button"
