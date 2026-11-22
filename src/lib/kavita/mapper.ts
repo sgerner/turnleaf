@@ -39,6 +39,7 @@ function mapChapterToBook(
 ): BookRecord {
   const file = chapter.files.find(isEpubFile);
   if (!file) throw new Error('An EPUB chapter did not include an EPUB file.');
+  const chapterKey = extractChapterKey(chapter);
   return {
     id: `${serverId}:${series.id}:${chapter.id}`,
     serverId,
@@ -54,6 +55,7 @@ function mapChapterToBook(
     format: 'epub',
     pages: chapter.pages || series.pages,
     pagesRead: chapter.pagesRead ?? 0,
+    ...(chapterKey ? { chapterKey } : {}),
     ...(chapter.pagesRead === undefined ? { remoteProgressKnown: false } : {}),
     ...(!chapter.lastReadingProgressUtc ? { remoteReadDateKnown: false } : {}),
     createdAt: series.created,
@@ -61,8 +63,28 @@ function mapChapterToBook(
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
+    remoteFileSize: file.bytes,
     remoteAvailable: true,
   };
+}
+
+function extractChapterKey(chapter: KavitaChapter): string | null {
+  const isbn = chapter.isbn?.replace(/[\s-]+/g, '').toLowerCase();
+  if (isbn) return `isbn:${isbn}`;
+  const number = chapter.number?.trim();
+  if (number && number !== '-100000') return `number:${number.toLowerCase()}`;
+  const range = chapter.range?.trim();
+  if (range && range !== '-100000' && !/\.epub$/i.test(range)) {
+    return `range:${range.toLowerCase()}`;
+  }
+  if (
+    typeof chapter.sortOrder === 'number' &&
+    Number.isFinite(chapter.sortOrder) &&
+    chapter.sortOrder >= 0
+  ) {
+    return `sort:${chapter.sortOrder}`;
+  }
+  return null;
 }
 
 function lastReadAt(chapter: KavitaChapter): string | null {

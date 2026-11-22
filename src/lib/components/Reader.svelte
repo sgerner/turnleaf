@@ -2,11 +2,16 @@
   import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
-  import { tick, onDestroy, onMount } from 'svelte';
+  import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
-  import { getPreferences, setPreferences } from '../database/database';
+  import {
+    getPreferences,
+    mergeReaderPreferenceValue,
+    READER_PREFERENCE_PREFIXES,
+    setPreferences,
+  } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -139,6 +144,7 @@
   let syncingLatest = $state(false);
   let destroyed = false;
   let localNavigationDuringSession = false;
+  let activeBookId = untrack(() => bookId);
   const nativeFeatures = Capacitor.isNativePlatform()
     ? createReaderNativeFeatures({
         hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
@@ -154,18 +160,25 @@
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
+    const requestedBookId = bookId;
     const preferences = await getPreferences([
       'appearance',
-      `readerBookmarks:${bookId}`,
-      `readerHistory:${bookId}`,
-      `readerAnnotations:${bookId}`,
+      `readerBookmarks:${requestedBookId}`,
+      `readerHistory:${requestedBookId}`,
+      `readerAnnotations:${requestedBookId}`,
     ]);
     if (destroyed) return;
     const saved = preferences.get('appearance');
     appearance = saved ? parseAppearance(saved) : { ...defaultAppearance, mode: defaultMode };
-    bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
-    locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
-    annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
+    bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${requestedBookId}`) ?? null);
+    locationHistory = parseLocationHistory(
+      preferences.get(`readerHistory:${requestedBookId}`) ?? null,
+    );
+    annotations = parseAnnotations(preferences.get(`readerAnnotations:${requestedBookId}`) ?? null);
+    if (bookId !== requestedBookId) {
+      await syncReaderPreferencesForBook(bookId);
+      if (destroyed) return;
+    }
     await enableNativeReaderChrome();
     try {
       await openReaderSession();
@@ -264,6 +277,15 @@
       // Resume syncing is optional; the reader itself should keep working.
     }
   }
+
+  $effect(() => {
+    const nextBookId = bookId;
+    if (nextBookId === activeBookId) return;
+    const previousBookId = activeBookId;
+    activeBookId = nextBookId;
+    rekeyPendingReaderPreferences(previousBookId, nextBookId);
+    void syncReaderPreferencesForBook(nextBookId);
+  });
 
   $effect(() => {
     if (!nativeFeatures || !androidReader) return;
@@ -595,6 +617,79 @@
   const pendingPreferences = new SvelteMap<string, string>();
   let preferenceWrite = Promise.resolve();
 
+  function rekeyPendingReaderPreferences(fromBookId: string, toBookId: string): void {
+    if (fromBookId === toBookId) return;
+    let moved = false;
+    for (const prefix of READER_PREFERENCE_PREFIXES) {
+      const fromKey = `${prefix}${fromBookId}`;
+      const toKey = `${prefix}${toBookId}`;
+      const pendingFrom = pendingPreferences.get(fromKey);
+      if (pendingFrom === undefined) continue;
+      const merged =
+        mergeReaderPreferenceValue(prefix, pendingFrom, pendingPreferences.get(toKey)) ??
+        pendingFrom;
+      pendingPreferences.delete(fromKey);
+      pendingPreferences.set(toKey, merged);
+      moved = true;
+    }
+    if (moved) flushPreferences();
+  }
+
+  async function syncReaderPreferencesForBook(targetBookId: string): Promise<void> {
+    try {
+      const stored = await getPreferences([
+        `readerBookmarks:${targetBookId}`,
+        `readerHistory:${targetBookId}`,
+        `readerAnnotations:${targetBookId}`,
+      ]);
+      if (destroyed || bookId !== targetBookId) return;
+      const currentBookmarksJson = bookmarks.length ? JSON.stringify(bookmarks) : undefined;
+      const currentHistoryJson = locationHistory.length
+        ? JSON.stringify(locationHistory)
+        : undefined;
+      const currentAnnotationsJson = annotations.length ? JSON.stringify(annotations) : undefined;
+
+      const storedBookmarks = stored.get(`readerBookmarks:${targetBookId}`);
+      const storedHistory = stored.get(`readerHistory:${targetBookId}`);
+      const storedAnnotations = stored.get(`readerAnnotations:${targetBookId}`);
+
+      const mergedBookmarks = mergeReaderPreferenceValue(
+        'readerBookmarks:',
+        storedBookmarks,
+        currentBookmarksJson,
+      );
+      const mergedHistory = mergeReaderPreferenceValue(
+        'readerHistory:',
+        storedHistory,
+        currentHistoryJson,
+      );
+      const mergedAnnotations = mergeReaderPreferenceValue(
+        'readerAnnotations:',
+        storedAnnotations,
+        currentAnnotationsJson,
+      );
+
+      if (mergedBookmarks !== undefined) bookmarks = parseBookmarks(mergedBookmarks);
+      if (mergedHistory !== undefined) locationHistory = parseLocationHistory(mergedHistory);
+      if (mergedAnnotations !== undefined) {
+        annotations = parseAnnotations(mergedAnnotations);
+        session?.updateHighlights(annotations);
+      }
+
+      if (mergedBookmarks !== undefined && mergedBookmarks !== storedBookmarks) {
+        queuePreference(`readerBookmarks:${targetBookId}`, mergedBookmarks);
+      }
+      if (mergedHistory !== undefined && mergedHistory !== storedHistory) {
+        queuePreference(`readerHistory:${targetBookId}`, mergedHistory);
+      }
+      if (mergedAnnotations !== undefined && mergedAnnotations !== storedAnnotations) {
+        queuePreference(`readerAnnotations:${targetBookId}`, mergedAnnotations);
+      }
+    } catch {
+      // Keep in-memory reader notes and bookmarks intact if preference reload fails.
+    }
+  }
+
   function queuePreference(key: string, value: string): void {
     pendingPreferences.set(key, value);
     flushPreferences();
@@ -602,10 +697,29 @@
 
   function flushPreferences(): void {
     preferenceWrite = preferenceWrite.then(async () => {
-      const batch = new Map(pendingPreferences);
+      const currentId = activeBookId;
+      const snapshot = new Map(pendingPreferences);
+      const mergedEntries: Record<string, string> = {};
+      for (const [key, value] of snapshot) {
+        const matchedPrefix = READER_PREFERENCE_PREFIXES.find((prefix) => key.startsWith(prefix));
+        if (matchedPrefix && key !== `${matchedPrefix}${currentId}`) {
+          const targetKey = `${matchedPrefix}${currentId}`;
+          mergedEntries[targetKey] =
+            mergeReaderPreferenceValue(matchedPrefix, value, mergedEntries[targetKey]) ?? value;
+          continue;
+        }
+        const existing = mergedEntries[key];
+        if (existing !== undefined && matchedPrefix) {
+          mergedEntries[key] = mergeReaderPreferenceValue(matchedPrefix, existing, value) ?? value;
+        } else {
+          mergedEntries[key] = value;
+        }
+      }
+      const batch = new Map(Object.entries(mergedEntries));
+      if (batch.size === 0) return;
       try {
         await setPreferences(batch);
-        for (const [key, value] of batch) {
+        for (const [key, value] of snapshot) {
           if (pendingPreferences.get(key) === value) pendingPreferences.delete(key);
         }
       } catch {

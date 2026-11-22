@@ -460,4 +460,38 @@ describe('normalizeSeriesDetail', () => {
       secret,
     );
   });
+
+  it('preserves optional chapter lineage markers when valid and ignores malformed markers quietly', () => {
+    const valid = normalizeSeriesDetail(
+      detail({
+        chapters: [
+          chapter({
+            range: 'Volume 2',
+            number: '2',
+            sortOrder: 2,
+            isSpecial: false,
+            isbn: '978-0-441-47812-5',
+          }),
+          chapter({
+            id: 22,
+            range: 99,
+            number: {},
+            sortOrder: 'nan',
+            isSpecial: 'yes',
+            isbn: '   ',
+          }),
+        ],
+      }),
+    );
+
+    expect(valid.chapters[0]).toMatchObject({
+      range: 'Volume 2',
+      number: '2',
+      sortOrder: 2,
+      isSpecial: false,
+      isbn: '978-0-441-47812-5',
+    });
+    expect(valid.chapters[1]).not.toHaveProperty('range');
+    expect(valid.chapters[1]).not.toHaveProperty('isbn');
+  });
 });

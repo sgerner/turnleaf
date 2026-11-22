@@ -37,12 +37,18 @@ export function toKavitaPageNumber(
   percentage: number,
   totalPages: number,
   spineIndex?: number,
+  downloadedPages?: number | null,
 ): number {
   if (!Number.isFinite(percentage) || totalPages <= 0) return 0;
-  const nearestPage =
-    Number.isInteger(spineIndex) && spineIndex !== undefined && spineIndex >= 0
-      ? spineIndex + 1
-      : Math.round(Math.max(0, percentage) * totalPages);
+  const hasSpine = Number.isInteger(spineIndex) && spineIndex !== undefined && spineIndex >= 0;
+  const nearestPage = hasSpine
+    ? downloadedPages && downloadedPages > 0 && downloadedPages !== totalPages
+      ? Math.max(
+          spineIndex > 0 || percentage > 0 ? 1 : 0,
+          Math.round(((spineIndex + 1) / downloadedPages) * totalPages),
+        )
+      : spineIndex + 1
+    : Math.round(Math.max(0, percentage) * totalPages);
   return Math.min(Math.max(0, totalPages - 1), nearestPage);
 }
 

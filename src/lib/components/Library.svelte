@@ -96,7 +96,10 @@
   });
   let books = $state<BookRecord[]>([]);
   let displayableBooks = $derived(
-    books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
+    books.filter(
+      (book) =>
+        book.remoteAvailable !== false || Boolean(book.downloadPath) || Boolean(book.hasLocalData),
+    ),
   );
   let query = $state('');
   let offlineMessage = $state('');
@@ -294,10 +297,19 @@
   }
 
   function openBookLabel(book: BookRecord, includeProgress = true): string {
-    const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
+    const status =
+      book.remoteAvailable === false
+        ? book.downloadPath
+          ? ', downloaded for offline reading, unavailable on Kavita'
+          : ', unavailable on Kavita'
+        : book.downloadPath
+          ? book.downloadOutdated
+            ? ', downloaded for offline reading, update available'
+            : ', downloaded for offline reading'
+          : '';
     const progress =
       includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
-    return `Open ${book.title}${downloaded}${progress}`;
+    return `Open ${book.title}${status}${progress}`;
   }
 
   function parseSortOrder(value: string | null): LibrarySortOrder {
@@ -548,10 +560,7 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          if (connected) void syncAndRefresh().catch(() => {});
         }),
       ),
     );
@@ -578,8 +587,7 @@
       ),
     );
     if (!destroyed && !offline) {
-      await refresh();
-      void syncProgress(false);
+      await syncAndRefresh();
     }
   });
 
@@ -662,6 +670,14 @@
     cleanups.forEach((remove) => void remove());
   });
 
+  async function syncAndRefresh(): Promise<void> {
+    await syncProgress(false);
+    if (destroyed || offline) return;
+    await refresh();
+    if (destroyed || offline) return;
+    await syncProgress(false);
+  }
+
   function refresh(): Promise<void> {
     if (destroyed || offline) return Promise.resolve();
     if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
@@ -706,13 +722,33 @@
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
-      await reconcileBooks(server.id, mapped, { preserveMissing: incomplete, snapshotStartedAt });
+      const remapped = await reconcileBooks(server.id, mapped, {
+        preserveMissing: incomplete,
+        snapshotStartedAt,
+      });
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
+      const resolveRefreshedBook = (id: string) => {
+        const targetId = remapped.get(id) ?? id;
+        return books.find((item) => item.id === targetId) ?? null;
+      };
+      if (reading) {
+        const refreshedReading = resolveRefreshedBook(reading.book.id);
+        if (refreshedReading) reading = { ...reading, book: refreshedReading };
+      }
+      if (conflict) {
+        const refreshedConflict = resolveRefreshedBook(conflict.book.id);
+        if (refreshedConflict) conflict = { ...conflict, book: refreshedConflict };
+      }
+      if (actionMenuBook) {
+        const refreshedActionBook = resolveRefreshedBook(actionMenuBook.id);
+        if (refreshedActionBook) actionMenuBook = refreshedActionBook;
+      }
       retainCoversFor(books);
       coverReloadRequest += 1;
+      void refreshSyncStatus();
       if (downloadNeedsRefresh && downloadFailureBook) {
-        const refreshedFailure = books.find((item) => item.id === downloadFailureBook?.id) ?? null;
+        const refreshedFailure = resolveRefreshedBook(downloadFailureBook.id);
         downloadNeedsRefresh = false;
         if (refreshedFailure?.downloadPath) {
           downloadFailureBook = null;
@@ -721,6 +757,9 @@
           if (refreshedFailure) downloadFailureBook = refreshedFailure;
           message = 'Library state refreshed. You can retry the download.';
         }
+      } else if (downloadFailureBook) {
+        const refreshedFailure = resolveRefreshedBook(downloadFailureBook.id);
+        if (refreshedFailure) downloadFailureBook = refreshedFailure;
       }
       kavitaUnreachable = false;
       offlineMessage = '';
@@ -843,6 +882,7 @@
     failedDownloadCleanupPath = null;
     downloadNeedsRefresh = false;
     message = `Downloading ${book.title}...`;
+    const previousPath = book.downloadPath;
     let downloadedPath: string | null = null;
     try {
       const file = await downloadEpub(
@@ -853,16 +893,31 @@
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
       );
+      const downloadedBytes = book.remoteFileSize ?? file.transferredSize ?? file.size;
+      const downloadedPages = book.pages > 0 ? book.pages : null;
       downloadedPath = file.relativePath;
-      await markDownloaded(book.id, file.relativePath, file.size);
+      await markDownloaded(book.id, file.relativePath, file.size, {
+        downloadedBytes,
+        downloadedPages,
+      });
       downloadedPath = null;
-      const refreshed = {
+      if (previousPath && previousPath !== file.relativePath) {
+        await deleteDownloadedEpub(previousPath).catch(() => {});
+      }
+      const refreshed: BookRecord = {
         ...book,
         downloadPath: file.relativePath,
         downloadStatus: 'available',
         fileSize: file.size,
+        remoteFileSize: book.remoteFileSize ?? downloadedBytes,
+        downloadedBytes,
+        downloadedPages,
+        downloadOutdated: false,
+        hasLocalData: true,
       };
       books = books.map((item) => (item.id === book.id ? refreshed : item));
+      if (actionMenuBook?.id === book.id) actionMenuBook = refreshed;
+      if (reading?.book.id === book.id) reading = { ...reading, book: refreshed };
       message = `${book.title} is ready offline.`;
       return refreshed;
     } catch (error) {
@@ -978,7 +1033,10 @@
             ...item,
             downloadPath: null,
             downloadStatus: 'none',
-            fileSize: null,
+            fileSize: item.remoteFileSize ?? null,
+            downloadedBytes: null,
+            downloadedPages: null,
+            downloadOutdated: false,
           }
         : item,
     );
@@ -1020,6 +1078,10 @@
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
     if (!book.downloadPath) {
+      if (book.remoteAvailable === false) {
+        message = `${book.title} is no longer available on Kavita, so its EPUB cannot be downloaded. Local bookmarks and notes remain saved on this device.`;
+        return;
+      }
       const refreshed = await download(book);
       if (refreshed) await open(refreshed, options);
       return;
@@ -1140,19 +1202,37 @@
   }
 
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
+    const activeBook =
+      books.find((item) => item.id === book.id) ??
+      (reading
+        ? (books.find((item) => item.id === reading?.book.id) ?? reading.book)
+        : undefined) ??
+      book;
     await saveLocalProgress(
-      book,
+      activeBook,
       location.cfi,
       location.xpath,
       location.percentage,
       location.spineIndex,
     );
-    const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
+    const pagesRead = toKavitaPageNumber(
+      location.percentage,
+      activeBook.pages,
+      location.spineIndex,
+      activeBook.downloadPath ? activeBook.downloadedPages : null,
+    );
     const lastReadAt = new Date().toISOString();
-    const savedBook = books.find((item) => item.id === book.id);
+    const savedBook = books.find((item) => item.id === activeBook.id);
     if (savedBook) {
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
+      savedBook.hasLocalData = true;
+    }
+    if (reading?.book.id === activeBook.id) {
+      reading = {
+        ...reading,
+        book: { ...reading.book, pagesRead, lastReadAt, hasLocalData: true },
+      };
     }
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
@@ -1526,8 +1606,8 @@
       closeSettings();
       // An upload started with the previous key may still be finishing.
       await syncWork;
-      await refresh();
-      await syncProgress(false);
+      await tick();
+      await syncAndRefresh();
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -2108,19 +2188,7 @@
                             alt=""
                           />
                         {/if}
-                        {#if book.downloadPath && book.remoteAvailable !== false}
-                          <span
-                            class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
-                          >
-                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                              <path
-                                fill="currentColor"
-                                d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
-                              />
-                            </svg>
-                          </span>
-                        {/if}
-                        {#if book.remoteAvailable === false && book.downloadPath}
+                        {#if book.remoteAvailable === false || (book.downloadPath && book.downloadOutdated)}
                           <span
                             class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
                           >
@@ -2128,6 +2196,17 @@
                               <path
                                 fill="currentColor"
                                 d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                              />
+                            </svg>
+                          </span>
+                        {:else if book.downloadPath}
+                          <span
+                            class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
+                          >
+                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                              <path
+                                fill="currentColor"
+                                d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
                               />
                             </svg>
                           </span>
@@ -2144,6 +2223,15 @@
                         </p>
                         {#if book.series}
                           <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
+                        {/if}
+                        {#if book.remoteAvailable === false}
+                          <p class="mt-1 truncate text-xs text-warning-700-300">
+                            {book.downloadPath
+                              ? 'Unavailable on Kavita · Saved offline'
+                              : 'Unavailable on Kavita · Notes saved'}
+                          </p>
+                        {:else if book.downloadPath && book.downloadOutdated}
+                          <p class="mt-1 truncate text-xs text-warning-700-300">Update available</p>
                         {/if}
                         {#if downloadingBookId === book.id}
                           <div
@@ -2224,19 +2312,7 @@
                           alt=""
                         />
                       {/if}
-                      {#if book.downloadPath && book.remoteAvailable !== false}
-                        <span
-                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                            <path
-                              fill="currentColor"
-                              d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
-                            />
-                          </svg>
-                        </span>
-                      {/if}
-                      {#if book.remoteAvailable === false && book.downloadPath}
+                      {#if book.remoteAvailable === false || (book.downloadPath && book.downloadOutdated)}
                         <span
                           class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
@@ -2244,6 +2320,17 @@
                             <path
                               fill="currentColor"
                               d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+                            />
+                          </svg>
+                        </span>
+                      {:else if book.downloadPath}
+                        <span
+                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                        >
+                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+                            <path
+                              fill="currentColor"
+                              d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
                             />
                           </svg>
                         </span>
@@ -2313,6 +2400,15 @@
                       <p class="mt-1 truncate text-sm text-surface-700-300">
                         {book.author ?? 'Unknown author'}
                       </p>
+                      {#if book.remoteAvailable === false}
+                        <p class="mt-1 truncate text-xs text-warning-700-300">
+                          {book.downloadPath
+                            ? 'Unavailable on Kavita · Saved offline'
+                            : 'Unavailable on Kavita · Notes saved'}
+                        </p>
+                      {:else if book.downloadPath && book.downloadOutdated}
+                        <p class="mt-1 truncate text-xs text-warning-700-300">Update available</p>
+                      {/if}
                     </div>
                   </div>
                 {/if}
@@ -2368,10 +2464,24 @@
         </button>
       </div>
 
+      {#if actionMenuBook.remoteAvailable === false && !actionMenuBook.downloadPath}
+        <p class="mt-3 rounded-md p-2.5 text-xs preset-tonal-warning">
+          Unavailable on Kavita. Local bookmarks, notes, and reading history remain saved on this
+          device.
+        </p>
+      {:else if actionMenuBook.downloadPath && actionMenuBook.downloadOutdated && actionMenuBook.remoteAvailable !== false}
+        <p class="mt-3 rounded-md p-2.5 text-xs preset-tonal-warning">
+          Kavita has an updated EPUB for this book. Your current offline copy stays readable until
+          you update.
+        </p>
+      {/if}
+
       <div class="mt-4 grid gap-2">
         <button
           class="btn preset-filled-primary-700-300 justify-start"
           type="button"
+          disabled={!actionMenuBook.downloadPath &&
+            (Boolean(downloadingBookId) || offline || actionMenuBook.remoteAvailable === false)}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
@@ -2383,6 +2493,23 @@
           </svg>
           <span>{actionMenuBook.downloadPath ? 'Open book' : 'Download and open'}</span>
         </button>
+        {#if actionMenuBook.downloadPath && actionMenuBook.downloadOutdated && actionMenuBook.remoteAvailable !== false}
+          <button
+            class="btn preset-tonal-warning justify-start"
+            type="button"
+            disabled={Boolean(downloadingBookId) || offline}
+            onclick={() => {
+              const book = actionMenuBook;
+              closeMenu();
+              if (book) void download(book);
+            }}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+              <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+            </svg>
+            <span>Update download</span>
+          </button>
+        {/if}
         {#if !actionMenuBook.downloadPath}
           <button
             class="btn preset-tonal-surface justify-start"

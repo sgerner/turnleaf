@@ -7,12 +7,14 @@ import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue } from 'node:sqlite';
 import type { capTask } from '@capacitor-community/sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { KavitaClient } from '../kavita/client';
 
 const native = vi.hoisted(() => ({
   databasePath: '',
   database: null as DatabaseSync | null,
   isOpen: false,
   failTransactionAt: null as number | null,
+  failStatementMatching: null as string | null,
   createAdapter: null as (() => unknown) | null,
 }));
 
@@ -83,7 +85,10 @@ const book = {
 function createAdapter() {
   return {
     async open(): Promise<void> {
-      if (!native.database) native.database = new DatabaseSync(native.databasePath);
+      if (!native.database) {
+        native.database = new DatabaseSync(native.databasePath);
+        native.database.exec('PRAGMA foreign_keys = ON;');
+      }
       native.isOpen = true;
     },
     async close(): Promise<void> {
@@ -119,11 +124,18 @@ function createAdapter() {
       const database = native.database;
       if (!database) throw new Error('database is not open');
       const failAt = native.failTransactionAt;
+      const failMatch = native.failStatementMatching;
       native.failTransactionAt = null;
+      native.failStatementMatching = null;
       database.exec('BEGIN');
       try {
         for (const [index, task] of tasks.entries()) {
           if (index === failAt) throw new Error(`injected transaction failure at ${index}`);
+          if (failMatch && task.statement.includes(failMatch)) {
+            throw Object.assign(new Error(`SQLITE_IOERR: ${failMatch}`), {
+              code: 'SQLITE_IOERR',
+            });
+          }
           if (task.values && task.values.length > 0) {
             database.prepare(task.statement).run(...(task.values as SQLInputValue[]));
           } else {
@@ -168,6 +180,7 @@ describe('native progress transactions against SQLite', () => {
     native.database = null;
     native.isOpen = false;
     native.failTransactionAt = null;
+    native.failStatementMatching = null;
   });
 
   afterEach(() => {
@@ -175,6 +188,7 @@ describe('native progress transactions against SQLite', () => {
     native.database = null;
     native.isOpen = false;
     native.failTransactionAt = null;
+    native.failStatementMatching = null;
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -527,5 +541,263 @@ describe('native progress transactions against SQLite', () => {
     const reopened = await importDatabase();
     await expect(reopened.openDatabase()).resolves.toBeDefined();
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
+  });
+
+  it('routes queued progress across changing book.id values and uploads replacement seriesId and chapterId via saveProgress', async () => {
+    const database = await importDatabase();
+    const { flushProgress } = await import('../sync/sync');
+    const primaryServer = { ...server, id: 'primary' };
+    const initialBook = {
+      ...book,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      libraryId: 3,
+      seriesId: 42,
+      volumeId: 420,
+      chapterId: 100,
+      title: 'A Wizard of Earthsea',
+      author: 'Ursula K. Le Guin',
+      series: 'Earthsea Cycle',
+      chapterKey: 'isbn:9780547773742',
+    };
+    await database.saveServer(primaryServer);
+    await database.reconcileBooks('primary', [initialBook]);
+    await database.saveLocalProgress(
+      initialBook,
+      'epubcfi(/6/6!/4/2)',
+      '//body/DocFragment[3]/body/p[4]',
+      0.35,
+    );
+
+    const firstPending = (await database.getPendingSync('primary'))[0]!;
+    await database.markSyncFailure(
+      initialBook.id,
+      'Chapter 100 missing',
+      firstPending.revision,
+      firstPending.updatedAt,
+    );
+
+    const chapterRemap = await database.reconcileBooks('primary', [
+      {
+        ...initialBook,
+        id: 'primary:42:101',
+        volumeId: 421,
+        chapterId: 101,
+      },
+    ]);
+    expect(chapterRemap).toEqual(new Map([['primary:42:100', 'primary:42:101']]));
+
+    const seriesRemap = await database.reconcileBooks('primary', [
+      {
+        ...initialBook,
+        id: 'primary:43:102',
+        libraryId: 4,
+        seriesId: 43,
+        volumeId: 430,
+        chapterId: 102,
+      },
+    ]);
+    expect(seriesRemap).toEqual(new Map([['primary:42:101', 'primary:43:102']]));
+    expect(await database.getSyncStatus('primary')).toMatchObject({
+      pendingCount: 1,
+      failedCount: 0,
+      lastError: null,
+    });
+
+    const saveProgress = vi.fn(async () => undefined);
+    await flushProgress({ saveProgress } as unknown as KavitaClient, 'primary');
+
+    expect(saveProgress).toHaveBeenCalledExactlyOnceWith({
+      libraryId: 4,
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      pageNum: 35,
+      bookScrollId: '//body/DocFragment[3]/body/p[4]',
+    });
+    expect(await database.getPendingSync('primary')).toEqual([]);
+    expect(await database.getReadingState('primary:43:102')).toMatchObject({
+      cfi: 'epubcfi(/6/6!/4/2)',
+      pendingSync: false,
+      syncRevision: 1,
+    });
+  });
+
+  it('retains unmapped non-downloaded books with bookmarks or annotations and exposes hasLocalData', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    const bookmarkedOnly = {
+      ...book,
+      id: 'server:9:90',
+      seriesId: 9,
+      chapterId: 90,
+      title: 'Bookmarked Book',
+    };
+    const annotatedOnly = {
+      ...book,
+      id: 'server:9:91',
+      seriesId: 9,
+      chapterId: 91,
+      title: 'Annotated Book',
+    };
+    const untouched = {
+      ...book,
+      id: 'server:9:92',
+      seriesId: 9,
+      chapterId: 92,
+      title: 'Untouched Book',
+    };
+    await database.reconcileBooks(server.id, [bookmarkedOnly, annotatedOnly, untouched]);
+    await database.setPreference(
+      `readerBookmarks:${bookmarkedOnly.id}`,
+      '[{"id":"bm-1","cfi":"epubcfi(/6/2)","href":"ch1.xhtml","percentage":0.1,"label":"10%","savedAt":"2026-01-01T00:00:00.000Z"}]',
+    );
+    await database.setPreference(
+      `readerAnnotations:${annotatedOnly.id}`,
+      '[{"id":"an-1","cfi":"epubcfi(/6/4)","excerpt":"Passage","note":"Saved note","createdAt":"2026-01-01T00:00:00.000Z"}]',
+    );
+
+    await database.reconcileBooks(server.id, []);
+
+    const saved = await database.getBooks(server.id);
+    expect(saved.map((item) => item.id)).toEqual(['server:9:91', 'server:9:90']);
+    expect(saved).toEqual([
+      expect.objectContaining({
+        id: 'server:9:91',
+        remoteAvailable: false,
+        downloadPath: null,
+        hasLocalData: true,
+      }),
+      expect.objectContaining({
+        id: 'server:9:90',
+        remoteAvailable: false,
+        downloadPath: null,
+        hasLocalData: true,
+      }),
+    ]);
+  });
+
+  it('flags a 10-page, 150 KB downloaded EPUB upgraded in place to 25 pages as downloadOutdated and avoids 10 / 25 truncation', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    const originalEpub = {
+      ...book,
+      id: 'server:12:120',
+      seriesId: 12,
+      chapterId: 120,
+      title: 'Expanded Edition',
+      pages: 10,
+      fileSize: 153_600,
+    };
+    await database.reconcileBooks(server.id, [originalEpub]);
+    await database.markDownloaded(originalEpub.id, 'epubs/server-12-120.epub', 153_600, {
+      downloadedBytes: 153_600,
+      downloadedPages: 10,
+    });
+
+    expect((await database.getBooks(server.id))[0]).toMatchObject({
+      downloadOutdated: false,
+      downloadedBytes: 153_600,
+      downloadedPages: 10,
+      remoteFileSize: 153_600,
+    });
+
+    await database.reconcileBooks(server.id, [
+      {
+        ...originalEpub,
+        pages: 25,
+        fileSize: 235_520,
+      },
+    ]);
+
+    const upgraded = (await database.getBooks(server.id))[0]!;
+    expect(upgraded).toMatchObject({
+      pages: 25,
+      fileSize: 153_600,
+      remoteFileSize: 235_520,
+      downloadedBytes: 153_600,
+      downloadedPages: 10,
+      downloadOutdated: true,
+    });
+
+    // Navigating to the final spine item (spineIndex 9) of the 10-page local copy scales across 25 pages instead of truncating at 10 / 25
+    await database.saveLocalProgress(
+      upgraded,
+      'epubcfi(/6/20!/4/2/1:0)',
+      '//body/DocFragment[10]/body/p[1]',
+      0.98,
+      9,
+    );
+
+    const afterRead = (await database.getBooks(server.id))[0]!;
+    expect(afterRead.pagesRead).toBe(24);
+    const queued = (await database.getPendingSync(server.id))[0]!;
+    expect(JSON.parse(queued.payload)).toMatchObject({
+      chapterId: 120,
+      pageNum: 24,
+    });
+
+    // Updating the local download clears downloadOutdated
+    await database.markDownloaded(upgraded.id, 'epubs/server-12-120.epub', 235_520, {
+      downloadedBytes: 235_520,
+      downloadedPages: 25,
+    });
+    expect((await database.getBooks(server.id))[0]).toMatchObject({
+      pages: 25,
+      downloadedBytes: 235_520,
+      downloadedPages: 25,
+      downloadOutdated: false,
+    });
+  });
+
+  it('passes PRAGMA foreign_key_check with zero errors and user_version = 8 across Migration 8, failed writes, and confirmSync reopen', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    const initial = {
+      ...book,
+      id: 'server:42:100',
+      seriesId: 42,
+      chapterId: 100,
+      title: 'Integrity Check Book',
+      chapterKey: 'isbn:9780000000088',
+    };
+    await database.reconcileBooks(server.id, [initial]);
+    await database.saveLocalProgress(initial, 'epubcfi(/6/4)', '/body/p[1]', 0.3);
+    await database.setPreference(`readerBookmarks:${initial.id}`, '[{"id":"bm-1"}]');
+
+    // Inject failed lineage transaction write
+    native.failStatementMatching = 'sync_queue';
+    await expect(
+      database.reconcileBooks(server.id, [
+        { ...initial, id: 'server:43:102', seriesId: 43, chapterId: 102 },
+      ]),
+    ).rejects.toThrow('SQLITE_IOERR: sync_queue');
+
+    // Succeed on retry, then confirmSync
+    await database.reconcileBooks(server.id, [
+      { ...initial, id: 'server:43:102', seriesId: 43, chapterId: 102 },
+    ]);
+    const pending = (await database.getPendingSync(server.id))[0]!;
+    expect(pending.bookId).toBe('server:43:102');
+    await database.confirmSync(
+      pending.bookId,
+      '2026-01-03T00:00:00.000Z',
+      pending.revision,
+      pending.updatedAt,
+    );
+
+    const reopened = await reopenDatabase(database);
+    await reopened.openDatabase();
+    const versionRow = native.database?.prepare('PRAGMA user_version').get() as
+      { user_version: number } | undefined;
+    const fkErrors = native.database?.prepare('PRAGMA foreign_key_check').all() ?? [];
+
+    expect(versionRow?.user_version).toBe(8);
+    expect(fkErrors).toEqual([]);
+    expect(await reopened.getPendingSync(server.id)).toEqual([]);
+    expect(await reopened.getReadingState('server:43:102')).toMatchObject({
+      cfi: 'epubcfi(/6/4)',
+      pendingSync: false,
+    });
   });
 });

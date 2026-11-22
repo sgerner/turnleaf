@@ -886,3 +886,160 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
+
+it('remaps browser lineage across chapter and series replacements and flags outdated downloads', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  const original: BookRecord = {
+    ...existingBook,
+    id: 'primary:42:100',
+    serverId: 'primary',
+    seriesId: 42,
+    chapterId: 100,
+    pages: 10,
+    pagesRead: 3,
+    fileSize: 153_600,
+    remoteFileSize: 153_600,
+    downloadedBytes: 153_600,
+    downloadedPages: 10,
+    downloadPath: 'epubs/primary-42-100.epub',
+    downloadStatus: 'available',
+    chapterKey: 'isbn:9780000000042',
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'primary' },
+      books: [original],
+      readingState: {
+        [original.id]: {
+          cfi: 'epubcfi(/6/6)',
+          xpath: '//body/DocFragment[3]/body/p[1]',
+          percentage: 0.3,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+          syncRevision: 2,
+        },
+      },
+      syncQueue: {
+        [original.id]: {
+          bookId: original.id,
+          serverId: 'primary',
+          payloadJson: JSON.stringify({
+            libraryId: 1,
+            seriesId: 42,
+            volumeId: 10,
+            chapterId: 100,
+            pageNum: 3,
+          }),
+          attemptCount: 1,
+          lastAttemptAt: updatedAt,
+          lastError: 'HTTP 404',
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 2,
+        },
+      },
+      preferences: {
+        [`readerAnnotations:${original.id}`]:
+          '[{"id":"a1","cfi":"epubcfi(/6/6)","excerpt":"quote","note":"note","createdAt":"2026-09-07T00:00:00.000Z"}]',
+      },
+    }),
+  );
+
+  const remapped = await reconcileBooks('primary', [
+    {
+      ...original,
+      id: 'primary:43:102',
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      pages: 25,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 220_000,
+      remoteFileSize: 220_000,
+      downloadedBytes: null,
+      downloadedPages: null,
+    },
+  ]);
+
+  expect(remapped).toEqual(new Map([['primary:42:100', 'primary:43:102']]));
+  const [migrated] = await getBooks('primary');
+  expect(migrated).toMatchObject({
+    id: 'primary:43:102',
+    seriesId: 43,
+    chapterId: 102,
+    pages: 25,
+    pagesRead: 3,
+    downloadPath: 'epubs/primary-42-100.epub',
+    downloadedBytes: 153_600,
+    downloadedPages: 10,
+    remoteFileSize: 220_000,
+    downloadOutdated: true,
+    hasLocalData: true,
+  });
+  const pending = await getPendingSync('primary');
+  expect(pending).toHaveLength(1);
+  expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+    seriesId: 43,
+    volumeId: 430,
+    chapterId: 102,
+    pageNum: 3,
+  });
+  const rawPrefs = (
+    JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+      preferences: Record<string, string>;
+    }
+  ).preferences;
+  expect(rawPrefs['readerAnnotations:primary:42:100']).toBeUndefined();
+  expect(rawPrefs['readerAnnotations:primary:43:102']).toContain('"note":"note"');
+});
+
+it('retains vanished non-downloaded browser books that hold bookmarks or annotations', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const annotatedOnly: BookRecord = {
+    ...existingBook,
+    id: 'server:9:99',
+    chapterId: 99,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [annotatedOnly],
+      readingState: {},
+      syncQueue: {},
+      preferences: {
+        'readerBookmarks:server:9:99':
+          '[{"id":"bm-1","cfi":"epubcfi(/6/2)","href":"ch1.xhtml","percentage":0.1,"label":"10%","savedAt":"2026-09-07T00:00:00.000Z"}]',
+      },
+    }),
+  );
+
+  await reconcileBooks('server', []);
+
+  await expect(getBooks('server')).resolves.toMatchObject([
+    {
+      id: 'server:9:99',
+      remoteAvailable: false,
+      downloadPath: null,
+      hasLocalData: true,
+    },
+  ]);
+});

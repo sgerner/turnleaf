@@ -48,13 +48,31 @@ function createDatabase(): DatabaseSync {
     null,
     baseBook.createdAt,
   );
+  db.prepare(
+    `INSERT INTO server_config
+      (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+      VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    'primary',
+    'Primary server',
+    'https://primary.example.com',
+    'primary-credential',
+    null,
+    baseBook.createdAt,
+  );
   return db;
 }
 
-function createAdapter(
-  db: DatabaseSync,
-): Pick<Parameters<typeof replaceBooksInTransaction>[0], 'executeTransaction'> {
+function createAdapter(db: DatabaseSync): Parameters<typeof reconcileBooksInTransaction>[0] {
   return {
+    query(
+      statement: string,
+      values: unknown[] = [],
+    ): Promise<{ values: Record<string, unknown>[] }> {
+      const rows = db.prepare(statement).all(...(values as SQLInputValue[])) as
+        Record<string, unknown>[] | undefined;
+      return Promise.resolve({ values: rows ?? [] });
+    },
     executeTransaction(tasks: capTask[]): Promise<{ changes: { changes: number } }> {
       db.exec('BEGIN');
       try {
@@ -304,4 +322,456 @@ describe('native metadata transactions against SQLite', () => {
 
     expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
   });
+
+  it('migrates local state atomically across chapter and series remaps (primary:42:100 -> primary:42:101 -> primary:43:102)', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const updatedAt = '2026-09-08T12:00:00.000Z';
+    const original: BookRecord = {
+      ...baseBook,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      libraryId: 1,
+      seriesId: 42,
+      volumeId: 420,
+      chapterId: 100,
+      title: 'The Left Hand of Darkness',
+      author: 'Ursula K. Le Guin',
+      series: 'Hainish Cycle',
+      pages: 10,
+      pagesRead: 4,
+      downloadPath: 'epubs/primary-42-100.epub',
+      downloadStatus: 'available',
+      fileSize: 153_600,
+      remoteFileSize: 153_600,
+      downloadedBytes: 153_600,
+      downloadedPages: 10,
+      chapterKey: 'isbn:9780441478125',
+    };
+    await replaceBooksInTransaction(adapter, 'primary', [original], updatedAt);
+
+    db.prepare(
+      `INSERT INTO reading_state
+        (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+        VALUES (?, ?, ?, ?, ?, 1, 3)`,
+    ).run(original.id, 'epubcfi(/6/8!/4/2/1:0)', '//body/DocFragment[4]/body/p[2]', 0.4, updatedAt);
+    db.prepare(
+      `INSERT INTO sync_queue
+        (book_id, payload_json, attempt_count, last_attempt_at, last_error, created_at, updated_at, revision)
+        VALUES (?, ?, 2, ?, 'HTTP 404', ?, ?, 3)`,
+    ).run(
+      original.id,
+      JSON.stringify({
+        libraryId: 1,
+        seriesId: 42,
+        volumeId: 420,
+        chapterId: 100,
+        pageNum: 4,
+        bookScrollId: '//body/DocFragment[4]/body/p[2]',
+      }),
+      updatedAt,
+      updatedAt,
+      updatedAt,
+    );
+    const bookmarkJson = JSON.stringify([
+      {
+        id: 'epubcfi(/6/8!/4/2/1:0)|chapter4.xhtml',
+        cfi: 'epubcfi(/6/8!/4/2/1:0)',
+        href: 'chapter4.xhtml',
+        percentage: 0.4,
+        label: 'Winter parade',
+        savedAt: updatedAt,
+      },
+    ]);
+    const annotationJson = JSON.stringify([
+      {
+        id: 'note-1',
+        cfi: 'epubcfi(/6/8!/4/2/1:0)',
+        excerpt: 'Light is the left hand of darkness',
+        note: 'Opening epigraph',
+        createdAt: updatedAt,
+      },
+    ]);
+    const historyJson = JSON.stringify([
+      {
+        id: 'epubcfi(/6/8!/4/2/1:0)|chapter4.xhtml',
+        cfi: 'epubcfi(/6/8!/4/2/1:0)',
+        href: 'chapter4.xhtml',
+        percentage: 0.4,
+        label: '40%',
+        savedAt: updatedAt,
+      },
+    ]);
+    const insertPref = db.prepare(
+      'INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)',
+    );
+    insertPref.run(`readerBookmarks:${original.id}`, bookmarkJson, updatedAt);
+    insertPref.run(`readerAnnotations:${original.id}`, annotationJson, updatedAt);
+    insertPref.run(`readerHistory:${original.id}`, historyJson, updatedAt);
+
+    // Step 1: chapter remap within the same series (primary:42:100 -> primary:42:101)
+    const chapterReplacement: BookRecord = {
+      ...original,
+      id: 'primary:42:101',
+      chapterId: 101,
+      volumeId: 421,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 153_600,
+      remoteFileSize: 153_600,
+    };
+    const chapterRemap = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [chapterReplacement],
+      '2026-09-09T00:00:00.000Z',
+    );
+
+    expect(chapterRemap).toEqual(new Map([['primary:42:100', 'primary:42:101']]));
+    expect(readBook(db, 'primary:42:100')).toBeUndefined();
+    expect(readBook(db, 'primary:42:101')).toMatchObject({
+      series_id: 42,
+      volume_id: 421,
+      chapter_id: 101,
+      pages_read: 4,
+      download_path: 'epubs/primary-42-100.epub',
+      download_status: 'available',
+      downloaded_bytes: 153_600,
+      downloaded_pages: 10,
+      remote_available: 1,
+    });
+    expect(
+      db.prepare('SELECT * FROM reading_state WHERE book_id=?').get('primary:42:101'),
+    ).toMatchObject({
+      cfi: 'epubcfi(/6/8!/4/2/1:0)',
+      pending_sync: 1,
+      sync_revision: 3,
+    });
+    const chapterQueue = db
+      .prepare('SELECT * FROM sync_queue WHERE book_id=?')
+      .get('primary:42:101') as Record<string, unknown>;
+    expect(chapterQueue).toMatchObject({
+      attempt_count: 0,
+      last_attempt_at: null,
+      last_error: null,
+      revision: 3,
+      updated_at: updatedAt,
+    });
+    expect(JSON.parse(String(chapterQueue.payload_json))).toMatchObject({
+      libraryId: 1,
+      seriesId: 42,
+      volumeId: 421,
+      chapterId: 101,
+      pageNum: 4,
+    });
+    expect(
+      db.prepare('SELECT value FROM preferences WHERE key=?').get('readerBookmarks:primary:42:100'),
+    ).toBeUndefined();
+    expect(
+      db.prepare('SELECT value FROM preferences WHERE key=?').get('readerBookmarks:primary:42:101'),
+    ).toEqual({ value: bookmarkJson });
+
+    // Pre-populate a distinct annotation on the upcoming target key to verify lossless merge
+    insertPref.run(
+      'readerAnnotations:primary:43:102',
+      JSON.stringify([
+        {
+          id: 'note-2',
+          cfi: 'epubcfi(/6/12!/4/2/1:0)',
+          excerpt: 'To learn which questions are unanswerable',
+          note: 'Second note',
+          createdAt: '2026-09-09T01:00:00.000Z',
+        },
+      ]),
+      '2026-09-09T01:00:00.000Z',
+    );
+
+    // Step 2: series + chapter remap on full rescan (primary:42:101 -> primary:43:102)
+    const seriesReplacement: BookRecord = {
+      ...chapterReplacement,
+      id: 'primary:43:102',
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      chapterKey: null,
+      pages: 25,
+      fileSize: 220_000,
+      remoteFileSize: 220_000,
+    };
+    const seriesRemap = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [seriesReplacement],
+      '2026-09-10T00:00:00.000Z',
+    );
+
+    expect(seriesRemap).toEqual(new Map([['primary:42:101', 'primary:43:102']]));
+    expect(readBook(db, 'primary:42:101')).toBeUndefined();
+    expect(readBook(db, 'primary:43:102')).toMatchObject({
+      series_id: 43,
+      volume_id: 430,
+      chapter_id: 102,
+      pages: 25,
+      pages_read: 4,
+      download_path: 'epubs/primary-42-100.epub',
+      download_status: 'available',
+      file_size: 153_600,
+      remote_file_size: 220_000,
+      downloaded_bytes: 153_600,
+      downloaded_pages: 10,
+      remote_available: 1,
+    });
+    expect(
+      db.prepare('SELECT * FROM reading_state WHERE book_id=?').get('primary:43:102'),
+    ).toMatchObject({
+      cfi: 'epubcfi(/6/8!/4/2/1:0)',
+      pending_sync: 1,
+      sync_revision: 3,
+    });
+    const seriesQueue = db
+      .prepare('SELECT * FROM sync_queue WHERE book_id=?')
+      .get('primary:43:102') as Record<string, unknown>;
+    expect(JSON.parse(String(seriesQueue.payload_json))).toMatchObject({
+      libraryId: 1,
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      pageNum: 4,
+    });
+    const mergedAnnotations = JSON.parse(
+      String(
+        (
+          db
+            .prepare('SELECT value FROM preferences WHERE key=?')
+            .get('readerAnnotations:primary:43:102') as { value: string }
+        ).value,
+      ),
+    ) as Array<{ id: string }>;
+    expect(mergedAnnotations.map((entry) => entry.id)).toEqual(['note-1', 'note-2']);
+    expect(db.prepare('SELECT key FROM preferences WHERE key LIKE ?').all('%primary:42:%')).toEqual(
+      [],
+    );
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
+  it('leaves ambiguous multi-book changes and partial snapshots unmerged', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const first: BookRecord = {
+      ...baseBook,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      seriesId: 42,
+      chapterId: 100,
+      title: 'Shared Omnibus Entry',
+      downloadPath: 'epubs/first.epub',
+      downloadStatus: 'available',
+    };
+    const second: BookRecord = {
+      ...first,
+      id: 'primary:42:101',
+      chapterId: 101,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    await replaceBooksInTransaction(adapter, 'primary', [first, second]);
+
+    const partialRemap = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [
+        {
+          ...first,
+          id: 'primary:42:200',
+          chapterId: 200,
+          downloadPath: null,
+          downloadStatus: 'none',
+        },
+      ],
+      '2026-09-10T00:00:00.000Z',
+      true,
+    );
+    expect(partialRemap.size).toBe(0);
+    expect(readBook(db, 'primary:42:100')).toBeDefined();
+
+    const ambiguousRemap = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [
+        { ...second, id: 'primary:42:201', chapterId: 201 },
+        { ...second, id: 'primary:42:202', chapterId: 202 },
+      ],
+      '2026-09-11T00:00:00.000Z',
+      false,
+    );
+    expect(ambiguousRemap.size).toBe(0);
+    expect(readBook(db, 'primary:42:100')).toMatchObject({
+      remote_available: 0,
+      download_path: 'epubs/first.epub',
+    });
+    expect(readBook(db, 'primary:42:101')).toBeUndefined();
+  });
+
+  it('retains non-downloaded unmapped books that hold only bookmarks or annotations', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const withBookmarks: BookRecord = {
+      ...baseBook,
+      id: 'primary:50:500',
+      serverId: 'primary',
+      seriesId: 50,
+      chapterId: 500,
+      title: 'Bookmarked Only',
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    const withAnnotations: BookRecord = {
+      ...withBookmarks,
+      id: 'primary:50:501',
+      chapterId: 501,
+      title: 'Annotated Only',
+    };
+    const withEmptyPrefs: BookRecord = {
+      ...withBookmarks,
+      id: 'primary:50:502',
+      chapterId: 502,
+      title: 'Empty Preferences Only',
+    };
+    await replaceBooksInTransaction(adapter, 'primary', [
+      withBookmarks,
+      withAnnotations,
+      withEmptyPrefs,
+    ]);
+
+    const insertPref = db.prepare(
+      'INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)',
+    );
+    insertPref.run(
+      `readerBookmarks:${withBookmarks.id}`,
+      '[{"id":"bm-1","cfi":"epubcfi(/6/2)","href":"ch1.xhtml","percentage":0.2,"label":"20%","savedAt":"2026-09-01T00:00:00.000Z"}]',
+      '2026-09-01T00:00:00.000Z',
+    );
+    insertPref.run(
+      `readerAnnotations:${withAnnotations.id}`,
+      '[{"id":"an-1","cfi":"epubcfi(/6/4)","excerpt":"Quote","note":"Thought","createdAt":"2026-09-01T00:00:00.000Z"}]',
+      '2026-09-01T00:00:00.000Z',
+    );
+    insertPref.run(`readerBookmarks:${withEmptyPrefs.id}`, '[]', '2026-09-01T00:00:00.000Z');
+
+    await reconcileBooksInTransaction(adapter, 'primary', [], '2026-09-10T00:00:00.000Z');
+
+    expect(readBook(db, withBookmarks.id)).toMatchObject({
+      remote_available: 0,
+      download_path: null,
+    });
+    expect(readBook(db, withAnnotations.id)).toMatchObject({
+      remote_available: 0,
+      download_path: null,
+    });
+    expect(readBook(db, withEmptyPrefs.id)).toBeUndefined();
+    expect(
+      db
+        .prepare('SELECT value FROM preferences WHERE key=?')
+        .get(`readerBookmarks:${withEmptyPrefs.id}`),
+    ).toBeUndefined();
+    expect(
+      db
+        .prepare('SELECT value FROM preferences WHERE key=?')
+        .get(`readerBookmarks:${withBookmarks.id}`),
+    ).toBeDefined();
+    expect(
+      db
+        .prepare('SELECT value FROM preferences WHERE key=?')
+        .get(`readerAnnotations:${withAnnotations.id}`),
+    ).toBeDefined();
+  });
+
+  it.each(['sync_queue', 'preferences', 'DELETE FROM books'] as const)(
+    'rolls back every table change completely on SQLITE_IOERR during %s task',
+    async (faultTarget) => {
+      db = createDatabase();
+      const baseAdapter = createAdapter(db);
+      const updatedAt = '2026-09-08T12:00:00.000Z';
+      const original: BookRecord = {
+        ...baseBook,
+        id: 'primary:42:100',
+        serverId: 'primary',
+        seriesId: 42,
+        chapterId: 100,
+        title: 'Rollback Target',
+        chapterKey: 'isbn:9780000000100',
+      };
+      await replaceBooksInTransaction(baseAdapter, 'primary', [original], updatedAt);
+      db.prepare(
+        `INSERT INTO reading_state
+          (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+          VALUES (?, 'epubcfi(/6/2)', '/p[1]', 0.2, ?, 1, 1)`,
+      ).run(original.id, updatedAt);
+      db.prepare(
+        `INSERT INTO sync_queue
+          (book_id, payload_json, created_at, updated_at, revision)
+          VALUES (?, '{"pageNum":10}', ?, ?, 1)`,
+      ).run(original.id, updatedAt, updatedAt);
+      db.prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)').run(
+        `readerBookmarks:${original.id}`,
+        '[{"id":"bm-1"}]',
+        updatedAt,
+      );
+
+      const snapshot = () => ({
+        books: db.prepare('SELECT * FROM books ORDER BY id').all(),
+        reading: db.prepare('SELECT * FROM reading_state ORDER BY book_id').all(),
+        queue: db.prepare('SELECT * FROM sync_queue ORDER BY book_id').all(),
+        prefs: db.prepare('SELECT * FROM preferences ORDER BY key').all(),
+      });
+      const before = snapshot();
+
+      const failingAdapter: Parameters<typeof reconcileBooksInTransaction>[0] = {
+        query: baseAdapter.query!,
+        executeTransaction(tasks: capTask[]) {
+          db.exec('BEGIN');
+          try {
+            for (const task of tasks) {
+              if (task.statement.includes(faultTarget)) {
+                throw Object.assign(new Error(`SQLITE_IOERR on ${faultTarget}`), {
+                  code: 'SQLITE_IOERR',
+                });
+              }
+              db.prepare(task.statement).run(...((task.values ?? []) as SQLInputValue[]));
+            }
+            db.exec('COMMIT');
+            return Promise.resolve({ changes: { changes: tasks.length } });
+          } catch (error) {
+            db.exec('ROLLBACK');
+            throw error;
+          }
+        },
+      };
+
+      await expect(
+        reconcileBooksInTransaction(
+          failingAdapter,
+          'primary',
+          [
+            {
+              ...original,
+              id: 'primary:43:102',
+              seriesId: 43,
+              chapterId: 102,
+              downloadPath: null,
+              downloadStatus: 'none',
+            },
+          ],
+          '2026-09-09T00:00:00.000Z',
+        ),
+      ).rejects.toThrow(`SQLITE_IOERR on ${faultTarget}`);
+
+      expect(snapshot()).toEqual(before);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    },
+  );
 });

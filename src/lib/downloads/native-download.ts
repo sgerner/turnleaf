@@ -69,6 +69,7 @@ export interface DownloadedBookFile {
   nativeUri: string;
   webViewUrl: string;
   size: number;
+  transferredSize?: number;
 }
 
 async function ensureDataDirectory(path: string): Promise<void> {
@@ -203,6 +204,7 @@ export async function downloadEpub(
       nativeUri: final.uri,
       webViewUrl,
       size: repaired?.length ?? stat.size,
+      transferredSize: stat.size,
     };
   } catch (error) {
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});

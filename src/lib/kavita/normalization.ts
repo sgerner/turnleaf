@@ -149,6 +149,20 @@ function isEpubFile(value: unknown): boolean {
   );
 }
 
+function chapterMarkers(
+  row: Row,
+): Pick<KavitaChapter, 'range' | 'number' | 'sortOrder' | 'isSpecial' | 'isbn'> {
+  const markers: Pick<KavitaChapter, 'range' | 'number' | 'sortOrder' | 'isSpecial' | 'isbn'> = {};
+  if (typeof row.range === 'string' && row.range.trim()) markers.range = row.range.trim();
+  if (typeof row.number === 'string' && row.number.trim()) markers.number = row.number.trim();
+  if (typeof row.sortOrder === 'number' && Number.isFinite(row.sortOrder)) {
+    markers.sortOrder = row.sortOrder;
+  }
+  if (typeof row.isSpecial === 'boolean') markers.isSpecial = row.isSpecial;
+  if (typeof row.isbn === 'string' && row.isbn.trim()) markers.isbn = row.isbn.trim();
+  return markers;
+}
+
 function chapters(
   values: unknown[],
   path: string,
@@ -216,6 +230,7 @@ function chapters(
         summary: text(row.summary, DETAIL_ENDPOINT, `${p}.summary`),
         pages: count(row.pages, DETAIL_ENDPOINT, `${p}.pages`),
         ...progressFields(row.pagesRead, DETAIL_ENDPOINT, `${p}.pagesRead`),
+        ...chapterMarkers(row),
         lastReadingProgressUtc:
           date(row.lastReadingProgressUtc, DETAIL_ENDPOINT, `${p}.lastReadingProgressUtc`, true) ||
           null,
