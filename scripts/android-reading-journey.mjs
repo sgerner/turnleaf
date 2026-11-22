@@ -2,7 +2,9 @@ import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createCdpClient } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
@@ -178,7 +180,7 @@ const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).som
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
 
-const installCspMonitor = `(() => {
+export const installCspMonitor = `(() => {
   if (!window.__turnleafCspViolations) {
     window.__turnleafCspViolations = [];
     document.addEventListener('securitypolicyviolation', (event) => {
@@ -188,10 +190,21 @@ const installCspMonitor = `(() => {
   return true;
 })()`;
 
-const styledChapter = (number) => `(async () => {
+export const styledChapter = (number) => `(async () => {
   if ((window.__turnleafCspViolations?.length ?? 0) > 0) {
     throw new Error('CSP violations: ' + window.__turnleafCspViolations.join(', '));
   }
+  const matchesBorderPx = (value, expected, dpr) => {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return false;
+    const scale = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+    const candidates = [
+      expected,
+      Math.floor(expected * scale) / scale,
+      Math.round(expected * scale) / scale,
+    ];
+    return candidates.some((candidate) => Math.abs(parsed - candidate) <= 0.02);
+  };
   for (const frame of document.querySelectorAll('iframe')) {
     const doc = frame.contentDocument;
     const win = frame.contentWindow;
@@ -201,8 +214,10 @@ const styledChapter = (number) => `(async () => {
     const headingStyle = win.getComputedStyle(heading);
     const leadStyle = win.getComputedStyle(lead);
     if (
-      headingStyle.borderBottomWidth !== '2px' ||
-      leadStyle.borderLeftWidth !== '3px' ||
+      !matchesBorderPx(headingStyle.borderBottomWidth, 2, win.devicePixelRatio) ||
+      !matchesBorderPx(leadStyle.borderLeftWidth, 3, win.devicePixelRatio) ||
+      headingStyle.borderBottomColor !== 'rgb(180, 83, 9)' ||
+      leadStyle.borderLeftColor !== 'rgb(180, 83, 9)' ||
       !headingStyle.fontFamily.includes('TurnleafSample')
     ) {
       return false;
@@ -386,7 +401,9 @@ async function run() {
   console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
 }
 
-await run().catch((error) => {
-  console.error(error);
-  process.exitCode ??= 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await run().catch((error) => {
+    console.error(error);
+    process.exitCode ??= 1;
+  });
+}
