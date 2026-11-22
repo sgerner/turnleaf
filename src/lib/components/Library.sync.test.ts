@@ -193,8 +193,8 @@ type MockResponse = {
 let container: HTMLDivElement;
 let instance: Record<string, unknown> | null = null;
 
-async function settle(cycles = 50): Promise<void> {
-  const total = Math.max(50, cycles);
+async function settle(cycles = 100): Promise<void> {
+  const total = Math.max(100, cycles);
   for (let index = 0; index < total; index += 1) {
     flushSync();
     await Promise.resolve();
