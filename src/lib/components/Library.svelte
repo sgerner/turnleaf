@@ -74,10 +74,10 @@
     mode,
     onThemeChange,
     onModeChange,
-    onReadingChange,
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
+    onReaderOpenChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -85,10 +85,10 @@
     mode: 'light' | 'dark';
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
-    onReadingChange?: ((reading: boolean) => void) | undefined;
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -479,11 +479,6 @@
   }
 
   $effect(() => {
-    const active = Boolean(reading);
-    onReadingChange?.(active);
-  });
-
-  $effect(() => {
     if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
   });
 
@@ -660,7 +655,7 @@
 
   onDestroy(() => {
     destroyed = true;
-    onReadingChange?.(false);
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1598,6 +1593,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
