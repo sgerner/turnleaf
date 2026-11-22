@@ -504,7 +504,209 @@ it('classifies malformed JSON as an invalid response', async () => {
     new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
   ).rejects.toMatchObject({
     kind: 'invalid-response',
+    message: 'Kavita returned malformed JSON at /api/Series/v2.',
   });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'web' })).toContain(
+    'validation endpoint=/api/Series/v2 detail=invalid-json',
+  );
+});
+
+it('classifies native malformed JSON as an invalid response and ignores blank native bodies', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {},
+    url: '',
+    data: '{not-json',
+  });
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'invalid-response',
+    message: 'Kavita returned malformed JSON at /api/Series/v2.',
+  });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain(
+    'validation endpoint=/api/Series/v2 detail=invalid-json',
+  );
+
+  clearDiagnostics();
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {},
+    url: '',
+    data: '   ',
+  });
+  await expect(
+    client.saveProgress({
+      libraryId: 1,
+      seriesId: 2,
+      volumeId: 3,
+      chapterId: 4,
+      pageNum: 5,
+    }),
+  ).resolves.toBeUndefined();
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+});
+
+it('falls back cleanly when /api/Health returns non-JSON on browser and native transports', async () => {
+  const libraries = [{ id: 1, name: 'Books', type: 2 }];
+  vi.mocked(fetch)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => libraries,
+    } as unknown as Response)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => {
+        throw new SyntaxError('Ok');
+      },
+    } as unknown as Response);
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  await expect(client.testConnection()).resolves.toEqual({
+    version: null,
+    bookLibraries: libraries,
+  });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'web' })).toContain('Events: 0');
+
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request)
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify(libraries),
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      url: '',
+      data: 'Ok',
+    });
+
+  await expect(client.testConnection()).resolves.toEqual({
+    version: null,
+    bookLibraries: libraries,
+  });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+});
+
+it('distinguishes browser request timeouts from caller aborts and clears timers', async () => {
+  vi.useFakeTimers();
+  try {
+    const abortableFetch = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'));
+          return;
+        }
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+          once: true,
+        });
+      });
+    });
+    vi.stubGlobal('fetch', abortableFetch as unknown as typeof fetch);
+
+    const client = new KavitaClient('https://books.example.com', 'abc123');
+
+    const timedOut = expect(client.getSeriesDetail(4)).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita did not respond in time.',
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    await timedOut;
+    expect(vi.getTimerCount()).toBe(0);
+
+    const caller = new AbortController();
+    const abortedByCaller = expect(client.getSeriesDetail(4, caller.signal)).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached. Check the address and network.',
+    });
+    caller.abort();
+    await abortedByCaller;
+    expect(vi.getTimerCount()).toBe(0);
+
+    const coverCaller = new AbortController();
+    const abortedCover = expect(client.getCover(4, coverCaller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    coverCaller.abort();
+    await abortedCover;
+    expect(vi.getTimerCount()).toBe(0);
+
+    const timedOutCover = expect(client.getCover(4)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    await timedOutCover;
+    expect(vi.getTimerCount()).toBe(0);
+
+    let resolveJson: ((value: unknown) => void) | undefined;
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: () =>
+        new Promise((resolve) => {
+          resolveJson = resolve;
+        }),
+    } as unknown as Response);
+    const pendingSeries = client.getBookSeries();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(vi.getTimerCount()).toBe(1);
+    resolveJson?.([]);
+    await expect(pendingSeries).resolves.toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('omits response diagnostics when getCover receives an error status while request and nativeRequest record them', async () => {
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 404,
+    headers: { get: () => null },
+  } as unknown as Response);
+
+  await expect(client.getCover(4)).rejects.toMatchObject({
+    kind: 'server',
+    status: 404,
+  });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'web' })).toContain('Events: 0');
+
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+  } as unknown as Response);
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'authentication',
+    status: 401,
+  });
+
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 503,
+    headers: {},
+    url: '',
+    data: '',
+  });
+  await expect(client.getSeriesDetail(4)).rejects.toMatchObject({
+    kind: 'server',
+    status: 503,
+  });
+
+  const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+  expect(log).toContain('response endpoint=/api/Series/v2 status=401');
+  expect(log).toContain('response endpoint=/api/Series/series-detail status=503');
 });
 
 it('retries a transient 5xx progress read once', async () => {
