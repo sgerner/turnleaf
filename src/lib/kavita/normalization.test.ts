@@ -1,10 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from '../diagnostics/log';
+import { issue51VolumeDetail } from './fixtures/issue-51-volume-detail';
 import {
   KavitaPayloadError,
   normalizeLibraries,
   normalizeSeriesDetail,
   normalizeSeriesPage,
 } from './normalization';
+
+afterEach(() => {
+  clearDiagnostics();
+  vi.restoreAllMocks();
+});
 
 it.each([null, undefined])(
   'marks a volume with unavailable chapters as incomplete (%s)',
@@ -481,6 +488,24 @@ describe('normalizeSeriesDetail', () => {
             isbn: '   ',
           }),
         ],
+        specials: [
+          chapter({
+            range: 'Volume 2',
+            number: '2',
+            sortOrder: 2,
+            isSpecial: false,
+            isbn: '978-0-441-47812-5',
+          }),
+        ],
+        storylineChapters: [
+          chapter({
+            range: 'Volume 3',
+            number: '3',
+            sortOrder: 3,
+            isSpecial: false,
+            isbn: '978-0-441-47812-5',
+          }),
+        ],
       }),
     );
 
@@ -491,7 +516,107 @@ describe('normalizeSeriesDetail', () => {
       isSpecial: false,
       isbn: '978-0-441-47812-5',
     });
+    expect(valid.specials[0]).toBe(valid.chapters[0]);
+    expect(valid.storylineChapters[0]).not.toBe(valid.chapters[0]);
+    expect(valid.storylineChapters[0]?.range).toBe('Volume 3');
     expect(valid.chapters[1]).not.toHaveProperty('range');
     expect(valid.chapters[1]).not.toHaveProperty('isbn');
+  });
+
+  it('reuses clean normalized chapters across collections within one call without sharing across calls', () => {
+    const normalized = normalizeSeriesDetail({
+      chapters: [chapter()],
+      specials: [chapter({ id: '20', volumeId: '10', pages: '80', pagesRead: '25' })],
+      storylineChapters: [chapter()],
+      volumes: [{ id: 10, chapters: [chapter({ volumeId: undefined })] }],
+    });
+
+    const first = normalized.chapters[0]!;
+    expect(normalized.specials[0]).toBe(first);
+    expect(normalized.storylineChapters[0]).toBe(first);
+    expect(normalized.volumes![0]!.chapters[0]).toBe(first);
+
+    const nextCall = normalizeSeriesDetail(detail({ chapters: [chapter()] }));
+    expect(nextCall.chapters[0]).toEqual(first);
+    expect(nextCall.chapters[0]).not.toBe(first);
+  });
+
+  it('re-validates duplicate chapter IDs when fields differ or diagnostics are triggered', () => {
+    clearDiagnostics();
+    const differing = normalizeSeriesDetail({
+      chapters: [chapter({ titleName: 'Flat Edition', pagesRead: 5 })],
+      storylineChapters: [chapter({ titleName: 'Storyline Edition', pagesRead: 12 })],
+      volumes: [
+        { id: 10, chapters: [chapter({ title: null })] },
+        { id: 99, chapters: [chapter({ volumeId: undefined })] },
+      ],
+    });
+
+    expect(differing.chapters[0]!.titleName).toBe('Flat Edition');
+    expect(differing.storylineChapters[0]!.titleName).toBe('Storyline Edition');
+    expect(differing.volumes![0]!.chapters[0]!.title).toBe('');
+    expect(differing.volumes![1]!.chapters[0]!.volumeId).toBe(99);
+    const exported = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+    expect(exported).toContain('path=$.volumes[0].chapters[0].title');
+
+    clearDiagnostics();
+    normalizeSeriesDetail({
+      chapters: [chapter({ pagesRead: undefined })],
+      volumes: [{ id: 10, chapters: [chapter({ pagesRead: undefined })] }],
+    });
+    const repeatedDiagnostics = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+    expect(repeatedDiagnostics).toContain('path=$.chapters[0].pagesRead');
+    expect(repeatedDiagnostics).toContain('path=$.volumes[0].chapters[0].pagesRead');
+  });
+
+  it('preserves exact error paths across collections and skips null diagnostics on rejected payloads', () => {
+    clearDiagnostics();
+    expectPayloadError(
+      () => normalizeSeriesDetail({ chapters: null, volumes: undefined }),
+      '$',
+      'object',
+    );
+    expect(getDiagnosticCount()).toBe(0);
+
+    expectPayloadError(
+      () =>
+        normalizeSeriesDetail({
+          chapters: [chapter()],
+          volumes: [{ id: 10, chapters: [chapter({ files: [{ format: 3 }] })] }],
+        }),
+      '$.volumes[0].chapters[0].files[0].id',
+      'missing',
+    );
+    expectPayloadError(
+      () =>
+        normalizeSeriesDetail({
+          chapters: [chapter()],
+          specials: [chapter({ volumeId: undefined })],
+        }),
+      '$.specials[0].volumeId',
+      'missing',
+    );
+  });
+
+  it('short-circuits Kavita unread sentinel timestamps without calling Date.parse', () => {
+    const parseSpy = vi.spyOn(Date, 'parse');
+
+    const normalizedDetail = normalizeSeriesDetail({
+      ...issue51VolumeDetail,
+      specials: [chapter({ id: 99, lastReadingProgressUtc: '0001-01-01T00:00:00Z' })],
+    });
+    const normalizedSeries = normalizeSeriesPage([
+      series({
+        created: '0001-01-01T00:00:00',
+        latestReadDate: '0001-01-01T00:00:00Z',
+      }),
+    ]);
+
+    expect(parseSpy).not.toHaveBeenCalled();
+    expect(normalizedDetail.volumes![0]!.chapters[0]!.lastReadingProgressUtc).toBe(
+      '0001-01-01T00:00:00',
+    );
+    expect(normalizedDetail.specials[0]!.lastReadingProgressUtc).toBe('0001-01-01T00:00:00Z');
+    expect(normalizedSeries[0]!.latestReadDate).toBe('0001-01-01T00:00:00Z');
   });
 });
