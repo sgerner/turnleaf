@@ -74,7 +74,7 @@
     initialPercentage?: number | null;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
-    onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
+    onSyncLatest?: ((manual: boolean) => Promise<SyncedLocation | null>) | undefined;
     onRetryDownload?: (() => Promise<void>) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
@@ -1288,7 +1288,7 @@
               onclick={() => syncLatestLocation()}
               aria-label="Sync latest reading position"
               title="Sync latest reading position"
-              disabled={syncingLatest}
+              disabled={syncingLatest || !onSyncLatest}
             >
               <svg
                 aria-hidden="true"

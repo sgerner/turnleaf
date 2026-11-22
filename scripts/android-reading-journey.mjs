@@ -76,11 +76,15 @@ async function startFixture() {
   const offlineRequests = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
   const server = createServer(async (request, response) => {
+    const path = new URL(request.url, 'http://localhost').pathname;
+    if (path === '/connectivity-check') {
+      response.writeHead(503).end();
+      return;
+    }
     if (request.headers['x-api-key'] !== key) {
       response.writeHead(401).end();
       return;
     }
-    const path = new URL(request.url, 'http://localhost').pathname;
     if (offline) {
       offlineRequests.push(path);
       response.writeHead(503).end();
@@ -198,6 +202,7 @@ async function run() {
   let tunnel;
   let web;
   let disabledNetwork = false;
+  let previousCaptivePortalSettings;
   let journeyError;
   let cleanupError;
   let journeyPassed = false;
@@ -236,11 +241,9 @@ async function run() {
     disabledNetwork = true;
     await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
-    await waitFor('offline state', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
-      );
-      return connected === false;
+    await waitFor('disconnected state', async () => {
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return status?.connected === false && status?.connectionType === 'none';
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
@@ -283,11 +286,48 @@ async function run() {
       );
     }
 
+    const captivePortalSettingKeys = [
+      'captive_portal_mode',
+      'captive_portal_use_https',
+      'captive_portal_http_url',
+      'captive_portal_https_url',
+      'test_url_expiration_time',
+      'test_captive_portal_http_url',
+      'test_captive_portal_https_url',
+    ];
+    previousCaptivePortalSettings = await Promise.all(
+      captivePortalSettingKeys.map(async (settingKey) => [
+        settingKey,
+        await adb('shell', 'settings', 'get', 'global', settingKey),
+      ]),
+    );
+    const deviceEpochSeconds = Number.parseInt(await adb('shell', 'date', '+%s'), 10);
+    const expirationMs = String(
+      (Number.isFinite(deviceEpochSeconds) ? deviceEpochSeconds : Math.floor(Date.now() / 1000)) *
+        1000 +
+        300_000,
+    );
+    const portalHttpUrl = `http://localhost:${fixture.port}/connectivity-check`;
+    const portalHttpsUrl = `https://localhost:${fixture.port}/connectivity-check`;
+    for (const [settingKey, value] of [
+      ['captive_portal_mode', '1'],
+      ['captive_portal_use_https', '0'],
+      ['test_url_expiration_time', expirationMs],
+      ['test_captive_portal_http_url', portalHttpUrl],
+      ['test_captive_portal_https_url', portalHttpsUrl],
+      ['captive_portal_http_url', portalHttpUrl],
+      ['captive_portal_https_url', portalHttpsUrl],
+    ]) {
+      await adb('shell', 'settings', 'put', 'global', settingKey, value);
+    }
+
     fixture.setOffline(false);
     await adb('shell', 'svc', 'wifi', 'enable');
-    await adb('shell', 'svc', 'data', 'enable');
-    disabledNetwork = false;
-    await waitFor('queued passage uploaded after reconnect', () =>
+    await waitFor('unvalidated Wi-Fi state', async () => {
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return status?.connectionType === 'wifi' && status?.connected === false;
+    });
+    await waitFor('queued passage uploaded after reconnect on unvalidated Wi-Fi', () =>
       fixture.uploads
         .slice(uploadCount)
         .some(
@@ -295,6 +335,12 @@ async function run() {
             progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
         ),
     );
+    const syncNetworkStatus = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+    if (syncNetworkStatus?.connectionType !== 'wifi' || syncNetworkStatus?.connected !== false) {
+      throw new Error(
+        `Expected unvalidated Wi-Fi during reconnect sync, got ${JSON.stringify(syncNetworkStatus)}.`,
+      );
+    }
     await waitFor('return to library after reconnect', async () => {
       if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
       await web.evaluate(click('[aria-label="Show reading controls"]'));
@@ -315,6 +361,20 @@ async function run() {
     }
   } finally {
     const cleanup = [];
+    if (previousCaptivePortalSettings) {
+      cleanup.push([
+        'restore captive portal settings',
+        async () => {
+          for (const [settingKey, previousValue] of previousCaptivePortalSettings) {
+            if (!previousValue || previousValue === 'null') {
+              await adb('shell', 'settings', 'delete', 'global', settingKey);
+            } else {
+              await adb('shell', 'settings', 'put', 'global', settingKey, previousValue);
+            }
+          }
+        },
+      ]);
+    }
     if (disabledNetwork) {
       cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);
       cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);

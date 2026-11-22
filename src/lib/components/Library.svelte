@@ -1,7 +1,7 @@
 <script lang="ts">
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
-  import { Network } from '@capacitor/network';
+  import { Network, type ConnectionStatus } from '@capacitor/network';
   import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
@@ -42,6 +42,15 @@
     type CoverLoadItem,
   } from '../downloads/cover-loader';
   import { KavitaClient, KavitaError } from '../kavita/client';
+  import {
+    applyKavitaFailure,
+    applyKavitaSuccess,
+    applyNetworkStatusChange,
+    canAttemptKavitaRequest,
+    createReachabilityState,
+    isKavitaNetworkFailure,
+    type ReachabilityState,
+  } from '../kavita/reachability';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
@@ -77,22 +86,41 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  let replacedApiKey = $state<{ propKey: string; value: string } | null>(null);
+  const currentApiKey = $derived(
+    replacedApiKey && replacedApiKey.propKey === apiKey ? replacedApiKey.value : apiKey,
+  );
+  const client = $derived(new KavitaClient(server.baseUrl, currentApiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
+    const allowDownload = !initialRefreshPending && (await networkAvailable({ manual: false }));
     if (Capacitor.isNativePlatform()) {
-      return cacheCover(
-        client.coverUrl(seriesId),
-        apiKey,
-        seriesId,
-        signal,
-        server.id,
-        await networkAvailable(),
-      );
+      try {
+        return await cacheCover(
+          client.coverUrl(seriesId),
+          currentApiKey,
+          seriesId,
+          signal,
+          server.id,
+          allowDownload,
+        );
+      } catch (error) {
+        if (!signal.aborted && isKavitaNetworkFailure(error)) {
+          markKavitaUnreachable();
+        }
+        throw error;
+      }
     }
-    if (offline) throw new Error('Offline');
-    const blob = await client.getCover(seriesId, signal);
-    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-    return blob;
+    if (!allowDownload) throw new Error('Offline');
+    try {
+      const blob = await client.getCover(seriesId, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      return blob;
+    } catch (error) {
+      if (!signal.aborted && !(error instanceof KavitaError && error.kind !== 'network')) {
+        markKavitaUnreachable();
+      }
+      throw error;
+    }
   });
   let books = $state<BookRecord[]>([]);
   let displayableBooks = $derived(
@@ -206,7 +234,14 @@
   let downloadFailureBook = $state<BookRecord | null>(null);
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
-  let offline = $state(false);
+  let reachability = $state<ReachabilityState>(
+    createReachabilityState(
+      { connected: true, connectionType: 'unknown' },
+      { native: false, browserOnline: true },
+    ),
+  );
+  const offline = $derived(reachability.offline);
+  let initialRefreshPending = false;
   let message = $state('');
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
@@ -218,7 +253,6 @@
   let syncWork: Promise<void> | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
-  let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
   let diagnosticsVisible = $state(false);
@@ -520,38 +554,25 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    offline = !(await Network.getStatus().catch(() => null))?.connected;
+    const status = await Network.getStatus().catch(() => null);
     if (destroyed) return;
+    reachability = createReachabilityState(status, transportOptions());
     books = savedBooks;
     retainCoversFor(books);
+    initialRefreshPending = !reachability.offline;
     loading = false;
     void refreshSyncStatus();
-    offlineMessage = offline
-      ? displayableBooks.length
-        ? 'No network connection. Showing your saved library.'
-        : 'No network connection. Connect to Kavita to load your library.'
-      : '';
+    offlineMessage = reachability.offline ? disconnectedLibraryMessage() : '';
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', ({ connected }) => {
+        await Network.addListener('networkStatusChange', (nextStatus) => {
           if (destroyed) return;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
-          }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
+          if (handleNetworkStatus(nextStatus)) {
             void refresh()
               .then(() => syncProgress(false))
               .catch(() => {});
+          }
         }),
       ),
     );
@@ -577,9 +598,11 @@
         }),
       ),
     );
-    if (!destroyed && !offline) {
+    if (!destroyed && !reachability.offline) {
       await refresh();
       void syncProgress(false);
+    } else {
+      initialRefreshPending = false;
     }
   });
 
@@ -593,11 +616,71 @@
     return handle.remove;
   }
 
-  async function networkAvailable(): Promise<boolean> {
-    if (offline || destroyed) return false;
-    if (!Capacitor.isNativePlatform()) return true;
+  function transportOptions() {
+    return {
+      native: Capacitor.isNativePlatform(),
+      browserOnline: typeof navigator === 'undefined' || navigator.onLine !== false,
+    };
+  }
+
+  function disconnectedLibraryMessage(): string {
+    return displayableBooks.length
+      ? 'No network connection. Showing your saved library.'
+      : 'No network connection. Connect to Kavita to load your library.';
+  }
+
+  function abortActiveNetworkProbes(): void {
+    refreshController?.abort();
+    openProgressProbe?.abort();
+    cancelCoverLoading();
+    sharedCoverLoader.cancel();
+  }
+
+  function handleNetworkStatus(status: ConnectionStatus | null): boolean {
+    const transition = applyNetworkStatusChange(reachability, status, transportOptions());
+    reachability = transition.state;
+    if (transition.disconnected) {
+      initialRefreshPending = false;
+      abortActiveNetworkProbes();
+      offlineMessage = disconnectedLibraryMessage();
+    } else if (transition.shouldReconnect) {
+      initialRefreshPending = true;
+      offlineMessage = '';
+    }
+    return transition.shouldReconnect;
+  }
+
+  function markKavitaUnreachable(): void {
+    const next = applyKavitaFailure(reachability, new KavitaError('Unreachable', 'network'));
+    if (!reachability.kavitaUnreachable && next.kavitaUnreachable) {
+      cancelCoverLoading();
+      sharedCoverLoader.cancel();
+    }
+    reachability = next;
+  }
+
+  function markKavitaReachable(): void {
+    const wasUnreachable = reachability.kavitaUnreachable;
+    reachability = applyKavitaSuccess(reachability);
+    if (wasUnreachable) {
+      offlineMessage = '';
+      coverReloadRequest += 1;
+    }
+  }
+
+  async function networkAvailable(options: { manual?: boolean } = {}): Promise<boolean> {
+    if (destroyed || !canAttemptKavitaRequest(reachability, options)) return false;
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    if (destroyed) return false;
+    const transition = applyNetworkStatusChange(reachability, status, transportOptions());
+    if (transition.disconnected) {
+      reachability = transition.state;
+      initialRefreshPending = false;
+      abortActiveNetworkProbes();
+      offlineMessage = disconnectedLibraryMessage();
+      return false;
+    }
+    return !destroyed && canAttemptKavitaRequest(reachability, options);
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -611,6 +694,9 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
+    if (!showFeedback && !canAttemptKavitaRequest(reachability, { manual: false })) {
+      return Promise.resolve();
+    }
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
@@ -623,14 +709,18 @@
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     try {
-      if (!(await networkAvailable())) {
+      if (!(await networkAvailable({ manual: showFeedback }))) {
         if (showFeedback)
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
       await flushProgress(client, server.id);
+      markKavitaReachable();
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
+      if (isKavitaNetworkFailure(error)) {
+        markKavitaUnreachable();
+      }
       if (
         error instanceof AggregateError &&
         error.errors.some(
@@ -681,7 +771,7 @@
     let diagnosticEndpoint = '/api/unknown';
     message = '';
     try {
-      if (!(await networkAvailable()) || controller.signal.aborted) return;
+      if (!(await networkAvailable({ manual: true })) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
@@ -710,6 +800,9 @@
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);
+      initialRefreshPending = false;
+      reachability = applyKavitaSuccess(reachability);
+      offlineMessage = '';
       coverReloadRequest += 1;
       if (downloadNeedsRefresh && downloadFailureBook) {
         const refreshedFailure = books.find((item) => item.id === downloadFailureBook?.id) ?? null;
@@ -722,13 +815,12 @@
           message = 'Library state refreshed. You can retry the download.';
         }
       }
-      kavitaUnreachable = false;
-      offlineMessage = '';
       if (incomplete)
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
       if (controller.signal.aborted) return;
+      initialRefreshPending = false;
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -753,18 +845,22 @@
             break;
           case 'invalid-response':
             offlineMessage = `${cause.message} Open Settings to copy diagnostics. ${savedBooks}`;
+            coverReloadRequest += 1;
             break;
           case 'network':
-            kavitaUnreachable = true;
-          // fall through
+            markKavitaUnreachable();
+            offlineMessage = `${cause.message} ${savedBooks}`;
+            break;
           case 'server':
             offlineMessage = `${cause.message} ${savedBooks}`;
+            coverReloadRequest += 1;
             break;
         }
       } else {
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
     } finally {
+      initialRefreshPending = false;
       refreshController = null;
       refreshing = false;
     }
@@ -837,6 +933,10 @@
       message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
+    if (!(await networkAvailable({ manual: true }))) {
+      message = 'No network connection. Connect to Kavita to download this book.';
+      return null;
+    }
     downloadingBookId = book.id;
     downloadPercent = null;
     downloadFailureBook = null;
@@ -847,7 +947,7 @@
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
-        apiKey,
+        currentApiKey,
         book.id.replaceAll(':', '-'),
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
@@ -856,6 +956,7 @@
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
       downloadedPath = null;
+      markKavitaReachable();
       const refreshed = {
         ...book,
         downloadPath: file.relativePath,
@@ -877,6 +978,7 @@
           savedBooks?.find((item) => item.id === book.id && item.downloadPath === downloadedPath) ??
           null;
         if (persistedBook && savedBooks) {
+          markKavitaReachable();
           books = savedBooks;
           message = `${book.title} is ready offline.`;
           return persistedBook;
@@ -897,6 +999,9 @@
       if (error instanceof EpubTransferError) {
         status = error.status;
         detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
+        if (error.connectionFailed) {
+          markKavitaUnreachable();
+        }
         if (status === 401) {
           message = 'Kavita rejected authentication for this download. Check your API key.';
         } else if (status === 403) {
@@ -988,13 +1093,20 @@
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
     try {
       let remote: KavitaProgress | null = null;
-      if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
+      if (
+        book.remoteAvailable !== false &&
+        canAttemptKavitaRequest(reachability, { manual: Boolean(force) })
+      ) {
         const probe = new AbortController();
+        let timedOut = false;
         openProgressProbe = probe;
         const abort = new Promise<null>((resolve) => {
           probe.signal.addEventListener('abort', () => resolve(null), { once: true });
         });
-        const timer = window.setTimeout(() => probe.abort(), 1_500);
+        const timer = window.setTimeout(() => {
+          timedOut = true;
+          probe.abort();
+        }, 1_500);
         const upload = syncWork;
         try {
           remote = await Promise.race([
@@ -1003,10 +1115,22 @@
               // Compare revisions only after any previous upload has settled.
               await upload;
               if (probe.signal.aborted) return null;
-              if (!(await networkAvailable()) || probe.signal.aborted) return null;
-              return client.getProgress(book.chapterId, probe.signal).catch(() => null);
+              if (!(await networkAvailable({ manual: Boolean(force) })) || probe.signal.aborted) {
+                return null;
+              }
+              try {
+                const progress = await client.getProgress(book.chapterId, probe.signal);
+                if (!probe.signal.aborted) markKavitaReachable();
+                return progress;
+              } catch (cause) {
+                if (!probe.signal.aborted && isKavitaNetworkFailure(cause)) {
+                  markKavitaUnreachable();
+                }
+                return null;
+              }
             })(),
           ]);
+          if (timedOut) markKavitaUnreachable();
         } finally {
           window.clearTimeout(timer);
           openProgressProbe = null;
@@ -1147,6 +1271,7 @@
       location.percentage,
       location.spineIndex,
     );
+    void refreshSyncStatus();
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
     const savedBook = books.find((item) => item.id === book.id);
@@ -1167,15 +1292,17 @@
     accept?: () => Promise<void>;
   } | null> {
     if (!manual && !pendingAutoSync) return null;
-    if (book.remoteAvailable === false || !(await networkAvailable())) {
+    if (book.remoteAvailable === false || !(await networkAvailable({ manual }))) {
       if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
     }
     if (manual) {
       try {
         await flushProgress(client, server.id);
-      } catch {
-        throw new Error('Reading progress is saved here and still waiting to upload.');
+        markKavitaReachable();
+      } catch (cause) {
+        if (isKavitaNetworkFailure(cause)) markKavitaUnreachable();
+        throw new Error('Reading progress is saved here and still waiting to upload.', { cause });
       } finally {
         void refreshSyncStatus();
       }
@@ -1185,7 +1312,14 @@
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
       return null;
     }
-    const remote = await client.getProgress(book.chapterId);
+    let remote: KavitaProgress;
+    try {
+      remote = await client.getProgress(book.chapterId);
+      markKavitaReachable();
+    } catch (cause) {
+      if (isKavitaNetworkFailure(cause)) markKavitaUnreachable();
+      throw cause;
+    }
     if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
     return {
       xpath: remote.bookScrollId ?? null,
@@ -1218,6 +1352,7 @@
   async function markDone(book: BookRecord): Promise<void> {
     const readingState = await getReadingState(book.id);
     await markBookCompleted(book, readingState);
+    void refreshSyncStatus();
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1505,6 +1640,9 @@
     try {
       const nextKey = replacementApiKey.trim();
       if (!nextKey) throw new Error('Enter a new Kavita auth key.');
+      if (!(await networkAvailable({ manual: true }))) {
+        throw new Error('No network connection. Connect to Kavita to update the API key.');
+      }
 
       const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
       if (result.bookLibraries.length === 0) {
@@ -1520,7 +1658,9 @@
       };
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
+      replacedApiKey = { propKey: apiKey, value: nextKey };
       onApiKeyChange(nextKey);
+      markKavitaReachable();
       replacementApiKey = '';
       message = 'API key updated.';
       closeSettings();
@@ -1529,6 +1669,7 @@
       await refresh();
       await syncProgress(false);
     } catch (cause) {
+      if (isKavitaNetworkFailure(cause)) markKavitaUnreachable();
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
     } finally {
@@ -1579,7 +1720,9 @@
       initialPercentage={reading.percentage}
       onBack={() => void closeReader()}
       onRelocated={handleRelocated}
-      onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
+      onSyncLatest={offline || reading.book.remoteAvailable === false
+        ? undefined
+        : (manual) => syncLatestForReader(reading!.book, manual)}
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
@@ -1637,7 +1780,7 @@
           class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
           onclick={refresh}
-          disabled={refreshing}
+          disabled={refreshing || offline}
           aria-label="Refresh library"
           title="Refresh"
         >
@@ -1961,7 +2104,7 @@
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
               onclick={() => void refresh()}
-              disabled={refreshing}>Refresh library</button
+              disabled={refreshing || offline}>Refresh library</button
             >
           {:else}
             <button
@@ -2189,7 +2332,8 @@
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
                       aria-label={openBookLabel(book, false)}
-                      disabled={downloadingBookId === book.id}
+                      disabled={downloadingBookId === book.id ||
+                        (!book.downloadPath && (offline || book.remoteAvailable === false))}
                     >
                       <span class="sr-only">{openBookLabel(book)}</span>
                     </button>
@@ -2284,7 +2428,8 @@
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
                       aria-label={openBookLabel(book)}
-                      disabled={downloadingBookId === book.id}
+                      disabled={downloadingBookId === book.id ||
+                        (!book.downloadPath && (offline || book.remoteAvailable === false))}
                     >
                       <span class="sr-only">{openBookLabel(book)}</span>
                     </button>
@@ -2372,6 +2517,8 @@
         <button
           class="btn preset-filled-primary-700-300 justify-start"
           type="button"
+          disabled={!actionMenuBook.downloadPath &&
+            (Boolean(downloadingBookId) || offline || actionMenuBook.remoteAvailable === false)}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
@@ -2405,6 +2552,7 @@
         <button
           class="btn preset-tonal-primary justify-start"
           type="button"
+          disabled={offline || actionMenuBook.remoteAvailable === false}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
@@ -2743,7 +2891,7 @@
               <button
                 class="btn preset-filled-primary-700-300 shrink-0"
                 type="submit"
-                disabled={replacingApiKey}
+                disabled={replacingApiKey || offline}
               >
                 {replacingApiKey ? 'Testing...' : 'Save'}
               </button>
