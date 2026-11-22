@@ -1,5 +1,6 @@
 import type { BookRecord } from '../database/database';
-import type { KavitaChapter, KavitaSeries, KavitaSeriesDetail } from './types';
+import { sanitizeEpubFileName } from './normalization';
+import type { KavitaChapter, KavitaFile, KavitaSeries, KavitaSeriesDetail } from './types';
 
 const EMPTY_DATE = '0001-01-01T00:00:00';
 
@@ -25,44 +26,121 @@ export function mapSeriesToBooks(
       seen.add(chapter.id);
       return true;
     })
-    .map((chapter) => mapChapterToBook(serverId, series, chapter));
+    .flatMap((chapter) => mapChapterToBooks(serverId, series, chapter));
+  disambiguateDuplicateTitles(books);
   if (books.length > 1 && series.name) {
     for (const book of books) book.series = series.name;
   }
   return books;
 }
 
-function mapChapterToBook(
+function mapChapterToBooks(
   serverId: string,
   series: KavitaSeries,
   chapter: KavitaChapter,
+): BookRecord[] {
+  const epubFiles = chapter.files.filter(isEpubFile);
+  if (!epubFiles.length) throw new Error('An EPUB chapter did not include an EPUB file.');
+  const multiFileChapter = Boolean(chapter.hasMultipleFiles) || chapter.files.length > 1;
+  return epubFiles.map((file, epubIndex) =>
+    mapFileToBook(serverId, series, chapter, file, epubIndex, multiFileChapter),
+  );
+}
+
+function mapFileToBook(
+  serverId: string,
+  series: KavitaSeries,
+  chapter: KavitaChapter,
+  file: KavitaFile,
+  epubIndex: number,
+  multiFileChapter: boolean,
 ): BookRecord {
-  const file = chapter.files.find(isEpubFile);
-  if (!file) throw new Error('An EPUB chapter did not include an EPUB file.');
+  const isPrimary = epubIndex === 0;
+  const pages = resolveFilePages(series, chapter, file, multiFileChapter);
+  const rawPagesRead = chapter.pagesRead ?? 0;
+  const pagesRead = isPrimary ? (pages > 0 ? Math.min(pages, rawPagesRead) : rawPagesRead) : 0;
+  const fileName = sanitizeEpubFileName(file.fileName);
   return {
-    id: `${serverId}:${series.id}:${chapter.id}`,
+    id: isPrimary
+      ? `${serverId}:${series.id}:${chapter.id}`
+      : `${serverId}:${series.id}:${chapter.id}:${file.id}`,
     serverId,
     libraryId: series.libraryId,
     seriesId: series.id,
     volumeId: chapter.volumeId,
     chapterId: chapter.id,
+    fileId: file.id,
+    fileName,
     title: chapter.titleName || chapter.title || series.name || `Book ${chapter.id}`,
     author: chapter.writers.map((writer) => writer.name).join(', ') || null,
     series:
       chapter.titleName && series.name && chapter.titleName !== series.name ? series.name : null,
     descriptionHtml: chapter.summary || null,
     format: 'epub',
-    pages: chapter.pages || series.pages,
-    pagesRead: chapter.pagesRead ?? 0,
-    ...(chapter.pagesRead === undefined ? { remoteProgressKnown: false } : {}),
-    ...(!chapter.lastReadingProgressUtc ? { remoteReadDateKnown: false } : {}),
+    pages,
+    pagesRead,
+    ...(isPrimary
+      ? {
+          ...(chapter.pagesRead === undefined ? { remoteProgressKnown: false } : {}),
+          ...(!chapter.lastReadingProgressUtc ? { remoteReadDateKnown: false } : {}),
+        }
+      : {
+          remoteProgressKnown: false,
+          remoteReadDateKnown: false,
+        }),
     createdAt: series.created,
-    lastReadAt: lastReadAt(chapter),
+    lastReadAt: isPrimary ? lastReadAt(chapter) : null,
     downloadPath: null,
     downloadStatus: 'none',
     fileSize: file.bytes,
+    remoteFileSize: file.bytes,
+    chapterEpubIndex: epubIndex,
+    multiFileChapter,
+    syncProgress: isPrimary,
     remoteAvailable: true,
   };
+}
+
+function resolveFilePages(
+  series: KavitaSeries,
+  chapter: KavitaChapter,
+  file: KavitaFile,
+  multiFileChapter: boolean,
+): number {
+  if (file.pages !== undefined && file.pages > 0) return file.pages;
+  if (multiFileChapter) return file.pages ?? 0;
+  return chapter.pages || series.pages;
+}
+
+function fileDisplayStem(fileName: string | null | undefined): string {
+  const sanitized = sanitizeEpubFileName(fileName);
+  if (!sanitized) return '';
+  return sanitized.replace(/\.epub$/i, '').trim();
+}
+
+function disambiguateDuplicateTitles(books: BookRecord[]): void {
+  const groups = new Map<string, BookRecord[]>();
+  for (const book of books) {
+    const group = groups.get(book.title);
+    if (group) group.push(book);
+    else groups.set(book.title, [book]);
+  }
+  for (const [baseTitle, group] of groups) {
+    if (group.length < 2) continue;
+    const labels = group.map(
+      (book) => fileDisplayStem(book.fileName) || `File ${(book.chapterEpubIndex ?? 0) + 1}`,
+    );
+    const labelCounts = new Map<string, number>();
+    for (const label of labels) {
+      labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+    }
+    group.forEach((book, index) => {
+      const label = labels[index]!;
+      const uniqueLabel =
+        (labelCounts.get(label) ?? 0) > 1 ? `${label} #${book.fileId ?? index + 1}` : label;
+      book.title = `${baseTitle} (${uniqueLabel})`;
+    });
+  }
 }
 
 function lastReadAt(chapter: KavitaChapter): string | null {

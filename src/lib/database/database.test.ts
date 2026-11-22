@@ -886,3 +886,123 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
+
+it('preserves primary downloads and keeps sibling EPUB progress local across browser catalog refreshes', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'epubcfi(/6/2)',
+          xpath: '/body/p[1]',
+          percentage: 0.25,
+          localUpdatedAt: '2026-01-02T00:00:00.000Z',
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+          syncRevision: 1,
+        },
+      },
+      syncQueue: {
+        [existingBook.id]: {
+          bookId: existingBook.id,
+          serverId: 'server',
+          payloadJson: JSON.stringify({
+            libraryId: 1,
+            seriesId: 1,
+            volumeId: 10,
+            chapterId: 10,
+            pageNum: 25,
+            bookScrollId: '/body/p[1]',
+          }),
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: '2026-01-02T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+          revision: 1,
+        },
+      },
+      preferences: {},
+    }),
+  );
+
+  const primaryUpgrade: BookRecord = {
+    ...existingBook,
+    fileId: 2114,
+    fileName: '/private/server/path/edition-a.epub',
+    title: 'Vol 3 (edition-a)',
+    pages: 5,
+    pagesRead: 0,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 1955734,
+    remoteFileSize: 1955734,
+    chapterEpubIndex: 0,
+    multiFileChapter: true,
+    syncProgress: true,
+  };
+  const siblingBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:10:2115',
+    fileId: 2115,
+    fileName: 'C:\\secret\\dir\\edition-b.epub',
+    title: 'Vol 3 (edition-b)',
+    pages: 4,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 2169759,
+    remoteFileSize: 2169759,
+    chapterEpubIndex: 1,
+    multiFileChapter: true,
+    syncProgress: false,
+    remoteProgressKnown: false,
+    remoteReadDateKnown: false,
+  };
+
+  await reconcileBooks('server', [primaryUpgrade, siblingBook]);
+
+  let books = await getBooks('server');
+  expect(books).toHaveLength(2);
+  expect(books.find((item) => item.id === existingBook.id)).toMatchObject({
+    downloadPath: existingBook.downloadPath,
+    downloadStatus: 'available',
+    fileSize: existingBook.fileSize,
+    remoteFileSize: 1955734,
+    fileName: 'edition-a.epub',
+    pagesRead: 25,
+    syncProgress: true,
+  });
+  const savedSibling = books.find((item) => item.id === siblingBook.id)!;
+  expect(savedSibling).toMatchObject({
+    fileName: 'edition-b.epub',
+    fileSize: 2169759,
+    remoteFileSize: 2169759,
+    syncProgress: false,
+  });
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).not.toContain('/private/server');
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).not.toContain('secret\\dir');
+
+  await saveLocalProgress(savedSibling, 'epubcfi(/6/4)', '/body/p[2]', 0.75, 2);
+  await expect(getPendingSync('server')).resolves.toEqual([
+    expect.objectContaining({ bookId: existingBook.id }),
+  ]);
+  await expect(getSyncStatus('server')).resolves.toMatchObject({ pendingCount: 1 });
+
+  await reconcileBooks('server', [primaryUpgrade, siblingBook]);
+  books = await getBooks('server');
+  expect(books.find((item) => item.id === siblingBook.id)).toMatchObject({
+    pagesRead: 3,
+    syncProgress: false,
+  });
+  expect(books.find((item) => item.id === siblingBook.id)?.lastReadAt).toBeTruthy();
+});

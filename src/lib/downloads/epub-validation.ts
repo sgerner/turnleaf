@@ -15,6 +15,7 @@ export const MAX_EPUB_CENTRAL_DIRECTORY_SIZE = 16 * 1024 * 1024;
 const MAX_REPAIR_FILE_SIZE = 16 * 1024 * 1024;
 const CONTAINER_PATH = 'META-INF/container.xml';
 const MAX_CONTAINER_XML_SIZE = 1024 * 1024;
+const ARCHIVE_READ_CHUNK_SIZE = 1024 * 1024;
 const INITIAL_READ_SIZE = 4096;
 const ZIP_TAIL_READ_SIZE = ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH + ZIP_MAX_COMMENT_LENGTH;
 
@@ -22,9 +23,16 @@ export interface EpubArchiveEntry {
   name: string;
   flags: number;
   compressionMethod: number;
+  crc32: number;
   compressedSize: number;
   uncompressedSize: number;
   localHeaderOffset: number;
+}
+
+export interface EpubArchiveTarget {
+  fileName?: string | null | undefined;
+  expectedByteSize?: number | null | undefined;
+  epubIndex?: number | null | undefined;
 }
 
 export interface EpubRangeReader {
@@ -111,6 +119,7 @@ function parseCentralDirectory(
 
     const flags = readUint16(bytes, offset + 8);
     const compressionMethod = readUint16(bytes, offset + 10);
+    const crc32 = readUint32(bytes, offset + 16);
     const compressedSize = readUint32(bytes, offset + 20);
     const uncompressedSize = readUint32(bytes, offset + 24);
     const nameLength = readUint16(bytes, offset + 28);
@@ -153,6 +162,7 @@ function parseCentralDirectory(
       name,
       flags,
       compressionMethod,
+      crc32,
       compressedSize,
       uncompressedSize,
       localHeaderOffset,
@@ -440,17 +450,39 @@ async function findRecoveryPackage(
   }
 }
 
-/**
- * Inspect only the ZIP header, end record, and central directory. The caller
- * supplies a range reader so native files are never loaded wholesale merely
- * to decide whether they are safe to mark as available. When recovery is enabled,
- * return a repaired copy only for a small archive with an identifiable package.
- */
-export async function validateEpubArchive(
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function computeCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ bytes[index]!) & 0xff]!;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+interface InspectedZipArchive {
+  head: Uint8Array;
+  centralDirectory: Uint8Array;
+  centralDirectoryOffset: number;
+  entryCount: number;
+  archiveEntries: EpubArchiveEntry[];
+  readBufferedRange: EpubRangeReader;
+}
+
+async function inspectZipArchive(
   fileSize: number,
   readRange: EpubRangeReader,
-  allowContainerRecovery = false,
-): Promise<Uint8Array | undefined> {
+): Promise<InspectedZipArchive> {
   if (!Number.isSafeInteger(fileSize) || fileSize < ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH) {
     throw new EpubValidationError('The downloaded EPUB is empty or too small.');
   }
@@ -524,6 +556,29 @@ export async function validateEpubArchive(
     throw new EpubValidationError('The EPUB expands beyond the supported size.');
   }
 
+  return {
+    head,
+    centralDirectory,
+    centralDirectoryOffset,
+    entryCount: entries,
+    archiveEntries,
+    readBufferedRange,
+  };
+}
+
+async function validateTopLevelEpub(
+  inspected: InspectedZipArchive,
+  fileSize: number,
+  allowContainerRecovery: boolean,
+): Promise<Uint8Array | undefined> {
+  const {
+    head,
+    centralDirectory,
+    centralDirectoryOffset,
+    entryCount: entries,
+    archiveEntries,
+    readBufferedRange,
+  } = inspected;
   const mimetype = archiveEntries[0];
   const container = archiveEntries.find((entry) => entry.name === CONTAINER_PATH);
   if (!mimetype || !container) {
@@ -568,4 +623,285 @@ export async function validateEpubArchive(
   validateMimetypeEntry(head, mimetype);
   const xml = await readXmlEntry(container, centralDirectoryOffset, fileSize, readBufferedRange);
   if (xml) validateContainerXml(xml);
+}
+
+function sanitizeTargetFileName(fileName: string | null | undefined): string | null {
+  if (!fileName) return null;
+  const tail = /[\\/]/.test(fileName)
+    ? (fileName.split(/[\\/]/).at(-1) ?? '')
+    : fileName.replace(/^[A-Za-z]:/, '');
+  const trimmed = tail.trim();
+  if (!trimmed || trimmed === '.' || trimmed === '..') return null;
+  return trimmed.normalize('NFC');
+}
+
+function entryBasename(entryName: string): string {
+  return (entryName.split('/').at(-1) ?? '').normalize('NFC');
+}
+
+function selectBySizeOrOrder(
+  candidates: EpubArchiveEntry[],
+  allEpubEntries: EpubArchiveEntry[],
+  expectedSize: number | null,
+  epubIndex: number | null,
+): EpubArchiveEntry | undefined {
+  if (expectedSize !== null) {
+    const sizeMatches = candidates.filter((entry) => entry.uncompressedSize === expectedSize);
+    if (sizeMatches.length === 1) return sizeMatches[0];
+    if (sizeMatches.length > 1 && epubIndex !== null && sizeMatches[epubIndex]) {
+      return sizeMatches[epubIndex];
+    }
+    if (sizeMatches.length > 0) return sizeMatches[0];
+  }
+  if (epubIndex !== null) {
+    if (candidates === allEpubEntries) return allEpubEntries[epubIndex];
+    return candidates[epubIndex] ?? candidates[0];
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function selectTargetEpubEntry(
+  epubEntries: EpubArchiveEntry[],
+  target?: EpubArchiveTarget,
+): EpubArchiveEntry {
+  const wantedName = sanitizeTargetFileName(target?.fileName);
+  const expectedSize =
+    typeof target?.expectedByteSize === 'number' &&
+    Number.isSafeInteger(target.expectedByteSize) &&
+    target.expectedByteSize > 0
+      ? target.expectedByteSize
+      : null;
+  const epubIndex =
+    typeof target?.epubIndex === 'number' &&
+    Number.isSafeInteger(target.epubIndex) &&
+    target.epubIndex >= 0
+      ? target.epubIndex
+      : target && (wantedName !== null || expectedSize !== null || target.epubIndex !== undefined)
+        ? null
+        : 0;
+
+  if (wantedName !== null) {
+    const exactMatches = epubEntries.filter((entry) => entryBasename(entry.name) === wantedName);
+    if (exactMatches.length === 1) return exactMatches[0]!;
+    if (exactMatches.length > 1) {
+      const narrowed = selectBySizeOrOrder(exactMatches, epubEntries, expectedSize, epubIndex);
+      if (narrowed) return narrowed;
+    }
+    const lowerWanted = wantedName.toLowerCase();
+    const caseMatches = epubEntries.filter(
+      (entry) => entryBasename(entry.name).toLowerCase() === lowerWanted,
+    );
+    if (caseMatches.length === 1) return caseMatches[0]!;
+    if (caseMatches.length > 1) {
+      const narrowed = selectBySizeOrOrder(caseMatches, epubEntries, expectedSize, epubIndex);
+      if (narrowed) return narrowed;
+    }
+  }
+
+  if (expectedSize !== null) {
+    const sizeMatches = epubEntries.filter((entry) => entry.uncompressedSize === expectedSize);
+    if (sizeMatches.length === 1) return sizeMatches[0]!;
+    if (sizeMatches.length > 1) {
+      if (epubIndex !== null && sizeMatches[epubIndex]) return sizeMatches[epubIndex]!;
+      return sizeMatches[0]!;
+    }
+  }
+
+  if (epubIndex !== null && epubIndex < epubEntries.length) {
+    return epubEntries[epubIndex]!;
+  }
+
+  throw new EpubValidationError(
+    'The downloaded chapter archive did not include the requested EPUB file.',
+  );
+}
+
+async function inflateBoundedEntry(
+  dataOffset: number,
+  compressedSize: number,
+  expectedUncompressedSize: number,
+  readRange: EpubRangeReader,
+): Promise<Uint8Array> {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new EpubValidationError('This device cannot extract compressed chapter archives.');
+  }
+  let readPosition = 0;
+  const compressedStream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (readPosition >= compressedSize) {
+        controller.close();
+        return;
+      }
+      const chunkLength = Math.min(ARCHIVE_READ_CHUNK_SIZE, compressedSize - readPosition);
+      const chunk = await readRange(dataOffset + readPosition, chunkLength);
+      requireRange(chunk, chunkLength, 'The downloaded chapter archive is truncated.');
+      readPosition += chunkLength;
+      controller.enqueue(chunk);
+    },
+  });
+
+  const decompressedStream = compressedStream.pipeThrough(
+    new DecompressionStream('deflate-raw') as unknown as ReadableWritablePair<
+      Uint8Array,
+      Uint8Array
+    >,
+  );
+  const reader = decompressedStream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      total += result.value.byteLength;
+      if (total > expectedUncompressedSize || total > MAX_EPUB_FILE_SIZE) {
+        await reader.cancel().catch(() => {});
+        throw new EpubValidationError('The extracted EPUB exceeds its declared size.');
+      }
+      chunks.push(result.value);
+    }
+  } catch (error) {
+    if (error instanceof EpubValidationError) throw error;
+    throw new EpubValidationError('The chapter archive entry could not be extracted.');
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (total !== expectedUncompressedSize) {
+    throw new EpubValidationError('The extracted EPUB size did not match the chapter archive.');
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
+async function extractArchiveEntry(
+  entry: EpubArchiveEntry,
+  archiveOffset: number,
+  fileSize: number,
+  readRange: EpubRangeReader,
+): Promise<Uint8Array> {
+  if (entry.uncompressedSize < ZIP_END_OF_CENTRAL_DIRECTORY_LENGTH) {
+    throw new EpubValidationError('The extracted EPUB is empty or too small.');
+  }
+  if (entry.uncompressedSize > MAX_EPUB_FILE_SIZE) {
+    throw new EpubValidationError('The extracted EPUB is too large.');
+  }
+
+  const localHeader = await readRange(entry.localHeaderOffset, 30);
+  requireRange(localHeader, 30, 'The chapter archive local header is truncated.');
+  if (!hasSignature(localHeader, 0, ZIP_LOCAL_FILE_HEADER)) {
+    throw new EpubValidationError('The chapter archive local header is malformed.');
+  }
+  const localFlags = readUint16(localHeader, 6);
+  const localMethod = readUint16(localHeader, 8);
+  const nameLength = readUint16(localHeader, 26);
+  const extraLength = readUint16(localHeader, 28);
+  const dataOffset = entry.localHeaderOffset + 30 + nameLength + extraLength;
+  if (localFlags & ZIP_ENCRYPTION_FLAGS) {
+    throw new EpubValidationError('The chapter archive contains an encrypted entry.');
+  }
+  if (
+    localMethod !== entry.compressionMethod ||
+    (localMethod !== 0 && localMethod !== 8) ||
+    nameLength === 0 ||
+    dataOffset < entry.localHeaderOffset ||
+    dataOffset + entry.compressedSize > archiveOffset ||
+    dataOffset + entry.compressedSize > fileSize
+  ) {
+    throw new EpubValidationError('The chapter archive entry header is invalid.');
+  }
+
+  const localNameBytes = await readRange(entry.localHeaderOffset + 30, nameLength);
+  requireRange(localNameBytes, nameLength, 'The chapter archive entry name is truncated.');
+  const localName = decodeName(localNameBytes, Boolean(localFlags & 0x800));
+  validatePath(localName);
+
+  let extracted: Uint8Array;
+  if (entry.compressionMethod === 0) {
+    if (entry.compressedSize !== entry.uncompressedSize) {
+      throw new EpubValidationError('The stored chapter archive entry size is invalid.');
+    }
+    extracted = new Uint8Array(entry.uncompressedSize);
+    for (let offset = 0; offset < entry.compressedSize; offset += ARCHIVE_READ_CHUNK_SIZE) {
+      const length = Math.min(ARCHIVE_READ_CHUNK_SIZE, entry.compressedSize - offset);
+      const chunk = await readRange(dataOffset + offset, length);
+      requireRange(chunk, length, 'The downloaded chapter archive is truncated.');
+      extracted.set(chunk, offset);
+    }
+  } else {
+    extracted = await inflateBoundedEntry(
+      dataOffset,
+      entry.compressedSize,
+      entry.uncompressedSize,
+      readRange,
+    );
+  }
+
+  if (entry.crc32 !== 0 && computeCrc32(extracted) !== entry.crc32) {
+    throw new EpubValidationError('The extracted EPUB failed integrity verification.');
+  }
+  return extracted;
+}
+
+/**
+ * Inspect only the ZIP header, end record, and central directory. The caller
+ * supplies a range reader so native files are never loaded wholesale merely
+ * to decide whether they are safe to mark as available. When recovery is enabled,
+ * return a repaired copy only for a small archive with an identifiable package.
+ */
+export async function validateEpubArchive(
+  fileSize: number,
+  readRange: EpubRangeReader,
+  allowContainerRecovery = false,
+): Promise<Uint8Array | undefined> {
+  const inspected = await inspectZipArchive(fileSize, readRange);
+  return validateTopLevelEpub(inspected, fileSize, allowContainerRecovery);
+}
+
+/**
+ * Validate a downloaded chapter response that may be either a direct EPUB file
+ * or a Kavita multi-file outer `.cbz` archive. Returns undefined when the file
+ * on disk is already a valid EPUB, or returns the extracted/repaired inner EPUB
+ * bytes after validating its EPUB container.
+ */
+export async function prepareDownloadedEpub(
+  fileSize: number,
+  readRange: EpubRangeReader,
+  target?: EpubArchiveTarget,
+): Promise<Uint8Array | undefined> {
+  const inspected = await inspectZipArchive(fileSize, readRange);
+  if (inspected.archiveEntries[0]?.name === 'mimetype') {
+    return validateTopLevelEpub(inspected, fileSize, true);
+  }
+
+  const epubEntries = inspected.archiveEntries.filter(
+    (entry) => !entry.name.endsWith('/') && /\.epub$/i.test(entry.name),
+  );
+  if (!epubEntries.length) {
+    throw new EpubValidationError('The downloaded chapter archive does not contain an EPUB file.');
+  }
+  const selected = selectTargetEpubEntry(epubEntries, target);
+  const extracted = await extractArchiveEntry(
+    selected,
+    inspected.centralDirectoryOffset,
+    fileSize,
+    inspected.readBufferedRange,
+  );
+  const repaired = await validateEpubArchive(
+    extracted.length,
+    async (offset, length) => extracted.subarray(offset, offset + length),
+    true,
+  );
+  if (repaired) {
+    await validateEpubArchive(repaired.length, async (offset, length) =>
+      repaired.subarray(offset, offset + length),
+    );
+    return repaired;
+  }
+  return extracted;
 }

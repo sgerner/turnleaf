@@ -95,6 +95,46 @@ function progressFields(value: unknown, endpoint: string, path: string): { pages
   return pagesRead === undefined ? {} : { pagesRead };
 }
 
+function optionalCount(value: unknown, endpoint: string, path: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const n = integer(value);
+  if (n !== undefined) return n;
+  fallback(endpoint, path, value, 'integer');
+  return undefined;
+}
+
+/**
+ * Extract only a terminal file basename and strip server directory paths, drive
+ * prefixes, and control characters so host filesystem layout never enters local
+ * records or diagnostics.
+ */
+export function sanitizeEpubFileName(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const hasSeparator = /[\\/]/.test(value);
+  const tail = hasSeparator ? (value.split(/[\\/]/).at(-1) ?? '') : value.replace(/^[A-Za-z]:/, '');
+  const cleaned = [...tail]
+    .filter((character) => {
+      const code = character.charCodeAt(0);
+      return code >= 0x20 && code !== 0x7f;
+    })
+    .join('')
+    .trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') return null;
+  return cleaned.slice(0, 255);
+}
+
+function fileNameField(file: Row, endpoint: string, path: string): { fileName?: string } {
+  const raw = file.filePath !== undefined ? file.filePath : file.fileName;
+  const fieldName = file.filePath !== undefined ? 'filePath' : 'fileName';
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'string') {
+    fallback(endpoint, `${path}.${fieldName}`, raw, 'string');
+    return {};
+  }
+  const sanitized = sanitizeEpubFileName(raw);
+  return sanitized ? { fileName: sanitized } : {};
+}
+
 export function normalizeLibraries(payload: unknown): KavitaLibrary[] {
   if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
   return payload.map((value, index) => {
@@ -167,6 +207,7 @@ function chapters(
     }
     if (!Array.isArray(files)) throw new KavitaPayloadError(`${p}.files`, 'array', files);
     if (!files.length) throw new KavitaPayloadError(`${p}.files`, 'nonempty array', files);
+    const hasMultipleFiles = files.length > 1;
     const epubFiles: KavitaFile[] = files.flatMap((fileValue, fileIndex) => {
       const fp = `${p}.files[${fileIndex}]`,
         file = object(fileValue, fp);
@@ -177,12 +218,15 @@ function chapters(
         if (extension && !/^\.?epub$/i.test(extension)) return [];
         throw new KavitaPayloadError(`${fp}.format`, 'known format', file.format);
       }
+      const filePages = optionalCount(file.pages, DETAIL_ENDPOINT, `${fp}.pages`);
       return [
         {
           id: id(file.id, `${fp}.id`),
           format: 3,
           extension,
           bytes: count(file.bytes, DETAIL_ENDPOINT, `${fp}.bytes`),
+          ...(filePages !== undefined ? { pages: filePages } : {}),
+          ...fileNameField(file, DETAIL_ENDPOINT, fp),
         },
       ];
     });
@@ -209,6 +253,7 @@ function chapters(
         id: id(row.id, `${p}.id`),
         volumeId,
         format: 3,
+        ...(hasMultipleFiles ? { hasMultipleFiles: true } : {}),
         files: epubFiles,
         writers,
         title: text(row.title, DETAIL_ENDPOINT, `${p}.title`),

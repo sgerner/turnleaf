@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import {
   KavitaPayloadError,
   normalizeLibraries,
   normalizeSeriesDetail,
   normalizeSeriesPage,
+  sanitizeEpubFileName,
 } from './normalization';
 
 it.each([null, undefined])(
@@ -459,5 +461,146 @@ describe('normalizeSeriesDetail', () => {
       'string',
       secret,
     );
+  });
+
+  it('retains per-file page counts, strips server directories from filePath, and flags multi-file chapters', () => {
+    clearDiagnostics();
+    const posixSecretDir = '/var/lib/kavita/private-library/Rawlinson';
+    const windowsSecretDir = 'C:\\Users\\PrivateReader\\Kavita\\Books';
+    const normalized = normalizeSeriesDetail(
+      detail({
+        volumes: [
+          {
+            id: 188,
+            chapters: [
+              chapter({
+                id: 1406,
+                volumeId: 188,
+                pages: 9,
+                files: [
+                  {
+                    id: 2114,
+                    format: 3,
+                    bytes: 1955734,
+                    pages: 5,
+                    extension: '.epub',
+                    filePath: `${posixSecretDir}/pg16163-images-3.epub`,
+                  },
+                  {
+                    id: 2115,
+                    format: 3,
+                    bytes: 2169759,
+                    pages: '4',
+                    extension: '.epub',
+                    filePath: `${windowsSecretDir}\\Vol-3-Media.epub`,
+                  },
+                ],
+              }),
+              chapter({
+                id: 1407,
+                volumeId: 188,
+                pages: 310,
+                files: [
+                  {
+                    id: 2116,
+                    format: 3,
+                    bytes: 820000,
+                    pages: 10,
+                    extension: '.epub',
+                    filePath: '/srv/books/mixed/book-edition.epub',
+                  },
+                  {
+                    id: 2117,
+                    format: 4,
+                    bytes: 9500000,
+                    pages: 300,
+                    extension: '.pdf',
+                    filePath: '/srv/books/mixed/scan-edition.pdf',
+                  },
+                ],
+              }),
+            ],
+          },
+        ],
+      }),
+    );
+
+    const [multiEpub, mixedChapter] = normalized.volumes![0]!.chapters;
+    expect(multiEpub).toMatchObject({
+      id: 1406,
+      pages: 9,
+      hasMultipleFiles: true,
+      files: [
+        {
+          id: 2114,
+          bytes: 1955734,
+          pages: 5,
+          fileName: 'pg16163-images-3.epub',
+        },
+        {
+          id: 2115,
+          bytes: 2169759,
+          pages: 4,
+          fileName: 'Vol-3-Media.epub',
+        },
+      ],
+    });
+    expect(mixedChapter).toMatchObject({
+      id: 1407,
+      hasMultipleFiles: true,
+      files: [
+        {
+          id: 2116,
+          bytes: 820000,
+          pages: 10,
+          fileName: 'book-edition.epub',
+        },
+      ],
+    });
+    expect(mixedChapter!.files).toHaveLength(1);
+    const serialized = JSON.stringify(normalized);
+    expect(serialized).not.toContain('private-library');
+    expect(serialized).not.toContain('PrivateReader');
+    expect(serialized).not.toContain('/srv/books');
+  });
+
+  it('sanitizes edge-case filePath values and never leaks invalid filePath payloads into diagnostics', () => {
+    clearDiagnostics();
+    const secretPath = '/srv/secret-folder/do-not-log';
+    expect(sanitizeEpubFileName('D:portable-edition.epub')).toBe('portable-edition.epub');
+    expect(sanitizeEpubFileName('/srv/books/trailing-slash/')).toBeNull();
+    expect(sanitizeEpubFileName('/srv/books/..')).toBeNull();
+    expect(sanitizeEpubFileName('C:')).toBeNull();
+
+    const normalized = normalizeSeriesDetail(
+      detail({
+        chapters: [
+          chapter({
+            files: [
+              {
+                id: 30,
+                format: 3,
+                bytes: 1024,
+                pages: 'invalid-pages',
+                extension: '.epub',
+                filePath: { leaked: secretPath },
+              },
+            ],
+          }),
+        ],
+      }),
+    );
+
+    expect(normalized.chapters[0]!.files[0]).toEqual({
+      id: 30,
+      format: 3,
+      bytes: 1024,
+      extension: '.epub',
+    });
+    const diagnostics = exportDiagnostics({ appVersion: '0.1.0', platform: 'web' });
+    expect(diagnostics).toContain('path=$.chapters[0].files[0].pages');
+    expect(diagnostics).toContain('path=$.chapters[0].files[0].filePath');
+    expect(diagnostics).not.toContain('secret-folder');
+    expect(diagnostics).not.toContain('invalid-pages');
   });
 });

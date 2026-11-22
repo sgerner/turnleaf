@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 
+import { crc32, deflateRawSync } from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
 import {
   EpubValidationError,
   MAX_EPUB_ENTRIES,
   MAX_EPUB_EXPANDED_SIZE,
   MAX_EPUB_FILE_SIZE,
+  prepareDownloadedEpub,
   validateEpubArchive,
 } from './epub-validation';
 
@@ -14,6 +16,8 @@ interface ZipTestEntry {
   data?: Uint8Array;
   declaredSize?: number;
   flags?: number;
+  compressionMethod?: number;
+  crc?: number;
 }
 
 function write16(bytes: Uint8Array, offset: number, value: number): void {
@@ -27,12 +31,19 @@ function write32(bytes: Uint8Array, offset: number, value: number): void {
 }
 
 function makeZip(entries: ZipTestEntry[]): Uint8Array {
-  const normalized = entries.map((entry) => ({
-    name: new TextEncoder().encode(entry.name),
-    data: entry.data ?? new Uint8Array(),
-    declaredSize: entry.declaredSize ?? entry.data?.length ?? 0,
-    flags: entry.flags ?? 0,
-  }));
+  const normalized = entries.map((entry) => {
+    const rawData = entry.data ?? new Uint8Array();
+    const method = entry.compressionMethod ?? 0;
+    const storedData = method === 8 ? new Uint8Array(deflateRawSync(rawData)) : rawData;
+    return {
+      name: new TextEncoder().encode(entry.name),
+      data: storedData,
+      declaredSize: entry.declaredSize ?? rawData.length,
+      flags: entry.flags ?? 0,
+      compressionMethod: method,
+      crc: entry.crc ?? (method === 8 ? crc32(rawData) : 0),
+    };
+  });
   const localSize = normalized.reduce(
     (total, entry) => total + 30 + entry.name.length + entry.data.length,
     0,
@@ -46,6 +57,10 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     write32(archive, offset, 0x04034b50);
     write16(archive, offset + 4, 20);
     write16(archive, offset + 6, entry.flags);
+    write16(archive, offset + 8, entry.compressionMethod);
+    write32(archive, offset + 14, entry.crc);
+    write32(archive, offset + 18, entry.data.length);
+    write32(archive, offset + 22, entry.declaredSize);
     write16(archive, offset + 26, entry.name.length);
     offset += 30;
     archive.set(entry.name, offset);
@@ -59,6 +74,8 @@ function makeZip(entries: ZipTestEntry[]): Uint8Array {
     write16(archive, offset + 4, 20);
     write16(archive, offset + 6, 20);
     write16(archive, offset + 8, entry.flags);
+    write16(archive, offset + 10, entry.compressionMethod);
+    write32(archive, offset + 16, entry.crc);
     write16(archive, offset + 28, entry.name.length);
     write32(archive, offset + 20, entry.data.length);
     write32(archive, offset + 24, entry.declaredSize);
@@ -226,5 +243,178 @@ describe('EPUB container validation', () => {
       EpubValidationError,
     );
     expect(readRange).not.toHaveBeenCalled();
+  });
+
+  it('extracts only the requested EPUB from stored and deflated multi-file outer archives', async () => {
+    const epubOne = makeZip(
+      validEntries([
+        { name: 'OEBPS/ed1.xhtml', data: new TextEncoder().encode('<h1>Edition One</h1>') },
+      ]),
+    );
+    const epubTwo = makeZip(
+      validEntries([
+        {
+          name: 'OEBPS/ed2.xhtml',
+          data: new TextEncoder().encode('<h1>Edition Two Extended Content</h1>'),
+        },
+      ]),
+    );
+    const largePdf = new Uint8Array(250_000).fill(0x25);
+
+    for (const method of [0, 8] as const) {
+      const outer = makeZip([
+        {
+          name: 'scan-edition/scan-edition.pdf',
+          data: largePdf,
+          compressionMethod: 0,
+        },
+        {
+          name: 'pg16163-images-3/pg16163-images-3.epub',
+          data: epubOne,
+          compressionMethod: method,
+          crc: crc32(epubOne),
+        },
+        {
+          name: 'Vol-3-Media/Vol-3-Media.epub',
+          data: epubTwo,
+          compressionMethod: method,
+          crc: crc32(epubTwo),
+        },
+      ]);
+
+      const readOffsets: Array<{ offset: number; length: number }> = [];
+      const extractedSecond = await prepareDownloadedEpub(
+        outer.length,
+        async (offset, length) => {
+          readOffsets.push({ offset, length });
+          return outer.slice(offset, offset + length);
+        },
+        {
+          fileName: 'Vol-3-Media.epub',
+          expectedByteSize: epubTwo.length,
+          epubIndex: 1,
+        },
+      );
+
+      expect(extractedSecond).toEqual(epubTwo);
+      // Bytes 4096..180_000 sit inside the 250 KB PDF before both epubTwo and the 64 KB EOCD tail window.
+      expect(readOffsets.some((read) => read.offset >= 4096 && read.offset < 180_000)).toBe(false);
+    }
+  });
+
+  it('selects inner EPUBs by file name first, then byte size, and finally EPUB order', async () => {
+    const epubAlpha = makeZip(
+      validEntries([{ name: 'OEBPS/a.xhtml', data: new TextEncoder().encode('alpha') }]),
+    );
+    const epubBeta = makeZip(
+      validEntries([
+        { name: 'OEBPS/b.xhtml', data: new TextEncoder().encode('beta-longer-edition') },
+      ]),
+    );
+    const outer = makeZip([
+      {
+        name: 'alpha/alpha.epub',
+        data: epubAlpha,
+        compressionMethod: 8,
+      },
+      {
+        name: 'beta/beta.epub',
+        data: epubBeta,
+        compressionMethod: 8,
+      },
+    ]);
+    const reader = async (offset: number, length: number) => outer.slice(offset, offset + length);
+
+    // 1. File name wins over conflicting byte size and EPUB index.
+    await expect(
+      prepareDownloadedEpub(outer.length, reader, {
+        fileName: 'BETA.EPUB',
+        expectedByteSize: epubAlpha.length,
+        epubIndex: 0,
+      }),
+    ).resolves.toEqual(epubBeta);
+
+    // 2. Byte size wins when file name is unavailable or renamed.
+    await expect(
+      prepareDownloadedEpub(outer.length, reader, {
+        fileName: 'renamed-on-server.epub',
+        expectedByteSize: epubBeta.length,
+        epubIndex: 0,
+      }),
+    ).resolves.toEqual(epubBeta);
+
+    // 3. EPUB order wins when neither file name nor byte size matches.
+    await expect(
+      prepareDownloadedEpub(outer.length, reader, {
+        fileName: null,
+        expectedByteSize: 999_999,
+        epubIndex: 1,
+      }),
+    ).resolves.toEqual(epubBeta);
+  });
+
+  it('rejects outer archives with missing, corrupted, encrypted, or invalid inner EPUBs', async () => {
+    const validInner = makeZip(validEntries());
+    const readerFor = (archive: Uint8Array) => async (offset: number, length: number) =>
+      archive.slice(offset, offset + length);
+
+    // Outer archive with only a PDF and no EPUB.
+    const pdfOnly = makeZip([{ name: 'doc/scan.pdf', data: new TextEncoder().encode('%PDF-1.7') }]);
+    await expect(prepareDownloadedEpub(pdfOnly.length, readerFor(pdfOnly))).rejects.toBeInstanceOf(
+      EpubValidationError,
+    );
+
+    // Requested sibling EPUB index missing from archive.
+    const singleOuter = makeZip([
+      { name: 'only/only.epub', data: validInner, compressionMethod: 8 },
+    ]);
+    await expect(
+      prepareDownloadedEpub(singleOuter.length, readerFor(singleOuter), {
+        fileName: 'missing-second.epub',
+        expectedByteSize: validInner.length + 50,
+        epubIndex: 1,
+      }),
+    ).rejects.toBeInstanceOf(EpubValidationError);
+
+    // Corrupted inner EPUB payload (not a valid EPUB container).
+    const bogusInner = new TextEncoder().encode('not-an-epub-archive-at-all-1234567890');
+    const bogusOuter = makeZip([
+      { name: 'broken/broken.epub', data: bogusInner, compressionMethod: 8 },
+    ]);
+    await expect(
+      prepareDownloadedEpub(bogusOuter.length, readerFor(bogusOuter)),
+    ).rejects.toBeInstanceOf(EpubValidationError);
+
+    // CRC-32 mismatch on extracted inner EPUB.
+    const badCrcOuter = makeZip([
+      {
+        name: 'corrupt/corrupt.epub',
+        data: validInner,
+        compressionMethod: 0,
+        crc: (crc32(validInner) ^ 0xff) >>> 0,
+      },
+    ]);
+    await expect(
+      prepareDownloadedEpub(badCrcOuter.length, readerFor(badCrcOuter)),
+    ).rejects.toBeInstanceOf(EpubValidationError);
+
+    // Encrypted outer archive entry.
+    const encryptedOuter = makeZip([{ name: 'secret/secret.epub', data: validInner, flags: 0x1 }]);
+    await expect(
+      prepareDownloadedEpub(encryptedOuter.length, readerFor(encryptedOuter)),
+    ).rejects.toBeInstanceOf(EpubValidationError);
+
+    // Declared uncompressed size smaller than actual inflated stream (zip-bomb guard).
+    const bombOuter = makeZip([
+      {
+        name: 'bomb/bomb.epub',
+        data: validInner,
+        compressionMethod: 8,
+        declaredSize: 64,
+      },
+    ]);
+    await expect(
+      prepareDownloadedEpub(bombOuter.length, readerFor(bombOuter)),
+    ).rejects.toBeInstanceOf(EpubValidationError);
   });
 });

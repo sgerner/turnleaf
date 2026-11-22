@@ -528,4 +528,68 @@ describe('native progress transactions against SQLite', () => {
     await expect(reopened.openDatabase()).resolves.toBeDefined();
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
   });
+
+  it('persists secondary EPUB reading positions and completion locally without queuing remote sync', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    const primaryBook = {
+      ...book,
+      fileId: 2114,
+      fileName: 'vol3-primary.epub',
+      pages: 5,
+      fileSize: 1955734,
+      remoteFileSize: 1955734,
+      chapterEpubIndex: 0,
+      multiFileChapter: true,
+      syncProgress: true,
+    };
+    const siblingBook = {
+      ...book,
+      id: 'server:1:10:2115',
+      fileId: 2115,
+      fileName: 'vol3-secondary.epub',
+      title: 'Book (vol3-secondary)',
+      pages: 4,
+      fileSize: 2169759,
+      remoteFileSize: 2169759,
+      chapterEpubIndex: 1,
+      multiFileChapter: true,
+      syncProgress: false,
+      remoteProgressKnown: false,
+      remoteReadDateKnown: false,
+    };
+    await database.reconcileBooks(server.id, [primaryBook, siblingBook]);
+
+    await database.saveLocalProgress(siblingBook, 'epubcfi(/6/4)', '/html/body/p[3]', 0.5, 1);
+
+    const reopened = await reopenDatabase(database);
+    expect(await reopened.getReadingState(siblingBook.id)).toMatchObject({
+      cfi: 'epubcfi(/6/4)',
+      xpath: '/html/body/p[3]',
+      percentage: 0.5,
+      pendingSync: false,
+    });
+    expect(await reopened.getPendingSync(server.id)).toEqual([]);
+    expect(await reopened.getSyncStatus(server.id)).toMatchObject({ pendingCount: 0 });
+
+    await reopened.reconcileBooks(server.id, [primaryBook, siblingBook]);
+    const savedSibling = (await reopened.getBooks(server.id)).find(
+      (item) => item.id === siblingBook.id,
+    );
+    expect(savedSibling).toMatchObject({
+      fileId: 2115,
+      fileName: 'vol3-secondary.epub',
+      remoteFileSize: 2169759,
+      chapterEpubIndex: 1,
+      multiFileChapter: true,
+      syncProgress: false,
+      pagesRead: 2,
+    });
+
+    await reopened.markBookCompleted(siblingBook, await reopened.getReadingState(siblingBook.id));
+    expect(await reopened.getPendingSync(server.id)).toEqual([]);
+    expect(
+      (await reopened.getBooks(server.id)).find((item) => item.id === siblingBook.id)?.pagesRead,
+    ).toBe(4);
+  });
 });

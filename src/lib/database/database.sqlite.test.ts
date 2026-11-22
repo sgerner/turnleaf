@@ -304,4 +304,79 @@ describe('native metadata transactions against SQLite', () => {
 
     expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
   });
+
+  it('persists per-file EPUB columns, strips server paths, and preserves secondary EPUB progress on refresh', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    await replaceBooksInTransaction(adapter, 'server', [baseBook], '2026-09-08T00:00:00.000Z');
+
+    const primaryRefreshed: BookRecord = {
+      ...baseBook,
+      fileId: 2114,
+      fileName: '/var/kavita/books/edition-primary.epub',
+      pages: 5,
+      pagesRead: 2,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 1955734,
+      remoteFileSize: 1955734,
+      chapterEpubIndex: 0,
+      multiFileChapter: true,
+      syncProgress: true,
+    };
+    const siblingBook: BookRecord = {
+      ...baseBook,
+      id: 'server:1:10:2115',
+      fileId: 2115,
+      fileName: 'C:\\Books\\Secret\\edition-secondary.epub',
+      title: 'Book (edition-secondary)',
+      pages: 4,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 2169759,
+      remoteFileSize: 2169759,
+      chapterEpubIndex: 1,
+      multiFileChapter: true,
+      syncProgress: false,
+    };
+
+    await reconcileBooksInTransaction(adapter, 'server', [primaryRefreshed, siblingBook]);
+
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      download_path: baseBook.downloadPath,
+      download_status: 'available',
+      file_size: baseBook.fileSize,
+      remote_file_size: 1955734,
+      file_id: 2114,
+      file_name: 'edition-primary.epub',
+      chapter_epub_index: 0,
+      multi_file_chapter: 1,
+      sync_progress: 1,
+      pages: 5,
+    });
+    expect(readBook(db, siblingBook.id)).toMatchObject({
+      file_size: 2169759,
+      remote_file_size: 2169759,
+      file_id: 2115,
+      file_name: 'edition-secondary.epub',
+      chapter_epub_index: 1,
+      multi_file_chapter: 1,
+      sync_progress: 0,
+      pages: 4,
+      pages_read: 0,
+    });
+
+    db.prepare('UPDATE books SET pages_read=3, last_read_at=? WHERE id=?').run(
+      '2026-09-11T00:00:00.000Z',
+      siblingBook.id,
+    );
+    await reconcileBooksInTransaction(adapter, 'server', [primaryRefreshed, siblingBook]);
+
+    expect(readBook(db, siblingBook.id)).toMatchObject({
+      pages_read: 3,
+      last_read_at: '2026-09-11T00:00:00.000Z',
+    });
+  });
 });

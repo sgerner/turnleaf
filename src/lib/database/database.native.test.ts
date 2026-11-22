@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 7;
+  let databaseVersion = 8;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 7;
+      databaseVersion = 8;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -214,7 +214,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(7);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(8);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -224,6 +224,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN file_id'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -233,5 +234,34 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 5;',
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
+    'PRAGMA user_version = 8;',
+  ]);
+});
+
+it('saves secondary EPUB progress locally without inserting into sync_queue', async () => {
+  const { markBookCompleted, saveLocalProgress } = await import('./database');
+  const siblingBook = {
+    ...book,
+    id: 'server:1:10:2115',
+    fileId: 2115,
+    chapterEpubIndex: 1,
+    multiFileChapter: true,
+    syncProgress: false,
+  };
+
+  await saveLocalProgress(siblingBook, readingState.cfi, readingState.xpath, 0.5, 1);
+  await markBookCompleted(siblingBook, readingState);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
+  const [progressTasks, completionTasks] = mocks.executeTransaction.mock.calls;
+  expect(progressTasks?.[0]?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('pending_sync=0'),
+    'DELETE FROM sync_queue WHERE book_id=?',
+    expect.stringContaining('UPDATE books'),
+  ]);
+  expect(completionTasks?.[0]?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('UPDATE books'),
+    expect.stringContaining('pending_sync=0'),
+    'DELETE FROM sync_queue WHERE book_id=?',
   ]);
 });

@@ -74,7 +74,7 @@
     initialPercentage?: number | null;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
-    onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
+    onSyncLatest?: ((manual: boolean) => Promise<SyncedLocation | null>) | undefined;
     onRetryDownload?: (() => Promise<void>) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
@@ -1282,27 +1282,29 @@
               </svg>
               <span class="reader-toolbar-label">Search</span>
             </button>
-            <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
-              type="button"
-              onclick={() => syncLatestLocation()}
-              aria-label="Sync latest reading position"
-              title="Sync latest reading position"
-              disabled={syncingLatest}
-            >
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                class:animate-spin={syncingLatest}
-                class="reader-toolbar-icon reader-toolbar-icon-always"
+            {#if onSyncLatest}
+              <button
+                class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+                type="button"
+                onclick={() => syncLatestLocation()}
+                aria-label="Sync latest reading position"
+                title="Sync latest reading position"
+                disabled={syncingLatest}
               >
-                <path
-                  fill="currentColor"
-                  d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
-                />
-              </svg>
-              <span class="reader-toolbar-label">Sync</span>
-            </button>
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  class:animate-spin={syncingLatest}
+                  class="reader-toolbar-icon reader-toolbar-icon-always"
+                >
+                  <path
+                    fill="currentColor"
+                    d="M17.7 6.3A8 8 0 0 0 4.3 10H2l3.5 3.5L9 10H6.4a5.8 5.8 0 0 1 9.8-2.2l1.5-1.5ZM18.5 10.5 15 14h2.6a5.8 5.8 0 0 1-9.8 2.2l-1.5 1.5A8 8 0 0 0 19.7 14H22l-3.5-3.5Z"
+                  />
+                </svg>
+                <span class="reader-toolbar-label">Sync</span>
+              </button>
+            {/if}
           </div>
           <p class="reader-toolbar-title">
             {title}

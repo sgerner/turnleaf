@@ -10,11 +10,11 @@
 
 ## Download rule
 
-A native file transfer writes directly to `.partial`, the app verifies a nonempty native file, renames it, then permits SQLite to mark it available. Startup/open must call `verifyDownloadedEpub`; a missing file becomes unavailable rather than producing a false offline promise.
+A native file transfer writes directly to `.partial`. When Kavita wraps a multi-file chapter into an outer `.cbz` archive, Turnleaf extracts only the target `.epub` entry within strict size and entry limits, validates the inner EPUB container, renames `.partial` to the final `.epub` path, and then permits SQLite to mark it available. Startup/open must call `verifyDownloadedEpub`; a missing or invalid file becomes unavailable rather than producing a false offline promise.
 
 ## Progress rule
 
-Every meaningful relocation is saved locally first using EPUB CFI, percentage, spine location, XPath, and timestamp. The queue has one row per book; a newer payload replaces the older payload without resetting retry history.
+Every meaningful relocation is saved locally first using EPUB CFI, percentage, spine location, XPath, and timestamp. Primary chapter EPUBs queue one row per book for Kavita sync (a newer payload replaces the older payload without resetting retry history), while secondary EPUBs on a multi-EPUB chapter persist reading state, bookmarks, and notes locally on the device without queuing or sending `chapterId` progress to Kavita.
 
 Flush triggers are connectivity restoration, app backgrounding, chapter change, and one rescheduled idle deadline. There is no interval, poll, WebSocket, or background service.
 

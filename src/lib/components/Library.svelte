@@ -300,6 +300,29 @@
     return `Open ${book.title}${downloaded}${progress}`;
   }
 
+  function formatByteSize(bytes: number | null | undefined): string | null {
+    if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) return null;
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 * 1024) {
+      return `${(bytes / 1024).toFixed(1).replace(/\.0$/, '')} KB`;
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+      return `${(bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')} MB`;
+    }
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function bookDetailsSummary(book: BookRecord): string | null {
+    const parts: string[] = [];
+    if (book.pages > 0) {
+      parts.push(`${book.pages} ${book.pages === 1 ? 'page' : 'pages'}`);
+    }
+    const size = formatByteSize(book.fileSize ?? book.remoteFileSize);
+    if (size) parts.push(size);
+    if (book.syncProgress === false) parts.push('Saved on this device');
+    return parts.length ? parts.join(' · ') : null;
+  }
+
   function parseSortOrder(value: string | null): LibrarySortOrder {
     return value === 'author' || value === 'recent' ? value : 'title';
   }
@@ -852,6 +875,11 @@
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        {
+          fileName: book.fileName,
+          expectedByteSize: book.remoteFileSize ?? book.fileSize,
+          epubIndex: book.chapterEpubIndex ?? 0,
+        },
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -988,7 +1016,12 @@
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
     try {
       let remote: KavitaProgress | null = null;
-      if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
+      if (
+        book.syncProgress !== false &&
+        !offline &&
+        (!kavitaUnreachable || force) &&
+        book.remoteAvailable !== false
+      ) {
         const probe = new AbortController();
         openProgressProbe = probe;
         const abort = new Promise<null>((resolve) => {
@@ -1098,7 +1131,7 @@
         xpath: local?.xpath ?? null,
         percentage: local?.percentage ?? null,
       };
-      if (preferFurthest) void syncProgress(false);
+      if (preferFurthest && book.syncProgress !== false) void syncProgress(false);
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
@@ -1154,8 +1187,10 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    if (book.syncProgress !== false) {
+      if (syncTimer !== null) window.clearTimeout(syncTimer);
+      syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    }
   }
 
   async function syncLatestForReader(
@@ -1166,6 +1201,7 @@
     percentage: number | null;
     accept?: () => Promise<void>;
   } | null> {
+    if (book.syncProgress === false) return null;
     if (!manual && !pendingAutoSync) return null;
     if (book.remoteAvailable === false || !(await networkAvailable())) {
       if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
@@ -1223,7 +1259,7 @@
       savedBook.pagesRead = book.pages;
       savedBook.lastReadAt = new Date().toISOString();
     }
-    void syncProgress(false);
+    if (book.syncProgress !== false) void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
   }
@@ -1579,7 +1615,9 @@
       initialPercentage={reading.percentage}
       onBack={() => void closeReader()}
       onRelocated={handleRelocated}
-      onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
+      onSyncLatest={reading.book.syncProgress === false
+        ? undefined
+        : (manual) => syncLatestForReader(reading!.book, manual)}
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
@@ -2351,6 +2389,11 @@
           <p class="truncate text-sm text-surface-700-300">
             {actionMenuBook.author ?? 'Unknown author'}
           </p>
+          {#if bookDetailsSummary(actionMenuBook)}
+            <p class="mt-1 text-xs text-surface-700-300" data-book-details>
+              {bookDetailsSummary(actionMenuBook)}
+            </p>
+          {/if}
         </div>
         <button
           class="btn btn-sm h-11 w-11 !p-0"
@@ -2402,23 +2445,25 @@
             <span>Download for offline</span>
           </button>
         {/if}
-        <button
-          class="btn preset-tonal-primary justify-start"
-          type="button"
-          onclick={() => {
-            const book = actionMenuBook;
-            closeMenu();
-            if (book) void syncFurthest(book);
-          }}
-        >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-            <path
-              fill="currentColor"
-              d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
-            />
-          </svg>
-          <span>Sync furthest read</span>
-        </button>
+        {#if actionMenuBook.syncProgress !== false}
+          <button
+            class="btn preset-tonal-primary justify-start"
+            type="button"
+            onclick={() => {
+              const book = actionMenuBook;
+              closeMenu();
+              if (book) void syncFurthest(book);
+            }}
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+              <path
+                fill="currentColor"
+                d="M12 4V2a10 10 0 0 0-7.07 17.07l1.42-1.42A8 8 0 1 1 12 4Z"
+              />
+            </svg>
+            <span>Sync furthest read</span>
+          </button>
+        {/if}
         <button
           class="btn preset-tonal-tertiary justify-start"
           type="button"
