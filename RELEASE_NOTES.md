@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- Use app-private streaming downloads and system Markdown note export across Android 7 through 16 without storage permissions
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
