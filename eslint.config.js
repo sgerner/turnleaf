@@ -10,11 +10,18 @@ export default defineConfig(
   ...tseslint.configs.recommended,
   ...svelte.configs.recommended,
   {
-    files: ['**/*.svelte'],
+    files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
     languageOptions: {
       parserOptions: {
+        extraFileExtensions: ['.svelte'],
         parser: tseslint.parser,
       },
+    },
+  },
+  {
+    files: ['src/**/*.svelte', 'src/**/*.svelte.ts'],
+    rules: {
+      'no-undef': 'off',
     },
   },
   {
