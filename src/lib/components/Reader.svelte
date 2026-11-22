@@ -47,7 +47,14 @@
     recordLocation,
     type StoredReaderLocation,
   } from '../reader/bookmarks';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusFirstElement,
+    focusModal,
+    restoreFocus,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   type SyncedLocation = {
     xpath: string | null;
@@ -69,6 +76,7 @@
     onStudyChanged,
     onSyncStudy,
     onRetryDownload,
+    onMountChange,
     registerBackHandler,
   }: {
     bookUrl: string;
@@ -86,6 +94,7 @@
       manual: boolean,
     ) => Promise<{ annotations: StoredAnnotation[]; bookmarks: StoredReaderLocation[] } | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
+    onMountChange?: ((mounted: boolean) => void) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
@@ -160,6 +169,7 @@
     : null;
 
   onMount(async () => {
+    onMountChange?.(true);
     previousDocumentTitle = document.title;
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
@@ -385,6 +395,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onMountChange?.(false);
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
@@ -404,20 +415,6 @@
     controlsVisible = true;
     scheduleChromeHide();
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
-  }
-
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusPanel(getPanel: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getPanel()));
-  }
-
-  function restorePanelFocus(opener: HTMLElement | null): void {
-    void tick().then(() => restoreFocus(opener));
   }
 
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
@@ -466,14 +463,14 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => settingsPanel);
+    focusModal(() => settingsPanel);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -489,14 +486,14 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => tocPanel);
+    focusModal(() => tocPanel);
   }
 
   function closeToc(): void {
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -512,7 +509,7 @@
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => bookmarksPanel);
+    focusModal(() => bookmarksPanel);
   }
 
   function closeBookmarks(): void {
@@ -520,7 +517,7 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -540,7 +537,7 @@
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusPanel(() => annotationsPanel);
+    focusModal(() => annotationsPanel);
   }
 
   function closeAnnotations(): void {
@@ -573,7 +570,7 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchError = '';
-    focusPanel(() => searchPanel);
+    focusModal(() => searchPanel);
   }
 
   function closeSearch(): void {
@@ -583,7 +580,7 @@
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -591,14 +588,14 @@
     pauseChromeHide();
     syncConfirmationOpener = activeElement();
     pendingSyncLocation = progress;
-    focusPanel(() => syncConfirmationPanel);
+    focusModal(() => syncConfirmationPanel);
   }
 
   function closeSyncConfirmation(): void {
     pendingSyncLocation = null;
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
