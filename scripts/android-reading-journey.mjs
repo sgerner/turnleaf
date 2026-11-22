@@ -2,7 +2,9 @@ import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createCdpClient } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
@@ -66,17 +68,38 @@ async function connectWebView() {
   }
 }
 
-async function startFixture() {
+function isValidKavitaScrollId(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/DocFragment/i.test(trimmed) || /^epubcfi\(/i.test(trimmed)) return false;
+  return (
+    /^(?:\/{1,2}(?:html(?:\[1])?\/)?)?body(?:\[1])?(?:\/[A-Za-z0-9:_-]+(?:\[\d+])?)*\/?$/i.test(
+      trimmed,
+    ) || /^(?:\/{1,2})?id\((["'])[^"']+\1\)(?:\/[A-Za-z0-9:_-]+(?:\[\d+])?)*\/?$/i.test(trimmed)
+  );
+}
+
+export async function startFixture({ totalPages = 2, apiKey = key } = {}) {
   const epub = await readFile(
     new URL('../dev/kavita/data/Books/lorem-ipsum.epub', import.meta.url),
   );
   const uploads = [];
+  let savedProgress = null;
   let downloads = 0;
   let offline = false;
   const offlineRequests = [];
-  const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
+  const emptyProgress = {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 0,
+    bookScrollId: null,
+  };
   const server = createServer(async (request, response) => {
-    if (request.headers['x-api-key'] !== key) {
+    if (request.headers['x-api-key'] !== apiKey) {
       response.writeHead(401).end();
       return;
     }
@@ -86,7 +109,8 @@ async function startFixture() {
       response.writeHead(503).end();
       return;
     }
-    const pagesRead = uploads.at(-1)?.pageNum ?? 0;
+    const pagesRead = savedProgress?.pageNum ?? 0;
+    const lastReadingProgressUtc = savedProgress?.lastModifiedUtc ?? '0001-01-01T00:00:00';
     let body;
     switch (path) {
       case '/api/Health':
@@ -96,7 +120,7 @@ async function startFixture() {
         body = [{ id: 1, name: 'Books', type: 2 }];
         break;
       case '/api/Series/v2':
-        body = [{ id: 1, libraryId: 1, name: title, format: 3, pages: 2, pagesRead }];
+        body = [{ id: 1, libraryId: 1, name: title, format: 3, pages: totalPages, pagesRead }];
         break;
       case '/api/Series/series-detail':
         body = {
@@ -109,8 +133,9 @@ async function startFixture() {
                   volumeId: 1,
                   title,
                   titleName: title,
-                  pages: 2,
+                  pages: totalPages,
                   pagesRead,
+                  lastReadingProgressUtc,
                   format: 3,
                   files: [{ id: 1, format: 3, extension: '.epub', bytes: epub.length }],
                 },
@@ -129,18 +154,49 @@ async function startFixture() {
           .end(epub);
         return;
       case '/api/Reader/get-progress':
-        body = uploads.at(-1) ?? emptyProgress;
+        body = savedProgress ?? emptyProgress;
         break;
       case '/api/Reader/progress': {
         let json = '';
         for await (const chunk of request) json += chunk;
+        let payload;
         try {
-          uploads.push(JSON.parse(json));
-          body = {};
+          payload = JSON.parse(json);
         } catch {
           response.writeHead(400).end();
           return;
         }
+        if (
+          !payload ||
+          typeof payload !== 'object' ||
+          Array.isArray(payload) ||
+          payload.libraryId !== 1 ||
+          payload.seriesId !== 1 ||
+          payload.volumeId !== 1 ||
+          payload.chapterId !== 1 ||
+          !Number.isInteger(payload.pageNum) ||
+          payload.pageNum < 0 ||
+          payload.pageNum > totalPages ||
+          !isValidKavitaScrollId(payload.bookScrollId)
+        ) {
+          response.writeHead(400).end();
+          return;
+        }
+        uploads.push(payload);
+        // Mirror Kavita ReaderService.SaveReadingProgress: do not create a new
+        // AppUserProgress record when none exists yet and pageNum is 0.
+        if (savedProgress !== null || payload.pageNum > 0) {
+          savedProgress = {
+            libraryId: 1,
+            seriesId: 1,
+            volumeId: 1,
+            chapterId: 1,
+            pageNum: Math.min(totalPages, Math.max(0, payload.pageNum)),
+            bookScrollId: payload.pageNum >= totalPages ? null : (payload.bookScrollId ?? null),
+            lastModifiedUtc: new Date().toISOString(),
+          };
+        }
+        body = {};
         break;
       }
       default:
@@ -292,7 +348,11 @@ async function run() {
         .slice(uploadCount)
         .some(
           (progress) =>
-            progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
+            progress.chapterId === 1 &&
+            progress.pageNum === 1 &&
+            typeof progress.bookScrollId === 'string' &&
+            progress.bookScrollId.startsWith('//body') &&
+            !progress.bookScrollId.includes('DocFragment'),
         ),
     );
     await waitFor('return to library after reconnect', async () => {
@@ -342,7 +402,9 @@ async function run() {
   console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
 }
 
-await run().catch((error) => {
-  console.error(error);
-  process.exitCode ??= 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await run().catch((error) => {
+    console.error(error);
+    process.exitCode ??= 1;
+  });
+}

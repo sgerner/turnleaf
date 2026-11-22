@@ -18,6 +18,7 @@
     type Appearance,
     type ReadingMode,
   } from '../reader/appearance';
+  import { parseKavitaXPath } from '../reader/kavita-xpath';
   import {
     ReaderSession,
     type ReaderLocation,
@@ -46,8 +47,10 @@
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
 
   type SyncedLocation = {
+    pageNum?: number | null;
     xpath: string | null;
     percentage: number | null;
+    completed?: boolean;
     accept?: () => Promise<void>;
   };
 
@@ -57,6 +60,7 @@
     title,
     defaultMode = defaultAppearance.mode,
     initialCfi = null,
+    initialPageNum = null,
     initialXPath = null,
     initialPercentage = null,
     onBack,
@@ -70,6 +74,7 @@
     title: string;
     defaultMode?: Appearance['mode'];
     initialCfi?: string | null;
+    initialPageNum?: number | null;
     initialXPath?: string | null;
     initialPercentage?: number | null;
     onBack: () => void;
@@ -225,6 +230,7 @@
         }
       },
       handleKeyboardNavigation,
+      initialPageNum,
     );
     if (!destroyed) {
       toc = nextSession.tableOfContents();
@@ -829,28 +835,53 @@
       .replace(/\/$/, '');
   }
 
-  function hasSyncedLocation(progress: {
-    xpath: string | null;
-    percentage: number | null;
-  }): boolean {
+  function hasSyncedLocation(progress: SyncedLocation): boolean {
     return (
       Boolean(progress.xpath?.trim()) ||
+      progress.completed === true ||
+      (typeof progress.pageNum === 'number' &&
+        Number.isInteger(progress.pageNum) &&
+        progress.pageNum > 0) ||
       (typeof progress.percentage === 'number' &&
         Number.isFinite(progress.percentage) &&
         progress.percentage > 0)
     );
   }
 
-  function hasDivergentSyncLocation(progress: {
-    xpath: string | null;
-    percentage: number | null;
-  }): boolean {
+  function hasDivergentSyncLocation(progress: SyncedLocation): boolean {
     if (!hasSyncedLocation(progress)) return false;
     if (!location) return true;
+    if (progress.completed) {
+      return location.percentage < 1;
+    }
     const serverXPath = progress.xpath?.trim();
     const localXPath = location.xpath?.trim();
     if (serverXPath && localXPath) {
+      const localTarget = parseKavitaXPath(localXPath, location.spineIndex);
+      const serverTarget = parseKavitaXPath(serverXPath, progress.pageNum);
+      if (localTarget && serverTarget) {
+        if (
+          localTarget.spineIndex === serverTarget.spineIndex &&
+          localTarget.contentXPath === serverTarget.contentXPath
+        ) {
+          return false;
+        }
+        if (session?.matchesServerLocation(serverXPath, progress.pageNum)) {
+          return false;
+        }
+        return true;
+      }
+      if (progress.pageNum != null && progress.pageNum !== location.spineIndex) {
+        return true;
+      }
       return normalizeReaderXPath(serverXPath) !== normalizeReaderXPath(localXPath);
+    }
+    if (
+      !serverXPath &&
+      typeof progress.pageNum === 'number' &&
+      Number.isInteger(progress.pageNum)
+    ) {
+      return location.spineIndex !== progress.pageNum;
     }
     if (typeof progress.percentage === 'number' && Number.isFinite(progress.percentage)) {
       return Math.abs(location.percentage - progress.percentage) >= 0.001;
@@ -860,16 +891,16 @@
 
   async function displaySyncedLocation(
     reader: ReaderSession,
-    progress: { xpath: string | null; percentage: number | null },
+    progress: SyncedLocation,
   ): Promise<void> {
     if (progress.xpath) {
-      const restored = await reader.displayServerLocation(progress.xpath);
+      const restored = await reader.displayServerLocation(progress.xpath, progress.pageNum ?? null);
       if (restored) return;
     }
     if (
       typeof progress.percentage === 'number' &&
       Number.isFinite(progress.percentage) &&
-      progress.percentage > 0
+      progress.percentage >= 0
     ) {
       await reader.displayServerPercentage(progress.percentage);
     }

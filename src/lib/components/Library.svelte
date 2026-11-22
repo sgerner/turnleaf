@@ -44,6 +44,7 @@
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
+  import { resolveKavitaPageNumber } from '../reader/kavita-xpath';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
@@ -183,6 +184,7 @@
     book: BookRecord;
     url: string;
     cfi: string | null;
+    pageNum: number | null;
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
@@ -1081,11 +1083,13 @@
         resolvingOpenProgress = false;
       }
       if (destroyed) return;
+      const completed = book.pages > 0 && remote.pageNum >= book.pages;
       reading = {
         book,
         url: file.webViewUrl,
         cfi: null,
-        xpath: remote.bookScrollId ?? null,
+        pageNum: resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, book.pages),
+        xpath: completed ? null : (remote.bookScrollId ?? null),
         percentage: remotePercentage(remote, book),
       };
       return;
@@ -1095,6 +1099,7 @@
         book,
         url: file.webViewUrl,
         cfi: local?.cfi || null,
+        pageNum: local?.pageNum ?? null,
         xpath: local?.xpath ?? null,
         percentage: local?.percentage ?? null,
       };
@@ -1109,6 +1114,13 @@
       book,
       url: file.webViewUrl,
       cfi: local?.cfi ?? null,
+      pageNum: local
+        ? (local.pageNum ?? null)
+        : remote
+          ? resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, book.pages)
+          : book.pagesRead > 0
+            ? book.pagesRead
+            : null,
       xpath: local ? null : (remote?.bookScrollId ?? null),
       percentage:
         !local && remote
@@ -1130,13 +1142,17 @@
   }
 
   function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
-    if (!book.pages || remote.pageNum <= 0) return null;
-    return Math.max(0, Math.min(0.999, remote.pageNum / book.pages));
+    if (!book.pages) return null;
+    if (remote.pageNum >= book.pages) return 1;
+    const pageNum =
+      resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, book.pages) ?? remote.pageNum;
+    if (pageNum <= 0 && !remote.bookScrollId?.trim()) return null;
+    return Math.max(0, pageNum / book.pages);
   }
 
   function metadataPercentage(book: BookRecord): number | null {
     if (!book.pages || book.pagesRead <= 0) return null;
-    return Math.max(0, Math.min(0.999, book.pagesRead / book.pages));
+    return book.pagesRead >= book.pages ? 1 : Math.max(0, book.pagesRead / book.pages);
   }
 
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
@@ -1162,8 +1178,10 @@
     book: BookRecord,
     manual: boolean,
   ): Promise<{
+    pageNum: number | null;
     xpath: string | null;
     percentage: number | null;
+    completed: boolean;
     accept?: () => Promise<void>;
   } | null> {
     if (!manual && !pendingAutoSync) return null;
@@ -1186,10 +1204,14 @@
       return null;
     }
     const remote = await client.getProgress(book.chapterId);
+    if (!remote.bookScrollId?.trim() && remote.pageNum <= 0) return null;
     if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
+    const completed = book.pages > 0 && remote.pageNum >= book.pages;
     return {
-      xpath: remote.bookScrollId ?? null,
+      pageNum: resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, book.pages),
+      xpath: completed ? null : (remote.bookScrollId ?? null),
       percentage: remotePercentage(remote, book),
+      completed,
       accept: async () => {
         acceptingRemoteProgress = true;
         try {
@@ -1210,7 +1232,11 @@
   function updateRemoteBookProgress(book: BookRecord, remote: KavitaProgress): void {
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
-      savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+      const resolvedPage =
+        resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, book.pages) ??
+        Math.max(0, remote.pageNum);
+      savedBook.pagesRead =
+        book.pages > 0 ? Math.max(0, Math.min(book.pages, resolvedPage)) : resolvedPage;
       savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
     }
   }
@@ -1317,7 +1343,17 @@
       }
 
       const lastReadAt = current.remote.lastModifiedUtc ?? new Date().toISOString();
-      const pagesRead = Math.max(0, Math.min(current.book.pages, current.remote.pageNum));
+      const completed = current.book.pages > 0 && current.remote.pageNum >= current.book.pages;
+      const resolvedPage =
+        resolveKavitaPageNumber(
+          current.remote.pageNum,
+          current.remote.bookScrollId,
+          current.book.pages,
+        ) ?? Math.max(0, current.remote.pageNum);
+      const pagesRead =
+        current.book.pages > 0
+          ? Math.max(0, Math.min(current.book.pages, resolvedPage))
+          : resolvedPage;
       books = books.map((book) =>
         book.id === current.book.id ? { ...book, pagesRead, lastReadAt } : book,
       );
@@ -1325,7 +1361,8 @@
         book: current.book,
         url: current.url,
         cfi: null,
-        xpath: current.remote.bookScrollId ?? null,
+        pageNum: resolvedPage,
+        xpath: completed ? null : (current.remote.bookScrollId ?? null),
         percentage: remotePercentage(current.remote, current.book),
       };
       dismissConflict();
@@ -1575,6 +1612,7 @@
       title={reading.book.title}
       defaultMode={mode}
       initialCfi={reading.cfi}
+      initialPageNum={reading.pageNum}
       initialXPath={reading.xpath}
       initialPercentage={reading.percentage}
       onBack={() => void closeReader()}
@@ -2492,9 +2530,15 @@
           <dt class="font-medium">Kavita</dt>
           <dd>
             {#if conflict.book.pages > 0}
-              Page {conflict.remote.pageNum} of {conflict.book.pages}
+              {@const remoteChapter =
+                resolveKavitaPageNumber(
+                  conflict.remote.pageNum,
+                  conflict.remote.bookScrollId,
+                  conflict.book.pages,
+                ) ?? Math.max(0, conflict.remote.pageNum)}
+              Page {Math.min(conflict.book.pages, remoteChapter + 1)} of {conflict.book.pages}
             {:else}
-              Page {conflict.remote.pageNum}
+              Page {Math.max(1, conflict.remote.pageNum + 1)}
             {/if}
             {#if conflict.remote.lastModifiedUtc}
               · {new Date(conflict.remote.lastModifiedUtc).toLocaleString()}
@@ -2515,6 +2559,7 @@
               book: conflict!.book,
               url: conflict!.url,
               cfi: conflict!.local.cfi || null,
+              pageNum: conflict!.local.pageNum ?? null,
               xpath: conflict!.local.xpath,
               percentage: conflict!.local.percentage,
             };

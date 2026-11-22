@@ -1,0 +1,165 @@
+// @vitest-environment node
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { KavitaClient } from '../src/lib/kavita/client';
+import { markBookCompleted, saveLocalProgress } from '../src/lib/database/database';
+import { flushProgress } from '../src/lib/sync/sync';
+import { startFixture } from './android-reading-journey.mjs';
+
+const STORAGE_KEY = 'turnleaf_browser_database_v1';
+
+class MemoryStorage {
+  values = new Map();
+
+  get length() {
+    return this.values.size;
+  }
+
+  clear() {
+    this.values.clear();
+  }
+
+  getItem(key) {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index) {
+    return [...this.values.keys()][index] ?? null;
+  }
+
+  removeItem(key) {
+    this.values.delete(key);
+  }
+
+  setItem(key, value) {
+    this.values.set(key, String(value));
+  }
+}
+
+const book = {
+  id: 'server:1:1',
+  serverId: 'server',
+  libraryId: 1,
+  seriesId: 1,
+  volumeId: 1,
+  chapterId: 1,
+  title: 'Turnleaf Journey Fixture',
+  author: 'Turnleaf Test',
+  series: 'Turnleaf Journey Fixture',
+  descriptionHtml: null,
+  format: 'epub',
+  pages: 2,
+  pagesRead: 0,
+  createdAt: '2026-01-01T00:00:00.000Z',
+  lastReadAt: null,
+  downloadPath: null,
+  downloadStatus: 'none',
+  fileSize: null,
+};
+
+describe('Kavita ProgressDto journey fixture contract', () => {
+  let fixture;
+
+  beforeEach(async () => {
+    const storage = new MemoryStorage();
+    vi.stubGlobal('localStorage', storage);
+    vi.stubGlobal('window', {
+      localStorage: storage,
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+    });
+    storage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        serverConfig: { id: 'server' },
+        books: [{ ...book }],
+        readingState: {},
+        syncQueue: {},
+        preferences: {},
+      }),
+    );
+    fixture = await startFixture();
+  });
+
+  afterEach(() => {
+    fixture?.close();
+    vi.unstubAllGlobals();
+  });
+
+  async function postRawProgress(payload) {
+    return fetch(`http://127.0.0.1:${fixture.port}/api/Reader/progress`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': 'turnleaf-ci-only',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  it('rejects DocFragment wrappers, EPUB CFIs, and out-of-range page numbers with HTTP 400', async () => {
+    const docFragment = await postRawProgress({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 1,
+      pageNum: 0,
+      bookScrollId: '//body/DocFragment[1]/body/p[1]',
+    });
+    expect(docFragment.status).toBe(400);
+
+    const cfi = await postRawProgress({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 1,
+      pageNum: 0,
+      bookScrollId: 'epubcfi(/6/2!/4/2)',
+    });
+    expect(cfi.status).toBe(400);
+
+    const outOfRange = await postRawProgress({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 1,
+      pageNum: 3,
+      bookScrollId: null,
+    });
+    expect(outOfRange.status).toBe(400);
+  });
+
+  it('enforces Kavita page-zero unstarted guard while flushProgress bootstraps and persists chapter-zero progress', async () => {
+    const client = new KavitaClient(`http://127.0.0.1:${fixture.port}`, 'turnleaf-ci-only');
+
+    // Direct save with pageNum === 0 on an unstarted book mirrors Kavita's no-op guard.
+    await client.saveProgress({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 1,
+      pageNum: 0,
+      bookScrollId: '//body/p[2]',
+    });
+    expect(await client.getProgress(1)).toMatchObject({
+      pageNum: 0,
+      bookScrollId: null,
+    });
+
+    // Turnleaf's flushProgress bootstraps pageNum: 1 before saving chapter-zero progress.
+    await saveLocalProgress(book, 'epubcfi(/6/2!/4/4)', '//body/p[2]', 0.25, 0);
+    await flushProgress(client, 'server');
+    expect(await client.getProgress(1)).toMatchObject({
+      pageNum: 0,
+      bookScrollId: '//body/p[2]',
+    });
+
+    // Explicit completion sends pageNum = book.pages (2) and bookScrollId = null.
+    await markBookCompleted(book, null);
+    await flushProgress(client, 'server');
+    expect(await client.getProgress(1)).toMatchObject({
+      pageNum: 2,
+      bookScrollId: null,
+    });
+  });
+});

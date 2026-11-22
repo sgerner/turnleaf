@@ -5,6 +5,7 @@ import {
   type capTask,
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
+import { resolveKavitaPageNumber } from '../reader/kavita-xpath';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
 import { migrations } from './schema';
@@ -552,6 +553,7 @@ export async function markDownloaded(bookId: string, path: string, size: number)
 
 export interface StoredReadingState {
   cfi: string;
+  pageNum?: number | null;
   xpath: string | null;
   percentage: number;
   localUpdatedAt: string;
@@ -572,11 +574,11 @@ export interface PendingProgressPayload {
 }
 
 const readingStateUpsertStatement = `INSERT INTO reading_state
-  (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync,sync_revision)
-  VALUES (?,?,?,?,?,1,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
+  (book_id,cfi,kavita_xpath,percentage,local_updated_at,server_page_num,pending_sync,sync_revision)
+  VALUES (?,?,?,?,?,?,1,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
   kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
-  local_updated_at=excluded.local_updated_at,pending_sync=1,
-  sync_revision=reading_state.sync_revision+1`;
+  local_updated_at=excluded.local_updated_at,server_page_num=excluded.server_page_num,
+  pending_sync=1,sync_revision=reading_state.sync_revision+1`;
 
 const syncQueueUpsertStatement = `INSERT INTO sync_queue
   (book_id,payload_json,created_at,updated_at,revision)
@@ -591,10 +593,11 @@ function createReadingStateTask(
   xpath: string | null,
   percentage: number,
   updatedAt: string,
+  pageNum: number | null,
 ): capTask {
   return {
     statement: readingStateUpsertStatement,
-    values: [bookId, cfi, xpath, percentage, updatedAt],
+    values: [bookId, cfi, xpath, percentage, updatedAt, pageNum],
   };
 }
 
@@ -616,6 +619,7 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
     if (!readingState) return null;
     return {
       ...readingState,
+      pageNum: readingState.pageNum ?? null,
       syncRevision: Math.max(
         Number(readingState.syncRevision ?? 0),
         Number(state.syncQueue[bookId]?.revision ?? 0),
@@ -627,6 +631,7 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
   if (!row) return null;
   return {
     cfi: String(row.cfi),
+    pageNum: row.server_page_num == null ? null : Number(row.server_page_num),
     xpath: row.kavita_xpath ? String(row.kavita_xpath) : null,
     percentage: Number(row.percentage),
     localUpdatedAt: String(row.local_updated_at),
@@ -645,6 +650,12 @@ export async function saveLocalProgress(
   spineIndex?: number,
 ): Promise<void> {
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
+  const localPageNum =
+    book.pages > 0
+      ? pagesRead
+      : Number.isInteger(spineIndex) && spineIndex !== undefined && spineIndex >= 0
+        ? spineIndex
+        : null;
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
@@ -655,6 +666,7 @@ export async function saveLocalProgress(
         ) + 1;
       state.readingState[book.id] = {
         cfi,
+        pageNum: localPageNum,
         xpath,
         percentage,
         localUpdatedAt: now,
@@ -703,7 +715,7 @@ export async function saveLocalProgress(
     bookScrollId: xpath,
   };
   await executeNativeTransaction(db, [
-    createReadingStateTask(book.id, cfi, xpath, percentage, now),
+    createReadingStateTask(book.id, cfi, xpath, percentage, now, localPageNum),
     createSyncQueueTask(book.id, payload, now),
     {
       statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
@@ -743,6 +755,7 @@ export async function markBookCompleted(
       );
       state.readingState[book.id] = {
         cfi: '',
+        pageNum: book.pages,
         xpath: null,
         percentage: 1,
         localUpdatedAt: now,
@@ -772,7 +785,7 @@ export async function markBookCompleted(
       values: [book.pages, now, book.id],
     },
   ];
-  tasks.push(createReadingStateTask(book.id, '', null, 1, now));
+  tasks.push(createReadingStateTask(book.id, '', null, 1, now, book.pages));
   tasks.push(createSyncQueueTask(book.id, payload, now));
   await executeNativeTransaction(db, tasks);
 }
@@ -895,6 +908,17 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   };
 }
 
+function resolveRemoteProgressSnapshot(book: BookRecord, remote: KavitaProgress) {
+  const completed = book.pages > 0 && remote.pageNum >= book.pages;
+  const resolvedPage =
+    resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, book.pages) ??
+    Math.max(0, remote.pageNum);
+  const pagesRead = book.pages > 0 ? Math.max(0, Math.min(book.pages, resolvedPage)) : resolvedPage;
+  const percentage = book.pages > 0 ? (completed ? 1 : Math.max(0, pagesRead / book.pages)) : 0;
+  const xpath = completed ? null : (remote.bookScrollId ?? null);
+  return { resolvedPage: pagesRead, pagesRead, percentage, xpath };
+}
+
 export async function saveRemoteProgress(
   book: BookRecord,
   remote: KavitaProgress,
@@ -902,11 +926,15 @@ export async function saveRemoteProgress(
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+  const { resolvedPage, pagesRead, percentage, xpath } = resolveRemoteProgressSnapshot(
+    book,
+    remote,
+  );
   const next: StoredReadingState = {
     cfi: '',
-    xpath: remote.bookScrollId ?? null,
-    percentage: book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0,
+    pageNum: resolvedPage,
+    xpath,
+    percentage,
     localUpdatedAt: now,
     syncedLocalUpdatedAt: now,
     serverUpdatedAt,
@@ -955,7 +983,7 @@ export async function saveRemoteProgress(
           next.percentage,
           now,
           now,
-          remote.pageNum,
+          resolvedPage,
           next.xpath,
           serverUpdatedAt,
           next.syncRevision,
@@ -982,9 +1010,10 @@ export async function acceptRemoteProgress(
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const percentage = book.pages > 0 ? Math.max(0, Math.min(0.999, remote.pageNum / book.pages)) : 0;
-  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-  const xpath = remote.bookScrollId ?? null;
+  const { resolvedPage, pagesRead, percentage, xpath } = resolveRemoteProgressSnapshot(
+    book,
+    remote,
+  );
 
   if (!Capacitor.isNativePlatform()) {
     return updateBrowserState((state) => {
@@ -1004,6 +1033,7 @@ export async function acceptRemoteProgress(
       state.readingState[book.id] = {
         ...reading,
         cfi: '',
+        pageNum: resolvedPage,
         xpath,
         percentage,
         localUpdatedAt: now,
@@ -1031,7 +1061,7 @@ export async function acceptRemoteProgress(
         percentage,
         now,
         now,
-        remote.pageNum,
+        resolvedPage,
         xpath,
         serverUpdatedAt,
         book.id,

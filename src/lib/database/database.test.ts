@@ -7,10 +7,13 @@ import {
   confirmSync,
   getBooks,
   getPendingSync,
+  getReadingState,
   getSyncStatus,
+  markBookCompleted,
   reconcileBooks,
   replaceBooksInTransaction,
   saveLocalProgress,
+  saveRemoteProgress,
   type BookRecord,
 } from './database';
 
@@ -885,4 +888,79 @@ it('accepts the selected browser server progress and drops only the displayed lo
   const newer = await getPendingSync('server');
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
+});
+
+it('persists zero-based spine pageNum, explicit completion payloads, and legacy DocFragment remote overrides in browser storage', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await saveLocalProgress(existingBook, 'cfi-ch1', '//body/p[4]', 0.05, 0);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: 'cfi-ch1',
+    pageNum: 0,
+    xpath: '//body/p[4]',
+    percentage: 0.05,
+    pendingSync: true,
+  });
+  const firstQueue = await getPendingSync('server');
+  expect(JSON.parse(firstQueue[0]!.payload)).toMatchObject({
+    pageNum: 0,
+    bookScrollId: '//body/p[4]',
+  });
+
+  const currentState = await getReadingState(existingBook.id);
+  await markBookCompleted(existingBook, currentState);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    pageNum: existingBook.pages,
+    xpath: null,
+    percentage: 1,
+    pendingSync: true,
+  });
+  const completedQueue = await getPendingSync('server');
+  expect(JSON.parse(completedQueue[0]!.payload)).toMatchObject({
+    pageNum: existingBook.pages,
+    bookScrollId: null,
+  });
+
+  await confirmSync(
+    existingBook.id,
+    '2026-09-07T00:01:00.000Z',
+    completedQueue[0]!.revision,
+    completedQueue[0]!.updatedAt,
+  );
+  const acknowledged = await getReadingState(existingBook.id);
+  await expect(
+    saveRemoteProgress(
+      existingBook,
+      {
+        libraryId: 1,
+        seriesId: 1,
+        volumeId: 10,
+        chapterId: 10,
+        pageNum: 3,
+        bookScrollId: '//body/DocFragment[3]/body/p[2]',
+        lastModifiedUtc: '2026-09-07T00:02:00.000Z',
+      },
+      acknowledged,
+    ),
+  ).resolves.toBe(true);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: '',
+    pageNum: 2,
+    xpath: '//body/DocFragment[3]/body/p[2]',
+    percentage: 0.02,
+    pendingSync: false,
+  });
 });

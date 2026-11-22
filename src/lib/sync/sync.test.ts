@@ -227,3 +227,150 @@ it('allows a manual retry after an authorization failure', async () => {
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
+
+it('bootstraps Kavita progress before saving non-zero progress inside chapter index zero for an unstarted book', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [{ ...book }],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.04, 0);
+
+  const getProgress = vi.fn().mockResolvedValue({
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 0,
+    bookScrollId: null,
+  });
+  const saveProgress = vi.fn().mockResolvedValue(undefined);
+
+  await flushProgress({ getProgress, saveProgress } as never, 'server');
+
+  expect(getProgress).toHaveBeenCalledExactlyOnceWith(1);
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  expect(saveProgress).toHaveBeenNthCalledWith(1, {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 1,
+    bookScrollId: null,
+  });
+  expect(saveProgress).toHaveBeenNthCalledWith(2, {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 0,
+    bookScrollId: '//body/p[3]',
+  });
+});
+
+it('skips chapter-zero bootstrap when remote progress already exists or local progress is at book start', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [{ ...book }],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.04, 0);
+
+  const getStartedProgress = vi.fn().mockResolvedValue({
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 0,
+    bookScrollId: '//body/p[1]',
+  });
+  const saveStartedProgress = vi.fn().mockResolvedValue(undefined);
+  await flushProgress(
+    { getProgress: getStartedProgress, saveProgress: saveStartedProgress } as never,
+    'server',
+  );
+  expect(saveStartedProgress).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ pageNum: 0, bookScrollId: '//body/p[3]' }),
+  );
+
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/2)', '//body/p[1]', 0, 0);
+  const getUnstartedProgress = vi.fn().mockResolvedValue({
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 0,
+    bookScrollId: null,
+  });
+  const saveInitialProgress = vi.fn().mockResolvedValue(undefined);
+  await flushProgress(
+    { getProgress: getUnstartedProgress, saveProgress: saveInitialProgress } as never,
+    'server',
+  );
+  expect(getUnstartedProgress).not.toHaveBeenCalled();
+  expect(saveInitialProgress).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ pageNum: 0, bookScrollId: '//body/p[1]' }),
+  );
+});
+
+it('retries chapter-zero save without repeating bootstrap if interrupted after bootstrap', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [{ ...book }],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.04, 0);
+
+  const getProgress = vi
+    .fn()
+    .mockResolvedValueOnce({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 1,
+      pageNum: 0,
+      bookScrollId: null,
+    })
+    .mockResolvedValueOnce({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 1,
+      pageNum: 1,
+      bookScrollId: null,
+    });
+  const saveProgress = vi
+    .fn()
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(new Error('network lost after bootstrap'))
+    .mockResolvedValueOnce(undefined);
+
+  const client = { getProgress, saveProgress } as never;
+  await expect(flushProgress(client, 'server')).rejects.toThrow('1 reading progress item failed');
+  await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
+
+  expect(saveProgress).toHaveBeenCalledTimes(3);
+  expect(saveProgress).toHaveBeenNthCalledWith(3, {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 1,
+    chapterId: 1,
+    pageNum: 0,
+    bookScrollId: '//body/p[3]',
+  });
+});
