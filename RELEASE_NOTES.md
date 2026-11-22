@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Attest and verify Android APK provenance
+- Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops
