@@ -43,7 +43,13 @@
     toggleBookmark,
     type StoredReaderLocation,
   } from '../reader/bookmarks';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusFirstElement,
+    focusModal,
+    restoreFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   type SyncedLocation = {
     xpath: string | null;
@@ -320,24 +326,15 @@
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
   }
 
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusPanel(getPanel: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getPanel()));
-  }
-
-  function restorePanelFocus(opener: HTMLElement | null, fallbackSelector?: string): void {
+  function restorePanelFocus(opener: HTMLElement | null, fallbackSelector: string): void {
     void tick().then(() => {
-      if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
-      else if (fallbackSelector)
-        readerToolbar?.querySelector<HTMLElement>(fallbackSelector)?.focus();
+      const target =
+        opener?.isConnected && opener !== document.body && !opener.hasAttribute('disabled')
+          ? opener
+          : (readerToolbar?.querySelector<HTMLElement>(fallbackSelector) ?? null);
+      restoreFocus(target);
     });
   }
-
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
     void tick().then(() => {
       const controls = panel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
@@ -384,7 +381,7 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => settingsPanel);
+    focusModal(() => settingsPanel);
   }
 
   function closeSettings(): void {
@@ -407,7 +404,7 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => tocPanel);
+    focusModal(() => tocPanel);
   }
 
   function closeToc(): void {
@@ -430,7 +427,7 @@
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => bookmarksPanel);
+    focusModal(() => bookmarksPanel);
   }
 
   function closeBookmarks(): void {
@@ -458,7 +455,7 @@
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusPanel(() => annotationsPanel);
+    focusModal(() => annotationsPanel);
   }
 
   function closeAnnotations(): void {
@@ -487,7 +484,7 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchError = '';
-    focusPanel(() => searchPanel);
+    focusModal(() => searchPanel);
   }
 
   function closeSearch(): void {
@@ -506,7 +503,7 @@
     syncConfirmationOpener = activeElement();
     controlsVisible = true;
     pendingSyncLocation = progress;
-    focusPanel(() => syncConfirmationPanel);
+    focusModal(() => syncConfirmationPanel);
   }
 
   function closeSyncConfirmation(): void {
