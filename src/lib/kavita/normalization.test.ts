@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  extractAnnotationNote,
+  formatAnnotationCommentFields,
   KavitaPayloadError,
+  normalizeAnnotation,
+  normalizeAnnotations,
   normalizeLibraries,
+  normalizePersonalToc,
   normalizeSeriesDetail,
   normalizeSeriesPage,
 } from './normalization';
@@ -459,5 +464,113 @@ describe('normalizeSeriesDetail', () => {
       'string',
       secret,
     );
+  });
+});
+
+describe('Kavita annotations and personal ToC normalization', () => {
+  it('round-trips multi-line notes through ProseMirror JSON and HTML comment fields', () => {
+    const formatted = formatAnnotationCommentFields('First line\n<Second & "quoted">');
+    expect(formatted.commentHtml).toBe(
+      '<p>First line</p><p>&lt;Second &amp; &quot;quoted&quot;&gt;</p>',
+    );
+    expect(extractAnnotationNote(null, null, formatted.comment)).toBe(
+      'First line\n<Second & "quoted">',
+    );
+    expect(extractAnnotationNote(null, formatted.commentHtml, null)).toBe(
+      'First line\n<Second & "quoted">',
+    );
+    expect(formatAnnotationCommentFields('   ')).toEqual({ comment: '', commentHtml: '' });
+  });
+
+  it('normalizes AnnotationDto payloads and falls back across comment fields', () => {
+    const items = normalizeAnnotations([
+      {
+        id: 77,
+        chapterId: 20,
+        volumeId: 10,
+        seriesId: 5,
+        libraryId: 2,
+        ownerUserId: 1,
+        xPath: '//body/DocFragment[2]/body/p[3]',
+        endingXPath: '//body/DocFragment[2]/body/p[4]',
+        selectedText: 'Highlighted text',
+        comment:
+          '{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"From ProseMirror"}]}]}',
+        commentHtml: '',
+        commentPlainText: null,
+        chapterTitle: 'Chapter Two',
+        context: 'Surrounding paragraph',
+        highlightCount: 16,
+        containsSpoiler: true,
+        pageNumber: 1,
+        selectedSlotIndex: 2,
+        createdUtc: '2026-05-01T12:00:00Z',
+        lastModifiedUtc: '2026-05-01T12:05:00Z',
+      },
+    ]);
+    expect(items).toEqual([
+      {
+        id: 77,
+        chapterId: 20,
+        volumeId: 10,
+        seriesId: 5,
+        libraryId: 2,
+        ownerUserId: 1,
+        xPath: '//body/DocFragment[2]/body/p[3]',
+        endingXPath: '//body/DocFragment[2]/body/p[4]',
+        selectedText: 'Highlighted text',
+        comment:
+          '{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"From ProseMirror"}]}]}',
+        commentHtml: '',
+        commentPlainText: 'From ProseMirror',
+        chapterTitle: 'Chapter Two',
+        context: 'Surrounding paragraph',
+        highlightCount: 16,
+        containsSpoiler: true,
+        pageNumber: 1,
+        selectedSlotIndex: 2,
+        createdUtc: '2026-05-01T12:00:00Z',
+        lastModifiedUtc: '2026-05-01T12:05:00Z',
+      },
+    ]);
+    expect(
+      normalizeAnnotation({
+        id: '8',
+        chapterId: '20',
+        selectedText: 'Quote',
+        xPath: '//body/DocFragment[1]/body/p[1]',
+      }).highlightCount,
+    ).toBe(5);
+  });
+
+  it('normalizes PersonalToCDto payloads and drops entries missing titles without leaking text', () => {
+    const items = normalizePersonalToc([
+      {
+        id: 3,
+        chapterId: 20,
+        pageNumber: 2,
+        title: '  Key Passage  ',
+        bookScrollId: '//body/DocFragment[3]/body/p[5]',
+        selectedText: 'Snippet',
+        chapterTitle: 'Part I',
+      },
+      {
+        id: 4,
+        chapterId: 20,
+        pageNumber: 3,
+        title: '   ',
+      },
+    ]);
+    expect(items).toEqual([
+      {
+        id: 3,
+        chapterId: 20,
+        pageNumber: 2,
+        title: 'Key Passage',
+        bookScrollId: '//body/DocFragment[3]/body/p[5]',
+        selectedText: 'Snippet',
+        chapterTitle: 'Part I',
+      },
+    ]);
   });
 });

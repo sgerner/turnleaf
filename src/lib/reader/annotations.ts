@@ -1,9 +1,21 @@
+export type StudySyncState = 'synced' | 'pending_create' | 'pending_update' | 'pending_delete';
+
 export interface StoredAnnotation {
   id: string;
   cfi: string;
   excerpt: string;
   note: string;
   createdAt: string;
+  updatedAt?: string;
+  remoteId?: number | null;
+  xpath?: string | null;
+  endingXPath?: string | null;
+  pageNumber?: number;
+  context?: string | null;
+  chapterTitle?: string | null;
+  slotIndex?: number;
+  containsSpoiler?: boolean;
+  syncState?: StudySyncState;
 }
 
 function isAnnotation(value: unknown): value is StoredAnnotation {
@@ -34,6 +46,19 @@ export function addAnnotation(
   excerpt: string,
   note: string,
   createdAt = new Date().toISOString(),
+  metadata: Partial<
+    Pick<
+      StoredAnnotation,
+      | 'xpath'
+      | 'endingXPath'
+      | 'pageNumber'
+      | 'context'
+      | 'chapterTitle'
+      | 'slotIndex'
+      | 'containsSpoiler'
+      | 'syncState'
+    >
+  > = {},
 ): StoredAnnotation[] {
   const trimmedCfi = cfi.trim();
   const trimmedExcerpt = excerpt.trim();
@@ -41,7 +66,14 @@ export function addAnnotation(
   const existing = annotations.find((annotation) => annotation.cfi === trimmedCfi);
   if (existing) {
     return annotations.map((annotation) =>
-      annotation.id === existing.id ? { ...annotation, note: note.trim() } : annotation,
+      annotation.id === existing.id
+        ? {
+            ...annotation,
+            ...metadata,
+            note: note.trim().slice(0, 2000),
+            updatedAt: createdAt,
+          }
+        : annotation,
     );
   }
   return [
@@ -52,6 +84,7 @@ export function addAnnotation(
       excerpt: trimmedExcerpt.slice(0, 500),
       note: note.trim().slice(0, 2000),
       createdAt,
+      ...metadata,
     },
   ].slice(-200);
 }
@@ -80,6 +113,33 @@ export function annotationsMarkdown(title: string, annotations: StoredAnnotation
       '',
     );
     if (annotation.note) lines.push(annotation.note, '');
+  }
+  return `${lines.join('\n').trim()}\n`;
+}
+
+export function libraryAnnotationsMarkdown(
+  books: ReadonlyArray<{
+    title: string;
+    author?: string | null;
+    annotations: readonly StoredAnnotation[];
+  }>,
+): string {
+  const nonEmpty = books.filter((entry) => entry.annotations.length > 0);
+  if (nonEmpty.length === 1 && nonEmpty[0]) {
+    return annotationsMarkdown(nonEmpty[0].title, [...nonEmpty[0].annotations]);
+  }
+  const lines = ['# Highlights and notes', ''];
+  for (const entry of nonEmpty) {
+    lines.push(`## ${entry.title}${entry.author ? ` — ${entry.author}` : ''}`, '');
+    for (const annotation of entry.annotations) {
+      lines.push(
+        `### ${annotation.createdAt}`,
+        '',
+        `> ${annotation.excerpt.replaceAll('\n', ' ')}`,
+        '',
+      );
+      if (annotation.note) lines.push(annotation.note, '');
+    }
   }
   return `${lines.join('\n').trim()}\n`;
 }

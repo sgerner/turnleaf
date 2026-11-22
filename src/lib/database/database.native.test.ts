@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 7;
+  let databaseVersion = 8;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 7;
+      databaseVersion = 8;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -214,7 +214,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(7);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(8);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -224,6 +224,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('CREATE TABLE IF NOT EXISTS annotations'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -233,5 +234,105 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 5;',
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
+    'PRAGMA user_version = 8;',
+  ]);
+});
+
+it('migrates active-server legacy study preferences during v8 upgrade and ignores deleted-server orphans', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(7);
+  mocks.executeTransaction.mockClear();
+  mocks.db.query
+    .mockResolvedValueOnce({
+      values: [
+        {
+          key: 'readerAnnotations:active:1:10',
+          value: JSON.stringify([
+            {
+              id: 'a1',
+              cfi: 'epubcfi(/6/4!/4/2/1:0)',
+              excerpt: 'Active highlight',
+              note: 'Active note',
+              createdAt: '2026-01-01T00:00:00.000Z',
+            },
+          ]),
+        },
+        {
+          key: 'readerAnnotations:deleted:1:10',
+          value: JSON.stringify([
+            {
+              id: 'orphan',
+              cfi: 'epubcfi(/6/2!/4/2)',
+              excerpt: 'Orphaned highlight',
+              note: 'Should be dropped',
+              createdAt: '2026-01-01T00:00:00.000Z',
+            },
+          ]),
+        },
+        {
+          key: 'readerBookmarks:active:1:10',
+          value: JSON.stringify([
+            {
+              id: 'b1',
+              cfi: 'epubcfi(/6/4!/4/2)',
+              href: 'ch2.xhtml',
+              percentage: 0.3,
+              label: 'Saved spot',
+              savedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ]),
+        },
+        {
+          key: 'readerHistory:active:1:10',
+          value: JSON.stringify([
+            {
+              id: 'h1',
+              cfi: 'epubcfi(/6/4!/4/2)',
+              href: 'ch2.xhtml',
+              percentage: 0.3,
+              label: '30%',
+              savedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ]),
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ values: [{ id: 'active:1:10' }] });
+
+  await openDatabase();
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  const statements = tasks?.map((task) => task.statement) ?? [];
+  expect(statements[0]).toContain('CREATE TABLE IF NOT EXISTS annotations');
+  expect(statements).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining('INSERT OR IGNORE INTO annotations'),
+      expect.stringContaining('INSERT OR IGNORE INTO bookmarks'),
+      expect.stringContaining('INSERT OR IGNORE INTO reading_history'),
+      'PRAGMA user_version = 8;',
+    ]),
+  );
+  const annotationInsert = tasks?.find((task) => task.statement.includes('INTO annotations'));
+  expect(annotationInsert?.values).toContain('active:1:10:a1');
+  expect(JSON.stringify(tasks)).not.toContain('deleted:1:10');
+});
+
+it('removes books, server config, and any legacy study preferences atomically on native removeServer', async () => {
+  const { openDatabase, removeServer, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(8);
+  await openDatabase();
+  mocks.executeTransaction.mockClear();
+
+  await removeServer('srv_123');
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks?.map((task) => task.statement)).toEqual([
+    'DELETE FROM books WHERE server_id=?',
+    'DELETE FROM server_config WHERE id=?',
+    expect.stringContaining('DELETE FROM preferences'),
   ]);
 });

@@ -1,9 +1,22 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
-import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
+import type {
+  ConnectedServer,
+  KavitaAnnotation,
+  KavitaAnnotationWrite,
+  KavitaCreatePersonalTocRequest,
+  KavitaPersonalTocItem,
+  KavitaProgress,
+  KavitaSeries,
+  KavitaSeriesDetail,
+} from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
+  formatAnnotationCommentFields,
   KavitaPayloadError,
+  normalizeAnnotation,
+  normalizeAnnotations,
   normalizeLibraries,
+  normalizePersonalToc,
   normalizeSeriesPage,
   normalizeSeriesDetail,
 } from './normalization';
@@ -286,11 +299,165 @@ export class KavitaClient {
       body: JSON.stringify(progress),
     };
     if (signal) options.signal = signal;
-    return this.request('/api/Reader/progress', options);
+    return this.request('/api/Reader/progress', options, false);
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
+  async getAnnotations(chapterId: number, signal?: AbortSignal): Promise<KavitaAnnotation[]> {
+    const endpoint = '/api/Annotation/all';
+    const payload = await this.request<unknown>(
+      `${endpoint}?chapterId=${chapterId}`,
+      signal ? { signal } : {},
+    );
+    return normalizePayload(endpoint, () => normalizeAnnotations(payload, endpoint));
+  }
+
+  async getSeriesAnnotations(seriesId: number, signal?: AbortSignal): Promise<KavitaAnnotation[]> {
+    const endpoint = '/api/Annotation/all-for-series';
+    const payload = await this.request<unknown>(
+      `${endpoint}?seriesId=${seriesId}`,
+      signal ? { signal } : {},
+    );
+    return normalizePayload(endpoint, () => normalizeAnnotations(payload, endpoint));
+  }
+
+  async createAnnotation(
+    annotation: KavitaAnnotationWrite & { note?: string },
+    signal?: AbortSignal,
+  ): Promise<KavitaAnnotation> {
+    const endpoint = '/api/Annotation/create';
+    const selectedText = annotation.selectedText.trim();
+    const commentFields =
+      annotation.comment !== undefined || annotation.commentHtml !== undefined
+        ? {
+            comment: annotation.comment ?? '',
+            commentHtml: annotation.commentHtml ?? '',
+          }
+        : formatAnnotationCommentFields(annotation.note ?? '');
+    const now = new Date().toISOString();
+    const body = {
+      id: annotation.id ?? 0,
+      chapterId: annotation.chapterId,
+      volumeId: annotation.volumeId,
+      seriesId: annotation.seriesId,
+      libraryId: annotation.libraryId,
+      ownerUserId: annotation.ownerUserId ?? 0,
+      xPath: annotation.xPath,
+      endingXPath: annotation.endingXPath ?? annotation.xPath,
+      selectedText,
+      comment: commentFields.comment,
+      commentHtml: commentFields.commentHtml,
+      chapterTitle: annotation.chapterTitle ?? null,
+      context: annotation.context ?? selectedText,
+      highlightCount: Math.max(1, annotation.highlightCount ?? selectedText.length),
+      containsSpoiler: annotation.containsSpoiler ?? false,
+      pageNumber: Math.max(0, annotation.pageNumber),
+      selectedSlotIndex: annotation.selectedSlotIndex ?? 0,
+      createdUtc: annotation.createdUtc ?? now,
+      lastModifiedUtc: annotation.lastModifiedUtc ?? now,
+    };
+    const options: RequestInit = {
+      method: 'POST',
+      body: JSON.stringify(body),
+    };
+    if (signal) options.signal = signal;
+    const payload = await this.request<unknown>(endpoint, options);
+    return normalizePayload(endpoint, () => normalizeAnnotation(payload, endpoint));
+  }
+
+  async updateAnnotation(
+    annotation: KavitaAnnotationWrite & { id: number; note?: string },
+    signal?: AbortSignal,
+  ): Promise<KavitaAnnotation> {
+    const endpoint = '/api/Annotation/update';
+    const selectedText = annotation.selectedText.trim();
+    const commentFields =
+      annotation.comment !== undefined || annotation.commentHtml !== undefined
+        ? {
+            comment: annotation.comment ?? '',
+            commentHtml: annotation.commentHtml ?? '',
+          }
+        : formatAnnotationCommentFields(annotation.note ?? '');
+    const now = new Date().toISOString();
+    const body = {
+      id: annotation.id,
+      chapterId: annotation.chapterId,
+      volumeId: annotation.volumeId,
+      seriesId: annotation.seriesId,
+      libraryId: annotation.libraryId,
+      ownerUserId: annotation.ownerUserId ?? 0,
+      xPath: annotation.xPath,
+      endingXPath: annotation.endingXPath ?? annotation.xPath,
+      selectedText,
+      comment: commentFields.comment,
+      commentHtml: commentFields.commentHtml,
+      chapterTitle: annotation.chapterTitle ?? null,
+      context: annotation.context ?? selectedText,
+      highlightCount: Math.max(1, annotation.highlightCount ?? selectedText.length),
+      containsSpoiler: annotation.containsSpoiler ?? false,
+      pageNumber: Math.max(0, annotation.pageNumber),
+      selectedSlotIndex: annotation.selectedSlotIndex ?? 0,
+      createdUtc: annotation.createdUtc ?? now,
+      lastModifiedUtc: annotation.lastModifiedUtc ?? now,
+    };
+    const options: RequestInit = {
+      method: 'POST',
+      body: JSON.stringify(body),
+    };
+    if (signal) options.signal = signal;
+    const payload = await this.request<unknown>(endpoint, options);
+    return normalizePayload(endpoint, () => normalizeAnnotation(payload, endpoint));
+  }
+
+  deleteAnnotation(annotationId: number, signal?: AbortSignal): Promise<void> {
+    const options: RequestInit = { method: 'DELETE' };
+    if (signal) options.signal = signal;
+    return this.request(`/api/Annotation?annotationId=${annotationId}`, options, false);
+  }
+
+  async getPersonalToc(chapterId: number, signal?: AbortSignal): Promise<KavitaPersonalTocItem[]> {
+    const endpoint = '/api/Reader/ptoc';
+    const payload = await this.request<unknown>(
+      `${endpoint}?chapterId=${chapterId}`,
+      signal ? { signal } : {},
+    );
+    return normalizePayload(endpoint, () => normalizePersonalToc(payload, endpoint));
+  }
+
+  createPersonalToc(entry: KavitaCreatePersonalTocRequest, signal?: AbortSignal): Promise<void> {
+    const options: RequestInit = {
+      method: 'POST',
+      body: JSON.stringify({
+        libraryId: entry.libraryId,
+        seriesId: entry.seriesId,
+        volumeId: entry.volumeId,
+        chapterId: entry.chapterId,
+        pageNumber: Math.max(0, entry.pageNumber),
+        title: entry.title.trim(),
+        bookScrollId: entry.bookScrollId ?? null,
+        selectedText: entry.selectedText ?? '',
+      }),
+    };
+    if (signal) options.signal = signal;
+    return this.request('/api/Reader/create-ptoc', options, false);
+  }
+
+  deletePersonalToc(
+    chapterId: number,
+    pageNum: number,
+    title: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const options: RequestInit = { method: 'DELETE' };
+    if (signal) options.signal = signal;
+    return this.request(
+      `/api/Reader/ptoc?chapterId=${chapterId}&pageNum=${Math.max(0, pageNum)}&title=${encodeURIComponent(title.trim())}`,
+      options,
+      false,
+    );
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}, expectJson = true): Promise<T> {
+    if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init, expectJson);
     const timeout = new AbortController();
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
     const signal = init.signal ? AbortSignal.any([init.signal, timeout.signal]) : timeout.signal;
@@ -320,7 +487,11 @@ export class KavitaClient {
           response.status,
         );
       }
-      if (response.status === 204 || response.headers.get('content-length') === '0') {
+      if (
+        !expectJson ||
+        response.status === 204 ||
+        response.headers.get('content-length') === '0'
+      ) {
         return undefined as T;
       }
       try {
@@ -345,7 +516,7 @@ export class KavitaClient {
     }
   }
 
-  private async nativeRequest<T>(path: string, init: RequestInit): Promise<T> {
+  private async nativeRequest<T>(path: string, init: RequestInit, expectJson = true): Promise<T> {
     if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const method = init.method ?? 'GET';
     const options: HttpOptions = {
@@ -393,6 +564,7 @@ export class KavitaClient {
       }
       this.assertStatus(response.status);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (!expectJson) return undefined as T;
       if (typeof response.data === 'string') {
         if (!response.data.trim()) return undefined as T;
         try {

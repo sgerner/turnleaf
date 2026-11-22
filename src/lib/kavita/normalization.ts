@@ -1,8 +1,10 @@
 import { recordDiagnostic } from '../diagnostics/log';
 import type {
+  KavitaAnnotation,
   KavitaChapter,
   KavitaFile,
   KavitaLibrary,
+  KavitaPersonalTocItem,
   KavitaSeries,
   KavitaSeriesDetail,
 } from './types';
@@ -263,4 +265,167 @@ export function normalizeSeriesDetail(payload: unknown): KavitaSeriesDetail {
   };
   if (incomplete) detail.incomplete = true;
   return detail;
+}
+
+function escapeHtmlText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function stripSimpleHtml(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replaceAll('&nbsp;', ' ')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&amp;', '&')
+    .trim();
+}
+
+function extractProseMirrorText(node: unknown): string | null {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+  const record = node as Row;
+  if (typeof record.text === 'string') return record.text;
+  if (Array.isArray(record.content)) {
+    const parts = record.content
+      .map((child) => extractProseMirrorText(child))
+      .filter((item): item is string => item !== null);
+    if (record.type === 'doc') return parts.join('\n').trim();
+    return parts.join('');
+  }
+  if (Object.keys(record).length === 0) return '';
+  return null;
+}
+
+export function extractAnnotationNote(
+  commentPlainText: unknown,
+  commentHtml: unknown,
+  comment: unknown,
+): string {
+  if (typeof commentPlainText === 'string' && commentPlainText.trim()) {
+    return commentPlainText.trim();
+  }
+  if (typeof commentHtml === 'string' && commentHtml.trim()) {
+    const stripped = stripSimpleHtml(commentHtml);
+    if (stripped) return stripped;
+  }
+  if (typeof comment === 'string' && comment.trim()) {
+    const trimmed = comment.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = extractProseMirrorText(JSON.parse(trimmed));
+        if (parsed !== null) return parsed;
+      } catch {
+        // Fall through to plain-text comment.
+      }
+    }
+    return trimmed;
+  }
+  return '';
+}
+
+export function formatAnnotationCommentFields(note: string): {
+  comment: string;
+  commentHtml: string;
+} {
+  const trimmed = note.trim();
+  if (!trimmed) return { comment: '', commentHtml: '' };
+  const lines = trimmed.split(/\r?\n/);
+  return {
+    comment: JSON.stringify({
+      type: 'doc',
+      content: lines.map((line) =>
+        line
+          ? { type: 'paragraph', content: [{ type: 'text', text: line }] }
+          : { type: 'paragraph' },
+      ),
+    }),
+    commentHtml: lines.map((line) => `<p>${escapeHtmlText(line)}</p>`).join(''),
+  };
+}
+
+export function normalizeAnnotation(
+  payload: unknown,
+  endpoint = '/api/Annotation',
+  path = '$',
+): KavitaAnnotation {
+  const row = object(payload, path);
+  const selectedText = typeof row.selectedText === 'string' ? row.selectedText : '';
+  const xPath = typeof row.xPath === 'string' ? row.xPath : '';
+  const comment = typeof row.comment === 'string' ? row.comment : '';
+  const commentHtml = typeof row.commentHtml === 'string' ? row.commentHtml : '';
+  const commentPlainText = extractAnnotationNote(row.commentPlainText, commentHtml, comment);
+  return {
+    id: id(row.id, `${path}.id`),
+    chapterId: id(row.chapterId, `${path}.chapterId`),
+    volumeId: count(row.volumeId, endpoint, `${path}.volumeId`),
+    seriesId: count(row.seriesId, endpoint, `${path}.seriesId`),
+    libraryId: count(row.libraryId, endpoint, `${path}.libraryId`),
+    ownerUserId: count(row.ownerUserId, endpoint, `${path}.ownerUserId`),
+    xPath,
+    endingXPath: typeof row.endingXPath === 'string' && row.endingXPath ? row.endingXPath : null,
+    selectedText,
+    comment,
+    commentHtml,
+    commentPlainText,
+    chapterTitle:
+      typeof row.chapterTitle === 'string' && row.chapterTitle ? row.chapterTitle : null,
+    context: typeof row.context === 'string' && row.context ? row.context : null,
+    highlightCount: count(
+      row.highlightCount ?? selectedText.length,
+      endpoint,
+      `${path}.highlightCount`,
+    ),
+    containsSpoiler: row.containsSpoiler === true,
+    pageNumber: count(row.pageNumber, endpoint, `${path}.pageNumber`),
+    selectedSlotIndex: count(row.selectedSlotIndex, endpoint, `${path}.selectedSlotIndex`),
+    createdUtc: date(row.createdUtc, endpoint, `${path}.createdUtc`, true),
+    lastModifiedUtc: date(row.lastModifiedUtc, endpoint, `${path}.lastModifiedUtc`, true),
+  };
+}
+
+export function normalizeAnnotations(
+  payload: unknown,
+  endpoint = '/api/Annotation/all',
+): KavitaAnnotation[] {
+  if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
+  return payload.map((value, index) => normalizeAnnotation(value, endpoint, `$[${index}]`));
+}
+
+export function normalizePersonalToc(
+  payload: unknown,
+  endpoint = '/api/Reader/ptoc',
+): KavitaPersonalTocItem[] {
+  if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
+  return payload.flatMap((value, index) => {
+    const p = `$[${index}]`;
+    const row = object(value, p);
+    const title = typeof row.title === 'string' ? row.title.trim() : '';
+    if (!title) {
+      fallback(endpoint, `${p}.title`, row.title, 'nonempty string');
+      return [];
+    }
+    return [
+      {
+        id: id(row.id, `${p}.id`),
+        chapterId: id(row.chapterId, `${p}.chapterId`),
+        pageNumber: count(row.pageNumber, endpoint, `${p}.pageNumber`),
+        title,
+        bookScrollId:
+          typeof row.bookScrollId === 'string' && row.bookScrollId ? row.bookScrollId : null,
+        selectedText:
+          typeof row.selectedText === 'string' && row.selectedText ? row.selectedText : null,
+        chapterTitle:
+          typeof row.chapterTitle === 'string' && row.chapterTitle ? row.chapterTitle : null,
+      },
+    ];
+  });
 }

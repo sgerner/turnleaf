@@ -6,6 +6,14 @@ import {
   type ReaderSearchResult,
 } from './search';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
+import {
+  domRangeToKavitaXPaths,
+  elementToContentXPath,
+  parseKavitaLocator,
+  resolveKavitaAnnotationDomRange,
+} from './kavita-xpath-range';
+import type { StoredAnnotation } from './annotations';
+import type { StoredReaderLocation } from './bookmarks';
 
 export interface ReaderLocation {
   cfi: string;
@@ -26,6 +34,13 @@ export interface ReaderSelection {
   text: string;
 }
 
+export interface ReaderSelectionDetails {
+  xpath: string | null;
+  endingXPath: string | null;
+  spineIndex: number;
+  context: string;
+}
+
 export interface TocItem {
   label: string;
   href: string;
@@ -35,6 +50,10 @@ export interface TocItem {
 interface SpineSection {
   href: string;
   index: number;
+  document?: Document;
+  contents?: unknown;
+  cfiFromRange?: (range: Range) => string;
+  cfiFromElement?: (element: Element) => string;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
 }
@@ -311,6 +330,7 @@ export class ReaderSession {
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
+  private lastSelectionDetails: (ReaderSelection & ReaderSelectionDetails) | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
@@ -366,7 +386,25 @@ export class ReaderSession {
             return;
           }
           try {
-            onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
+            const range = selection.getRangeAt(0);
+            const spineIndex =
+              typeof contents.sectionIndex === 'number'
+                ? contents.sectionIndex
+                : (this.current?.start.index ?? 0);
+            const locators = domRangeToKavitaXPaths(range, spineIndex);
+            const cfi = contents.cfiFromRange(range);
+            this.lastSelectionDetails = {
+              cfi,
+              text,
+              xpath: locators?.xPath ?? null,
+              endingXPath: locators?.endingXPath ?? null,
+              spineIndex,
+              context: locators?.context ?? text,
+            };
+            onSelection({
+              cfi,
+              text,
+            });
           } catch {
             // Selection can change while a section is being replaced.
           }
@@ -486,6 +524,19 @@ export class ReaderSession {
     await this.navigate(() => this.rendition!.prev());
   }
 
+  describeSelection(selection: ReaderSelection): ReaderSelectionDetails | null {
+    const details = this.lastSelectionDetails;
+    if (!details || details.cfi !== selection.cfi || details.text !== selection.text) {
+      return null;
+    }
+    return {
+      xpath: details.xpath,
+      endingXPath: details.endingXPath,
+      spineIndex: details.spineIndex,
+      context: details.context,
+    };
+  }
+
   tableOfContents(): TocItem[] {
     const mapItems = (items: EpubTocItem[]): TocItem[] =>
       items.map((item) => ({
@@ -501,7 +552,7 @@ export class ReaderSession {
     const rendition = this.rendition;
     if (!rendition) return;
 
-    const next = new Set(annotations.map((annotation) => annotation.cfi));
+    const next = new Set(annotations.map((annotation) => annotation.cfi.trim()).filter(Boolean));
     for (const cfi of this.highlightCfis) {
       if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
     }
@@ -575,8 +626,185 @@ export class ReaderSession {
     }
   }
 
-  displayServerLocation(xpath: string): Promise<boolean> {
-    return this.displayXPath(xpath, this.beginLocationOperation(false));
+  displayServerLocation(xpath: string, fallbackSpineIndex?: number): Promise<boolean> {
+    return this.displayXPath(xpath, this.beginLocationOperation(false), fallbackSpineIndex);
+  }
+
+  async displayStudyLocation(target: {
+    cfi?: string | null | undefined;
+    xpath?: string | null | undefined;
+    pageNumber?: number | undefined;
+    href?: string | null | undefined;
+    percentage?: number | undefined;
+  }): Promise<boolean> {
+    if (target.cfi?.trim() && (await this.displayCfi(target.cfi.trim()))) {
+      return true;
+    }
+    if (
+      target.xpath?.trim() &&
+      (await this.displayXPath(
+        target.xpath.trim(),
+        this.beginLocationOperation(true),
+        target.pageNumber,
+      ))
+    ) {
+      return true;
+    }
+    if (target.href?.trim()) {
+      try {
+        await this.display(target.href.trim());
+        return true;
+      } catch {
+        // Fall back to spine index or percentage.
+      }
+    }
+    if (target.pageNumber !== undefined && Number.isInteger(target.pageNumber)) {
+      const section = this.getSpine().sections[target.pageNumber];
+      if (section) {
+        try {
+          await this.display(section.href);
+          return true;
+        } catch {
+          // Fall back to percentage.
+        }
+      }
+    }
+    if (target.percentage !== undefined && Number.isFinite(target.percentage)) {
+      return this.displayPercentage(target.percentage, this.beginLocationOperation(true));
+    }
+    return false;
+  }
+
+  async resolveAnnotationLocations(annotations: StoredAnnotation[]): Promise<StoredAnnotation[]> {
+    const { sections } = this.getSpine();
+    if (!sections.length || !annotations.length) return annotations;
+    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
+    const bySpine = new Map<number, number[]>();
+
+    annotations.forEach((annotation, index) => {
+      if (annotation.cfi.trim()) return;
+      const startTarget = parseKavitaLocator(annotation.xpath, annotation.pageNumber);
+      if (!startTarget) return;
+      const list = bySpine.get(startTarget.spineIndex) ?? [];
+      list.push(index);
+      bySpine.set(startTarget.spineIndex, list);
+    });
+
+    if (bySpine.size === 0) return annotations;
+    const next = [...annotations];
+
+    for (const [spineIndex, indices] of bySpine) {
+      const section = sections[spineIndex];
+      if (!section) continue;
+      const wasLoaded = Boolean(section.contents);
+      try {
+        await section.load(request);
+        const doc = section.document;
+        if (!doc || typeof section.cfiFromRange !== 'function') continue;
+        for (const itemIndex of indices) {
+          const item = next[itemIndex];
+          if (!item) continue;
+          const startTarget = parseKavitaLocator(item.xpath, item.pageNumber);
+          if (!startTarget) continue;
+          const endTarget = parseKavitaLocator(
+            item.endingXPath ?? item.xpath,
+            startTarget.spineIndex,
+          );
+          const range = resolveKavitaAnnotationDomRange(
+            doc,
+            startTarget.contentXPath,
+            endTarget?.contentXPath ?? null,
+            item.excerpt,
+          );
+          if (!range) continue;
+          const cfi = section.cfiFromRange(range);
+          if (cfi) {
+            next[itemIndex] = {
+              ...item,
+              cfi,
+              pageNumber: item.pageNumber ?? spineIndex,
+            };
+          }
+        }
+      } catch {
+        // Leave unresolved remote annotations intact so notes remain readable.
+      } finally {
+        if (!wasLoaded) section.unload();
+      }
+    }
+
+    return next;
+  }
+
+  async resolveBookmarkLocations(
+    bookmarks: StoredReaderLocation[],
+  ): Promise<StoredReaderLocation[]> {
+    const { sections } = this.getSpine();
+    if (!sections.length || !bookmarks.length) return bookmarks;
+    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
+    const bySpine = new Map<number, number[]>();
+
+    bookmarks.forEach((bookmark, index) => {
+      if (bookmark.cfi.trim()) return;
+      const target =
+        parseKavitaLocator(bookmark.xpath, bookmark.pageNumber) ??
+        (bookmark.pageNumber !== undefined &&
+        Number.isInteger(bookmark.pageNumber) &&
+        bookmark.pageNumber >= 0 &&
+        bookmark.pageNumber < sections.length
+          ? { spineIndex: bookmark.pageNumber, contentXPath: '/html/body' }
+          : null);
+      if (!target) return;
+      const list = bySpine.get(target.spineIndex) ?? [];
+      list.push(index);
+      bySpine.set(target.spineIndex, list);
+    });
+
+    if (bySpine.size === 0) return bookmarks;
+    const next = [...bookmarks];
+    const sectionCount = Math.max(1, sections.length);
+
+    for (const [spineIndex, indices] of bySpine) {
+      const section = sections[spineIndex];
+      if (!section) continue;
+      const wasLoaded = Boolean(section.contents);
+      try {
+        await section.load(request);
+        const doc = section.document;
+        if (!doc || typeof section.cfiFromRange !== 'function') continue;
+        for (const itemIndex of indices) {
+          const item = next[itemIndex];
+          if (!item) continue;
+          const target = parseKavitaLocator(item.xpath, item.pageNumber) ?? {
+            spineIndex,
+            contentXPath: '/html/body',
+          };
+          const range = resolveKavitaAnnotationDomRange(
+            doc,
+            target.contentXPath,
+            target.contentXPath,
+            item.excerpt ?? '',
+          );
+          if (!range) continue;
+          const cfi = section.cfiFromRange(range);
+          if (cfi) {
+            next[itemIndex] = {
+              ...item,
+              cfi,
+              href: item.href || section.href,
+              percentage: item.percentage > 0 ? item.percentage : spineIndex / sectionCount,
+              pageNumber: item.pageNumber ?? spineIndex,
+            };
+          }
+        }
+      } catch {
+        // Keep unresolved bookmark metadata intact for fallback navigation.
+      } finally {
+        if (!wasLoaded) section.unload();
+      }
+    }
+
+    return next;
   }
 
   displayServerPercentage(percentage: number): Promise<boolean> {
@@ -719,26 +947,9 @@ export class ReaderSession {
     try {
       if (!this.rendition) return null;
       const range = this.rendition.getRange(cfi);
-      let element =
-        range.startContainer.nodeType === Node.ELEMENT_NODE
-          ? (range.startContainer as Element)
-          : range.startContainer.parentElement;
-      if (!element) return null;
-      const parts: string[] = [];
-      while (element && element.localName !== 'body' && element.localName !== 'html') {
-        const tag = element.localName;
-        let index = 1;
-        for (
-          let sibling = element.previousElementSibling;
-          sibling;
-          sibling = sibling.previousElementSibling
-        ) {
-          if (sibling.localName === tag) index += 1;
-        }
-        parts.push(`${tag}[${index}]`);
-        element = element.parentElement;
-      }
-      return toKavitaXPath(`/${parts.reverse().join('/')}`, spineIndex);
+      const contentXPath = elementToContentXPath(range.startContainer);
+      if (!contentXPath) return null;
+      return toKavitaXPath(contentXPath, spineIndex);
     } catch {
       return null;
     }
@@ -755,10 +966,17 @@ export class ReaderSession {
     return this.isCurrentLocationOperation(generation);
   }
 
-  private async displayXPath(xpath: string, generation: number): Promise<boolean> {
+  private async displayXPath(
+    xpath: string,
+    generation: number,
+    fallbackSpineIndex?: number,
+  ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    const target = parseKavitaXPath(xpath);
+    const target =
+      fallbackSpineIndex !== undefined
+        ? parseKavitaLocator(xpath, fallbackSpineIndex)
+        : parseKavitaXPath(xpath);
     if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;

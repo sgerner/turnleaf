@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { render } from 'svelte/server';
 import { describe, expect, it, vi } from 'vitest';
-import type { ServerConfig } from '../database/database';
+import { createServerId, type ServerConfig } from '../database/database';
 import Onboarding from './Onboarding.svelte';
 
 const require = createRequire(import.meta.url);
@@ -101,5 +101,14 @@ describe('Onboarding autocomplete attributes', () => {
     expect(editAddressDoc.getElementById('kavita-auth-key')?.getAttribute('autocomplete')).toBe(
       'off',
     );
+  });
+
+  it('generates distinct server IDs rather than reusing a static primary ID across setups', () => {
+    const first = createServerId();
+    const second = createServerId();
+    expect(first).toMatch(/^server_[a-z0-9-]+$/i);
+    expect(second).toMatch(/^server_[a-z0-9-]+$/i);
+    expect(first).not.toBe('primary');
+    expect(first).not.toBe(second);
   });
 });

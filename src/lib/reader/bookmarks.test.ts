@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  findMatchingBookmark,
   parseBookmarks,
   recordLocation,
   removeBookmark,
@@ -32,5 +33,34 @@ describe('reader bookmarks and history', () => {
   it('ignores malformed persisted values', () => {
     expect(parseBookmarks('{"bad":true}')).toEqual([]);
     expect(parseBookmarks(JSON.stringify([{ ...location, id: 'x' }]))).toEqual([]);
+  });
+
+  it('matches bookmarks by CFI or remote Kavita XPath before CFI resolution', () => {
+    const bookmarks = [
+      {
+        id: 'remote-bm',
+        cfi: '',
+        xpath: '//body/DocFragment[2]/body/p[4]',
+        href: '',
+        percentage: 0.3,
+        pageNumber: 1,
+        label: 'Remote Spot',
+        savedAt: '2026-01-01T00:00:00.000Z',
+      },
+    ];
+    expect(
+      findMatchingBookmark(bookmarks, {
+        cfi: 'epubcfi(/6/4!/4/8)',
+        href: 'ch2.xhtml',
+        xpath: '//body/DocFragment[2]/body/p[4]',
+      })?.id,
+    ).toBe('remote-bm');
+    expect(
+      findMatchingBookmark(bookmarks, {
+        cfi: 'epubcfi(/6/4!/4/8)',
+        href: 'ch2.xhtml',
+        xpath: '//body/DocFragment[2]/body/p[9]',
+      }),
+    ).toBeNull();
   });
 });

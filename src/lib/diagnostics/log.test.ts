@@ -73,9 +73,18 @@ describe('diagnostic log', () => {
       category: 'request',
       endpoint: 'https://host.invalid/user-prefix/api/Series/123/cover?token=secret',
     });
-    expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain(
-      'endpoint=/api/Series/:id/cover',
-    );
+    recordDiagnostic({
+      category: 'request',
+      endpoint:
+        'https://host.invalid/api/Reader/ptoc?chapterId=42&pageNum=3&title=Private+Bookmark+Title',
+      detail: 'library-annotations-sync-failed',
+    });
+    const exported = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(exported).toContain('endpoint=/api/Series/:id/cover');
+    expect(exported).toContain('endpoint=/api/Reader/ptoc detail=library-annotations-sync-failed');
+    expect(exported).not.toContain('Private');
+    expect(exported).not.toContain('Bookmark');
+    expect(exported).not.toContain('42');
   });
 
   it('keeps a bounded in-memory ring and can clear it', () => {

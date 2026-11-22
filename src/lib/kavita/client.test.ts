@@ -602,3 +602,159 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+it('fetches, creates, updates, and deletes Kavita annotations and PToC bookmarks', async () => {
+  const annotationDto = {
+    id: 55,
+    chapterId: 10,
+    volumeId: 4,
+    seriesId: 2,
+    libraryId: 1,
+    ownerUserId: 9,
+    xPath: '//body/DocFragment[1]/body/p[2]',
+    endingXPath: '//body/DocFragment[1]/body/p[2]',
+    selectedText: 'A memorable quote',
+    comment:
+      '{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"My note"}]}]}',
+    commentHtml: '<p>My note</p>',
+    commentPlainText: 'My note',
+    chapterTitle: 'Ch 1',
+    context: 'A memorable quote in context.',
+    highlightCount: 17,
+    containsSpoiler: false,
+    pageNumber: 0,
+    selectedSlotIndex: 0,
+    createdUtc: '2026-06-01T00:00:00Z',
+    lastModifiedUtc: '2026-06-01T00:00:00Z',
+  };
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [annotationDto],
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [annotationDto],
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => annotationDto,
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({ ...annotationDto, commentPlainText: 'Edited note' }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [
+        {
+          id: 12,
+          chapterId: 10,
+          pageNumber: 0,
+          title: 'Bookmark & More',
+          bookScrollId: '//body/DocFragment[1]/body/p[2]',
+        },
+      ],
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await expect(client.getAnnotations(10)).resolves.toHaveLength(1);
+  expect(fetchMock.mock.calls[0]?.[0]).toBe(
+    'https://books.example.com/api/Annotation/all?chapterId=10',
+  );
+
+  await expect(client.getSeriesAnnotations(2)).resolves.toHaveLength(1);
+  expect(fetchMock.mock.calls[1]?.[0]).toBe(
+    'https://books.example.com/api/Annotation/all-for-series?seriesId=2',
+  );
+
+  const created = await client.createAnnotation({
+    libraryId: 1,
+    seriesId: 2,
+    volumeId: 4,
+    chapterId: 10,
+    xPath: '//body/DocFragment[1]/body/p[2]',
+    selectedText: 'A memorable quote',
+    note: 'My note',
+    pageNumber: 0,
+  });
+  expect(created.id).toBe(55);
+  expect(fetchMock.mock.calls[2]?.[0]).toBe('https://books.example.com/api/Annotation/create');
+  const createPayload = JSON.parse(String((fetchMock.mock.calls[2]?.[1] as RequestInit).body));
+  expect(createPayload).toMatchObject({
+    chapterId: 10,
+    highlightCount: 17,
+    commentHtml: '<p>My note</p>',
+  });
+
+  const updated = await client.updateAnnotation({
+    id: 55,
+    libraryId: 1,
+    seriesId: 2,
+    volumeId: 4,
+    chapterId: 10,
+    xPath: '//body/DocFragment[1]/body/p[2]',
+    selectedText: 'A memorable quote',
+    note: 'Edited note',
+    pageNumber: 0,
+  });
+  expect(updated.commentPlainText).toBe('Edited note');
+  expect(fetchMock.mock.calls[3]?.[0]).toBe('https://books.example.com/api/Annotation/update');
+
+  await client.deleteAnnotation(55);
+  expect(fetchMock.mock.calls[4]?.[0]).toBe(
+    'https://books.example.com/api/Annotation?annotationId=55',
+  );
+  expect((fetchMock.mock.calls[4]?.[1] as RequestInit).method).toBe('DELETE');
+
+  const ptoc = await client.getPersonalToc(10);
+  expect(ptoc[0]?.title).toBe('Bookmark & More');
+  expect(fetchMock.mock.calls[5]?.[0]).toBe(
+    'https://books.example.com/api/Reader/ptoc?chapterId=10',
+  );
+
+  await client.createPersonalToc({
+    libraryId: 1,
+    seriesId: 2,
+    volumeId: 4,
+    chapterId: 10,
+    pageNumber: 0,
+    title: 'Bookmark & More',
+    bookScrollId: '//body/DocFragment[1]/body/p[2]',
+  });
+  expect(fetchMock.mock.calls[6]?.[0]).toBe('https://books.example.com/api/Reader/create-ptoc');
+
+  await client.deletePersonalToc(10, 0, 'Bookmark & More');
+  expect(fetchMock.mock.calls[7]?.[0]).toBe(
+    'https://books.example.com/api/Reader/ptoc?chapterId=10&pageNum=0&title=Bookmark%20%26%20More',
+  );
+  expect((fetchMock.mock.calls[7]?.[1] as RequestInit).method).toBe('DELETE');
+});

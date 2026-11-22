@@ -1,14 +1,18 @@
 <script lang="ts">
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
+  import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { Network } from '@capacitor/network';
   import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import {
+    getBookAnnotationCounts,
+    getBookBookmarkCounts,
     getBooks,
     getReadingState,
     getPreferences,
+    getServerAnnotations,
     getSyncStatus,
     acceptRemoteProgress,
     markDownloaded,
@@ -20,6 +24,7 @@
     saveRemoteProgress,
     saveServer,
     setPreference,
+    type BookAnnotationsGroup,
     type BookRecord,
     type ServerConfig,
     type SyncStatus,
@@ -44,11 +49,12 @@
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
+  import { annotationsMarkdown, libraryAnnotationsMarkdown } from '../reader/annotations';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
-  import { flushProgress } from '../sync/sync';
+  import { flushProgress, syncBookStudyData, syncLibraryAnnotations } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
@@ -95,8 +101,19 @@
     return blob;
   });
   let books = $state<BookRecord[]>([]);
+  let annotationCounts = $state<Map<string, number>>(new Map());
+  let bookmarkCounts = $state<Map<string, number>>(new Map());
+  let totalAnnotationCount = $derived(
+    [...annotationCounts.values()].reduce((sum, count) => sum + count, 0),
+  );
   let displayableBooks = $derived(
-    books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
+    books.filter(
+      (book) =>
+        book.remoteAvailable !== false ||
+        Boolean(book.downloadPath) ||
+        (annotationCounts.get(book.id) ?? 0) > 0 ||
+        (bookmarkCounts.get(book.id) ?? 0) > 0,
+    ),
   );
   let query = $state('');
   let offlineMessage = $state('');
@@ -238,9 +255,26 @@
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
+  let notesVisible = $state(false);
+  let notesDialog = $state<HTMLElement | null>(null);
+  let notesGroups = $state<BookAnnotationsGroup[]>([]);
+  let notesBookFilter = $state('');
+  let syncingNotes = $state(false);
+  let exportingNotes = $state(false);
+  let notesMessage = $state('');
+  let notesExportFallback = $state('');
+  let filteredNotesGroups = $derived(
+    notesBookFilter
+      ? notesGroups.filter((group) => group.book.id === notesBookFilter)
+      : notesGroups,
+  );
+  let filteredNotesCount = $derived(
+    filteredNotesGroups.reduce((sum, group) => sum + group.annotations.length, 0),
+  );
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
+  let notesOpener: HTMLElement | null = null;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
@@ -270,6 +304,7 @@
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
+  const AUTO_NOTES_SERIES_LIMIT = 50;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const GRID_GAP_PX = 16;
   const GRID_ROW_GAP_PX = 32;
@@ -278,6 +313,12 @@
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
+  let notesSyncController: AbortController | null = null;
+  let readerStudyController: AbortController | null = null;
+
+  function isAbortError(cause: unknown): boolean {
+    return (cause as { name?: unknown } | null)?.name === 'AbortError';
+  }
 
   function normalizeLibrarySearch(value: string): string {
     return value
@@ -294,10 +335,18 @@
   }
 
   function openBookLabel(book: BookRecord, includeProgress = true): string {
+    if (!book.downloadPath && book.remoteAvailable === false) {
+      const notes = annotationCounts.get(book.id) ?? 0;
+      return notes > 0
+        ? `View ${notes} saved highlight${notes === 1 ? '' : 's'} for ${book.title}`
+        : `${book.title}, removed from Kavita`;
+    }
     const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
     const progress =
       includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
-    return `Open ${book.title}${downloaded}${progress}`;
+    const notes = annotationCounts.get(book.id) ?? 0;
+    const notesSuffix = notes > 0 ? `, ${notes} saved highlight${notes === 1 ? '' : 's'}` : '';
+    return `Open ${book.title}${downloaded}${progress}${notesSuffix}`;
   }
 
   function parseSortOrder(value: string | null): LibrarySortOrder {
@@ -502,16 +551,20 @@
     window.addEventListener('resize', scheduleVirtualWindow);
     scheduleVirtualWindow();
 
-    const [preferences, savedBooks] = await Promise.all([
-      getPreferences([
-        'syncFurthest',
-        'librarySort',
-        'libraryAuthor',
-        'librarySeries',
-        'libraryView',
-      ]),
-      getBooks(server.id, { includeDescription: false }),
-    ]);
+    const [preferences, savedBooks, savedAnnotationCounts, savedBookmarkCounts] = await Promise.all(
+      [
+        getPreferences([
+          'syncFurthest',
+          'librarySort',
+          'libraryAuthor',
+          'librarySeries',
+          'libraryView',
+        ]),
+        getBooks(server.id, { includeDescription: false }),
+        getBookAnnotationCounts(server.id),
+        getBookBookmarkCounts(server.id),
+      ],
+    );
     if (destroyed) return;
     pendingTheme = theme as SkeletonTheme;
     pendingMode = mode;
@@ -523,6 +576,8 @@
     offline = !(await Network.getStatus().catch(() => null))?.connected;
     if (destroyed) return;
     books = savedBooks;
+    annotationCounts = savedAnnotationCounts;
+    bookmarkCounts = savedBookmarkCounts;
     retainCoversFor(books);
     loading = false;
     void refreshSyncStatus();
@@ -540,6 +595,8 @@
           if (!connected) {
             refreshController?.abort();
             openProgressProbe?.abort();
+            notesSyncController?.abort();
+            readerStudyController?.abort();
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -571,7 +628,8 @@
           else if (reading) {
             if (readerBackHandler?.()) return;
             void closeReader();
-          } else if (settingsVisible) closeSettings();
+          } else if (notesVisible) closeNotesDialog();
+          else if (settingsVisible) closeSettings();
           else if (filtersVisible) filtersVisible = false;
           else void App.exitApp();
         }),
@@ -609,6 +667,23 @@
     }
   }
 
+  async function refreshStudyCounts(): Promise<void> {
+    try {
+      const [nextAnnotations, nextBookmarks] = await Promise.all([
+        getBookAnnotationCounts(server.id),
+        getBookBookmarkCounts(server.id),
+      ]);
+      if (destroyed) return;
+      annotationCounts = nextAnnotations;
+      bookmarkCounts = nextBookmarks;
+      if (notesVisible) {
+        notesGroups = await getServerAnnotations(server.id);
+      }
+    } catch {
+      // Study counts must not block library rendering.
+    }
+  }
+
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
@@ -625,11 +700,13 @@
     try {
       if (!(await networkAvailable())) {
         if (showFeedback)
-          message = 'Offline. Reading progress will retry when Kavita is available.';
+          message =
+            'Offline. Pending progress, bookmarks, and notes will retry when Kavita is available.';
         return;
       }
       await flushProgress(client, server.id);
-      if (showFeedback) message = 'Reading progress synced.';
+      await refreshStudyCounts();
+      if (showFeedback) message = 'Reading progress, bookmarks, and notes synced.';
     } catch (error) {
       if (
         error instanceof AggregateError &&
@@ -637,10 +714,9 @@
           (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
         )
       ) {
-        message =
-          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
+        message = 'Kavita rejected the saved auth key. Update it in Settings to sync with Kavita.';
       } else if (showFeedback) {
-        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+        message = 'Some updates are waiting to sync. Retry when Kavita is available.';
       }
     } finally {
       await refreshSyncStatus();
@@ -656,6 +732,8 @@
     window.removeEventListener('resize', scheduleVirtualWindow);
     openProgressProbe?.abort();
     refreshController?.abort();
+    notesSyncController?.abort();
+    readerStudyController?.abort();
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -709,6 +787,10 @@
       await reconcileBooks(server.id, mapped, { preserveMissing: incomplete, snapshotStartedAt });
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
+      await refreshStudyCounts();
+      if (series.length <= AUTO_NOTES_SERIES_LIMIT) {
+        void refreshLibraryNotes(false);
+      }
       retainCoversFor(books);
       coverReloadRequest += 1;
       if (downloadNeedsRefresh && downloadFailureBook) {
@@ -1020,6 +1102,14 @@
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
     if (!book.downloadPath) {
+      if (book.remoteAvailable === false) {
+        if ((annotationCounts.get(book.id) ?? 0) > 0) {
+          await openNotesDialog(book.id);
+        } else {
+          message = `${book.title} is no longer available on Kavita. Saved study data remains on this device.`;
+        }
+        return;
+      }
       const refreshed = await download(book);
       if (refreshed) await open(refreshed, options);
       return;
@@ -1234,8 +1324,12 @@
   }
 
   async function closeReader(): Promise<void> {
+    readerStudyController?.abort();
+    readerStudyController = null;
     const bookId = reading?.book.id;
     reading = null;
+    void refreshStudyCounts();
+    void refreshSyncStatus();
     await tick();
     if (reading || !libraryMain) return;
 
@@ -1491,6 +1585,162 @@
     void relocated(reading.book, location);
   }
 
+  function handleReaderStudyChanged(): void {
+    void refreshStudyCounts();
+    void refreshSyncStatus();
+    if (syncTimer !== null) window.clearTimeout(syncTimer);
+    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+  }
+
+  async function syncStudyForReader(book: BookRecord, manual: boolean) {
+    if (book.remoteAvailable === false || !(await networkAvailable())) {
+      if (manual) return null;
+      return null;
+    }
+    readerStudyController?.abort();
+    const controller = new AbortController();
+    readerStudyController = controller;
+    try {
+      const synced = await syncBookStudyData(client, book, controller.signal);
+      if (destroyed || controller.signal.aborted) return null;
+      await refreshStudyCounts();
+      await refreshSyncStatus();
+      return synced;
+    } catch (cause) {
+      if (controller.signal.aborted || isAbortError(cause)) return null;
+      throw cause;
+    } finally {
+      if (readerStudyController === controller) readerStudyController = null;
+    }
+  }
+
+  async function openNotesDialog(bookId = ''): Promise<void> {
+    notesOpener = activeElement();
+    notesBookFilter = bookId;
+    notesMessage = '';
+    notesExportFallback = '';
+    notesVisible = true;
+    notesGroups = await getServerAnnotations(server.id);
+    focusModal(() => notesDialog);
+    if (!offline) {
+      void refreshLibraryNotes(false);
+    }
+  }
+
+  function closeNotesDialog(): void {
+    notesVisible = false;
+    notesMessage = '';
+    notesExportFallback = '';
+    const opener = notesOpener;
+    notesOpener = null;
+    void tick().then(() => {
+      if (reading || notesVisible || !libraryMain) return;
+      restoreFocus(opener);
+      if (!libraryMain.contains(document.activeElement)) {
+        libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+      }
+    });
+  }
+
+  async function refreshLibraryNotes(manual: boolean): Promise<void> {
+    if (syncingNotes || destroyed) return;
+    if (!(await networkAvailable())) {
+      if (manual) {
+        notesMessage = 'Offline. Showing highlights and notes saved on this device.';
+      }
+      return;
+    }
+    syncingNotes = true;
+    const controller = new AbortController();
+    notesSyncController = controller;
+    if (manual) notesMessage = '';
+    try {
+      const groups = await syncLibraryAnnotations(client, server.id, books, controller.signal);
+      if (destroyed || controller.signal.aborted) return;
+      notesGroups = groups;
+      await refreshStudyCounts();
+      await refreshSyncStatus();
+      if (manual) {
+        notesMessage = 'Highlights and notes synced with Kavita.';
+      }
+    } catch (cause) {
+      if (controller.signal.aborted || isAbortError(cause)) return;
+      recordDiagnostic({
+        category:
+          cause instanceof KavitaError
+            ? cause.kind === 'invalid-response'
+              ? 'response'
+              : 'request'
+            : 'request',
+        endpoint: '/api/Annotation/all-for-series',
+        ...(cause instanceof KavitaError && cause.status ? { status: cause.status } : {}),
+        detail:
+          cause instanceof KavitaError
+            ? cause.kind.replace('_', '-')
+            : 'library-annotations-sync-failed',
+      });
+      if (manual && !destroyed) {
+        notesMessage =
+          cause instanceof KavitaError
+            ? cause.message
+            : 'Highlights and notes could not sync with Kavita right now.';
+      }
+    } finally {
+      if (notesSyncController === controller) notesSyncController = null;
+      syncingNotes = false;
+    }
+  }
+
+  async function exportLibraryNotes(copy = false): Promise<void> {
+    if (filteredNotesGroups.length === 0 || exportingNotes) return;
+    notesMessage = '';
+    notesExportFallback = '';
+    exportingNotes = true;
+    const singleGroup = filteredNotesGroups.length === 1 ? filteredNotesGroups[0] : null;
+    const markdown = singleGroup
+      ? annotationsMarkdown(singleGroup.book.title, singleGroup.annotations)
+      : libraryAnnotationsMarkdown(
+          filteredNotesGroups.map((group) => ({
+            title: group.book.title,
+            author: group.book.author,
+            annotations: group.annotations,
+          })),
+        );
+    const slugSource = singleGroup ? singleGroup.book.title : server.displayName || 'turnleaf';
+    const slug = slugSource.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'notes';
+    try {
+      if (copy) {
+        await navigator.clipboard.writeText(markdown);
+        notesMessage = 'Markdown copied.';
+      } else if (Capacitor.isNativePlatform()) {
+        const filename = `${slug}-notes-${Date.now()}.md`;
+        await Filesystem.writeFile({
+          path: filename,
+          data: markdown,
+          directory: Directory.Documents,
+          encoding: Encoding.UTF8,
+        });
+        notesMessage = `Saved to Documents as ${filename}.`;
+      } else {
+        const blob = new Blob([markdown], { type: 'text/markdown' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${slug}-notes.md`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        notesMessage = 'Markdown exported.';
+      }
+    } catch {
+      notesExportFallback = markdown;
+      notesMessage = 'Copy the Markdown from the field below.';
+    } finally {
+      exportingNotes = false;
+    }
+  }
+
   function registerReaderBackHandler(handler: () => boolean): () => void {
     readerBackHandler = handler;
     return () => {
@@ -1540,6 +1790,15 @@
     settingsError = '';
     deletingServer = true;
     try {
+      if (syncTimer !== null) {
+        window.clearTimeout(syncTimer);
+        syncTimer = null;
+      }
+      refreshController?.abort();
+      openProgressProbe?.abort();
+      notesSyncController?.abort();
+      readerStudyController?.abort();
+      await syncWork;
       for (const book of books.filter((item) => item.downloadPath)) await remove(book);
       cancelCoverLoading();
       await clearCoverCache().catch(() => {});
@@ -1580,6 +1839,8 @@
       onBack={() => void closeReader()}
       onRelocated={handleRelocated}
       onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
+      onStudyChanged={handleReaderStudyChanged}
+      onSyncStudy={(manual) => syncStudyForReader(reading!.book, manual)}
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
@@ -1597,7 +1858,7 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
-    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
+    inert={Boolean(actionMenuBook || conflict || settingsVisible || notesVisible)}
   >
     <a
       href="#library-results"
@@ -1619,6 +1880,25 @@
         </div>
       </div>
       <div class="card preset-tonal-surface flex shrink-0 gap-1 p-1">
+        <button
+          class="btn btn-sm preset-tonal-surface h-11 gap-1.5 !px-2.5"
+          type="button"
+          onclick={() => void openNotesDialog()}
+          aria-label={totalAnnotationCount > 0
+            ? `Open highlights and notes (${totalAnnotationCount})`
+            : 'Open highlights and notes'}
+          title="Highlights and notes"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M4 4h16v12H5.17L4 17.17V4Zm2 4v2h12V8H6Zm0 4v2h8v-2H6Z" />
+          </svg>
+          <span class="hidden text-xs font-medium sm:inline">Notes</span>
+          {#if totalAnnotationCount > 0}
+            <span class="badge preset-filled-primary-700-300 px-1.5 py-0 text-xs tabular-nums">
+              {totalAnnotationCount}
+            </span>
+          {/if}
+        </button>
         <button
           class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
@@ -1984,8 +2264,8 @@
         <div class="min-w-0">
           <p>
             {syncStatus.failedCount > 0
-              ? `${syncStatus.failedCount} reading progress update${syncStatus.failedCount === 1 ? '' : 's'} failed and remain queued.`
-              : `${syncStatus.pendingCount} reading progress update${syncStatus.pendingCount === 1 ? '' : 's'} waiting to sync.`}
+              ? `${syncStatus.failedCount} sync update${syncStatus.failedCount === 1 ? '' : 's'} failed and remain queued.`
+              : `${syncStatus.pendingCount} sync update${syncStatus.pendingCount === 1 ? '' : 's'} waiting to sync.`}
           </p>
           {#if syncStatus.lastError}
             <p class="mt-1 truncate text-xs opacity-80">Last error: {syncStatus.lastError}</p>
@@ -2120,7 +2400,7 @@
                             </svg>
                           </span>
                         {/if}
-                        {#if book.remoteAvailable === false && book.downloadPath}
+                        {#if book.remoteAvailable === false}
                           <span
                             class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
                           >
@@ -2236,7 +2516,7 @@
                           </svg>
                         </span>
                       {/if}
-                      {#if book.remoteAvailable === false && book.downloadPath}
+                      {#if book.remoteAvailable === false}
                         <span
                           class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
@@ -2372,6 +2652,7 @@
         <button
           class="btn preset-filled-primary-700-300 justify-start"
           type="button"
+          disabled={!actionMenuBook.downloadPath && actionMenuBook.remoteAvailable === false}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
@@ -2402,6 +2683,26 @@
             <span>Download for offline</span>
           </button>
         {/if}
+        <button
+          class="btn preset-tonal-surface justify-start"
+          type="button"
+          onclick={() => {
+            const book = actionMenuBook;
+            closeMenu();
+            if (book) void openNotesDialog(book.id);
+          }}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path fill="currentColor" d="M4 4h16v12H5.17L4 17.17V4Zm2 4v2h12V8H6Zm0 4v2h8v-2H6Z" />
+          </svg>
+          <span>
+            {#if (annotationCounts.get(actionMenuBook.id) ?? 0) > 0}
+              View highlights and notes ({annotationCounts.get(actionMenuBook.id)})
+            {:else}
+              View highlights and notes
+            {/if}
+          </span>
+        </button>
         <button
           class="btn preset-tonal-primary justify-start"
           type="button"
@@ -2776,8 +3077,9 @@
           Storage and maintenance
         </h3>
         <p class="mt-1 text-sm text-surface-700-300">
-          Downloads and reading progress stay on this device. Clearing covers is safe; removing
-          downloads deletes local EPUB files but does not change Kavita.
+          Downloaded EPUB files and recent page history stay on this device, while reading progress,
+          bookmarks, highlights, and notes sync with Kavita when online. Clearing covers or removing
+          downloads deletes local files without changing Kavita.
         </p>
         <div class="mt-3 grid gap-2">
           <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}
@@ -2859,8 +3161,9 @@
         <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
           <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
           <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
+            This removes the server connection, downloaded books, cached covers, reading progress,
+            bookmarks, highlights, notes, and recent history for this server from this device.
+            Synced items already on Kavita are not deleted.
           </p>
           <div class="mt-4 flex gap-2">
             <button
@@ -2880,6 +3183,164 @@
               Cancel
             </button>
           </div>
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if notesVisible}
+  <div
+    class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
+    role="presentation"
+    transition:fade
+    onclick={(event) => event.target === event.currentTarget && closeNotesDialog()}
+  >
+    <div
+      bind:this={notesDialog}
+      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-2xl overflow-auto p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="library-notes-title"
+      tabindex="-1"
+      onkeydown={(event) => trapModalKeydown(event, notesDialog!, closeNotesDialog)}
+      transition:fly={{ y: 16, duration: 150 }}
+    >
+      <div
+        class="sticky top-0 z-10 -mx-6 -mt-6 mb-4 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
+      >
+        <h2 id="library-notes-title" class="font-serif text-3xl">Highlights and notes</h2>
+        <button
+          class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
+          type="button"
+          onclick={closeNotesDialog}
+          aria-label="Close highlights and notes"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <p class="text-sm text-surface-700-300">
+        Browse and export saved highlights and notes across your library without downloading or
+        opening books. Changes sync with Kavita when online.
+      </p>
+
+      <div class="mt-4 flex flex-wrap items-end gap-2">
+        <label class="label min-w-48 flex-1">
+          <span class="label-text">Book</span>
+          <select class="select preset-tonal-surface" bind:value={notesBookFilter}>
+            <option value="">All annotated books ({totalAnnotationCount})</option>
+            {#each notesGroups as group (group.book.id)}
+              <option value={group.book.id}>
+                {group.book.title} ({group.annotations.length})
+              </option>
+            {/each}
+            {#if notesBookFilter && !notesGroups.some((group) => group.book.id === notesBookFilter)}
+              {@const selectedBook = books.find((item) => item.id === notesBookFilter)}
+              {#if selectedBook}
+                <option value={selectedBook.id}>{selectedBook.title} (0)</option>
+              {/if}
+            {/if}
+          </select>
+        </label>
+        <button
+          class="btn btn-sm preset-tonal-primary h-11"
+          type="button"
+          onclick={() => void refreshLibraryNotes(true)}
+          disabled={syncingNotes || offline}
+        >
+          {syncingNotes ? 'Syncing…' : 'Sync with Kavita'}
+        </button>
+        <button
+          class="btn btn-sm preset-tonal-surface h-11"
+          type="button"
+          onclick={() => void exportLibraryNotes(false)}
+          disabled={filteredNotesCount === 0 || exportingNotes}
+        >
+          Export Markdown
+        </button>
+        <button
+          class="btn btn-sm preset-tonal-surface h-11"
+          type="button"
+          onclick={() => void exportLibraryNotes(true)}
+          disabled={filteredNotesCount === 0 || exportingNotes}
+        >
+          Copy Markdown
+        </button>
+      </div>
+
+      {#if notesMessage}
+        <p class="mt-3 text-sm text-surface-700-300" role="status">{notesMessage}</p>
+      {/if}
+      {#if notesExportFallback}
+        <label class="label mt-3">
+          <span class="label-text">Exported Markdown</span>
+          <textarea class="textarea min-h-28" readonly value={notesExportFallback}></textarea>
+        </label>
+      {/if}
+
+      {#if filteredNotesGroups.length === 0}
+        <p class="mt-6 text-sm text-surface-700-300">
+          {notesBookFilter
+            ? 'No saved highlights or notes for this book yet.'
+            : 'No saved highlights or notes yet. Select text in a book or sync with Kavita to view your notes here.'}
+        </p>
+      {:else}
+        <div class="mt-5 grid gap-5">
+          {#each filteredNotesGroups as group (group.book.id)}
+            <section
+              class="rounded-xl border border-surface-300/35 p-4"
+              aria-labelledby={`notes-book-${group.book.id}`}
+            >
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <h3 id={`notes-book-${group.book.id}`} class="font-serif text-xl">
+                    {group.book.title}
+                  </h3>
+                  <p class="text-sm text-surface-700-300">
+                    {group.book.author ?? 'Unknown author'}
+                    {#if group.book.remoteAvailable === false}
+                      · Removed from Kavita
+                    {/if}
+                  </p>
+                </div>
+                {#if group.book.downloadPath || group.book.remoteAvailable !== false}
+                  <button
+                    class="btn btn-sm preset-tonal-surface h-10"
+                    type="button"
+                    onclick={() => {
+                      const target = books.find((item) => item.id === group.book.id) ?? group.book;
+                      closeNotesDialog();
+                      void open(target);
+                    }}
+                  >
+                    {group.book.downloadPath ? 'Open book' : 'Download and open'}
+                  </button>
+                {/if}
+              </div>
+
+              <div class="mt-3 grid gap-2.5">
+                {#each group.annotations as annotation (annotation.id)}
+                  <article class="rounded-lg preset-tonal-surface p-3">
+                    {#if annotation.chapterTitle}
+                      <p class="mb-1 text-xs uppercase tracking-wide text-surface-700-300">
+                        {annotation.chapterTitle}
+                      </p>
+                    {/if}
+                    <blockquote class="text-sm italic">“{annotation.excerpt}”</blockquote>
+                    {#if annotation.note}
+                      <p class="mt-2 whitespace-pre-wrap text-sm">{annotation.note}</p>
+                    {/if}
+                  </article>
+                {/each}
+              </div>
+            </section>
+          {/each}
         </div>
       {/if}
     </div>

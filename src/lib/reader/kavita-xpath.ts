@@ -44,10 +44,15 @@ export function toKavitaXPath(contentXPath: string, spineIndex: number): string 
   const content = contentXPath
     .replace(/^\/?html(?:\[1])?\/body(?:\[1])?/i, '')
     .replace(/^\/?body(?:\[1])?/i, '');
+  if (!content) return `//body/DocFragment[${spineIndex + 1}]/body`;
   return `//body/DocFragment[${spineIndex + 1}]/body${content.startsWith('/') ? content : `/${content}`}`;
 }
 
 export function resolveContentXPath(document: Document, xpath: string): Element | null {
+  const idMatch = xpath.trim().match(/^id\("([^"]+)"\)$/i);
+  if (idMatch?.[1]) {
+    return document.getElementById(idMatch[1]);
+  }
   const parts = xpath
     .replace(/^\/html(?:\[1])?\/body(?:\[1])?/i, '')
     .split('/')

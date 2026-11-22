@@ -105,4 +105,92 @@ export const migrations = [
       );
     `,
   },
+  {
+    version: 8,
+    statements: `
+      CREATE TABLE IF NOT EXISTS annotations (
+        id TEXT PRIMARY KEY NOT NULL,
+        book_id TEXT NOT NULL,
+        remote_id INTEGER,
+        cfi TEXT NOT NULL DEFAULT '',
+        xpath TEXT NOT NULL DEFAULT '',
+        ending_xpath TEXT,
+        page_number INTEGER NOT NULL DEFAULT 0,
+        slot_index INTEGER NOT NULL DEFAULT 0,
+        contains_spoiler INTEGER NOT NULL DEFAULT 0,
+        context TEXT,
+        chapter_title TEXT,
+        excerpt TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        remote_updated_at TEXT,
+        sync_state TEXT NOT NULL DEFAULT 'synced',
+        sync_revision INTEGER NOT NULL DEFAULT 0,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        last_error TEXT,
+        FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS annotations_book_created_idx
+        ON annotations(book_id, created_at, id);
+      CREATE INDEX IF NOT EXISTS annotations_sync_state_idx
+        ON annotations(sync_state, book_id);
+
+      CREATE TABLE IF NOT EXISTS bookmarks (
+        id TEXT PRIMARY KEY NOT NULL,
+        book_id TEXT NOT NULL,
+        remote_id INTEGER,
+        cfi TEXT NOT NULL DEFAULT '',
+        xpath TEXT,
+        href TEXT NOT NULL DEFAULT '',
+        percentage REAL NOT NULL DEFAULT 0,
+        page_number INTEGER NOT NULL DEFAULT 0,
+        label TEXT NOT NULL,
+        excerpt TEXT NOT NULL DEFAULT '',
+        remote_title TEXT,
+        remote_page_number INTEGER,
+        saved_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        sync_state TEXT NOT NULL DEFAULT 'synced',
+        sync_revision INTEGER NOT NULL DEFAULT 0,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        last_error TEXT,
+        FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS bookmarks_book_saved_idx
+        ON bookmarks(book_id, saved_at DESC, id);
+      CREATE INDEX IF NOT EXISTS bookmarks_sync_state_idx
+        ON bookmarks(sync_state, book_id);
+
+      CREATE TABLE IF NOT EXISTS reading_history (
+        book_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        cfi TEXT NOT NULL,
+        href TEXT NOT NULL,
+        percentage REAL NOT NULL,
+        label TEXT NOT NULL,
+        saved_at TEXT NOT NULL,
+        PRIMARY KEY(book_id, id),
+        FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS reading_history_book_saved_idx
+        ON reading_history(book_id, saved_at DESC);
+
+      CREATE TABLE IF NOT EXISTS preferences (
+        key TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      DELETE FROM preferences
+        WHERE key LIKE 'readerAnnotations:%'
+           OR key LIKE 'readerBookmarks:%'
+           OR key LIKE 'readerHistory:%';
+    `,
+  },
 ] as const;

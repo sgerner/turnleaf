@@ -1,8 +1,21 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { saveLocalProgress } from '../database/database';
-import { flushProgress } from './sync';
+import {
+  deleteBookAnnotation,
+  deleteBookBookmark,
+  getBookAnnotations,
+  getBookBookmarks,
+  getSyncStatus,
+  reconcileBooks,
+  renameBookBookmark,
+  saveBookAnnotation,
+  saveBookBookmark,
+  saveLocalProgress,
+  updateBookAnnotationNote,
+} from '../database/database';
+import { KavitaError } from '../kavita/client';
+import { flushProgress, syncBookStudyData, syncLibraryAnnotations } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
 
@@ -226,4 +239,167 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('flushes offline annotation and PToC bookmark creates, edits, and deletes idempotently', async () => {
+  await reconcileBooks('server', [book]);
+  const createdAnnotation = await saveBookAnnotation(book.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Offline highlight',
+    note: 'Offline note',
+  });
+  const createdBookmark = await saveBookBookmark(book.id, {
+    cfi: 'epubcfi(/6/2!/4/2)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    href: 'ch1.xhtml',
+    percentage: 0.1,
+    pageNumber: 0,
+    label: 'Offline bookmark',
+  });
+
+  const remoteAnnotation = {
+    id: 99,
+    chapterId: 1,
+    volumeId: 1,
+    seriesId: 1,
+    libraryId: 1,
+    ownerUserId: 1,
+    xPath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    selectedText: 'Offline highlight',
+    comment: '',
+    commentHtml: '<p>Offline note</p>',
+    commentPlainText: 'Offline note',
+    chapterTitle: null,
+    context: 'Offline highlight',
+    highlightCount: 17,
+    containsSpoiler: false,
+    pageNumber: 0,
+    selectedSlotIndex: 0,
+    createdUtc: '2026-09-07T00:00:00Z',
+    lastModifiedUtc: '2026-09-07T00:00:00Z',
+  };
+
+  const client = {
+    saveProgress: vi.fn().mockResolvedValue(undefined),
+    createAnnotation: vi.fn().mockResolvedValue(remoteAnnotation),
+    updateAnnotation: vi.fn().mockImplementation(async (input: { note: string }) => ({
+      ...remoteAnnotation,
+      commentPlainText: input.note,
+    })),
+    deleteAnnotation: vi.fn().mockResolvedValue(undefined),
+    getAnnotations: vi.fn().mockResolvedValue([]),
+    createPersonalToc: vi
+      .fn()
+      // First call simulates duplicate 400 retry recovery from an earlier interrupted response
+      .mockRejectedValueOnce(new KavitaError('Duplicate PToC', 'server', 400))
+      .mockResolvedValue(undefined),
+    deletePersonalToc: vi.fn().mockResolvedValue(undefined),
+    getPersonalToc: vi.fn().mockResolvedValue([
+      {
+        id: 77,
+        chapterId: 1,
+        pageNumber: 0,
+        title: 'Offline bookmark',
+        bookScrollId: '//body/DocFragment[1]/body/p[1]',
+        selectedText: null,
+        chapterTitle: null,
+      },
+    ]),
+  };
+
+  await flushProgress(client as never, 'server');
+  expect(client.createAnnotation).toHaveBeenCalledOnce();
+  expect(client.createPersonalToc).toHaveBeenCalledOnce();
+  await expect(getSyncStatus('server')).resolves.toMatchObject({ pendingCount: 0, failedCount: 0 });
+
+  // Edit note + rename bookmark offline, then flush
+  await updateBookAnnotationNote(book.id, createdAnnotation!.id, 'Updated note');
+  await renameBookBookmark(book.id, createdBookmark!.id, 'Renamed bookmark');
+  await flushProgress(client as never, 'server');
+
+  expect(client.updateAnnotation).toHaveBeenCalledWith(
+    expect.objectContaining({ id: 99, note: 'Updated note' }),
+  );
+  expect(client.deletePersonalToc).toHaveBeenCalledWith(1, 0, 'Offline bookmark');
+  expect(client.createPersonalToc).toHaveBeenLastCalledWith(
+    expect.objectContaining({ title: 'Renamed bookmark', pageNumber: 0 }),
+  );
+
+  // Delete both offline, then flush
+  await deleteBookAnnotation(book.id, createdAnnotation!.id);
+  await deleteBookBookmark(book.id, createdBookmark!.id);
+  await flushProgress(client as never, 'server');
+
+  expect(client.deleteAnnotation).toHaveBeenCalledWith(99);
+  expect(client.deletePersonalToc).toHaveBeenLastCalledWith(1, 0, 'Renamed bookmark');
+  await expect(getBookAnnotations(book.id)).resolves.toEqual([]);
+  await expect(getBookBookmarks(book.id)).resolves.toEqual([]);
+});
+
+it('syncs open-book and library-wide study data while preserving unsynced local edits', async () => {
+  await reconcileBooks('server', [book]);
+  await saveBookAnnotation(book.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Pending local quote',
+    note: 'Pending note',
+  });
+
+  const remoteFromKavita = {
+    id: 201,
+    chapterId: 1,
+    volumeId: 1,
+    seriesId: 1,
+    libraryId: 1,
+    ownerUserId: 1,
+    xPath: '//body/DocFragment[2]/body/p[3]',
+    endingXPath: '//body/DocFragment[2]/body/p[3]',
+    selectedText: 'Remote Kavita highlight',
+    comment: '',
+    commentHtml: '<p>From Kavita web</p>',
+    commentPlainText: 'From Kavita web',
+    chapterTitle: 'Chapter 2',
+    context: 'Remote Kavita highlight',
+    highlightCount: 23,
+    containsSpoiler: false,
+    pageNumber: 1,
+    selectedSlotIndex: 0,
+    createdUtc: '2026-09-08T00:00:00Z',
+    lastModifiedUtc: '2026-09-08T00:00:00Z',
+  };
+
+  const client = {
+    saveProgress: vi.fn().mockResolvedValue(undefined),
+    // Simulate temporary create failure so local item stays pending_create during reconciliation
+    createAnnotation: vi.fn().mockRejectedValueOnce(new Error('offline during create')),
+    getAnnotations: vi.fn().mockResolvedValue([remoteFromKavita]),
+    getPersonalToc: vi.fn().mockResolvedValue([
+      {
+        id: 301,
+        chapterId: 1,
+        pageNumber: 1,
+        title: 'Remote PToC',
+        bookScrollId: '//body/DocFragment[2]/body/p[3]',
+        selectedText: null,
+        chapterTitle: 'Chapter 2',
+      },
+    ]),
+    getSeriesAnnotations: vi.fn().mockResolvedValue([remoteFromKavita]),
+  };
+
+  const synced = await syncBookStudyData(client as never, book);
+  expect(synced.annotations.map((item) => item.excerpt).sort()).toEqual([
+    'Pending local quote',
+    'Remote Kavita highlight',
+  ]);
+  expect(synced.bookmarks.map((item) => item.label)).toEqual(['Remote PToC']);
+
+  const groups = await syncLibraryAnnotations(client as never, 'server', [book]);
+  expect(groups).toHaveLength(1);
+  expect(groups[0]?.annotations).toHaveLength(2);
 });

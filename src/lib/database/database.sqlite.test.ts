@@ -198,8 +198,30 @@ describe('native metadata transactions against SQLite', () => {
       downloadStatus: 'none',
       fileSize: null,
     };
+    const withAnnotation = {
+      ...baseBook,
+      id: 'server:1:13',
+      chapterId: 13,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    const withBookmark = {
+      ...baseBook,
+      id: 'server:1:14',
+      chapterId: 14,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
     const cfi = 'epubcfi(/6/4!/4/2/1:12)';
-    await replaceBooksInTransaction(adapter, 'server', [retained, removable, withSyncedProgress]);
+    await replaceBooksInTransaction(adapter, 'server', [
+      retained,
+      removable,
+      withSyncedProgress,
+      withAnnotation,
+      withBookmark,
+    ]);
     db.prepare(
       `INSERT INTO reading_state
       (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
@@ -214,11 +236,21 @@ describe('native metadata transactions against SQLite', () => {
       '2026-09-07T00:00:00.000Z',
       '2026-09-07T00:00:00.000Z',
     );
+    db.prepare(
+      `INSERT INTO annotations (id, book_id, cfi, xpath, excerpt, note, created_at, updated_at)
+       VALUES ('ann-1', ?, 'epubcfi(/6/2!/4/2)', '//body/DocFragment[1]/body/p[1]', 'Saved quote', 'Saved note', '2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z')`,
+    ).run(withAnnotation.id);
+    db.prepare(
+      `INSERT INTO bookmarks (id, book_id, cfi, href, percentage, label, saved_at, updated_at)
+       VALUES ('bm-1', ?, 'epubcfi(/6/2!/4/2)', 'ch1.xhtml', 0.1, 'Saved bookmark', '2026-09-07T00:00:00.000Z', '2026-09-07T00:00:00.000Z')`,
+    ).run(withBookmark.id);
 
     await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z');
 
     expect(readBook(db, retained.id)).toMatchObject({ remote_available: 0 });
     expect(readBook(db, withSyncedProgress.id)).toMatchObject({ remote_available: 0 });
+    expect(readBook(db, withAnnotation.id)).toMatchObject({ remote_available: 0 });
+    expect(readBook(db, withBookmark.id)).toMatchObject({ remote_available: 0 });
     expect(
       db.prepare('SELECT cfi FROM reading_state WHERE book_id=?').get(withSyncedProgress.id),
     ).toEqual({

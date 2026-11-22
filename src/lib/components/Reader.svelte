@@ -6,7 +6,22 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
-  import { getPreferences, setPreferences } from '../database/database';
+  import {
+    deleteBookAnnotation,
+    deleteBookBookmark,
+    getBookAnnotations,
+    getBookBookmarks,
+    getBookHistory,
+    getPreferences,
+    recordBookHistory,
+    renameBookBookmark,
+    saveBookAnnotation,
+    saveBookBookmark,
+    saveResolvedBookAnnotations,
+    saveResolvedBookBookmarks,
+    setPreferences,
+    updateBookAnnotationNote,
+  } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -26,21 +41,10 @@
     type TocItem,
   } from '../reader/session';
   import type { ReaderSearchResult } from '../reader/search';
+  import { annotationsMarkdown, type StoredAnnotation } from '../reader/annotations';
   import {
-    addAnnotation,
-    annotationsMarkdown,
-    parseAnnotations,
-    removeAnnotation,
-    updateAnnotation,
-    type StoredAnnotation,
-  } from '../reader/annotations';
-  import {
-    parseBookmarks,
-    parseLocationHistory,
+    findMatchingBookmark,
     recordLocation,
-    removeBookmark,
-    renameBookmark,
-    toggleBookmark,
     type StoredReaderLocation,
   } from '../reader/bookmarks';
   import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
@@ -62,6 +66,8 @@
     onBack,
     onRelocated,
     onSyncLatest,
+    onStudyChanged,
+    onSyncStudy,
     onRetryDownload,
     registerBackHandler,
   }: {
@@ -75,6 +81,10 @@
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
+    onStudyChanged?: () => void;
+    onSyncStudy?: (
+      manual: boolean,
+    ) => Promise<{ annotations: StoredAnnotation[]; bookmarks: StoredReaderLocation[] } | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
@@ -154,18 +164,18 @@
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
-    const preferences = await getPreferences([
-      'appearance',
-      `readerBookmarks:${bookId}`,
-      `readerHistory:${bookId}`,
-      `readerAnnotations:${bookId}`,
+    const [preferences, savedBookmarks, savedHistory, savedAnnotations] = await Promise.all([
+      getPreferences(['appearance']),
+      getBookBookmarks(bookId),
+      getBookHistory(bookId),
+      getBookAnnotations(bookId),
     ]);
     if (destroyed) return;
     const saved = preferences.get('appearance');
     appearance = saved ? parseAppearance(saved) : { ...defaultAppearance, mode: defaultMode };
-    bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
-    locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
-    annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
+    bookmarks = savedBookmarks;
+    locationHistory = savedHistory;
+    annotations = savedAnnotations;
     await enableNativeReaderChrome();
     try {
       await openReaderSession();
@@ -204,7 +214,9 @@
           localNavigationDuringSession = true;
           onRelocated(next);
           locationHistory = recordLocation(locationHistory, next);
-          queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+          void recordBookHistory(bookId, next).then((persisted) => {
+            if (!destroyed && persisted.length > 0) locationHistory = persisted;
+          });
           if (origin === 'link') showControls();
         }
       },
@@ -230,6 +242,80 @@
       toc = nextSession.tableOfContents();
       nextSession.updateHighlights(annotations);
       updateDocumentTitle();
+      void resolveAndApplyStudyLocations(nextSession, annotations, bookmarks);
+      void syncStudyWithKavita(nextSession, false);
+    }
+  }
+
+  async function resolveAndApplyStudyLocations(
+    reader: ReaderSession,
+    targetAnnotations: StoredAnnotation[],
+    targetBookmarks: StoredReaderLocation[],
+  ): Promise<void> {
+    try {
+      const unresolvedAnnotationIds = new Set(
+        targetAnnotations.filter((item) => !item.cfi.trim()).map((item) => item.id),
+      );
+      const unresolvedBookmarkIds = new Set(
+        targetBookmarks.filter((item) => !item.cfi.trim()).map((item) => item.id),
+      );
+      const [resolvedAnnotations, resolvedBookmarks] = await Promise.all([
+        unresolvedAnnotationIds.size > 0
+          ? reader.resolveAnnotationLocations(targetAnnotations)
+          : Promise.resolve(targetAnnotations),
+        unresolvedBookmarkIds.size > 0
+          ? reader.resolveBookmarkLocations(targetBookmarks)
+          : Promise.resolve(targetBookmarks),
+      ]);
+      if (destroyed || session !== reader) return;
+      const newlyResolvedAnnotations = resolvedAnnotations.filter(
+        (item) => unresolvedAnnotationIds.has(item.id) && Boolean(item.cfi.trim()),
+      );
+      if (newlyResolvedAnnotations.length > 0) {
+        const cfiById = new Map(newlyResolvedAnnotations.map((item) => [item.id, item.cfi]));
+        annotations = annotations.map((item) => {
+          const cfi = cfiById.get(item.id);
+          return cfi ? { ...item, cfi } : item;
+        });
+        await saveResolvedBookAnnotations(bookId, newlyResolvedAnnotations);
+      }
+      const newlyResolvedBookmarks = resolvedBookmarks.filter(
+        (item) => unresolvedBookmarkIds.has(item.id) && Boolean(item.cfi.trim()),
+      );
+      if (newlyResolvedBookmarks.length > 0) {
+        const resolvedById = new Map(newlyResolvedBookmarks.map((item) => [item.id, item]));
+        bookmarks = bookmarks.map((item) => {
+          const resolved = resolvedById.get(item.id);
+          return resolved
+            ? {
+                ...item,
+                cfi: resolved.cfi,
+                href: resolved.href,
+                percentage: resolved.percentage,
+              }
+            : item;
+        });
+        await saveResolvedBookBookmarks(bookId, newlyResolvedBookmarks);
+      }
+      if (!destroyed && session === reader) {
+        reader.updateHighlights(annotations);
+      }
+    } catch {
+      // Unresolvable locators remain accessible by XPath or chapter fallback.
+    }
+  }
+
+  async function syncStudyWithKavita(reader: ReaderSession, manual: boolean): Promise<void> {
+    if (!onSyncStudy) return;
+    try {
+      const synced = await onSyncStudy(manual);
+      if (!synced || destroyed || session !== reader) return;
+      annotations = synced.annotations;
+      bookmarks = synced.bookmarks;
+      reader.updateHighlights(annotations);
+      await resolveAndApplyStudyLocations(reader, annotations, bookmarks);
+    } catch {
+      // Study sync errors are surfaced via sync status or manual sync feedback.
     }
   }
 
@@ -589,16 +675,13 @@
       cfi: next.cfi,
       href: next.href,
       percentage: next.percentage,
+      xpath: next.xpath,
+      pageNumber: next.spineIndex,
     };
   }
 
   const pendingPreferences = new SvelteMap<string, string>();
   let preferenceWrite = Promise.resolve();
-
-  function queuePreference(key: string, value: string): void {
-    pendingPreferences.set(key, value);
-    flushPreferences();
-  }
 
   function flushPreferences(): void {
     preferenceWrite = preferenceWrite.then(async () => {
@@ -625,14 +708,31 @@
 
   function currentBookmark(): StoredReaderLocation | null {
     if (!location) return null;
-    const id = `${location.cfi}|${location.href}`;
-    return bookmarks.find((bookmark) => bookmark.id === id) ?? null;
+    return findMatchingBookmark(bookmarks, readerLocation(location));
   }
 
-  function toggleCurrentBookmark(): void {
+  async function toggleCurrentBookmark(): Promise<void> {
     if (!location) return;
-    bookmarks = toggleBookmark(bookmarks, readerLocation(location));
-    queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    const current = location;
+    const existing = currentBookmark();
+    if (existing) {
+      await deleteBookBookmark(bookId, existing.id);
+      if (destroyed) return;
+      bookmarks = await getBookBookmarks(bookId);
+    } else {
+      const label = `${currentSectionLabel()} · ${Math.round(current.percentage * 100)}%`;
+      await saveBookBookmark(bookId, {
+        cfi: current.cfi,
+        href: current.href,
+        percentage: current.percentage,
+        label,
+        xpath: current.xpath,
+        pageNumber: current.spineIndex,
+      });
+      if (destroyed) return;
+      bookmarks = await getBookBookmarks(bookId);
+    }
+    onStudyChanged?.();
     showControls();
   }
 
@@ -642,36 +742,65 @@
     focusReaderTarget(bookmarksPanel, 'bookmark-editor', bookmark.id);
   }
 
-  function saveBookmarkName(bookmark: StoredReaderLocation): void {
-    bookmarks = renameBookmark(bookmarks, bookmark.id, bookmarkDraft);
+  async function saveBookmarkName(bookmark: StoredReaderLocation): Promise<void> {
+    const draft = bookmarkDraft;
     editingBookmarkId = null;
-    queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    const updated = await renameBookBookmark(bookId, bookmark.id, draft);
+    if (!destroyed && updated) {
+      bookmarks = await getBookBookmarks(bookId);
+      onStudyChanged?.();
+    }
     focusReaderTarget(bookmarksPanel, 'bookmark-rename', bookmark.id);
   }
 
-  function deleteBookmark(bookmark: StoredReaderLocation): void {
+  async function deleteBookmark(bookmark: StoredReaderLocation): Promise<void> {
     const index = bookmarks.findIndex((entry) => entry.id === bookmark.id);
-    bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
-    queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    await deleteBookBookmark(bookId, bookmark.id);
+    if (destroyed) return;
+    bookmarks = await getBookBookmarks(bookId);
+    onStudyChanged?.();
     const next = bookmarks[Math.min(Math.max(index, 0), bookmarks.length - 1)];
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(): void {
-    if (!selectedText) return;
-    annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
-    session?.updateHighlights(annotations);
+  async function saveAnnotation(): Promise<void> {
+    const selection = selectedText;
+    if (!selection) return;
+    const draft = annotationDraft;
     annotationDraft = '';
     selectedText = null;
-    queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    const details = session?.describeSelection(selection) ?? null;
+    const spineIndex = details?.spineIndex ?? location?.spineIndex ?? 0;
+    const chapterTitle = location
+      ? sectionLabelForHref(location.href, spineIndex)
+      : `Section ${spineIndex + 1}`;
+    const created = await saveBookAnnotation(bookId, {
+      cfi: selection.cfi,
+      excerpt: selection.text,
+      note: draft,
+      xpath: details?.xpath,
+      endingXPath: details?.endingXPath,
+      pageNumber: spineIndex,
+      context: details?.context,
+      chapterTitle,
+    });
+    if (!destroyed && created) {
+      annotations = await getBookAnnotations(bookId);
+      session?.updateHighlights(annotations);
+      onStudyChanged?.();
+    }
   }
 
-  function editAnnotation(annotation: StoredAnnotation): void {
-    annotations = updateAnnotation(annotations, annotation.id, annotationDraft);
+  async function editAnnotation(annotation: StoredAnnotation): Promise<void> {
+    const draft = annotationDraft;
     editingAnnotationId = null;
     annotationDraft = '';
-    queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    const updated = await updateBookAnnotationNote(bookId, annotation.id, draft);
+    if (!destroyed && updated) {
+      annotations = await getBookAnnotations(bookId);
+      onStudyChanged?.();
+    }
     focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
@@ -681,11 +810,13 @@
     focusReaderTarget(annotationsPanel, 'annotation-editor', annotation.id);
   }
 
-  function deleteAnnotation(annotation: StoredAnnotation): void {
+  async function deleteAnnotation(annotation: StoredAnnotation): Promise<void> {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
-    annotations = removeAnnotation(annotations, annotation.id);
+    await deleteBookAnnotation(bookId, annotation.id);
+    if (destroyed) return;
+    annotations = await getBookAnnotations(bookId);
     session?.updateHighlights(annotations);
-    queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    onStudyChanged?.();
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
   }
@@ -786,12 +917,40 @@
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
     if (!session) return;
     try {
-      const restored = await session.displayCfi(saved.cfi);
-      if (!restored && saved.href) await session.display(saved.href);
+      const restored = await session.displayStudyLocation({
+        cfi: saved.cfi,
+        xpath: saved.xpath,
+        pageNumber: saved.pageNumber,
+        href: saved.href,
+        percentage: saved.percentage,
+      });
+      if (!restored) {
+        error = 'This saved location is no longer available in the current EPUB.';
+        return;
+      }
       closeBookmarks();
       showControls();
     } catch {
       error = 'This saved location is no longer available in the current EPUB.';
+    }
+  }
+
+  async function jumpToAnnotation(annotation: StoredAnnotation): Promise<void> {
+    if (!session) return;
+    try {
+      const restored = await session.displayStudyLocation({
+        cfi: annotation.cfi,
+        xpath: annotation.xpath,
+        pageNumber: annotation.pageNumber,
+      });
+      if (!restored) {
+        error = 'This highlight location is no longer available in the current EPUB.';
+        return;
+      }
+      closeAnnotations();
+      showControls();
+    } catch {
+      error = 'This highlight location is no longer available in the current EPUB.';
     }
   }
 
@@ -900,7 +1059,10 @@
     syncingLatest = true;
     readerSyncMessage = '';
     try {
-      const progress = await onSyncLatest(showFeedback);
+      const [progress] = await Promise.all([
+        onSyncLatest(showFeedback),
+        syncStudyWithKavita(reader, showFeedback),
+      ]);
       if (destroyed || session !== reader || (!showFeedback && localNavigationDuringSession))
         return;
       if (progress && showFeedback && hasDivergentSyncLocation(progress)) {
@@ -1729,14 +1891,15 @@
           </button>
           <h2 id="reader-bookmarks-title" class="font-serif text-xl">Bookmarks and history</h2>
           <p class="mt-2 text-sm text-surface-700-300">
-            Saved on this device with EPUB locations. They are not sent to Kavita.
+            Bookmarks save on this device and sync with Kavita’s personal table of contents when
+            online. Recent locations stay on this device.
           </p>
           {#if location}
             <button
               class="btn mt-4 w-full preset-tonal-primary"
               type="button"
               data-reader-focus="bookmark-current"
-              onclick={toggleCurrentBookmark}
+              onclick={() => void toggleCurrentBookmark()}
             >
               {currentBookmark() ? 'Remove bookmark at this page' : 'Bookmark this page'}
             </button>
@@ -1760,7 +1923,7 @@
                         class="flex gap-2"
                         onsubmit={(event) => {
                           event.preventDefault();
-                          saveBookmarkName(bookmark);
+                          void saveBookmarkName(bookmark);
                         }}
                       >
                         <input
@@ -1801,7 +1964,7 @@
                           aria-label={`Delete ${bookmark.label}`}
                           data-reader-focus="bookmark-delete"
                           data-reader-focus-id={bookmark.id}
-                          onclick={() => deleteBookmark(bookmark)}
+                          onclick={() => void deleteBookmark(bookmark)}
                         >
                           <span aria-hidden="true">×</span>
                         </button>
@@ -1869,7 +2032,8 @@
           </button>
           <h2 id="reader-annotations-title" class="font-serif text-xl">Highlights and notes</h2>
           <p class="mt-2 text-sm text-surface-700-300">
-            Saved on this device. Select text in the book to add a highlight and an optional note.
+            Saved on this device and synced with Kavita across devices when online. Select text in
+            the book to add a highlight and an optional note.
           </p>
 
           {#if selectedText}
@@ -1877,7 +2041,7 @@
               class="mt-4 rounded-lg preset-tonal-primary p-3"
               onsubmit={(event) => {
                 event.preventDefault();
-                saveAnnotation();
+                void saveAnnotation();
               }}
             >
               <p class="text-sm italic">“{selectedText.text}”</p>
@@ -1944,10 +2108,7 @@
                   <button
                     class="w-full text-left text-sm italic"
                     type="button"
-                    onclick={() => {
-                      void session?.displayCfi(annotation.cfi);
-                      closeAnnotations();
-                    }}
+                    onclick={() => void jumpToAnnotation(annotation)}
                   >
                     “{annotation.excerpt}”
                   </button>
@@ -1956,7 +2117,7 @@
                       class="mt-2 grid gap-2"
                       onsubmit={(event) => {
                         event.preventDefault();
-                        editAnnotation(annotation);
+                        void editAnnotation(annotation);
                       }}
                     >
                       <label class="label">
@@ -2003,7 +2164,7 @@
                         class="btn btn-sm preset-tonal-error"
                         type="button"
                         aria-label={`Delete highlight ${annotation.excerpt}`}
-                        onclick={() => deleteAnnotation(annotation)}
+                        onclick={() => void deleteAnnotation(annotation)}
                       >
                         Delete
                       </button>

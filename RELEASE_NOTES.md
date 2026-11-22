@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Sync annotations and bookmarks with Kavita and isolate study data per server
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace

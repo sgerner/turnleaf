@@ -15,6 +15,10 @@ Kavita supports user-created auth keys through the `x-api-key` header. Turnleaf 
 - `GET /api/Download/chapter`: EPUB download by `chapterId`.
 - `GET /api/Reader/get-progress`: current `ProgressDto` by `chapterId`.
 - `POST /api/Reader/progress`: save `ProgressDto`.
+- `GET /api/Annotation/all`: chapter annotations (`AnnotationDto[]`) by `chapterId`.
+- `GET /api/Annotation/all-for-series`: series annotations (`AnnotationDto[]`) by `seriesId` for library-wide note browsing and Markdown export.
+- `POST /api/Annotation/create`, `POST /api/Annotation/update`, `DELETE /api/Annotation`: create, update, and remove EPUB highlights and notes using `xPath` / `endingXPath` locators and ProseMirror/HTML comment fields.
+- `GET /api/Reader/ptoc`, `POST /api/Reader/create-ptoc`, `DELETE /api/Reader/ptoc`: personal table-of-contents bookmarks (`PersonalToCDto`) keyed by `(chapterId, pageNumber, title)` with `bookScrollId` XPath locators.
 - `GET /api/Image/series-cover`: cover retrieval.
 - `GET /api/Search/search`: server search.
 
