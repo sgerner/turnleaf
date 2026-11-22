@@ -744,10 +744,7 @@ export async function saveLocalProgress(
   ]);
 }
 
-export async function markBookCompleted(
-  book: BookRecord,
-  readingState: StoredReadingState | null = null,
-): Promise<void> {
+export async function markBookCompleted(book: BookRecord): Promise<void> {
   const now = new Date().toISOString();
   const payload: PendingProgressPayload = {
     libraryId: book.libraryId,
@@ -778,8 +775,8 @@ export async function markBookCompleted(
         xpath: null,
         percentage: 1,
         localUpdatedAt: now,
-        syncedLocalUpdatedAt: readingState?.syncedLocalUpdatedAt ?? null,
-        serverUpdatedAt: readingState?.serverUpdatedAt ?? null,
+        syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
+        serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
         pendingSync: true,
         syncRevision,
       };
