@@ -1,0 +1,115 @@
+import { saveServer, type ServerConfig } from '../database/database';
+import { removeApiKey, saveApiKey } from '../native/credentials';
+import { KavitaClient, KavitaError } from './client';
+import type { ConnectedServer } from './types';
+import { ServerUrlError } from './url';
+
+export type InvalidConnectionField = 'address' | 'key' | null;
+
+export interface SaveConnectionMessages {
+  saveFailed: string;
+  cleanupFailed: string;
+}
+
+export const ADDRESS_ROTATION_MESSAGES: SaveConnectionMessages = {
+  saveFailed:
+    'The new address tested successfully, but local setup could not be saved. The saved connection and auth key were left in place; retry reconnect.',
+  cleanupFailed:
+    'The new address tested successfully, but local setup could not be saved and the new auth key could not be cleaned up. The saved connection was left in place; retry reconnect.',
+};
+
+export const INITIAL_SETUP_MESSAGES: SaveConnectionMessages = {
+  saveFailed:
+    'The connection worked, but local setup could not be saved. No auth key was retained; try again.',
+  cleanupFailed:
+    'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
+};
+
+export async function saveConnection(
+  server: ServerConfig,
+  key: string,
+  messages: SaveConnectionMessages,
+): Promise<void> {
+  await saveApiKey(server.credentialRef, key);
+  try {
+    await saveServer(server);
+  } catch (storageError) {
+    try {
+      await removeApiKey(server.credentialRef);
+    } catch (cleanupError) {
+      throw new Error(messages.cleanupFailed, { cause: cleanupError });
+    }
+    throw new Error(messages.saveFailed, { cause: storageError });
+  }
+}
+
+export async function verifyKavitaConnection(
+  baseUrl: string,
+  key: string,
+  signal?: AbortSignal,
+): Promise<ConnectedServer> {
+  let result: ConnectedServer;
+  try {
+    result = await new KavitaClient(baseUrl, key).testConnection(signal);
+  } catch (cause) {
+    if (cause instanceof KavitaError && cause.status === 404) {
+      throw new KavitaError(
+        'Kavita API was not found at this address (404). Check the server address or reverse-proxy subpath, or paste your Kavita OPDS URL.',
+        'server',
+        404,
+      );
+    }
+    throw cause;
+  }
+
+  if (result.bookLibraries.length === 0) {
+    throw new Error(
+      'This account has no book or light novel libraries. Other media types are not supported.',
+    );
+  }
+  return result;
+}
+
+export async function rotateServerConnection(
+  savedServer: ServerConfig,
+  baseUrl: string,
+  key: string,
+  version: string | null,
+  messages: SaveConnectionMessages = ADDRESS_ROTATION_MESSAGES,
+): Promise<ServerConfig> {
+  let credentialRef = `server_${savedServer.id}_api_key_${Date.now().toString(36)}`;
+  if (credentialRef === savedServer.credentialRef) {
+    credentialRef = `${credentialRef}_next`;
+  }
+  const connectedServer: ServerConfig = {
+    ...savedServer,
+    baseUrl,
+    credentialRef,
+    kavitaVersion: version,
+    lastConnectedAt: new Date().toISOString(),
+  };
+  await saveConnection(connectedServer, key, messages);
+  if (savedServer.credentialRef !== credentialRef) {
+    await removeApiKey(savedServer.credentialRef).catch(() => {});
+  }
+  return connectedServer;
+}
+
+export function classifyConnectionError(
+  cause: unknown,
+  fallbackMessage: string,
+): { message: string; invalidField: InvalidConnectionField } {
+  let invalidField: InvalidConnectionField = null;
+  if (cause instanceof ServerUrlError) {
+    invalidField = 'address';
+  } else if (cause instanceof KavitaError && cause.status === 404) {
+    invalidField = 'address';
+  } else if (cause instanceof KavitaError && cause.kind === 'authentication') {
+    invalidField = 'key';
+  }
+
+  if (cause instanceof KavitaError || cause instanceof ServerUrlError || cause instanceof Error) {
+    return { message: cause.message, invalidField };
+  }
+  return { message: fallbackMessage, invalidField };
+}

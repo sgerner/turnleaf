@@ -73,9 +73,15 @@ describe('diagnostic log', () => {
       category: 'request',
       endpoint: 'https://host.invalid/user-prefix/api/Series/123/cover?token=secret',
     });
-    expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain(
-      'endpoint=/api/Series/:id/cover',
-    );
+    recordDiagnostic({
+      category: 'request',
+      endpoint: 'https://host.invalid/kavita/api/opds/secret-opds-token/libraries#clients',
+    });
+    const exported = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(exported).toContain('endpoint=/api/Series/:id/cover');
+    expect(exported).toContain('endpoint=/api/opds');
+    expect(exported).not.toContain('secret-opds-token');
+    expect(exported).not.toContain('host.invalid');
   });
 
   it('keeps a bounded in-memory ring and can clear it', () => {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
   import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
@@ -24,11 +25,19 @@
   let booting = $state(Capacitor.isNativePlatform());
   let startupError = $state('');
   let repairing = $state(false);
-  let changingServerAddress = $state(false);
+  let autoFocusOnboarding = $state(false);
   let apiKey = $state<string | null>(null);
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let activeBackHandler: (() => boolean) | null = null;
+
+  function registerBackHandler(handler: () => boolean): () => void {
+    activeBackHandler = handler;
+    return () => {
+      if (activeBackHandler === handler) activeBackHandler = null;
+    };
+  }
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -64,7 +73,27 @@
   }
 
   onMount(() => {
+    let destroyed = false;
+    let removeBackListener: (() => Promise<void>) | null = null;
+    void App.addListener('backButton', () => {
+      if (destroyed) return;
+      if (activeBackHandler?.()) return;
+      void Promise.resolve()
+        .then(() => App.exitApp())
+        .catch(() => {});
+    })
+      .then((handle) => {
+        if (destroyed) void handle.remove();
+        else removeBackListener = () => handle.remove();
+      })
+      .catch(() => {});
+
     void loadLocalData();
+
+    return () => {
+      destroyed = true;
+      if (removeBackListener) void removeBackListener();
+    };
   });
 
   async function repairLocalData(): Promise<void> {
@@ -158,7 +187,7 @@
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
         </div>
       </main>
-    {:else if server && apiKey && !changingServerAddress}
+    {:else if server && apiKey}
       <Library
         {server}
         {apiKey}
@@ -167,18 +196,23 @@
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
-        onChangeServerAddress={() => (changingServerAddress = true)}
+        onServerChange={(updatedServer, nextKey) => {
+          server = updatedServer;
+          apiKey = nextKey;
+        }}
         onServerDeleted={() => {
+          autoFocusOnboarding = true;
           server = null;
           apiKey = null;
         }}
+        {registerBackHandler}
       />
     {:else if startupError}
       <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
         <p>{startupError}</p>
         <div class="flex flex-wrap gap-2">
           <button
-            class="btn btn-sm preset-filled-error-500 !text-sm"
+            class="btn btn-sm preset-filled-error-500 min-h-11 !text-sm"
             type="button"
             onclick={() => void loadLocalData()}
             disabled={repairing}
@@ -187,15 +221,18 @@
           </button>
           {#if server}
             <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
+              class="btn btn-sm preset-tonal-surface min-h-11 !text-sm"
               type="button"
-              onclick={() => (startupError = '')}
+              onclick={() => {
+                autoFocusOnboarding = true;
+                startupError = '';
+              }}
             >
               Enter auth key
             </button>
           {:else}
             <button
-              class="btn btn-sm preset-tonal-error !text-sm"
+              class="btn btn-sm preset-tonal-error min-h-11 !text-sm"
               type="button"
               disabled={repairing}
               onclick={() => {
@@ -216,12 +253,12 @@
     {:else}
       <Onboarding
         savedServer={server}
-        editAddress={changingServerAddress}
-        onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
+        autoFocus={autoFocusOnboarding}
+        {registerBackHandler}
         onConnected={(connected, key) => {
+          autoFocusOnboarding = false;
           apiKey = key;
           server = connected;
-          changingServerAddress = false;
         }}
       />
     {/if}

@@ -42,8 +42,15 @@
     type CoverLoadItem,
   } from '../downloads/cover-loader';
   import { KavitaClient, KavitaError } from '../kavita/client';
+  import {
+    classifyConnectionError,
+    rotateServerConnection,
+    verifyKavitaConnection,
+    type InvalidConnectionField,
+  } from '../kavita/connection';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
+  import { extractPastedOpdsUrl, normalizeServerUrl } from '../kavita/url';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
@@ -62,8 +69,9 @@
     onThemeChange,
     onModeChange,
     onApiKeyChange,
+    onServerChange,
     onServerDeleted,
-    onChangeServerAddress,
+    registerBackHandler,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -72,8 +80,9 @@
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
     onApiKeyChange: (apiKey: string) => void;
+    onServerChange: (server: ServerConfig, apiKey: string) => void;
     onServerDeleted: () => void;
-    onChangeServerAddress: () => void;
+    registerBackHandler?: ((handler: () => boolean) => () => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -229,6 +238,13 @@
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
   let settingsError = $state('');
+  let editingServerAddress = $state(false);
+  let nextServerUrl = $state('');
+  let allowInsecureServerUrl = $state(false);
+  let savingServerAddress = $state(false);
+  let addressError = $state('');
+  let addressInvalidField = $state<InvalidConnectionField>(null);
+  let addressStatusMessage = $state('');
   let diagnosticsMessage = $state('');
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
@@ -238,6 +254,9 @@
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
+  let serverAddressEditor = $state<HTMLElement | null>(null);
+  let changeServerAddressButton = $state<HTMLButtonElement | null>(null);
+  let settingsTriggerButton = $state<HTMLButtonElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
@@ -343,7 +362,9 @@
   }
 
   function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+    return typeof document !== 'undefined' &&
+      document.activeElement instanceof HTMLElement &&
+      document.activeElement !== document.body
       ? document.activeElement
       : null;
   }
@@ -486,6 +507,40 @@
     if (viewMode === 'grid' || viewMode === 'list') scheduleVirtualWindow();
   });
 
+  function handleBackNavigation(): boolean {
+    if (destroyed) return false;
+    if (conflict) {
+      closeConflict();
+      return true;
+    }
+    if (actionMenuBook) {
+      closeMenu();
+      return true;
+    }
+    if (reading) {
+      if (!readerBackHandler?.()) void closeReader();
+      return true;
+    }
+    if (settingsVisible && editingServerAddress) {
+      if (!savingServerAddress) cancelServerAddressEdit();
+      return true;
+    }
+    if (settingsVisible) {
+      if (!savingServerAddress && !replacingApiKey && !deletingServer) closeSettings();
+      return true;
+    }
+    if (filtersVisible) {
+      filtersVisible = false;
+      return true;
+    }
+    return false;
+  }
+
+  $effect(() => {
+    if (!registerBackHandler) return;
+    return registerBackHandler(handleBackNavigation);
+  });
+
   $effect(() => {
     if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
     const observer = new ResizeObserver(() => scheduleVirtualWindow());
@@ -562,21 +617,20 @@
         }),
       ),
     );
-    cleanups.push(
-      await registerListener(
-        await App.addListener('backButton', () => {
-          if (destroyed) return;
-          if (conflict) closeConflict();
-          else if (actionMenuBook) closeMenu();
-          else if (reading) {
-            if (readerBackHandler?.()) return;
-            void closeReader();
-          } else if (settingsVisible) closeSettings();
-          else if (filtersVisible) filtersVisible = false;
-          else void App.exitApp();
-        }),
-      ),
-    );
+    if (!registerBackHandler) {
+      cleanups.push(
+        await registerListener(
+          await App.addListener('backButton', () => {
+            if (destroyed) return;
+            if (!handleBackNavigation()) {
+              void Promise.resolve()
+                .then(() => App.exitApp())
+                .catch(() => {});
+            }
+          }),
+        ),
+      );
+    }
     if (!destroyed && !offline) {
       await refresh();
       void syncProgress(false);
@@ -1339,7 +1393,7 @@
   }
 
   function openSettings(): void {
-    settingsOpener = activeElement();
+    settingsOpener = activeElement() ?? settingsTriggerButton;
     settingsVisible = true;
     void Promise.allSettled(skeletonThemes.map(loadTheme));
     focusModal(() => settingsDialog);
@@ -1347,10 +1401,112 @@
 
   function closeSettings(): void {
     settingsVisible = false;
+    editingServerAddress = false;
+    nextServerUrl = '';
+    allowInsecureServerUrl = false;
+    addressError = '';
+    addressInvalidField = null;
+    addressStatusMessage = '';
     showReplacementKey = false;
-    const opener = settingsOpener;
+    const opener = settingsOpener ?? settingsTriggerButton;
     settingsOpener = null;
     void tick().then(() => restoreFocus(opener));
+  }
+
+  function openServerAddressEdit(): void {
+    confirmDeleteServer = false;
+    addressError = '';
+    addressInvalidField = null;
+    addressStatusMessage = '';
+    settingsError = '';
+    nextServerUrl = server.baseUrl;
+    allowInsecureServerUrl = false;
+    editingServerAddress = true;
+    void tick().then(() => focusFirstElement(serverAddressEditor));
+  }
+
+  function cancelServerAddressEdit(): void {
+    if (savingServerAddress) return;
+    editingServerAddress = false;
+    nextServerUrl = server.baseUrl;
+    allowInsecureServerUrl = false;
+    addressError = '';
+    addressInvalidField = null;
+    void tick().then(() => restoreFocus(changeServerAddressButton));
+  }
+
+  function handleSettingsServerUrlPaste(event: ClipboardEvent): void {
+    const pasted =
+      event.clipboardData?.getData('text/plain') || event.clipboardData?.getData('text') || '';
+    const extracted = extractPastedOpdsUrl(pasted);
+    if (!extracted) return;
+    event.preventDefault();
+    nextServerUrl = extracted.baseUrl;
+    if (!replacementApiKey.trim()) replacementApiKey = extracted.apiKey;
+    addressError = '';
+    addressInvalidField = null;
+  }
+
+  async function updateServerAddress(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    addressError = '';
+    addressInvalidField = null;
+    addressStatusMessage = '';
+    settingsError = '';
+    savingServerAddress = true;
+    try {
+      const normalized = normalizeServerUrl(nextServerUrl);
+      nextServerUrl = normalized.baseUrl;
+      if (!replacementApiKey.trim() && normalized.apiKey) {
+        replacementApiKey = normalized.apiKey;
+      }
+      if (normalized.insecure && !allowInsecureServerUrl) {
+        addressInvalidField = 'address';
+        throw new Error('Confirm that you accept an unencrypted HTTP connection.');
+      }
+      const candidateKey = replacementApiKey.trim() || apiKey;
+      if (!candidateKey) {
+        addressInvalidField = 'key';
+        throw new Error('Enter a Kavita auth key.');
+      }
+
+      const result = await verifyKavitaConnection(normalized.baseUrl, candidateKey);
+      const updatedServer = await rotateServerConnection(
+        server,
+        normalized.baseUrl,
+        candidateKey,
+        result.version,
+      );
+
+      const keyChanged = candidateKey !== apiKey;
+      onServerChange(updatedServer, candidateKey);
+      if (keyChanged) onApiKeyChange(candidateKey);
+      replacementApiKey = '';
+      editingServerAddress = false;
+      allowInsecureServerUrl = false;
+      savingServerAddress = false;
+      addressStatusMessage = 'Server address updated.';
+      message = 'Server address updated.';
+      await tick();
+      restoreFocus(changeServerAddressButton);
+
+      refreshController?.abort();
+      cancelCoverLoading();
+      clearCovers();
+      coverReloadRequest += 1;
+      await syncWork;
+      await refresh();
+      await syncProgress(false);
+    } catch (cause) {
+      const classified = classifyConnectionError(
+        cause,
+        'Turnleaf could not update the server address.',
+      );
+      if (!addressInvalidField) addressInvalidField = classified.invalidField;
+      addressError = classified.message;
+    } finally {
+      savingServerAddress = false;
+    }
   }
 
   function diagnosticsText(): string {
@@ -1506,12 +1662,7 @@
       const nextKey = replacementApiKey.trim();
       if (!nextKey) throw new Error('Enter a new Kavita auth key.');
 
-      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
-      if (result.bookLibraries.length === 0) {
-        throw new Error(
-          'This account has no book or light novel libraries. Only EPUB books are supported.',
-        );
-      }
+      const result = await verifyKavitaConnection(server.baseUrl, nextKey);
 
       const updatedServer: ServerConfig = {
         ...server,
@@ -1520,6 +1671,7 @@
       };
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
+      onServerChange(updatedServer, nextKey);
       onApiKeyChange(nextKey);
       replacementApiKey = '';
       message = 'API key updated.';
@@ -1529,8 +1681,10 @@
       await refresh();
       await syncProgress(false);
     } catch (cause) {
-      settingsError =
-        cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
+      settingsError = classifyConnectionError(
+        cause,
+        'Turnleaf could not update the API key.',
+      ).message;
     } finally {
       replacingApiKey = false;
     }
@@ -1620,6 +1774,7 @@
       </div>
       <div class="card preset-tonal-surface flex shrink-0 gap-1 p-1">
         <button
+          bind:this={settingsTriggerButton}
           class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
           onclick={openSettings}
@@ -2552,7 +2707,14 @@
       aria-modal="true"
       aria-labelledby="library-settings-title"
       tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
+      onkeydown={(event) =>
+        trapModalKeydown(event, settingsDialog!, () => {
+          if (editingServerAddress) {
+            cancelServerAddressEdit();
+          } else if (!savingServerAddress && !replacingApiKey && !deletingServer) {
+            closeSettings();
+          }
+        })}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <div
@@ -2699,17 +2861,98 @@
             <dd class="truncate text-right">{server.baseUrl}</dd>
           </div>
         </dl>
-        <button
-          class="btn preset-tonal-surface mt-3"
-          type="button"
-          disabled={Boolean(downloadingBookId) ||
-            cleanupInProgress ||
-            replacingApiKey ||
-            deletingServer}
-          onclick={onChangeServerAddress}
-        >
-          Change server address
-        </button>
+        {#if editingServerAddress}
+          <form
+            bind:this={serverAddressEditor}
+            class="mt-3 grid gap-3 rounded-xl preset-tonal-surface p-4"
+            novalidate
+            onsubmit={updateServerAddress}
+          >
+            <label class="label">
+              <span class="label-text">New Kavita server address</span>
+              <input
+                id="settings-server-url"
+                class="input min-h-11"
+                type="url"
+                inputmode="url"
+                autocomplete="url"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                placeholder="https://books.example.com"
+                bind:value={nextServerUrl}
+                onpaste={handleSettingsServerUrlPaste}
+                aria-invalid={addressInvalidField === 'address' || undefined}
+                aria-describedby={addressError ? 'settings-address-error' : undefined}
+                disabled={savingServerAddress}
+                required
+              />
+            </label>
+            <p class="text-xs text-surface-700-300">
+              Use this only when the new address reaches the same Kavita server and libraries. Leave
+              Replace API key blank to keep your current key, or paste a Kavita OPDS URL.
+            </p>
+            {#if nextServerUrl.trim().toLowerCase().startsWith('http://')}
+              <label
+                class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
+                transition:fade
+              >
+                <input
+                  class="checkbox mt-0.5"
+                  type="checkbox"
+                  bind:checked={allowInsecureServerUrl}
+                  disabled={savingServerAddress}
+                />
+                <span
+                  >Allow plain HTTP. Anyone on this network may be able to observe your reading
+                  traffic and auth key.</span
+                >
+              </label>
+            {/if}
+            <div
+              id="settings-address-error"
+              role="alert"
+              class:alert={addressError}
+              class:preset-tonal-error={addressError}
+            >
+              {addressError}
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                class="btn preset-filled-primary-700-300 min-h-11"
+                type="submit"
+                disabled={savingServerAddress}
+              >
+                {savingServerAddress ? 'Testing…' : 'Save address'}
+              </button>
+              <button
+                class="btn preset-tonal-surface min-h-11"
+                type="button"
+                onclick={cancelServerAddressEdit}
+                disabled={savingServerAddress}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {:else}
+          <button
+            bind:this={changeServerAddressButton}
+            class="btn preset-tonal-surface mt-3 min-h-11"
+            type="button"
+            disabled={Boolean(downloadingBookId) ||
+              cleanupInProgress ||
+              savingServerAddress ||
+              replacingApiKey ||
+              deletingServer}
+            onclick={openServerAddressEdit}
+          >
+            Change server address
+          </button>
+        {/if}
+        {#if addressStatusMessage}
+          <p class="mt-2 text-sm text-surface-700-300" role="status">{addressStatusMessage}</p>
+        {/if}
         {#if insecureServer()}
           <div class="alert preset-tonal-warning mt-4" role="alert">
             Plain HTTP is enabled. Anyone on this network may be able to observe your reading
@@ -2717,33 +2960,39 @@
           </div>
         {/if}
 
-        <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
+        <form class="mt-4 grid gap-3" novalidate onsubmit={updateApiKey}>
           <div class="label">
             <label for="replacement-api-key" class="label-text">Replace API key</label>
             <div class="flex flex-wrap gap-2">
               <input
                 id="replacement-api-key"
-                class="input min-w-0 flex-1 max-w-96"
+                class="input min-h-11 min-w-0 max-w-96 flex-1"
                 type={showReplacementKey ? 'text' : 'password'}
+                autocapitalize="none"
+                autocorrect="off"
                 spellcheck="false"
                 autocomplete="off"
                 bind:value={replacementApiKey}
                 placeholder="Enter a new Kavita key"
-                aria-invalid={settingsError ? true : undefined}
-                aria-describedby={settingsError ? 'settings-key-error' : undefined}
+                aria-invalid={Boolean(settingsError) || addressInvalidField === 'key' || undefined}
+                aria-describedby={settingsError
+                  ? 'settings-key-error'
+                  : addressInvalidField === 'key' && addressError
+                    ? 'settings-address-error'
+                    : undefined}
                 required
               />
               <button
-                class="btn preset-tonal-surface"
+                class="btn preset-tonal-surface min-h-11"
                 type="button"
                 onclick={() => (showReplacementKey = !showReplacementKey)}
               >
                 {showReplacementKey ? 'Hide key' : 'Show key'}
               </button>
               <button
-                class="btn preset-filled-primary-700-300 shrink-0"
+                class="btn preset-filled-primary-700-300 min-h-11 shrink-0"
                 type="submit"
-                disabled={replacingApiKey}
+                disabled={replacingApiKey || savingServerAddress}
               >
                 {replacingApiKey ? 'Testing...' : 'Save'}
               </button>
@@ -2761,10 +3010,10 @@
             {settingsError}
           </div>
           <button
-            class="btn preset-tonal-error"
+            class="btn preset-tonal-error min-h-11"
             type="button"
             onclick={() => (confirmDeleteServer = true)}
-            disabled={deletingServer}
+            disabled={deletingServer || savingServerAddress}
           >
             Delete server
           </button>

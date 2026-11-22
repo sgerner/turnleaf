@@ -1,50 +1,84 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { tick } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { saveServer, type ServerConfig } from '../database/database';
-  import { KavitaClient, KavitaError } from '../kavita/client';
-  import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
-  import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { focusFirstElement, restoreFocus } from '../a11y/modal-focus';
+  import type { ServerConfig } from '../database/database';
+  import {
+    classifyConnectionError,
+    INITIAL_SETUP_MESSAGES,
+    rotateServerConnection,
+    saveConnection,
+    verifyKavitaConnection,
+    type InvalidConnectionField,
+  } from '../kavita/connection';
+  import { extractPastedOpdsUrl, normalizeServerUrl } from '../kavita/url';
+  import { saveApiKey } from '../native/credentials';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
   let {
     savedServer = null,
-    editAddress = false,
-    onCancel,
+    autoFocus = false,
+    registerBackHandler,
     onConnected,
   }: {
     savedServer?: ServerConfig | null;
-    editAddress?: boolean;
-    onCancel?: (() => void) | undefined;
+    autoFocus?: boolean;
+    registerBackHandler?: ((handler: () => boolean) => () => void) | undefined;
     onConnected: (server: ServerConfig, key: string) => void;
   } = $props();
 
-  let serverUrl = $state(untrack(() => (editAddress ? (savedServer?.baseUrl ?? '') : '')));
-  let changeServerAddress = $state(untrack(() => editAddress));
+  let formElement = $state<HTMLFormElement | null>(null);
+  let serverUrlInput = $state<HTMLInputElement | null>(null);
+  let changeAddressButton = $state<HTMLButtonElement | null>(null);
+  let serverUrl = $state('');
+  let changeServerAddress = $state(false);
   let displayName = $state('Books');
   let apiKey = $state('');
   let allowHttp = $state(false);
   let busy = $state(false);
   let error = $state('');
-  let invalidField = $state<'address' | 'key' | null>(null);
+  let invalidField = $state<InvalidConnectionField>(null);
   let showKey = $state(false);
 
-  async function saveConnection(
-    server: ServerConfig,
-    key: string,
-    messages: { saveFailed: string; cleanupFailed: string },
-  ): Promise<void> {
-    await saveApiKey(server.credentialRef, key);
-    try {
-      await saveServer(server);
-    } catch (storageError) {
-      try {
-        await removeApiKey(server.credentialRef);
-      } catch (cleanupError) {
-        throw new Error(messages.cleanupFailed, { cause: cleanupError });
+  $effect(() => {
+    if (!autoFocus) return;
+    void tick().then(() => focusFirstElement(formElement));
+  });
+
+  $effect(() => {
+    if (!registerBackHandler) return;
+    return registerBackHandler(() => {
+      if (savedServer && changeServerAddress) {
+        if (!busy) toggleChangeServerAddress(false);
+        return true;
       }
-      throw new Error(messages.saveFailed, { cause: storageError });
+      return false;
+    });
+  });
+
+  function toggleChangeServerAddress(next = !changeServerAddress): void {
+    changeServerAddress = next;
+    serverUrl = next && savedServer ? savedServer.baseUrl : '';
+    allowHttp = false;
+    error = '';
+    invalidField = null;
+    if (next) {
+      void tick().then(() => restoreFocus(serverUrlInput));
+    } else {
+      void tick().then(() => restoreFocus(changeAddressButton));
     }
+  }
+
+  function handleServerUrlPaste(event: ClipboardEvent): void {
+    const pasted =
+      event.clipboardData?.getData('text/plain') || event.clipboardData?.getData('text') || '';
+    const extracted = extractPastedOpdsUrl(pasted);
+    if (!extracted) return;
+    event.preventDefault();
+    serverUrl = extracted.baseUrl;
+    if (!apiKey.trim()) apiKey = extracted.apiKey;
+    error = '';
+    invalidField = null;
   }
 
   async function connect(event: SubmitEvent): Promise<void> {
@@ -58,7 +92,14 @@
       const normalized = normalizeServerUrl(
         savedServer && !changingServerAddress ? savedServer.baseUrl : serverUrl,
       );
+      if (!savedServer || changingServerAddress) {
+        serverUrl = normalized.baseUrl;
+      }
+      if (!apiKey.trim() && normalized.apiKey) {
+        apiKey = normalized.apiKey;
+      }
       if ((!savedServer || changingServerAddress) && normalized.insecure && !allowHttp) {
+        invalidField = 'address';
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
       const key = apiKey.trim();
@@ -67,31 +108,17 @@
         throw new Error('Enter a Kavita auth key.');
       }
 
-      const result = await new KavitaClient(normalized.baseUrl, key).testConnection();
-      if (result.bookLibraries.length === 0) {
-        throw new Error(
-          'This account has no book or light novel libraries. Other media types are not supported.',
-        );
-      }
+      const result = await verifyKavitaConnection(normalized.baseUrl, key);
 
       if (savedServer) {
         let connectedServer = savedServer;
         if (changingServerAddress) {
-          const credentialRef = `${savedServer.credentialRef}_${Date.now().toString(36)}`;
-          connectedServer = {
-            ...savedServer,
-            baseUrl: normalized.baseUrl,
-            credentialRef,
-            kavitaVersion: result.version,
-            lastConnectedAt: new Date().toISOString(),
-          };
-          await saveConnection(connectedServer, key, {
-            saveFailed:
-              'The new address tested successfully, but local setup could not be saved. The saved connection and auth key were left in place; retry reconnect.',
-            cleanupFailed:
-              'The new address tested successfully, but local setup could not be saved and the new auth key could not be cleaned up. The saved connection was left in place; retry reconnect.',
-          });
-          await removeApiKey(savedServer.credentialRef).catch(() => {});
+          connectedServer = await rotateServerConnection(
+            savedServer,
+            normalized.baseUrl,
+            key,
+            result.version,
+          );
         } else {
           await saveApiKey(savedServer.credentialRef, key);
         }
@@ -110,26 +137,13 @@
         lastConnectedAt: new Date().toISOString(),
       };
 
-      await saveConnection(server, key, {
-        saveFailed:
-          'The connection worked, but local setup could not be saved. No auth key was retained; try again.',
-        cleanupFailed:
-          'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
-      });
+      await saveConnection(server, key, INITIAL_SETUP_MESSAGES);
       apiKey = '';
       onConnected(server, key);
     } catch (cause) {
-      if (cause instanceof ServerUrlError) invalidField = 'address';
-      if (cause instanceof KavitaError && cause.kind === 'authentication') invalidField = 'key';
-      if (
-        cause instanceof KavitaError ||
-        cause instanceof ServerUrlError ||
-        cause instanceof Error
-      ) {
-        error = cause.message;
-      } else {
-        error = 'Turnleaf could not complete setup.';
-      }
+      const classified = classifyConnectionError(cause, 'Turnleaf could not complete setup.');
+      if (!invalidField) invalidField = classified.invalidField;
+      error = classified.message;
     } finally {
       busy = false;
     }
@@ -165,7 +179,9 @@
 
   <div class="mt-10 flex flex-col gap-5 lg:mt-0" in:fly={{ y: 12, duration: 280, delay: 80 }}>
     <form
+      bind:this={formElement}
       class="card preset-filled-surface-50-950 space-y-5 p-6 shadow-2xl sm:p-8"
+      novalidate
       onsubmit={connect}
     >
       {#if !savedServer || changeServerAddress}
@@ -174,12 +190,17 @@
             {savedServer ? 'New Kavita server address' : 'Kavita server address'}
           </span>
           <input
-            class="input"
+            bind:this={serverUrlInput}
+            class="input min-h-11"
             type="url"
             inputmode="url"
             autocomplete="url"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
             placeholder="https://books.example.com"
             bind:value={serverUrl}
+            onpaste={handleServerUrlPaste}
             aria-invalid={invalidField === 'address' || undefined}
             aria-describedby={error ? 'connection-error' : undefined}
             required
@@ -205,17 +226,13 @@
         </div>
       {/if}
 
-      {#if savedServer && !editAddress}
+      {#if savedServer}
         <button
-          class="btn btn-sm preset-tonal-surface h-11 self-start"
+          bind:this={changeAddressButton}
+          class="btn btn-sm preset-tonal-surface min-h-11 self-start"
           type="button"
           disabled={busy}
-          onclick={() => {
-            changeServerAddress = !changeServerAddress;
-            serverUrl = changeServerAddress ? savedServer.baseUrl : '';
-            error = '';
-            invalidField = null;
-          }}
+          onclick={() => toggleChangeServerAddress()}
         >
           {changeServerAddress ? 'Use saved address' : 'Change server address'}
         </button>
@@ -232,9 +249,11 @@
         <div class="flex gap-2">
           <input
             id="kavita-auth-key"
-            class="input min-w-0 flex-1"
+            class="input min-h-11 min-w-0 flex-1"
             type={showKey ? 'text' : 'password'}
             autocomplete="off"
+            autocapitalize="none"
+            autocorrect="off"
             spellcheck="false"
             bind:value={apiKey}
             aria-invalid={invalidField === 'key' || undefined}
@@ -242,7 +261,7 @@
             required
           />
           <button
-            class="btn preset-tonal-surface"
+            class="btn preset-tonal-surface min-h-11 shrink-0"
             type="button"
             onclick={() => (showKey = !showKey)}
           >
@@ -260,7 +279,7 @@
           <span class="label-text">
             Library name <span class="text-surface-600-400">Optional</span></span
           >
-          <input class="input" autocomplete="organization" bind:value={displayName} />
+          <input class="input min-h-11" autocomplete="organization" bind:value={displayName} />
         </label>
       {/if}
 
@@ -274,7 +293,11 @@
         {error}
       </div>
 
-      <button class="btn btn-lg preset-filled-primary-700-300 w-full" type="submit" disabled={busy}>
+      <button
+        class="btn btn-lg preset-filled-primary-700-300 min-h-11 w-full"
+        type="submit"
+        disabled={busy}
+      >
         {#if busy}
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5 animate-spin">
             <path
@@ -290,16 +313,6 @@
           </svg>
         {/if}
       </button>
-      {#if onCancel}
-        <button
-          class="btn preset-tonal-surface w-full"
-          type="button"
-          onclick={onCancel}
-          disabled={busy}
-        >
-          Cancel
-        </button>
-      {/if}
     </form>
 
     <aside class="card preset-tonal-surface p-5" aria-labelledby="getting-started-title">

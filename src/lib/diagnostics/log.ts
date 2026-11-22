@@ -46,7 +46,10 @@ function sanitizeEndpoint(value: string): string {
   const apiIndex = withoutQuery.toLowerCase().lastIndexOf('/api/');
   if (apiIndex < 0) return '[unknown endpoint]';
 
-  const route = withoutQuery.slice(apiIndex).replace(/\/(\d+)(?=\/|$)/g, '/:id');
+  const route = withoutQuery
+    .slice(apiIndex)
+    .replace(/^(\/api\/opds)(?:\/.*)?$/i, '$1')
+    .replace(/\/(\d+)(?=\/|$)/g, '/:id');
   if (!/^\/api(?:\/[a-zA-Z0-9._:-]+)+$/.test(route) || route.includes('..')) {
     return '[unknown endpoint]';
   }
