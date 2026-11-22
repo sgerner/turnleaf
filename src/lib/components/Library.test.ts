@@ -738,4 +738,32 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
     expect(mocks.removeDownloads).not.toHaveBeenCalled();
     expect(onServerDeleted).toHaveBeenCalledOnce();
   });
+
+  it('keeps the server configuration when bulk EPUB cleanup reports failed paths', async () => {
+    const catalog = makeCatalog(20, 10);
+    mocks.getBooks.mockResolvedValueOnce(catalog);
+    const { target } = renderLibrary();
+    await settle();
+
+    target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await settle();
+    Array.from(target.querySelectorAll('button'))
+      .find((button) => button.textContent?.trim() === 'Delete server')!
+      .click();
+    await settle();
+
+    mocks.deleteAllDownloadedEpubs.mockResolvedValueOnce({
+      removedPaths: [],
+      failedPaths: ['books/server-0-1.epub'],
+    });
+    Array.from(target.querySelectorAll('button'))
+      .find((button) => button.textContent?.trim() === 'Delete now')!
+      .click();
+    await settle();
+
+    expect(mocks.removeApiKey).not.toHaveBeenCalled();
+    expect(mocks.removeServer).not.toHaveBeenCalled();
+    expect(target.textContent).toContain('Could not remove the server safely');
+    expect(target.textContent).toContain('Retry cleanup before deleting this server.');
+  });
 });

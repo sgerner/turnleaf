@@ -1652,7 +1652,12 @@
       const downloadedPaths = books.flatMap((item) =>
         item.downloadPath ? [item.downloadPath] : [],
       );
-      await deleteAllDownloadedEpubs(downloadedPaths);
+      const cleanup = await deleteAllDownloadedEpubs(downloadedPaths);
+      if (cleanup.failedPaths.length > 0) {
+        throw new Error(
+          `Could not remove ${cleanup.failedPaths.length} local download${cleanup.failedPaths.length === 1 ? '' : 's'}. Retry cleanup before deleting this server.`,
+        );
+      }
       cancelCoverLoading();
       sharedCoverLoader.retain(new Set());
       await clearCoverCache().catch(() => {});
