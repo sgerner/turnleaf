@@ -29,17 +29,54 @@ jobs:
           - language: javascript-typescript
             build-mode: none
           - language: java-kotlin
-            build-mode: none
+            build-mode: manual
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Set up Android SDK
+        if: matrix.language == 'java-kotlin'
+        uses: android-actions/setup-android@v4
+
+      - name: Install dependencies
+        if: matrix.language == 'java-kotlin'
+        run: npm ci
+
+      - name: Build web app
+        if: matrix.language == 'java-kotlin'
+        run: npm run build
+
+      - name: Sync Capacitor Android
+        if: matrix.language == 'java-kotlin'
+        run: npx cap sync android
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+
+      - name: Compile Android debug Java
+        if: matrix.language == 'java-kotlin'
+        working-directory: android
+        run: ./gradlew :app:compileDebugJavaWithJavac --no-daemon
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4
