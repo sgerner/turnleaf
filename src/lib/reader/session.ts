@@ -45,6 +45,28 @@ interface EpubTocItem {
   subitems?: EpubTocItem[];
 }
 
+interface EpubQueue {
+  enqueue: <T>(task: () => T | Promise<T>) => Promise<T>;
+  running?: unknown;
+}
+
+interface EpubStage {
+  resizeFunc?: EventListener | undefined;
+  orientationChangeFunc?: EventListener | undefined;
+}
+
+interface EpubManager {
+  stage?: EpubStage | undefined;
+  _stageSize?: unknown;
+}
+
+type InternalRendition = Omit<Rendition, 'resize'> & {
+  q?: EpubQueue | undefined;
+  displaying?: unknown;
+  manager?: EpubManager | undefined;
+  resize: (width?: number, height?: number, epubcfi?: string) => void;
+};
+
 const MODE_COLORS = {
   light: {
     background: '--color-surface-50',
@@ -305,6 +327,11 @@ export class ReaderSession {
   private current: Location | null = null;
   private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
   private locationGeneration = 0;
+  private opening = false;
+  private activeDisplayOperations = 0;
+  private relocationSettled: Promise<void> | null = null;
+  private resolveRelocationWait: (() => void) | null = null;
+  private relocationWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
@@ -313,6 +340,12 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private pendingViewportSize: { width: number; height: number } | null = null;
+  private resizeFlushFrame: number | null = null;
+  private resizeSettled: Promise<void> | null = null;
+  private resolveResizeSettled: (() => void) | null = null;
+  private resizeSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+  private resizeDispatched = false;
   private highlightCfis = new Set<string>();
   private onLocation:
     | ((
@@ -341,13 +374,18 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    const initialRect = target.getBoundingClientRect();
+    const initialWidth = Math.floor(initialRect.width);
+    const initialHeight = Math.floor(initialRect.height);
+    this.viewportSize = { width: initialWidth, height: initialHeight };
+    this.opening = true;
     this.rendition = this.book.renderTo(target, {
-      width: '100%',
-      height: '100%',
+      width: initialWidth > 0 ? initialWidth : '100%',
+      height: initialHeight > 0 ? initialHeight : '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: true,
+      resizeOnOrientationChange: false,
       allowScriptedContent: false,
     });
     this.observeViewport(target);
@@ -384,7 +422,11 @@ export class ReaderSession {
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
+      if (
+        isUserNavigation ||
+        this.userNavigationOrigin === 'link' ||
+        (this.userNavigationPending && this.activeDisplayOperations === 0 && !this.reflowPending)
+      ) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
         this.userNavigationOrigin = 'navigation';
@@ -395,6 +437,15 @@ export class ReaderSession {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
       }
+      const hasPendingResize = this.hasPendingViewportChange();
+      if (hasPendingResize && this.getQueue()) {
+        this.ensureResizeSettled();
+        this.resizeDispatched = false;
+        this.scheduleViewportResizeFlush();
+      } else if (this.resizeDispatched) {
+        this.finishResizeSettled();
+      }
+      this.clearRelocationWait();
     };
     this.rendition.on('relocated', this.relocated);
     this.contentClick = (event, contents) => {
@@ -428,24 +479,30 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
+    try {
+      await this.rendition.started;
+      this.detachStageWindowResizeListeners();
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      if (cfi) {
+        try {
+          if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
+        } catch {
+          // A saved CFI can name a section removed in a newer copy of the EPUB.
+        }
       }
+      if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
+      if (
+        serverPercentage &&
+        serverPercentage > 0 &&
+        (await this.displayPercentage(serverPercentage, restoreGeneration))
+      ) {
+        return;
+      }
+      await this.displayAtGeneration(undefined, restoreGeneration);
+    } finally {
+      this.opening = false;
+      this.scheduleViewportResizeFlush();
     }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -658,6 +715,16 @@ export class ReaderSession {
 
   destroy(): void {
     this.locationGeneration += 1;
+    this.opening = false;
+    this.activeDisplayOperations = 0;
+    if (this.resizeFlushFrame !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.resizeFlushFrame);
+    }
+    this.resizeFlushFrame = null;
+    this.pendingViewportSize = null;
+    this.clearRelocationWait();
+    this.finishResizeSettled();
+    this.detachStageWindowResizeListeners();
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
@@ -672,6 +739,7 @@ export class ReaderSession {
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
@@ -698,8 +766,10 @@ export class ReaderSession {
   }
 
   private observeViewport(target: HTMLElement): void {
-    const initial = target.getBoundingClientRect();
-    this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
+    if (!this.viewportSize) {
+      const initial = target.getBoundingClientRect();
+      this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
+    }
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -708,11 +778,177 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
-      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.rendition.resize(width, height);
+      if (!this.getQueue()) {
+        if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+        this.viewportSize = { width, height };
+        this.rendition.resize(width, height);
+        return;
+      }
+      if (
+        !this.pendingViewportSize &&
+        this.viewportSize?.width === width &&
+        this.viewportSize.height === height
+      ) {
+        return;
+      }
+      this.pendingViewportSize = { width, height };
+      if (this.hasPendingViewportChange()) {
+        this.ensureResizeSettled();
+      }
+      this.scheduleViewportResizeFlush();
     });
     this.resizeObserver.observe(target);
+  }
+
+  private getQueue(): EpubQueue | null {
+    const queue = (this.rendition as InternalRendition | null)?.q;
+    return typeof queue?.enqueue === 'function' ? queue : null;
+  }
+
+  private detachStageWindowResizeListeners(): void {
+    if (typeof window === 'undefined') return;
+    const stage = (this.rendition as InternalRendition | null)?.manager?.stage;
+    if (!stage) return;
+    if (stage.resizeFunc) {
+      window.removeEventListener('resize', stage.resizeFunc, false);
+      stage.resizeFunc = undefined;
+    }
+    if (stage.orientationChangeFunc) {
+      window.removeEventListener('orientationchange', stage.orientationChangeFunc, false);
+      stage.orientationChangeFunc = undefined;
+    }
+  }
+
+  private hasPendingViewportChange(): boolean {
+    if (!this.pendingViewportSize) return false;
+    return (
+      this.pendingViewportSize.width !== this.viewportSize?.width ||
+      this.pendingViewportSize.height !== this.viewportSize.height
+    );
+  }
+
+  private ensureRelocationWait(): void {
+    if (this.relocationSettled) return;
+    this.relocationSettled = new Promise<void>((resolve) => {
+      this.resolveRelocationWait = resolve;
+    });
+  }
+
+  private startRelocationWaitTimer(timeoutMs: number): void {
+    if (!this.relocationSettled) return;
+    if (this.relocationWaitTimer !== null) clearTimeout(this.relocationWaitTimer);
+    this.relocationWaitTimer = setTimeout(() => {
+      this.clearRelocationWait();
+      this.scheduleViewportResizeFlush();
+    }, timeoutMs);
+  }
+
+  private clearRelocationWait(): void {
+    if (this.relocationWaitTimer !== null) {
+      clearTimeout(this.relocationWaitTimer);
+      this.relocationWaitTimer = null;
+    }
+    const resolve = this.resolveRelocationWait;
+    this.resolveRelocationWait = null;
+    this.relocationSettled = null;
+    resolve?.();
+  }
+
+  private ensureResizeSettled(): void {
+    if (this.resizeSettled) return;
+    this.resizeSettled = new Promise<void>((resolve) => {
+      this.resolveResizeSettled = resolve;
+    });
+  }
+
+  private startResizeSafetyTimer(timeoutMs: number): void {
+    if (this.resizeSafetyTimer !== null) clearTimeout(this.resizeSafetyTimer);
+    this.resizeSafetyTimer = setTimeout(() => {
+      this.finishResizeSettled();
+    }, timeoutMs);
+  }
+
+  private finishResizeSettled(): void {
+    if (this.resizeSafetyTimer !== null) {
+      clearTimeout(this.resizeSafetyTimer);
+      this.resizeSafetyTimer = null;
+    }
+    this.resizeDispatched = false;
+    const resolve = this.resolveResizeSettled;
+    this.resolveResizeSettled = null;
+    this.resizeSettled = null;
+    resolve?.();
+  }
+
+  private scheduleViewportResizeFlush(): void {
+    if (!this.pendingViewportSize || !this.rendition || this.resizeFlushFrame !== null) return;
+    const schedule =
+      typeof requestAnimationFrame === 'function'
+        ? requestAnimationFrame
+        : (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0) as unknown as number;
+    this.resizeFlushFrame = schedule(() => {
+      this.resizeFlushFrame = null;
+      this.flushPendingViewportResize();
+    });
+  }
+
+  private flushPendingViewportResize(): void {
+    const rendition = this.rendition as InternalRendition | null;
+    const nextSize = this.pendingViewportSize;
+    if (!rendition || !nextSize) return;
+    if (
+      nextSize.width === this.viewportSize?.width &&
+      nextSize.height === this.viewportSize.height
+    ) {
+      this.pendingViewportSize = null;
+      if (!this.resizeDispatched) this.finishResizeSettled();
+      return;
+    }
+    if (this.opening || this.activeDisplayOperations > 0 || this.resizeDispatched) return;
+    const hadNonZeroViewport = Boolean(this.viewportSize?.width && this.viewportSize.height);
+    if (this.relocationSettled && hadNonZeroViewport) return;
+    if (!rendition.manager?.stage) return;
+    if (rendition.q?.running || rendition.displaying) {
+      this.scheduleViewportResizeFlush();
+      return;
+    }
+
+    this.pendingViewportSize = null;
+    this.viewportSize = nextSize;
+    rendition.manager._stageSize = undefined;
+    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi;
+    this.ensureResizeSettled();
+    this.resizeDispatched = true;
+    this.startResizeSafetyTimer(400);
+    if (cfi) rendition.resize(nextSize.width, nextSize.height, cfi);
+    else rendition.resize(nextSize.width, nextSize.height);
+    if (!rendition.location?.start) {
+      const fallback = cfi ? rendition.display(cfi) : rendition.display();
+      void fallback.catch(() => {});
+    }
+  }
+
+  private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.activeDisplayOperations += 1;
+    const queued = this.getQueue() !== null;
+    if (queued) this.ensureRelocationWait();
+    try {
+      const result = await operation();
+      if (queued && this.relocationSettled) {
+        this.startRelocationWaitTimer(250);
+      }
+      return result;
+    } catch (error) {
+      if (this.activeDisplayOperations === 1) {
+        this.clearRelocationWait();
+      }
+      throw error;
+    } finally {
+      this.activeDisplayOperations = Math.max(0, this.activeDisplayOperations - 1);
+      if (this.activeDisplayOperations === 0 && !this.relocationSettled) {
+        this.scheduleViewportResizeFlush();
+      }
+    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -750,8 +986,9 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    if (target === undefined) await rendition.display();
-    else await rendition.display(target);
+    await this.runDisplayOperation(() =>
+      target === undefined ? rendition.display() : rendition.display(target),
+    );
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -763,18 +1000,20 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      await rendition.display(section.href);
-      if (!this.isCurrentLocationOperation(generation)) return false;
-      const contents = (rendition.getContents() as unknown as Contents[]).find(
-        (item) => item.sectionIndex === target.spineIndex,
-      );
-      if (!contents) return false;
-      const node = resolveContentXPath(contents.document, target.contentXPath);
-      if (!node) return false;
-      const range = contents.document.createRange();
-      range.selectNodeContents(node);
-      await rendition.display(contents.cfiFromRange(range));
-      return this.isCurrentLocationOperation(generation);
+      return await this.runDisplayOperation(async () => {
+        await rendition.display(section.href);
+        if (!this.isCurrentLocationOperation(generation)) return false;
+        const contents = (rendition.getContents() as unknown as Contents[]).find(
+          (item) => item.sectionIndex === target.spineIndex,
+        );
+        if (!contents) return false;
+        const node = resolveContentXPath(contents.document, target.contentXPath);
+        if (!node) return false;
+        const range = contents.document.createRange();
+        range.selectNodeContents(node);
+        await rendition.display(contents.cfiFromRange(range));
+        return this.isCurrentLocationOperation(generation);
+      });
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
@@ -796,9 +1035,15 @@ export class ReaderSession {
   }
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {
+    if (this.getQueue()) {
+      while (this.relocationSettled || this.resizeSettled) {
+        await (this.resizeSettled ?? this.relocationSettled);
+      }
+      if (!this.rendition) return;
+    }
     const generation = this.beginLocationOperation(true);
     try {
-      await display();
+      await this.runDisplayOperation(display);
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
@@ -827,6 +1072,10 @@ export class ReaderSession {
     this.userNavigationStartCfi = start.cfi;
     this.userNavigationOrigin = 'link';
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
+    if (this.getQueue()) {
+      this.ensureRelocationWait();
+      this.startRelocationWaitTimer(250);
+    }
   }
 
   private isCurrentLocationOperation(generation: number): boolean {
@@ -838,7 +1087,7 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    void rendition.display(cfi).catch(() => {
+    void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
   }
