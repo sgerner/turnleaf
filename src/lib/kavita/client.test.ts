@@ -602,3 +602,345 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+function makeSeriesPage(pageNumber: number, count = 500): Record<string, unknown>[] {
+  const startId = (pageNumber - 1) * 500 + 1;
+  return Array.from({ length: count }, (_, index) => ({
+    id: startId + index,
+    name: `Book ${startId + index}`,
+    libraryId: 1,
+    format: 3,
+    pages: 10,
+    pagesRead: 0,
+    created: '2026-01-01',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: '',
+  }));
+}
+
+function paginationHeaders(totalPages: number, currentPage = 1, totalItems = totalPages * 500) {
+  const headerValue = JSON.stringify({
+    currentPage,
+    itemsPerPage: 500,
+    totalItems,
+    totalPages,
+  });
+  return {
+    get: (name: string) => (name.toLowerCase() === 'pagination' ? headerValue : null),
+  };
+}
+
+it('stops after page 1 without a trailing probe when 500 items match totalPages=1', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: paginationHeaders(1, 1, 500),
+    json: async () => makeSeriesPage(1, 500),
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+  expect(series).toHaveLength(500);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+it('reads native CapacitorHttp Pagination headers case-insensitively to stop after page 1', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {
+      pagination: JSON.stringify({
+        currentPage: 1,
+        itemsPerPage: 500,
+        totalItems: 500,
+        totalPages: 1,
+      }),
+    },
+    url: '',
+    data: JSON.stringify(makeSeriesPage(1, 500)),
+  });
+
+  const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+  expect(series).toHaveLength(500);
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
+});
+
+it('fetches remaining series pages with bounded concurrency of 4 and no trailing empty probe', async () => {
+  const totalPages = 10;
+  let active = 0;
+  let maxActive = 0;
+  const pending: Array<() => void> = [];
+
+  const fetchMock = vi.fn((input: string | URL | Request) => {
+    const url = new URL(String(input));
+    const pageNumber = Number(url.searchParams.get('PageNumber'));
+    if (pageNumber === 1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: paginationHeaders(totalPages, 1),
+        json: async () => makeSeriesPage(1, 500),
+      });
+    }
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    return new Promise((resolve) => {
+      pending.push(() => {
+        active -= 1;
+        resolve({
+          ok: true,
+          status: 200,
+          headers: paginationHeaders(totalPages, pageNumber),
+          json: async () => makeSeriesPage(pageNumber, 500),
+        });
+      });
+    });
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const promise = new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+  await vi.waitFor(() => {
+    expect(pending).toHaveLength(4);
+  });
+  expect(maxActive).toBe(4);
+  expect(fetchMock).toHaveBeenCalledTimes(5);
+
+  while (pending.length > 0) {
+    const releaseBatch = pending.splice(0, pending.length);
+    releaseBatch.forEach((release) => release());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  const series = await promise;
+  expect(maxActive).toBe(4);
+  expect(fetchMock).toHaveBeenCalledTimes(totalPages);
+  expect(series).toHaveLength(totalPages * 500);
+  expect(series[0]?.id).toBe(1);
+  expect(series[series.length - 1]?.id).toBe(5000);
+});
+
+it('merges concurrent series pages in deterministic 1..N order even when responses arrive out of order', async () => {
+  const totalPages = 5;
+  const resolvers = new Map<number, () => void>();
+
+  const fetchMock = vi.fn((input: string | URL | Request) => {
+    const url = new URL(String(input));
+    const pageNumber = Number(url.searchParams.get('PageNumber'));
+    if (pageNumber === 1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: paginationHeaders(totalPages, 1, 2100),
+        json: async () => makeSeriesPage(1, 500),
+      });
+    }
+    const count = pageNumber === totalPages ? 100 : 500;
+    return new Promise((resolve) => {
+      resolvers.set(pageNumber, () => {
+        resolve({
+          ok: true,
+          status: 200,
+          headers: paginationHeaders(totalPages, pageNumber, 2100),
+          json: async () => makeSeriesPage(pageNumber, count),
+        });
+      });
+    });
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const promise = new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+  await vi.waitFor(() => {
+    expect(resolvers.size).toBe(4);
+  });
+
+  // Resolve in reverse order: 5, 4, 3, 2
+  for (const pageNumber of [5, 4, 3, 2]) {
+    resolvers.get(pageNumber)?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  const series = await promise;
+  expect(series).toHaveLength(2100);
+  expect(series.map((item) => item.id)).toEqual(
+    Array.from({ length: 2100 }, (_, index) => index + 1),
+  );
+});
+
+it('aborts in-flight concurrent page requests and skips queued pages when caller aborts', async () => {
+  const totalPages = 8;
+  const controller = new AbortController();
+  const inFlightSignals: AbortSignal[] = [];
+
+  const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const pageNumber = Number(url.searchParams.get('PageNumber'));
+    if (pageNumber === 1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: paginationHeaders(totalPages, 1),
+        json: async () => makeSeriesPage(1, 500),
+      });
+    }
+    const signal = init?.signal;
+    if (signal) inFlightSignals.push(signal);
+    return new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const promise = new KavitaClient('https://books.example.com', 'abc123').getBookSeries(
+    controller.signal,
+  );
+  await vi.waitFor(() => {
+    expect(inFlightSignals).toHaveLength(4);
+  });
+
+  controller.abort();
+
+  await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+  expect(inFlightSignals.every((sig) => sig.aborted)).toBe(true);
+  // Page 1 + 4 concurrent workers; pages 6..8 were never started
+  expect(fetchMock).toHaveBeenCalledTimes(5);
+});
+
+it('aborts sibling in-flight page requests immediately when a worker fails', async () => {
+  const totalPages = 8;
+  const siblingSignals: AbortSignal[] = [];
+  let failPage3: (() => void) | undefined;
+
+  const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const pageNumber = Number(url.searchParams.get('PageNumber'));
+    if (pageNumber === 1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: paginationHeaders(totalPages, 1),
+        json: async () => makeSeriesPage(1, 500),
+      });
+    }
+    const signal = init?.signal;
+    if (pageNumber === 3) {
+      return new Promise((resolve) => {
+        failPage3 = () =>
+          resolve({
+            ok: false,
+            status: 500,
+            headers: { get: () => null },
+          });
+      });
+    }
+    if (signal) siblingSignals.push(signal);
+    return new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const promise = new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+  await vi.waitFor(() => {
+    expect(siblingSignals).toHaveLength(3);
+    expect(failPage3).toBeDefined();
+  });
+
+  failPage3?.();
+
+  await expect(promise).rejects.toMatchObject({
+    kind: 'server',
+    status: 500,
+  });
+  expect(siblingSignals.every((sig) => sig.aborted)).toBe(true);
+  expect(fetchMock).toHaveBeenCalledTimes(5);
+});
+
+it.each(['{corrupted-json', '{"totalPages":-1}', '{"totalPages":1.5}', '{"totalPages":"2"}'])(
+  'falls back to sequential pagination when Pagination header is invalid (%s)',
+  async (invalidHeader) => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name: string) => (name.toLowerCase() === 'pagination' ? invalidHeader : null),
+        },
+        json: async () => makeSeriesPage(1, 500),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: {
+          get: (name: string) => (name.toLowerCase() === 'pagination' ? invalidHeader : null),
+        },
+        json: async () => makeSeriesPage(2, 2),
+      });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+    expect(series).toHaveLength(502);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  },
+);
+
+it('rejects excessive totalPages in Pagination header immediately on page 1', async () => {
+  const fetchMock = vi.fn().mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    headers: paginationHeaders(202, 1),
+    json: async () => makeSeriesPage(1, 500),
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'invalid-response',
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+it('fetches trailing pages sequentially when concurrent server writes increase totalPages', async () => {
+  const fetchMock = vi.fn((input: string | URL | Request) => {
+    const url = new URL(String(input));
+    const pageNumber = Number(url.searchParams.get('PageNumber'));
+    if (pageNumber === 1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: paginationHeaders(2, 1, 1000),
+        json: async () => makeSeriesPage(1, 500),
+      });
+    }
+    if (pageNumber === 2) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: paginationHeaders(3, 2, 1005),
+        json: async () => makeSeriesPage(2, 500),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: paginationHeaders(3, 3, 1005),
+      json: async () => makeSeriesPage(3, 5),
+    });
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
+
+  expect(fetchMock).toHaveBeenCalledTimes(3);
+  expect(series).toHaveLength(1005);
+  expect(series[1004]?.id).toBe(1005);
+});
