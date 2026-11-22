@@ -80,6 +80,7 @@
     onReconnect,
     onServerDeleted,
     onChangeServerAddress,
+    onReaderOpenChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -92,6 +93,7 @@
     onReconnect?: (() => void) | undefined;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -721,6 +723,7 @@
   onDestroy(() => {
     destroyed = true;
     unsubscribeCredentials();
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1728,6 +1731,7 @@
       onRetryDownload={offline || !credentialReady || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
