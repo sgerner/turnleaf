@@ -233,4 +233,154 @@ describe('ReaderSession keyboard navigation', () => {
     expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
     session.destroy();
   });
+
+  it('defers viewport resize until initial open completes and preserves the restored CFI across system-bar inset changes', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    let rect = new DOMRect(0, 0, 412, 843);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => rect);
+
+    let resolveInitialDisplay!: () => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveInitialDisplay = resolve;
+        }),
+    );
+
+    const session = new ReaderSession('book.epub');
+    const restoredCfi = 'epubcfi(/6/4!/4/14/1:350)';
+    const openPromise = session.open(
+      viewport,
+      restoredCfi,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    // ResizeObserver must not be attached before initial display finishes, and epubjs
+    // Stage's uncontrolled window resize listener must be disabled so system-bar inset
+    // changes do not drop the restored CFI.
+    expect(mockBook.renderTo).toHaveBeenCalledWith(
+      viewport,
+      expect.objectContaining({
+        width: '100%',
+        height: '100%',
+        resizeOnOrientationChange: false,
+      }),
+    );
+    await Promise.resolve();
+    expect(resizeCallbacks).toHaveLength(0);
+    rect = new DOMRect(0, 0, 412, 880);
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    resolveInitialDisplay();
+    await openPromise;
+
+    expect(mockRendition.resize).toHaveBeenCalledWith(412, 880, restoredCfi);
+    expect(resizeCallbacks).toHaveLength(1);
+
+    // Even if initial pagination snapped rendition.location to an earlier column,
+    // subsequent system-bar hide resizes before user navigation still target restoredCfi.
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/12/1:120)',
+        displayed: { page: 2, total: 7 },
+      },
+    });
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(mockRendition.resize).toHaveBeenLastCalledWith(412, 915, restoredCfi);
+    session.destroy();
+  });
+
+  it('detaches epubjs Stage window listeners and realigns restored CFI columns after queued resize', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+
+    const stageResize = vi.fn();
+    const stageOrientation = vi.fn();
+    window.addEventListener('resize', stageResize);
+    window.addEventListener('orientationchange', stageOrientation);
+
+    const expandView = vi.fn();
+    const runtimeRendition = mockRendition as typeof mockRendition & {
+      manager?: unknown;
+      q?: { enqueue: (task: () => void) => Promise<void> };
+    };
+    runtimeRendition.manager = {
+      stage: { resizeFunc: stageResize, orientationChangeFunc: stageOrientation },
+      container: document.createElement('div'),
+      views: { all: () => [{ expand: expandView }] },
+    };
+    runtimeRendition.q = {
+      enqueue: async (task: () => void) => {
+        task();
+      },
+    };
+
+    try {
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 843));
+
+      const session = new ReaderSession('book.epub');
+      const restoredCfi = 'epubcfi(/6/4!/4/14/1:350)';
+      await session.open(viewport, restoredCfi, null, null, defaultAppearance, vi.fn(), vi.fn());
+
+      window.dispatchEvent(new Event('resize'));
+      window.dispatchEvent(new Event('orientationchange'));
+      expect(stageResize).not.toHaveBeenCalled();
+      expect(stageOrientation).not.toHaveBeenCalled();
+      expect(expandView).toHaveBeenCalledTimes(1);
+
+      mockRendition.display.mockClear();
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 880 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(mockRendition.resize).toHaveBeenLastCalledWith(412, 915, restoredCfi);
+      expect(expandView).toHaveBeenCalled();
+      expect(mockRendition.display).toHaveBeenLastCalledWith(restoredCfi);
+      session.destroy();
+    } finally {
+      delete runtimeRendition.manager;
+      delete runtimeRendition.q;
+      window.removeEventListener('resize', stageResize);
+      window.removeEventListener('orientationchange', stageOrientation);
+    }
+  });
 });
