@@ -334,4 +334,175 @@ describe('ReaderSession', () => {
     );
     session.destroy();
   });
+
+  it('defers viewport resizes while open is awaiting initial location readiness and flushes the latest size afterward', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveDisplay = () => {};
+    const displayGate = new Promise<void>((resolve) => {
+      resolveDisplay = resolve;
+    });
+    const rawManagerResize = vi.fn();
+    const queuedRendition = {
+      location: undefined as Location | undefined,
+      manager: {
+        isRendered: () => true,
+        resize: rawManagerResize,
+      },
+      q: {
+        running: false,
+        length: () => 0,
+        enqueue: vi.fn((task: () => Promise<void>) => task()),
+      },
+      hooks: { content: { register: vi.fn() } },
+      on: vi.fn(),
+      off: vi.fn(),
+      started: Promise.resolve(),
+      themes: { register: vi.fn(), select: vi.fn() },
+      annotations: { highlight: vi.fn(), remove: vi.fn() },
+      display: vi.fn(() => displayGate),
+      resize: vi.fn((width?: number, height?: number) => {
+        queuedRendition.manager.resize(width, height);
+      }),
+      destroy: vi.fn(),
+    };
+    mockBook.renderTo.mockReturnValueOnce(queuedRendition as unknown as typeof mockRendition);
+
+    const viewport = document.createElement('div');
+    let currentRect = new DOMRect(0, 0, 411, 842);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => currentRect);
+
+    const session = new ReaderSession('book.epub');
+    const openPromise = session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    await Promise.resolve();
+
+    currentRect = new DOMRect(0, 0, 411, 880);
+    queuedRendition.manager.resize();
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 880 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    currentRect = new DOMRect(0, 0, 411, 914);
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 914 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(rawManagerResize).not.toHaveBeenCalled();
+    expect(queuedRendition.resize).not.toHaveBeenCalled();
+
+    resolveDisplay();
+    await openPromise;
+    expect(queuedRendition.resize).not.toHaveBeenCalled();
+
+    const relocated = queuedRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1] as
+      ((value: Location) => void) | undefined;
+    const initialLocation = location('epubcfi(/6/2!/4/2/1:0)');
+    queuedRendition.location = initialLocation;
+    relocated?.(initialLocation);
+
+    await vi.waitFor(() => {
+      expect(queuedRendition.resize).toHaveBeenCalledExactlyOnceWith(411, 914);
+    });
+    expect(rawManagerResize).toHaveBeenCalledExactlyOnceWith(411, 914, undefined);
+    session.destroy();
+  });
+
+  it('keeps userNavigationPending intact when open emits its queued relocated event after next starts', async () => {
+    let resolveNext = () => {};
+    const nextGate = new Promise<void>((resolve) => {
+      resolveNext = resolve;
+    });
+    const queuedRendition = {
+      location: undefined as Location | undefined,
+      q: {
+        running: false,
+        length: () => 0,
+        enqueue: vi.fn((task: () => Promise<void>) => task()),
+      },
+      hooks: { content: { register: vi.fn() } },
+      on: vi.fn(),
+      off: vi.fn(),
+      started: Promise.resolve(),
+      themes: { register: vi.fn(), select: vi.fn() },
+      annotations: { highlight: vi.fn(), remove: vi.fn() },
+      display: vi.fn(async () => {}),
+      next: vi.fn(() => nextGate),
+      resize: vi.fn(),
+      destroy: vi.fn(),
+    };
+    mockBook.renderTo.mockReturnValueOnce(queuedRendition as unknown as typeof mockRendition);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = queuedRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1] as
+      ((value: Location) => void) | undefined;
+
+    const nextPromise = session.next();
+
+    const chapter1Location = {
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    queuedRendition.location = chapter1Location;
+    relocated?.(chapter1Location);
+
+    resolveNext();
+    await nextPromise;
+
+    const chapter2Location = {
+      start: {
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        href: 'second.xhtml',
+        index: 1,
+        percentage: 0.5,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    queuedRendition.location = chapter2Location;
+    relocated?.(chapter2Location);
+
+    expect(onLocation).toHaveBeenCalledTimes(2);
+    expect(onLocation).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)', spineIndex: 0 }),
+      'restore',
+    );
+    expect(onLocation).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)', spineIndex: 1 }),
+      'navigation',
+    );
+    session.destroy();
+  });
 });
