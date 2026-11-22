@@ -318,7 +318,7 @@ it('keeps a failed native progress transaction atomic', async () => {
 it('groups completion and acknowledgement writes separately', async () => {
   const { confirmSync, markBookCompleted } = await import('./database');
 
-  await markBookCompleted(book, readingState);
+  await markBookCompleted(book);
   await confirmSync(book.id, '2026-01-02T00:00:00.000Z', 1, readingState.localUpdatedAt);
 
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
