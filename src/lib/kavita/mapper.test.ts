@@ -151,6 +151,75 @@ it('deduplicates a chapter exposed both flat and inside its volume', () => {
   expect(mapSeriesToBooks('primary', series, detail)).toHaveLength(1);
 });
 
+it('prefers flat collections in order and keeps non-EPUB chapter IDs out of seen', () => {
+  const series = {
+    id: 9,
+    name: 'A Series',
+    libraryId: 1,
+    format: 3,
+    pages: 10,
+    pagesRead: 0,
+    created: '2026-09-05',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: 'cover.png',
+  } satisfies KavitaSeries;
+  const makeChapter = (
+    id: number,
+    titleName: string,
+    overrides: Partial<KavitaSeriesDetail['chapters'][number]> = {},
+  ): KavitaSeriesDetail['chapters'][number] => ({
+    id,
+    title: titleName,
+    titleName,
+    volumeId: 9,
+    pages: 10,
+    pagesRead: 0,
+    summary: '',
+    format: 3,
+    files: [{ id, bytes: 900, extension: '.epub', format: 3 }],
+    writers: [{ name: 'Author One' }, { name: 'Author Two' }],
+    lastReadingProgressUtc: '0001-01-01T00:00:00Z',
+    ...overrides,
+  });
+
+  const detail = {
+    chapters: [
+      makeChapter(90, 'From Chapters'),
+      makeChapter(92, 'Archive Placeholder', {
+        format: 1,
+        files: [{ id: 920, bytes: 500, extension: '.cbz', format: 1 }],
+      }),
+      makeChapter(93, 'Empty Files Placeholder', {
+        files: [{ id: 930, bytes: 500, extension: '.pdf', format: 4 }],
+      }),
+    ],
+    specials: [makeChapter(90, 'From Specials'), makeChapter(91, 'From Specials')],
+    storylineChapters: [
+      makeChapter(91, 'From Storyline'),
+      makeChapter(92, 'EPUB After Non-EPUB Format'),
+    ],
+    volumes: [
+      {
+        id: 9,
+        chapters: [
+          makeChapter(90, 'From Volume'),
+          makeChapter(91, 'From Volume'),
+          makeChapter(93, 'EPUB After Non-EPUB File'),
+        ],
+      },
+    ],
+  } satisfies KavitaSeriesDetail;
+
+  const books = mapSeriesToBooks('primary', series, detail);
+  expect(books.map((book) => [book.chapterId, book.title, book.lastReadAt, book.author])).toEqual([
+    [90, 'From Chapters', null, 'Author One, Author Two'],
+    [91, 'From Specials', null, 'Author One, Author Two'],
+    [92, 'EPUB After Non-EPUB Format', null, 'Author One, Author Two'],
+    [93, 'EPUB After Non-EPUB File', null, 'Author One, Author Two'],
+  ]);
+  expect(books.every((book) => book.remoteReadDateKnown === undefined)).toBe(true);
+});
+
 it('maps the minimized volume-only payload reported in issue #51', () => {
   const series = {
     id: 82,

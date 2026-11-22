@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from '../diagnostics/log';
+import { issue51VolumeDetail } from './fixtures/issue-51-volume-detail';
+import { mapSeriesToBooks } from './mapper';
 import {
   KavitaPayloadError,
   normalizeLibraries,
@@ -8,6 +10,11 @@ import {
   sanitizeEpubFileName,
 } from './normalization';
 
+afterEach(() => {
+  clearDiagnostics();
+  vi.restoreAllMocks();
+});
+
 it.each([null, undefined])(
   'marks a volume with unavailable chapters as incomplete (%s)',
   (chapters) => {
@@ -15,7 +22,6 @@ it.each([null, undefined])(
     expect(normalized).toMatchObject({ incomplete: true, volumes: [] });
   },
 );
-import { mapSeriesToBooks } from './mapper';
 
 function series(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -602,5 +608,184 @@ describe('normalizeSeriesDetail', () => {
     expect(diagnostics).toContain('path=$.chapters[0].files[0].filePath');
     expect(diagnostics).not.toContain('secret-folder');
     expect(diagnostics).not.toContain('invalid-pages');
+  });
+
+  it('reuses clean normalized chapters across collections within one call without sharing across calls', () => {
+    const normalized = normalizeSeriesDetail({
+      chapters: [chapter()],
+      specials: [chapter({ id: '20', volumeId: '10', pages: '80', pagesRead: '25' })],
+      storylineChapters: [chapter()],
+      volumes: [{ id: 10, chapters: [chapter({ volumeId: undefined })] }],
+    });
+
+    const first = normalized.chapters[0]!;
+    expect(normalized.specials[0]).toBe(first);
+    expect(normalized.storylineChapters[0]).toBe(first);
+    expect(normalized.volumes![0]!.chapters[0]).toBe(first);
+
+    const nextCall = normalizeSeriesDetail(detail({ chapters: [chapter()] }));
+    expect(nextCall.chapters[0]).toEqual(first);
+    expect(nextCall.chapters[0]).not.toBe(first);
+  });
+
+  it('re-validates duplicate chapter IDs when fields differ or diagnostics are triggered', () => {
+    clearDiagnostics();
+    const differing = normalizeSeriesDetail({
+      chapters: [chapter({ titleName: 'Flat Edition', pagesRead: 5 })],
+      storylineChapters: [chapter({ titleName: 'Storyline Edition', pagesRead: 12 })],
+      volumes: [
+        { id: 10, chapters: [chapter({ title: null })] },
+        { id: 99, chapters: [chapter({ volumeId: undefined })] },
+      ],
+    });
+
+    expect(differing.chapters[0]!.titleName).toBe('Flat Edition');
+    expect(differing.storylineChapters[0]!.titleName).toBe('Storyline Edition');
+    expect(differing.volumes![0]!.chapters[0]!.title).toBe('');
+    expect(differing.volumes![1]!.chapters[0]!.volumeId).toBe(99);
+    const exported = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+    expect(exported).toContain('path=$.volumes[0].chapters[0].title');
+
+    clearDiagnostics();
+    normalizeSeriesDetail({
+      chapters: [chapter({ pagesRead: undefined })],
+      volumes: [{ id: 10, chapters: [chapter({ pagesRead: undefined })] }],
+    });
+    const repeatedDiagnostics = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+    expect(repeatedDiagnostics).toContain('path=$.chapters[0].pagesRead');
+    expect(repeatedDiagnostics).toContain('path=$.volumes[0].chapters[0].pagesRead');
+  });
+
+  it('preserves exact error paths across collections and skips null diagnostics on rejected payloads', () => {
+    clearDiagnostics();
+    expectPayloadError(
+      () => normalizeSeriesDetail({ chapters: null, volumes: undefined }),
+      '$',
+      'object',
+    );
+    expect(getDiagnosticCount()).toBe(0);
+
+    expectPayloadError(
+      () =>
+        normalizeSeriesDetail({
+          chapters: [chapter()],
+          volumes: [{ id: 10, chapters: [chapter({ files: [{ format: 3 }] })] }],
+        }),
+      '$.volumes[0].chapters[0].files[0].id',
+      'missing',
+    );
+    expectPayloadError(
+      () =>
+        normalizeSeriesDetail({
+          chapters: [chapter()],
+          specials: [chapter({ volumeId: undefined })],
+        }),
+      '$.specials[0].volumeId',
+      'missing',
+    );
+  });
+
+  it('reuses clean multi-EPUB chapters across collections and invalidates cache when file metadata differs', () => {
+    const multiFiles = [
+      {
+        id: 2114,
+        format: 3,
+        bytes: 1955734,
+        pages: 5,
+        extension: '.epub',
+        filePath: '/srv/a/pg16163-images-3.epub',
+      },
+      {
+        id: 2115,
+        format: 3,
+        bytes: 2169759,
+        pages: 4,
+        extension: '.epub',
+        filePath: '/srv/a/Vol-3-Media.epub',
+      },
+    ];
+    const reused = normalizeSeriesDetail({
+      chapters: [chapter({ id: 1406, volumeId: 188, files: multiFiles })],
+      volumes: [
+        {
+          id: 188,
+          chapters: [
+            chapter({
+              id: 1406,
+              volumeId: undefined,
+              files: [
+                { ...multiFiles[0], pages: '5', filePath: 'C:\\Books\\pg16163-images-3.epub' },
+                { ...multiFiles[1], pages: '4', fileName: 'Vol-3-Media.epub', filePath: undefined },
+              ],
+            }),
+          ],
+        },
+      ],
+    });
+    expect(reused.volumes![0]!.chapters[0]).toBe(reused.chapters[0]);
+
+    const differing = normalizeSeriesDetail({
+      chapters: [
+        chapter({
+          id: 1407,
+          volumeId: 188,
+          files: [
+            { id: 2116, format: 3, bytes: 820000, pages: 10, extension: '.epub' },
+            { id: 2117, format: 4, bytes: 9500000, pages: 300, extension: '.pdf' },
+          ],
+        }),
+      ],
+      specials: [
+        chapter({
+          id: 1407,
+          volumeId: 188,
+          files: [{ id: 2116, format: 3, bytes: 820000, pages: 10, extension: '.epub' }],
+        }),
+      ],
+      storylineChapters: [
+        chapter({
+          id: 1407,
+          volumeId: 188,
+          files: [
+            {
+              id: 2116,
+              format: 3,
+              bytes: 820000,
+              pages: 12,
+              extension: '.epub',
+              filePath: '/srv/other.epub',
+            },
+          ],
+        }),
+      ],
+    });
+    expect(differing.chapters[0]!.hasMultipleFiles).toBe(true);
+    expect(differing.specials[0]!.hasMultipleFiles).toBeUndefined();
+    expect(differing.storylineChapters[0]!.files[0]).toMatchObject({
+      pages: 12,
+      fileName: 'other.epub',
+    });
+  });
+
+  it('short-circuits Kavita unread sentinel timestamps without calling Date.parse', () => {
+    const parseSpy = vi.spyOn(Date, 'parse');
+
+    const normalizedDetail = normalizeSeriesDetail({
+      ...issue51VolumeDetail,
+      specials: [chapter({ id: 99, lastReadingProgressUtc: '0001-01-01T00:00:00Z' })],
+    });
+    const normalizedSeries = normalizeSeriesPage([
+      series({
+        created: '0001-01-01T00:00:00',
+        latestReadDate: '0001-01-01T00:00:00Z',
+      }),
+    ]);
+
+    expect(parseSpy).not.toHaveBeenCalled();
+    expect(normalizedDetail.volumes![0]!.chapters[0]!.lastReadingProgressUtc).toBe(
+      '0001-01-01T00:00:00',
+    );
+    expect(normalizedDetail.specials[0]!.lastReadingProgressUtc).toBe('0001-01-01T00:00:00Z');
+    expect(normalizedSeries[0]!.latestReadDate).toBe('0001-01-01T00:00:00Z');
   });
 });

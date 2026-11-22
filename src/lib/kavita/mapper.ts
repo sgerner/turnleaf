@@ -12,39 +12,35 @@ export function mapSeriesToBooks(
   // Keep flat arrays first so their representation wins if Kavita exposes the
   // same chapter both flat and nested. IDs include the chapter ID, so existing
   // local records remain matched regardless of this ordering.
-  const chapters = [
-    ...detail.chapters,
-    ...detail.specials,
-    ...detail.storylineChapters,
-    ...(detail.volumes ?? []).flatMap((volume) => volume.chapters),
-  ];
   const seen = new Set<number>();
-  const books = chapters
-    .filter(isEpubChapter)
-    .filter((chapter) => {
-      if (seen.has(chapter.id)) return false;
-      seen.add(chapter.id);
-      return true;
-    })
-    .flatMap((chapter) => mapChapterToBooks(serverId, series, chapter));
+  const books: BookRecord[] = [];
+  const appendChapters = (chapters: KavitaChapter[]): void => {
+    for (const chapter of chapters) {
+      if (seen.has(chapter.id)) continue;
+      if (chapter.format !== undefined && chapter.format !== null && chapter.format !== 3) continue;
+      let epubIndex = 0;
+      const multiFileChapter = Boolean(chapter.hasMultipleFiles) || chapter.files.length > 1;
+      for (const file of chapter.files) {
+        if (!isEpubFile(file)) continue;
+        if (epubIndex === 0) seen.add(chapter.id);
+        books.push(mapFileToBook(serverId, series, chapter, file, epubIndex, multiFileChapter));
+        epubIndex += 1;
+      }
+    }
+  };
+  appendChapters(detail.chapters);
+  appendChapters(detail.specials);
+  appendChapters(detail.storylineChapters);
+  if (detail.volumes) {
+    for (const volume of detail.volumes) {
+      appendChapters(volume.chapters);
+    }
+  }
   disambiguateDuplicateTitles(books);
   if (books.length > 1 && series.name) {
     for (const book of books) book.series = series.name;
   }
   return books;
-}
-
-function mapChapterToBooks(
-  serverId: string,
-  series: KavitaSeries,
-  chapter: KavitaChapter,
-): BookRecord[] {
-  const epubFiles = chapter.files.filter(isEpubFile);
-  if (!epubFiles.length) throw new Error('An EPUB chapter did not include an EPUB file.');
-  const multiFileChapter = Boolean(chapter.hasMultipleFiles) || chapter.files.length > 1;
-  return epubFiles.map((file, epubIndex) =>
-    mapFileToBook(serverId, series, chapter, file, epubIndex, multiFileChapter),
-  );
 }
 
 function mapFileToBook(
@@ -56,11 +52,18 @@ function mapFileToBook(
   multiFileChapter: boolean,
 ): BookRecord {
   const isPrimary = epubIndex === 0;
+  const writers = chapter.writers;
+  const author =
+    writers.length === 0
+      ? null
+      : writers.length === 1
+        ? writers[0]!.name || null
+        : writers.map((writer) => writer.name).join(', ') || null;
   const pages = resolveFilePages(series, chapter, file, multiFileChapter);
   const rawPagesRead = chapter.pagesRead ?? 0;
   const pagesRead = isPrimary ? (pages > 0 ? Math.min(pages, rawPagesRead) : rawPagesRead) : 0;
   const fileName = sanitizeEpubFileName(file.fileName);
-  return {
+  const record: BookRecord = {
     id: isPrimary
       ? `${serverId}:${series.id}:${chapter.id}`
       : `${serverId}:${series.id}:${chapter.id}:${file.id}`,
@@ -72,22 +75,13 @@ function mapFileToBook(
     fileId: file.id,
     fileName,
     title: chapter.titleName || chapter.title || series.name || `Book ${chapter.id}`,
-    author: chapter.writers.map((writer) => writer.name).join(', ') || null,
+    author,
     series:
       chapter.titleName && series.name && chapter.titleName !== series.name ? series.name : null,
     descriptionHtml: chapter.summary || null,
     format: 'epub',
     pages,
     pagesRead,
-    ...(isPrimary
-      ? {
-          ...(chapter.pagesRead === undefined ? { remoteProgressKnown: false } : {}),
-          ...(!chapter.lastReadingProgressUtc ? { remoteReadDateKnown: false } : {}),
-        }
-      : {
-          remoteProgressKnown: false,
-          remoteReadDateKnown: false,
-        }),
     createdAt: series.created,
     lastReadAt: isPrimary ? lastReadAt(chapter) : null,
     downloadPath: null,
@@ -99,6 +93,14 @@ function mapFileToBook(
     syncProgress: isPrimary,
     remoteAvailable: true,
   };
+  if (!isPrimary) {
+    record.remoteProgressKnown = false;
+    record.remoteReadDateKnown = false;
+  } else {
+    if (chapter.pagesRead === undefined) record.remoteProgressKnown = false;
+    if (!chapter.lastReadingProgressUtc) record.remoteReadDateKnown = false;
+  }
+  return record;
 }
 
 function resolveFilePages(
@@ -119,6 +121,7 @@ function fileDisplayStem(fileName: string | null | undefined): string {
 }
 
 function disambiguateDuplicateTitles(books: BookRecord[]): void {
+  if (books.length < 2) return;
   const groups = new Map<string, BookRecord[]>();
   for (const book of books) {
     const group = groups.get(book.title);
@@ -148,13 +151,6 @@ function lastReadAt(chapter: KavitaChapter): string | null {
   return !value || value.startsWith(EMPTY_DATE) ? null : value;
 }
 
-function isEpubChapter(chapter: KavitaChapter): boolean {
-  return (
-    (chapter.format === undefined || chapter.format === null || chapter.format === 3) &&
-    chapter.files.some(isEpubFile)
-  );
-}
-
-function isEpubFile(file: KavitaChapter['files'][number]): boolean {
+function isEpubFile(file: KavitaFile): boolean {
   return file.format === 3 || file.extension?.toLowerCase() === '.epub';
 }
