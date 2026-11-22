@@ -1,8 +1,13 @@
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildXcodeSimulatorArgs,
   defaultSpmCacheDir,
+  extractXcodeErrors,
+  runXcodeBuild,
   shouldCleanXcodeBuild,
+  shouldSkipIosSync,
   verifyBuiltSimulatorApp,
 } from './ios-simulator-build.mjs';
 import {
@@ -39,7 +44,7 @@ let package = Package(
     name: "CapApp-SPM",
     platforms: [.iOS(.v15)],
     dependencies: [
-        .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", exact: "8.6.0")
+        .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", exact: "8.6.2")
     ]
 )
 `;
@@ -93,7 +98,7 @@ describe('iOS sync and manifest validation', () => {
   it('passes when Package.swift, MARKETING_VERSION, and PrivacyInfo.xcprivacy match', () => {
     const result = validateIosManifests({
       packageVersion: '0.3.5',
-      capacitorIosVersion: '8.6.0',
+      capacitorIosVersion: '8.6.2',
       packageSwiftContent: samplePackageSwift,
       pbxprojContent: samplePbxproj,
       infoPlistContent: sampleInfoPlist,
@@ -110,8 +115,8 @@ describe('iOS sync and manifest validation', () => {
     );
     const result = validateIosManifests({
       packageVersion: '0.3.5',
-      capacitorIosVersion: '8.6.0',
-      packageSwiftContent: samplePackageSwift.replace('8.6.0', '8.4.1'),
+      capacitorIosVersion: '8.6.2',
+      packageSwiftContent: samplePackageSwift.replace('8.6.2', '8.4.1'),
       pbxprojContent: withoutPrivacyInResources.replaceAll('0.3.5', '0.3.3'),
       infoPlistContent: sampleInfoPlist,
       privacyManifestExists: true,
@@ -120,7 +125,7 @@ describe('iOS sync and manifest validation', () => {
 
     expect(result.ok).toBe(false);
     expect(result.errors).toEqual([
-      'ios/App/CapApp-SPM/Package.swift pins capacitor-swift-pm to 8.4.1, expected 8.6.0 from @capacitor/ios.',
+      'ios/App/CapApp-SPM/Package.swift pins capacitor-swift-pm to 8.4.1, expected 8.6.2 from @capacitor/ios.',
       'ios/App/App.xcodeproj/project.pbxproj MARKETING_VERSION (0.3.3, 0.3.3) does not match package.json version 0.3.5.',
       'ios/App/App.xcodeproj/project.pbxproj omits PrivacyInfo.xcprivacy from PBXResourcesBuildPhase target resources.',
     ]);
@@ -140,6 +145,8 @@ describe('iOS simulator build helpers', () => {
     );
     expect(shouldCleanXcodeBuild({ TURNLEAF_XCODE_CLEAN: 'true' })).toBe(true);
     expect(shouldCleanXcodeBuild({})).toBe(false);
+    expect(shouldSkipIosSync({ TURNLEAF_SKIP_IOS_SYNC: 'true' })).toBe(true);
+    expect(shouldSkipIosSync({})).toBe(false);
 
     expect(
       buildXcodeSimulatorArgs({
@@ -164,6 +171,51 @@ describe('iOS simulator build helpers', () => {
       'CODE_SIGNING_ALLOWED=NO',
       'clean',
       'build',
+    ]);
+  });
+
+  it('extracts compiler errors and emits GitHub Actions annotations when xcodebuild fails', async () => {
+    expect(
+      extractXcodeErrors([
+        'Build settings from command line:',
+        'SwiftCompile normal arm64 TurnleafBridgeViewController.swift',
+        '/repo/ios/App/App/TurnleafBridgeViewController.swift:22:45: error: inaccessible due to private protection level',
+        '** BUILD FAILED **',
+      ]),
+    ).toEqual([
+      '/repo/ios/App/App/TurnleafBridgeViewController.swift:22:45: error: inaccessible due to private protection level',
+    ]);
+
+    const annotations = [];
+    const stdoutSink = new PassThrough();
+    const stderrSink = new PassThrough();
+    const spawnImpl = vi.fn(() => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      queueMicrotask(() => {
+        child.stdout.write('SwiftCompile normal arm64 TurnleafBridgeViewController.swift\n');
+        child.stderr.write(
+          '/repo/ios/App/App/TurnleafBridgeViewController.swift:22:45: error: inaccessible due to private protection level\n** BUILD FAILED **\n',
+        );
+        child.emit('close', 65, null);
+      });
+      return child;
+    });
+
+    await expect(
+      runXcodeBuild(['build'], {
+        cwd: '/repo',
+        env: { GITHUB_ACTIONS: 'true' },
+        spawnImpl,
+        stdout: stdoutSink,
+        stderr: stderrSink,
+        onErrorAnnotation: (annotation) => annotations.push(annotation),
+      }),
+    ).rejects.toThrow('xcodebuild exited with code 65');
+
+    expect(annotations).toEqual([
+      '::error title=xcodebuild simulator build failed::/repo/ios/App/App/TurnleafBridgeViewController.swift:22:45: error: inaccessible due to private protection level',
     ]);
   });
 

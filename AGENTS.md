@@ -6,7 +6,6 @@
 - Keep the `## Unreleased` section current.
 - A local git hook amends each commit with a `RELEASE_NOTES.md` update from the commit subject when hooks are installed.
 - Use `npm run release:notes` to extract the release body for GitHub releases.
-- Run `npm run verify` for web security audit, formatting, lint, type checks, unit tests, and production build.
 - Run `npm run ios:sync` after Capacitor, dependency, or version changes to update `ios/App/CapApp-SPM/Package.swift` and `MARKETING_VERSION`, and run `npm run ios:check` to verify zero iOS manifest or git drift.
 - On macOS with Xcode installed, run `npm run ios:simulator` to compile the unsigned iPhone Simulator `App.app` bundle and verify `PrivacyInfo.xcprivacy` and `CFBundleShortVersionString`.
 - Keep changes small and explicit; do not add abstractions unless they solve a real problem.
