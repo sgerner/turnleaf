@@ -125,7 +125,7 @@ jobs:
       - name: Cache Android AVD snapshot
         if: steps.release_preflight.outputs.already_released != 'true'
         id: avd-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.android/avd/*
@@ -134,7 +134,7 @@ jobs:
 
       - name: Create AVD and generate snapshot for caching
         if: steps.release_preflight.outputs.already_released != 'true' && steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 36
           target: google_apis
