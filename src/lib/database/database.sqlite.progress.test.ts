@@ -528,4 +528,217 @@ describe('native progress transactions against SQLite', () => {
     await expect(reopened.openDatabase()).resolves.toBeDefined();
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
   });
+
+  it('persists server_page_num and server_xpath on sync and preserves baseline across local saves', async () => {
+    const database = await importDatabase();
+    const { flushProgress } = await import('../sync/sync');
+    const { chooseOpenProgress } = await import('../sync/conflict');
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+    await database.saveLocalProgress(
+      book,
+      'epubcfi(/6/4!/4/2/1:0)',
+      '//body/DocFragment[2]/body/p[1]',
+      0.25,
+    );
+
+    const saveProgress = vi.fn().mockResolvedValue(undefined);
+    await flushProgress({ saveProgress } as never, server.id);
+
+    const rawRow = native.database
+      ?.prepare(
+        'SELECT server_page_num, server_xpath, pending_sync FROM reading_state WHERE book_id=?',
+      )
+      .get(book.id);
+    expect(rawRow).toEqual({
+      server_page_num: 25,
+      server_xpath: '//body/DocFragment[2]/body/p[1]',
+      pending_sync: 0,
+    });
+
+    const synced = await database.getReadingState(book.id);
+    expect(synced).toMatchObject({
+      xpath: '//body/DocFragment[2]/body/p[1]',
+      serverPageNum: 25,
+      serverXPath: '//body/DocFragment[2]/body/p[1]',
+      pendingSync: false,
+    });
+
+    await database.saveLocalProgress(
+      book,
+      'epubcfi(/6/6!/4/2/1:0)',
+      '//body/DocFragment[3]/body/p[4]',
+      0.5,
+    );
+    const advanced = await database.getReadingState(book.id);
+    expect(advanced).toMatchObject({
+      cfi: 'epubcfi(/6/6!/4/2/1:0)',
+      xpath: '//body/DocFragment[3]/body/p[4]',
+      serverPageNum: 25,
+      serverXPath: '//body/DocFragment[2]/body/p[1]',
+      pendingSync: true,
+    });
+
+    expect(
+      chooseOpenProgress(
+        advanced,
+        { pageNum: 25, bookScrollId: '//body/DocFragment[2]/body/p[1]' },
+        book.pages,
+        false,
+      ),
+    ).toBe('local');
+    expect(
+      chooseOpenProgress(
+        advanced,
+        { pageNum: 60, bookScrollId: '//body/DocFragment[6]/body/p[2]' },
+        book.pages,
+        false,
+      ),
+    ).toBe('conflict');
+  });
+
+  it('removes synced reading_state rows on zero-pagesRead catalog refresh while preserving pending offline rows', async () => {
+    const database = await importDatabase();
+    const { flushProgress } = await import('../sync/sync');
+    const pendingBook = { ...book, id: 'server:1:11', chapterId: 11 };
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book, pendingBook]);
+
+    await database.saveLocalProgress(book, 'synced-cfi', '//body/DocFragment[2]/body/p[1]', 0.3);
+    await flushProgress({ saveProgress: vi.fn().mockResolvedValue(undefined) } as never, server.id);
+    await database.saveLocalProgress(
+      pendingBook,
+      'offline-cfi',
+      '//body/DocFragment[4]/body/p[2]',
+      0.4,
+    );
+
+    await database.reconcileBooks(server.id, [
+      { ...book, pagesRead: 0, remoteProgressKnown: true },
+      { ...pendingBook, pagesRead: 0, remoteProgressKnown: true },
+    ]);
+
+    expect(await database.getReadingState(book.id)).toBeNull();
+    expect(
+      (await database.getBooks(server.id)).find((item) => item.id === book.id)?.pagesRead,
+    ).toBe(0);
+    expect(await database.getReadingState(pendingBook.id)).toMatchObject({
+      cfi: 'offline-cfi',
+      pendingSync: true,
+    });
+    expect(await database.getPendingSync(server.id)).toMatchObject([{ bookId: pendingBook.id }]);
+  });
+
+  it('stores percentage 1 when adopting remote completion and returns local on subsequent reopen', async () => {
+    const database = await importDatabase();
+    const { chooseOpenProgress } = await import('../sync/conflict');
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+
+    const completedRemote = {
+      libraryId: book.libraryId,
+      seriesId: book.seriesId,
+      volumeId: book.volumeId,
+      chapterId: book.chapterId,
+      pageNum: book.pages,
+      bookScrollId: '//body/DocFragment[10]/body/p[8]',
+      lastModifiedUtc: '2026-01-03T00:00:00.000Z',
+    };
+
+    expect(await database.saveRemoteProgress(book, completedRemote, null)).toBe(true);
+    const saved = await database.getReadingState(book.id);
+    expect(saved).toMatchObject({
+      percentage: 1,
+      serverPageNum: book.pages,
+      serverXPath: completedRemote.bookScrollId,
+      pendingSync: false,
+    });
+    expect(chooseOpenProgress(saved, completedRemote, book.pages, true)).toBe('local');
+    expect(chooseOpenProgress(saved, completedRemote, book.pages, false)).toBe('local');
+
+    await database.saveLocalProgress(book, 'partial-cfi', '//body/DocFragment[3]/body/p[1]', 0.3);
+    const pending = await database.getReadingState(book.id);
+    expect(
+      await database.acceptRemoteProgress(
+        book,
+        completedRemote,
+        pending!.syncRevision!,
+        pending!.localUpdatedAt,
+      ),
+    ).toBe(true);
+    const accepted = await database.getReadingState(book.id);
+    expect(accepted).toMatchObject({
+      percentage: 1,
+      serverPageNum: book.pages,
+      serverXPath: completedRemote.bookScrollId,
+      pendingSync: false,
+    });
+    expect(chooseOpenProgress(accepted, completedRemote, book.pages, true)).toBe('local');
+  });
+
+  it('backfills missing baselines for synced version-7 books during migration without touching pending books', async () => {
+    const updatedAt = '2026-01-01T00:00:00.000Z';
+    native.database = new DatabaseSync(native.databasePath);
+    native.database.exec(`
+      CREATE TABLE books (
+        id TEXT PRIMARY KEY NOT NULL,
+        server_id TEXT NOT NULL,
+        library_id INTEGER NOT NULL DEFAULT 0,
+        series_id INTEGER NOT NULL DEFAULT 0,
+        volume_id INTEGER NOT NULL DEFAULT 0,
+        chapter_id INTEGER NOT NULL DEFAULT 0,
+        pages_read INTEGER NOT NULL DEFAULT 0,
+        last_read_at TEXT,
+        remote_available INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE TABLE reading_state (
+        book_id TEXT PRIMARY KEY NOT NULL,
+        cfi TEXT NOT NULL,
+        kavita_xpath TEXT,
+        percentage REAL NOT NULL,
+        local_updated_at TEXT NOT NULL,
+        synced_local_updated_at TEXT,
+        server_page_num INTEGER,
+        server_xpath TEXT,
+        server_updated_at TEXT,
+        pending_sync INTEGER NOT NULL DEFAULT 0,
+        sync_revision INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE sync_queue (
+        book_id TEXT PRIMARY KEY NOT NULL,
+        payload_json TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO books(id,server_id,pages_read,last_read_at)
+        VALUES ('server:1:10','server',35,'${updatedAt}'),
+               ('server:1:11','server',60,'${updatedAt}');
+      INSERT INTO reading_state(
+        book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,server_updated_at,pending_sync,sync_revision
+      ) VALUES
+        ('server:1:10','synced-cfi','//body/DocFragment[3]/body/p[5]',0.35,'${updatedAt}','${updatedAt}','${updatedAt}',0,2),
+        ('server:1:11','pending-cfi','//body/DocFragment[6]/body/p[1]',0.6,'${updatedAt}',NULL,NULL,1,1);
+      INSERT INTO sync_queue(book_id,payload_json,created_at,updated_at,revision)
+        VALUES ('server:1:11','{"pageNum":60}','${updatedAt}','${updatedAt}',1);
+      PRAGMA user_version = 7;
+    `);
+
+    const database = await importDatabase();
+    expect(await database.getReadingState('server:1:10')).toMatchObject({
+      cfi: 'synced-cfi',
+      serverPageNum: 35,
+      serverXPath: '//body/DocFragment[3]/body/p[5]',
+      pendingSync: false,
+    });
+    expect(await database.getReadingState('server:1:11')).toMatchObject({
+      cfi: 'pending-cfi',
+      serverPageNum: null,
+      serverXPath: null,
+      pendingSync: true,
+    });
+  });
 });

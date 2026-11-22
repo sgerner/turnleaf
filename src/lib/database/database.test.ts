@@ -7,10 +7,12 @@ import {
   confirmSync,
   getBooks,
   getPendingSync,
+  getReadingState,
   getSyncStatus,
   reconcileBooks,
   replaceBooksInTransaction,
   saveLocalProgress,
+  saveRemoteProgress,
   type BookRecord,
 } from './database';
 
@@ -885,4 +887,88 @@ it('accepts the selected browser server progress and drops only the displayed lo
   const newer = await getPendingSync('server');
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
+});
+
+it('persists browser baselines across sync and local saves, clears synced unread state on refresh, and stores completion percentage 1', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await saveLocalProgress(existingBook, 'cfi-1', '//body/DocFragment[2]/body/p[1]', 0.3);
+  const queued = (await getPendingSync('server'))[0]!;
+  await confirmSync(
+    existingBook.id,
+    '2026-09-07T00:00:02.000Z',
+    queued.revision,
+    queued.updatedAt,
+    {
+      pageNum: 30,
+      bookScrollId: '//body/DocFragment[2]/body/p[1]',
+    },
+  );
+
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: 'cfi-1',
+    serverPageNum: 30,
+    serverXPath: '//body/DocFragment[2]/body/p[1]',
+    pendingSync: false,
+  });
+
+  await saveLocalProgress(existingBook, 'cfi-2', '//body/DocFragment[3]/body/p[4]', 0.5);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: 'cfi-2',
+    serverPageNum: 30,
+    serverXPath: '//body/DocFragment[2]/body/p[1]',
+    pendingSync: true,
+  });
+
+  await reconcileBooks('server', [{ ...existingBook, pagesRead: 0, remoteProgressKnown: true }]);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: 'cfi-2',
+    pendingSync: true,
+  });
+
+  const secondQueued = (await getPendingSync('server'))[0]!;
+  await confirmSync(
+    existingBook.id,
+    '2026-09-07T00:00:05.000Z',
+    secondQueued.revision,
+    secondQueued.updatedAt,
+    { pageNum: 50, bookScrollId: '//body/DocFragment[3]/body/p[4]' },
+  );
+  await reconcileBooks('server', [{ ...existingBook, pagesRead: 0, remoteProgressKnown: true }]);
+  await expect(getReadingState(existingBook.id)).resolves.toBeNull();
+
+  await expect(
+    saveRemoteProgress(
+      existingBook,
+      {
+        libraryId: existingBook.libraryId,
+        seriesId: existingBook.seriesId,
+        volumeId: existingBook.volumeId,
+        chapterId: existingBook.chapterId,
+        pageNum: existingBook.pages,
+        bookScrollId: '//body/DocFragment[9]/body/p[2]',
+      },
+      null,
+    ),
+  ).resolves.toBe(true);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    percentage: 1,
+    serverPageNum: existingBook.pages,
+    serverXPath: '//body/DocFragment[9]/body/p[2]',
+    pendingSync: false,
+  });
 });

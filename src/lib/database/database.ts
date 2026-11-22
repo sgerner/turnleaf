@@ -132,20 +132,37 @@ function readBrowserState(): BrowserDatabaseState {
         }))
       : [];
     const booksById = new Map(books.map((book) => [book.id, book]));
+    const syncQueue = Object.fromEntries(
+      Object.entries(parsed.syncQueue ?? {}).map(([bookId, row]) => [
+        bookId,
+        {
+          ...row,
+          serverId: row.serverId ?? booksById.get(bookId)?.serverId ?? '',
+          revision: Number(row.revision ?? 0),
+        },
+      ]),
+    );
+    const readingState = Object.fromEntries(
+      Object.entries(parsed.readingState ?? {}).map(([bookId, entry]) => {
+        if (!entry.pendingSync && !syncQueue[bookId] && entry.serverPageNum === undefined) {
+          return [
+            bookId,
+            {
+              ...entry,
+              serverPageNum: booksById.get(bookId)?.pagesRead ?? 0,
+              serverXPath:
+                entry.serverXPath !== undefined ? entry.serverXPath : (entry.xpath ?? null),
+            },
+          ];
+        }
+        return [bookId, entry];
+      }),
+    );
     return {
       serverConfig: parsed.serverConfig ?? null,
       books,
-      readingState: parsed.readingState ?? {},
-      syncQueue: Object.fromEntries(
-        Object.entries(parsed.syncQueue ?? {}).map(([bookId, row]) => [
-          bookId,
-          {
-            ...row,
-            serverId: row.serverId ?? booksById.get(bookId)?.serverId ?? '',
-            revision: Number(row.revision ?? 0),
-          },
-        ]),
-      ),
+      readingState,
+      syncQueue,
       preferences: parsed.preferences ?? {},
     };
   } catch {
@@ -333,16 +350,20 @@ export async function reconcileBooks(
           )
           .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
     const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
+    const nextReadingState = { ...state.readingState };
     const merged = [...incoming.values()].map((book) => {
       const previous = existingById.get(book.id);
-      if (!previous) return { ...book, remoteAvailable: true };
-      const reading = state.readingState[book.id];
+      const reading = nextReadingState[book.id];
       const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
       const changedDuringRefresh =
-        reading &&
-        (Date.parse(reading.localUpdatedAt) >= began ||
-          Date.parse(reading.serverUpdatedAt ?? '') >= began);
+        Boolean(reading) &&
+        (Date.parse(reading!.localUpdatedAt) >= began ||
+          Date.parse(reading!.serverUpdatedAt ?? '') >= began);
       const preserveProgress = pending || changedDuringRefresh || unknownProgress.has(book.id);
+      if (!preserveProgress && book.pagesRead <= 0) {
+        delete nextReadingState[book.id];
+      }
+      if (!previous) return { ...book, remoteAvailable: true };
       const preserveReadDate = preserveProgress || unknownReadDate.has(book.id);
       return {
         ...withoutRemoteProgressMarkers(previous),
@@ -356,6 +377,7 @@ export async function reconcileBooks(
         lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
       };
     });
+    state.readingState = nextReadingState;
     state.books = [
       ...state.books.filter((book) => book.serverId !== serverId),
       ...merged,
@@ -460,6 +482,21 @@ const retainedBookCondition = `(download_path IS NOT NULL OR download_status='av
   OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id)
   OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
 
+function clearUnreadReadingStateTask(
+  bookId: string,
+  snapshotStartedAt: string | null = null,
+): capTask {
+  return {
+    statement: `DELETE FROM reading_state WHERE book_id=? AND pending_sync=0
+      AND (? IS NULL OR (
+        julianday(local_updated_at)<julianday(?) AND
+        (server_updated_at IS NULL OR julianday(server_updated_at)<julianday(?))
+      ))
+      AND NOT EXISTS (SELECT 1 FROM sync_queue WHERE book_id=?)`,
+    values: [bookId, snapshotStartedAt, snapshotStartedAt, snapshotStartedAt, bookId],
+  };
+}
+
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
 export async function reconcileBooksInTransaction(
   db: Pick<SQLiteDBConnection, 'executeTransaction'>,
@@ -480,6 +517,9 @@ export async function reconcileBooksInTransaction(
     tasks.push(
       replaceBookTask(serverId, { ...book, remoteAvailable: true }, refreshedAt, snapshotStartedAt),
     );
+    if (book.pagesRead <= 0 && book.remoteProgressKnown !== false) {
+      tasks.push(clearUnreadReadingStateTask(book.id, snapshotStartedAt));
+    }
   }
   if (!preserveMissing) {
     tasks.push({
@@ -556,6 +596,8 @@ export interface StoredReadingState {
   percentage: number;
   localUpdatedAt: string;
   syncedLocalUpdatedAt: string | null;
+  serverPageNum?: number | null;
+  serverXPath?: string | null;
   serverUpdatedAt: string | null;
   pendingSync: boolean;
   /** Monotonic reading revision, retained after the queue row is acknowledged. */
@@ -616,6 +658,8 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
     if (!readingState) return null;
     return {
       ...readingState,
+      serverPageNum: readingState.serverPageNum ?? null,
+      serverXPath: readingState.serverXPath ?? null,
       syncRevision: Math.max(
         Number(readingState.syncRevision ?? 0),
         Number(state.syncQueue[bookId]?.revision ?? 0),
@@ -631,6 +675,8 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
     percentage: Number(row.percentage),
     localUpdatedAt: String(row.local_updated_at),
     syncedLocalUpdatedAt: row.synced_local_updated_at ? String(row.synced_local_updated_at) : null,
+    serverPageNum: row.server_page_num == null ? null : Number(row.server_page_num),
+    serverXPath: row.server_xpath ? String(row.server_xpath) : null,
     serverUpdatedAt: row.server_updated_at ? String(row.server_updated_at) : null,
     pendingSync: Number(row.pending_sync) === 1,
     syncRevision: Number(row.sync_revision ?? 0),
@@ -653,13 +699,16 @@ export async function saveLocalProgress(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
           Number(state.syncQueue[book.id]?.revision ?? 0),
         ) + 1;
+      const previous = state.readingState[book.id];
       state.readingState[book.id] = {
         cfi,
         xpath,
         percentage,
         localUpdatedAt: now,
-        syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
-        serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
+        syncedLocalUpdatedAt: previous?.syncedLocalUpdatedAt ?? null,
+        serverPageNum: previous?.serverPageNum ?? null,
+        serverXPath: previous?.serverXPath ?? null,
+        serverUpdatedAt: previous?.serverUpdatedAt ?? null,
         pendingSync: true,
         syncRevision,
       };
@@ -741,13 +790,16 @@ export async function markBookCompleted(
             }
           : item,
       );
+      const previous = state.readingState[book.id] ?? readingState;
       state.readingState[book.id] = {
         cfi: '',
         xpath: null,
         percentage: 1,
         localUpdatedAt: now,
-        syncedLocalUpdatedAt: readingState?.syncedLocalUpdatedAt ?? null,
-        serverUpdatedAt: readingState?.serverUpdatedAt ?? null,
+        syncedLocalUpdatedAt: previous?.syncedLocalUpdatedAt ?? null,
+        serverPageNum: previous?.serverPageNum ?? null,
+        serverXPath: previous?.serverXPath ?? null,
+        serverUpdatedAt: previous?.serverUpdatedAt ?? null,
         pendingSync: true,
         syncRevision,
       };
@@ -895,6 +947,12 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   };
 }
 
+function remoteProgressPercentage(pageNum: number, totalPages: number): number {
+  if (totalPages <= 0 || pageNum <= 0) return 0;
+  if (pageNum >= totalPages) return 1;
+  return Math.min(0.999, pageNum / totalPages);
+}
+
 export async function saveRemoteProgress(
   book: BookRecord,
   remote: KavitaProgress,
@@ -903,12 +961,15 @@ export async function saveRemoteProgress(
   const now = new Date().toISOString();
   const serverUpdatedAt = remote.lastModifiedUtc ?? now;
   const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+  const xpath = remote.bookScrollId ?? null;
   const next: StoredReadingState = {
     cfi: '',
-    xpath: remote.bookScrollId ?? null,
-    percentage: book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0,
+    xpath,
+    percentage: remoteProgressPercentage(remote.pageNum, book.pages),
     localUpdatedAt: now,
     syncedLocalUpdatedAt: now,
+    serverPageNum: remote.pageNum,
+    serverXPath: xpath,
     serverUpdatedAt,
     pendingSync: false,
     syncRevision: (expected?.syncRevision ?? 0) + 1,
@@ -982,7 +1043,7 @@ export async function acceptRemoteProgress(
 ): Promise<boolean> {
   const now = new Date().toISOString();
   const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const percentage = book.pages > 0 ? Math.max(0, Math.min(0.999, remote.pageNum / book.pages)) : 0;
+  const percentage = remoteProgressPercentage(remote.pageNum, book.pages);
   const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
   const xpath = remote.bookScrollId ?? null;
 
@@ -1008,6 +1069,8 @@ export async function acceptRemoteProgress(
         percentage,
         localUpdatedAt: now,
         syncedLocalUpdatedAt: now,
+        serverPageNum: remote.pageNum,
+        serverXPath: xpath,
         serverUpdatedAt,
         pendingSync: false,
         syncRevision: expectedRevision,
@@ -1073,26 +1136,67 @@ export async function acceptRemoteProgress(
   );
 }
 
+export interface AcknowledgedSyncBaseline {
+  pageNum: number;
+  bookScrollId?: string | null;
+}
+
+function parseBaselineFromPayload(
+  payloadJson: string | undefined,
+  fallbackPageNum: number | null,
+  fallbackXPath: string | null,
+): { serverPageNum: number | null; serverXPath: string | null } {
+  if (payloadJson) {
+    try {
+      const parsed = JSON.parse(payloadJson) as Record<string, unknown>;
+      const pageNum =
+        typeof parsed.pageNum === 'number' && Number.isFinite(parsed.pageNum)
+          ? parsed.pageNum
+          : fallbackPageNum;
+      const bookScrollId =
+        typeof parsed.bookScrollId === 'string'
+          ? parsed.bookScrollId
+          : parsed.bookScrollId === null
+            ? null
+            : fallbackXPath;
+      return { serverPageNum: pageNum, serverXPath: bookScrollId };
+    } catch {
+      // Fall back to saved reading state if payload JSON cannot be parsed.
+    }
+  }
+  return { serverPageNum: fallbackPageNum, serverXPath: fallbackXPath };
+}
+
 export async function confirmSync(
   bookId: string,
   serverUpdatedAt: string,
   expectedRevision: number,
   expectedUpdatedAt: string,
+  baseline?: AcknowledgedSyncBaseline,
 ): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
-      if (
-        state.syncQueue[bookId]?.revision !== expectedRevision ||
-        state.syncQueue[bookId]?.updatedAt !== expectedUpdatedAt
-      ) {
+      const queued = state.syncQueue[bookId];
+      if (queued?.revision !== expectedRevision || queued?.updatedAt !== expectedUpdatedAt) {
         return false;
       }
       delete state.syncQueue[bookId];
-      if (state.readingState[bookId]) {
+      const current = state.readingState[bookId];
+      if (current) {
+        const fallbackBook = state.books.find((item) => item.id === bookId);
+        const resolved = baseline
+          ? { serverPageNum: baseline.pageNum, serverXPath: baseline.bookScrollId ?? null }
+          : parseBaselineFromPayload(
+              queued.payloadJson,
+              fallbackBook?.pagesRead ?? current.serverPageNum ?? null,
+              current.xpath,
+            );
         state.readingState[bookId] = {
-          ...state.readingState[bookId],
+          ...current,
           pendingSync: false,
           syncedLocalUpdatedAt: expectedUpdatedAt,
+          serverPageNum: resolved.serverPageNum,
+          serverXPath: resolved.serverXPath,
           serverUpdatedAt,
           syncRevision: expectedRevision,
         };
@@ -1101,13 +1205,20 @@ export async function confirmSync(
     return;
   }
   const db = await openDatabase();
+  const hasBaseline = baseline !== undefined ? 1 : 0;
   await executeNativeTransaction(db, [
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=?,
+        server_page_num=CASE WHEN ? THEN ? ELSE (SELECT pages_read FROM books WHERE id=reading_state.book_id) END,
+        server_xpath=CASE WHEN ? THEN ? ELSE reading_state.kavita_xpath END,
         server_updated_at=? WHERE book_id=? AND local_updated_at=?
         AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?)`,
       values: [
         expectedUpdatedAt,
+        hasBaseline,
+        baseline?.pageNum ?? null,
+        hasBaseline,
+        baseline?.bookScrollId ?? null,
         serverUpdatedAt,
         bookId,
         expectedUpdatedAt,

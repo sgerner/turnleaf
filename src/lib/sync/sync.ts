@@ -31,8 +31,12 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
     for (const item of pending) {
       attempted.set(item.bookId, item);
       try {
-        await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
-        await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
+        const progress = JSON.parse(item.payload) as KavitaProgress;
+        await client.saveProgress(progress);
+        await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt, {
+          pageNum: progress.pageNum,
+          bookScrollId: progress.bookScrollId ?? null,
+        });
       } catch (error) {
         await markSyncFailure(
           item.bookId,

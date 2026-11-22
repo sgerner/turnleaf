@@ -119,6 +119,109 @@ describe('reader open progress selection', () => {
       'conflict',
     );
   });
+
+  it('keeps pending local progress when Kavita still holds the synced baseline', () => {
+    const advancedLocal = {
+      cfi: 'epubcfi(/6/6!/4/2/1:8)',
+      percentage: 0.45,
+      pendingSync: true,
+      xpath: '//body/DocFragment[3]/body/p[2]',
+      serverPageNum: 25,
+      serverXPath: '//body/DocFragment[1]/body/p[1]',
+    };
+    expect(
+      chooseOpenProgress(
+        advancedLocal,
+        { pageNum: 25, bookScrollId: '//body/DocFragment[1]/body/p[1]' },
+        100,
+        false,
+      ),
+    ).toBe('local');
+    expect(
+      chooseOpenProgress(
+        advancedLocal,
+        { pageNum: 25, bookScrollId: '//body/DocFragment[1]/body/p[1]' },
+        100,
+        true,
+      ),
+    ).toBe('local');
+  });
+
+  it('keeps never-synced local progress when Kavita is still unread', () => {
+    expect(
+      chooseOpenProgress(
+        {
+          cfi: 'epubcfi(/6/4!/4/2/1:4)',
+          percentage: 0.15,
+          pendingSync: true,
+          xpath: '//body/DocFragment[1]/body/p[6]',
+          serverPageNum: null,
+          serverXPath: null,
+        },
+        { pageNum: 0, bookScrollId: null },
+        100,
+        false,
+      ),
+    ).toBe('local');
+  });
+
+  it('flags a conflict when both local and Kavita moved from the shared baseline', () => {
+    const advancedLocal = {
+      cfi: 'epubcfi(/6/6!/4/2/1:8)',
+      percentage: 0.45,
+      pendingSync: true,
+      xpath: '//body/DocFragment[3]/body/p[2]',
+      serverPageNum: 25,
+      serverXPath: '//body/DocFragment[1]/body/p[1]',
+    };
+    expect(
+      chooseOpenProgress(
+        advancedLocal,
+        { pageNum: 80, bookScrollId: '//body/DocFragment[5]/body/p[9]' },
+        100,
+        true,
+      ),
+    ).toBe('conflict');
+  });
+
+  it('adopts an earlier chapter re-read or unread reset on Kavita when local state has no pending sync', () => {
+    const syncedLocal = {
+      cfi: 'epubcfi(/6/10!/4/2/1:0)',
+      percentage: 0.8,
+      pendingSync: false,
+      xpath: '//body/DocFragment[5]/body/p[4]',
+      serverPageNum: 80,
+      serverXPath: '//body/DocFragment[5]/body/p[4]',
+    };
+    const earlierChapter = {
+      pageNum: 12,
+      bookScrollId: '//body/DocFragment[1]/body/p[3]',
+    };
+    expect(chooseOpenProgress(syncedLocal, earlierChapter, 100, true)).toBe('remote');
+    expect(chooseOpenProgress(syncedLocal, earlierChapter, 100, false)).toBe('remote');
+    expect(chooseOpenProgress(syncedLocal, { pageNum: 0, bookScrollId: null }, 100, true)).toBe(
+      'remote',
+    );
+  });
+
+  it('returns local when reopening a completed remote book that matches the stored baseline', () => {
+    const completedLocal = {
+      cfi: '',
+      percentage: 1,
+      pendingSync: false,
+      xpath: '//body/DocFragment[2]/body/p[4]',
+      serverPageNum: 100,
+      serverXPath: '//body/DocFragment[2]/body/p[4]',
+    };
+    expect(
+      chooseOpenProgress(
+        completedLocal,
+        { pageNum: 100, bookScrollId: '//body/DocFragment[2]/body/p[4]' },
+        100,
+        true,
+      ),
+    ).toBe('local');
+  });
 });
 
 describe('Kavita page updates', () => {

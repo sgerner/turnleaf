@@ -135,6 +135,8 @@ it('keeps and uploads a newer local relocation when an older upload completes', 
   expect(acknowledged.readingState['book-1']).toMatchObject({
     pendingSync: false,
     syncedLocalUpdatedAt: updatedAt,
+    serverPageNum: 20,
+    serverXPath: 'xpath-b',
   });
 });
 

@@ -1098,7 +1098,7 @@
         xpath: local?.xpath ?? null,
         percentage: local?.percentage ?? null,
       };
-      if (preferFurthest) void syncProgress(false);
+      if (local?.pendingSync || preferFurthest) void syncProgress(false);
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
@@ -1131,6 +1131,7 @@
 
   function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
     if (!book.pages || remote.pageNum <= 0) return null;
+    if (remote.pageNum >= book.pages) return 1;
     return Math.max(0, Math.min(0.999, remote.pageNum / book.pages));
   }
 
