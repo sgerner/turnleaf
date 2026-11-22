@@ -71,6 +71,7 @@
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
+    onReaderOpenChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -81,6 +82,7 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -670,6 +672,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1279,8 +1282,7 @@
       };
       return;
     }
-    const readingState = await getReadingState(book.id);
-    await markBookCompleted(book, readingState);
+    await markBookCompleted(book);
     const now = new Date().toISOString();
     books = books.map((item) =>
       item.id === book.id ? { ...item, pagesRead: book.pages, lastReadAt: now } : item,
@@ -1658,6 +1660,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
