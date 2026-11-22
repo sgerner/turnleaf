@@ -7,18 +7,68 @@ import { defaultAppearance, type Appearance } from '../reader/appearance';
 const mocks = vi.hoisted(() => {
   let openShouldFail = false;
   let capturedAppearance: Appearance | null = null;
+  let isNative = false;
   const preferences = new Map<string, string>();
   const writeFile = vi.fn(async () => ({ uri: 'file:///Documents/notes.md' }));
+  const getPreferencesMock = vi.fn(async (keys: readonly string[]) => {
+    const out = new Map<string, string>();
+    for (const key of keys) {
+      const val = preferences.get(key);
+      if (val !== undefined) out.set(key, val);
+    }
+    return out;
+  });
+  const setPreferencesMock = vi.fn(async (entries: ReadonlyMap<string, string>) => {
+    for (const [k, v] of entries) preferences.set(k, v);
+  });
+  const openSessionMock = vi.fn(
+    async (
+      _viewport: HTMLElement,
+      _cfi: string | null,
+      _xpath: string | null,
+      _pct: number | null,
+      appearance: Appearance,
+    ) => {
+      capturedAppearance = appearance;
+      if (openShouldFail) {
+        throw new Error('Corrupt EPUB zip');
+      }
+    },
+  );
+  const destroySessionMock = vi.fn();
 
   return {
+    destroySessionMock,
     getCapturedAppearance: () => capturedAppearance,
+    getPreferencesMock,
+    isNative: () => isNative,
+    openSessionMock,
     preferences,
-    reset() {
+    reset(nativePlatform: boolean) {
+      isNative = nativePlatform;
       openShouldFail = false;
       capturedAppearance = null;
       preferences.clear();
       writeFile.mockReset();
       writeFile.mockResolvedValue({ uri: 'file:///Documents/notes.md' });
+      getPreferencesMock.mockClear();
+      setPreferencesMock.mockClear();
+      openSessionMock.mockReset();
+      openSessionMock.mockImplementation(
+        async (
+          _viewport: HTMLElement,
+          _cfi: string | null,
+          _xpath: string | null,
+          _pct: number | null,
+          appearance: Appearance,
+        ) => {
+          capturedAppearance = appearance;
+          if (openShouldFail) {
+            throw new Error('Corrupt EPUB zip');
+          }
+        },
+      );
+      destroySessionMock.mockClear();
     },
     setCapturedAppearance(next: Appearance) {
       capturedAppearance = next;
@@ -26,15 +76,15 @@ const mocks = vi.hoisted(() => {
     setOpenShouldFail(next: boolean) {
       openShouldFail = next;
     },
-    shouldFailOpen: () => openShouldFail,
+    setPreferencesMock,
     writeFile,
   };
 });
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
-    getPlatform: () => 'android',
-    isNativePlatform: () => true,
+    getPlatform: () => (mocks.isNative() ? 'android' : 'web'),
+    isNativePlatform: () => mocks.isNative(),
   },
 }));
 
@@ -78,41 +128,19 @@ vi.mock('../native/volume-buttons', () => ({
 }));
 
 vi.mock('../database/database', () => ({
-  getPreferences: vi.fn(async (keys: readonly string[]) => {
-    const out = new Map<string, string>();
-    for (const key of keys) {
-      const val = mocks.preferences.get(key);
-      if (val !== undefined) out.set(key, val);
-    }
-    return out;
-  }),
-  setPreferences: vi.fn(async (entries: ReadonlyMap<string, string>) => {
-    for (const [k, v] of entries) mocks.preferences.set(k, v);
-  }),
+  getPreferences: mocks.getPreferencesMock,
+  setPreferences: mocks.setPreferencesMock,
 }));
 
 vi.mock('../reader/session', () => ({
-  ReaderSession: class {
-    async open(
-      _viewport: HTMLElement,
-      _cfi: string | null,
-      _xpath: string | null,
-      _pct: number | null,
-      appearance: Appearance,
-    ): Promise<void> {
-      mocks.setCapturedAppearance(appearance);
-      if (mocks.shouldFailOpen()) {
-        throw new Error('Corrupt EPUB zip');
-      }
-    }
-    tableOfContents() {
-      return [];
-    }
-    updateHighlights() {}
+  ReaderSession: class MockReaderSession {
+    open = mocks.openSessionMock;
+    tableOfContents = () => [];
+    updateHighlights = vi.fn();
     applyAppearance(next: Appearance) {
       mocks.setCapturedAppearance(next);
     }
-    destroy() {}
+    destroy = mocks.destroySessionMock;
   },
 }));
 
@@ -125,11 +153,116 @@ async function settle(): Promise<void> {
   flushSync();
 }
 
+describe('Reader mount lifecycle', () => {
+  let target: HTMLDivElement;
+  let mounted: Record<string, unknown> | null = null;
+
+  beforeEach(() => {
+    mocks.reset(false);
+    target = document.createElement('div');
+    document.body.append(target);
+  });
+
+  afterEach(async () => {
+    if (mounted) {
+      await unmount(mounted);
+      mounted = null;
+    }
+    target.remove();
+  });
+
+  it('reports true on mount and false on destroy through onMountChange', async () => {
+    const onMountChange = vi.fn<(isMounted: boolean) => void>();
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-1',
+        title: 'Test Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onMountChange,
+      },
+    });
+    flushSync();
+
+    expect(target.querySelector('.reader-shell')).not.toBeNull();
+    expect(onMountChange).toHaveBeenCalledTimes(1);
+    expect(onMountChange).toHaveBeenNthCalledWith(1, true);
+
+    await vi.waitFor(() => {
+      expect(mocks.openSessionMock).toHaveBeenCalledOnce();
+    });
+
+    await unmount(mounted);
+    mounted = null;
+
+    expect(onMountChange).toHaveBeenCalledTimes(2);
+    expect(onMountChange).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it('still reports mount and destroy transitions when opening the EPUB fails', async () => {
+    mocks.openSessionMock.mockRejectedValueOnce(new Error('corrupt epub'));
+    const onMountChange = vi.fn<(isMounted: boolean) => void>();
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:broken-book',
+        bookId: 'book-2',
+        title: 'Broken Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onMountChange,
+      },
+    });
+    flushSync();
+
+    expect(onMountChange).toHaveBeenCalledWith(true);
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+        'This EPUB could not be opened.',
+      );
+    });
+    expect(onMountChange).toHaveBeenCalledTimes(1);
+
+    await unmount(mounted);
+    mounted = null;
+
+    expect(onMountChange).toHaveBeenCalledTimes(2);
+    expect(onMountChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('mounts and unmounts cleanly when onMountChange is omitted', async () => {
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:optional-book',
+        bookId: 'book-3',
+        title: 'Optional Callback Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    flushSync();
+
+    await vi.waitFor(() => {
+      expect(mocks.openSessionMock).toHaveBeenCalledOnce();
+    });
+
+    await unmount(mounted);
+    mounted = null;
+    expect(mocks.destroySessionMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe('Reader.svelte resilience and bookmark/note exports', () => {
   let mounted: ReturnType<typeof mount> | null = null;
 
   beforeEach(() => {
-    mocks.reset();
+    mocks.reset(true);
     document.body.innerHTML = '';
     Element.prototype.animate ??= (() => {
       const anim = {

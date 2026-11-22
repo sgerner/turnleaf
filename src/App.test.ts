@@ -1,147 +1,369 @@
 // @vitest-environment jsdom
 
-import { flushSync, mount, unmount } from 'svelte';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { flushSync, mount, unmount } from 'svelte';
+import type { BookRecord, ServerConfig } from './lib/database/database';
 
-const mocks = vi.hoisted(() => {
-  const dataFiles = new Map<string, string>([
-    ['books/primary-1-10.epub', 'PK\x03\x04offline-epub'],
-    ['turnleafSQLite.db', 'corrupt-sqlite-bytes'],
-  ]);
-  let corrupt = true;
-
-  const db = {
-    close: vi.fn(async () => undefined),
-    execute: vi.fn(async () => ({ changes: { changes: 0 } })),
-    executeTransaction: vi.fn(async () => ({ changes: { changes: 0 } })),
-    getVersion: vi.fn(async () => ({ version: 7 })),
-    open: vi.fn(async () => {
-      if (corrupt) {
-        throw new Error('SQLiteDatabaseCorruptException: database disk image is malformed');
-      }
-    }),
-    query: vi.fn(async () => ({ values: [] as Record<string, unknown>[] })),
-    run: vi.fn(async () => ({ changes: { changes: 1 } })),
-  };
-
-  const sqlite = {
-    checkConnectionsConsistency: vi.fn(async () => ({ result: true })),
-    createConnection: vi.fn(async () => db),
-    isConnection: vi.fn(async () => ({ result: false })),
-    retrieveConnection: vi.fn(async () => db),
-  };
-
-  const closeConnection = vi.fn(async () => undefined);
-  const legacyDeleteDatabase = vi.fn(async () => {
-    throw new Error('CapacitorSQLite.deleteDatabase must not be called');
-  });
-  const nativeUnlinkDatabase = vi.fn(async () => {
-    dataFiles.delete('turnleafSQLite.db');
-    corrupt = false;
-    return { deletedCount: 1 };
-  });
-
-  return {
-    closeConnection,
-    dataFiles,
-    db,
-    legacyDeleteDatabase,
-    nativeUnlinkDatabase,
-    reset() {
-      corrupt = true;
-      dataFiles.clear();
-      dataFiles.set('books/primary-1-10.epub', 'PK\x03\x04offline-epub');
-      dataFiles.set('turnleafSQLite.db', 'corrupt-sqlite-bytes');
-      vi.clearAllMocks();
-    },
-    sqlite,
-  };
-});
-
-vi.mock('@capacitor/core', () => ({
-  Capacitor: {
-    getPlatform: () => 'android',
-    isNativePlatform: () => true,
-  },
-  registerPlugin: () => ({
-    deleteDatabase: mocks.nativeUnlinkDatabase,
-  }),
-}));
-
-vi.mock('@capacitor-community/sqlite', () => ({
-  CapacitorSQLite: {
-    closeConnection: mocks.closeConnection,
-    deleteDatabase: mocks.legacyDeleteDatabase,
-  },
-  SQLiteConnection: class {
-    constructor() {
-      return mocks.sqlite;
-    }
-  },
+const {
+  getServerMock,
+  getPreferencesMock,
+  getPreferencesByPrefixMock,
+  getAllBookMetadataMock,
+  salvageOpenReadingNotePreferencesMock,
+  setPreferenceMock,
+  setPreferencesMock,
+  getBooksMock,
+  getReadingStateMock,
+  getSyncStatusMock,
+  removeServerMock,
+  resetLocalDatabaseMock,
+  getApiKeyMock,
+  removeApiKeyMock,
+  loadThemeMock,
+  verifyDownloadedEpubMock,
+  cleanupInterruptedEpubDownloadsMock,
+  clearCoverCacheMock,
+  openSessionMock,
+  destroySessionMock,
+} = vi.hoisted(() => ({
+  getServerMock: vi.fn(),
+  getPreferencesMock: vi.fn(),
+  getPreferencesByPrefixMock: vi.fn(),
+  getAllBookMetadataMock: vi.fn(),
+  salvageOpenReadingNotePreferencesMock: vi.fn(),
+  setPreferenceMock: vi.fn(),
+  setPreferencesMock: vi.fn(),
+  getBooksMock: vi.fn(),
+  getReadingStateMock: vi.fn(),
+  getSyncStatusMock: vi.fn(),
+  removeServerMock: vi.fn(),
+  resetLocalDatabaseMock: vi.fn(),
+  getApiKeyMock: vi.fn(),
+  removeApiKeyMock: vi.fn(),
+  loadThemeMock: vi.fn(),
+  verifyDownloadedEpubMock: vi.fn(),
+  cleanupInterruptedEpubDownloadsMock: vi.fn(),
+  clearCoverCacheMock: vi.fn(),
+  openSessionMock: vi.fn(),
+  destroySessionMock: vi.fn(),
 }));
 
 vi.mock('./lib/github/releases', () => ({
-  fetchLatestGithubRelease: vi.fn(async () => null),
+  fetchLatestGithubRelease: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('./lib/themes/themes', () => ({
-  loadTheme: vi.fn(async () => true),
-  skeletonThemes: ['fennec', 'vintage'],
+  loadTheme: loadThemeMock,
+  skeletonThemes: ['fennec', 'eink', 'catppuccin'],
+}));
+
+vi.mock('./lib/native/credentials', () => ({
+  getApiKey: getApiKeyMock,
+  removeApiKey: removeApiKeyMock,
+  saveApiKey: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('./lib/database/database', () => ({
+  getServer: getServerMock,
+  getPreferences: getPreferencesMock,
+  getPreferencesByPrefix: getPreferencesByPrefixMock,
+  getAllBookMetadata: getAllBookMetadataMock,
+  salvageOpenReadingNotePreferences: salvageOpenReadingNotePreferencesMock,
+  setPreference: setPreferenceMock,
+  setPreferences: setPreferencesMock,
+  getBooks: getBooksMock,
+  getReadingState: getReadingStateMock,
+  getSyncStatus: getSyncStatusMock,
+  removeServer: removeServerMock,
+  resetLocalDatabase: resetLocalDatabaseMock,
+  acceptRemoteProgress: vi.fn(),
+  markDownloaded: vi.fn(),
+  markBookCompleted: vi.fn(),
+  removeDownload: vi.fn(),
+  reconcileBooks: vi.fn(),
+  saveLocalProgress: vi.fn(),
+  saveRemoteProgress: vi.fn(),
+  saveServer: vi.fn(),
+}));
+
+vi.mock('./lib/downloads/native-download', () => ({
+  cacheCover: vi.fn(),
+  clearCoverCache: clearCoverCacheMock,
+  cleanupInterruptedEpubDownloads: cleanupInterruptedEpubDownloadsMock,
+  deleteDownloadedEpub: vi.fn().mockResolvedValue(undefined),
+  downloadEpub: vi.fn(),
+  EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
+  EpubTransferError: class EpubTransferError extends Error {},
+  verifyDownloadedEpub: verifyDownloadedEpubMock,
+}));
+
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn().mockResolvedValue({ connected: false, connectionType: 'none' }),
+    addListener: vi.fn().mockResolvedValue({ remove: async () => {} }),
+  },
+}));
+
+vi.mock('@capacitor/app', () => ({
+  App: {
+    addListener: vi.fn().mockResolvedValue({ remove: async () => {} }),
+    exitApp: vi.fn(),
+  },
+}));
+
+vi.mock('./lib/reader/session', () => ({
+  ReaderSession: class MockReaderSession {
+    open = openSessionMock;
+    tableOfContents = () => [];
+    updateHighlights = vi.fn();
+    destroy = destroySessionMock;
+  },
 }));
 
 import App from './App.svelte';
 
-async function settle(): Promise<void> {
-  for (let i = 0; i < 6; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-  flushSync();
-}
+const savedServer: ServerConfig = {
+  id: 'server-1',
+  baseUrl: 'https://books.example.com',
+  displayName: 'Home Library',
+  credentialRef: 'cred-1',
+  kavitaVersion: '0.8.4',
+  lastConnectedAt: '2026-01-01T00:00:00.000Z',
+};
 
-describe('App.svelte repairLocalData on corrupt native SQLite', () => {
-  let mounted: ReturnType<typeof mount> | null = null;
+const downloadedBook: BookRecord = {
+  id: 'book-1',
+  serverId: 'server-1',
+  libraryId: 1,
+  seriesId: 10,
+  volumeId: 100,
+  chapterId: 1000,
+  title: 'Static Glows Handbook',
+  author: 'Ada Lovelace',
+  series: 'Performance Notes',
+  descriptionHtml: null,
+  format: 'EPUB',
+  pages: 200,
+  pagesRead: 40,
+  createdAt: '2026-01-01T00:00:00.000Z',
+  lastReadAt: '2026-01-02T00:00:00.000Z',
+  downloadPath: 'books/book-1.epub',
+  downloadStatus: 'downloaded',
+  fileSize: 524_288,
+  remoteAvailable: true,
+};
+
+describe('App.svelte static ambient glows and reader unmount behavior', () => {
+  let target: HTMLDivElement;
+  let mounted: Record<string, unknown> | null = null;
 
   beforeEach(() => {
-    mocks.reset();
-    document.body.innerHTML = '';
-    Element.prototype.animate ??= (() => {
-      const anim = {
-        cancel() {},
-        finish() {},
-        onfinish: null as (() => void) | null,
-      };
-      queueMicrotask(() => anim.onfinish?.());
-      return anim as unknown as Animation;
-    }) as typeof Element.prototype.animate;
+    vi.clearAllMocks();
+    if (typeof Element.prototype.animate !== 'function') {
+      Element.prototype.animate = (() => {
+        const anim = {
+          currentTime: 0,
+          playState: 'running',
+          effect: null,
+          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+          cancel() {
+            anim.playState = 'idle';
+          },
+          finish() {
+            anim.playState = 'finished';
+          },
+        };
+        queueMicrotask(() => {
+          if (anim.playState !== 'idle') {
+            anim.playState = 'finished';
+            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+          }
+        });
+        return anim as unknown as Animation;
+      }) as typeof Element.prototype.animate;
+    }
+    document.documentElement.removeAttribute('data-theme');
+    document.documentElement.removeAttribute('data-mode');
+
+    getServerMock.mockResolvedValue(savedServer);
+    getApiKeyMock.mockResolvedValue('secret-api-key');
+    removeApiKeyMock.mockResolvedValue(undefined);
+    removeServerMock.mockResolvedValue(undefined);
+    loadThemeMock.mockResolvedValue(true);
+    getPreferencesMock.mockResolvedValue(new Map());
+    getPreferencesByPrefixMock.mockResolvedValue(new Map());
+    getAllBookMetadataMock.mockResolvedValue([]);
+    salvageOpenReadingNotePreferencesMock.mockResolvedValue(null);
+    setPreferenceMock.mockResolvedValue(undefined);
+    setPreferencesMock.mockResolvedValue(undefined);
+    getBooksMock.mockResolvedValue([downloadedBook]);
+    getReadingStateMock.mockResolvedValue({
+      bookId: downloadedBook.id,
+      cfi: 'epubcfi(/6/2!/4/2)',
+      xpath: null,
+      percentage: 0.2,
+      updatedAt: '2026-01-02T00:00:00.000Z',
+    });
+    getSyncStatusMock.mockResolvedValue({ pendingCount: 0, failedCount: 0 });
+    verifyDownloadedEpubMock.mockResolvedValue({
+      path: downloadedBook.downloadPath,
+      webViewUrl: 'blob:book-1',
+    });
+    cleanupInterruptedEpubDownloadsMock.mockResolvedValue(undefined);
+    clearCoverCacheMock.mockResolvedValue(undefined);
+    openSessionMock.mockResolvedValue(undefined);
+
+    target = document.createElement('div');
+    document.body.append(target);
   });
 
-  afterEach(() => {
-    if (mounted) unmount(mounted);
-    mounted = null;
+  afterEach(async () => {
+    if (mounted) {
+      await unmount(mounted);
+      mounted = null;
+    }
+    target.remove();
   });
 
-  it('resets corrupt SQLite files via SqliteReset without opening the corrupt DB and preserves downloaded EPUBs', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    mounted = mount(App, { target: document.body });
-    await settle();
+  it('omits .mesh, will-change, translate3d, and infinite drift-* keyframe rules in App.svelte', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/App.svelte'), 'utf8');
 
-    const alert = document.querySelector('[role="alert"]');
-    expect(alert?.textContent).toContain('Turnleaf could not open its local data');
+    expect(source).not.toContain('.mesh');
+    expect(source).not.toContain('class="mesh"');
+    expect(source).not.toContain('will-change');
+    expect(source).not.toContain('translate3d');
+    expect(source).not.toMatch(/drift-(primary|secondary|tertiary)/);
+    expect(source).not.toContain('@keyframes');
 
-    const resetButton = [...document.querySelectorAll('button')].find((btn) =>
-      btn.textContent?.includes('Reset local data'),
+    expect(source).toContain('.orb-primary');
+    expect(source).toContain('.orb-secondary');
+    expect(source).toContain('.orb-tertiary');
+    expect(source).toContain('.vignette');
+  });
+
+  it('mounts static .app-ambient in the library and unmounts it while Reader.svelte is open', async () => {
+    mounted = mount(App, { target });
+
+    await vi.waitFor(() => {
+      expect(
+        target.querySelector('button[aria-label^="Continue reading Static Glows Handbook"]'),
+      ).not.toBeNull();
+    });
+
+    const ambient = target.querySelector('.app-ambient');
+    expect(ambient).not.toBeNull();
+    expect(ambient?.querySelectorAll('.orb')).toHaveLength(3);
+    expect(ambient?.querySelector('.vignette')).not.toBeNull();
+    expect(ambient?.querySelector('.mesh')).toBeNull();
+
+    const continueButton = target.querySelector<HTMLButtonElement>(
+      'button[aria-label^="Continue reading Static Glows Handbook"]',
     );
-    expect(resetButton).toBeTruthy();
+    continueButton?.click();
 
-    mocks.db.open.mockClear();
-    resetButton!.click();
-    await settle();
+    await vi.waitFor(() => {
+      expect(target.querySelector('.reader-shell')).not.toBeNull();
+    });
+    flushSync();
 
-    expect(mocks.legacyDeleteDatabase).not.toHaveBeenCalled();
-    expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledExactlyOnceWith({ database: 'turnleaf' });
-    expect(mocks.dataFiles.has('turnleafSQLite.db')).toBe(false);
-    expect(mocks.dataFiles.get('books/primary-1-10.epub')).toBe('PK\x03\x04offline-epub');
-    expect(document.body.textContent).not.toContain('Turnleaf could not open its local data');
-    expect(document.querySelector('#connection-error')).toBeTruthy();
+    expect(target.querySelector('.app-ambient')).toBeNull();
+
+    const showControlsButton = target.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show reading controls"]',
+    );
+    showControlsButton?.click();
+    flushSync();
+
+    const backButton = target.querySelector<HTMLButtonElement>(
+      'button[aria-label="Back to library"]',
+    );
+    expect(backButton).not.toBeNull();
+    backButton?.click();
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('.reader-shell')).toBeNull();
+      expect(target.querySelector('.app-ambient')).not.toBeNull();
+    });
+  });
+
+  it('unmounts .app-ambient when uiTheme is eink and restores it for non-eink themes', async () => {
+    getPreferencesMock.mockImplementation(async (keys: string[]) => {
+      const map = new Map<string, string>();
+      if (keys.includes('uiTheme')) map.set('uiTheme', 'eink');
+      return map;
+    });
+
+    mounted = mount(App, { target });
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+    expect(document.documentElement.dataset.theme).toBe('eink');
+    expect(target.querySelector('.app-ambient')).toBeNull();
+
+    target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
+    flushSync();
+
+    target.querySelector<HTMLButtonElement>('button[aria-label="Use fennec theme"]')?.click();
+    await vi.waitFor(() => {
+      expect(document.documentElement.dataset.theme).toBe('fennec');
+      expect(target.querySelector('.app-ambient')).not.toBeNull();
+    });
+
+    target.querySelector<HTMLButtonElement>('button[aria-label="Use eink theme"]')?.click();
+    await vi.waitFor(() => {
+      expect(document.documentElement.dataset.theme).toBe('eink');
+      expect(target.querySelector('.app-ambient')).toBeNull();
+    });
+  });
+
+  it('keeps .app-ambient mounted on Onboarding after leaving Library via server address change or deletion', async () => {
+    mounted = mount(App, { target });
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+
+    target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
+    flushSync();
+
+    const changeAddressButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.includes('Change server address'),
+    );
+    expect(changeAddressButton).toBeDefined();
+    changeAddressButton?.click();
+    flushSync();
+
+    expect(target.querySelector('.app-ambient')).not.toBeNull();
+
+    const cancelButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find((btn) =>
+      btn.textContent?.includes('Cancel'),
+    );
+    cancelButton?.click();
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+    target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
+    flushSync();
+
+    const deleteServerButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Delete server',
+    );
+    deleteServerButton?.click();
+    flushSync();
+
+    const confirmDeleteButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Delete now',
+    );
+    confirmDeleteButton?.click();
+
+    await vi.waitFor(() => {
+      expect(removeServerMock).toHaveBeenCalledWith('server-1');
+    });
+    flushSync();
+    expect(target.querySelector('.app-ambient')).not.toBeNull();
   });
 });
