@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Reset corrupt SQLite databases natively and add reading notes backup/restore
-- Reset corrupt native SQLite databases without opening them, retain unavailable remote books with saved bookmarks or notes, reorder server deletion to preserve downloaded EPUBs on failure, harden reader appearance parsing, and add library-wide and reader reading-notes export/restore with restricted-device text fallbacks
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
