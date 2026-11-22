@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Guard destructive reading actions with confirmation dialogs
+- fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace
