@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Extend timeout for real apksigner verification test
 - Attest and verify Android APK provenance
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
 - Link repo to its Stitch workspace

@@ -19,6 +19,7 @@ import {
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const variablesGradlePath = join(projectRoot, 'android', 'variables.gradle');
+const REAL_SIGNING_TEST_TIMEOUT_MS = 30_000;
 const tempDirectories = [];
 
 function createTempDirectory() {
@@ -384,5 +385,6 @@ describe('Android release APK verification', () => {
         }),
       ).toThrow('APK signature verification failed');
     },
+    REAL_SIGNING_TEST_TIMEOUT_MS,
   );
 });
