@@ -13,6 +13,9 @@ const { book, rendition } = vi.hoisted(() => {
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    next: vi.fn(async () => {}),
+    prev: vi.fn(async () => {}),
+    currentLocation: vi.fn((): unknown => undefined),
     resize: vi.fn(),
     destroy: vi.fn(),
   };
@@ -32,20 +35,22 @@ vi.mock('epubjs', () => ({ default: () => book }));
 
 import { ReaderSession } from './session';
 
-function location(cfi: string): Location {
+function location(cfi: string, page = 2): Location {
   return {
     start: {
       cfi,
       href: 'chapter.xhtml',
       index: 0,
       percentage: 0.2,
-      displayed: { page: 2, total: 10 },
+      displayed: { page, total: 10 },
     },
   } as Location;
 }
 
 describe('ReaderSession internal links', () => {
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
+    vi.clearAllMocks();
+    rendition.currentLocation.mockReturnValue(undefined);
     const onLocation = vi.fn();
     const session = new ReaderSession('book.epub');
     await session.open(
@@ -84,6 +89,114 @@ describe('ReaderSession internal links', () => {
 
     expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
     expect(onLocation.mock.calls.at(-1)).toHaveLength(2);
+    session.destroy();
+  });
+
+  it('flushes the final page turn when session.destroy() runs immediately after session.next()', async () => {
+    vi.clearAllMocks();
+    let activeLocation: unknown = location('page-2-cfi', 2);
+    rendition.currentLocation.mockImplementation(() => activeLocation);
+    let resolveNext!: () => void;
+    rendition.next.mockImplementationOnce(() => {
+      activeLocation = location('page-3-cfi', 3);
+      return new Promise<void>((resolve) => {
+        resolveNext = resolve;
+      });
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = rendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated(location('page-2-cfi', 2));
+    onLocation.mockClear();
+
+    const pendingTurn = session.next();
+    session.destroy();
+    resolveNext();
+    await pendingTurn;
+
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ cfi: 'page-3-cfi', pageIndex: 2 }),
+      'navigation',
+    );
+  });
+
+  it('reports awaited page turns before animation-frame relocated events and skips duplicate RAF callbacks', async () => {
+    vi.clearAllMocks();
+    let activeLocation: unknown = location('page-2-cfi', 2);
+    rendition.currentLocation.mockImplementation(() => activeLocation);
+    rendition.next.mockImplementationOnce(async () => {
+      activeLocation = location('page-3-cfi', 3);
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = rendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated(location('page-2-cfi', 2));
+    onLocation.mockClear();
+
+    await session.next();
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ cfi: 'page-3-cfi', pageIndex: 2 }),
+      'navigation',
+    );
+
+    // Simulate EPUB.js's deferred requestAnimationFrame relocated callback for the same turn.
+    relocated(location('page-3-cfi', 3));
+    expect(onLocation).toHaveBeenCalledOnce();
+
+    session.destroy();
+    expect(onLocation).toHaveBeenCalledOnce();
+  });
+
+  it('ignores undefined and promise currentLocation() results until rendition is ready', async () => {
+    vi.clearAllMocks();
+    rendition.currentLocation.mockReturnValueOnce(undefined);
+    rendition.next.mockImplementationOnce(async () => {
+      rendition.currentLocation.mockReturnValueOnce(Promise.resolve(location('async-cfi', 3)));
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = rendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated(location('page-2-cfi', 2));
+    onLocation.mockClear();
+
+    await session.next();
+    expect(onLocation).not.toHaveBeenCalled();
+
+    relocated(location('async-cfi', 3));
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ cfi: 'async-cfi', pageIndex: 2 }),
+      'navigation',
+    );
     session.destroy();
   });
 });
