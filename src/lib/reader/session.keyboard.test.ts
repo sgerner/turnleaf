@@ -193,7 +193,14 @@ describe('ReaderSession keyboard navigation', () => {
       {},
       undefined,
       'turnleaf-highlight',
-      { fill: '#facc15', 'fill-opacity': '0.38' },
+      expect.objectContaining({
+        fill: expect.stringMatching(/^#[0-9a-f]{6}$/),
+        'fill-opacity': expect.stringMatching(/^0\.\d{2}$/),
+        stroke: expect.stringMatching(/^#[0-9a-f]{6}$/),
+        'stroke-opacity': '1',
+        'stroke-width': '1.5',
+        'mix-blend-mode': 'normal',
+      }),
     );
 
     session.updateHighlights([]);

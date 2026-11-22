@@ -1,5 +1,6 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
-import type { Appearance } from './appearance';
+import type { Appearance, ReadingMode } from './appearance';
+import { resolveReaderPalette, type ResolvedReaderPalette } from './color-contrast';
 import {
   clipReaderSearchExcerpt,
   normalizeReaderSearchQuery,
@@ -44,21 +45,6 @@ interface EpubTocItem {
   href: string;
   subitems?: EpubTocItem[];
 }
-
-const MODE_COLORS = {
-  light: {
-    background: '--color-surface-50',
-    text: '--color-surface-950',
-    link: '--color-primary-700',
-    selection: '--color-primary-200',
-  },
-  dark: {
-    background: '--color-surface-950',
-    text: '--color-surface-50',
-    link: '--color-primary-300',
-    selection: '--color-primary-800',
-  },
-} as const;
 
 type EpubReferenceKind = 'link' | 'resource' | 'stylesheet';
 
@@ -311,6 +297,9 @@ export class ReaderSession {
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
+  private appliedPaletteKey: string | null = null;
+  private highlightStyleKey: string | null = null;
+  private themeObserver: MutationObserver | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
@@ -351,6 +340,7 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
+    this.observeThemeChanges();
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
@@ -501,28 +491,31 @@ export class ReaderSession {
     const rendition = this.rendition;
     if (!rendition) return;
 
+    const palette = this.resolvePalette(this.appearance?.mode ?? 'light');
+    const highlightStyles = { ...palette.highlight };
+    const styleKey = JSON.stringify(highlightStyles);
+    const styleChanged = this.highlightStyleKey !== null && this.highlightStyleKey !== styleKey;
+
     const next = new Set(annotations.map((annotation) => annotation.cfi));
     for (const cfi of this.highlightCfis) {
-      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+      if (!next.has(cfi) || styleChanged) rendition.annotations.remove(cfi, 'highlight');
     }
 
     const applied = new Set<string>();
     for (const cfi of next) {
-      if (this.highlightCfis.has(cfi)) {
+      if (!styleChanged && this.highlightCfis.has(cfi)) {
         applied.add(cfi);
         continue;
       }
       try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
-          fill: '#facc15',
-          'fill-opacity': '0.38',
-        });
+        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', highlightStyles);
         applied.add(cfi);
       } catch {
         // A saved CFI can stop matching after an EPUB is replaced or changed.
       }
     }
     this.highlightCfis = applied;
+    this.highlightStyleKey = applied.size > 0 ? styleKey : null;
   }
 
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
@@ -588,17 +581,9 @@ export class ReaderSession {
     this.appearance = { ...value };
     const rendition = this.rendition;
     if (!rendition) return;
-    const themeChanged =
-      !previous ||
-      previous.mode !== value.mode ||
-      previous.fontFamily !== value.fontFamily ||
-      previous.fontSize !== value.fontSize ||
-      previous.lineHeight !== value.lineHeight ||
-      previous.margin !== value.margin ||
-      previous.bottomMargin !== value.bottomMargin ||
-      previous.paragraphSpacing !== value.paragraphSpacing ||
-      previous.alignment !== value.alignment ||
-      previous.hyphenation !== value.hyphenation;
+    const palette = this.resolvePalette(value.mode);
+    const paletteKey = `${document.documentElement.dataset.theme ?? ''}:${JSON.stringify(palette)}`;
+    const paletteChanged = this.appliedPaletteKey !== paletteKey;
     const layoutChanged =
       previous !== null &&
       (previous.fontFamily !== value.fontFamily ||
@@ -609,22 +594,26 @@ export class ReaderSession {
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
         previous.hyphenation !== value.hyphenation);
+    const themeChanged =
+      !previous || previous.mode !== value.mode || paletteChanged || layoutChanged;
     if (!themeChanged) return;
-    const colors = MODE_COLORS[value.mode];
+    this.appliedPaletteKey = paletteKey;
     const family =
       value.fontFamily === 'book'
         ? 'Iowan Old Style, Georgia, serif'
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    this.clearInjectedThemeRules(rendition);
     rendition.themes.register('turnleaf', {
       html: {
-        background: `${this.resolveToken(colors.background)} !important`,
+        background: `${palette.background} !important`,
+        'color-scheme': value.mode,
         'box-sizing': 'border-box',
       },
       body: {
-        color: `${this.resolveToken(colors.text)} !important`,
-        background: `${this.resolveToken(colors.background)} !important`,
+        color: `${palette.text} !important`,
+        background: `${palette.background} !important`,
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
@@ -642,10 +631,29 @@ export class ReaderSession {
       img: {
         height: 'auto !important',
       },
-      a: { color: `${this.resolveToken(colors.link)} !important` },
-      '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
+      a: {
+        color: `${palette.link} !important`,
+        'text-decoration': 'underline !important',
+        'text-decoration-line': 'underline !important',
+        'text-underline-offset': '0.15em',
+      },
+      'a:link, a:visited, a:hover, a:active': {
+        color: `${palette.link} !important`,
+        'text-decoration': 'underline !important',
+        'text-decoration-line': 'underline !important',
+      },
+      'a:focus-visible': {
+        outline: `3px solid ${palette.focusOuter} !important`,
+        'outline-offset': '2px !important',
+        'box-shadow': `0 0 0 2px ${palette.focusInner} !important`,
+        'border-radius': '2px',
+      },
+      '::selection': { background: `${palette.selection} !important` },
     });
     rendition.themes.select('turnleaf');
+    if (paletteChanged && this.highlightCfis.size > 0) {
+      this.updateHighlights([...this.highlightCfis].map((cfi) => ({ cfi })));
+    }
     if (!layoutChanged) return;
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
@@ -663,6 +671,8 @@ export class ReaderSession {
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
     this.rendition?.destroy();
+    this.themeObserver?.disconnect();
+    this.themeObserver = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
@@ -674,6 +684,8 @@ export class ReaderSession {
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
+    this.appliedPaletteKey = null;
+    this.highlightStyleKey = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
     this.spine = null;
@@ -861,7 +873,36 @@ export class ReaderSession {
     return Math.max(0, runtimePage.index ?? 0);
   }
 
-  private resolveToken(token: string): string {
-    return getComputedStyle(document.documentElement).getPropertyValue(token).trim() || token;
+  private observeThemeChanges(): void {
+    if (typeof MutationObserver === 'undefined') return;
+    const refresh = () => {
+      if (this.appearance) this.applyAppearance(this.appearance);
+    };
+    this.themeObserver = new MutationObserver(refresh);
+    this.themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme', 'style'],
+    });
+    if (document.head) {
+      this.themeObserver.observe(document.head, { childList: true });
+    }
+  }
+
+  private clearInjectedThemeRules(rendition: Rendition): void {
+    const getContents = (rendition as unknown as { getContents?: () => Contents[] }).getContents;
+    if (typeof getContents !== 'function') return;
+    const contents = getContents.call(rendition);
+    if (!Array.isArray(contents)) return;
+    for (const content of contents) {
+      for (const id of ['epubjs-inserted-css-turnleaf', 'turnleaf']) {
+        const styleEl = content.document?.getElementById(id);
+        if (styleEl) styleEl.textContent = '';
+      }
+    }
+  }
+
+  private resolvePalette(mode: ReadingMode): ResolvedReaderPalette {
+    const computed = getComputedStyle(document.documentElement);
+    return resolveReaderPalette(mode, (token) => computed.getPropertyValue(token));
   }
 }
