@@ -108,23 +108,6 @@ function normalizePassageText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
-function extractReadableBodyText(root: Element | null | undefined): string {
-  if (!root) return '';
-  const doc = root.ownerDocument;
-  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  const chunks: string[] = [];
-  let node = walker.nextNode();
-  while (node) {
-    const parent = node.parentElement;
-    if (!parent?.closest('style, script, noscript')) {
-      const value = node.nodeValue ?? '';
-      if (value.trim()) chunks.push(value);
-    }
-    node = walker.nextNode();
-  }
-  return normalizePassageText(chunks.join(' '));
-}
-
 function mergeCfiRange(startCfi: string, endCfi?: string | null): string {
   if (!endCfi || startCfi === endCfi) return startCfi;
   if (
@@ -730,6 +713,7 @@ export class ReaderSession {
       if (!doc?.body) continue;
       const metrics = this.getViewportMetrics(contents);
       const pageRange = metrics === null ? this.resolveLocationRange(contents) : null;
+      if (metrics === null && pageRange === null) continue;
       const candidates = Array.from(doc.body.querySelectorAll<HTMLElement>(PASSAGE_BLOCK_SELECTOR));
 
       for (const block of candidates) {
@@ -761,6 +745,16 @@ export class ReaderSession {
 
     if (passages.length > 0) return passages;
     return this.getFallbackPagePassages(contentsList);
+  }
+
+  clearTextSelection(): void {
+    for (const contents of this.getActiveContents()) {
+      try {
+        contents.window.getSelection()?.removeAllRanges();
+      } catch {
+        // A contents document can unload while the selection is being cleared.
+      }
+    }
   }
 
   syncVisibleColumnLinks(): void {
@@ -1292,9 +1286,6 @@ export class ReaderSession {
         }
       }
     }
-    if (!text) {
-      text = extractReadableBodyText(primaryContents?.document?.body);
-    }
     return cfi && text ? [{ cfi, text }] : [];
   }
 
@@ -1376,20 +1367,36 @@ export class ReaderSession {
     try {
       await this.runDisplayOperation(() => rendition.display(section.href));
       if (!this.isCurrentLocationOperation(generation)) return false;
+      if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
       if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
       if (!node) return false;
-      const range = contents.document.createRange();
-      range.selectNodeContents(node);
-      await this.runDisplayOperation(() => rendition.display(contents.cfiFromRange(range)));
+      const cfi = this.cfiFromXPathNode(contents, node);
+      if (!(contents.range(cfi) as Range | null)) return false;
+      await this.runDisplayOperation(() => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
     }
+  }
+
+  private cfiFromXPathNode(contents: Contents, node: Element): string {
+    const walker = contents.document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    for (let current = walker.nextNode(); current; current = walker.nextNode()) {
+      if (current.parentElement?.localName === 'style') continue;
+      const offset = current.textContent?.search(/\S/) ?? -1;
+      if (offset >= 0) {
+        const range = contents.document.createRange();
+        range.setStart(current, offset);
+        range.collapse(true);
+        return contents.cfiFromRange(range);
+      }
+    }
+    return contents.cfiFromNode(node);
   }
 
   private async displayPercentage(percentage: number, generation: number): Promise<boolean> {

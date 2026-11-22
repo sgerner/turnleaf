@@ -20,6 +20,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    getContents: vi.fn((): unknown[] => []),
     resize: vi.fn(),
     destroy: vi.fn(),
   };
@@ -69,6 +70,7 @@ function location(cfi: string): Location {
 describe('ReaderSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRendition.getContents.mockReturnValue([]);
     mockBook.navigation.toc = [];
     mockBook.spine.sections = [...defaultSpineSections];
   });
@@ -319,7 +321,13 @@ describe('ReaderSession', () => {
       window: { frameElement: frame },
       document: doc,
       sectionIndex: 0,
-      cfiFromRange: (range: Range) => `cfi:${range.toString().trim()}`,
+      range: () => {
+        const range = doc.createRange();
+        range.selectNodeContents(doc.body);
+        return range;
+      },
+      cfiFromRange: (range: Range) =>
+        range.toString().includes('Bare chapter text') ? '' : `cfi:${range.toString().trim()}`,
     });
 
     relocated({
@@ -365,6 +373,75 @@ describe('ReaderSession', () => {
       },
     ]);
 
+    session.destroy();
+  });
+
+  it('clears the active EPUB text selection', async () => {
+    const session = new ReaderSession('book.epub');
+    const paragraph = document.createElement('p');
+    paragraph.textContent = 'Selected passage';
+    document.body.append(paragraph);
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    const selection = window.getSelection();
+    selection?.addRange(range);
+
+    mockRendition.getContents.mockReturnValue([{ document, window } as unknown as Contents]);
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    session.clearTextSelection();
+
+    expect(selection?.rangeCount).toBe(0);
+    session.destroy();
+    paragraph.remove();
+  });
+
+  it('does not offer whole-chapter text as a page passage without viewport or location geometry', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const prepareContents = mockRendition.hooks.content.register.mock.calls[0]?.[0];
+    const relocated = getRenditionListener('relocated');
+    const doc = document.implementation.createHTMLDocument('chapter');
+    doc.body.innerHTML = '<p>Current page passage</p><p>Later chapter text</p>';
+
+    await prepareContents({
+      window: { frameElement: document.createElement('iframe') },
+      document: doc,
+      sectionIndex: 0,
+      cfiFromRange: (range: Range) => `cfi:${range.toString().trim()}`,
+    });
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 4 },
+      },
+      end: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:24)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+
+    expect(session.getVisiblePassages()).toEqual([]);
     session.destroy();
   });
 
