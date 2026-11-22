@@ -44,7 +44,7 @@
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
-  import type { ReaderLocation } from '../reader/session';
+  import { withEpubRetryParam, type ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
@@ -187,6 +187,7 @@
     percentage: number | null;
   } | null>(null);
   let readerBackHandler: (() => boolean) | null = null;
+  let readerRetryCount = 0;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -1122,11 +1123,35 @@
   async function retryReaderDownload(): Promise<void> {
     const current = reading;
     if (!current || offline || current.book.remoteAvailable === false) {
-      throw new Error('This book is not available from Kavita right now.');
+      throw new Error(
+        offline
+          ? 'No network connection. Reconnect to Kavita to download this book again.'
+          : 'This book is not available from Kavita right now.',
+      );
     }
     const refreshed = await download(current.book);
-    if (!refreshed) throw new Error('Turnleaf could not download this book.');
-    if (reading?.book.id === current.book.id) reading = { ...current, book: refreshed };
+    if (!refreshed) throw new Error(message || 'Turnleaf could not download this book.');
+    if (!refreshed.downloadPath) {
+      throw new Error('Turnleaf could not verify the downloaded book.');
+    }
+    let verified: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
+    try {
+      verified = await verifyDownloadedEpub(refreshed.downloadPath);
+    } catch {
+      throw new Error(
+        'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.',
+      );
+    }
+    if (!verified) {
+      await removeDownload(refreshed.id);
+      books = await getBooks(server.id, { includeDescription: false });
+      throw new Error('The downloaded file is missing or corrupted. Download it again.');
+    }
+    readerRetryCount += 1;
+    const nextUrl = withEpubRetryParam(verified.webViewUrl, readerRetryCount);
+    if (reading?.book.id === current.book.id) {
+      reading = { ...reading, book: refreshed, url: nextUrl };
+    }
   }
 
   function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
@@ -1577,6 +1602,8 @@
       initialCfi={reading.cfi}
       initialXPath={reading.xpath}
       initialPercentage={reading.percentage}
+      {offline}
+      remoteAvailable={reading.book.remoteAvailable !== false}
       onBack={() => void closeReader()}
       onRelocated={handleRelocated}
       onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}

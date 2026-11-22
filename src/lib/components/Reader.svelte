@@ -59,6 +59,8 @@
     initialCfi = null,
     initialXPath = null,
     initialPercentage = null,
+    offline = false,
+    remoteAvailable = true,
     onBack,
     onRelocated,
     onSyncLatest,
@@ -72,6 +74,8 @@
     initialCfi?: string | null;
     initialXPath?: string | null;
     initialPercentage?: number | null;
+    offline?: boolean;
+    remoteAvailable?: boolean;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
@@ -166,7 +170,6 @@
     bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
-    await enableNativeReaderChrome();
     try {
       await openReaderSession();
     } catch {
@@ -178,7 +181,9 @@
       await restoreNativeReaderChrome();
       return;
     }
-
+    if (destroyed) return;
+    await enableNativeReaderChrome();
+    if (destroyed) return;
     await listenForReaderResume();
   });
 
@@ -275,12 +280,14 @@
     retryingReader = true;
     try {
       await onRetryDownload();
+      await tick();
       if (destroyed) return;
       error = '';
-      await enableNativeReaderChrome();
       await openReaderSession();
       if (destroyed) return;
       startupOpenFailed = false;
+      await enableNativeReaderChrome();
+      if (destroyed) return;
       await listenForReaderResume();
     } catch (cause) {
       if (destroyed) return;
@@ -783,6 +790,19 @@
     }
   }
 
+  async function openTocSection(href: string): Promise<void> {
+    closeToc();
+    if (!session) return;
+    try {
+      await session.display(href);
+    } catch (cause) {
+      error =
+        cause instanceof Error
+          ? cause.message
+          : 'This section could not be displayed. Try reopening the book.';
+    }
+  }
+
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
     if (!session) return;
     try {
@@ -1151,9 +1171,20 @@
   {/if}
 
   {#if error}
-    <div class="absolute inset-0 grid place-items-center p-8" role="alert">
+    <div class="absolute inset-0 z-30 grid place-items-center p-8" role="alert">
       <div class="card preset-tonal-error max-w-sm p-6 text-center">
         <p>{error}</p>
+        {#if startupOpenFailed && !onRetryDownload}
+          {#if !remoteAvailable}
+            <p class="mt-3 text-sm">
+              This book is no longer available on Kavita, so a fresh copy cannot be downloaded.
+            </p>
+          {:else if offline}
+            <p class="mt-3 text-sm">
+              No network connection. Reconnect to Kavita to download a fresh copy of this book.
+            </p>
+          {/if}
+        {/if}
         <div class="mt-5 flex flex-wrap justify-center gap-3">
           {#if startupOpenFailed && onRetryDownload}
             <button
@@ -1594,10 +1625,7 @@
                       : ''}"
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
-                    onclick={() => {
-                      void session?.display(item.href);
-                      closeToc();
-                    }}>{item.label}</button
+                    onclick={() => void openTocSection(item.href)}>{item.label}</button
                   >
                   {#if item.children.length > 0}
                     <div class="ml-4 border-l border-surface-300/50 pl-2">
