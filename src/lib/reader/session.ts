@@ -3,6 +3,9 @@ import type { Appearance } from './appearance';
 import {
   clipReaderSearchExcerpt,
   normalizeReaderSearchQuery,
+  splitReaderSearchExcerpt,
+  type ReaderSearchBatch,
+  type ReaderSearchCursor,
   type ReaderSearchResult,
 } from './search';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
@@ -59,6 +62,19 @@ const MODE_COLORS = {
     selection: '--color-primary-800',
   },
 } as const;
+
+const USER_HIGHLIGHT_STYLES = {
+  fill: '#facc15',
+  'fill-opacity': '0.38',
+};
+
+const SEARCH_HIGHLIGHT_STYLES = {
+  fill: '#0ea5e9',
+  'fill-opacity': '0.32',
+  stroke: '#0284c7',
+  'stroke-opacity': '0.85',
+  'stroke-width': '1.5',
+};
 
 type EpubReferenceKind = 'link' | 'resource' | 'stylesheet';
 
@@ -314,6 +330,7 @@ export class ReaderSession {
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private highlightCfis = new Set<string>();
+  private activeSearchCfi: string | null = null;
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -503,73 +520,196 @@ export class ReaderSession {
 
     const next = new Set(annotations.map((annotation) => annotation.cfi));
     for (const cfi of this.highlightCfis) {
-      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+      if (!next.has(cfi) && cfi !== this.activeSearchCfi) {
+        rendition.annotations.remove(cfi, 'highlight');
+      }
     }
 
     const applied = new Set<string>();
     for (const cfi of next) {
-      if (this.highlightCfis.has(cfi)) {
+      if (this.highlightCfis.has(cfi) || cfi === this.activeSearchCfi) {
         applied.add(cfi);
         continue;
       }
-      try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
-          fill: '#facc15',
-          'fill-opacity': '0.38',
-        });
+      if (this.applyUserHighlight(cfi)) {
         applied.add(cfi);
-      } catch {
-        // A saved CFI can stop matching after an EPUB is replaced or changed.
       }
     }
     this.highlightCfis = applied;
   }
 
-  async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
-    const normalizedQuery = normalizeReaderSearchQuery(query);
-    if (!normalizedQuery) return [];
-    const results: ReaderSearchResult[] = [];
-    const { sections } = this.getSpine();
-    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
+  setSearchHighlight(cfi: string | null): void {
+    const rendition = this.rendition;
+    const nextCfi = cfi?.trim() || null;
+    if (!rendition) {
+      this.activeSearchCfi = nextCfi;
+      return;
+    }
+    if (this.activeSearchCfi === nextCfi) return;
 
-    for (const section of sections) {
+    const previousCfi = this.activeSearchCfi;
+    this.activeSearchCfi = null;
+    if (previousCfi) {
+      rendition.annotations.remove(previousCfi, 'highlight');
+      if (this.highlightCfis.has(previousCfi)) {
+        this.applyUserHighlight(previousCfi);
+      }
+    }
+
+    if (!nextCfi) return;
+
+    if (this.highlightCfis.has(nextCfi)) {
+      rendition.annotations.remove(nextCfi, 'highlight');
+    }
+    try {
+      rendition.annotations.highlight(
+        nextCfi,
+        {},
+        undefined,
+        'turnleaf-search-highlight',
+        SEARCH_HIGHLIGHT_STYLES,
+      );
+      this.activeSearchCfi = nextCfi;
+    } catch {
+      if (this.highlightCfis.has(nextCfi)) {
+        this.applyUserHighlight(nextCfi);
+      }
+    }
+  }
+
+  private applyUserHighlight(cfi: string): boolean {
+    if (!this.rendition) return false;
+    try {
+      this.rendition.annotations.highlight(
+        cfi,
+        {},
+        undefined,
+        'turnleaf-highlight',
+        USER_HIGHLIGHT_STYLES,
+      );
+      return true;
+    } catch {
+      // A saved CFI can stop matching after an EPUB is replaced or changed.
+      return false;
+    }
+  }
+
+  async search(
+    query: string,
+    signal?: AbortSignal,
+    limit = 100,
+    cursor: ReaderSearchCursor | null = null,
+  ): Promise<ReaderSearchBatch> {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const normalizedQuery = normalizeReaderSearchQuery(query);
+    const { sections } = this.getSpine();
+    const totalChapters = sections.length;
+    if (!normalizedQuery || limit <= 0) {
+      return {
+        results: [],
+        scannedChapters: 0,
+        skippedChapters: 0,
+        totalChapters,
+        nextCursor: null,
+      };
+    }
+
+    const startSection = Math.max(0, cursor?.sectionIndex ?? 0);
+    const initialMatchIndex = Math.max(0, cursor?.matchIndex ?? 0);
+    if (startSection >= totalChapters) {
+      return {
+        results: [],
+        scannedChapters: 0,
+        skippedChapters: 0,
+        totalChapters,
+        nextCursor: null,
+      };
+    }
+
+    const results: ReaderSearchResult[] = [];
+    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
+    let scannedChapters = 0;
+
+    for (
+      let sectionPosition = startSection;
+      sectionPosition < totalChapters;
+      sectionPosition += 1
+    ) {
+      const section = sections[sectionPosition]!;
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const wasLoaded = Boolean((section as unknown as { contents?: unknown }).contents);
       try {
         await section.load(request);
-        const matches = (
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        scannedChapters += 1;
+        const rawMatches = (
           section as unknown as {
             search: (value: string) => Array<{ cfi: string; excerpt: string }>;
           }
         ).search(normalizedQuery);
-        for (const match of matches) {
+        const matches = rawMatches.filter((match) => Boolean(match.cfi));
+        const matchStart = sectionPosition === startSection ? initialMatchIndex : 0;
+
+        for (let matchIndex = matchStart; matchIndex < matches.length; matchIndex += 1) {
           if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-          if (!match.cfi) continue;
+          const match = matches[matchIndex]!;
+          const excerpt = clipReaderSearchExcerpt(match.excerpt, 180, normalizedQuery);
           results.push({
             cfi: match.cfi,
-            excerpt: clipReaderSearchExcerpt(match.excerpt),
+            excerpt,
+            segments: splitReaderSearchExcerpt(excerpt, normalizedQuery),
             href: section.href,
             spineIndex: section.index,
           });
-          if (results.length >= limit) return results;
+          if (results.length >= limit) {
+            const hasMoreInSection = matchIndex + 1 < matches.length;
+            const hasMoreSections = sectionPosition + 1 < totalChapters;
+            const nextCursor: ReaderSearchCursor | null = hasMoreInSection
+              ? { sectionIndex: sectionPosition, matchIndex: matchIndex + 1 }
+              : hasMoreSections
+                ? { sectionIndex: sectionPosition + 1, matchIndex: 0 }
+                : null;
+            return {
+              results,
+              scannedChapters,
+              skippedChapters: totalChapters - (sectionPosition + 1),
+              totalChapters,
+              nextCursor,
+            };
+          }
         }
       } finally {
         if (!wasLoaded) section.unload();
       }
     }
-    return results;
+
+    return {
+      results,
+      scannedChapters,
+      skippedChapters: 0,
+      totalChapters,
+      nextCursor: null,
+    };
   }
 
-  async display(href: string): Promise<void> {
+  async display(href: string, userNavigation = true): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.display(href));
+    if (userNavigation) {
+      await this.navigate(() => this.rendition!.display(href));
+      return;
+    }
+    const generation = this.beginLocationOperation(false);
+    await this.displayAtGeneration(href, generation);
   }
 
-  async displayCfi(cfi: string): Promise<boolean> {
+  async displayCfi(cfi: string, userNavigation = true): Promise<boolean> {
     if (!this.rendition) return false;
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
-      return true;
+      if (userNavigation) {
+        await this.navigate(() => this.rendition!.display(cfi));
+        return true;
+      }
+      return await this.displayAtGeneration(cfi, this.beginLocationOperation(false));
     } catch {
       return false;
     }
@@ -675,6 +815,7 @@ export class ReaderSession {
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
+    this.activeSearchCfi = null;
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
