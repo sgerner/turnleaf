@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- ci: cache Android AVD snapshots and prune unused Gradle cache
+- chore: drop RELEASE_NOTES entry to avoid cross-PR conflicts
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
