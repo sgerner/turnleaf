@@ -8,6 +8,12 @@ import {
   normalizeSeriesDetail,
 } from './normalization';
 import { recordDiagnostic } from '../diagnostics/log';
+import {
+  canSendCredential,
+  getCredentialState,
+  markCredentialRejected,
+  resolveCredentialEpoch,
+} from '../native/credentials';
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
@@ -129,19 +135,63 @@ function assertRedirectLimit(count: number, status: number): void {
   }
 }
 
+export interface KavitaClientOptions {
+  credentialEpoch?: number | undefined;
+  probe?: boolean | undefined;
+}
+
 export class KavitaClient {
+  private readonly credentialEpoch: number | undefined;
+  private readonly probe: boolean;
+  private localRejectedStatus: number | undefined;
+
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
-  ) {}
+    options: KavitaClientOptions = {},
+  ) {
+    this.probe = options.probe === true;
+    this.credentialEpoch = this.probe
+      ? undefined
+      : resolveCredentialEpoch(apiKey, options.credentialEpoch);
+  }
+
+  canSendRequests(): boolean {
+    if (!this.apiKey.trim()) return false;
+    if (this.localRejectedStatus !== undefined) return false;
+    if (this.probe) return true;
+    return canSendCredential(this.apiKey, this.credentialEpoch);
+  }
+
+  private assertCredentialReady(probe = this.probe): void {
+    if (!this.apiKey.trim()) {
+      throw new KavitaError('Enter a Kavita auth key.', 'authentication');
+    }
+    if (probe) return;
+    if (
+      this.localRejectedStatus !== undefined ||
+      !canSendCredential(this.apiKey, this.credentialEpoch)
+    ) {
+      const status = this.localRejectedStatus ?? getCredentialState().statusCode;
+      throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+    }
+  }
+
+  private rejectCredential(status: number, probe = this.probe): never {
+    if (!probe) {
+      this.localRejectedStatus = status;
+      markCredentialRejected(this.credentialEpoch, status);
+    }
+    throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+  }
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
     const options = signal ? { signal } : {};
     const [libraries, health] = await Promise.all([
-      this.request<unknown>('/api/Library/libraries', options).then((payload) =>
+      this.request<unknown>('/api/Library/libraries', options, true).then((payload) =>
         normalizePayload('/api/Library/libraries', () => normalizeLibraries(payload)),
       ),
-      this.request<unknown>('/api/Health', options).catch(() => null),
+      this.request<unknown>('/api/Health', options, true).catch(() => null),
     ]);
     return {
       version: readHealthVersion(health),
@@ -212,6 +262,7 @@ export class KavitaClient {
   }
 
   async getCover(seriesId: number, signal?: AbortSignal): Promise<Blob> {
+    this.assertCredentialReady();
     const url = this.coverUrl(seriesId);
     if (Capacitor.isNativePlatform()) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -289,29 +340,34 @@ export class KavitaClient {
     return this.request('/api/Reader/progress', options);
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
+  private async request<T>(path: string, init: RequestInit = {}, probe = this.probe): Promise<T> {
+    this.assertCredentialReady(probe);
+    if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init, probe);
     const timeout = new AbortController();
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
     const signal = init.signal ? AbortSignal.any([init.signal, timeout.signal]) : timeout.signal;
 
     try {
-      const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
-        ...init,
-        signal,
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'x-api-key': this.apiKey,
-          ...init.headers,
+      const response = await this.browserFetchWithRedirects(
+        this.resolveUrl(path),
+        {
+          ...init,
+          signal,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'x-api-key': this.apiKey,
+            ...init.headers,
+          },
         },
-      });
+        probe,
+      );
 
       if (response.status >= 400) {
         recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
       }
       if (response.status === 401 || response.status === 403) {
-        throw new KavitaError('Kavita rejected this auth key.', 'authentication', response.status);
+        this.rejectCredential(response.status, probe);
       }
       if (!response.ok) {
         throw new KavitaError(
@@ -345,8 +401,9 @@ export class KavitaClient {
     }
   }
 
-  private async nativeRequest<T>(path: string, init: RequestInit): Promise<T> {
+  private async nativeRequest<T>(path: string, init: RequestInit, probe = this.probe): Promise<T> {
     if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    this.assertCredentialReady(probe);
     const method = init.method ?? 'GET';
     const options: HttpOptions = {
       url: this.resolveUrl(path),
@@ -367,6 +424,7 @@ export class KavitaClient {
       let redirectCount = 0;
       let response: HttpResponse;
       while (true) {
+        this.assertCredentialReady(probe);
         response = await CapacitorHttp.request({ ...options, url: currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         const nextUrl = redirectTarget(
@@ -391,7 +449,7 @@ export class KavitaClient {
       if (response.status >= 400) {
         recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
       }
-      this.assertStatus(response.status);
+      this.assertStatus(response.status, probe);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (typeof response.data === 'string') {
         if (!response.data.trim()) return undefined as T;
@@ -423,6 +481,7 @@ export class KavitaClient {
     let redirectCount = 0;
     while (true) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      this.assertCredentialReady();
       const response = await CapacitorHttp.get({
         url: currentUrl,
         headers: { 'x-api-key': this.apiKey },
@@ -453,13 +512,18 @@ export class KavitaClient {
     }
   }
 
-  private async browserFetchWithRedirects(url: string, init: RequestInit): Promise<Response> {
+  private async browserFetchWithRedirects(
+    url: string,
+    init: RequestInit,
+    probe = this.probe,
+  ): Promise<Response> {
     const method = init.method ?? 'GET';
     const serverOrigin = new URL(this.baseUrl).origin;
     let currentUrl = url;
     const visited = new Set([currentUrl]);
     let redirectCount = 0;
     while (true) {
+      this.assertCredentialReady(probe);
       const response = await fetch(currentUrl, { ...init, redirect: 'manual' });
       const nextUrl = redirectTarget(
         response.status,
@@ -483,9 +547,9 @@ export class KavitaClient {
     }
   }
 
-  private assertStatus(status: number): void {
+  private assertStatus(status: number, probe = this.probe): void {
     if (status === 401 || status === 403) {
-      throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+      this.rejectCredential(status, probe);
     }
     if (status < 200 || status >= 300) {
       throw new KavitaError(`Kavita returned an error (${status}).`, 'server', status);

@@ -75,7 +75,7 @@
       }
 
       if (savedServer) {
-        let connectedServer = savedServer;
+        let connectedServer: ServerConfig;
         if (changingServerAddress) {
           const credentialRef = `${savedServer.credentialRef}_${Date.now().toString(36)}`;
           connectedServer = {
@@ -93,8 +93,22 @@
           });
           await removeApiKey(savedServer.credentialRef).catch(() => {});
         } else {
+          connectedServer = {
+            ...savedServer,
+            kavitaVersion: result.version,
+            lastConnectedAt: new Date().toISOString(),
+          };
           await saveApiKey(savedServer.credentialRef, key);
+          try {
+            await saveServer(connectedServer);
+          } catch (storageError) {
+            throw new Error(
+              'The auth key worked, but local server details could not be updated. Retry reconnect.',
+              { cause: storageError },
+            );
+          }
         }
+        apiKey = '';
         onConnected(connectedServer, key);
         return;
       }

@@ -12,7 +12,12 @@
     resetLocalDatabase,
     type ServerConfig,
   } from './lib/database/database';
-  import { getApiKey } from './lib/native/credentials';
+  import {
+    getApiKey,
+    markCredentialMissing,
+    markCredentialUnreadable,
+    syncLoadedCredential,
+  } from './lib/native/credentials';
   import { loadTheme } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
@@ -25,16 +30,35 @@
   let startupError = $state('');
   let repairing = $state(false);
   let changingServerAddress = $state(false);
-  let apiKey = $state<string | null>(null);
+  let reconnectingServer = $state(false);
+  let apiKey = $state('');
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+
+  async function loadServerCredential(saved: ServerConfig): Promise<boolean> {
+    try {
+      const loaded = await getApiKey(saved.credentialRef);
+      if (loaded && loaded.trim()) {
+        apiKey = loaded;
+        syncLoadedCredential(loaded, saved.credentialRef);
+        return true;
+      }
+      apiKey = '';
+      markCredentialMissing(saved.credentialRef);
+      return false;
+    } catch {
+      apiKey = '';
+      markCredentialUnreadable(saved.credentialRef);
+      return false;
+    }
+  }
 
   async function loadLocalData(): Promise<void> {
     booting = true;
     startupError = '';
     server = null;
-    apiKey = null;
+    apiKey = '';
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -48,12 +72,7 @@
       uiMode = savedMode === 'light' ? 'light' : 'dark';
       if (saved) {
         server = saved;
-        try {
-          apiKey = await getApiKey(saved.credentialRef);
-        } catch {
-          startupError =
-            'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
-        }
+        await loadServerCredential(saved);
       }
     } catch {
       startupError =
@@ -158,21 +177,6 @@
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
         </div>
       </main>
-    {:else if server && apiKey && !changingServerAddress}
-      <Library
-        {server}
-        {apiKey}
-        theme={uiTheme}
-        mode={uiMode}
-        onThemeChange={(value) => (uiTheme = value)}
-        onModeChange={(value) => (uiMode = value)}
-        onApiKeyChange={(value) => (apiKey = value)}
-        onChangeServerAddress={() => (changingServerAddress = true)}
-        onServerDeleted={() => {
-          server = null;
-          apiKey = null;
-        }}
-      />
     {:else if startupError}
       <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
         <p>{startupError}</p>
@@ -185,43 +189,64 @@
           >
             Retry
           </button>
-          {#if server}
-            <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
-              type="button"
-              onclick={() => (startupError = '')}
-            >
-              Enter auth key
-            </button>
-          {:else}
-            <button
-              class="btn btn-sm preset-tonal-error !text-sm"
-              type="button"
-              disabled={repairing}
-              onclick={() => {
-                if (
-                  window.confirm(
-                    'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
-                  )
-                ) {
-                  void repairLocalData();
-                }
-              }}
-            >
-              {repairing ? 'Resetting...' : 'Reset local data'}
-            </button>
-          {/if}
+          <button
+            class="btn btn-sm preset-tonal-error !text-sm"
+            type="button"
+            disabled={repairing}
+            onclick={() => {
+              if (
+                window.confirm(
+                  'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
+                )
+              ) {
+                void repairLocalData();
+              }
+            }}
+          >
+            {repairing ? 'Resetting...' : 'Reset local data'}
+          </button>
         </div>
       </div>
+    {:else if server && !changingServerAddress && !reconnectingServer}
+      <Library
+        {server}
+        {apiKey}
+        theme={uiTheme}
+        mode={uiMode}
+        onThemeChange={(value) => (uiTheme = value)}
+        onModeChange={(value) => (uiMode = value)}
+        onApiKeyChange={(value, updatedServer) => {
+          apiKey = value;
+          if (updatedServer) server = updatedServer;
+        }}
+        onRetryCredentials={async () => {
+          if (!server) return false;
+          return loadServerCredential(server);
+        }}
+        onReconnect={() => (reconnectingServer = true)}
+        onChangeServerAddress={() => (changingServerAddress = true)}
+        onServerDeleted={() => {
+          server = null;
+          apiKey = '';
+          changingServerAddress = false;
+          reconnectingServer = false;
+        }}
+      />
     {:else}
       <Onboarding
         savedServer={server}
         editAddress={changingServerAddress}
-        onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
+        onCancel={server
+          ? () => {
+              changingServerAddress = false;
+              reconnectingServer = false;
+            }
+          : undefined}
         onConnected={(connected, key) => {
           apiKey = key;
           server = connected;
           changingServerAddress = false;
+          reconnectingServer = false;
         }}
       />
     {/if}

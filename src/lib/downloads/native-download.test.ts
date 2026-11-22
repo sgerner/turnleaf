@@ -37,6 +37,12 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import {
+  getCredentialState,
+  markCredentialRejected,
+  resetCredentialState,
+  syncLoadedCredential,
+} from '../native/credentials';
 import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
@@ -45,6 +51,7 @@ function encoded(bytes: Uint8Array): string {
 
 beforeEach(() => {
   clearDiagnostics();
+  resetCredentialState();
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
@@ -202,5 +209,134 @@ describe('native cover cache', () => {
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('continues serving cached local covers during credential lockout while skipping uncached transfers', async () => {
+    const state = syncLoadedCredential('stale-key', 'server_primary_api_key');
+    markCredentialRejected(state.epoch, 401);
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'stale-key',
+        7,
+        undefined,
+        'primary',
+        true,
+        state.epoch,
+      ),
+    ).resolves.toBe('web://file://covers/primary/7.img');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    vi.mocked(Filesystem.stat).mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'stale-key',
+        8,
+        undefined,
+        'primary',
+        true,
+        state.epoch,
+      ),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    vi.mocked(Filesystem.stat).mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' });
+    await expect(cacheCover('https://books.example.com/cover', '   ', 9)).rejects.toThrow(
+      'Offline',
+    );
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('marks credentials rejected and logs a sanitized diagnostic on HTTP 401 or 403 cover responses', async () => {
+    const state = syncLoadedCredential('stale-key', 'server_primary_api_key');
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
+      code: 'OS-PLUG-FLTR-0010',
+      data: { httpStatus: 401, source: 'https://private.example/cover' },
+    });
+
+    await expect(
+      cacheCover(
+        'https://private.example/cover',
+        'stale-key',
+        12,
+        undefined,
+        'primary',
+        true,
+        state.epoch,
+      ),
+    ).rejects.toMatchObject({ code: 'OS-PLUG-FLTR-0010', data: { httpStatus: 401 } });
+
+    expect(getCredentialState()).toEqual({
+      status: 'rejected',
+      epoch: state.epoch,
+      statusCode: 401,
+    });
+    const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
+    expect(log).toContain('endpoint=/api/Image/series-cover');
+    expect(log).toContain('status=401');
+    expect(log).not.toMatch(/private\.example|stale-key/);
+  });
+});
+
+describe('native EPUB credential gating', () => {
+  it('refuses EPUB downloads with blank or rejected credentials without starting FileTransfer', async () => {
+    await expect(
+      downloadEpub('https://books.example.com/download', '   ', 'server-book'),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    const state = syncLoadedCredential('stale-key', 'server_primary_api_key');
+    markCredentialRejected(state.epoch, 401);
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'stale-key',
+        'server-book',
+        undefined,
+        state.epoch,
+      ),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('marks credentials rejected on EPUB HTTP 401 while keeping HTTP 403 permission errors distinct', async () => {
+    const state = syncLoadedCredential('valid-key', 'server_primary_api_key');
+    vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
+      code: 'OS-PLUG-FLTR-0010',
+      data: { httpStatus: 403 },
+    });
+
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'valid-key',
+        'server-book',
+        undefined,
+        state.epoch,
+      ),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(getCredentialState()).toEqual({ status: 'ready', epoch: state.epoch });
+
+    vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
+      code: 'OS-PLUG-FLTR-0010',
+      data: { httpStatus: 401 },
+    });
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'valid-key',
+        'server-book',
+        undefined,
+        state.epoch,
+      ),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(getCredentialState()).toEqual({
+      status: 'rejected',
+      epoch: state.epoch,
+      statusCode: 401,
+    });
   });
 });

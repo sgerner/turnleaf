@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { KavitaError } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -226,4 +227,44 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('stops immediately on a KavitaError authentication failure without trying remaining queued books', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2', chapterId: 2 });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const saveProgress = vi
+    .fn()
+    .mockRejectedValueOnce(new KavitaError('Kavita rejected this auth key.', 'authentication', 401))
+    .mockResolvedValueOnce(undefined);
+
+  await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
+    '1 reading progress item failed to sync.',
+  );
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']?.attemptCount).toBe(1);
+  expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
+  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+  expect(saved.readingState['book-2']?.pendingSync).toBe(true);
 });

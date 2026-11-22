@@ -4,7 +4,7 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import type { KavitaClient } from '../kavita/client';
+import { KavitaError, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
 const flushing = new Map<string, Promise<void>>();
@@ -28,6 +28,7 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
     if (pending.length === 0) break;
+    let authFailed = false;
     for (const item of pending) {
       attempted.set(item.bookId, item);
       try {
@@ -41,8 +42,13 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
           item.updatedAt,
         );
         failures.push(error);
+        if (error instanceof KavitaError && error.kind === 'authentication') {
+          authFailed = true;
+          break;
+        }
       }
     }
+    if (authFailed) break;
   }
   if (failures.length > 0) {
     throw new AggregateError(

@@ -2,7 +2,9 @@ import { execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createCdpClient } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
@@ -12,6 +14,8 @@ import { main as smoke } from './android-smoke.mjs';
 const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
+const rotatedKey = 'turnleaf-ci-rotated';
+const secureStorageKey = 'turnleaf_server_primary_api_key';
 let deviceSerial;
 const adb = async (...args) =>
   (
@@ -66,31 +70,35 @@ async function connectWebView() {
   }
 }
 
-async function startFixture() {
+export async function startFixture() {
   const epub = await readFile(
     new URL('../dev/kavita/data/Books/lorem-ipsum.epub', import.meta.url),
   );
   const uploads = [];
   let downloads = 0;
   let offline = false;
+  let activeKey = key;
+  let version = '0.0.0-ci';
   const offlineRequests = [];
+  const unauthorizedRequests = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
   const server = createServer(async (request, response) => {
-    if (request.headers['x-api-key'] !== key) {
-      response.writeHead(401).end();
-      return;
-    }
     const path = new URL(request.url, 'http://localhost').pathname;
     if (offline) {
       offlineRequests.push(path);
       response.writeHead(503).end();
       return;
     }
+    if (request.headers['x-api-key'] !== activeKey) {
+      unauthorizedRequests.push(path);
+      response.writeHead(401).end();
+      return;
+    }
     const pagesRead = uploads.at(-1)?.pageNum ?? 0;
     let body;
     switch (path) {
       case '/api/Health':
-        body = { version: '0.0.0-ci' };
+        body = { version };
         break;
       case '/api/Library/libraries':
         body = [{ id: 1, name: 'Books', type: 2 }];
@@ -158,8 +166,13 @@ async function startFixture() {
       return downloads;
     },
     offlineRequests,
+    unauthorizedRequests,
     setOffline(value) {
       offline = value;
+    },
+    setApiKey(nextKey, nextVersion = version) {
+      activeKey = nextKey;
+      version = nextVersion;
     },
     close() {
       server.close();
@@ -201,6 +214,32 @@ async function run() {
   let journeyError;
   let cleanupError;
   let journeyPassed = false;
+
+  async function restartApp() {
+    if (web) {
+      await web.close();
+      web = undefined;
+    }
+    await adb('shell', 'am', 'force-stop', packageName);
+    await adb(
+      'shell',
+      'am',
+      'start',
+      '-W',
+      '-n',
+      `${packageName}/app.turnleaf.reader.MainActivity`,
+    );
+    web = await connectWebView();
+  }
+
+  async function returnToLibrary(label) {
+    await waitFor(label, async () => {
+      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
+      await web.evaluate(click('[aria-label="Show reading controls"]'));
+      return false;
+    });
+  }
+
   try {
     deviceSerial = await resolveDeviceSerial({ emulatorOnly: true });
     throwIfInterrupted();
@@ -251,43 +290,100 @@ async function run() {
         'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
       ),
     );
-    await waitFor('return to library control', async () => {
-      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
-      await web.evaluate(click('[aria-label="Show reading controls"]'));
-      return false;
-    });
+    await returnToLibrary('return to library control');
     await waitFor('saved offline progress', () =>
       web.evaluate(
         `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
       ),
     );
 
-    const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
-    await web.close();
-    web = undefined;
-    await adb('shell', 'am', 'force-stop', packageName);
-    await adb(
-      'shell',
-      'am',
-      'start',
-      '-W',
-      '-n',
-      `${packageName}/app.turnleaf.reader.MainActivity`,
+    // Phase 2: degraded offline startup when saved key is missing from SecureStorage.
+    await web.evaluate(
+      `Capacitor.Plugins.SecureStorage.internalRemoveItem({ prefixedKey: ${JSON.stringify(secureStorageKey)}, sync: false }).then(() => true)`,
     );
-    web = await connectWebView();
-    await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
-    await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
+    const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
+    await restartApp();
+    await waitFor('missing-key alert in degraded offline library', () =>
+      web.evaluate(
+        `document.querySelector('[data-credential-alert="missing"]') !== null && document.querySelectorAll('.alert').length === 1`,
+      ),
+    );
+    await waitFor('offline catalog book without saved key', () =>
+      web.evaluate(click('[data-book-open]')),
+    );
+    await waitFor('offline passage restored without saved key', () => web.evaluate(chapter(2)));
+    await returnToLibrary('return to library from missing-key offline reader');
+    await waitFor('missing-key alert after closing offline reader', () =>
+      web.evaluate(`document.querySelector('[data-credential-alert="missing"]') !== null`),
+    );
     if (fixture.offlineRequests.length > 0) {
       throw new Error(
-        `Turnleaf sent authenticated requests offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
+        `Turnleaf sent requests while offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
       );
     }
 
+    // Phase 3: online startup with stale key verifies 401 circuit breaker & consolidated alert.
+    await web.evaluate(
+      `Capacitor.Plugins.SecureStorage.internalSetItem({ prefixedKey: ${JSON.stringify(secureStorageKey)}, data: ${JSON.stringify(JSON.stringify(key))}, sync: false, access: 0 }).then(() => true)`,
+    );
+    fixture.setApiKey(rotatedKey, '0.0.1-rotated');
     fixture.setOffline(false);
     await adb('shell', 'svc', 'wifi', 'enable');
     await adb('shell', 'svc', 'data', 'enable');
     disabledNetwork = false;
-    await waitFor('queued passage uploaded after reconnect', () =>
+    await waitFor('online state before stale-key restart', async () => {
+      const connected = await web.evaluate(
+        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
+      );
+      return connected === true;
+    });
+    fixture.unauthorizedRequests.length = 0;
+    await restartApp();
+    await waitFor('consolidated rejected-key alert', () =>
+      web.evaluate(
+        `document.querySelector('[data-credential-alert="rejected"]') !== null && document.querySelectorAll('.alert').length === 1`,
+      ),
+    );
+    await waitFor('downloaded book while key is rejected', () =>
+      web.evaluate(click('[data-book-open]')),
+    );
+    await waitFor('offline passage while key is rejected', () => web.evaluate(chapter(2)));
+    await returnToLibrary('return to library while key is rejected');
+    await waitFor('consolidated rejected-key alert after closing reader', () =>
+      web.evaluate(
+        `document.querySelector('[data-credential-alert="rejected"]') !== null && document.querySelectorAll('.alert').length === 1`,
+      ),
+    );
+    if (
+      fixture.unauthorizedRequests.length !== 1 ||
+      fixture.unauthorizedRequests[0] !== '/api/Series/v2'
+    ) {
+      throw new Error(
+        `Expected exactly one 401 request (/api/Series/v2) before circuit breaker tripped, saw: ${fixture.unauthorizedRequests.join(', ') || 'none'}.`,
+      );
+    }
+    if (fixture.uploads.length !== uploadCount) {
+      throw new Error('Queued progress uploaded before key rotation.');
+    }
+
+    // Phase 4: key rotation in Settings clears circuit breaker and flushes queued progress.
+    await waitFor('recover key in Settings control', () =>
+      web.evaluate(click('[data-credential-recover]')),
+    );
+    await waitFor('replacement API key input', () =>
+      web.evaluate("Boolean(document.querySelector('#replacement-api-key'))"),
+    );
+    await web.evaluate(`(() => {
+      const input = document.querySelector('#replacement-api-key');
+      if (!input) return false;
+      input.value = ${JSON.stringify(rotatedKey)};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const submit = input.closest('form')?.querySelector('button[type="submit"]');
+      if (!submit || submit.disabled) return false;
+      submit.click();
+      return true;
+    })()`);
+    await waitFor('queued passage uploaded after key rotation', () =>
       fixture.uploads
         .slice(uploadCount)
         .some(
@@ -295,14 +391,9 @@ async function run() {
             progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
         ),
     );
-    await waitFor('return to library after reconnect', async () => {
-      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
-      await web.evaluate(click('[aria-label="Show reading controls"]'));
-      return false;
-    });
-    await waitFor('saved passage after reconnect', () =>
+    await waitFor('credential alert cleared after key rotation', () =>
       web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
+        `!document.querySelector('[data-credential-alert]') && Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
       ),
     );
     throwIfInterrupted();
@@ -339,10 +430,14 @@ async function run() {
     throw journeyError;
   }
   if (cleanupError) throw cleanupError;
-  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+  console.log(
+    'Android reading journey passed: connect, download, missing-key offline startup, 401 gating, rotate key, sync.',
+  );
 }
 
-await run().catch((error) => {
-  console.error(error);
-  process.exitCode ??= 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await run().catch((error) => {
+    console.error(error);
+    process.exitCode ??= 1;
+  });
+}

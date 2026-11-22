@@ -45,7 +45,14 @@
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
-  import { removeApiKey, saveApiKey } from '../native/credentials';
+  import {
+    getCredentialState,
+    removeApiKey,
+    saveApiKey,
+    subscribeCredentialState,
+    type CredentialState,
+    type CredentialStatus,
+  } from '../native/credentials';
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
@@ -62,6 +69,8 @@
     onThemeChange,
     onModeChange,
     onApiKeyChange,
+    onRetryCredentials,
+    onReconnect,
     onServerDeleted,
     onChangeServerAddress,
   }: {
@@ -71,25 +80,41 @@
     mode: 'light' | 'dark';
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
-    onApiKeyChange: (apiKey: string) => void;
+    onApiKeyChange: (apiKey: string, updatedServer?: ServerConfig) => void;
+    onRetryCredentials?: (() => Promise<boolean>) | undefined;
+    onReconnect?: (() => void) | undefined;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  let credentialState = $state<CredentialState>(getCredentialState());
+  let retryingCredentials = $state(false);
+  let catalogCheckPending = $state(false);
+  const credentialStatus = $derived<CredentialStatus>(
+    credentialState.status === 'ready' && !apiKey.trim() ? 'missing' : credentialState.status,
+  );
+  const credentialReady = $derived(credentialStatus === 'ready');
+  const client = $derived(
+    new KavitaClient(server.baseUrl, apiKey, { credentialEpoch: credentialState.epoch }),
+  );
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
+      const allowDownload =
+        !catalogCheckPending && !refreshing && credentialReady && (await networkAvailable());
       return cacheCover(
         client.coverUrl(seriesId),
         apiKey,
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        allowDownload,
+        credentialState.epoch,
       );
     }
-    if (offline) throw new Error('Offline');
+    if (offline || !credentialReady || catalogCheckPending || refreshing) {
+      throw new Error('Offline');
+    }
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
@@ -278,6 +303,35 @@
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
+  const unsubscribeCredentials = subscribeCredentialState((next) => {
+    if (destroyed) return;
+    credentialState = next;
+    if (next.status !== 'ready') {
+      catalogCheckPending = false;
+      refreshController?.abort();
+      openProgressProbe?.abort();
+      cancelCoverLoading();
+      sharedCoverLoader.cancel();
+    }
+  });
+
+  const credentialBannerMessage = $derived.by(() => {
+    if (credentialReady) return '';
+    const libraryNote = displayableBooks.length
+      ? 'Downloaded books remain available offline.'
+      : 'No saved books are available on this device yet.';
+    const pendingNote =
+      syncStatus.pendingCount > 0
+        ? ` ${syncStatus.pendingCount} reading progress update${syncStatus.pendingCount === 1 ? ' is' : 's are'} saved on this device and will sync after you update the key.`
+        : '';
+    if (credentialStatus === 'missing') {
+      return `Turnleaf could not find the saved Kavita auth key. ${libraryNote} Enter a key in Settings to sync with Kavita.${pendingNote}`;
+    }
+    if (credentialStatus === 'unreadable') {
+      return `Turnleaf could not read the saved Kavita auth key. ${libraryNote} Retry reading the key or enter a new key in Settings.${pendingNote}`;
+    }
+    return `Kavita rejected the saved auth key. ${libraryNote} Update it in Settings to sync with Kavita.${pendingNote}`;
+  });
 
   function normalizeLibrarySearch(value: string): string {
     return value
@@ -524,13 +578,15 @@
     if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
+    catalogCheckPending = !offline && credentialReady;
     loading = false;
     void refreshSyncStatus();
-    offlineMessage = offline
-      ? displayableBooks.length
-        ? 'No network connection. Showing your saved library.'
-        : 'No network connection. Connect to Kavita to load your library.'
-      : '';
+    offlineMessage =
+      offline && credentialReady
+        ? displayableBooks.length
+          ? 'No network connection. Showing your saved library.'
+          : 'No network connection. Connect to Kavita to load your library.'
+        : '';
     if (destroyed) return;
     cleanups.push(
       await registerListener(
@@ -538,27 +594,33 @@
           if (destroyed) return;
           offline = !connected;
           if (!connected) {
+            catalogCheckPending = false;
             refreshController?.abort();
             openProgressProbe?.abort();
           }
-          coverReloadRequest += 1;
           kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
+            : credentialReady
+              ? displayableBooks.length
+                ? 'No network connection. Showing your saved library.'
+                : 'No network connection. Connect to Kavita to load your library.'
+              : '';
+          if (!connected) {
+            coverReloadRequest += 1;
+          } else if (credentialReady) {
+            catalogCheckPending = true;
             void refresh()
-              .then(() => syncProgress(false))
+              .then(() => (credentialReady ? syncProgress(false) : undefined))
               .catch(() => {});
+          }
         }),
       ),
     );
     cleanups.push(
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
-          if (!destroyed && !isActive) void syncProgress(false);
+          if (!destroyed && !isActive && credentialReady) void syncProgress(false);
         }),
       ),
     );
@@ -577,9 +639,13 @@
         }),
       ),
     );
-    if (!destroyed && !offline) {
+    if (!destroyed && !offline && credentialReady) {
       await refresh();
-      void syncProgress(false);
+      if (!destroyed && !offline && credentialReady) {
+        void syncProgress(false);
+      }
+    } else {
+      catalogCheckPending = false;
     }
   });
 
@@ -611,7 +677,13 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
-    if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+    if (
+      destroyed ||
+      !credentialReady ||
+      conflict ||
+      resolvingOpenProgress ||
+      acceptingRemoteProgress
+    ) {
       return Promise.resolve();
     }
     syncWork = runProgressSync(showFeedback).finally(() => {
@@ -623,6 +695,7 @@
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     try {
+      if (!credentialReady) return;
       if (!(await networkAvailable())) {
         if (showFeedback)
           message = 'Offline. Reading progress will retry when Kavita is available.';
@@ -631,14 +704,14 @@
       await flushProgress(client, server.id);
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
-      if (
-        error instanceof AggregateError &&
-        error.errors.some(
-          (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
-        )
-      ) {
-        message =
-          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
+      const authError =
+        (error instanceof KavitaError && error.kind === 'authentication') ||
+        (error instanceof AggregateError &&
+          error.errors.some(
+            (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
+          ));
+      if (authError) {
+        message = '';
       } else if (showFeedback) {
         message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
       }
@@ -650,6 +723,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    unsubscribeCredentials();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -663,7 +737,10 @@
   });
 
   function refresh(): Promise<void> {
-    if (destroyed || offline) return Promise.resolve();
+    if (destroyed || offline || !credentialReady) {
+      catalogCheckPending = false;
+      return Promise.resolve();
+    }
     if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
     if (!refreshWork) {
       refreshWork = refreshCatalog().finally(() => {
@@ -681,7 +758,7 @@
     let diagnosticEndpoint = '/api/unknown';
     message = '';
     try {
-      if (!(await networkAvailable()) || controller.signal.aborted) return;
+      if (!credentialReady || !(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
@@ -710,7 +787,6 @@
       if (destroyed) return;
       books = await getBooks(server.id, { includeDescription: false });
       retainCoversFor(books);
-      coverReloadRequest += 1;
       if (downloadNeedsRefresh && downloadFailureBook) {
         const refreshedFailure = books.find((item) => item.id === downloadFailureBook?.id) ?? null;
         downloadNeedsRefresh = false;
@@ -749,7 +825,7 @@
       if (cause instanceof KavitaError) {
         switch (cause.kind) {
           case 'authentication':
-            offlineMessage = `Kavita rejected the saved auth key. Update it in Settings. ${savedBooks}`;
+            offlineMessage = '';
             break;
           case 'invalid-response':
             offlineMessage = `${cause.message} Open Settings to copy diagnostics. ${savedBooks}`;
@@ -767,6 +843,10 @@
     } finally {
       refreshController = null;
       refreshing = false;
+      catalogCheckPending = false;
+      if (!destroyed && !offline && credentialReady && !kavitaUnreachable) {
+        coverReloadRequest += 1;
+      }
     }
   }
 
@@ -833,6 +913,10 @@
   }
 
   async function download(book: BookRecord): Promise<BookRecord | null> {
+    if (!credentialReady) {
+      libraryMain?.querySelector<HTMLElement>('[data-credential-recover]')?.focus();
+      return null;
+    }
     if (downloadingBookId || cleanupInProgress) {
       message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
@@ -852,6 +936,7 @@
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        credentialState.epoch,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -898,7 +983,16 @@
         status = error.status;
         detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
         if (status === 401) {
-          message = 'Kavita rejected authentication for this download. Check your API key.';
+          recordDiagnostic({
+            category: 'download',
+            endpoint: EPUB_DOWNLOAD_ENDPOINT,
+            status,
+            detail,
+          });
+          if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
+          message = '';
+          downloadFailureBook = null;
+          return null;
         } else if (status === 403) {
           message = 'Kavita denied the download. Check your account’s download permissions.';
         } else if (status !== undefined) {
@@ -988,7 +1082,12 @@
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
     try {
       let remote: KavitaProgress | null = null;
-      if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
+      if (
+        credentialReady &&
+        !offline &&
+        (!kavitaUnreachable || force) &&
+        book.remoteAvailable !== false
+      ) {
         const probe = new AbortController();
         openProgressProbe = probe;
         const abort = new Promise<null>((resolve) => {
@@ -1002,8 +1101,10 @@
             (async () => {
               // Compare revisions only after any previous upload has settled.
               await upload;
-              if (probe.signal.aborted) return null;
-              if (!(await networkAvailable()) || probe.signal.aborted) return null;
+              if (probe.signal.aborted || !credentialReady) return null;
+              if (!(await networkAvailable()) || probe.signal.aborted || !credentialReady) {
+                return null;
+              }
               return client.getProgress(book.chapterId, probe.signal).catch(() => null);
             })(),
           ]);
@@ -1121,7 +1222,7 @@
 
   async function retryReaderDownload(): Promise<void> {
     const current = reading;
-    if (!current || offline || current.book.remoteAvailable === false) {
+    if (!current || offline || !credentialReady || current.book.remoteAvailable === false) {
       throw new Error('This book is not available from Kavita right now.');
     }
     const refreshed = await download(current.book);
@@ -1167,6 +1268,14 @@
     accept?: () => Promise<void>;
   } | null> {
     if (!manual && !pendingAutoSync) return null;
+    if (!credentialReady) {
+      if (manual) {
+        throw new Error(
+          'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
+        );
+      }
+      return null;
+    }
     if (book.remoteAvailable === false || !(await networkAvailable())) {
       if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
@@ -1345,6 +1454,38 @@
     focusModal(() => settingsDialog);
   }
 
+  function openSettingsForApiKey(): void {
+    settingsOpener = activeElement();
+    settingsVisible = true;
+    void Promise.allSettled(skeletonThemes.map(loadTheme));
+    void tick().then(() => {
+      const input = settingsDialog?.querySelector<HTMLInputElement>('#replacement-api-key');
+      if (input) input.focus();
+      else focusFirstElement(settingsDialog);
+    });
+  }
+
+  async function retryCredentials(): Promise<void> {
+    if (!onRetryCredentials || retryingCredentials) return;
+    retryingCredentials = true;
+    catalogCheckPending = !offline;
+    let refreshed = false;
+    try {
+      const recovered = await onRetryCredentials();
+      await tick();
+      if (recovered && !destroyed && !offline && credentialReady) {
+        refreshed = true;
+        await refresh();
+        if (!destroyed && !offline && credentialReady) {
+          await syncProgress(false);
+        }
+      }
+    } finally {
+      if (!refreshed) catalogCheckPending = false;
+      retryingCredentials = false;
+    }
+  }
+
   function closeSettings(): void {
     settingsVisible = false;
     showReplacementKey = false;
@@ -1518,16 +1659,24 @@
         kavitaVersion: result.version,
         lastConnectedAt: new Date().toISOString(),
       };
+      catalogCheckPending = !offline;
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
-      onApiKeyChange(nextKey);
+      onApiKeyChange(nextKey, updatedServer);
       replacementApiKey = '';
-      message = 'API key updated.';
       closeSettings();
+      await tick();
       // An upload started with the previous key may still be finishing.
       await syncWork;
-      await refresh();
-      await syncProgress(false);
+      if (!offline && credentialReady) {
+        await refresh();
+        if (!offline && credentialReady) {
+          await syncProgress(false);
+        }
+      } else {
+        catalogCheckPending = false;
+      }
+      if (!message) message = 'API key updated.';
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -1580,7 +1729,7 @@
       onBack={() => void closeReader()}
       onRelocated={handleRelocated}
       onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
-      onRetryDownload={offline || reading.book.remoteAvailable === false
+      onRetryDownload={offline || !credentialReady || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
       registerBackHandler={registerReaderBackHandler}
@@ -1606,7 +1755,9 @@
       Skip to library books
     </a>
     <p class="sr-only" role="status">
-      {offlineMessage || message || (refreshing ? 'Refreshing library' : '')}
+      {(credentialReady ? offlineMessage : '') ||
+        message ||
+        (refreshing ? 'Refreshing library' : '')}
       {#if !loading && !refreshing}
         {visibleBooks.length} of {displayableBooks.length} books.
       {/if}
@@ -1637,7 +1788,7 @@
           class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
           onclick={refresh}
-          disabled={refreshing}
+          disabled={refreshing || offline || !credentialReady}
           aria-label="Refresh library"
           title="Refresh"
         >
@@ -1897,7 +2048,45 @@
       </div>
     {/if}
 
-    {#if offlineMessage}
+    {#if !credentialReady}
+      <div
+        class="alert preset-tonal-warning mt-5 flex flex-wrap items-center justify-between gap-3"
+        role="alert"
+        data-credential-alert={credentialStatus}
+        transition:fade
+      >
+        <p class="min-w-0 flex-1">{credentialBannerMessage}</p>
+        <div class="flex flex-wrap items-center gap-2">
+          {#if credentialStatus === 'unreadable' && onRetryCredentials}
+            <button
+              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
+              type="button"
+              disabled={retryingCredentials}
+              onclick={() => void retryCredentials()}
+            >
+              {retryingCredentials ? 'Retrying…' : 'Retry key'}
+            </button>
+          {/if}
+          {#if onReconnect && !offline}
+            <button
+              class="btn btn-sm preset-tonal-surface h-11 shrink-0"
+              type="button"
+              onclick={onReconnect}
+            >
+              Reconnect
+            </button>
+          {/if}
+          <button
+            class="btn btn-sm preset-filled-primary-700-300 h-11 shrink-0"
+            type="button"
+            data-credential-recover
+            onclick={openSettingsForApiKey}
+          >
+            Update key in Settings
+          </button>
+        </div>
+      </div>
+    {:else if offlineMessage}
       <div class="alert preset-tonal-warning mt-5" transition:fade>
         {offlineMessage}
       </div>
@@ -1947,7 +2136,7 @@
             </span>
           </div>
         {/if}
-        {#if downloadFailureBook}
+        {#if downloadFailureBook && (failedDownloadCleanupPath || credentialReady)}
           {#if failedDownloadCleanupPath}
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
@@ -1961,7 +2150,7 @@
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
               onclick={() => void refresh()}
-              disabled={refreshing}>Refresh library</button
+              disabled={refreshing || !credentialReady}>Refresh library</button
             >
           {:else}
             <button
@@ -1970,13 +2159,14 @@
               onclick={() => void download(downloadFailureBook!)}
               disabled={Boolean(downloadingBookId) ||
                 offline ||
+                !credentialReady ||
                 downloadFailureBook.remoteAvailable === false}>Retry download</button
             >
           {/if}
         {/if}
       </div>
     {/if}
-    {#if syncStatus.pendingCount > 0}
+    {#if credentialReady && syncStatus.pendingCount > 0}
       <div
         class="alert preset-tonal-warning mt-4 flex flex-wrap items-center justify-between gap-3"
         role="status"
@@ -1995,7 +2185,7 @@
           class="btn btn-sm preset-tonal-warning h-10 shrink-0"
           type="button"
           onclick={() => void syncProgress()}
-          disabled={syncing || offline}
+          disabled={syncing || offline || !credentialReady}
         >
           {syncing ? 'Retrying...' : 'Retry sync'}
         </button>
@@ -2032,14 +2222,16 @@
           />
         </svg>
         <p>No EPUB books found.</p>
-        <button
-          class="btn preset-tonal-surface mt-2 h-11"
-          type="button"
-          onclick={() => void refresh()}
-          disabled={refreshing || offline}
-        >
-          {refreshing ? 'Refreshing…' : 'Refresh library'}
-        </button>
+        {#if credentialReady}
+          <button
+            class="btn preset-tonal-surface mt-2 h-11"
+            type="button"
+            onclick={() => void refresh()}
+            disabled={refreshing || offline}
+          >
+            {refreshing ? 'Refreshing…' : 'Refresh library'}
+          </button>
+        {/if}
       </div>
     {:else if visibleBooks.length === 0}
       <div
@@ -2372,6 +2564,11 @@
         <button
           class="btn preset-filled-primary-700-300 justify-start"
           type="button"
+          disabled={!actionMenuBook.downloadPath &&
+            (Boolean(downloadingBookId) ||
+              offline ||
+              !credentialReady ||
+              actionMenuBook.remoteAvailable === false)}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();
@@ -2389,6 +2586,7 @@
             type="button"
             disabled={Boolean(downloadingBookId) ||
               offline ||
+              !credentialReady ||
               actionMenuBook.remoteAvailable === false}
             onclick={() => {
               const book = actionMenuBook;
@@ -2405,6 +2603,8 @@
         <button
           class="btn preset-tonal-primary justify-start"
           type="button"
+          disabled={!actionMenuBook.downloadPath &&
+            (offline || !credentialReady || actionMenuBook.remoteAvailable === false)}
           onclick={() => {
             const book = actionMenuBook;
             closeMenu();

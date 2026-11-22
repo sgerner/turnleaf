@@ -2,6 +2,11 @@ import { Capacitor } from '@capacitor/core';
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { recordDiagnostic } from '../diagnostics/log';
+import {
+  canSendCredential,
+  markCredentialRejected,
+  resolveCredentialEpoch,
+} from '../native/credentials';
 import { EpubValidationError, validateEpubArchive } from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
@@ -107,10 +112,15 @@ export async function downloadEpub(
   apiKey: string,
   bookId: string,
   onProgress?: (percent: number) => void,
+  credentialEpoch?: number,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
   assertSafeBookId(bookId);
+  const epoch = resolveCredentialEpoch(apiKey, credentialEpoch);
+  if (!canSendCredential(apiKey, epoch)) {
+    throw new EpubTransferError(401, false);
+  }
 
   await cleanupInterruptedEpubDownloads();
   await ensureDataDirectory(BOOK_DIRECTORY);
@@ -135,6 +145,9 @@ export async function downloadEpub(
 
   try {
     for (let attempt = 0; ; attempt += 1) {
+      if (!canSendCredential(apiKey, epoch)) {
+        throw new EpubTransferError(401, false);
+      }
       try {
         await FileTransfer.downloadFile({
           url: downloadUrl,
@@ -153,6 +166,9 @@ export async function downloadEpub(
           httpStatus <= 599
             ? httpStatus
             : undefined;
+        if (status === 401) {
+          markCredentialRejected(epoch, 401);
+        }
         const connectionFailed = failure?.code === 'OS-PLUG-FLTR-0008';
         const retryable =
           status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
@@ -254,6 +270,7 @@ export async function cacheCover(
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload = true,
+  credentialEpoch?: number,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const namespace = safeCoverNamespace(cacheNamespace);
@@ -263,7 +280,8 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!allowDownload) throw new Error('Offline');
+    const epoch = resolveCredentialEpoch(apiKey, credentialEpoch);
+    if (!allowDownload || !canSendCredential(apiKey, epoch)) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
@@ -284,6 +302,16 @@ export async function cacheCover(
         directory: Directory.Data,
       });
     } catch (error) {
+      const httpStatus = (error as { data?: { httpStatus?: unknown } } | null)?.data?.httpStatus;
+      if (httpStatus === 401 || httpStatus === 403) {
+        markCredentialRejected(epoch, httpStatus);
+        recordDiagnostic({
+          category: 'response',
+          endpoint: '/api/Image/series-cover',
+          status: httpStatus,
+          detail: 'authentication',
+        });
+      }
       await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
         () => {},
       );
