@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- Update server address inline in settings and parse OPDS paste
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
