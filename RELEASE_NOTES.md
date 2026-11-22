@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Deduplicate controls in Library cards with Svelte snippets
 - Link repo to its Stitch workspace
 - Make EPUB link jumps reversible and volume keys opt-in
 - Stop Kavita background requests when connectivity drops

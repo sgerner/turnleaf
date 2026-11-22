@@ -73,6 +73,7 @@ export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },
+  ...(process.env.VITEST ? { resolve: { conditions: ['browser'] } } : {}),
   build: {
     target: 'es2022',
     sourcemap: false,
