@@ -30,8 +30,7 @@ const mocks = vi.hoisted(() => ({
       ) => Promise<boolean>
     >(),
   markDownloaded: vi.fn<(bookId: string, path: string, size: number) => Promise<void>>(),
-  markBookCompleted:
-    vi.fn<(book: BookRecord, readingState?: StoredReadingState | null) => Promise<void>>(),
+  markBookCompleted: vi.fn<(book: BookRecord) => Promise<void>>(),
   removeDownload: vi.fn<(bookId: string) => Promise<void>>(),
   removeDownloads: vi.fn<(bookIds: readonly string[]) => Promise<void>>(),
   removeServer: vi.fn<(serverId: string) => Promise<void>>(),
