@@ -52,7 +52,13 @@
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusModal,
+    restoreFocus,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   let {
     server,
@@ -340,16 +346,6 @@
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
-  }
-
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
   }
 
   function insecureServer(): boolean {
@@ -1289,7 +1285,7 @@
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1350,7 +1346,7 @@
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   function diagnosticsText(): string {
