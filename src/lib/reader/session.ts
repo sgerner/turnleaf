@@ -125,7 +125,7 @@ function isSafeEpubReference(value: string, kind: EpubReferenceKind): boolean {
   if (decoded.startsWith('#')) return true;
   if (kind !== 'link' && decoded.toLowerCase().startsWith('blob:')) return true;
   if (/^[a-z][a-z\d+.-]*:/i.test(decoded)) return false;
-  if (decoded.startsWith('/') || decoded.startsWith('\\') || decoded.startsWith('//')) return false;
+  if (decoded.startsWith('/') || decoded.startsWith('\\')) return false;
   return true;
 }
 
@@ -200,7 +200,6 @@ function decodeDataStylesheet(value: string): string | null {
   const trimmed = value.trim();
   if (!SAFE_DATA_STYLESHEET.test(trimmed)) return null;
   const separator = trimmed.indexOf(',');
-  if (separator < 0) return null;
   const metadata = trimmed.slice(0, separator).toLowerCase();
   const body = trimmed.slice(separator + 1);
   try {
@@ -397,7 +396,7 @@ function isSafeBaseReference(value: string, document: Document): boolean {
   const decoded = decodedReference(value);
   if (!decoded) return false;
   if (!/^[a-z][a-z\d+.-]*:/i.test(decoded)) {
-    return !decoded.startsWith('/') && !decoded.startsWith('\\') && !decoded.startsWith('//');
+    return !decoded.startsWith('/') && !decoded.startsWith('\\');
   }
   return isLocalContentUrl(decoded, document);
 }
@@ -1225,9 +1224,7 @@ export class ReaderSession {
   }
 
   private pageIndex(page: number): number {
-    if (typeof page === 'number') return Math.max(0, page - 1);
-    const runtimePage = page as unknown as { index?: number };
-    return Math.max(0, runtimePage.index ?? 0);
+    return Math.max(0, page - 1);
   }
 
   private resolveToken(token: string): string {
