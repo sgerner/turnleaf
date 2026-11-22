@@ -19,14 +19,13 @@
     type ReadingMode,
   } from '../reader/appearance';
   import {
-    createSwipeGestureTracker,
     ReaderSession,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
-    type ReaderSwipeDirection,
     type TocItem,
   } from '../reader/session';
+  import { createSwipeGestureTracker, type ReaderSwipeDirection } from '../reader/swipe';
   import type { ReaderSearchResult } from '../reader/search';
   import {
     addAnnotation,
@@ -76,6 +75,7 @@
     onRelocated,
     onSyncLatest,
     onRetryDownload,
+    onMountChange,
     registerBackHandler,
   }: {
     bookUrl: string;
@@ -89,6 +89,7 @@
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
+    onMountChange?: ((mounted: boolean) => void) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
@@ -172,6 +173,7 @@
     : null;
 
   onMount(async () => {
+    onMountChange?.(true);
     previousDocumentTitle = document.title;
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
@@ -335,6 +337,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onMountChange?.(false);
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
