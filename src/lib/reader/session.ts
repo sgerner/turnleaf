@@ -306,12 +306,18 @@ export class ReaderSession {
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
+  private userNavigationStartPage: { index: number; page: number } | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private pendingViewportSize: { width: number; height: number } | null = null;
+  private readyForResize = false;
+  private displayInFlight = false;
+  private lastDisplayedTarget: string | undefined = undefined;
+  private hasDisplayedTarget = false;
   private highlightCfis = new Set<string>();
   private onLocation:
     | ((
@@ -340,6 +346,11 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    this.pendingViewportSize = null;
+    this.readyForResize = false;
+    this.displayInFlight = false;
+    this.lastDisplayedTarget = undefined;
+    this.hasDisplayedTarget = false;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
@@ -376,20 +387,32 @@ export class ReaderSession {
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-      const isUserNavigation =
-        this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const startPage = this.userNavigationStartPage;
+      const movedCfi = startCfi ? startCfi !== location.start.cfi : !this.reflowPending;
+      const movedPage = startPage
+        ? startPage.index !== location.start.index ||
+          startPage.page !== location.start.displayed.page
+        : false;
+      const isUserNavigation = this.userNavigationPending && (movedCfi || movedPage);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (startCfi !== location.start.cfi) onSelection?.(null);
+      if (startCfi !== location.start.cfi || movedPage) onSelection?.(null);
       this.current = location;
+      this.lastDisplayedTarget = location.start.cfi;
+      this.hasDisplayedTarget = true;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
       this.reportLocation(location, origin, returnTarget);
+      if (!this.userNavigationPending && this.pendingViewportSize) {
+        this.reflowPending = false;
+        this.flushPendingViewportResize();
+        return;
+      }
       if (this.reflowPending) {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
@@ -427,24 +450,32 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
+    try {
+      await this.rendition.started;
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      let displayed = false;
+      if (cfi) {
+        try {
+          displayed = await this.displayAtGeneration(cfi, restoreGeneration);
+        } catch {
+          // A saved CFI can name a section removed in a newer copy of the EPUB.
+        }
+      }
+      if (!displayed && serverXPath) {
+        displayed = await this.displayXPath(serverXPath, restoreGeneration);
+      }
+      if (!displayed && serverPercentage && serverPercentage > 0) {
+        displayed = await this.displayPercentage(serverPercentage, restoreGeneration);
+      }
+      if (!displayed) {
+        await this.displayAtGeneration(undefined, restoreGeneration);
+      }
+    } finally {
+      if (this.rendition && this.isCurrentLocationOperation(restoreGeneration)) {
+        this.readyForResize = true;
+        this.flushPendingViewportResize();
       }
     }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -646,7 +677,7 @@ export class ReaderSession {
     });
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    const cfi = this.liveLocation()?.start.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
       this.reflowPending = true;
@@ -665,13 +696,20 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
+    this.pendingViewportSize = null;
+    this.readyForResize = false;
+    this.displayInFlight = false;
+    this.lastDisplayedTarget = undefined;
+    this.hasDisplayedTarget = false;
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.userNavigationStartPage = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -707,11 +745,59 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
-      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.rendition.resize(width, height);
+      if (this.viewportSize?.width === width && this.viewportSize.height === height) {
+        this.pendingViewportSize = null;
+        return;
+      }
+      if (!this.readyForResize || this.displayInFlight || this.userNavigationPending) {
+        this.pendingViewportSize = { width, height };
+        return;
+      }
+      this.resizeViewport(width, height);
     });
     this.resizeObserver.observe(target);
+  }
+
+  private flushPendingViewportResize(): void {
+    if (
+      !this.readyForResize ||
+      this.displayInFlight ||
+      this.userNavigationPending ||
+      !this.pendingViewportSize
+    ) {
+      return;
+    }
+    const { width, height } = this.pendingViewportSize;
+    this.pendingViewportSize = null;
+    if (!width || !height) return;
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    this.resizeViewport(width, height);
+  }
+
+  private resizeViewport(width: number, height: number): void {
+    const rendition = this.rendition;
+    if (!rendition) return;
+    const internal = rendition as Rendition & {
+      resize: (width?: number, height?: number, epubcfi?: string) => void;
+      manager?: { rendered?: boolean; stage?: unknown; views?: { length?: number } };
+    };
+    if (internal.manager && (!internal.manager.rendered || !internal.manager.stage)) {
+      this.pendingViewportSize = { width, height };
+      return;
+    }
+    const hadLocation = Boolean(rendition.location?.start?.cfi);
+    const cfi =
+      this.liveLocation()?.start.cfi ??
+      (this.lastDisplayedTarget?.startsWith('epubcfi(') ? this.lastDisplayedTarget : undefined);
+    const fallbackTarget = cfi ?? this.lastDisplayedTarget;
+    this.viewportSize = { width, height };
+    if (cfi) internal.resize(width, height, cfi);
+    else internal.resize(width, height);
+    const viewsAfter = internal.manager?.views?.length ?? 0;
+    if (internal.manager && !hadLocation && viewsAfter === 0 && this.hasDisplayedTarget) {
+      const generation = this.locationGeneration;
+      void this.displayAtGeneration(fallbackTarget, generation).catch(() => {});
+    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -749,9 +835,21 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    if (target === undefined) await rendition.display();
-    else await rendition.display(target);
-    return this.isCurrentLocationOperation(generation);
+    this.displayInFlight = true;
+    try {
+      if (target === undefined) await rendition.display();
+      else await rendition.display(target);
+      if (this.isCurrentLocationOperation(generation)) {
+        if (!this.current) this.current = this.liveLocation();
+        this.lastDisplayedTarget = target;
+        this.hasDisplayedTarget = true;
+        return true;
+      }
+      return false;
+    } finally {
+      this.displayInFlight = false;
+      this.flushPendingViewportResize();
+    }
   }
 
   private async displayXPath(xpath: string, generation: number): Promise<boolean> {
@@ -761,9 +859,13 @@ export class ReaderSession {
     if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
+    this.displayInFlight = true;
     try {
       await rendition.display(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
+      if (!this.current) this.current = this.liveLocation();
+      this.lastDisplayedTarget = section.href;
+      this.hasDisplayedTarget = true;
       if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
@@ -774,10 +876,19 @@ export class ReaderSession {
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
       await rendition.display(cfi);
-      return this.isCurrentLocationOperation(generation);
+      if (this.isCurrentLocationOperation(generation)) {
+        this.current = this.liveLocation() ?? this.current;
+        this.lastDisplayedTarget = cfi;
+        this.hasDisplayedTarget = true;
+        return true;
+      }
+      return false;
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
+    } finally {
+      this.displayInFlight = false;
+      this.flushPendingViewportResize();
     }
   }
 
@@ -812,15 +923,40 @@ export class ReaderSession {
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {
     const generation = this.beginLocationOperation(true);
+    this.displayInFlight = true;
     try {
       await display();
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationStartPage = null;
       }
       throw error;
+    } finally {
+      this.displayInFlight = false;
+      this.flushPendingViewportResize();
     }
+  }
+
+  private liveLocation(): Location | null {
+    try {
+      const currentLocation: unknown = (
+        this.rendition as { currentLocation?: () => unknown } | null
+      )?.currentLocation?.();
+      if (
+        currentLocation &&
+        typeof currentLocation === 'object' &&
+        !(currentLocation instanceof Promise) &&
+        'start' in currentLocation &&
+        (currentLocation as Location).start?.cfi
+      ) {
+        return currentLocation as Location;
+      }
+    } catch {
+      // EPUB.js can throw if layout metrics are not ready yet.
+    }
+    return this.current ?? this.rendition?.location ?? null;
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
@@ -828,18 +964,21 @@ export class ReaderSession {
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
-    this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
+    const start = userNavigation ? this.liveLocation()?.start : null;
+    this.userNavigationStartCfi = start?.cfi ?? null;
+    this.userNavigationStartPage = start
+      ? { index: start.index, page: start.displayed.page }
       : null;
     return this.locationGeneration;
   }
 
   private beginLinkedNavigation(): void {
-    const start = this.current?.start ?? this.rendition?.location?.start;
+    const start = this.liveLocation()?.start;
     if (!start) return;
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
+    this.userNavigationStartPage = { index: start.index, page: start.displayed.page };
     this.userNavigationOrigin = 'link';
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }

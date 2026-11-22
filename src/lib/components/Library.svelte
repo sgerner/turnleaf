@@ -91,13 +91,8 @@
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
-      return cacheCover(
-        client.coverUrl(seriesId),
-        apiKey,
-        seriesId,
-        signal,
-        server.id,
-        await networkAvailable(),
+      return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id, () =>
+        networkAvailable(),
       );
     }
     if (offline) throw new Error('Offline');
@@ -538,21 +533,30 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          const wasOffline = offline;
           offline = !connected;
           if (!connected) {
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
             refreshController?.abort();
             openProgressProbe?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
           }
-          coverReloadRequest += 1;
+          if (connected && wasOffline) {
+            coverReloadRequest += 1;
+          }
           kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
+          if (connected && wasOffline)
+            void syncProgress(false)
+              .then(() => refresh())
               .catch(() => {});
         }),
       ),
@@ -615,7 +619,7 @@
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client, server.id);
+      await flushProgress(client, server.id, () => networkAvailable());
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
       if (
@@ -677,7 +681,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !(await networkAvailable())) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -692,7 +696,7 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !(await networkAvailable())) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -1009,6 +1013,8 @@
   }
 
   async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
+    cancelCoverLoading();
+    sharedCoverLoader.cancel();
     if (!book.downloadPath) {
       const refreshed = await download(book);
       if (refreshed) await open(refreshed, options);
@@ -1163,7 +1169,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, () => networkAvailable());
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
