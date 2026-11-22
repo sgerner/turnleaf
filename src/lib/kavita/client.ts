@@ -190,6 +190,7 @@ export class KavitaClient {
   }
 
   async getBookSeries(signal?: AbortSignal): Promise<KavitaSeries[]> {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const series: KavitaSeries[] = [];
     const seenSeriesIds = new Set<number>();
 
@@ -261,6 +262,9 @@ export class KavitaClient {
             }
           }),
         );
+      } catch (error) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        throw error;
       } finally {
         signal?.removeEventListener('abort', onCallerAbort);
       }
@@ -367,19 +371,14 @@ export class KavitaClient {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       return blob;
     }
-    const timeout = new AbortController();
-    const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
-    try {
-      const combined = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+    return this.withBrowserTimeout(signal, async (combined) => {
       const response = await this.browserFetchWithRedirects(url, {
         signal: combined,
         headers: { 'x-api-key': this.apiKey },
       });
       this.assertStatus(response.status);
       return await response.blob();
-    } finally {
-      window.clearTimeout(timer);
-    }
+    });
   }
 
   async getProgress(chapterId: number, signal?: AbortSignal): Promise<KavitaProgress> {
@@ -433,65 +432,35 @@ export class KavitaClient {
     init: RequestInit = {},
   ): Promise<KavitaResponse<T>> {
     if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
-    if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const timeout = new AbortController();
-    const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
-    const signal = init.signal ? AbortSignal.any([init.signal, timeout.signal]) : timeout.signal;
-
-    try {
-      const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
-        ...init,
-        signal,
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'x-api-key': this.apiKey,
-          ...init.headers,
-        },
-      });
-
-      const getHeader = (name: string): string | null =>
-        response.headers.get(name) ??
-        (name !== name.toLowerCase() ? response.headers.get(name.toLowerCase()) : null);
-      if (response.status >= 400) {
-        recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
-      }
-      if (response.status === 401 || response.status === 403) {
-        throw new KavitaError('Kavita rejected this auth key.', 'authentication', response.status);
-      }
-      if (!response.ok) {
-        throw new KavitaError(
-          `Kavita returned an error (${response.status}).`,
-          'server',
-          response.status,
-        );
-      }
-      if (response.status === 204 || getHeader('content-length') === '0') {
-        return { data: undefined as T, getHeader };
-      }
+    return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
       try {
-        return { data: (await response.json()) as T, getHeader };
-      } catch {
-        if (path === '/api/Health') return { data: undefined as T, getHeader };
-        recordDiagnostic({ category: 'validation', endpoint: path, detail: 'invalid-json' });
-        throw new KavitaError(
-          `Kavita returned malformed JSON at ${path.split('?')[0]}.`,
-          'invalid-response',
-        );
+        const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
+          ...init,
+          signal,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'x-api-key': this.apiKey,
+            ...init.headers,
+          },
+        });
+
+        const getHeader = (name: string): string | null => response.headers.get(name);
+        this.assertStatus(response.status, path);
+        if (response.status === 204 || getHeader('content-length') === '0') {
+          return { data: undefined as T, getHeader };
+        }
+        const data = await this.parseJsonPayload<T>(path, () => response.json() as Promise<T>);
+        return { data, getHeader };
+      } catch (error) {
+        if (error instanceof KavitaError) throw error;
+        recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+        const message = timeoutSignal.aborted
+          ? 'Kavita did not respond in time.'
+          : 'Kavita could not be reached. Check the address and network.';
+        throw new KavitaError(message, 'network');
       }
-    } catch (error) {
-      if (error instanceof KavitaError) throw error;
-      if (init.signal?.aborted && !timeout.signal.aborted) {
-        throw error instanceof DOMException ? error : new DOMException('Aborted', 'AbortError');
-      }
-      recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
-      const message = timeout.signal.aborted
-        ? 'Kavita did not respond in time.'
-        : 'Kavita could not be reached. Check the address and network.';
-      throw new KavitaError(message, 'network');
-    } finally {
-      window.clearTimeout(timer);
-    }
+    });
   }
 
   private async nativeRequest<T>(path: string, init: RequestInit): Promise<KavitaResponse<T>> {
@@ -537,25 +506,14 @@ export class KavitaClient {
         visited.add(nextUrl);
         currentUrl = nextUrl;
       }
-      if (response.status >= 400) {
-        recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
-      }
-      this.assertStatus(response.status);
+      this.assertStatus(response.status, path);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const headers = response.headers ?? {};
       const getHeader = (name: string): string | null => nativeHeader(headers, name);
       if (typeof response.data === 'string') {
         if (!response.data.trim()) return { data: undefined as T, getHeader };
-        try {
-          return { data: JSON.parse(response.data) as T, getHeader };
-        } catch {
-          if (path === '/api/Health') return { data: undefined as T, getHeader };
-          recordDiagnostic({ category: 'validation', endpoint: path, detail: 'invalid-json' });
-          throw new KavitaError(
-            `Kavita returned malformed JSON at ${path.split('?')[0]}.`,
-            'invalid-response',
-          );
-        }
+        const data = await this.parseJsonPayload<T>(path, () => JSON.parse(response.data) as T);
+        return { data, getHeader };
       }
       return { data: response.data as T, getHeader };
     } catch (error) {
@@ -634,7 +592,37 @@ export class KavitaClient {
     }
   }
 
-  private assertStatus(status: number): void {
+  private async withBrowserTimeout<T>(
+    signal: AbortSignal | null | undefined,
+    run: (combinedSignal: AbortSignal, timeoutSignal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const timeout = new AbortController();
+    const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const combinedSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+      return await run(combinedSignal, timeout.signal);
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  private async parseJsonPayload<T>(endpoint: string, parse: () => T | Promise<T>): Promise<T> {
+    try {
+      return await parse();
+    } catch {
+      if (endpoint === '/api/Health') return undefined as T;
+      recordDiagnostic({ category: 'validation', endpoint, detail: 'invalid-json' });
+      throw new KavitaError(
+        `Kavita returned malformed JSON at ${endpoint.split('?')[0]}.`,
+        'invalid-response',
+      );
+    }
+  }
+
+  private assertStatus(status: number, endpoint?: string): void {
+    if (endpoint !== undefined && status >= 400) {
+      recordDiagnostic({ category: 'response', endpoint, status });
+    }
     if (status === 401 || status === 403) {
       throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
     }

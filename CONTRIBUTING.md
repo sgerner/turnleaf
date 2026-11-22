@@ -47,7 +47,7 @@ The single contributor command is:
 npm run verify
 ```
 
-It runs the production dependency audit, formatting check, lint, type check, unit tests, and web build. Run `npm run format` only when you intend to rewrite formatting.
+It runs workflow action SHA pin verification (`npm run workflow:check`), the production dependency audit, formatting check, lint, type check, unit tests, and web build. Run `npm run format` only when you intend to rewrite formatting.
 
 ## Android validation
 
