@@ -2,7 +2,7 @@
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
-  import { tick, onDestroy, onMount, untrack } from 'svelte';
+  import { flushSync, tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import {
@@ -52,7 +52,12 @@
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activateModal,
+    deactivateModal,
+    restoreFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   let {
     server,
@@ -241,6 +246,8 @@
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
+  let modalCleanup: (() => void) | null = null;
+  let pointerPressActive = false;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
@@ -349,7 +356,18 @@
   }
 
   function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
+    void tick().then(() => {
+      if (destroyed) return;
+      const dialog = getDialog();
+      if (!dialog) return;
+      modalCleanup = activateModal(dialog, modalCleanup);
+    });
+  }
+
+  function releaseModal(closingDialog?: HTMLElement | null): void {
+    const cleanup = modalCleanup;
+    modalCleanup = null;
+    deactivateModal(cleanup, closingDialog);
   }
 
   function insecureServer(): boolean {
@@ -390,6 +408,69 @@
     });
   }
 
+  function getStickyBannerOffset(container: HTMLElement | null): number {
+    if (!container) return 0;
+    const tracked = Number(container.dataset.stickyBannerHeight) || 0;
+    const banner = container.querySelector<HTMLElement>('[data-release-banner]');
+    if (!banner || banner.hidden) return Math.max(0, Math.ceil(tracked));
+    const containerTop = container.getBoundingClientRect().top;
+    const bannerRect = banner.getBoundingClientRect();
+    const measured =
+      bannerRect.height > 0
+        ? Math.max(bannerRect.height, bannerRect.bottom - containerTop)
+        : banner.offsetHeight;
+    return Math.max(0, Math.ceil(Math.max(measured, tracked)));
+  }
+
+  function getGridScrollMetrics(
+    grid: HTMLElement,
+    container: HTMLElement | null,
+  ): { listTop: number; scrollTop: number; viewportHeight: number; stickyOffset: number } {
+    const gridRect = grid.getBoundingClientRect();
+    if (container) {
+      const containerRect = container.getBoundingClientRect();
+      const hasLayoutRects =
+        containerRect.height > 0 ||
+        containerRect.width > 0 ||
+        gridRect.height > 0 ||
+        gridRect.width > 0;
+      const listTop = hasLayoutRects
+        ? gridRect.top - containerRect.top + container.scrollTop
+        : grid.offsetTop;
+      return {
+        listTop,
+        scrollTop: container.scrollTop,
+        viewportHeight: container.clientHeight,
+        stickyOffset: getStickyBannerOffset(container),
+      };
+    }
+    const winHeight = typeof window !== 'undefined' ? window.innerHeight : 0;
+    const winScrollY = typeof window !== 'undefined' ? window.scrollY : 0;
+    const hasLayoutRects = gridRect.height > 0 || gridRect.width > 0;
+    const listTop = hasLayoutRects ? gridRect.top + winScrollY : grid.offsetTop;
+    return {
+      listTop,
+      scrollTop: winScrollY,
+      viewportHeight: winHeight,
+      stickyOffset: 0,
+    };
+  }
+
+  function setScrollPosition(container: HTMLElement | null, nextScrollTop: number): void {
+    const clamped = Math.max(0, nextScrollTop);
+    if (container) {
+      if (container.scrollTop !== clamped) container.scrollTop = clamped;
+      return;
+    }
+    if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
+      try {
+        window.scrollTo({ top: clamped, behavior: 'instant' });
+      } catch {
+        // Non-scrolling test environments may not implement window.scrollTo.
+      }
+    }
+  }
+
   function updateVirtualWindow(): void {
     if (destroyed || !virtualGrid) return;
     const width = virtualGrid.clientWidth;
@@ -405,43 +486,219 @@
         ? Math.floor(activeIndex / nextColumns)
         : -1;
 
-    const gridRect = virtualGrid.getBoundingClientRect();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
-    if (scrollContainer) {
-      const containerRect = scrollContainer.getBoundingClientRect();
-      const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
-      virtualWindow = calculateVirtualWindow(
-        visibleBooks.length,
-        nextColumns,
-        nextRowHeight,
-        scrollContainer.scrollTop - listTop,
-        scrollContainer.clientHeight,
-        VIRTUALIZATION_OVERSCAN_ROWS,
-      );
-      return;
-    }
-    if (typeof window === 'undefined') return;
+    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    if (!scrollContainer && typeof window === 'undefined') return;
+    const { listTop, scrollTop, viewportHeight } = getGridScrollMetrics(
+      virtualGrid,
+      scrollContainer,
+    );
     virtualWindow = calculateVirtualWindow(
       visibleBooks.length,
       nextColumns,
       nextRowHeight,
-      -gridRect.top,
-      window.innerHeight,
+      scrollTop - listTop,
+      viewportHeight,
       VIRTUALIZATION_OVERSCAN_ROWS,
     );
   }
 
   async function scrollToBook(index: number): Promise<HTMLElement | null> {
     const grid = virtualGrid;
-    if (!grid) return null;
+    if (!grid || index < 0 || index >= visibleBooks.length) return null;
     updateVirtualWindow();
-    const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
-    const container = libraryMain?.closest<HTMLElement>('.app-stage');
-    if (container) container.scrollTop += top - container.getBoundingClientRect().top;
-    else window.scrollBy({ top, behavior: 'instant' });
+    const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    const { listTop, stickyOffset } = getGridScrollMetrics(grid, container);
+    const targetScrollTop = listTop + Math.floor(index / gridColumns) * rowHeight - stickyOffset;
+    setScrollPosition(container, targetScrollTop);
     updateVirtualWindow();
     await tick();
     return grid.querySelector(`[data-book-index="${index}"]`);
+  }
+
+  function handleResultsPointerDown(): void {
+    if (typeof window === 'undefined') return;
+    pointerPressActive = true;
+    const clear = () => {
+      pointerPressActive = false;
+      window.removeEventListener('pointerup', clear, true);
+      window.removeEventListener('pointercancel', clear, true);
+    };
+    window.addEventListener('pointerup', clear, true);
+    window.addEventListener('pointercancel', clear, true);
+  }
+
+  function handleResultsFocusIn(event: FocusEvent): void {
+    if (destroyed || !virtualGrid) return;
+    if (pointerPressActive) {
+      scheduleVirtualWindow();
+      return;
+    }
+
+    const target = event.target instanceof HTMLElement ? event.target : activeElement();
+    const card = target?.closest<HTMLElement>('[data-book-index]');
+    if (!card) {
+      scheduleVirtualWindow();
+      return;
+    }
+
+    const bookIndex = Number(card.dataset.bookIndex);
+    if (
+      !Number.isInteger(bookIndex) ||
+      bookIndex < 0 ||
+      bookIndex >= visibleBooks.length ||
+      visibleBooks[bookIndex]?.id !== card.dataset.bookId
+    ) {
+      scheduleVirtualWindow();
+      return;
+    }
+
+    const width = virtualGrid.clientWidth;
+    const columns = width > 0 ? columnsForWidth(width) : gridColumns;
+    const height = width > 0 ? rowHeightFor(width, columns) : rowHeight;
+    const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    const { listTop, scrollTop, viewportHeight, stickyOffset } = getGridScrollMetrics(
+      virtualGrid,
+      container,
+    );
+
+    const targetRow = Math.floor(bookIndex / columns);
+    const rowScrollTop = listTop + targetRow * height;
+    const rowScrollBottom = rowScrollTop + height;
+    const maxScrollForTop = Math.max(0, rowScrollTop - stickyOffset);
+    const minScrollForBottom = Math.max(0, rowScrollBottom - viewportHeight);
+
+    let nextScrollTop = scrollTop;
+    if (minScrollForBottom > maxScrollForTop) {
+      nextScrollTop = maxScrollForTop;
+    } else if (scrollTop > maxScrollForTop) {
+      nextScrollTop = maxScrollForTop;
+    } else if (scrollTop < minScrollForBottom) {
+      nextScrollTop = minScrollForBottom;
+    }
+
+    let scrolled = false;
+    if (nextScrollTop !== scrollTop) {
+      setScrollPosition(container, nextScrollTop);
+      scrolled = true;
+    }
+
+    if (target && container) {
+      const containerRect = container.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      if (containerRect.height > 0 && targetRect.height > 0) {
+        const safeTop = containerRect.top + stickyOffset;
+        if (targetRect.top < safeTop) {
+          setScrollPosition(container, container.scrollTop - (safeTop - targetRect.top));
+          scrolled = true;
+        } else if (
+          targetRect.bottom > containerRect.bottom &&
+          targetRect.height <= containerRect.height - stickyOffset
+        ) {
+          setScrollPosition(
+            container,
+            container.scrollTop + (targetRect.bottom - containerRect.bottom),
+          );
+          scrolled = true;
+        }
+      }
+    }
+
+    if (scrolled) flushSync(() => updateVirtualWindow());
+    else updateVirtualWindow();
+  }
+
+  function focusCardControl(card: HTMLElement | null, preferActions: boolean): void {
+    if (!card) return;
+    const control = preferActions
+      ? (card.querySelector<HTMLElement>('[data-book-actions]') ??
+        card.querySelector<HTMLElement>('[data-book-open]:not(:disabled)'))
+      : (card.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
+        card.querySelector<HTMLElement>('[data-book-actions]'));
+    control?.focus();
+  }
+
+  async function handleFeedKeydown(event: KeyboardEvent): Promise<void> {
+    if (
+      event.defaultPrevented ||
+      event.altKey ||
+      event.metaKey ||
+      !virtualGrid ||
+      visibleBooks.length === 0
+    ) {
+      return;
+    }
+    if (
+      event.key !== 'PageDown' &&
+      event.key !== 'PageUp' &&
+      event.key !== 'Home' &&
+      event.key !== 'End'
+    ) {
+      return;
+    }
+
+    const target = event.target instanceof HTMLElement ? event.target : activeElement();
+    if (event.ctrlKey && (event.key === 'Home' || event.key === 'End') && libraryMain) {
+      const focusableInMain = Array.from(
+        libraryMain.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter(
+        (el) =>
+          el.tabIndex >= 0 &&
+          !virtualGrid!.contains(el) &&
+          !el.closest('[hidden], [inert], [aria-hidden="true"]'),
+      );
+      if (event.key === 'Home') {
+        const beforeFeed = focusableInMain.filter((el) =>
+          Boolean(el.compareDocumentPosition(virtualGrid!) & Node.DOCUMENT_POSITION_FOLLOWING),
+        );
+        const destination = beforeFeed[beforeFeed.length - 1];
+        if (destination) {
+          event.preventDefault();
+          destination.focus();
+          return;
+        }
+      } else {
+        const afterFeed = focusableInMain.filter((el) =>
+          Boolean(el.compareDocumentPosition(virtualGrid!) & Node.DOCUMENT_POSITION_PRECEDING),
+        );
+        const destination = afterFeed[0];
+        if (destination) {
+          event.preventDefault();
+          destination.focus();
+          return;
+        }
+      }
+    }
+
+    const activeCard = target?.closest<HTMLElement>('[data-book-index]');
+    const parsedIndex = activeCard ? Number(activeCard.dataset.bookIndex) : Number.NaN;
+    const currentIndex =
+      Number.isInteger(parsedIndex) && parsedIndex >= 0 && parsedIndex < visibleBooks.length
+        ? parsedIndex
+        : virtualWindow.startIndex;
+    const preferActions = Boolean(target?.hasAttribute('data-book-actions'));
+
+    const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    const { viewportHeight, stickyOffset } = getGridScrollMetrics(virtualGrid, container);
+    const usableHeight = Math.max(rowHeight, viewportHeight - stickyOffset);
+    const rowsPerPage = Math.max(1, Math.floor(usableHeight / Math.max(1, rowHeight)));
+    const pageStep = Math.max(1, rowsPerPage * gridColumns);
+
+    let nextIndex = currentIndex;
+    if (event.key === 'PageDown') {
+      nextIndex = Math.min(visibleBooks.length - 1, currentIndex + pageStep);
+    } else if (event.key === 'PageUp') {
+      nextIndex = Math.max(0, currentIndex - pageStep);
+    } else if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = visibleBooks.length - 1;
+    }
+
+    event.preventDefault();
+    const nextCard = await scrollToBook(nextIndex);
+    focusCardControl(nextCard, preferActions);
   }
 
   async function continueTabbing(
@@ -472,7 +729,12 @@
   }
 
   $effect(() => {
-    if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
+    const count = visibleBooks.length;
+    const mode = viewMode;
+    const grid = virtualGrid;
+    if (!reading && grid && count >= 0 && (mode === 'grid' || mode === 'list')) {
+      untrack(() => updateVirtualWindow());
+    }
   });
 
   $effect(() => {
@@ -483,7 +745,15 @@
   });
 
   $effect(() => {
-    if (viewMode === 'grid' || viewMode === 'list') scheduleVirtualWindow();
+    const grid = virtualGrid;
+    if (!grid) return;
+    const onKeyDown = (event: KeyboardEvent) => void handleFeedKeydown(event);
+    grid.addEventListener('pointerdown', handleResultsPointerDown);
+    grid.addEventListener('keydown', onKeyDown);
+    return () => {
+      grid.removeEventListener('pointerdown', handleResultsPointerDown);
+      grid.removeEventListener('keydown', onKeyDown);
+    };
   });
 
   $effect(() => {
@@ -650,6 +920,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    releaseModal();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -972,6 +1243,7 @@
         : `Could not remove ${book.title}: ${detail}`;
       return false;
     }
+    const indexBefore = visibleBooks.findIndex((item) => item.id === book.id);
     books = books.map((item) =>
       item.id === book.id
         ? {
@@ -982,6 +1254,7 @@
           }
         : item,
     );
+    await restoreCatalogFocusIfDetached(indexBefore);
     return true;
   }
 
@@ -1215,7 +1488,28 @@
     }
   }
 
+  async function restoreCatalogFocusIfDetached(preferredIndex: number): Promise<void> {
+    await tick();
+    if (destroyed || reading || actionMenuBook || conflict || settingsVisible || !libraryMain) {
+      return;
+    }
+    if (libraryMain.contains(document.activeElement)) return;
+    if (visibleBooks.length > 0 && preferredIndex >= 0 && virtualGrid) {
+      const fallbackIndex = Math.min(preferredIndex, visibleBooks.length - 1);
+      const card = await scrollToBook(fallbackIndex);
+      const control =
+        card?.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
+        card?.querySelector<HTMLElement>('[data-book-actions]');
+      if (control) {
+        control.focus();
+        return;
+      }
+    }
+    libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+  }
+
   async function markDone(book: BookRecord): Promise<void> {
+    const indexBefore = visibleBooks.findIndex((item) => item.id === book.id);
     const readingState = await getReadingState(book.id);
     await markBookCompleted(book, readingState);
     const savedBook = books.find((item) => item.id === book.id);
@@ -1226,6 +1520,7 @@
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
+    await restoreCatalogFocusIfDetached(indexBefore);
   }
 
   async function syncFurthest(book: BookRecord): Promise<void> {
@@ -1256,13 +1551,15 @@
   function openMenu(book: BookRecord): void {
     actionMenuOpener = activeElement();
     actionMenuBook = book;
-    focusModal(() => actionMenuDialog);
+    focusModal(() => (actionMenuBook ? actionMenuDialog : null));
   }
 
   function closeMenu(): void {
+    const closing = actionMenuDialog;
     actionMenuBook = null;
     const opener = actionMenuOpener;
     actionMenuOpener = null;
+    releaseModal(closing);
     void tick().then(() => {
       if (reading || actionMenuBook || !libraryMain) return;
       restoreFocus(opener);
@@ -1276,7 +1573,7 @@
     conflictOpener = activeElement();
     conflictError = '';
     conflict = next;
-    focusModal(() => conflictDialog);
+    focusModal(() => (conflict ? conflictDialog : null));
   }
 
   function closeConflict(): void {
@@ -1285,11 +1582,16 @@
   }
 
   function dismissConflict(): void {
+    const closing = conflictDialog;
     conflict = null;
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    releaseModal(closing);
+    void tick().then(() => {
+      if (reading || conflict) return;
+      restoreFocus(opener);
+    });
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1342,15 +1644,20 @@
     settingsOpener = activeElement();
     settingsVisible = true;
     void Promise.allSettled(skeletonThemes.map(loadTheme));
-    focusModal(() => settingsDialog);
+    focusModal(() => (settingsVisible ? settingsDialog : null));
   }
 
   function closeSettings(): void {
+    const closing = settingsDialog;
     settingsVisible = false;
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    releaseModal(closing);
+    void tick().then(() => {
+      if (settingsVisible) return;
+      restoreFocus(opener);
+    });
   }
 
   function diagnosticsText(): string {
@@ -1597,7 +1904,6 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
-    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
   >
     <a
       href="#library-results"
@@ -2068,23 +2374,30 @@
         class="relative mt-8"
         style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
         tabindex="-1"
+        role="feed"
         aria-label="Books"
-        onfocusin={scheduleVirtualWindow}
+        aria-busy={loading || refreshing}
+        onfocusin={handleResultsFocusIn}
         onfocusout={scheduleVirtualWindow}
       >
         {#each renderedRows as rowIndex (rowIndex)}
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
+            role="presentation"
             class="absolute inset-x-0 grid gap-x-4"
             style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}
+              {@const bookTitleId = `library-book-title-${bookIndex}`}
               <article
                 class="relative text-left"
                 data-book-id={book.id}
                 data-book-index={bookIndex}
+                aria-posinset={bookIndex + 1}
+                aria-setsize={visibleBooks.length}
+                aria-labelledby={bookTitleId}
                 oncontextmenu={(event) => {
                   event.preventDefault();
                   openMenu(book);
@@ -2135,6 +2448,7 @@
                       </div>
                       <div class="min-w-0 flex-1">
                         <h2
+                          id={bookTitleId}
                           class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
                         >
                           {book.title}
@@ -2306,6 +2620,7 @@
                     </button>
                     <div class="mt-3">
                       <h2
+                        id={bookTitleId}
                         class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
                       >
                         {book.title}

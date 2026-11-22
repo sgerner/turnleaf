@@ -29,6 +29,8 @@
   let uiTheme = $state(defaultTheme);
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let releaseBannerElement = $state<HTMLElement | null>(null);
+  let releaseBannerHeight = $state(0);
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -94,6 +96,26 @@
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
   });
+
+  $effect(() => {
+    const banner = releaseBanner ? releaseBannerElement : null;
+    if (!banner) {
+      releaseBannerHeight = 0;
+      return;
+    }
+    const updateBannerHeight = () => {
+      const rectHeight = banner.getBoundingClientRect().height;
+      releaseBannerHeight = Math.max(0, Math.ceil(rectHeight || banner.offsetHeight || 0));
+    };
+    updateBannerHeight();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateBannerHeight);
+      return () => window.removeEventListener('resize', updateBannerHeight);
+    }
+    const observer = new ResizeObserver(() => updateBannerHeight());
+    observer.observe(banner);
+    return () => observer.disconnect();
+  });
 </script>
 
 <div class="app-shell">
@@ -105,9 +127,18 @@
     <div class="vignette"></div>
   </div>
 
-  <div class="app-stage">
+  <div
+    class="app-stage"
+    data-sticky-banner-height={releaseBanner ? releaseBannerHeight : 0}
+    style:--sticky-banner-height={`${releaseBanner ? releaseBannerHeight : 0}px`}
+  >
     {#if releaseBanner}
-      <div class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
+      <div
+        bind:this={releaseBannerElement}
+        data-release-banner={releaseBanner ? '' : undefined}
+        class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4"
+        transition:fade
+      >
         <div
           class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
         >
@@ -384,6 +415,7 @@
     overflow: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    scroll-padding-top: var(--sticky-banner-height, 0px);
     z-index: 1;
   }
 

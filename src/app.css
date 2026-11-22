@@ -43,6 +43,11 @@ input {
   font: inherit;
 }
 
+[inert] {
+  pointer-events: none;
+  user-select: none;
+}
+
 :focus-visible {
   outline: 3px solid
     light-dark(var(--color-primary-700, currentColor), var(--color-primary-300, currentColor));

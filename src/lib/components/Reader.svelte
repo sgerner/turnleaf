@@ -43,7 +43,13 @@
     toggleBookmark,
     type StoredReaderLocation,
   } from '../reader/bookmarks';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activateModal,
+    deactivateModal,
+    focusFirstElement,
+    restoreFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   type SyncedLocation = {
     xpath: string | null;
@@ -101,6 +107,7 @@
   let annotationsOpener: HTMLElement | null = null;
   let searchOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
+  let panelCleanup: (() => void) | null = null;
   let toc = $state<TocItem[]>([]);
   let previousDocumentTitle = '';
   let bookmarks = $state<StoredReaderLocation[]>([]);
@@ -299,6 +306,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    releasePanel();
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
@@ -327,11 +335,25 @@
   }
 
   function focusPanel(getPanel: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getPanel()));
+    void tick().then(() => {
+      if (destroyed) return;
+      const panel = getPanel();
+      if (!panel) return;
+      panelCleanup = activateModal(panel, panelCleanup);
+    });
+  }
+
+  function releasePanel(closingPanel?: HTMLElement | null): void {
+    const cleanup = panelCleanup;
+    panelCleanup = null;
+    deactivateModal(cleanup, closingPanel);
   }
 
   function restorePanelFocus(opener: HTMLElement | null): void {
-    void tick().then(() => restoreFocus(opener));
+    void tick().then(() => {
+      if (hasOpenReaderPanel()) return;
+      restoreFocus(opener);
+    });
   }
 
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
@@ -376,17 +398,21 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => settingsPanel);
+    syncConfirmationOpener = null;
+    focusPanel(() => (settingsVisible ? settingsPanel : null));
   }
 
   function closeSettings(): void {
+    const closing = settingsPanel;
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
+    releasePanel(closing);
     restorePanelFocus(opener);
     resumeChromeHide();
   }
@@ -399,17 +425,21 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => tocPanel);
+    syncConfirmationOpener = null;
+    focusPanel(() => (tocVisible ? tocPanel : null));
   }
 
   function closeToc(): void {
+    const closing = tocPanel;
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
+    releasePanel(closing);
     restorePanelFocus(opener);
     resumeChromeHide();
   }
@@ -422,18 +452,22 @@
     tocVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => bookmarksPanel);
+    syncConfirmationOpener = null;
+    focusPanel(() => (bookmarksVisible ? bookmarksPanel : null));
   }
 
   function closeBookmarks(): void {
+    const closing = bookmarksPanel;
     bookmarksVisible = false;
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
+    releasePanel(closing);
     restorePanelFocus(opener);
     resumeChromeHide();
   }
@@ -447,17 +481,20 @@
     tocVisible = false;
     bookmarksVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusPanel(() => annotationsPanel);
+    focusPanel(() => (annotationsVisible ? annotationsPanel : null));
   }
 
   function closeAnnotations(): void {
+    const closing = annotationsPanel;
     annotationsVisible = false;
     editingAnnotationId = null;
     selectedText = null;
@@ -466,7 +503,9 @@
     exportMessage = '';
     const opener = annotationsOpener;
     annotationsOpener = null;
+    releasePanel(closing);
     void tick().then(() => {
+      if (hasOpenReaderPanel()) return;
       if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
       else
         readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-annotations"]')?.focus();
@@ -482,36 +521,53 @@
     tocVisible = false;
     bookmarksVisible = false;
     annotationsVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
+    syncConfirmationOpener = null;
     searchError = '';
-    focusPanel(() => searchPanel);
+    focusPanel(() => (searchVisible ? searchPanel : null));
   }
 
   function closeSearch(): void {
+    const closing = searchPanel;
     searchVisible = false;
     searchController?.abort();
     searchController = null;
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
+    releasePanel(closing);
     restorePanelFocus(opener);
     resumeChromeHide();
   }
 
   function openSyncConfirmation(progress: SyncedLocation): void {
+    controlsVisible = true;
     pauseChromeHide();
     syncConfirmationOpener = activeElement();
     pendingSyncLocation = progress;
-    focusPanel(() => syncConfirmationPanel);
+    settingsVisible = false;
+    tocVisible = false;
+    bookmarksVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
+    focusPanel(() => (pendingSyncLocation ? syncConfirmationPanel : null));
   }
 
   function closeSyncConfirmation(): void {
+    const closing = syncConfirmationPanel;
     pendingSyncLocation = null;
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
+    releasePanel(closing);
     restorePanelFocus(opener);
     resumeChromeHide();
   }
@@ -963,11 +1019,11 @@
     ) {
       event.preventDefault();
       if (pendingSyncLocation) closeSyncConfirmation();
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
+      else if (settingsVisible) closeSettings();
+      else if (tocVisible) closeToc();
+      else if (bookmarksVisible) closeBookmarks();
+      else if (annotationsVisible) closeAnnotations();
+      else if (searchVisible) closeSearch();
       showControls();
     }
   }
@@ -1039,18 +1095,7 @@
     Press Escape to close an open reader panel.
   </p>
 
-  <nav
-    class="tap-zones"
-    aria-label="Page navigation"
-    inert={Boolean(
-      settingsVisible ||
-      tocVisible ||
-      bookmarksVisible ||
-      annotationsVisible ||
-      searchVisible ||
-      pendingSyncLocation,
-    )}
-  >
+  <nav class="tap-zones" aria-label="Page navigation">
     <button
       type="button"
       aria-label="Previous page"
@@ -1176,14 +1221,6 @@
       <header
         bind:this={readerToolbar}
         class="reader-bar reader-top"
-        inert={Boolean(
-          settingsVisible ||
-          tocVisible ||
-          bookmarksVisible ||
-          annotationsVisible ||
-          searchVisible ||
-          pendingSyncLocation,
-        )}
         transition:fly={{ y: -8, duration: 140 }}
       >
         <div class="reader-toolbar">
@@ -1311,11 +1348,11 @@
       </header>
 
       {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || pendingSyncLocation}
-        <button
+        <div
           class="reader-panel-backdrop"
-          type="button"
-          tabindex="-1"
-          aria-label="Close reader panel"
+          data-modal-backdrop
+          role="presentation"
+          aria-hidden="true"
           onclick={() =>
             pendingSyncLocation
               ? closeSyncConfirmation()
@@ -1328,7 +1365,7 @@
                     : annotationsVisible
                       ? closeAnnotations()
                       : closeSearch()}
-        ></button>
+        ></div>
       {/if}
 
       {#if pendingSyncLocation}
