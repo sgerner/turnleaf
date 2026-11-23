@@ -2,7 +2,7 @@
 
 import type { Contents, Location } from 'epubjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { defaultAppearance } from './appearance';
+import { defaultAppearance, type Appearance } from './appearance';
 
 type TestTocItem = { label: string; href: string; subitems?: TestTocItem[] };
 type TestSpineSection = { href: string; index: number };
@@ -23,7 +23,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     next: vi.fn(async () => {}),
     resize: vi.fn(),
     destroy: vi.fn(),
-    location: undefined as Location | undefined,
+    location: undefined as Location | { start: { cfi: string } } | undefined,
     manager: undefined as { views?: { length?: number } } | undefined,
   };
   const spine = {
@@ -425,6 +425,184 @@ describe('ReaderSession', () => {
     expect(onTap.mock.calls).toEqual(
       Array.from({ length: 4 }, () => [['previous'], ['center'], ['next']]).flat(),
     );
+    session.destroy();
+  });
+
+  it('registers themes on initial mount and mode updates without reflowing the CFI', async () => {
+    const unopened = new ReaderSession('book.epub');
+    unopened.applyAppearance(defaultAppearance);
+    expect(mockRendition.themes.register).not.toHaveBeenCalled();
+    expect(mockRendition.themes.select).not.toHaveBeenCalled();
+    expect(mockRendition.display).not.toHaveBeenCalled();
+    unopened.destroy();
+    vi.clearAllMocks();
+
+    mockRendition.location = { start: { cfi: 'epubcfi(/6/2!/4/2/1:0)' } };
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    expect(mockRendition.themes.register).toHaveBeenCalledExactlyOnceWith(
+      'turnleaf',
+      expect.objectContaining({
+        a: { color: '--color-primary-700 !important' },
+      }),
+    );
+    expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith();
+
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+    vi.clearAllMocks();
+
+    session.applyAppearance({ ...defaultAppearance, mode: 'dark' });
+    expect(mockRendition.themes.register).toHaveBeenCalledExactlyOnceWith(
+      'turnleaf',
+      expect.objectContaining({
+        a: { color: '--color-primary-300 !important' },
+      }),
+    );
+    expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+    expect(mockRendition.display).not.toHaveBeenCalled();
+    session.destroy();
+  });
+
+  it('re-registers the theme and preserves the current CFI across layout updates', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+
+    const layoutPatches: Array<Partial<Appearance>> = [
+      { fontFamily: 'sans' },
+      { fontSize: 22 },
+      { lineHeight: 1.8 },
+      { margin: 32 },
+      { bottomMargin: 16 },
+      { paragraphSpacing: 1.0 },
+      { alignment: 'justify' },
+      { hyphenation: true },
+    ];
+
+    let current = { ...defaultAppearance };
+    for (const patch of layoutPatches) {
+      vi.clearAllMocks();
+      current = { ...current, ...patch };
+      session.applyAppearance(current);
+      expect(mockRendition.themes.register).toHaveBeenCalledOnce();
+      expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/1:0)');
+    }
+    session.destroy();
+  });
+
+  it('skips theme registration and CFI reflow for non-theme appearance toggles', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+    vi.clearAllMocks();
+
+    let current = { ...defaultAppearance };
+    for (const patch of [
+      {},
+      { publisherStyles: false },
+      { progressBar: false },
+      { keepAwake: true },
+      { volumeButtons: true },
+    ] satisfies Array<Partial<Appearance>>) {
+      current = { ...current, ...patch };
+      session.applyAppearance(current);
+    }
+
+    expect(mockRendition.themes.register).not.toHaveBeenCalled();
+    expect(mockRendition.themes.select).not.toHaveBeenCalled();
+    expect(mockRendition.display).not.toHaveBeenCalled();
+    session.destroy();
+  });
+
+  it('defers CFI preservation until pending user navigation settles', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+
+    await session.display('second.xhtml');
+    vi.clearAllMocks();
+
+    session.applyAppearance({ ...defaultAppearance, fontSize: 24 });
+    expect(mockRendition.themes.register).toHaveBeenCalledOnce();
+    expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+    expect(mockRendition.display).not.toHaveBeenCalled();
+
+    relocated({
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        displayed: { page: 1, total: 4 },
+      },
+    });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
 });
