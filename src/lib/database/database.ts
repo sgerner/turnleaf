@@ -248,11 +248,11 @@ export async function saveServer(config: ServerConfig): Promise<void> {
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
-        display_name = excluded.display_name,
-        base_url = excluded.base_url,
-        credential_ref = excluded.credential_ref,
-        kavita_version = excluded.kavita_version,
-        last_connected_at = excluded.last_connected_at`,
+        display_name=excluded.display_name,
+        base_url=excluded.base_url,
+        credential_ref=excluded.credential_ref,
+        kavita_version=excluded.kavita_version,
+        last_connected_at=excluded.last_connected_at`,
     [
       config.id,
       config.displayName,
