@@ -48,7 +48,7 @@ vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 import { ReaderSession } from './session';
 
 function getRenditionListener(
-  event: 'click' | 'keydown' | 'relocated',
+  event: 'click' | 'keydown' | 'relocated' | 'resized',
 ): (...args: unknown[]) => void {
   const listener = mockRendition.on.mock.calls.find(([name]) => name === event)?.[1];
   if (typeof listener !== 'function') {
@@ -604,5 +604,163 @@ describe('ReaderSession', () => {
     });
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
+  });
+
+  it('keeps waiting across multiple animation frames until initial relocation actually fires', async () => {
+    const rafCallbacks: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      rafCallbacks.push(callback);
+      return rafCallbacks.length;
+    });
+    mockRendition.manager = { views: { length: 1 } };
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+
+    const relocated = getRenditionListener('relocated');
+    const nextPromise = session.next();
+
+    // Even if multiple animation frames elapse (EPUB.js Queue tick + reportLocation rAF)
+    // before relocated emits, next() must not arm userNavigationPending prematurely.
+    rafCallbacks.shift()?.(16);
+    rafCallbacks.shift()?.(32);
+    await Promise.resolve();
+    expect(mockRendition.next).not.toHaveBeenCalled();
+
+    const firstChapter = location('epubcfi(/6/2!/4/2/1:0)');
+    mockRendition.location = firstChapter;
+    relocated(firstChapter);
+    await nextPromise;
+
+    expect(mockRendition.next).toHaveBeenCalledOnce();
+    const secondChapter = location('epubcfi(/6/4!/4/2/1:0)');
+    mockRendition.location = secondChapter;
+    relocated(secondChapter);
+
+    expect(onLocation.mock.calls.map((call) => [call[0].cfi, call[1]])).toEqual([
+      ['epubcfi(/6/2!/4/2/1:0)', 'restore'],
+      ['epubcfi(/6/4!/4/2/1:0)', 'navigation'],
+    ]);
+    session.destroy();
+  });
+
+  it('waits for an in-flight resize relocation before turning to the next chapter', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+    mockRendition.manager = { views: { length: 1 } };
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 867));
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    const relocated = getRenditionListener('relocated');
+    const resized = getRenditionListener('resized');
+    mockRendition.resize.mockImplementationOnce(() => {
+      resized();
+    });
+
+    const firstChapter = location('epubcfi(/6/2!/4/2/1:0)');
+    mockRendition.location = firstChapter;
+    relocated(firstChapter);
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+      412,
+      915,
+      'epubcfi(/6/2!/4/2/1:0)',
+    );
+
+    const nextPromise = session.next();
+    await Promise.resolve();
+    expect(mockRendition.next).not.toHaveBeenCalled();
+
+    // Resized re-display of Chapter 1 finishes relocating first as 'restore'.
+    relocated(firstChapter);
+    await nextPromise;
+    expect(mockRendition.next).toHaveBeenCalledOnce();
+
+    const secondChapter = location('epubcfi(/6/4!/4/2/1:0)');
+    mockRendition.location = secondChapter;
+    relocated(secondChapter);
+
+    expect(onLocation.mock.calls.map((call) => [call[0].cfi, call[1]])).toEqual([
+      ['epubcfi(/6/2!/4/2/1:0)', 'restore'],
+      ['epubcfi(/6/2!/4/2/1:0)', 'restore'],
+      ['epubcfi(/6/4!/4/2/1:0)', 'navigation'],
+    ]);
+    session.destroy();
+  });
+
+  it('does not flush the resize fallback timer with a stale CFI while user navigation is pending', async () => {
+    vi.useFakeTimers();
+    try {
+      const resizeCallbacks: ResizeObserverCallback[] = [];
+      class TestResizeObserver {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallbacks.push(callback);
+        }
+        observe(): void {}
+        disconnect(): void {}
+      }
+      vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 867));
+      const onLocation = vi.fn();
+      const session = new ReaderSession('book.epub');
+      await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+
+      const relocated = getRenditionListener('relocated');
+      const firstChapter = location('epubcfi(/6/2!/4/2/1:0)');
+      mockRendition.location = firstChapter;
+      relocated(firstChapter);
+
+      await session.next();
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      const secondChapter = location('epubcfi(/6/4!/4/2/1:0)');
+      mockRendition.location = secondChapter;
+      relocated(secondChapter);
+
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+        412,
+        915,
+        'epubcfi(/6/4!/4/2/1:0)',
+      );
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)' }),
+        'navigation',
+      );
+      session.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
