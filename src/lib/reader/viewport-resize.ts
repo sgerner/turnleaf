@@ -22,6 +22,7 @@ interface RenditionRuntimeLike {
   on?: ((event: string, listener: () => void) => void) | undefined;
   off?: ((event: string, listener: () => void) => void) | undefined;
   q?: RenditionQueueLike | undefined;
+  display?: ((target?: string) => Promise<unknown>) | undefined;
   resize: (width: number, height: number, epubcfi?: string) => void;
 }
 
@@ -41,8 +42,6 @@ export class ViewportResizeController {
   private viewportSize: ViewportDimensions;
   private pendingSize: ViewportDimensions | null = null;
   private activeOperations = 0;
-  private relocationEpoch = 0;
-  private operationStartRelocationEpoch = 0;
   private awaitingRelocation = false;
   private relocationFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private flushScheduled = false;
@@ -79,9 +78,6 @@ export class ViewportResizeController {
   }
 
   async trackOperation<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.activeOperations === 0) {
-      this.operationStartRelocationEpoch = this.relocationEpoch;
-    }
     this.activeOperations += 1;
     let succeeded = false;
     try {
@@ -92,11 +88,7 @@ export class ViewportResizeController {
       this.activeOperations = Math.max(0, this.activeOperations - 1);
       this.installManagerGuard();
       if (this.activeOperations === 0 && !this.destroyed) {
-        if (
-          succeeded &&
-          typeof this.runtime.q?.enqueue === 'function' &&
-          this.relocationEpoch === this.operationStartRelocationEpoch
-        ) {
+        if (succeeded && typeof this.runtime.q?.enqueue === 'function') {
           this.awaitRelocation();
         } else {
           this.scheduleFlush();
@@ -119,7 +111,6 @@ export class ViewportResizeController {
 
   notifyRelocated(): void {
     if (this.destroyed) return;
-    this.relocationEpoch += 1;
     this.awaitingRelocation = false;
     this.clearRelocationFallback();
     this.installManagerGuard();
@@ -170,7 +161,21 @@ export class ViewportResizeController {
         }
         this.pendingSize = null;
         this.viewportSize = measured;
-        return originalResize(measured.width, measured.height, epubcfi);
+        const hasRuntimeLocation = Boolean(this.runtime.location?.start?.cfi);
+        const fallbackCfi =
+          epubcfi ?? (!hasRuntimeLocation ? (this.getCurrentCfi() ?? undefined) : undefined);
+        const result = originalResize(measured.width, measured.height, fallbackCfi);
+        if (
+          fallbackCfi &&
+          !this.runtime.location?.start &&
+          typeof this.runtime.display === 'function'
+        ) {
+          void this.runtime.display(fallbackCfi);
+        }
+        if (hasRuntimeLocation || (fallbackCfi && typeof this.runtime.display === 'function')) {
+          this.awaitRelocation();
+        }
+        return result;
       }
       this.pendingSize = measured;
       this.scheduleFlush();
@@ -230,18 +235,23 @@ export class ViewportResizeController {
   private performResize(width: number, height: number): void {
     if (this.destroyed) return;
     this.viewportSize = { width, height };
-    const fallbackCfi = !this.runtime.location?.start?.cfi
-      ? (this.getCurrentCfi() ?? undefined)
-      : undefined;
+    const hasRuntimeLocation = Boolean(this.runtime.location?.start?.cfi);
+    const fallbackCfi = !hasRuntimeLocation ? (this.getCurrentCfi() ?? undefined) : undefined;
     this.applyingResize = true;
     try {
       if (fallbackCfi) {
         this.runtime.resize(width, height, fallbackCfi);
+        if (!this.runtime.location?.start && typeof this.runtime.display === 'function') {
+          void this.runtime.display(fallbackCfi);
+        }
       } else {
         this.rendition.resize(width, height);
       }
     } finally {
       this.applyingResize = false;
+    }
+    if (hasRuntimeLocation || (fallbackCfi && typeof this.runtime.display === 'function')) {
+      this.awaitRelocation();
     }
   }
 

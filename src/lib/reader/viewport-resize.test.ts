@@ -160,4 +160,96 @@ describe('ViewportResizeController', () => {
     expect(rendition.resize).not.toHaveBeenCalled();
     expect(rawManagerResize).not.toHaveBeenCalled();
   });
+
+  it('still awaits post-operation relocation when an earlier relocation fires mid-operation', async () => {
+    const { rendition, rawManagerResize } = createQueuedRendition();
+    const viewport = document.createElement('div');
+    let currentRect = new DOMRect(0, 0, 411, 842);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => currentRect);
+
+    let currentCfi = 'epubcfi(/6/2!/4/2/1:0)';
+    rendition.location = { start: { cfi: currentCfi } };
+    const controller = new ViewportResizeController(
+      viewport,
+      rendition as unknown as Rendition,
+      () => currentCfi,
+    );
+
+    // While next() is running, open()'s earlier rAF fires notifyRelocated() for Chapter 1
+    await controller.trackOperation(async () => {
+      controller.notifyRelocated();
+      await Promise.resolve();
+    });
+
+    // System-bar resize arrives before Chapter 2's rAF relocation runs
+    currentRect = new DOMRect(0, 0, 411, 914);
+    rendition.manager.resize();
+    expect(rendition.resize).not.toHaveBeenCalled();
+    expect(rawManagerResize).not.toHaveBeenCalled();
+
+    // Chapter 2's rAF relocation settles -> deferred resize flushes once
+    currentCfi = 'epubcfi(/6/4!/4/2/1:0)';
+    rendition.location = { start: { cfi: currentCfi } };
+    controller.notifyRelocated();
+
+    await vi.waitFor(() => {
+      expect(rendition.resize).toHaveBeenCalledExactlyOnceWith(411, 914);
+    });
+    controller.destroy();
+  });
+
+  it('re-displays fallbackCfi when resizing before rendition.location is populated and gates back-to-back resizes on relocation', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const { rendition, rawManagerResize } = createQueuedRendition();
+    const display = vi.fn(async () => {});
+    Object.assign(rendition, { display });
+
+    const viewport = document.createElement('div');
+    let currentRect = new DOMRect(0, 0, 411, 842);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => currentRect);
+
+    const fallbackCfi = 'epubcfi(/6/4!/4/2/1:0)';
+    const controller = new ViewportResizeController(
+      viewport,
+      rendition as unknown as Rendition,
+      () => fallbackCfi,
+    );
+
+    // First resize runs while rendition.location is still undefined: must resize AND display(fallbackCfi)
+    currentRect = new DOMRect(0, 0, 411, 880);
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 880 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(rendition.resize).toHaveBeenCalledExactlyOnceWith(411, 880, fallbackCfi);
+    expect(rawManagerResize).toHaveBeenCalledExactlyOnceWith(411, 880, fallbackCfi);
+    expect(display).toHaveBeenCalledExactlyOnceWith(fallbackCfi);
+
+    // Second back-to-back system-bar resize arrives before the resized view's relocation settles
+    currentRect = new DOMRect(0, 0, 411, 914);
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 914 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(rendition.resize).toHaveBeenCalledTimes(1);
+
+    // Once the resized view's relocation settles, the second resize flushes cleanly
+    rendition.location = { start: { cfi: fallbackCfi } };
+    controller.notifyRelocated();
+
+    await vi.waitFor(() => {
+      expect(rendition.resize).toHaveBeenCalledTimes(2);
+    });
+    expect(rendition.resize).toHaveBeenLastCalledWith(411, 914);
+    controller.destroy();
+  });
 });

@@ -379,8 +379,9 @@ export class ReaderSession {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
       const isUserNavigation =
         this.userNavigationPending &&
-        this.userNavigationReady &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+        (startCfi !== null
+          ? startCfi !== location.start.cfi
+          : this.userNavigationReady && !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
@@ -837,9 +838,29 @@ export class ReaderSession {
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
+      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? this.renderedStartCfi())
       : null;
     return this.locationGeneration;
+  }
+
+  private renderedStartCfi(): string | null {
+    const runtime = this.rendition as unknown as {
+      manager?: { currentLocation?: (() => unknown) | undefined } | undefined;
+      located?: ((location: unknown) => Location | undefined) | undefined;
+    } | null;
+    if (
+      typeof runtime?.manager?.currentLocation !== 'function' ||
+      typeof runtime.located !== 'function'
+    ) {
+      return null;
+    }
+    try {
+      const raw = runtime.manager.currentLocation();
+      if (!raw || typeof (raw as { then?: unknown }).then === 'function') return null;
+      return runtime.located(raw)?.start?.cfi ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private beginLinkedNavigation(): void {

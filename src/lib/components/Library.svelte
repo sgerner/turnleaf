@@ -276,6 +276,8 @@
   let scrollTarget: HTMLElement | Window | null = null;
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  let reconnectTimer: number | null = null;
+  const RECONNECT_SETTLE_MS = 150;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -534,8 +536,13 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          const wasOffline = offline;
           offline = !connected;
           if (!connected) {
+            if (reconnectTimer !== null) {
+              window.clearTimeout(reconnectTimer);
+              reconnectTimer = null;
+            }
             if (syncTimer !== null) {
               window.clearTimeout(syncTimer);
               syncTimer = null;
@@ -544,18 +551,27 @@
             openProgressProbe?.abort();
             cancelCoverLoading();
             sharedCoverLoader.cancel();
-          }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
+            if (!wasOffline) {
+              coverReloadRequest += 1;
+              kavitaUnreachable = false;
+            }
+            offlineMessage = displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
+            return;
+          }
+          if (!wasOffline && !kavitaUnreachable) return;
+          offlineMessage = '';
+          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            if (destroyed || offline) return;
+            coverReloadRequest += 1;
+            kavitaUnreachable = false;
             void refresh()
               .then(() => syncProgress(false))
               .catch(() => {});
+          }, RECONNECT_SETTLE_MS);
         }),
       ),
     );
@@ -655,6 +671,7 @@
   onDestroy(() => {
     destroyed = true;
     onReaderOpenChange?.(false);
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -692,6 +709,10 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
+        if (!(await networkAvailable())) {
+          controller.abort();
+          return;
+        }
         if (controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';

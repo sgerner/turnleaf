@@ -782,4 +782,99 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('captures the rendered start CFI before next runs so a queued relocation firing with the new chapter reports navigation', async () => {
+    let resolveNext = () => {};
+    const nextGate = new Promise<void>((resolve) => {
+      resolveNext = resolve;
+    });
+    const chapter1Location = {
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    const chapter2Location = {
+      start: {
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        href: 'second.xhtml',
+        index: 1,
+        percentage: 0.5,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    let liveRenderedLocation: Location = chapter1Location;
+
+    const queuedRendition = {
+      location: undefined as Location | undefined,
+      manager: {
+        isRendered: () => true,
+        currentLocation: () => liveRenderedLocation,
+        resize: vi.fn(),
+      },
+      located: (raw: unknown) => raw as Location,
+      q: {
+        running: false,
+        length: () => 0,
+        enqueue: vi.fn((task: () => Promise<void>) => task()),
+      },
+      hooks: { content: { register: vi.fn() } },
+      on: vi.fn(),
+      off: vi.fn(),
+      started: Promise.resolve(),
+      themes: { register: vi.fn(), select: vi.fn() },
+      annotations: { highlight: vi.fn(), remove: vi.fn() },
+      display: vi.fn(async () => {}),
+      next: vi.fn(() => {
+        liveRenderedLocation = chapter2Location;
+        return nextGate;
+      }),
+      resize: vi.fn(),
+      destroy: vi.fn(),
+    };
+    mockBook.renderTo.mockReturnValueOnce(queuedRendition as unknown as typeof mockRendition);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = queuedRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1] as
+      ((value: Location) => void) | undefined;
+
+    // Start next() before open()'s initial rAF relocation ran; manager synchronously advances view to Chapter 2
+    const nextPromise = session.next();
+
+    // open()'s queued rAF fires just before nextGate resolves and observes liveRenderedLocation (Chapter 2)
+    queuedRendition.location = chapter2Location;
+    relocated?.(chapter2Location);
+
+    resolveNext();
+    await nextPromise;
+
+    // next()'s own rAF fires afterward on the same Chapter 2 CFI
+    relocated?.(chapter2Location);
+
+    expect(onLocation).toHaveBeenCalledTimes(2);
+    expect(onLocation).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)', spineIndex: 1 }),
+      'navigation',
+    );
+    expect(onLocation).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)', spineIndex: 1 }),
+      'restore',
+    );
+    session.destroy();
+  });
 });
