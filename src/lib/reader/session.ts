@@ -747,17 +747,6 @@ export class ReaderSession {
     this.appearance = { ...value };
     const rendition = this.rendition;
     if (!rendition) return;
-    const themeChanged =
-      !previous ||
-      previous.mode !== value.mode ||
-      previous.fontFamily !== value.fontFamily ||
-      previous.fontSize !== value.fontSize ||
-      previous.lineHeight !== value.lineHeight ||
-      previous.margin !== value.margin ||
-      previous.bottomMargin !== value.bottomMargin ||
-      previous.paragraphSpacing !== value.paragraphSpacing ||
-      previous.alignment !== value.alignment ||
-      previous.hyphenation !== value.hyphenation;
     const layoutChanged =
       previous !== null &&
       (previous.fontFamily !== value.fontFamily ||
@@ -767,6 +756,7 @@ export class ReaderSession {
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
         previous.hyphenation !== value.hyphenation);
+    const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
     rendition.themes.registerCss('turnleaf', this.buildThemeCss(value));
     rendition.themes.select('turnleaf');
