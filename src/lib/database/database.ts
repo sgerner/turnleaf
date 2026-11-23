@@ -277,9 +277,15 @@ export async function saveServer(config: ServerConfig): Promise<void> {
   const db = await openDatabase();
   await executeNativeRun(
     db,
-    `INSERT OR REPLACE INTO server_config
+    `INSERT INTO server_config
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
-      VALUES (?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        display_name=excluded.display_name,
+        base_url=excluded.base_url,
+        credential_ref=excluded.credential_ref,
+        kavita_version=excluded.kavita_version,
+        last_connected_at=excluded.last_connected_at`,
     [
       config.id,
       config.displayName,
