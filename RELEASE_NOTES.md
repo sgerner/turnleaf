@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Fix Android reading journey DPR pagination, resize, and dual-radio sync races
+- Fix Android reading journey DPR pagination, ReaderChrome inset sync, post-reflow progress persistence, and reconnect sync races
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input

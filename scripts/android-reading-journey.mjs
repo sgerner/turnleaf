@@ -149,6 +149,8 @@ async function startFixture() {
     }
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
@@ -226,12 +228,22 @@ const readerSnapshotExpression = `(() => {
   };
 })()`;
 
-const querySqliteRows = (statement) => `Capacitor.Plugins.CapacitorSQLite.query({
-  database: 'turnleaf',
-  statement: ${JSON.stringify(statement)},
-  values: [],
-  readonly: false,
-}).then((res) => res?.values ?? [])`;
+const querySqliteRows = (statement) => `(async () => {
+  const txBefore = await Capacitor.Plugins.CapacitorSQLite.isTransactionActive({
+    database: 'turnleaf',
+  });
+  if (txBefore?.result !== false) return null;
+  const res = await Capacitor.Plugins.CapacitorSQLite.query({
+    database: 'turnleaf',
+    statement: ${JSON.stringify(statement)},
+    values: [],
+    readonly: false,
+  });
+  const txAfter = await Capacitor.Plugins.CapacitorSQLite.isTransactionActive({
+    database: 'turnleaf',
+  });
+  return txAfter?.result === false ? (res?.values ?? []) : null;
+})()`;
 
 function isMidChapterTwoSnapshot(snapshot) {
   if (!snapshot || snapshot.heading !== 'Chapter 2') return false;
@@ -335,7 +347,7 @@ async function run() {
       fill('#kavita-auth-key', ${JSON.stringify(key)});
     })()`);
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
-    await web.evaluate(click('button[type=submit]'));
+    await waitFor('connect submit', () => web.evaluate(click('button[type=submit]')));
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
@@ -344,10 +356,12 @@ async function run() {
     await adb('shell', 'svc', 'data', 'disable');
     await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return (
+        status?.connected === false &&
+        status?.connectionType !== 'wifi' &&
+        status?.connectionType !== 'cellular'
       );
-      return connected === false;
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
