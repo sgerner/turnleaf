@@ -783,6 +783,93 @@ describe('ReaderSession', () => {
     expect(onLocation.mock.calls.at(-1)).toHaveLength(2);
     session.destroy();
   });
+
+  it('preserves pending user navigation across in-flight same-CFI resize relocations and defers viewport resize until navigation settles', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    mockBook.spine.sections = [
+      { href: 'chapter-1.xhtml', index: 0 },
+      { href: 'chapter-2.xhtml', index: 1 },
+    ];
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = getRenditionListener('relocated');
+    relocated(location('epubcfi(/6/2!/4/2)', 'chapter-1.xhtml', 0, 1));
+    vi.clearAllMocks();
+
+    // 1. In-flight next() where a queued resize relocation at startCfi fires before next() resolves,
+    //    AND ResizeObserver fires again while next() is pending.
+    let resolveNext!: () => void;
+    mockRendition.next.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveNext = resolve;
+        }),
+    );
+    const nextPromise = session.next();
+
+    // Intermediate same-CFI relocation from an earlier resize RAF must not wipe pending 'page' origin.
+    relocated(location('epubcfi(/6/2!/4/2)', 'chapter-1.xhtml', 0, 1));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    // Viewport resize while userNavigationPending is true must wait until navigation relocation settles.
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 892 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    resolveNext();
+    await nextPromise;
+    relocated(location('epubcfi(/6/4!/4/2)', 'chapter-2.xhtml', 1, 1));
+
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('page');
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(412, 892);
+
+    // 2. Same-CFI jump after display() settles clears pending state so later relocations stay 'restore'.
+    await session.displayCfi('epubcfi(/6/4!/4/2)', 'jump');
+    relocated(location('epubcfi(/6/4!/4/2)', 'chapter-2.xhtml', 1, 1));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    relocated(location('epubcfi(/6/4!/4/4)', 'chapter-2.xhtml', 1, 2));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    // 3. In-flight 'return' ignores pre-settle same-CFI relocation and emits 'return' once settled.
+    let resolveReturn!: () => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveReturn = resolve;
+        }),
+    );
+    const returnPromise = session.displayCfi('epubcfi(/6/2!/4/2)', 'return');
+    relocated(location('epubcfi(/6/4!/4/4)', 'chapter-2.xhtml', 1, 2));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    resolveReturn();
+    await returnPromise;
+    relocated(location('epubcfi(/6/2!/4/2)', 'chapter-1.xhtml', 0, 1));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('return');
+
+    session.destroy();
+  });
 });
 
 describe('Reader return stack and excursion gating integration', () => {
