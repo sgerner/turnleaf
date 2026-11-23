@@ -18,6 +18,11 @@ const mocks = vi.hoisted(() => {
         }
       }
     },
+    emitNetworkEvent(connectedEvent: boolean) {
+      for (const listener of networkListeners) {
+        listener({ connected: connectedEvent });
+      }
+    },
     resetListeners() {
       networkListeners.clear();
     },
@@ -692,5 +697,82 @@ describe('Library download banners, cancellation, and offline guards', () => {
     await unmount(mountedComponent!);
     mountedComponent = null;
     expect(capturedSignal?.aborted).toBe(true);
+  });
+
+  it('confirms networkStatusChange disconnects with Network.getStatus before cancelling an active download or latching offline', async () => {
+    const book = makeBook({ chapterId: 1, title: 'Dual Radio Book' });
+    await reconcileBooks(server.id, [book]);
+    setupCatalogFromBooks([book]);
+
+    let capturedSignal: AbortSignal | undefined;
+    let resolveDownload: ((value: unknown) => void) | undefined;
+    mocks.downloadEpub.mockImplementationOnce(
+      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+        new Promise((resolve, reject) => {
+          capturedSignal = signal;
+          resolveDownload = resolve;
+          signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        }),
+    );
+
+    await mountLibrary();
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(1));
+    await flushUi();
+
+    // Android NetworkPlugin.onLost(cellular) emits connected=false while Wi-Fi remains connected in getStatus().
+    mocks.setConnected(true, false);
+    mocks.emitNetworkEvent(false);
+    await flushUi();
+
+    expect(capturedSignal?.aborted).toBe(false);
+    expect(document.querySelector('[data-banner="active-download"]')).not.toBeNull();
+    expect(document.querySelector('[data-banner="download-failure"]')).toBeNull();
+
+    resolveDownload?.({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+    });
+    mocks.verifyDownloadedEpub.mockResolvedValue({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+    });
+    await vi.waitFor(() => expect(buttonByText('Back to library')).not.toBeNull());
+  });
+
+  it('flushes queued reading progress before refreshing the catalog on reconnect', async () => {
+    mocks.setConnected(false, false);
+    const book = makeBook({ chapterId: 1, title: 'Queued Sync Book' });
+    await reconcileBooks(server.id, [book]);
+    await saveLocalProgress(book, 'epubcfi(/6/4!/4/2)', '//body/h1[1]', 0.5, 1);
+    setupCatalogFromBooks([book]);
+
+    const callOrder: string[] = [];
+    mocks.flushProgress.mockImplementation(async () => {
+      callOrder.push('flushProgress');
+    });
+    mocks.getBookSeries.mockImplementation(async () => {
+      callOrder.push('getBookSeries');
+      return [];
+    });
+
+    await mountLibrary();
+    expect(callOrder).toEqual([]);
+
+    // Simulate cellular -> Wi-Fi reconnect with trailing false onLost(cellular) event while Wi-Fi stays up.
+    mocks.setConnected(true, true);
+    mocks.emitNetworkEvent(false);
+
+    await vi.waitFor(() => expect(callOrder).toEqual(['flushProgress', 'getBookSeries']));
   });
 });

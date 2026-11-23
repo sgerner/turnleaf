@@ -23,6 +23,8 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     display: vi.fn(async () => {}),
     resize: vi.fn(),
     destroy: vi.fn(),
+    manager: undefined as unknown,
+    currentLocation: undefined as (() => { start?: Location['start'] }) | undefined,
   };
   const spine = {
     sections: [...defaultSpineSections],
@@ -73,6 +75,8 @@ describe('ReaderSession', () => {
     mockBook.navigation.toc = [];
     mockBook.spine.sections = [...defaultSpineSections];
     mockRendition.location = undefined;
+    mockRendition.manager = undefined;
+    mockRendition.currentLocation = undefined;
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -512,6 +516,95 @@ describe('ReaderSession', () => {
       },
     });
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
+    session.destroy();
+  });
+
+  it('defers ResizeObserver until initial display resolves and re-displays if resized before relocated RAF runs', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    let rect = new DOMRect(0, 0, 412, 843);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => rect);
+
+    let resolveInitialDisplay: (() => void) | undefined;
+    mockRendition.manager = {};
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveInitialDisplay = resolve;
+        }),
+    );
+
+    const session = new ReaderSession('book.epub');
+    const openPromise = session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    await vi.waitFor(() => expect(mockRendition.display).toHaveBeenCalledTimes(1));
+    expect(mockBook.renderTo).toHaveBeenCalledWith(
+      viewport,
+      expect.objectContaining({
+        width: 412,
+        height: 843,
+        resizeOnOrientationChange: false,
+      }),
+    );
+    // ResizeObserver is not attached while initial display is still in-flight.
+    expect(resizeCallbacks).toHaveLength(0);
+
+    // Async ReaderChrome system-bar hide expands viewport height before initial display settles,
+    // and rendition.location is still undefined (before requestAnimationFrame runs reportLocation).
+    rect = new DOMRect(0, 0, 412, 915);
+    resolveInitialDisplay?.();
+    await openPromise;
+
+    expect(resizeCallbacks).toHaveLength(1);
+    expect(mockRendition.resize).toHaveBeenCalledWith(412, 915);
+    expect(mockRendition.display).toHaveBeenCalledTimes(2);
+    session.destroy();
+  });
+
+  it('uses synchronous currentLocation() when navigating before the initial relocated RAF fires', async () => {
+    const onLocation = vi.fn();
+    const nextFn = vi.fn(async () => {});
+    (mockRendition as typeof mockRendition & { next?: () => Promise<void> }).next = nextFn;
+    mockRendition.currentLocation = () =>
+      location('epubcfi(/6/2!/4/2)').start ? { start: location('epubcfi(/6/2!/4/2)').start } : {};
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+
+    await session.next();
+    expect(nextFn).toHaveBeenCalledOnce();
+
+    const relocated = getRenditionListener('relocated');
+    relocated(location('epubcfi(/6/4!/4/2)'));
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2)' }),
+      'navigation',
+    );
     session.destroy();
   });
 });

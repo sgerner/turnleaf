@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix Android dual-radio network status and reader resize races
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input

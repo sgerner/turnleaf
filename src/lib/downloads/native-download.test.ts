@@ -325,4 +325,19 @@ describe('native cover cache', () => {
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
+
+  it('re-evaluates a dynamic allowDownload check after filesystem setup so offline transitions skip FileTransfer', async () => {
+    let online = true;
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
+      online = false;
+      return { uri: `file://${path}` };
+    });
+
+    await expect(
+      cacheCover('https://books.example.com/cover', 'secret', 7, undefined, 'srv-1', () => online),
+    ).rejects.toThrow('Offline');
+
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
 });

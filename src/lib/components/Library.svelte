@@ -88,13 +88,8 @@
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
-      return cacheCover(
-        client.coverUrl(seriesId),
-        apiKey,
-        seriesId,
-        signal,
-        server.id,
-        await networkAvailable(),
+      return cacheCover(client.coverUrl(seriesId), apiKey, seriesId, signal, server.id, () =>
+        networkAvailable(),
       );
     }
     if (offline) throw new Error('Offline');
@@ -289,6 +284,7 @@
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
+  let networkEventSeq = 0;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
 
@@ -417,6 +413,8 @@
 
   function enterReader(next: NonNullable<typeof reading>): void {
     if (downloadingBookId) cancelActiveDownload('exit');
+    cancelCoverLoading();
+    sharedCoverLoader.cancel();
     reading = next;
   }
 
@@ -596,23 +594,13 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
-            cancelActiveDownload('disconnect');
-          }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          const seq = ++networkEventSeq;
+          void Network.getStatus()
+            .catch(() => null)
+            .then((live) => {
+              if (destroyed || seq !== networkEventSeq) return;
+              applyConnectivityChange(live ? live.connected === true : connected);
+            });
         }),
       ),
     );
@@ -652,6 +640,37 @@
       return async () => {};
     }
     return handle.remove;
+  }
+
+  function applyConnectivityChange(connected: boolean): void {
+    if (destroyed) return;
+    const wasOffline = offline;
+    offline = !connected;
+    if (!connected) {
+      refreshController?.abort();
+      openProgressProbe?.abort();
+      cancelCoverLoading();
+      sharedCoverLoader.cancel();
+      cancelActiveDownload('disconnect');
+    }
+    if (wasOffline !== offline) {
+      coverReloadRequest += 1;
+    }
+    kavitaUnreachable = false;
+    offlineMessage = connected
+      ? ''
+      : displayableBooks.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.';
+    if (connected) {
+      if (wasOffline) {
+        void syncProgress(false).finally(() => {
+          if (!destroyed && !offline) void refresh();
+        });
+      } else if (syncStatus.pendingCount > 0 || syncStatus.failedCount > 0) {
+        void syncProgress(false);
+      }
+    }
   }
 
   async function networkAvailable(): Promise<boolean> {
@@ -750,7 +769,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (!(await networkAvailable()) || controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(

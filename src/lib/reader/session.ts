@@ -312,6 +312,9 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private pendingViewportSize: { width: number; height: number } | null = null;
+  private lastDisplayedTarget: string | undefined = undefined;
+  private hasDisplayed = false;
   private highlightCfis = new Set<string>();
   private onLocation:
     | ((
@@ -340,16 +343,20 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    const initial = target.getBoundingClientRect();
+    const initialWidth = Math.floor(initial.width);
+    const initialHeight = Math.floor(initial.height);
+    this.viewportSize =
+      initialWidth > 0 && initialHeight > 0 ? { width: initialWidth, height: initialHeight } : null;
     this.rendition = this.book.renderTo(target, {
-      width: '100%',
-      height: '100%',
+      width: this.viewportSize ? this.viewportSize.width : '100%',
+      height: this.viewportSize ? this.viewportSize.height : '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: true,
+      resizeOnOrientationChange: false,
       allowScriptedContent: false,
     });
-    this.observeViewport(target);
     this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
@@ -390,6 +397,11 @@ export class ReaderSession {
         this.pendingLinkReturnTarget = null;
       }
       this.reportLocation(location, origin, returnTarget);
+      if (this.pendingViewportSize && !this.userNavigationPending) {
+        const pending = this.pendingViewportSize;
+        this.pendingViewportSize = null;
+        this.applyViewportSize(pending.width, pending.height);
+      }
       if (this.reflowPending) {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
@@ -429,6 +441,16 @@ export class ReaderSession {
     const restoreGeneration = this.beginLocationOperation(false);
     await this.rendition.started;
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    await this.restoreInitialLocation(cfi, serverXPath, serverPercentage, restoreGeneration);
+    if (this.rendition) this.observeViewport(target);
+  }
+
+  private async restoreInitialLocation(
+    cfi: string | null,
+    serverXPath: string | null,
+    serverPercentage: number | null,
+    restoreGeneration: number,
+  ): Promise<void> {
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -636,7 +658,7 @@ export class ReaderSession {
     });
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    const cfi = this.liveStartLocation()?.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
       this.reflowPending = true;
@@ -655,6 +677,9 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
+    this.pendingViewportSize = null;
+    this.lastDisplayedTarget = undefined;
+    this.hasDisplayed = false;
     this.rendition = null;
     this.relocated = null;
     this.contentClick = null;
@@ -687,8 +712,16 @@ export class ReaderSession {
   }
 
   private observeViewport(target: HTMLElement): void {
-    const initial = target.getBoundingClientRect();
-    this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
+    const current = target.getBoundingClientRect();
+    const initialWidth = Math.floor(current.width);
+    const initialHeight = Math.floor(current.height);
+    if (initialWidth > 0 && initialHeight > 0) {
+      if (this.viewportSize) {
+        this.applyViewportSize(initialWidth, initialHeight);
+      } else {
+        this.viewportSize = { width: initialWidth, height: initialHeight };
+      }
+    }
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -696,12 +729,27 @@ export class ReaderSession {
       if (!entry || !this.rendition) return;
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
-      if (!width || !height) return;
-      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.rendition.resize(width, height);
+      this.applyViewportSize(width, height);
     });
     this.resizeObserver.observe(target);
+  }
+
+  private applyViewportSize(width: number, height: number): void {
+    if (!this.rendition || !width || !height) return;
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    if (this.userNavigationPending) {
+      this.pendingViewportSize = { width, height };
+      return;
+    }
+    this.viewportSize = { width, height };
+    const cfi = this.liveStartLocation()?.cfi ?? null;
+    this.rendition.resize(width, height);
+    const hasManager = Boolean((this.rendition as unknown as { manager?: unknown }).manager);
+    if (hasManager && this.hasDisplayed && !this.rendition.location?.start) {
+      const restoreTarget = cfi ?? this.lastDisplayedTarget;
+      if (restoreTarget === undefined) void this.rendition.display();
+      else void this.rendition.display(restoreTarget);
+    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -739,6 +787,8 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
+    this.lastDisplayedTarget = target;
+    this.hasDisplayed = true;
     if (target === undefined) await rendition.display();
     else await rendition.display(target);
     return this.isCurrentLocationOperation(generation);
@@ -752,6 +802,8 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
+      this.lastDisplayedTarget = section.href;
+      this.hasDisplayed = true;
       await rendition.display(section.href);
       if (!this.isCurrentLocationOperation(generation)) return false;
       if (target.contentXPath === '/html/body') return true;
@@ -763,6 +815,7 @@ export class ReaderSession {
       if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
+      this.lastDisplayedTarget = cfi;
       await rendition.display(cfi);
       return this.isCurrentLocationOperation(generation);
     } catch {
@@ -808,9 +861,23 @@ export class ReaderSession {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        if (this.pendingViewportSize) {
+          const pending = this.pendingViewportSize;
+          this.pendingViewportSize = null;
+          this.applyViewportSize(pending.width, pending.height);
+        }
       }
       throw error;
     }
+  }
+
+  private liveStartLocation(): Location['start'] | null {
+    if (this.current?.start) return this.current.start;
+    if (this.rendition?.location?.start) return this.rendition.location.start;
+    const live = (
+      this.rendition as unknown as { currentLocation?: () => { start?: Location['start'] } } | null
+    )?.currentLocation?.();
+    return live && !(live instanceof Promise) && live.start ? live.start : null;
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
@@ -818,14 +885,12 @@ export class ReaderSession {
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
-    this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
-      : null;
+    this.userNavigationStartCfi = userNavigation ? (this.liveStartLocation()?.cfi ?? null) : null;
     return this.locationGeneration;
   }
 
   private beginLinkedNavigation(): void {
-    const start = this.current?.start ?? this.rendition?.location?.start;
+    const start = this.liveStartLocation();
     if (!start) return;
     this.locationGeneration += 1;
     this.userNavigationPending = true;
