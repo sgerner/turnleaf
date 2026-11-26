@@ -82,6 +82,7 @@ export function parseAppearance(value: string): Appearance {
       64,
       Math.max(0, Number(parsed.bottomMargin ?? defaultAppearance.bottomMargin)),
     ),
+    publisherStyles: parsed.publisherStyles !== false,
     progressBar: parsed.progressBar !== false,
     volumeButtons: parsed.volumeButtons === true,
   };
