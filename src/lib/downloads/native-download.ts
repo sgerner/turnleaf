@@ -1,7 +1,12 @@
 import { Capacitor } from '@capacitor/core';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { recordDiagnostic } from '../diagnostics/log';
-import { KavitaError, assertRedirectLimit, redirectTarget } from '../kavita/client';
+import {
+  advanceRedirect,
+  assertSafeTransferTarget,
+  createRedirectState,
+  KavitaError,
+} from '../kavita/redirects';
 import {
   PRIVATE_TRANSFER_CONNECTION_FAILED,
   PrivateTransfer,
@@ -89,35 +94,30 @@ async function ensureDataDirectory(path: string): Promise<void> {
 }
 
 async function downloadWithSafeRedirects(options: {
-  url: string;
+  initialUrl: string;
+  normalizedInitialUrl: string;
+  serverOrigin: string;
   relativePath: string;
   apiKey: string;
   connectTimeout?: number;
   readTimeout?: number;
   progress?: boolean;
   transferId?: string;
-  signal?: AbortSignal;
-  onHopUrl?: (url: string) => void;
+  signal?: AbortSignal | undefined;
+  onHopUrl?: ((url: string) => void) | undefined;
 }): Promise<PrivateDownloadResult> {
-  let initial: URL;
-  try {
-    initial = new URL(options.url);
-  } catch {
-    throw new Error('Invalid Kavita download address.');
-  }
-  if (initial.protocol !== 'http:' && initial.protocol !== 'https:') {
-    throw new Error('Invalid Kavita download address.');
-  }
-  const serverOrigin = initial.origin;
-  let currentUrl = initial.toString();
-  const visited = new Set([currentUrl]);
-  let redirectCount = 0;
+  const redirects = createRedirectState(
+    options.initialUrl,
+    options.serverOrigin,
+    'GET',
+    options.normalizedInitialUrl,
+  );
 
   while (true) {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    options.onHopUrl?.(currentUrl);
+    options.onHopUrl?.(redirects.currentUrl);
     const response = await PrivateTransfer.downloadFile({
-      url: currentUrl,
+      url: redirects.currentUrl,
       relativePath: options.relativePath,
       headers: { 'x-api-key': options.apiKey },
       ...(options.connectTimeout !== undefined ? { connectTimeout: options.connectTimeout } : {}),
@@ -127,24 +127,8 @@ async function downloadWithSafeRedirects(options: {
     });
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    const nextUrl = redirectTarget(
-      response.status,
-      response.location ?? null,
-      currentUrl,
-      serverOrigin,
-      'GET',
-    );
+    const nextUrl = advanceRedirect(redirects, response.status, response.location ?? null);
     if (!nextUrl) return response;
-    assertRedirectLimit(++redirectCount, response.status);
-    if (visited.has(nextUrl)) {
-      throw new KavitaError(
-        'Kavita redirected in a loop. Check the saved server address.',
-        'server',
-        response.status,
-      );
-    }
-    visited.add(nextUrl);
-    currentUrl = nextUrl;
   }
 }
 
@@ -174,9 +158,14 @@ export async function downloadEpub(
   apiKey: string,
   bookId: string,
   onProgress?: (percent: number) => void,
+  serverOrigin?: string,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
-  if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
+  const target = assertSafeTransferTarget(
+    downloadUrl,
+    serverOrigin,
+    'Invalid Kavita download address.',
+  );
   assertSafeBookId(bookId);
 
   await cleanupInterruptedEpubDownloads();
@@ -184,12 +173,12 @@ export async function downloadEpub(
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}${PARTIAL_SUFFIX}`;
   const transferId = `epub-${++nextTransferSequence}`;
-  let activeUrl = downloadUrl;
+  let activeHopUrl = target.url;
   const listener = onProgress
     ? await PrivateTransfer.addListener('progress', (event) => {
-        const matchesTransfer = event.transferId
-          ? event.transferId === transferId
-          : event.url === activeUrl;
+        const matchesTransfer =
+          (event.transferId === undefined || event.transferId === transferId) &&
+          event.url === activeHopUrl;
         if (
           matchesTransfer &&
           event.lengthComputable &&
@@ -207,11 +196,13 @@ export async function downloadEpub(
     for (let attempt = 0; ; attempt += 1) {
       try {
         const response = await downloadWithSafeRedirects({
-          url: downloadUrl,
+          initialUrl: target.url,
+          normalizedInitialUrl: target.normalizedUrl,
+          serverOrigin: target.serverOrigin,
           relativePath: temporaryPath,
           apiKey,
           onHopUrl: (url) => {
-            activeUrl = url;
+            activeHopUrl = url;
           },
           ...(listener ? { progress: true, transferId } : {}),
         });
@@ -331,8 +322,14 @@ export async function cacheCover(
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload = true,
+  serverOrigin?: string,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  const target = assertSafeTransferTarget(
+    downloadUrl,
+    serverOrigin,
+    'Invalid Kavita cover address.',
+  );
   const namespace = safeCoverNamespace(cacheNamespace);
   const directory = `covers/${namespace}`;
   const path = `${directory}/${seriesId}.img`;
@@ -345,7 +342,9 @@ export async function cacheCover(
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     try {
       const response = await downloadWithSafeRedirects({
-        url: downloadUrl,
+        initialUrl: target.url,
+        normalizedInitialUrl: target.normalizedUrl,
+        serverOrigin: target.serverOrigin,
         relativePath: temporaryPath,
         apiKey,
         connectTimeout: 5_000,

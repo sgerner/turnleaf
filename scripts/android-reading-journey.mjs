@@ -16,7 +16,7 @@ const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
 const uiDumpRemotePath = '/data/local/tmp/turnleaf-ui.xml';
 const coverPng = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
   'base64',
 );
 let deviceSerial;
@@ -178,22 +178,42 @@ async function connectWebView() {
   }
 }
 
-async function startFixture() {
+export async function startFixture({ crossOriginRedirects = false } = {}) {
   const epub = await readFile(
     new URL('../dev/kavita/data/Books/lorem-ipsum.epub', import.meta.url),
   );
   const uploads = [];
   let downloads = 0;
   let covers = 0;
+  let coverRedirects = 0;
+  let downloadRedirects = 0;
+  let foreignAuthHeaders = 0;
   let offline = false;
+  let redirectCrossOrigin = crossOriginRedirects;
   const offlineRequests = [];
+  const notFoundPaths = [];
+  const foreignRequests = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
+
+  const foreignServer = createServer((request, response) => {
+    foreignRequests.push(new URL(request.url, 'http://localhost').pathname);
+    if (request.headers['x-api-key']) {
+      foreignAuthHeaders += 1;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/octet-stream' }).end('foreign');
+  });
+  foreignServer.listen(0, '127.0.0.1');
+  await once(foreignServer, 'listening');
+  const foreignPort = foreignServer.address().port;
+  const foreignOrigin = `http://127.0.0.1:${foreignPort}`;
+
   const server = createServer(async (request, response) => {
     if (request.headers['x-api-key'] !== key) {
       response.writeHead(401).end();
       return;
     }
-    const path = new URL(request.url, 'http://localhost').pathname;
+    const requestUrl = new URL(request.url, 'http://localhost');
+    const path = requestUrl.pathname;
     if (offline) {
       offlineRequests.push(path);
       response.writeHead(503).end();
@@ -221,7 +241,7 @@ async function startFixture() {
                   id: 1,
                   volumeId: 1,
                   title,
-                  titleName: title,
+                  titleName,
                   pages: 2,
                   pagesRead,
                   format: 3,
@@ -233,6 +253,15 @@ async function startFixture() {
         };
         break;
       case '/api/Image/series-cover':
+        if (redirectCrossOrigin) {
+          coverRedirects += 1;
+          response
+            .writeHead(302, {
+              Location: `${foreignOrigin}/api/Image/series-cover${requestUrl.search}`,
+            })
+            .end();
+          return;
+        }
         covers += 1;
         response
           .writeHead(200, {
@@ -242,6 +271,15 @@ async function startFixture() {
           .end(coverPng);
         return;
       case '/api/Download/chapter':
+        if (redirectCrossOrigin) {
+          downloadRedirects += 1;
+          response
+            .writeHead(302, {
+              Location: `${foreignOrigin}/api/Download/chapter${requestUrl.search}`,
+            })
+            .end();
+          return;
+        }
         downloads += 1;
         response
           .writeHead(200, {
@@ -266,17 +304,22 @@ async function startFixture() {
         break;
       }
       default:
+        notFoundPaths.push(path);
         response.writeHead(404).end();
         return;
     }
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
+  const titleName = title;
   server.keepAliveTimeout = 60_000;
   server.headersTimeout = 65_000;
+  foreignServer.keepAliveTimeout = 60_000;
+  foreignServer.headersTimeout = 65_000;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
     port: server.address().port,
+    foreignPort,
     uploads,
     get downloads() {
       return downloads;
@@ -284,12 +327,27 @@ async function startFixture() {
     get covers() {
       return covers;
     },
+    get coverRedirects() {
+      return coverRedirects;
+    },
+    get downloadRedirects() {
+      return downloadRedirects;
+    },
+    get foreignAuthHeaders() {
+      return foreignAuthHeaders;
+    },
     offlineRequests,
+    notFoundPaths,
+    foreignRequests,
     setOffline(value) {
       offline = value;
     },
+    setCrossOriginRedirects(value) {
+      redirectCrossOrigin = value;
+    },
     close() {
       server.close();
+      foreignServer.close();
     },
   };
 }
@@ -329,6 +387,20 @@ export const journeyExpressions = {
   })()`,
   hasCachedCoverImage: () =>
     "Array.from(document.querySelectorAll('img')).some(img => img.src.includes('_capacitor_file_') && img.complete && img.naturalWidth > 0)",
+  hasCatalogBookCard: () => "Boolean(document.querySelector('[data-book-open]'))",
+  renderedCover: () => `(() => {
+    const trigger = document.querySelector('[data-book-open]');
+    const parent = trigger && trigger.parentElement;
+    const image = parent && parent.querySelector('img');
+    return Boolean(image && image.complete && image.naturalWidth > 0);
+  })()`,
+  retryDownloadReady: () => `Array.from(document.querySelectorAll('button')).some(
+    button =>
+      !button.disabled &&
+      !(button.closest && button.closest('[inert]')) &&
+      button.textContent &&
+      button.textContent.trim() === 'Retry download'
+  )`,
   chapter: (number) => `Array.from(document.querySelectorAll('iframe')).some(frame => {
     const doc = frame.contentDocument;
     const heading = doc && doc.querySelector('h1');
@@ -376,11 +448,21 @@ export const journeyExpressions = {
 };
 
 const { click, clickByText, chapter } = journeyExpressions;
+const renderedCover = journeyExpressions.renderedCover();
+const retryDownloadReady = journeyExpressions.retryDownloadReady();
 
 let receivedSignal;
 
 function throwIfInterrupted() {
   if (receivedSignal) throw new Error(`Android reading journey interrupted by ${receivedSignal}.`);
+}
+
+function assertRedirectIsolation(fixture) {
+  if (fixture.foreignRequests.length > 0 || fixture.foreignAuthHeaders > 0) {
+    throw new Error(
+      `Cross-origin redirect received ${fixture.foreignRequests.length} request(s) and ${fixture.foreignAuthHeaders} x-api-key header(s).`,
+    );
+  }
 }
 
 async function run() {
@@ -395,6 +477,7 @@ async function run() {
 
   let fixture;
   let tunnel;
+  let foreignTunnel;
   let web;
   let disabledNetwork = false;
   let journeyError;
@@ -403,10 +486,12 @@ async function run() {
   try {
     deviceSerial = await resolveDeviceSerial({ emulatorOnly: true });
     throwIfInterrupted();
-    fixture = await startFixture();
+    fixture = await startFixture({ crossOriginRedirects: true });
     throwIfInterrupted();
     tunnel = `tcp:${fixture.port}`;
     await adb('reverse', tunnel, tunnel);
+    foreignTunnel = `tcp:${fixture.foreignPort}`;
+    await adb('reverse', foreignTunnel, foreignTunnel);
     throwIfInterrupted();
     await smoke({
       packageName,
@@ -428,11 +513,31 @@ async function run() {
     );
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
     await web.evaluate(click('button[type=submit]'));
-    await waitFor(
-      'cached library cover',
-      async () =>
-        fixture.covers >= 1 && (await web.evaluate(journeyExpressions.hasCachedCoverImage())),
+    await waitFor('catalog book card', () => web.evaluate(journeyExpressions.hasCatalogBookCard()));
+    await waitFor('blocked cross-origin cover redirect', () => fixture.coverRedirects >= 1);
+    await waitFor('attempt redirected EPUB download', () =>
+      web.evaluate(click('[data-book-open]')),
     );
+    await waitFor('blocked cross-origin EPUB redirect', () => web.evaluate(retryDownloadReady));
+    if (fixture.downloadRedirects !== 1) {
+      throw new Error('Expected one cross-origin EPUB redirect check.');
+    }
+    if (await web.evaluate(renderedCover)) {
+      throw new Error('Expected cross-origin cover redirect to not render.');
+    }
+    assertRedirectIsolation(fixture);
+
+    fixture.setCrossOriginRedirects(false);
+    await waitFor('refresh library for online cover', () =>
+      web.evaluate(click('[aria-label="Refresh library"]')),
+    );
+    await waitFor(
+      'rendered online cached cover',
+      async () =>
+        (await web.evaluate(renderedCover)) &&
+        (await web.evaluate(journeyExpressions.hasCachedCoverImage())),
+    );
+    if (fixture.covers !== 1) throw new Error('Expected one cached cover transfer.');
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
@@ -491,6 +596,7 @@ async function run() {
     await waitFor('saved offline progress', () =>
       web.evaluate(journeyExpressions.hasDownloadedBookProgress(title, 50)),
     );
+    await waitFor('rendered offline cover before restart', () => web.evaluate(renderedCover));
 
     const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
     await web.close();
@@ -505,8 +611,11 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
-    await waitFor('offline cached cover after restart', () =>
-      web.evaluate(journeyExpressions.hasCachedCoverImage()),
+    await waitFor(
+      'rendered offline cached cover after restart',
+      async () =>
+        (await web.evaluate(renderedCover)) &&
+        (await web.evaluate(journeyExpressions.hasCachedCoverImage())),
     );
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
@@ -536,6 +645,13 @@ async function run() {
     await waitFor('saved passage after reconnect', () =>
       web.evaluate(journeyExpressions.hasDownloadedBookProgress(title, 50)),
     );
+    await waitFor('rendered cover after reconnect', () => web.evaluate(renderedCover));
+    assertRedirectIsolation(fixture);
+    if (fixture.notFoundPaths.length > 0) {
+      throw new Error(
+        `Fixture returned unexpected 404 responses: ${fixture.notFoundPaths.join(', ')}.`,
+      );
+    }
     throwIfInterrupted();
     journeyPassed = true;
   } catch (error) {
@@ -554,6 +670,12 @@ async function run() {
       cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);
     }
     if (web) cleanup.push(['close WebView debugger', () => web.close()]);
+    if (foreignTunnel) {
+      cleanup.push([
+        'remove foreign ADB reverse tunnel',
+        () => adb('reverse', '--remove', foreignTunnel),
+      ]);
+    }
     if (tunnel)
       cleanup.push(['remove ADB reverse tunnel', () => adb('reverse', '--remove', tunnel)]);
 

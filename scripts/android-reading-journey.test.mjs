@@ -1,11 +1,20 @@
 import { JSDOM } from 'jsdom';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   cancelSystemExportSheet,
   completeSystemExportSheet,
   journeyExpressions,
   parseUiNodes,
+  startFixture,
 } from './android-reading-journey.mjs';
+
+const fixtures = [];
+
+afterEach(() => {
+  while (fixtures.length > 0) {
+    fixtures.pop()?.close();
+  }
+});
 
 const FORBIDDEN_CHROME_74_SYNTAX = [
   { label: 'optional chaining (?.)', pattern: /\?\./ },
@@ -27,6 +36,9 @@ describe('Android reading journey WebView expressions', () => {
       ['click', journeyExpressions.click('[data-book-open]')],
       ['clickByText', journeyExpressions.clickByText('#reader-annotations', 'Export Markdown')],
       ['hasCachedCoverImage', journeyExpressions.hasCachedCoverImage()],
+      ['hasCatalogBookCard', journeyExpressions.hasCatalogBookCard()],
+      ['renderedCover', journeyExpressions.renderedCover()],
+      ['retryDownloadReady', journeyExpressions.retryDownloadReady()],
       ['chapter', journeyExpressions.chapter(1)],
       ['selectChapterHeading', journeyExpressions.selectChapterHeading(1)],
       ['hasMarkdownCopyFallback', journeyExpressions.hasMarkdownCopyFallback('Turnleaf CI EPUB')],
@@ -52,8 +64,11 @@ describe('Android reading journey WebView expressions', () => {
     }
   });
 
-  it('evaluates chapter, selection, note export, and progress checks safely against DOM state', () => {
+  it('evaluates chapter, selection, note export, cover, and progress checks safely against DOM state', () => {
     const dom = new JSDOM(`<!doctype html><html><body>
+      <div class="book-card">
+        <button type="button" data-book-open>Open</button>
+      </div>
       <div id="reader-annotations">
         <p role="status">Export canceled. Copy the Markdown from the field below.</p>
         <textarea readonly># Notes for Turnleaf CI EPUB</textarea>
@@ -64,11 +79,19 @@ describe('Android reading journey WebView expressions', () => {
     const runExpr = (expr) =>
       new Function('document', 'Event', `return (${expr});`)(document, DomEvent);
 
+    expect(runExpr(journeyExpressions.hasCatalogBookCard())).toBe(true);
+    expect(runExpr(journeyExpressions.renderedCover())).toBe(false);
+    expect(runExpr(journeyExpressions.retryDownloadReady())).toBe(false);
     expect(runExpr(journeyExpressions.chapter(1))).toBe(false);
     expect(runExpr(journeyExpressions.selectChapterHeading(1))).toBe(false);
     expect(runExpr(journeyExpressions.hasMarkdownCopyFallback('Turnleaf CI EPUB'))).toBe(true);
     expect(runExpr(journeyExpressions.hasSavedNoteExportConfirmation())).toBe(false);
     expect(runExpr(journeyExpressions.hasReaderProgressAtLeast(50))).toBe(true);
+
+    const retryButton = document.createElement('button');
+    retryButton.textContent = 'Retry download';
+    document.body.appendChild(retryButton);
+    expect(runExpr(journeyExpressions.retryDownloadReady())).toBe(true);
 
     const frame = document.createElement('iframe');
     document.body.appendChild(frame);
@@ -156,5 +179,73 @@ describe('Android system export sheet helpers', () => {
       centerX: 880,
       centerY: 1660,
     });
+  });
+});
+
+describe('Android reading journey fixture', () => {
+  it('serves series covers as PNG with zero 404 responses and enforces the API key', async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+
+    const unauthorized = await fetch(
+      `http://127.0.0.1:${fixture.port}/api/Image/series-cover?seriesId=1`,
+    );
+    expect(unauthorized.status).toBe(401);
+
+    const response = await fetch(
+      `http://127.0.0.1:${fixture.port}/api/Image/series-cover?seriesId=1`,
+      {
+        headers: { 'x-api-key': 'turnleaf-ci-only' },
+      },
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/png');
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    expect(Array.from(bytes.slice(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+    expect(fixture.covers).toBe(1);
+    expect(fixture.notFoundPaths).toEqual([]);
+  });
+
+  it('tracks cross-origin redirect isolation for cover and EPUB endpoints', async () => {
+    const fixture = await startFixture({ crossOriginRedirects: true });
+    fixtures.push(fixture);
+
+    const coverRedirect = await fetch(
+      `http://127.0.0.1:${fixture.port}/api/Image/series-cover?seriesId=1`,
+      {
+        headers: { 'x-api-key': 'turnleaf-ci-only' },
+        redirect: 'manual',
+      },
+    );
+    expect(coverRedirect.status).toBe(302);
+    expect(coverRedirect.headers.get('location')).toBe(
+      `http://127.0.0.1:${fixture.foreignPort}/api/Image/series-cover?seriesId=1`,
+    );
+
+    const downloadRedirect = await fetch(
+      `http://127.0.0.1:${fixture.port}/api/Download/chapter?chapterId=1`,
+      {
+        headers: { 'x-api-key': 'turnleaf-ci-only' },
+        redirect: 'manual',
+      },
+    );
+    expect(downloadRedirect.status).toBe(302);
+    expect(downloadRedirect.headers.get('location')).toBe(
+      `http://127.0.0.1:${fixture.foreignPort}/api/Download/chapter?chapterId=1`,
+    );
+    expect(fixture.coverRedirects).toBe(1);
+    expect(fixture.downloadRedirects).toBe(1);
+    expect(fixture.foreignRequests).toEqual([]);
+    expect(fixture.foreignAuthHeaders).toBe(0);
+
+    await fetch(`http://127.0.0.1:${fixture.foreignPort}/probe`);
+    expect(fixture.foreignRequests).toEqual(['/probe']);
+    expect(fixture.foreignAuthHeaders).toBe(0);
+
+    await fetch(`http://127.0.0.1:${fixture.foreignPort}/probe-auth`, {
+      headers: { 'x-api-key': 'turnleaf-ci-only' },
+    });
+    expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
+    expect(fixture.foreignAuthHeaders).toBe(1);
   });
 });

@@ -232,7 +232,7 @@ describe('native EPUB download boundary', () => {
     {
       label: 'HTTPS-to-HTTP downgrade',
       location: 'http://books.example.com/download',
-      expectedMessage: /HTTPS to HTTP/i,
+      expectedMessage: /HTTPS to insecure HTTP/i,
     },
     {
       label: 'sensitive query parameter redirect',
@@ -332,6 +332,180 @@ describe('native EPUB download boundary', () => {
     await expect(verifyDownloadedEpub('books/book.epub')).resolves.toBeNull();
     expect(native.deleted).toEqual(['books/book.epub']);
   });
+
+  it('follows up to five same-origin 3xx hops and tracks active hop progress', async () => {
+    let progressHandler:
+      | ((event: {
+          transferId?: string;
+          url: string;
+          bytes: number;
+          contentLength: number;
+          lengthComputable: boolean;
+        }) => void)
+      | undefined;
+    const removeListener = vi.fn(async () => {});
+    vi.mocked(PrivateTransfer.addListener).mockImplementationOnce(async (_event, callback) => {
+      progressHandler = callback;
+      return { remove: removeListener };
+    });
+
+    const hops = [
+      '/kavita/download/step-1',
+      '/kavita/download/step-2',
+      'https://books.example.com/kavita/download/step-3',
+      '/kavita/download/step-4',
+      '/kavita/download/final?chapterId=42',
+    ];
+    for (const location of hops) {
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+        status: 302,
+        location,
+        bytesWritten: 0,
+      });
+    }
+    vi.mocked(PrivateTransfer.downloadFile).mockImplementationOnce(async ({ transferId, url }) => {
+      progressHandler?.({
+        ...(transferId ? { transferId } : {}),
+        url: 'https://books.example.com/api/Download/chapter?chapterId=42',
+        bytes: 10,
+        contentLength: 100,
+        lengthComputable: true,
+      });
+      progressHandler?.({
+        ...(transferId ? { transferId } : {}),
+        url,
+        bytes: 64,
+        contentLength: 100,
+        lengthComputable: true,
+      });
+      const epubBytes = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+      native.body = epubBytes;
+      return { status: 200, bytesWritten: epubBytes.length };
+    });
+
+    const progressUpdates: number[] = [];
+    await expect(
+      downloadEpub(
+        'https://books.example.com/api/Download/chapter?chapterId=42',
+        'secret',
+        'server-book',
+        (percent) => progressUpdates.push(percent),
+        'https://books.example.com',
+      ),
+    ).resolves.toMatchObject({ relativePath: 'books/server-book.epub' });
+
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(6);
+    for (const [options] of vi.mocked(PrivateTransfer.downloadFile).mock.calls) {
+      expect(options).toMatchObject({
+        relativePath: 'books/server-book.epub.partial',
+        headers: { 'x-api-key': 'secret' },
+      });
+    }
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[5]?.[0].url).toBe(
+      'https://books.example.com/kavita/download/final?chapterId=42',
+    );
+    expect(progressUpdates).toEqual([64]);
+    expect(removeListener).toHaveBeenCalledOnce();
+  });
+
+  it('rejects more than five same-origin redirect hops during EPUB download', async () => {
+    for (let step = 1; step <= 6; step += 1) {
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+        status: 302,
+        location: `/download/step-${step}`,
+        bytesWritten: 0,
+      });
+    }
+
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'secret',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+      ),
+    ).rejects.toThrow('redirected too many times');
+
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(6);
+    expect(native.renamed).toBe(false);
+    expect(native.deleted).toContain('books/server-book.epub.partial');
+  });
+
+  it.each([
+    {
+      label: 'redirect loop',
+      initialUrl: 'https://books.example.com/download',
+      serverOrigin: 'https://books.example.com',
+      redirects: ['/download/hop', '/download'],
+      expectedMessage: 'redirected in a loop',
+    },
+    {
+      label: 'cross-origin redirect',
+      initialUrl: 'https://books.example.com/download',
+      serverOrigin: 'https://books.example.com',
+      redirects: ['https://attacker.example/download'],
+      expectedMessage: 'redirected to a different server',
+    },
+    {
+      label: 'HTTPS-to-HTTP downgrade',
+      initialUrl: 'https://books.example.com/download',
+      serverOrigin: 'https://books.example.com',
+      redirects: ['http://books.example.com/download'],
+      expectedMessage: 'redirected from HTTPS to insecure HTTP',
+    },
+    {
+      label: 'embedded credentials in redirect',
+      initialUrl: 'https://books.example.com/download',
+      serverOrigin: 'https://books.example.com',
+      redirects: ['https://reader:secret@books.example.com/download'],
+      expectedMessage: 'redirected to a different server',
+    },
+    {
+      label: 'sensitive query parameter in redirect',
+      initialUrl: 'https://books.example.com/download',
+      serverOrigin: 'https://books.example.com',
+      redirects: ['/download?apiKey=leaked'],
+      expectedMessage: 'redirected to a different server',
+    },
+  ])(
+    'rejects $label in EPUB transfer before sending credentials to the unsafe target',
+    async ({ initialUrl, serverOrigin, redirects, expectedMessage }) => {
+      for (const location of redirects) {
+        vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+          status: 307,
+          location,
+          bytesWritten: 0,
+        });
+      }
+
+      await expect(
+        downloadEpub(initialUrl, 'secret', 'server-book', undefined, serverOrigin),
+      ).rejects.toThrow(expectedMessage);
+
+      expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
+      for (const [options] of vi.mocked(PrivateTransfer.downloadFile).mock.calls) {
+        expect(options.relativePath).toBe('books/server-book.epub.partial');
+        expect(new URL(options.url).origin).toBe(serverOrigin);
+      }
+      expect(native.renamed).toBe(false);
+      expect(native.deleted).toContain('books/server-book.epub.partial');
+    },
+  );
+
+  it('rejects an EPUB transfer when the initial URL does not match the configured server origin', async () => {
+    await expect(
+      downloadEpub(
+        'https://other.example.com/download',
+        'secret',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+      ),
+    ).rejects.toThrow('redirected to a different server');
+
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
+  });
 });
 
 describe('native cover cache', () => {
@@ -387,11 +561,122 @@ describe('native cover cache', () => {
     });
 
     await expect(cacheCover('https://books.example.com/cover', 'secret', 7)).rejects.toThrow(
-      /HTTPS to HTTP/i,
+      /HTTPS to insecure HTTP/i,
     );
     expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
     expect(native.deleted).toContain('covers/default/7.img.partial');
   });
+
+  it('follows validated same-origin 3xx cover redirects into app-private storage', async () => {
+    let downloaded = false;
+    vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+      if (path === 'covers/server-1') throw new Error('missing directory');
+      if (path === 'covers/server-1/7.img' && !downloaded) throw new Error('uncached');
+      return {
+        type: 'file',
+        size: 68,
+        name: path,
+        mtime: 0,
+        uri: `file://${path}`,
+      };
+    });
+    vi.mocked(PrivateTransfer.downloadFile)
+      .mockResolvedValueOnce({
+        status: 302,
+        location: '/kavita/api/Image/series-cover?seriesId=7',
+        bytesWritten: 0,
+      })
+      .mockImplementationOnce(async () => {
+        downloaded = true;
+        return { status: 200, bytesWritten: 68 };
+      });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/api/Image/series-cover?seriesId=7',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+      ),
+    ).resolves.toBe('web://file://covers/server-1/7.img');
+
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[0]?.[0]).toMatchObject({
+      url: 'https://books.example.com/api/Image/series-cover?seriesId=7',
+      relativePath: 'covers/server-1/7.img.partial',
+      headers: { 'x-api-key': 'secret' },
+    });
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[1]?.[0]).toMatchObject({
+      url: 'https://books.example.com/kavita/api/Image/series-cover?seriesId=7',
+      relativePath: 'covers/server-1/7.img.partial',
+      headers: { 'x-api-key': 'secret' },
+    });
+    expect(native.renamed).toBe(true);
+  });
+
+  it.each([
+    {
+      label: 'loop',
+      redirects: ['/cover/next', '/cover'],
+      expectedMessage: 'redirected in a loop',
+    },
+    {
+      label: 'cross-origin',
+      redirects: ['https://cdn.other.example/cover.png'],
+      expectedMessage: 'redirected to a different server',
+    },
+    {
+      label: 'HTTPS downgrade',
+      redirects: ['http://books.example.com/cover'],
+      expectedMessage: 'redirected from HTTPS to insecure HTTP',
+    },
+  ])(
+    'rejects $label cover redirects without leaking x-api-key and cleans up partial cover files',
+    async ({ redirects, expectedMessage }) => {
+      vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+        if (path === 'covers/server-1' || path === 'covers/server-1/7.img') {
+          throw new Error('missing');
+        }
+        return {
+          type: 'file',
+          size: 0,
+          name: path,
+          mtime: 0,
+          uri: `file://${path}`,
+        };
+      });
+      for (const location of redirects) {
+        vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+          status: 302,
+          location,
+          bytesWritten: 0,
+        });
+      }
+
+      await expect(
+        cacheCover(
+          'https://books.example.com/cover',
+          'secret',
+          7,
+          undefined,
+          'server-1',
+          true,
+          'https://books.example.com',
+        ),
+      ).rejects.toThrow(expectedMessage);
+
+      expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
+      for (const [options] of vi.mocked(PrivateTransfer.downloadFile).mock.calls) {
+        expect(options.relativePath).toBe('covers/server-1/7.img.partial');
+        expect(new URL(options.url).origin).toBe('https://books.example.com');
+      }
+      expect(native.renamed).toBe(false);
+      expect(native.deleted).toContain('covers/server-1/7.img.partial');
+    },
+  );
 });
 
 describe('Android manifest and storage permission bounds', () => {
