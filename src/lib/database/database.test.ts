@@ -9,13 +9,20 @@ import {
   getPendingSync,
   getPreferences,
   getReadingState,
+  getServer,
   getSyncStatus,
   markBookCompleted,
+  markDownloaded,
   reconcileBooks,
+  removeDownload,
+  removeServer,
   replaceBooksInTransaction,
   resetLocalDatabase,
   saveLocalProgress,
+  saveRemoteProgress,
+  saveServer,
   setPreference,
+  setPreferences,
   type BookRecord,
 } from './database';
 
@@ -1134,4 +1141,162 @@ it('round-trips library filter preferences in browser storage and clears them on
   await resetLocalDatabase();
   const afterReset = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
   expect(afterReset.size).toBe(0);
+});
+
+it('marks and removes browser downloads only on the matching book', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const undownloaded: BookRecord = {
+    ...existingBook,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  const sibling: BookRecord = {
+    ...existingBook,
+    id: 'server:1:11',
+    chapterId: 11,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [undownloaded, sibling],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await markDownloaded(undownloaded.id, 'books/downloaded.epub', 9876);
+  expect(await getBooks('server')).toEqual([
+    expect.objectContaining({
+      id: undownloaded.id,
+      downloadPath: 'books/downloaded.epub',
+      downloadStatus: 'available',
+      fileSize: 9876,
+    }),
+    expect.objectContaining({
+      id: sibling.id,
+      downloadPath: sibling.downloadPath,
+      downloadStatus: sibling.downloadStatus,
+      fileSize: sibling.fileSize,
+    }),
+  ]);
+
+  await removeDownload(undownloaded.id);
+  expect(await getBooks('server')).toEqual([
+    expect.objectContaining({
+      id: undownloaded.id,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    }),
+    expect.objectContaining({
+      id: sibling.id,
+      downloadPath: sibling.downloadPath,
+      downloadStatus: sibling.downloadStatus,
+      fileSize: sibling.fileSize,
+    }),
+  ]);
+});
+
+it('skips browser storage writes when removing an unmatched server or empty preferences', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const serverConfig = {
+    id: 'server',
+    displayName: 'Test server',
+    baseUrl: 'https://books.example.com',
+    credentialRef: 'credential',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  };
+  await saveServer(serverConfig);
+  await setPreferences(new Map([['uiTheme', 'eink']]));
+  await reconcileBooks('server', [existingBook]);
+
+  const setItemSpy = vi.spyOn(storage, 'setItem');
+  await setPreferences(new Map());
+  await removeServer('other-server');
+  expect(setItemSpy).not.toHaveBeenCalled();
+  await expect(getServer()).resolves.toEqual(serverConfig);
+  await expect(getPreferences(['uiTheme'])).resolves.toEqual(new Map([['uiTheme', 'eink']]));
+
+  await removeServer('server');
+  expect(setItemSpy).toHaveBeenCalledOnce();
+  await expect(getServer()).resolves.toBeNull();
+  await expect(getBooks('server')).resolves.toEqual([]);
+  await expect(getPreferences(['uiTheme'])).resolves.toEqual(new Map([['uiTheme', 'eink']]));
+});
+
+it('saves normalized browser remote progress and guards against concurrent local edits', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const zeroPageBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:12',
+    chapterId: 12,
+    pages: 0,
+    pagesRead: 0,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook, zeroPageBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  const clampedRemote = {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 10,
+    chapterId: 10,
+    pageNum: 150,
+    bookScrollId: '/remote/end',
+    lastModifiedUtc: '2026-09-07T00:00:05.000Z',
+  };
+  await expect(saveRemoteProgress(existingBook, clampedRemote, null)).resolves.toBe(true);
+  const saved = await getReadingState(existingBook.id);
+  expect(saved).toMatchObject({
+    cfi: '',
+    xpath: '/remote/end',
+    percentage: 0.999,
+    serverUpdatedAt: '2026-09-07T00:00:05.000Z',
+    pendingSync: false,
+    syncRevision: 1,
+  });
+  expect((await getBooks('server')).find((book) => book.id === existingBook.id)).toMatchObject({
+    pagesRead: 100,
+    lastReadAt: '2026-09-07T00:00:05.000Z',
+  });
+
+  await expect(
+    saveRemoteProgress(zeroPageBook, { ...clampedRemote, chapterId: 12, pageNum: 12 }, null),
+  ).resolves.toBe(true);
+  expect(await getReadingState(zeroPageBook.id)).toMatchObject({
+    cfi: '',
+    percentage: 0,
+    pendingSync: false,
+    syncRevision: 1,
+  });
+  expect((await getBooks('server')).find((book) => book.id === zeroPageBook.id)?.pagesRead).toBe(0);
+
+  await saveLocalProgress(existingBook, 'local-cfi', '/local', 0.5);
+  const setItemSpy = vi.spyOn(storage, 'setItem');
+  await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
+  expect(setItemSpy).not.toHaveBeenCalled();
 });
