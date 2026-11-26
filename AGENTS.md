@@ -6,6 +6,7 @@
 - Keep the `## Unreleased` section current.
 - A local git hook amends each commit with a `RELEASE_NOTES.md` update from the commit subject when hooks are installed.
 - Use `npm run release:notes` to extract the release body for GitHub releases.
+- For Android Java or CodeQL build changes, run `npm run build`, `npx cap sync android`, and `(cd android && ./gradlew :app:compileDebugJavaWithJavac --no-daemon)` locally.
 - Use `npm run android:verify-release` to verify a signed release APK's signature and SHA-256 digest locally.
 - Pin external GitHub Actions in `.github/workflows/` to full 40-character lowercase commit SHAs with `# vX.Y.Z` version comments; run `npm run workflow:check` (included in `npm run verify`) to verify workflow pins and quality gates locally.
 - Keep changes small and explicit; do not add abstractions unless they solve a real problem.

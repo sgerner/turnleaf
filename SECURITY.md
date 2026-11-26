@@ -19,7 +19,7 @@ Browser preview stores its development-only auth key and local database in local
 
 Use a dedicated non-administrator Kavita user for Turnleaf. Grant that user access only to the book libraries needed on the device, then create the auth key from that account. A Kavita auth key lets third-party apps act as that Kavita user, so an administrator key has administrator-level blast radius if it is stolen.
 
-Pull requests run formatting, linting, type checking, unit tests, production build, Android debug build, production and build dependency audits, dependency review, and CodeQL JavaScript/TypeScript analysis.
+Pull requests run formatting, linting, type checking, unit tests, production build, Android debug build, production and build dependency audits, dependency review, and CodeQL analysis for JavaScript/TypeScript and Java/Kotlin.
 
 Android release APKs are verified in CI with `apksigner` against `minSdkVersion` 24, bound to immutable SHA-256 workflow outputs, and signed with OIDC-backed GitHub Artifact Attestations before publication. Verify a downloaded `app-release.apk` before installing:
 
