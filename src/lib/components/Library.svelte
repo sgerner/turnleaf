@@ -74,6 +74,7 @@
     onServerDeleted,
     onChangeServerAddress,
     onReaderOpenChange,
+    onOverlayActiveChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -85,6 +86,7 @@
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
+    onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
@@ -614,6 +616,12 @@
     } else if (untrack(() => focusedRow) !== -1) {
       focusedRow = -1;
     }
+  });
+
+  $effect(() => {
+    const overlayActive = Boolean(reading || actionMenuBook || conflict || settingsVisible);
+    onOverlayActiveChange?.(overlayActive);
+    return () => onOverlayActiveChange?.(false);
   });
 
   $effect(() => {
