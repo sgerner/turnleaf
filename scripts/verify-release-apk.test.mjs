@@ -387,4 +387,73 @@ describe('Android release APK verification', () => {
     },
     REAL_SIGNING_TEST_TIMEOUT_MS,
   );
+
+  it('keeps release preflight deduplication, revision guards, and provenance attestation gates wired in android-release.yml', () => {
+    const workflowPath = join(projectRoot, '.github', 'workflows', 'android-release.yml');
+    const workflow = readFileSync(workflowPath, 'utf8');
+    const [buildSection, publishSection] = workflow.split('\n  publish-github-release:\n');
+    expect(buildSection).toBeTruthy();
+    expect(publishSection).toBeTruthy();
+
+    expect(buildSection).toContain('id-token: write');
+    expect(buildSection).toContain('attestations: write');
+    expect(buildSection).toContain(
+      'already_released: ${{ steps.release_preflight.outputs.already_released }}',
+    );
+    expect(buildSection).toContain('apk_sha256: ${{ steps.stage_release.outputs.apk_sha256 }}');
+    expect(buildSection).toContain('notes_sha256: ${{ steps.stage_release.outputs.notes_sha256 }}');
+    expect(buildSection).toContain(
+      'min_sdk_version: ${{ steps.stage_release.outputs.min_sdk_version }}',
+    );
+
+    const buildSteps = buildSection
+      .split(/\n {6}- name: /)
+      .slice(1)
+      .map((chunk) => {
+        const [name, ...rest] = chunk.split('\n');
+        return { name: name.trim(), body: rest.join('\n') };
+      });
+    const buildStepNames = buildSteps.map((step) => step.name);
+
+    expect(buildStepNames.slice(0, 3)).toEqual([
+      'Check out source',
+      'Confirm release revision is current master',
+      'Check for existing release',
+    ]);
+    expect(buildStepNames.indexOf('Confirm release revision is current before signing')).toBe(
+      buildStepNames.indexOf('Restore signing key') - 1,
+    );
+    expect(buildStepNames.slice(-3)).toEqual([
+      'Stage release artifacts and notes',
+      'Attest release APK build provenance',
+      'Upload release artifacts',
+    ]);
+
+    for (const step of buildSteps.slice(3)) {
+      expect(
+        step.body,
+        `Expected build-release-apk step "${step.name}" to guard against already_released`,
+      ).toContain("steps.release_preflight.outputs.already_released != 'true'");
+    }
+
+    expect(publishSection).toContain(
+      "if: needs.build-release-apk.outputs.already_released != 'true'",
+    );
+    expect(publishSection).toContain('contents: write');
+    expect(publishSection).toContain('attestations: read');
+
+    const publishSteps = publishSection
+      .split(/\n {6}- name: /)
+      .slice(1)
+      .map((chunk) => chunk.split('\n')[0].trim());
+
+    expect(publishSteps).toEqual([
+      'Check out release helper',
+      'Download tested release artifacts',
+      'Verify release provenance',
+      'Verify APK provenance attestation',
+      'Confirm release revision is still current master',
+      'Publish GitHub release',
+    ]);
+  });
 });
