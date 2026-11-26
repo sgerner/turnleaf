@@ -142,6 +142,7 @@ const ALLOWED = new Set([
   'network',
   'network-error',
   'no-book-libraries',
+  'notes-restore-failed',
   'server',
   'server-save-failed',
   'setup-failed',

@@ -61,6 +61,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
+let resetting: Promise<void> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
@@ -210,19 +211,38 @@ function updateBrowserState(mutate: (state: BrowserDatabaseState) => boolean | v
   return true;
 }
 
+async function waitForActiveReset(): Promise<void> {
+  while (resetting) {
+    await resetting.catch(() => undefined);
+  }
+}
+
+function isResetting(): boolean {
+  return resetting !== null;
+}
+
 export async function openDatabase(): Promise<SQLiteDBConnection> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
+  await waitForActiveReset();
   if (connection) return connection;
 
   if (opening) return opening;
-  opening = openNativeDatabase();
+  const pendingOpen = openNativeDatabase();
+  opening = pendingOpen;
   try {
-    connection = await opening;
-    return connection;
+    const db = await pendingOpen;
+    if (isResetting()) {
+      await waitForActiveReset();
+      return openDatabase();
+    }
+    connection = db;
+    return db;
   } finally {
-    opening = null;
+    if (opening === pendingOpen) {
+      opening = null;
+    }
   }
 }
 
@@ -246,33 +266,54 @@ export async function resetLocalDatabase(): Promise<void> {
     return;
   }
 
-  await opening?.catch(() => undefined);
-  await nativeTransactionQueue.catch(() => undefined);
-
-  try {
-    const activeConnection = connection;
-    connection = null;
-    opening = null;
-    if (activeConnection) {
-      try {
-        await activeConnection.close();
-      } catch {
-        // Best effort only; a broken connection can still be removed.
-      }
-    }
-    try {
-      await CapacitorSQLite.closeConnection?.({ database: 'turnleaf', readonly: false });
-    } catch {
-      // Best effort only; no native connection may be registered yet.
-    }
-    if (hasNativeSqliteResetPlugin()) {
-      await SqliteReset.deleteDatabase({ database: 'turnleaf' });
-    } else {
-      await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
-    }
-  } catch (error) {
-    throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
+  if (resetting) {
+    return resetting;
   }
+
+  const pendingReset = performNativeDatabaseReset();
+  resetting = pendingReset;
+  try {
+    await pendingReset;
+  } finally {
+    if (resetting === pendingReset) {
+      resetting = null;
+    }
+  }
+}
+
+async function performNativeDatabaseReset(): Promise<void> {
+  const inflightOpen = opening;
+  const openedDuringInflight = await inflightOpen?.catch(() => null);
+
+  await enqueueNativeWrite(async () => {
+    try {
+      const handlesToClose = new Set<SQLiteDBConnection>();
+      if (connection) handlesToClose.add(connection);
+      if (openedDuringInflight) handlesToClose.add(openedDuringInflight);
+      connection = null;
+      opening = null;
+
+      for (const handle of handlesToClose) {
+        try {
+          await handle.close();
+        } catch {
+          // Best effort only; a broken connection can still be removed.
+        }
+      }
+      try {
+        await CapacitorSQLite.closeConnection?.({ database: 'turnleaf', readonly: false });
+      } catch {
+        // Best effort only; no native connection may be registered yet.
+      }
+      if (hasNativeSqliteResetPlugin()) {
+        await SqliteReset.deleteDatabase({ database: 'turnleaf' });
+      } else {
+        await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+      }
+    } catch (error) {
+      throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
+    }
+  });
 }
 
 async function migrate(db: SQLiteDBConnection): Promise<void> {
@@ -1333,7 +1374,7 @@ export async function salvageOpenReadingNotePreferences(): Promise<{
     const books = await getAllBookNoteMetadata();
     return { preferences, books };
   }
-  if (!connection) return null;
+  if (!connection || resetting) return null;
   try {
     const preferences = await queryPreferencesByPrefixOnConnection(
       connection,

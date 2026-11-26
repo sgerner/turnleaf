@@ -137,4 +137,66 @@ describe('native SQLite reset without opening corrupt database files', () => {
       'SqliteReset.deleteDatabase:turnleaf',
     ]);
   });
+
+  it('blocks concurrent openDatabase and writes until native deletion finishes', async () => {
+    const { openDatabase, resetLocalDatabase, saveServer } = await import('./database');
+    mocks.setOpenShouldFail(false);
+    await openDatabase();
+    mocks.events.length = 0;
+    mocks.sqlite.createConnection.mockClear();
+    mocks.sqlite.retrieveConnection.mockClear();
+    mocks.db.open.mockClear();
+
+    let finishUnlink!: () => void;
+    mocks.nativeUnlinkDatabase.mockImplementationOnce(
+      async ({ database }: { database?: string }) => {
+        mocks.events.push(`SqliteReset.deleteDatabase:start:${database ?? 'turnleaf'}`);
+        await new Promise<void>((resolve) => {
+          finishUnlink = resolve;
+        });
+        mocks.events.push(`SqliteReset.deleteDatabase:done:${database ?? 'turnleaf'}`);
+        return { deletedCount: 1 };
+      },
+    );
+
+    const resetPromise = resetLocalDatabase();
+    await vi.waitFor(() => {
+      expect(mocks.events).toContain('SqliteReset.deleteDatabase:start:turnleaf');
+    });
+
+    // Trigger concurrent openDatabase() and saveServer() while native unlink is in progress.
+    let concurrentOpenSettled = false;
+    const concurrentOpen = openDatabase().then((handle) => {
+      concurrentOpenSettled = true;
+      return handle;
+    });
+    const concurrentWrite = saveServer({
+      id: 'primary',
+      displayName: 'Home Kavita',
+      baseUrl: 'https://books.example.com',
+      credentialRef: 'turnleaf_api_key_primary',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-03-10T00:00:00.000Z',
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 15));
+
+    // No connection creation, retrieval, or db.open() may occur before native deletion completes.
+    expect(concurrentOpenSettled).toBe(false);
+    expect(mocks.sqlite.createConnection).not.toHaveBeenCalled();
+    expect(mocks.sqlite.retrieveConnection).not.toHaveBeenCalled();
+    expect(mocks.db.open).not.toHaveBeenCalled();
+
+    finishUnlink();
+    await Promise.all([resetPromise, concurrentOpen, concurrentWrite]);
+
+    expect(concurrentOpenSettled).toBe(true);
+    expect(mocks.events).toEqual([
+      'db.close',
+      'CapacitorSQLite.closeConnection',
+      'SqliteReset.deleteDatabase:start:turnleaf',
+      'SqliteReset.deleteDatabase:done:turnleaf',
+      'db.open',
+    ]);
+  });
 });

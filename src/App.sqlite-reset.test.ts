@@ -20,8 +20,12 @@ const mocks = vi.hoisted(() => {
         throw new Error('SQLiteDatabaseCorruptException: database disk image is malformed');
       }
     }),
-    query: vi.fn(async () => ({ values: [] as Record<string, unknown>[] })),
-    run: vi.fn(async () => ({ changes: { changes: 1 } })),
+    query: vi.fn(
+      async (_sql = '', _values?: unknown[]): Promise<{ values: Record<string, unknown>[] }> => ({
+        values: [],
+      }),
+    ),
+    run: vi.fn(async (_sql = '', _values?: unknown[]) => ({ changes: { changes: 1 } })),
   };
 
   const sqlite = {
@@ -53,6 +57,11 @@ const mocks = vi.hoisted(() => {
       dataFiles.set('books/primary-1-10.epub', 'PK\x03\x04offline-epub');
       dataFiles.set('turnleafSQLite.db', 'corrupt-sqlite-bytes');
       vi.clearAllMocks();
+      db.query.mockImplementation(async () => ({ values: [] }));
+      db.run.mockImplementation(async () => ({ changes: { changes: 1 } }));
+    },
+    setCorrupt(value: boolean) {
+      corrupt = value;
     },
     sqlite,
   };
@@ -142,6 +151,125 @@ describe('App.svelte repairLocalData on corrupt native SQLite', () => {
     expect(mocks.dataFiles.has('turnleafSQLite.db')).toBe(false);
     expect(mocks.dataFiles.get('books/primary-1-10.epub')).toBe('PK\x03\x04offline-epub');
     expect(document.body.textContent).not.toContain('Turnleaf could not open its local data');
+    expect(document.querySelector('#connection-error')).toBeTruthy();
+  });
+
+  it('preserves salvaged notes in memory with export, copy, and retry when post-reset setPreferences rejects', async () => {
+    const { openDatabase, resetLocalDatabase } = await import('./lib/database/database');
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    const writeText = vi.fn(async (_text: string) => undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    // Simulate an already-open native handle whose server_config table fails while
+    // reading-note preferences remain readable for salvage.
+    await resetLocalDatabase();
+    mocks.nativeUnlinkDatabase.mockClear();
+    mocks.setCorrupt(false);
+    mocks.dataFiles.set('turnleafSQLite.db', 'partially-corrupt-sqlite');
+
+    await openDatabase();
+
+    let failPreferencesWrite = true;
+    mocks.db.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('FROM server_config')) {
+        throw new Error('SQLiteCorruptException: malformed server_config page');
+      }
+      if (sql.includes('FROM preferences')) {
+        return {
+          values: [
+            {
+              key: 'readerBookmarks:primary:1:10',
+              value: JSON.stringify([
+                {
+                  id: 'epubcfi(/6/2!/4/2)|ch1.xhtml',
+                  cfi: 'epubcfi(/6/2!/4/2)',
+                  href: 'ch1.xhtml',
+                  percentage: 0.42,
+                  label: 'Salvaged chapter bookmark',
+                  savedAt: '2026-03-10T00:00:00.000Z',
+                },
+              ]),
+            },
+            {
+              key: 'readerNoteMeta:primary:1:10',
+              value: JSON.stringify({
+                title: 'Left Hand of Darkness',
+                author: 'Ursula K. Le Guin',
+              }),
+            },
+          ],
+        };
+      }
+      if (sql.includes('FROM books')) {
+        return {
+          values: [
+            {
+              id: 'primary:1:10',
+              title: 'Left Hand of Darkness',
+              author: 'Ursula K. Le Guin',
+              series: null,
+            },
+          ],
+        };
+      }
+      return { values: [] };
+    });
+    mocks.db.run.mockImplementation(async (sql: string) => {
+      if (failPreferencesWrite && sql.includes('INSERT INTO preferences')) {
+        throw new Error('SQLiteFullException: disk full while restoring preferences');
+      }
+      return { changes: { changes: 1 } };
+    });
+
+    mounted = mount(App, { target: document.body });
+    await settle();
+
+    const resetButton = [...document.querySelectorAll('button')].find((btn) =>
+      btn.textContent?.includes('Reset local data'),
+    );
+    expect(resetButton).toBeTruthy();
+
+    resetButton!.click();
+    await settle();
+
+    // Reset ran once, setPreferences failed, explicit warning is shown, and notes remain exportable.
+    expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledTimes(1);
+    const alert = document.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain(
+      'Local data was reset, but Turnleaf could not restore your saved bookmarks and notes.',
+    );
+
+    const copyJsonButton = [...document.querySelectorAll('button')].find((btn) =>
+      btn.textContent?.includes('Copy JSON'),
+    );
+    expect(copyJsonButton).toBeTruthy();
+    copyJsonButton!.click();
+    await settle();
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const exportedJson = String(writeText.mock.calls[0]?.[0] ?? '');
+    expect(exportedJson).toContain('Salvaged chapter bookmark');
+    expect(exportedJson).toContain('Left Hand of Darkness');
+
+    // Once storage write succeeds, Retry persists the salvaged notes without re-deleting the DB.
+    failPreferencesWrite = false;
+    mocks.db.query.mockImplementation(async () => ({ values: [] }));
+    const retryButton = [...document.querySelectorAll('button')].find(
+      (btn) => btn.textContent?.trim() === 'Retry',
+    );
+    expect(retryButton).toBeTruthy();
+    retryButton!.click();
+    await settle();
+
+    expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledTimes(1);
+    expect(mocks.db.run).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO preferences'),
+      expect.arrayContaining(['readerBookmarks:primary:1:10']),
+    );
     expect(document.querySelector('#connection-error')).toBeTruthy();
   });
 });
