@@ -12,7 +12,7 @@ export interface StoredReturnLocation {
   href: string;
 }
 
-const MAX_BOOKMARKS = 100;
+export const MAX_BOOKMARKS = 100;
 const MAX_HISTORY = 12;
 export const MAX_RETURN_STACK = 12;
 
@@ -34,19 +34,20 @@ function validLocation(value: unknown): value is StoredReaderLocation {
   );
 }
 
-function parseLocations(value: string | null, limit: number): StoredReaderLocation[] {
+function parseLocations(value: string | null, limit?: number): StoredReaderLocation[] {
   if (!value) return [];
   try {
     const parsed: unknown = JSON.parse(value);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(validLocation).slice(0, limit);
+    const locations = parsed.filter(validLocation);
+    return limit === undefined ? locations : locations.slice(0, limit);
   } catch {
     return [];
   }
 }
 
 export function parseBookmarks(value: string | null): StoredReaderLocation[] {
-  return parseLocations(value, MAX_BOOKMARKS);
+  return parseLocations(value);
 }
 
 export function parseLocationHistory(value: string | null): StoredReaderLocation[] {
@@ -79,7 +80,8 @@ export function toggleBookmark(
   const id = `${current.cfi}|${current.href}`;
   const existing = bookmarks.findIndex((bookmark) => bookmark.id === id);
   if (existing >= 0) return bookmarks.filter((_, index) => index !== existing);
-  return [bookmarkLocation(current, savedAt), ...bookmarks].slice(0, MAX_BOOKMARKS);
+  if (bookmarks.length >= MAX_BOOKMARKS) return [...bookmarks];
+  return [bookmarkLocation(current, savedAt), ...bookmarks];
 }
 
 export function renameBookmark(

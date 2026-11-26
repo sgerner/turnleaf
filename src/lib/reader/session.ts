@@ -6,6 +6,15 @@ import {
   type ReaderSearchResult,
 } from './search';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
+import {
+  createSpineHrefLookup,
+  matchSpineHref,
+  resolveDisplayHref,
+  resolveTocHref,
+  type TocItem,
+} from './toc';
+
+export type { TocItem } from './toc';
 
 export interface ReaderLocation {
   cfi: string;
@@ -45,12 +54,6 @@ export function resolveReaderKeyboardAction(
   if (event.key === 'ArrowLeft' || event.key === 'PageUp') return 'previous';
   if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') return 'next';
   return null;
-}
-
-export interface TocItem {
-  label: string;
-  href: string;
-  children: TocItem[];
 }
 
 interface SpineSection {
@@ -373,7 +376,11 @@ export class ReaderSession {
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private current: Location | null = null;
-  private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
+  private spine: {
+    sections: SpineSection[];
+    indexes: Map<string, number>;
+    hrefs: Map<string, string>;
+  } | null = null;
   private locationGeneration = 0;
   private userNavigationPending = false;
   private navigationSettled = false;
@@ -642,9 +649,12 @@ export class ReaderSession {
   ): void {
     if (!this.onLocation) return;
     const start = location.start;
-    const { sections, indexes } = this.getSpine();
+    const { sections, indexes, hrefs } = this.getSpine();
     const sectionCount = Math.max(1, sections.length);
-    const sectionIndex = indexes.get(start.href) ?? 0;
+    const matchedHref = indexes.has(start.href)
+      ? start.href
+      : (matchSpineHref(start.href, hrefs) ?? start.href);
+    const sectionIndex = indexes.get(matchedHref) ?? 0;
     const pageIndex = this.pageIndex(start.displayed.page);
     const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
     const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
@@ -674,14 +684,16 @@ export class ReaderSession {
   }
 
   tableOfContents(): TocItem[] {
+    const { hrefs } = this.getSpine();
+    const navPath = this.navigationBasePath();
     const mapItems = (items: EpubTocItem[]): TocItem[] =>
       items.map((item) => ({
         label: item.label,
-        href: item.href,
+        href: resolveTocHref(item.href, navPath, hrefs),
         children: mapItems(item.subitems ?? []),
       }));
 
-    return mapItems(this.book.navigation.toc);
+    return mapItems(this.book.navigation?.toc ?? []);
   }
 
   updateHighlights(annotations: Array<{ cfi: string }>): void {
@@ -825,7 +837,8 @@ export class ReaderSession {
 
   async display(href: string, origin: 'jump' | 'return' = 'jump'): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.display(href), origin);
+    const target = this.resolveDisplayTarget(href);
+    await this.navigate(() => this.rendition!.display(target), origin);
   }
 
   async displayCfi(cfi: string, origin: 'jump' | 'return' = 'jump'): Promise<boolean> {
@@ -1518,12 +1531,45 @@ export class ReaderSession {
     if (this.spine) return this.spine;
     const sections: SpineSection[] = [];
     const indexes = new Map<string, number>();
+    const spineHrefs: string[] = [];
     this.book.spine.each((section: SpineSection) => {
       if (!indexes.has(section.href)) indexes.set(section.href, sections.length);
       sections.push(section);
+      spineHrefs.push(section.href);
     });
-    this.spine = { sections, indexes };
+    const hrefs = createSpineHrefLookup(spineHrefs);
+    this.spine = { sections, indexes, hrefs };
     return this.spine;
+  }
+
+  private navigationBasePath(): string {
+    const packaging = (
+      this.book as typeof this.book & {
+        packaging?: { navPath?: string | false; ncxPath?: string | false };
+      }
+    ).packaging;
+    const navPath = typeof packaging?.navPath === 'string' ? packaging.navPath.trim() : '';
+    if (navPath) return navPath;
+    const ncxPath = typeof packaging?.ncxPath === 'string' ? packaging.ncxPath.trim() : '';
+    return ncxPath;
+  }
+
+  private resolveDisplayTarget(href: string): string {
+    const trimmed = href.trim();
+    if (!trimmed) return href;
+    if (trimmed.startsWith('#')) {
+      const spineById = (
+        this.book.spine as typeof this.book.spine & {
+          spineById?: Record<string, number | undefined>;
+        }
+      ).spineById;
+      if (spineById && spineById[trimmed.slice(1)] !== undefined) {
+        return trimmed;
+      }
+    }
+    const { hrefs } = this.getSpine();
+    const currentHref = this.current?.start.href ?? this.rendition?.location?.start.href ?? null;
+    return resolveDisplayHref(trimmed, this.navigationBasePath(), hrefs, currentHref);
   }
 
   private pageIndex(page: number): number {
