@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import type { BookRecord, ServerConfig } from './lib/database/database';
+import type * as SessionModule from './lib/reader/session';
 
 const {
   getServerMock,
@@ -104,14 +105,20 @@ vi.mock('@capacitor/app', () => ({
   },
 }));
 
-vi.mock('./lib/reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    open = openSessionMock;
-    tableOfContents = () => [];
-    updateHighlights = vi.fn();
-    destroy = destroySessionMock;
-  },
-}));
+vi.mock('./lib/reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      open = openSessionMock;
+      tableOfContents = () => [];
+      getVisiblePassages = () => [];
+      clearTextSelection = vi.fn();
+      updateHighlights = vi.fn();
+      destroy = destroySessionMock;
+    },
+  };
+});
 
 import App from './App.svelte';
 

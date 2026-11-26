@@ -2,6 +2,7 @@
 
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as SessionModule from '../reader/session';
 import type {
   ReaderLinkReturnTarget,
   ReaderLocation,
@@ -67,6 +68,8 @@ const mocks = vi.hoisted(() => {
     displayServerPercentage = (pct: number) => displayServerPercentageImpl(pct);
     applyAppearance = vi.fn();
     updateHighlights = vi.fn();
+    clearTextSelection = vi.fn();
+    getVisiblePassages = vi.fn<() => ReaderSelection[]>(() => []);
     tableOfContents = vi.fn<() => TocItem[]>(() => [
       { label: 'Chapter 1', href: 'ch1.xhtml', children: [] },
     ]);
@@ -91,9 +94,13 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: mocks.MockReaderSession,
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    ReaderSession: mocks.MockReaderSession,
+  };
+});
 
 vi.mock('../database/database', () => ({
   getPreferences: mocks.getPreferencesMock,
