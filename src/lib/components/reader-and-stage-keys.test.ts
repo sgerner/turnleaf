@@ -2,13 +2,17 @@
 
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as ReaderSessionModule from '../reader/session';
 
 const mocks = vi.hoisted(() => {
   let currentPlatform = 'ios';
   let nativePlatform = true;
   let capturedKeyboardHandler: ((event: KeyboardEvent) => void) | null = null;
+  let capturedSelectionHandler: ((selection: { cfi: string; text: string } | null) => void) | null =
+    null;
   const nextSpy = vi.fn(async () => undefined);
   const previousSpy = vi.fn(async () => undefined);
+  const clearTextSelectionSpy = vi.fn();
   const setVolumeButtonsSpy = vi.fn(async () => undefined);
   const setReaderChromeSpy = vi.fn(async () => undefined);
   const setKeepAwakeSpy = vi.fn(async () => undefined);
@@ -24,8 +28,15 @@ const mocks = vi.hoisted(() => {
     setKeyboardHandler: (handler: ((event: KeyboardEvent) => void) | null) => {
       capturedKeyboardHandler = handler;
     },
+    getSelectionHandler: () => capturedSelectionHandler,
+    setSelectionHandler: (
+      handler: ((selection: { cfi: string; text: string } | null) => void) | null,
+    ) => {
+      capturedSelectionHandler = handler;
+    },
     nextSpy,
     previousSpy,
+    clearTextSelectionSpy,
     setVolumeButtonsSpy,
     setReaderChromeSpy,
     setKeepAwakeSpy,
@@ -157,74 +168,86 @@ vi.mock('../downloads/native-download', () => ({
   verifyDownloadedEpub: vi.fn(),
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    async open(
-      target: HTMLElement,
-      _cfi: string | null,
-      _xpath: string | null,
-      _percentage: number | null,
-      _appearance: unknown,
-      onLocation: (loc: {
-        cfi: string;
-        xpath: string | null;
-        href: string;
-        percentage: number;
-        spineIndex: number;
-        pageIndex: number;
-        pageCount: number;
-      }) => void,
-      _onTap: unknown,
-      _onSelection?: unknown,
-      onKeyboardNavigation?: (event: KeyboardEvent) => void,
-    ): Promise<void> {
-      mocks.setKeyboardHandler(onKeyboardNavigation ?? null);
-      const iframe = document.createElement('iframe');
-      target.append(iframe);
-      if (onKeyboardNavigation && iframe.contentDocument) {
-        iframe.contentDocument.addEventListener('keydown', onKeyboardNavigation, {
-          passive: false,
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof ReaderSessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      async open(
+        target: HTMLElement,
+        _cfi: string | null,
+        _xpath: string | null,
+        _percentage: number | null,
+        _appearance: unknown,
+        onLocation: (loc: {
+          cfi: string;
+          xpath: string | null;
+          href: string;
+          percentage: number;
+          spineIndex: number;
+          pageIndex: number;
+          pageCount: number;
+        }) => void,
+        _onTap: unknown,
+        onSelection?: (selection: { cfi: string; text: string } | null) => void,
+        onKeyboardNavigation?: (event: KeyboardEvent) => void,
+      ): Promise<void> {
+        mocks.setKeyboardHandler(onKeyboardNavigation ?? null);
+        mocks.setSelectionHandler(onSelection ?? null);
+        const iframe = document.createElement('iframe');
+        target.append(iframe);
+        if (onKeyboardNavigation && iframe.contentDocument) {
+          iframe.contentDocument.addEventListener('keydown', onKeyboardNavigation, {
+            passive: false,
+          });
+        }
+        onLocation({
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          xpath: '/body/div[1]/p[1]',
+          href: 'chapter-1.xhtml',
+          percentage: 0.25,
+          spineIndex: 0,
+          pageIndex: 1,
+          pageCount: 10,
         });
       }
-      onLocation({
-        cfi: 'epubcfi(/6/2!/4/2/1:0)',
-        xpath: '/body/div[1]/p[1]',
-        href: 'chapter-1.xhtml',
-        percentage: 0.25,
-        spineIndex: 0,
-        pageIndex: 1,
-        pageCount: 10,
-      });
-    }
-    async next(): Promise<void> {
-      await mocks.nextSpy();
-    }
-    async previous(): Promise<void> {
-      await mocks.previousSpy();
-    }
-    tableOfContents() {
-      return [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
-    }
-    updateHighlights(): void {}
-    applyAppearance(): void {}
-    async search() {
-      return [];
-    }
-    async display(): Promise<void> {}
-    async displayCfi(): Promise<boolean> {
-      return true;
-    }
-    async displayServerLocation(): Promise<boolean> {
-      return true;
-    }
-    async displayServerPercentage(): Promise<boolean> {
-      return true;
-    }
-    destroy(): void {
-      mocks.setKeyboardHandler(null);
-    }
-  },
-}));
+      async next(): Promise<void> {
+        await mocks.nextSpy();
+      }
+      async previous(): Promise<void> {
+        await mocks.previousSpy();
+      }
+      tableOfContents() {
+        return [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
+      }
+      getVisiblePassages() {
+        return [];
+      }
+      clearTextSelection(): void {
+        mocks.clearTextSelectionSpy();
+      }
+      updateHighlights(): void {}
+      applyAppearance(): void {}
+      async search() {
+        return [];
+      }
+      async display(): Promise<void> {}
+      async displayCfi(): Promise<boolean> {
+        return true;
+      }
+      async displayServerLocation(): Promise<boolean> {
+        return true;
+      }
+      async displayServerPercentage(): Promise<boolean> {
+        return true;
+      }
+      destroy(): void {
+        mocks.setKeyboardHandler(null);
+        mocks.setSelectionHandler(null);
+      }
+    },
+  };
+});
 
 import App from '../../App.svelte';
 import Reader from './Reader.svelte';
@@ -388,6 +411,7 @@ describe('Reader and .app-stage keyboard and hardware button behavior', () => {
     expect(helpText).toContain('Up');
     expect(helpText).toContain('Down');
     expect(helpText).toContain('Shift+Space');
+    expect(helpText).toContain('clear selected text');
 
     // Window keydown turns one page with defaultPrevented = true
     for (const [key, shiftKey, spy] of [
@@ -429,6 +453,55 @@ describe('Reader and .app-stage keyboard and hardware button behavior', () => {
       expect(event.defaultPrevented).toBe(true);
       expect(spy).toHaveBeenCalledOnce();
     }
+
+    // Shift+Arrow in EPUB iframe is left alone for text selection, and Escape clears active selection
+    mocks.nextSpy.mockClear();
+    mocks.previousSpy.mockClear();
+    for (const key of ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) {
+      const shiftArrow = new KeyboardEvent('keydown', {
+        key,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+        view: iframe.contentWindow,
+      });
+      iframe.contentDocument!.body.dispatchEvent(shiftArrow);
+      expect(shiftArrow.defaultPrevented).toBe(false);
+    }
+    expect(mocks.nextSpy).not.toHaveBeenCalled();
+    expect(mocks.previousSpy).not.toHaveBeenCalled();
+
+    // Focused link inside EPUB iframe suppresses page-turn keys
+    const epubLink = iframe.contentDocument!.createElement('a');
+    epubLink.href = '#footnote';
+    epubLink.textContent = 'Footnote 1';
+    iframe.contentDocument!.body.append(epubLink);
+    epubLink.focus();
+    const keyOnLink = new KeyboardEvent('keydown', {
+      key: 'ArrowDown',
+      bubbles: true,
+      cancelable: true,
+      view: iframe.contentWindow,
+    });
+    epubLink.dispatchEvent(keyOnLink);
+    expect(keyOnLink.defaultPrevented).toBe(false);
+    expect(mocks.nextSpy).not.toHaveBeenCalled();
+    epubLink.remove();
+
+    mocks.getSelectionHandler()?.({ cfi: 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:5)', text: 'Hello' });
+    await flushAll();
+    expect(host.querySelector('[aria-label="Selected text"]')).not.toBeNull();
+    mocks.clearTextSelectionSpy.mockClear();
+    const escapeSelection = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(escapeSelection);
+    await flushAll();
+    expect(escapeSelection.defaultPrevented).toBe(true);
+    expect(mocks.clearTextSelectionSpy).toHaveBeenCalledOnce();
+    expect(host.querySelector('[aria-label="Selected text"]')).toBeNull();
 
     // Hardware page button turns pages even when appearance.volumeButtons is false
     mocks.nextSpy.mockClear();
