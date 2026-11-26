@@ -5,7 +5,6 @@ import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import type { BookRecord, ServerConfig } from './lib/database/database';
-import type * as SessionModule from './lib/reader/session';
 
 const {
   getServerMock,
@@ -105,20 +104,17 @@ vi.mock('@capacitor/app', () => ({
   },
 }));
 
-vi.mock('./lib/reader/session', async (importOriginal) => {
-  const actual = await importOriginal<typeof SessionModule>();
-  return {
-    ...actual,
-    ReaderSession: class MockReaderSession {
-      open = openSessionMock;
-      tableOfContents = () => [];
-      getVisiblePassages = () => [];
-      clearTextSelection = vi.fn();
-      updateHighlights = vi.fn();
-      destroy = destroySessionMock;
-    },
-  };
-});
+vi.mock('./lib/reader/session', () => ({
+  resolveReaderKeyboardAction: vi.fn(() => null),
+  ReaderSession: class MockReaderSession {
+    open = openSessionMock;
+    tableOfContents = () => [];
+    getVisiblePassages = () => [];
+    clearTextSelection = vi.fn();
+    updateHighlights = vi.fn();
+    destroy = destroySessionMock;
+  },
+}));
 
 import App from './App.svelte';
 
@@ -241,10 +237,15 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
   it('mounts static .app-ambient in the library and unmounts it while Reader.svelte is open', async () => {
     mounted = mount(App, { target });
 
+    const findContinueButton = () =>
+      [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+        (btn) =>
+          btn.textContent?.includes('Continue reading') &&
+          btn.textContent?.includes('Static Glows Handbook'),
+      ) ?? null;
+
     await vi.waitFor(() => {
-      expect(
-        target.querySelector('button[aria-label^="Continue reading Static Glows Handbook"]'),
-      ).not.toBeNull();
+      expect(findContinueButton()).not.toBeNull();
     });
 
     const ambient = target.querySelector('.app-ambient');
@@ -253,9 +254,7 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     expect(ambient?.querySelector('.vignette')).not.toBeNull();
     expect(ambient?.querySelector('.mesh')).toBeNull();
 
-    const continueButton = target.querySelector<HTMLButtonElement>(
-      'button[aria-label^="Continue reading Static Glows Handbook"]',
-    );
+    const continueButton = findContinueButton();
     continueButton?.click();
 
     await vi.waitFor(() => {
