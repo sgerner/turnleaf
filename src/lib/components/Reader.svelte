@@ -1571,6 +1571,16 @@
             <input
               class="checkbox"
               type="checkbox"
+              checked={appearance.publisherStyles}
+              onchange={(event) =>
+                updateAppearance({ publisherStyles: event.currentTarget.checked })}
+            />
+            Respect publisher formatting
+          </label>
+          <label class="mt-4 flex min-h-12 items-center gap-3">
+            <input
+              class="checkbox"
+              type="checkbox"
               checked={appearance.hyphenation}
               onchange={(event) => updateAppearance({ hyphenation: event.currentTarget.checked })}
             />
