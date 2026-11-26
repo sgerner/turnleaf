@@ -109,28 +109,29 @@ describe('normalizeSeriesPage', () => {
   });
 
   it('filters known non-EPUB formats before validating their other fields', () => {
+    clearDiagnostics();
     const normalized = normalizeSeriesPage([
       { id: 'malformed-image', format: 0, files: 'not used' },
       { id: 'malformed-archive', format: 1, libraryId: null },
+      { id: 'malformed-unknown', format: 2, libraryId: null },
       { id: 'malformed-pdf', format: 4, libraryId: null },
       series({ id: '3', format: 3 }),
     ]);
 
     expect(normalized).toHaveLength(1);
     expect(normalized[0]!.id).toBe(3);
+    expect(getDiagnosticCount()).toBe(0);
   });
 
-  it('keeps unknown formats as candidates and defaults missing or malformed format to -1', () => {
+  it('keeps unrecognized formats as candidates and defaults missing or malformed format to -1', () => {
     const normalized = normalizeSeriesPage([
       series({ id: 11, format: undefined }),
-      series({ id: 12, format: 2 }),
       series({ id: 13, format: 'future-format' }),
       series({ id: 14, format: 88 }),
     ]);
 
     expect(normalized.map(({ id, format }) => [id, format])).toEqual([
       [11, -1],
-      [12, -1],
       [13, -1],
       [14, -1],
     ]);
@@ -269,7 +270,12 @@ describe('normalizeSeriesDetail', () => {
 
   it('skips known non-EPUB chapters before validating their metadata or files', () => {
     const normalized = normalizeSeriesDetail(
-      detail({ chapters: [{ format: 1, id: 'bad', files: 'malformed' }] }),
+      detail({
+        chapters: [
+          { format: 1, id: 'bad', files: 'malformed' },
+          { format: 2, id: 'unknown-non-epub', files: [{ id: 9, format: 2, extension: '.bin' }] },
+        ],
+      }),
     );
 
     expect(normalized.chapters).toEqual([]);
