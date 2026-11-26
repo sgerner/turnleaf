@@ -114,13 +114,37 @@ jobs:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
-      - name: Enable emulator hardware acceleration for manual journey
-        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
+      - name: Enable emulator hardware acceleration
+        if: steps.release_preflight.outputs.already_released != 'true'
         run: |
           if [ -c /dev/kvm ]; then
             sudo chgrp "$(id -gn)" /dev/kvm
             sudo chmod g+rw /dev/kvm
           fi
+
+      - name: Cache Android AVD snapshot
+        if: steps.release_preflight.outputs.already_released != 'true'
+        id: avd-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ runner.os }}-api-36-google_apis-x86_64-pixel_6-v1
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.release_preflight.outputs.already_released != 'true' && steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
 
       - name: Verify manually dispatched revision with reading journey
         if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
@@ -130,8 +154,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
-          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:journey
@@ -153,48 +177,42 @@ jobs:
         if: steps.release_preflight.outputs.already_released != 'true'
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -eu
+          umask 077
           if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
             echo "Missing ANDROID_KEYSTORE_BASE64 secret" >&2
             exit 1
           fi
-          if [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
-            echo "Missing ANDROID_KEYSTORE_PASSWORD secret" >&2
+          KEYSTORE_PATH="$RUNNER_TEMP/turnleaf-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode --ignore-garbage > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          if [ ! -s "$KEYSTORE_PATH" ]; then
+            echo "Decoded keystore at $KEYSTORE_PATH is empty" >&2
             exit 1
           fi
-          if [ -z "${ANDROID_KEY_ALIAS:-}" ]; then
-            echo "Missing ANDROID_KEY_ALIAS secret" >&2
-            exit 1
-          fi
-          if [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
-            echo "Missing ANDROID_KEY_PASSWORD secret" >&2
-            exit 1
-          fi
-          base64 --decode <<<"$ANDROID_KEYSTORE_BASE64" > android/turnleaf-release.jks
-          cat > android/keystore.properties <<EOF
-          TURNLEAF_STORE_FILE=turnleaf-release.jks
-          TURNLEAF_STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD
-          TURNLEAF_KEY_ALIAS=$ANDROID_KEY_ALIAS
-          TURNLEAF_KEY_PASSWORD=$ANDROID_KEY_PASSWORD
-          EOF
 
       - name: Build signed release APK
         if: steps.release_preflight.outputs.already_released != 'true'
         env:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
-        run: npm run android:release
+          TURNLEAF_STORE_FILE: ${{ runner.temp }}/turnleaf-release.jks
+          TURNLEAF_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          TURNLEAF_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          TURNLEAF_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: npm run android:release -- --no-daemon
 
-      - name: Enable emulator hardware acceleration for signed APK smoke test
-        if: steps.release_preflight.outputs.already_released != 'true'
+      - name: Clean up signing files
+        if: always()
         run: |
-          if [ -c /dev/kvm ]; then
-            sudo chgrp "$(id -gn)" /dev/kvm
-            sudo chmod g+rw /dev/kvm
-          fi
+          set -eu
+          for signing_file in "$RUNNER_TEMP/turnleaf-release.jks" "android/turnleaf-release.jks" "android/keystore.properties"; do
+            if [ -f "$signing_file" ]; then
+              shred -u "$signing_file" || rm -f "$signing_file"
+            else
+              rm -f "$signing_file"
+            fi
+          done
 
       - name: Smoke-test signed release APK
         if: steps.release_preflight.outputs.already_released != 'true'
@@ -207,8 +225,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
-          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:smoke
