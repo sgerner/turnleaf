@@ -31,7 +31,7 @@
   let uiMode = $state<'light' | 'dark'>(defaultMode);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let readerOpen = $state(false);
-  let modalOpen = $state(false);
+  let stageOverlayActive = $state(false);
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -39,7 +39,7 @@
     server = null;
     apiKey = null;
     readerOpen = false;
-    modalOpen = false;
+    stageOverlayActive = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -114,56 +114,52 @@
     </div>
   {/if}
 
-  <div class="app-stage">
-    {#if releaseBanner}
+  {#if releaseBanner}
+    <div class="release-banner" inert={readerOpen || stageOverlayActive} transition:fade>
       <div
-        class="release-banner sticky top-0 z-20 mx-auto w-full max-w-4xl"
-        inert={readerOpen || modalOpen}
-        transition:fade
+        class="mx-auto flex w-full max-w-4xl flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
       >
-        <div
-          class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
-        >
-          <div class="min-w-0">
-            <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
-            <p class="mt-1 font-medium text-surface-950-50">
-              Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
-                ? ` · ${releaseBanner.title}`
-                : ''}
-            </p>
-            <p class="text-sm text-surface-700-300">A newer GitHub release was found at startup.</p>
-          </div>
-          <div class="flex flex-wrap items-center gap-2">
-            {#if releaseBanner.downloadUrl}
-              <a
-                class="btn btn-sm preset-filled-success-500 !text-sm"
-                href={releaseBanner.downloadUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Download APK <span class="sr-only">(opens in a new tab)</span>
-              </a>
-            {/if}
+        <div class="min-w-0">
+          <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
+          <p class="mt-1 font-medium text-surface-950-50">
+            Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
+              ? ` · ${releaseBanner.title}`
+              : ''}
+          </p>
+          <p class="text-sm text-surface-700-300">A newer GitHub release was found at startup.</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          {#if releaseBanner.downloadUrl}
             <a
-              class="btn btn-sm preset-filled-tertiary-500 !text-sm"
-              href={releaseBanner.releaseUrl}
+              class="btn btn-sm preset-filled-success-500 !text-sm"
+              href={releaseBanner.downloadUrl}
               target="_blank"
               rel="noreferrer"
             >
-              Release notes <span class="sr-only">(opens in a new tab)</span>
+              Download APK <span class="sr-only">(opens in a new tab)</span>
             </a>
-            <button
-              class="btn btn-sm preset-tonal-error !text-sm"
-              type="button"
-              onclick={() => (releaseBanner = null)}
-            >
-              Dismiss
-            </button>
-          </div>
+          {/if}
+          <a
+            class="btn btn-sm preset-filled-tertiary-500 !text-sm"
+            href={releaseBanner.releaseUrl}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Release notes <span class="sr-only">(opens in a new tab)</span>
+          </a>
+          <button
+            class="btn btn-sm preset-tonal-error !text-sm"
+            type="button"
+            onclick={() => (releaseBanner = null)}
+          >
+            Dismiss
+          </button>
         </div>
       </div>
-    {/if}
+    </div>
+  {/if}
 
+  <div class="app-stage">
     {#if booting}
       <main class="boot-stage grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
@@ -181,15 +177,15 @@
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
         onReaderOpenChange={(open) => (readerOpen = open)}
-        onModalOpenChange={(open) => (modalOpen = open)}
+        onOverlayActiveChange={(active) => (stageOverlayActive = active)}
         onChangeServerAddress={() => {
           readerOpen = false;
-          modalOpen = false;
+          stageOverlayActive = false;
           changingServerAddress = true;
         }}
         onServerDeleted={() => {
           readerOpen = false;
-          modalOpen = false;
+          stageOverlayActive = false;
           server = null;
           apiKey = null;
         }}
@@ -255,6 +251,8 @@
   .app-shell {
     position: fixed;
     inset: 0;
+    display: flex;
+    flex-direction: column;
     isolation: isolate;
     overflow: hidden;
     background-color: color-mix(
@@ -378,16 +376,15 @@
     );
   }
 
-  .app-stage {
+  .release-banner {
     position: relative;
-    height: 100%;
-    overflow: auto;
+    flex: 0 0 auto;
+    min-height: 0;
+    max-height: 50%;
+    overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
-    z-index: 1;
-  }
-
-  .release-banner {
+    scroll-padding-block: 8px;
     padding-top: max(
       1rem,
       calc(
@@ -403,6 +400,19 @@
       1rem,
       var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
     );
+    padding-bottom: 0.5rem;
+    z-index: 1;
+  }
+
+  .app-stage {
+    position: relative;
+    flex: 1 1 0%;
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scroll-padding-block: 8px;
+    z-index: 1;
   }
 
   .boot-stage {
