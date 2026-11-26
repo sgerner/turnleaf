@@ -65,6 +65,7 @@ import {
   resetLocalDatabase,
   saveLocalProgress,
   saveServer,
+  setPreference,
   type BookRecord,
   type ServerConfig,
 } from '../database/database';
@@ -396,5 +397,72 @@ describe('Library destructive action confirmations', () => {
 
     expect(mockRemoveApiKey).toHaveBeenCalledWith(server.credentialRef);
     expect(onServerDeleted).toHaveBeenCalledOnce();
+  });
+
+  it('coordinates persisted library filter preferences with Mark as read and Remove download focus behavior', async () => {
+    await setPreference('libraryHideCompleted', 'false');
+    await setPreference('libraryDownloadedOnly', 'true');
+
+    mounted = mount(Library, {
+      target: host,
+      props: {
+        server,
+        apiKey: 'secret-key',
+        theme: 'fennec',
+        mode: 'dark',
+        onThemeChange: vi.fn(),
+        onModeChange: vi.fn(),
+        onApiKeyChange: vi.fn(),
+        onServerDeleted: vi.fn(),
+        onChangeServerAddress: vi.fn(),
+      },
+    });
+    await flushUi();
+
+    const menuTrigger = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Book actions for The Left Hand of Darkness"]',
+    )!;
+    menuTrigger.focus();
+    menuTrigger.click();
+    await flushUi();
+
+    const markReadButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Mark as read',
+    )!;
+    markReadButton.click();
+    await flushUi();
+
+    const dialog = host.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.textContent).not.toContain('Hide completed is active');
+
+    const confirmMarkRead = Array.from(dialog!.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Mark as read',
+    )!;
+    confirmMarkRead.click();
+    await flushUi();
+
+    // Card stays visible when persisted libraryHideCompleted is false, restoring focus to its menu trigger
+    const remainingTrigger = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Book actions for The Left Hand of Darkness"]',
+    );
+    expect(remainingTrigger).not.toBeNull();
+    expect(document.activeElement).toBe(remainingTrigger);
+
+    // Removing a server-available download while persisted libraryDownloadedOnly is true runs immediately and focuses #library-results
+    remainingTrigger!.click();
+    await flushUi();
+    const removeButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Remove download',
+    )!;
+    removeButton.click();
+    await flushUi();
+
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(mockDeleteDownloadedEpub).toHaveBeenCalledWith(activeBook.downloadPath);
+    expect(
+      host.querySelector('[aria-label="Book actions for The Left Hand of Darkness"]'),
+    ).toBeNull();
+    expect(document.activeElement?.id).toBe('library-results');
   });
 });

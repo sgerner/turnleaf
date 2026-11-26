@@ -341,11 +341,17 @@ describe('Reader destructive action confirmations', () => {
 
   it('uses ConfirmDialog when manual sync finds a divergent Kavita reading position', async () => {
     const accept = vi.fn(async () => {});
-    const onSyncLatest = vi.fn(async () => ({
-      xpath: '/body/div/p[9]',
-      percentage: 0.8,
-      accept,
-    }));
+    const onSyncLatest = vi.fn(async () => {
+      // Real browsers blur a focused <button> as soon as disabled={syncingLatest} flips true
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+      return {
+        xpath: '/body/div/p[9]',
+        percentage: 0.8,
+        accept,
+      };
+    });
 
     mounted = mount(Reader, {
       target: host,
@@ -376,10 +382,24 @@ describe('Reader destructive action confirmations', () => {
     expect(document.activeElement).toBe(buttons[0]);
     expect(buttons[0]?.textContent?.trim()).toBe('Stay here');
 
-    buttons[1]!.click();
+    // Escape cancels sync confirmation, keeps controls visible, and restores focus to syncButton
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(accept).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(syncButton);
+
+    // Re-trigger sync and confirm moving to the synced location
+    syncButton.click();
+    await flushUi();
+    const confirmButtons = Array.from(
+      host.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button'),
+    );
+    confirmButtons[1]!.click();
     await flushUi();
     expect(accept).toHaveBeenCalledOnce();
     expect(mockDisplayServerLocation).toHaveBeenCalledWith('/body/div/p[9]');
+    expect(document.activeElement).toBe(syncButton);
   });
 
   it('preserves shared panel headers, Escape selection clearing, and passage-highlight confirmation flows together', async () => {

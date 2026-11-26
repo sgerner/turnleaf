@@ -542,12 +542,16 @@
     resumeChromeHide();
   }
 
-  function openSyncConfirmation(progress: SyncedLocation): void {
+  function openSyncConfirmation(
+    progress: SyncedLocation,
+    opener: HTMLElement | null = activeElement(),
+  ): void {
+    controlsVisible = true;
     pauseChromeHide();
     readerConfirm = {
       kind: 'sync',
       progress,
-      opener: activeElement(),
+      opener,
     };
   }
 
@@ -999,6 +1003,7 @@
     if (!session || !onSyncLatest || syncingLatest) return;
     if (!showFeedback && (initialCfi || localNavigationDuringSession)) return;
     const reader = session;
+    const opener = showFeedback ? activeElement() : null;
     syncingLatest = true;
     readerSyncMessage = '';
     try {
@@ -1006,7 +1011,7 @@
       if (destroyed || session !== reader || (!showFeedback && localNavigationDuringSession))
         return;
       if (progress && showFeedback && hasDivergentSyncLocation(progress)) {
-        openSyncConfirmation(progress);
+        openSyncConfirmation(progress, opener);
         return;
       }
       if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
@@ -1050,6 +1055,7 @@
       event.preventDefault();
       if (readerConfirm) {
         cancelReaderConfirm();
+        if (!hasOpenReaderPanel()) showControls();
         return;
       }
       if (settingsVisible) closeSettings();
