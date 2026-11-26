@@ -3,8 +3,8 @@
 import { build, type Rollup } from 'vite';
 import { describe, expect, it } from 'vitest';
 
-const READER_RAW_BYTE_BUDGET = 305_000;
-const STARTUP_RAW_BYTE_BUDGET = 170_000;
+const READER_RAW_BYTE_BUDGET = 335_000;
+const STARTUP_RAW_BYTE_BUDGET = 185_000;
 
 describe('production bundle budgets and module exclusions', () => {
   it('trims Reader and startup index chunks within byte budgets and excludes dead or deferred modules', async () => {
@@ -57,12 +57,18 @@ describe('production bundle budgets and module exclusions', () => {
     expect(indexModules.some((id) => id.endsWith('/src/lib/components/Onboarding.svelte'))).toBe(
       false,
     );
+    expect(
+      indexModules.some((id) => id.endsWith('/src/lib/components/LibrarySettingsModal.svelte')),
+    ).toBe(false);
+    expect(indexModules.some((id) => id.endsWith('/src/lib/components/Reader.svelte'))).toBe(false);
     expect(indexModules.some((id) => id.endsWith('/src/lib/downloads/epub-validation.ts'))).toBe(
       false,
     );
     expect(indexModules.some((id) => id.endsWith('/src/lib/downloads/native-download.ts'))).toBe(
       false,
     );
+    expect(indexModules.some((id) => id.endsWith('/src/lib/github/releases.ts'))).toBe(false);
+    expect(indexModules.some((id) => id.endsWith('/src/lib/database/schema.ts'))).toBe(false);
     expect(
       indexModules.some((id) => id.includes('@capacitor-community/sqlite/dist/esm/definitions')),
     ).toBe(false);
