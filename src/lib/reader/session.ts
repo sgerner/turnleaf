@@ -542,8 +542,8 @@ export class ReaderSession {
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
     if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
       this.unloadedHookRegistered = true;
-      this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
-        if (view?.contents) this.cleanupContents(view.contents);
+      this.rendition.hooks.unloaded.register((view: EpubHighlightView | undefined) => {
+        this.disposeHighlightView(view);
       });
     }
     if (onSelection) {
@@ -788,6 +788,7 @@ export class ReaderSession {
   }
 
   clearTextSelection(): void {
+    this.cancelPendingSelections();
     for (const contents of this.getActiveContents()) {
       try {
         contents.window.getSelection()?.removeAllRanges();
@@ -1000,7 +1001,10 @@ export class ReaderSession {
     this.renditionResized = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
     this.appearance = null;
     this.highlightsBySection.clear();
     this.reflowPending = false;
@@ -1046,11 +1050,22 @@ export class ReaderSession {
       }
     };
 
-    const cancelPending = () => {
+    const cancelTimer = () => {
       if (timer !== null) {
         clearTimeout(timer);
         timer = null;
       }
+    };
+
+    const clearBlurGuard = () => {
+      clearTabTimer();
+      tabKeyActive = false;
+      blurredByTab = false;
+    };
+
+    const cancelPending = () => {
+      cancelTimer();
+      clearBlurGuard();
     };
 
     const shouldPreserveSelectionOnTabBlur = () => {
@@ -1082,7 +1097,7 @@ export class ReaderSession {
 
     const flushPending = () => {
       if (timer === null) return;
-      cancelPending();
+      cancelTimer();
       emitCurrentSelection();
     };
 
@@ -1096,9 +1111,8 @@ export class ReaderSession {
           tabKeyActive = false;
         }, 0);
       } else {
-        clearTabTimer();
-        tabKeyActive = false;
-        blurredByTab = false;
+        if (event.key === 'Escape') flushPending();
+        clearBlurGuard();
       }
     };
 
@@ -1110,24 +1124,18 @@ export class ReaderSession {
       if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
     };
 
-    const clearBlurGuard = () => {
-      clearTabTimer();
-      tabKeyActive = false;
-      blurredByTab = false;
-    };
-
     const onSelectionChange = () => {
       const selection = contents.window.getSelection();
       const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
       const text = hasRange ? normalizePassageText(selection!.toString()) : '';
       if (!hasRange || !text) {
-        cancelPending();
+        cancelTimer();
         if (shouldPreserveSelectionOnTabBlur()) return;
         onSelection(null);
         return;
       }
       blurredByTab = false;
-      cancelPending();
+      cancelTimer();
       timer = setTimeout(() => {
         timer = null;
         emitCurrentSelection();
@@ -1139,7 +1147,6 @@ export class ReaderSession {
       if (disposed) return;
       disposed = true;
       cancelPending();
-      clearTabTimer();
       doc.removeEventListener('keydown', handleKeydown, true);
       doc.removeEventListener('focusout', handleFocusOut);
       doc.removeEventListener('focusin', clearBlurGuard);

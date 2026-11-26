@@ -13,7 +13,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     { href: 'second.xhtml', index: 1 },
   ];
   const rendition = {
-    hooks: { content: { register: vi.fn() } },
+    hooks: { content: { register: vi.fn() }, unloaded: { register: vi.fn() } },
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
@@ -249,8 +249,27 @@ describe('ReaderSession', () => {
     vi.advanceTimersByTime(200);
     expect(cfiFromRange).not.toHaveBeenCalled();
 
-    // Pending timers and listeners are cleaned up on destroy.
+    // Link or page relocation cancels pending debounce and clears active selection immediately.
+    const relocated = getRenditionListener('relocated');
+    const click = getRenditionListener('click');
+    relocated(location('source-cfi'));
     selection.addRange(range);
+    vi.advanceTimersByTime(0);
+    cfiFromRange.mockClear();
+    onSelection.mockClear();
+    document.dispatchEvent(new Event('selectionchange'));
+    const internalLink = document.createElement('a');
+    internalLink.setAttribute('href', '#footnote');
+    click(
+      { target: internalLink, clientX: 100 },
+      { window: { getSelection: () => ({ isCollapsed: true }) } },
+    );
+    relocated(location('destination-cfi'));
+    expect(onSelection).toHaveBeenCalledExactlyOnceWith(null);
+    vi.advanceTimersByTime(200);
+    expect(cfiFromRange).not.toHaveBeenCalled();
+
+    // Pending timers and listeners are cleaned up on destroy.
     onSelection.mockClear();
     document.dispatchEvent(new Event('selectionchange'));
     session.destroy();
@@ -352,6 +371,19 @@ describe('ReaderSession', () => {
     doc.dispatchEvent(new Event('selectionchange'));
     vi.advanceTimersByTime(200);
     expect(onSelection).toHaveBeenCalledTimes(1);
+
+    // clearTextSelection resets the Tab-blur guard and cancels pending timers; Escape flushes before key handling.
+    session.clearTextSelection();
+    doc.dispatchEvent(new Event('selectionchange'));
+    expect(onSelection).toHaveBeenLastCalledWith(null);
+    onSelection.mockClear();
+    collapsed = false;
+    doc.dispatchEvent(new Event('selectionchange'));
+    doc.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    expect(onSelection).toHaveBeenCalledExactlyOnceWith({
+      cfi: 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:25)',
+      text: 'Selected with Shift+Arrow',
+    });
 
     session.destroy();
     viewport.remove();
@@ -660,7 +692,7 @@ describe('ReaderSession', () => {
     expect(onTap).toHaveBeenCalledExactlyOnceWith('next');
     expect(markBoundsSpy).not.toHaveBeenCalled();
 
-    // Single-page layout change realigns highlights via resizeCheck even without view reframe.
+    // Single-page layout change realigns highlights via resizeCheck even without view reframe, including publisherStyles toggles.
     pendingReflowRects = [new DOMRect(40, 112, 200, 30)];
     session.applyAppearance({ ...defaultAppearance, fontSize: 28, margin: 32 });
     expect(resizeCheck).toHaveBeenCalledTimes(2);
@@ -670,11 +702,31 @@ describe('ReaderSession', () => {
     expect(realignedRect?.getAttribute('width')).toBe('200');
     expect(realignedRect?.getAttribute('height')).toBe('30');
 
-    // Clearing highlights removes the SVG overlay; re-adding and removing view cleans up state.
+    pendingReflowRects = [new DOMRect(28, 96, 224, 28)];
+    session.applyAppearance({
+      ...defaultAppearance,
+      fontSize: 28,
+      margin: 32,
+      publisherStyles: false,
+    });
+    expect(resizeCheck).toHaveBeenCalledTimes(3);
+    const publisherOverrideRect = viewElement.querySelector('g.turnleaf-highlight rect');
+    expect(publisherOverrideRect?.getAttribute('x')).toBe('28');
+    expect(publisherOverrideRect?.getAttribute('y')).toBe('96');
+    expect(publisherOverrideRect?.getAttribute('width')).toBe('224');
+    expect(publisherOverrideRect?.getAttribute('height')).toBe('28');
+
+    // Clearing highlights removes the SVG overlay; re-adding and unloading/removing view cleans up state.
     session.updateHighlights([]);
     expect(viewElement.querySelector('svg')).toBeNull();
 
     session.updateHighlights([{ cfi: validCfi }]);
+    expect(viewElement.querySelector('svg')).not.toBeNull();
+    const unloaded = mockRendition.hooks.unloaded.register.mock.calls[0]?.[0];
+    unloaded?.(view);
+    expect(viewElement.querySelector('svg')).toBeNull();
+
+    rendered({ index: 0 }, view);
     expect(viewElement.querySelector('svg')).not.toBeNull();
     removed({ index: 0 }, view);
     expect(viewElement.querySelector('svg')).toBeNull();
