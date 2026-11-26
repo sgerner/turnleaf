@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as SessionModule from '../reader/session';
 
 const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
   () => ({
@@ -17,14 +18,20 @@ vi.mock('../database/database', () => ({
   setPreferences: setPreferencesMock,
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    open = openSessionMock;
-    tableOfContents = () => [];
-    updateHighlights = vi.fn();
-    destroy = destroySessionMock;
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      open = openSessionMock;
+      tableOfContents = () => [];
+      getVisiblePassages = () => [];
+      clearTextSelection = vi.fn();
+      updateHighlights = vi.fn();
+      destroy = destroySessionMock;
+    },
+  };
+});
 
 import Reader from './Reader.svelte';
 

@@ -2,30 +2,45 @@
 
 import { mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ReaderLocation } from '../reader/session';
+import type * as SessionModule from '../reader/session';
+import type { ReaderLocation, ReaderSelection } from '../reader/session';
 
-const { mockOpen, mockUpdateHighlights, mockDisplayServerLocation } = vi.hoisted(() => ({
+const {
+  mockOpen,
+  mockUpdateHighlights,
+  mockDisplayServerLocation,
+  mockGetVisiblePassages,
+  mockClearTextSelection,
+} = vi.hoisted(() => ({
   mockOpen: vi.fn(),
   mockUpdateHighlights: vi.fn(),
   mockDisplayServerLocation: vi.fn(async () => true),
+  mockGetVisiblePassages: vi.fn<() => ReaderSelection[]>(() => []),
+  mockClearTextSelection: vi.fn(),
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    open = mockOpen;
-    tableOfContents = () => [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
-    updateHighlights = mockUpdateHighlights;
-    applyAppearance = vi.fn();
-    display = vi.fn(async () => {});
-    displayCfi = vi.fn(async () => true);
-    displayServerLocation = mockDisplayServerLocation;
-    displayServerPercentage = vi.fn(async () => {});
-    next = vi.fn(async () => {});
-    previous = vi.fn(async () => {});
-    search = vi.fn(async () => []);
-    destroy = vi.fn();
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      open = mockOpen;
+      tableOfContents = () => [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
+      getVisiblePassages = mockGetVisiblePassages;
+      clearTextSelection = mockClearTextSelection;
+      updateHighlights = mockUpdateHighlights;
+      applyAppearance = vi.fn();
+      display = vi.fn(async () => {});
+      displayCfi = vi.fn(async () => true);
+      displayServerLocation = mockDisplayServerLocation;
+      displayServerPercentage = vi.fn(async () => {});
+      next = vi.fn(async () => {});
+      previous = vi.fn(async () => {});
+      search = vi.fn(async () => []);
+      destroy = vi.fn();
+    },
+  };
+});
 
 import { getPreferences, resetLocalDatabase, setPreferences } from '../database/database';
 import { addAnnotation } from '../reader/annotations';
@@ -91,6 +106,7 @@ describe('Reader destructive action confirmations', () => {
     vi.stubGlobal('localStorage', new MemoryStorage());
     await resetLocalDatabase();
     vi.clearAllMocks();
+    mockGetVisiblePassages.mockReturnValue([]);
     backHandler = null;
 
     mockOpen.mockImplementation(
@@ -364,5 +380,121 @@ describe('Reader destructive action confirmations', () => {
     await flushUi();
     expect(accept).toHaveBeenCalledOnce();
     expect(mockDisplayServerLocation).toHaveBeenCalledWith('/body/div/p[9]');
+  });
+
+  it('preserves shared panel headers, Escape selection clearing, and passage-highlight confirmation flows together', async () => {
+    let onSelectionCallback: ((selection: ReaderSelection | null) => void) | undefined;
+    mockGetVisiblePassages.mockReturnValue([
+      { cfi: 'epubcfi(/6/2!/4/8)', text: 'Visible keyboard passage on current page' },
+    ]);
+    mockOpen.mockImplementation(
+      async (
+        _viewport: HTMLElement,
+        _cfi: string | null,
+        _xpath: string | null,
+        _percentage: number | null,
+        _appearance: unknown,
+        onRelocated: (loc: ReaderLocation, origin: 'restore') => void,
+        _onTap: unknown,
+        onSelection?: (selection: ReaderSelection | null) => void,
+      ) => {
+        onSelectionCallback = onSelection;
+        onRelocated(currentLoc, 'restore');
+      },
+    );
+
+    mounted = mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'blob:book',
+        bookId,
+        title: 'Test Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await flushUi();
+
+    // Active EPUB text selection clears on Escape when no panel or confirmation dialog is open
+    onSelectionCallback?.({ cfi: 'epubcfi(/6/2!/4/4)', text: 'Selected inline sentence' });
+    await flushUi();
+    expect(host.querySelector('[role="group"][aria-label="Selected text"]')).not.toBeNull();
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await flushUi();
+    expect(mockClearTextSelection).toHaveBeenCalledOnce();
+    expect(host.querySelector('[role="group"][aria-label="Selected text"]')).toBeNull();
+
+    // Open Highlights and notes: verify shared readerPanelHeader + Passage on this page form
+    host.querySelector<HTMLButtonElement>('[aria-label="Show reading controls"]')!.click();
+    await flushUi();
+    host
+      .querySelector<HTMLButtonElement>('[aria-label="Notes: highlights and annotations"]')!
+      .click();
+    await flushUi();
+
+    const panel = host.querySelector<HTMLElement>('#reader-annotations')!;
+    expect(panel).not.toBeNull();
+    const closeHeaderButton = panel.firstElementChild as HTMLButtonElement | null;
+    expect(closeHeaderButton?.tagName).toBe('BUTTON');
+    expect(closeHeaderButton?.getAttribute('title')).toBe('Close');
+    expect(closeHeaderButton?.getAttribute('aria-label')).toBe('Close highlights and notes');
+    expect(closeHeaderButton?.nextElementSibling?.id).toBe('reader-annotations-title');
+
+    const passageSelect = panel.querySelector<HTMLSelectElement>(
+      'select[aria-label="Passage on this page"]',
+    );
+    expect(passageSelect).not.toBeNull();
+
+    const noteField = panel.querySelector<HTMLTextAreaElement>('textarea')!;
+    noteField.value = 'Keyboard passage note';
+    noteField.dispatchEvent(new Event('input', { bubbles: true }));
+    await flushUi();
+
+    panel
+      .querySelector<HTMLFormElement>('form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushUi();
+
+    expect(panel.textContent).toContain('Highlight and note saved.');
+
+    // Deleting the newly created passage highlight opens ConfirmDialog while keeping the panel inert
+    const deleteBtn = panel.querySelector<HTMLButtonElement>(
+      '[aria-label="Delete highlight Visible keyboard passage on current page"]',
+    )!;
+    deleteBtn.focus();
+    deleteBtn.click();
+    await flushUi();
+
+    expect(host.querySelector('[role="alertdialog"]')).not.toBeNull();
+    expect(panel.inert).toBe(true);
+
+    // Window-level Escape cancels ConfirmDialog first without closing Highlights and notes
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+    );
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(host.querySelector('#reader-annotations')).not.toBeNull();
+    expect(panel.inert).toBe(false);
+    expect(document.activeElement).toBe(deleteBtn);
+
+    // Confirming deletes the highlight, clears stale saved banner, announces deletion, and focuses fallback heading
+    deleteBtn.click();
+    await flushUi();
+    const confirmDelete = Array.from(
+      host.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button'),
+    ).find((button) => button.textContent?.trim() === 'Delete highlight')!;
+    confirmDelete.click();
+    await flushUi();
+
+    expect(panel.textContent).not.toContain('Highlight and note saved.');
+    const statuses = Array.from(host.querySelectorAll('[role="status"]')).map((node) =>
+      node.textContent?.trim(),
+    );
+    expect(statuses).toContain('Highlight and note deleted.');
+    expect((document.activeElement as HTMLElement | null)?.getAttribute('data-reader-focus')).toBe(
+      'annotations-heading',
+    );
   });
 });

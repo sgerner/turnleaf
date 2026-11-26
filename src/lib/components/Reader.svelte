@@ -20,6 +20,7 @@
   } from '../reader/appearance';
   import {
     ReaderSession,
+    resolveReaderKeyboardAction,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
@@ -141,6 +142,10 @@
   let exporting = $state(false);
   let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
+  let selectedTextGroup = $state<HTMLElement | null>(null);
+  let visiblePassages = $state<ReaderSelection[]>([]);
+  let selectedPassageIndex = $state(0);
+  let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
   let searchQuery = $state('');
@@ -221,7 +226,9 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
+        if (location?.cfi !== next.cfi) selectedText = null;
         location = next;
+        if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
         if (origin === 'link') {
           linkReturnTarget = returnTarget ?? null;
@@ -453,10 +460,26 @@
     resumeChromeHide();
   }
 
+  function refreshVisiblePassages(): void {
+    visiblePassages = session?.getVisiblePassages() ?? [];
+    selectedPassageIndex = 0;
+  }
+
+  function clipPassageOptionLabel(text: string, index: number): string {
+    const preview = text.length > 88 ? `${text.slice(0, 87).trimEnd()}…` : text;
+    return `Passage ${index + 1}: ${preview}`;
+  }
+
+  function restoreViewportFrameFocus(): void {
+    void tick().then(() => viewport?.querySelector<HTMLElement>('iframe')?.focus());
+  }
+
   function openAnnotations(): void {
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
+    refreshVisiblePassages();
+    annotationMessage = '';
     annotationsVisible = true;
     settingsVisible = false;
     tocVisible = false;
@@ -476,7 +499,10 @@
     annotationsVisible = false;
     editingAnnotationId = null;
     selectedText = null;
+    visiblePassages = [];
+    selectedPassageIndex = 0;
     annotationDraft = '';
+    annotationMessage = '';
     exportFallback = '';
     exportMessage = '';
     const opener = annotationsOpener;
@@ -707,12 +733,14 @@
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(): void {
-    if (!selectedText) return;
-    annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
+  function saveAnnotation(target: ReaderSelection | null = selectedText): void {
+    if (!target) return;
+    const hadNote = Boolean(annotationDraft.trim());
+    annotations = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
     session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
+    annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
@@ -733,6 +761,7 @@
   function deleteAnnotation(annotation: StoredAnnotation): void {
     pauseChromeHide();
     selectionMessage = '';
+    annotationMessage = '';
     readerConfirm = {
       kind: 'delete-annotation',
       annotation,
@@ -750,6 +779,7 @@
     readerConfirm = null;
     session?.updateHighlights(annotations);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    annotationMessage = '';
     selectionMessage = annotation.note ? 'Highlight and note deleted.' : 'Highlight deleted.';
     resumeChromeHide();
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
@@ -759,10 +789,16 @@
   async function copySelection(): Promise<void> {
     const selection = selectedText;
     if (!selection) return;
+    const restoreFrameFocus = Boolean(
+      selectedTextGroup &&
+      document.activeElement &&
+      selectedTextGroup.contains(document.activeElement),
+    );
     try {
       await navigator.clipboard.writeText(selection.text);
       selectedText = null;
       selectionMessage = 'Selected text copied.';
+      if (restoreFrameFocus) restoreViewportFrameFocus();
     } catch {
       selectionMessage = 'Turnleaf could not copy the selection.';
     }
@@ -1003,34 +1039,45 @@
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed || event.defaultPrevented) return;
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-    const target = event.target as Element | null;
-    if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
-      return;
-    }
-    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
-      event.preventDefault();
-      void turn('previous');
-      return;
-    }
-    if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
-      event.preventDefault();
-      void turn('next');
-      return;
-    }
-    if (event.key === 'Escape' && hasOpenReaderPanel()) {
+    if (
+      event.key === 'Escape' &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      hasOpenReaderPanel()
+    ) {
       event.preventDefault();
       if (readerConfirm) {
         cancelReaderConfirm();
         return;
       }
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
+      if (settingsVisible) closeSettings();
+      else if (tocVisible) closeToc();
+      else if (bookmarksVisible) closeBookmarks();
+      else if (annotationsVisible) closeAnnotations();
+      else if (searchVisible) closeSearch();
       showControls();
+      return;
     }
+    const action = resolveReaderKeyboardAction(event, {
+      hasOpenPanel: hasOpenReaderPanel(),
+      hasSelection: selectedText !== null,
+    });
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'clear-selection') {
+      const restoreFrameFocus = Boolean(
+        selectedTextGroup &&
+        document.activeElement &&
+        selectedTextGroup.contains(document.activeElement),
+      );
+      session?.clearTextSelection();
+      selectedText = null;
+      if (restoreFrameFocus) restoreViewportFrameFocus();
+      return;
+    }
+    void turn(action);
   }
 
   function handleBackButton(): boolean {
@@ -1092,6 +1139,50 @@
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport}></div>
 
+  <p class="sr-only" role="status">{selectionMessage}</p>
+  {#if selectedText && !hasOpenReaderPanel()}
+    <div
+      bind:this={selectedTextGroup}
+      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      role="group"
+      aria-label="Selected text"
+    >
+      <button
+        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => {
+          const restoreFrameFocus = Boolean(
+            selectedTextGroup &&
+            document.activeElement &&
+            selectedTextGroup.contains(document.activeElement),
+          );
+          saveAnnotation();
+          selectionMessage = 'Highlight saved.';
+          if (restoreFrameFocus) restoreViewportFrameFocus();
+        }}
+      >
+        Highlight
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={openAnnotations}
+      >
+        Add note
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => void copySelection()}
+      >
+        Copy text
+      </button>
+    </div>
+  {/if}
+
   <p class="sr-only" aria-live="polite" aria-atomic="true">
     {#if location}
       {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
@@ -1101,7 +1192,7 @@
 
   <p id="reader-keyboard-help" class="sr-only">
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
-    Press Escape to close an open reader panel.
+    Press Escape to close an open reader panel or clear selected text.
   </p>
 
   <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
@@ -1143,42 +1234,6 @@
     >
       {readerSyncMessage}
     </p>
-  {/if}
-  <p class="sr-only" role="status">{selectionMessage}</p>
-  {#if selectedText && !hasOpenReaderPanel()}
-    <div
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
-      role="group"
-      aria-label="Selected text"
-    >
-      <button
-        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => {
-          saveAnnotation();
-          selectionMessage = 'Highlight saved.';
-        }}
-      >
-        Highlight
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}
-      >
-        Add note
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => void copySelection()}
-      >
-        Copy text
-      </button>
-    </div>
   {/if}
 
   {#if appearance.progressBar}
@@ -1553,6 +1608,16 @@
             <input
               class="checkbox"
               type="checkbox"
+              checked={appearance.publisherStyles}
+              onchange={(event) =>
+                updateAppearance({ publisherStyles: event.currentTarget.checked })}
+            />
+            Respect publisher formatting
+          </label>
+          <label class="mt-4 flex min-h-12 items-center gap-3">
+            <input
+              class="checkbox"
+              type="checkbox"
               checked={appearance.hyphenation}
               onchange={(event) => updateAppearance({ hyphenation: event.currentTarget.checked })}
             />
@@ -1874,7 +1939,8 @@
             closeAnnotations,
           )}
           <p class="mt-2 text-sm text-surface-700-300">
-            Saved on this device. Select text in the book to add a highlight and an optional note.
+            Saved on this device. Choose a passage on this page or select text in the book to add a
+            highlight and an optional note.
           </p>
 
           {#if selectedText}
@@ -1906,7 +1972,49 @@
                 </button>
               </div>
             </form>
+          {:else if visiblePassages.length > 0}
+            {@const activePassage =
+              visiblePassages[selectedPassageIndex] ?? visiblePassages[0] ?? null}
+            <form
+              class="mt-4 rounded-lg preset-tonal-primary p-3"
+              onsubmit={(event) => {
+                event.preventDefault();
+                saveAnnotation(activePassage);
+              }}
+            >
+              <label class="label">
+                <span class="label-text">Passage on this page</span>
+                <select
+                  class="select"
+                  aria-label="Passage on this page"
+                  value={String(selectedPassageIndex)}
+                  onchange={(event) => {
+                    selectedPassageIndex = Number(event.currentTarget.value);
+                    annotationMessage = '';
+                  }}
+                >
+                  {#each visiblePassages as passage, index (`${passage.cfi}-${index}`)}
+                    <option value={String(index)}>
+                      {clipPassageOptionLabel(passage.text, index)}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+              {#if activePassage}
+                <p class="mt-2 line-clamp-4 text-sm italic">“{activePassage.text}”</p>
+              {/if}
+              <label class="label mt-3">
+                <span class="label-text">Note (optional)</span>
+                <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+              </label>
+              <div class="mt-3 flex gap-2">
+                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                  Save highlight
+                </button>
+              </div>
+            </form>
           {/if}
+          <p class="mt-2 text-sm text-surface-700-300" role="status">{annotationMessage}</p>
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3
