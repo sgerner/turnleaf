@@ -17,6 +17,10 @@ const primaryFileName = 'edition-1-primary.epub';
 const companionFileName = 'edition-2-companion.epub';
 const primaryTitle = `${title} (edition-1-primary)`;
 const companionTitle = `${title} (edition-2-companion)`;
+const primaryOpenLabel = `Open ${primaryTitle}, ${title}`;
+const primaryReadLabel = `${primaryOpenLabel}, downloaded for offline reading, 50% complete`;
+const companionOpenLabel = `Open ${companionTitle}, ${title}`;
+const companionReadLabel = `${companionOpenLabel}, downloaded for offline reading, 50% complete`;
 const key = 'turnleaf-ci-only';
 let deviceSerial;
 const adb = async (...args) =>
@@ -263,6 +267,10 @@ export async function startFixture() {
     key,
     primaryTitle,
     companionTitle,
+    primaryOpenLabel,
+    primaryReadLabel,
+    companionOpenLabel,
+    companionReadLabel,
     primaryByteSize: primaryEpub.length,
     companionByteSize: companionEpub.length,
     uploads,
@@ -343,11 +351,11 @@ async function run() {
     await web.evaluate(click('button[type=submit]'));
     await waitFor('both disambiguated EPUB books in catalog', () =>
       web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${primaryTitle}"]')) && Boolean(document.querySelector('[aria-label="Open ${companionTitle}"]'))`,
+        `Boolean(document.querySelector('[aria-label="${primaryOpenLabel}"]')) && Boolean(document.querySelector('[aria-label="${companionOpenLabel}"]'))`,
       ),
     );
     await waitFor('open primary catalog book', () =>
-      web.evaluate(click(`[aria-label="Open ${primaryTitle}"]`)),
+      web.evaluate(click(`[aria-label="${primaryOpenLabel}"]`)),
     );
     await waitFor('downloaded and unwrapped first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one chapter archive transfer.');
@@ -376,9 +384,7 @@ async function run() {
       return false;
     });
     await waitFor('saved offline progress', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${primaryTitle}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(`Boolean(document.querySelector('[aria-label="${primaryReadLabel}"]'))`),
     );
 
     const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
@@ -395,9 +401,7 @@ async function run() {
     );
     web = await connectWebView();
     await waitFor('offline catalog book', () =>
-      web.evaluate(
-        click(`[aria-label="Open ${primaryTitle}, downloaded for offline reading, 50% complete"]`),
-      ),
+      web.evaluate(click(`[aria-label="${primaryReadLabel}"]`)),
     );
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
     if (fixture.offlineRequests.length > 0) {
@@ -424,14 +428,12 @@ async function run() {
       return false;
     });
     await waitFor('saved passage after reconnect', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${primaryTitle}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(`Boolean(document.querySelector('[aria-label="${primaryReadLabel}"]'))`),
     );
 
     const uploadsBeforeCompanion = fixture.uploads.length;
     await waitFor('open secondary companion EPUB', () =>
-      web.evaluate(click(`[aria-label="Open ${companionTitle}"]`)),
+      web.evaluate(click(`[aria-label="${companionOpenLabel}"]`)),
     );
     await waitFor('downloaded and unwrapped companion first chapter', () =>
       web.evaluate(chapter(1)),
@@ -447,9 +449,7 @@ async function run() {
       return false;
     });
     await waitFor('saved local companion progress', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${companionTitle}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(`Boolean(document.querySelector('[aria-label="${companionReadLabel}"]'))`),
     );
     await delay(3_000);
     if (fixture.uploads.length !== uploadsBeforeCompanion) {

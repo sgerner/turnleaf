@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { openBookLabel } from '../src/lib/a11y/book-labels';
 import { prepareDownloadedEpub, validateEpubArchive } from '../src/lib/downloads/epub-validation';
 import { mapSeriesToBooks } from '../src/lib/kavita/mapper';
 import { normalizeSeriesDetail, normalizeSeriesPage } from '../src/lib/kavita/normalization';
@@ -32,6 +33,14 @@ describe('Android reading journey multi-file chapter fixture', () => {
 
     expect(books).toHaveLength(2);
     expect(books.map((book) => book.title)).toEqual([fixture.primaryTitle, fixture.companionTitle]);
+    expect(openBookLabel(books[0])).toBe(fixture.primaryOpenLabel);
+    expect(openBookLabel({ ...books[0], downloadPath: 'books/ci-1-1.epub', pagesRead: 1 })).toBe(
+      fixture.primaryReadLabel,
+    );
+    expect(openBookLabel(books[1])).toBe(fixture.companionOpenLabel);
+    expect(openBookLabel({ ...books[1], downloadPath: 'books/ci-1-1-2.epub', pagesRead: 1 })).toBe(
+      fixture.companionReadLabel,
+    );
     expect(books[0]).toMatchObject({
       id: 'ci:1:1',
       pages: 2,
