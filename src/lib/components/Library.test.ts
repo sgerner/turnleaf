@@ -329,6 +329,7 @@ describe('Library card snippets', () => {
       makeBook({
         id: 'book-1',
         title: 'A Wizard of Earthsea',
+        series: 'Earthsea Cycle',
         pages: 200,
         pagesRead: 100,
         downloadPath: 'books/book-1.epub',
@@ -345,32 +346,36 @@ describe('Library card snippets', () => {
 
     const root = await mountLibrary();
 
-    // Grid view: [data-book-open] includes progress in aria-label and .sr-only
+    // Grid view: [data-book-open] includes author, distinct series, download status, and progress in aria-label and .sr-only
     const gridCard1 = getCard(root, 'book-1');
     const gridOpen1 = gridCard1.querySelector<HTMLButtonElement>('[data-book-open]');
     const gridActions1 = gridCard1.querySelector<HTMLButtonElement>('[data-book-actions]');
     expect(gridOpen1?.getAttribute('aria-label')).toBe(
-      'Open A Wizard of Earthsea, downloaded for offline reading, 50% complete',
+      'Open A Wizard of Earthsea, by Ursula K. Le Guin, Earthsea Cycle, downloaded for offline reading, 50% complete',
     );
     expect(gridOpen1?.querySelector('.sr-only')?.textContent).toBe(
-      'Open A Wizard of Earthsea, downloaded for offline reading, 50% complete',
+      'Open A Wizard of Earthsea, by Ursula K. Le Guin, Earthsea Cycle, downloaded for offline reading, 50% complete',
     );
-    expect(gridActions1?.getAttribute('aria-label')).toBe('Book actions for A Wizard of Earthsea');
+    expect(gridActions1?.getAttribute('aria-label')).toBe(
+      'Book actions for A Wizard of Earthsea, by Ursula K. Le Guin, Earthsea Cycle',
+    );
     expect(gridActions1?.className).toContain('h-11');
     expect(gridActions1?.className).toContain('w-11');
 
-    // Switch to List view: [data-book-open] omits progress in aria-label while preserving .sr-only
+    // Switch to List view: [data-book-open] omits progress in aria-label and .sr-only (since reading progressbar is a sibling) while keeping author/series
     switchView(root, 'List');
     const listCard1 = getCard(root, 'book-1');
     const listOpen1 = listCard1.querySelector<HTMLButtonElement>('[data-book-open]');
     const listActions1 = listCard1.querySelector<HTMLButtonElement>('[data-book-actions]');
     expect(listOpen1?.getAttribute('aria-label')).toBe(
-      'Open A Wizard of Earthsea, downloaded for offline reading',
+      'Open A Wizard of Earthsea, by Ursula K. Le Guin, Earthsea Cycle, downloaded for offline reading',
     );
     expect(listOpen1?.querySelector('.sr-only')?.textContent).toBe(
-      'Open A Wizard of Earthsea, downloaded for offline reading, 50% complete',
+      'Open A Wizard of Earthsea, by Ursula K. Le Guin, Earthsea Cycle, downloaded for offline reading',
     );
-    expect(listActions1?.getAttribute('aria-label')).toBe('Book actions for A Wizard of Earthsea');
+    expect(listActions1?.getAttribute('aria-label')).toBe(
+      'Book actions for A Wizard of Earthsea, by Ursula K. Le Guin, Earthsea Cycle',
+    );
     expect(listActions1?.className).toContain('h-11');
     expect(listActions1?.className).toContain('w-11');
 
@@ -395,7 +400,7 @@ describe('Library card snippets', () => {
     expect(document.activeElement).toBe(listActions1);
   });
 
-  it('renders cover status badges and reading progress bars with view-specific static Tailwind classes', async () => {
+  it('renders cover status badges, removed-from-server screen-reader descriptions, and reading progress bars with view-specific static Tailwind classes', async () => {
     mocks.books = [
       makeBook({
         id: 'book-1',
@@ -424,6 +429,7 @@ describe('Library card snippets', () => {
     const gridPrimaryBadge = gridDownloaded.querySelector(
       '.badge-icon.preset-filled-primary-600-400',
     );
+    expect(gridPrimaryBadge?.getAttribute('aria-hidden')).toBe('true');
     expect(gridPrimaryBadge?.className).toContain('left-2 top-2 h-7 w-7 p-0 shadow-md');
     expect(gridDownloaded.querySelector('.badge-icon.preset-filled-warning-500')).toBeNull();
 
@@ -440,6 +446,17 @@ describe('Library card snippets', () => {
     const gridOrphaned = getCard(root, 'book-2');
     const gridWarningBadge = gridOrphaned.querySelector('.badge-icon.preset-filled-warning-500');
     expect(gridWarningBadge?.className).toContain('left-2 top-2 h-7 w-7 p-0 shadow-md');
+    expect(gridWarningBadge?.querySelector('.sr-only')?.textContent).toBe('Removed from server');
+    expect(
+      gridOrphaned.querySelector<HTMLButtonElement>('[data-book-open]')?.getAttribute('aria-label'),
+    ).toBe(
+      'Open Orphaned Book, by Ursula K. Le Guin, downloaded for offline reading, removed from server',
+    );
+    expect(
+      gridOrphaned
+        .querySelector<HTMLButtonElement>('[data-book-actions]')
+        ?.getAttribute('aria-label'),
+    ).toBe('Book actions for Orphaned Book, by Ursula K. Le Guin, removed from server');
     expect(gridOrphaned.querySelector('.badge-icon.preset-filled-primary-600-400')).toBeNull();
     expect(gridOrphaned.querySelector('[role="progressbar"]')).toBeNull();
 
@@ -449,6 +466,7 @@ describe('Library card snippets', () => {
     const listPrimaryBadge = listDownloaded.querySelector(
       '.badge-icon.preset-filled-primary-600-400',
     );
+    expect(listPrimaryBadge?.getAttribute('aria-hidden')).toBe('true');
     expect(listPrimaryBadge?.className).toContain('left-1 top-1 h-6 w-6 p-0');
     expect(listPrimaryBadge?.className).not.toContain('shadow-md');
 
@@ -464,6 +482,12 @@ describe('Library card snippets', () => {
     const listOrphaned = getCard(root, 'book-2');
     const listWarningBadge = listOrphaned.querySelector('.badge-icon.preset-filled-warning-500');
     expect(listWarningBadge?.className).toContain('left-1 top-1 h-6 w-6 p-0');
+    expect(listWarningBadge?.querySelector('.sr-only')?.textContent).toBe('Removed from server');
+    expect(
+      listOrphaned
+        .querySelector<HTMLButtonElement>('[data-book-actions]')
+        ?.getAttribute('aria-label'),
+    ).toBe('Book actions for Orphaned Book, by Ursula K. Le Guin, removed from server');
     expect(listOrphaned.querySelector('[role="progressbar"]')).toBeNull();
   });
 
@@ -472,6 +496,7 @@ describe('Library card snippets', () => {
       makeBook({
         id: 'book-1',
         title: 'The Tombs of Atuan',
+        series: 'Earthsea Cycle',
         downloadPath: null,
       }),
     ];
@@ -506,9 +531,11 @@ describe('Library card snippets', () => {
     });
     await tick();
 
-    // Indeterminate state (downloadPercent === null): banner + list card both render progressbar
+    // Indeterminate state (downloadPercent === null): banner + list card both render progressbar with author + series label
+    const expectedDownloadLabel =
+      'Download progress for The Tombs of Atuan, by Ursula K. Le Guin, Earthsea Cycle';
     const indeterminateBars = root.querySelectorAll<HTMLElement>(
-      '[role="progressbar"][aria-label="Download progress for The Tombs of Atuan"]',
+      `[role="progressbar"][aria-label="${expectedDownloadLabel}"]`,
     );
     expect(indeterminateBars).toHaveLength(2);
     expect(indeterminateBars[0]?.className).toContain(
@@ -526,6 +553,13 @@ describe('Library card snippets', () => {
     expect(
       getCard(root, 'book-1').querySelector<HTMLButtonElement>('[data-book-open]')?.disabled,
     ).toBe(true);
+    expect(
+      getCard(root, 'book-1')
+        .querySelector<HTMLButtonElement>('[data-book-actions]')
+        ?.getAttribute('aria-label'),
+    ).toBe(
+      'Book actions for The Tombs of Atuan, by Ursula K. Le Guin, Earthsea Cycle, download in progress',
+    );
 
     // Determinate state (downloadPercent = 64)
     flushSync(() => {
@@ -537,16 +571,28 @@ describe('Library card snippets', () => {
       expect(bar.firstElementChild?.classList.contains('animate-pulse')).toBe(false);
       expect(bar.firstElementChild?.getAttribute('style')).toContain('width: 64%');
     }
+    expect(
+      getCard(root, 'book-1')
+        .querySelector<HTMLButtonElement>('[data-book-actions]')
+        ?.getAttribute('aria-label'),
+    ).toBe(
+      'Book actions for The Tombs of Atuan, by Ursula K. Le Guin, Earthsea Cycle, 64% downloaded',
+    );
 
-    // Grid view keeps only the banner progressbar and shows the spinner badge on the card
+    // Grid view renders both the banner progressbar and the spinner badge progressbar on the card
     switchView(root, 'Grid');
     const gridBars = root.querySelectorAll<HTMLElement>(
-      '[role="progressbar"][aria-label="Download progress for The Tombs of Atuan"]',
+      `[role="progressbar"][aria-label="${expectedDownloadLabel}"]`,
     );
-    expect(gridBars).toHaveLength(1);
+    expect(gridBars).toHaveLength(2);
     const gridCard = getCard(root, 'book-1');
     expect(gridCard.querySelector('svg.animate-spin')).not.toBeNull();
     expect(gridCard.querySelector<HTMLButtonElement>('[data-book-open]')?.disabled).toBe(true);
+    expect(
+      gridCard.querySelector<HTMLButtonElement>('[data-book-actions]')?.getAttribute('aria-label'),
+    ).toBe(
+      'Book actions for The Tombs of Atuan, by Ursula K. Le Guin, Earthsea Cycle, 64% downloaded',
+    );
 
     // Finish download so pending work settles cleanly
     finishDownload?.({ relativePath: 'books/book-1.epub', size: 1024 });
