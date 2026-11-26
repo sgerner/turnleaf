@@ -1507,3 +1507,100 @@ it('saves normalized browser remote progress and guards against concurrent local
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
 });
+
+it('preserves existing notes on duplicate highlights and stops adding annotations or bookmarks at their caps', async () => {
+  const { MAX_ANNOTATIONS } = await import('../reader/annotations');
+  const { MAX_BOOKMARKS } = await import('../reader/bookmarks');
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  await saveServer({
+    id: 'server',
+    displayName: 'Server',
+    baseUrl: 'https://server.example',
+    credentialRef: 'server_key',
+    kavitaVersion: '0.8.8',
+    lastConnectedAt: '2026-09-01T00:00:00.000Z',
+  });
+  await reconcileBooks('server', [existingBook]);
+
+  const initial = await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Passage 0',
+    note: 'Keep this note',
+  });
+  const rehighlighted = await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Passage 0',
+    note: '   ',
+  });
+  expect(initial).not.toBeNull();
+  expect(rehighlighted).toMatchObject({
+    id: initial?.id,
+    note: 'Keep this note',
+  });
+
+  for (let i = 1; i < MAX_ANNOTATIONS; i += 1) {
+    await saveBookAnnotation(existingBook.id, {
+      cfi: `epubcfi(/6/2!/4/2/1:${i})`,
+      xpath: `//body/DocFragment[1]/body/p[${i + 1}]`,
+      endingXPath: `//body/DocFragment[1]/body/p[${i + 1}]`,
+      pageNumber: i,
+      excerpt: `Passage ${i}`,
+      note: '',
+    });
+  }
+  await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:999)',
+    xpath: '//body/DocFragment[1]/body/p[999]',
+    endingXPath: '//body/DocFragment[1]/body/p[999]',
+    pageNumber: 99,
+    excerpt: 'Overflow highlight',
+    note: 'Ignored',
+  });
+  const annotations = await getBookAnnotations(existingBook.id);
+  expect(annotations).toHaveLength(MAX_ANNOTATIONS);
+  expect(
+    annotations.some((item) => item.id === initial?.id && item.note === 'Keep this note'),
+  ).toBe(true);
+  expect(annotations.some((item) => item.cfi === 'epubcfi(/6/2!/4/2/1:999)')).toBe(false);
+
+  const firstBookmark = await saveBookBookmark(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    href: 'ch1.xhtml',
+    percentage: 0.01,
+    pageNumber: 0,
+    label: 'Bookmark 0',
+  });
+  for (let i = 1; i < MAX_BOOKMARKS; i += 1) {
+    await saveBookBookmark(existingBook.id, {
+      cfi: `epubcfi(/6/2!/4/2/1:${i})`,
+      xpath: `//body/DocFragment[1]/body/p[${i + 1}]`,
+      href: 'ch1.xhtml',
+      percentage: i / 100,
+      pageNumber: i,
+      label: `Bookmark ${i}`,
+    });
+  }
+  await saveBookBookmark(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:999)',
+    xpath: '//body/DocFragment[1]/body/p[999]',
+    href: 'ch1.xhtml',
+    percentage: 0.99,
+    pageNumber: 99,
+    label: 'Overflow bookmark',
+  });
+  const bookmarks = await getBookBookmarks(existingBook.id);
+  expect(bookmarks).toHaveLength(MAX_BOOKMARKS);
+  expect(bookmarks.some((item) => item.id === firstBookmark?.id)).toBe(true);
+  expect(bookmarks.some((item) => item.cfi === 'epubcfi(/6/2!/4/2/1:999)')).toBe(false);
+});

@@ -15,7 +15,7 @@ export interface StoredReaderLocation {
   syncState?: 'synced' | 'pending_create' | 'pending_update' | 'pending_delete';
 }
 
-const MAX_BOOKMARKS = 100;
+export const MAX_BOOKMARKS = 100;
 const MAX_HISTORY = 12;
 
 function validLocation(value: unknown): value is StoredReaderLocation {
@@ -32,19 +32,20 @@ function validLocation(value: unknown): value is StoredReaderLocation {
   );
 }
 
-function parseLocations(value: string | null, limit: number): StoredReaderLocation[] {
+function parseLocations(value: string | null, limit?: number): StoredReaderLocation[] {
   if (!value) return [];
   try {
     const parsed: unknown = JSON.parse(value);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(validLocation).slice(0, limit);
+    const locations = parsed.filter(validLocation);
+    return limit === undefined ? locations : locations.slice(0, limit);
   } catch {
     return [];
   }
 }
 
 export function parseBookmarks(value: string | null): StoredReaderLocation[] {
-  return parseLocations(value, MAX_BOOKMARKS);
+  return parseLocations(value);
 }
 
 export function parseLocationHistory(value: string | null): StoredReaderLocation[] {
@@ -92,7 +93,8 @@ export function toggleBookmark(
 ): StoredReaderLocation[] {
   const match = findMatchingBookmark(bookmarks, current);
   if (match) return bookmarks.filter((bookmark) => bookmark.id !== match.id);
-  return [bookmarkLocation(current, savedAt), ...bookmarks].slice(0, MAX_BOOKMARKS);
+  if (bookmarks.length >= MAX_BOOKMARKS) return [...bookmarks];
+  return [bookmarkLocation(current, savedAt), ...bookmarks];
 }
 
 export function renameBookmark(

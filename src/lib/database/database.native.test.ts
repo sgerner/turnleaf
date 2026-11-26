@@ -207,6 +207,129 @@ it('serializes direct native writes with transactions', async () => {
   expect(peakWrites).toBe(1);
 });
 
+it('serializes public native reads behind transactions and direct writes', async () => {
+  let activeOperations = 0;
+  let peakOperations = 0;
+  const order: string[] = [];
+  const track = async <T>(label: string, result: T): Promise<T> => {
+    activeOperations += 1;
+    peakOperations = Math.max(peakOperations, activeOperations);
+    order.push(`${label}:start`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    order.push(`${label}:end`);
+    activeOperations -= 1;
+    return result;
+  };
+  mocks.executeTransaction.mockImplementation(async () =>
+    track('transaction', { changes: { changes: 0 } }),
+  );
+  mocks.db.run.mockImplementation(async () => track('run', { changes: { changes: 0 } }));
+  mocks.db.query.mockImplementation(async () =>
+    track('query', { values: [] as Record<string, unknown>[] }),
+  );
+
+  const {
+    getBooks,
+    getPendingSync,
+    getPreferences,
+    getReadingState,
+    getServer,
+    getSyncStatus,
+    markSyncFailure,
+    saveLocalProgress,
+  } = await import('./database');
+  await openAndClearMocks();
+  await Promise.all([
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
+    getServer(),
+    getBooks(book.serverId),
+    getReadingState(book.id),
+    getPendingSync(book.serverId),
+    getSyncStatus(book.serverId),
+    getPreferences(['uiTheme']),
+    markSyncFailure(book.id, 'offline', 1, readingState.localUpdatedAt),
+  ]);
+
+  expect(peakOperations).toBe(1);
+  expect(order).toEqual([
+    'transaction:start',
+    'transaction:end',
+    'query:start',
+    'query:end',
+    'query:start',
+    'query:end',
+    'query:start',
+    'query:end',
+    'query:start',
+    'query:end',
+    'query:start',
+    'query:end',
+    'query:start',
+    'query:end',
+    'run:start',
+    'run:end',
+  ]);
+});
+
+it('recovers nativeTransactionQueue after a rejected native query', async () => {
+  const { getPreferences } = await import('./database');
+  await openAndClearMocks();
+  mocks.db.query
+    .mockRejectedValueOnce(new Error('sqlite busy'))
+    .mockResolvedValueOnce({ values: [{ key: 'uiTheme', value: 'eink' }] });
+
+  await expect(getPreferences(['uiTheme'])).rejects.toThrow('sqlite busy');
+  await expect(getPreferences(['uiTheme'])).resolves.toEqual(new Map([['uiTheme', 'eink']]));
+});
+
+it('keeps internal queries unqueued inside saveRemoteProgress and acceptRemoteProgress', async () => {
+  const events: string[] = [];
+  const { acceptRemoteProgress, markSyncFailure, saveRemoteProgress } = await import('./database');
+  await openAndClearMocks();
+
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    events.push(`query:${statement.includes('sync_queue') ? 'queue' : 'reading'}`);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    return { values: [] as Record<string, unknown>[] };
+  });
+  mocks.executeTransaction.mockImplementation(async () => {
+    events.push('transaction:start');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    events.push('transaction:end');
+    return { changes: { changes: 1 } };
+  });
+  mocks.db.run.mockImplementation(async () => {
+    events.push('run');
+    return { changes: { changes: 1 } };
+  });
+
+  const remote = {
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 10,
+    chapterId: 10,
+    pageNum: 50,
+    bookScrollId: '/remote',
+    lastModifiedUtc: '2026-01-02T00:00:00.000Z',
+  };
+
+  expect(await saveRemoteProgress(book, remote, null)).toBe(true);
+  expect(events).toEqual(['query:reading', 'query:queue', 'transaction:start', 'transaction:end']);
+
+  events.length = 0;
+  await Promise.all([
+    acceptRemoteProgress(book, remote, 1, readingState.localUpdatedAt),
+    markSyncFailure(book.id, 'offline', 1, readingState.localUpdatedAt),
+  ]);
+  expect(events).toEqual(['transaction:start', 'transaction:end', 'query:reading', 'run']);
+});
+
+async function openAndClearMocks(): Promise<void> {
+  const { openDatabase } = await import('./database');
+  await openDatabase();
+  vi.clearAllMocks();
+}
+
 it('keeps a failed native progress transaction atomic', async () => {
   const persisted = { book: false, readingState: false, syncQueue: false };
   mocks.executeTransaction.mockImplementationOnce(async (tasks: capTask[]) => {
@@ -379,4 +502,137 @@ it('removes books, server config, and any legacy study preferences atomically on
     'DELETE FROM server_config WHERE id=?',
     expect.stringContaining('DELETE FROM preferences'),
   ]);
+});
+
+it('serializes public native study reads and enforces note preservation and caps without deadlocking writes', async () => {
+  const {
+    getBookAnnotationCounts,
+    getBookAnnotations,
+    getBookBookmarkCounts,
+    getBookBookmarks,
+    getBookHistory,
+    getPendingAnnotationSync,
+    getPendingBookmarkSync,
+    getServerAnnotations,
+    saveBookAnnotation,
+    saveBookBookmark,
+    saveLocalProgress,
+  } = await import('./database');
+  const { MAX_ANNOTATIONS } = await import('../reader/annotations');
+  const { MAX_BOOKMARKS } = await import('../reader/bookmarks');
+  await openAndClearMocks();
+
+  let activeOperations = 0;
+  let peakOperations = 0;
+  const track = async <T>(result: T): Promise<T> => {
+    activeOperations += 1;
+    peakOperations = Math.max(peakOperations, activeOperations);
+    await new Promise((resolve) => setTimeout(resolve, 3));
+    activeOperations -= 1;
+    return result;
+  };
+  mocks.executeTransaction.mockImplementation(async () => track({ changes: { changes: 0 } }));
+  mocks.db.query.mockImplementation(async () => track({ values: [] as Record<string, unknown>[] }));
+
+  await Promise.all([
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
+    getBookAnnotations(book.id),
+    getServerAnnotations(book.serverId),
+    getBookAnnotationCounts(book.serverId),
+    getBookBookmarks(book.id),
+    getBookBookmarkCounts(book.serverId),
+    getBookHistory(book.id),
+    getPendingAnnotationSync(book.serverId),
+    getPendingBookmarkSync(book.serverId),
+  ]);
+  expect(peakOperations).toBe(1);
+
+  vi.clearAllMocks();
+  const fullBookmarkRows = Array.from({ length: MAX_BOOKMARKS }, (_, index) => ({
+    id: `${book.id}:b${index}`,
+    book_id: book.id,
+    remote_id: index + 1,
+    cfi: `epubcfi(/6/4!/4/2/1:${index})`,
+    xpath: `//body/DocFragment[2]/body/p[${index + 1}]`,
+    href: 'ch2.xhtml',
+    percentage: 0.1,
+    page_number: index,
+    label: `Bookmark ${index}`,
+    excerpt: '',
+    remote_title: `Bookmark ${index}`,
+    remote_page_number: index,
+    saved_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+    sync_state: 'synced',
+    sync_revision: 1,
+    attempt_count: 0,
+    last_attempt_at: null,
+    last_error: null,
+  }));
+  mocks.db.query
+    .mockResolvedValueOnce({
+      values: [
+        {
+          id: `${book.id}:a1`,
+          book_id: book.id,
+          remote_id: 42,
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          xpath: '//body/DocFragment[2]/body/p[1]',
+          ending_xpath: '//body/DocFragment[2]/body/p[1]',
+          selected_slot_index: 0,
+          page_number: 1,
+          contains_spoiler: 0,
+          chapter_title: 'Chapter 1',
+          context: 'Passage',
+          excerpt: 'Passage',
+          note: 'Saved note',
+          created_at: '2026-01-01T00:00:00.000Z',
+          updated_at: '2026-01-01T00:00:00.000Z',
+          sync_state: 'synced',
+          sync_revision: 1,
+          attempt_count: 0,
+          last_attempt_at: null,
+          last_error: null,
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ values: [] })
+    .mockResolvedValueOnce({ values: [{ total: MAX_ANNOTATIONS }] })
+    .mockResolvedValueOnce({ values: fullBookmarkRows });
+
+  const preserved = await saveBookAnnotation(book.id, {
+    cfi: 'epubcfi(/6/4!/4/2/1:0)',
+    xpath: '//body/DocFragment[2]/body/p[1]',
+    endingXPath: '//body/DocFragment[2]/body/p[1]',
+    pageNumber: 1,
+    excerpt: 'Passage',
+    note: '   ',
+  });
+  expect(preserved?.note).toBe('Saved note');
+  expect(mocks.db.run).toHaveBeenCalledOnce();
+
+  mocks.db.run.mockClear();
+  await expect(
+    saveBookAnnotation(book.id, {
+      cfi: 'epubcfi(/6/4!/4/2/1:8)',
+      xpath: '//body/DocFragment[2]/body/p[2]',
+      endingXPath: '//body/DocFragment[2]/body/p[2]',
+      pageNumber: 1,
+      excerpt: 'Overflow highlight',
+      note: '',
+    }),
+  ).resolves.toBeNull();
+  expect(mocks.db.run).not.toHaveBeenCalled();
+
+  await expect(
+    saveBookBookmark(book.id, {
+      cfi: 'epubcfi(/6/4!/4/8)',
+      xpath: '//body/DocFragment[2]/body/p[4]',
+      href: 'ch2.xhtml',
+      percentage: 0.5,
+      pageNumber: 5,
+      label: 'Overflow bookmark',
+    }),
+  ).resolves.toBeNull();
+  expect(mocks.db.run).not.toHaveBeenCalled();
 });
