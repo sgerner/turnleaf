@@ -61,6 +61,7 @@ export function parseAppearance(value: string): Appearance {
     ),
     margin: clampNumber(parsed.margin, 8, 56, defaultAppearance.margin),
     bottomMargin: clampNumber(parsed.bottomMargin, 0, 64, defaultAppearance.bottomMargin),
+    publisherStyles: parsed.publisherStyles !== false,
     progressBar: parsed.progressBar !== false,
     volumeButtons: parsed.volumeButtons === true,
   };

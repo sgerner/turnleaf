@@ -18,8 +18,13 @@ const { testState, mockBook, mockRendition } = vi.hoisted(() => {
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
-    themes: { register: vi.fn(), registerCss: vi.fn(), select: vi.fn() },
+    themes: { register: vi.fn(), registerCss: vi.fn(), select: vi.fn() } as {
+      register: (...args: unknown[]) => void;
+      registerCss: (name: string, css: string) => void;
+      select: (name: string) => void;
+    },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
+    location: undefined as { start: { cfi: string } } | undefined,
     getContents: vi.fn(() => {
       const active = state.sections[state.activeSectionIndex];
       return active ? [active.contents] : [];
@@ -68,7 +73,7 @@ vi.mock('epubjs', async (importOriginal) => {
   };
 });
 
-import { Contents } from 'epubjs';
+import { Book, Contents, Rendition } from 'epubjs';
 import { ReaderSession } from './session';
 
 function createSectionContents(
@@ -92,7 +97,6 @@ function createSectionContents(
     rafSpy.mockRestore();
   }
 }
-
 describe('Kavita EPUB locations', () => {
   it('adds the one-based Kavita spine fragment to an EPUB content path', () => {
     expect(toKavitaXPath('/html/body/section[1]/p[4]', 2)).toBe(
@@ -424,5 +428,101 @@ describe('ReaderSession XPath restoration', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-one.xhtml');
 
     session.destroy();
+  });
+});
+
+describe('ReaderSession publisher formatting cascade', () => {
+  it('preserves .scene-break and .epigraph styles when publisherStyles is true and overrides cleanly on toggle', async () => {
+    const frame = document.createElement('iframe');
+    document.body.appendChild(frame);
+    const originalThemes = mockRendition.themes;
+    try {
+      const chapterDoc = frame.contentDocument!;
+      chapterDoc.open();
+      chapterDoc.write(`<!doctype html><html><head><style>
+        .scene-break { text-align: center; margin: 1.5em 0; }
+        .epigraph { text-align: right; margin: 1.5em 2em; }
+        .epigraph p { margin-bottom: 0.25em; }
+      </style></head><body>
+        <p id="body-copy">Ordinary paragraph</p>
+        <p id="scene-break" class="scene-break">* * *</p>
+        <blockquote class="epigraph"><p id="epigraph-line">Epigraph quote</p></blockquote>
+      </body></html>`);
+      chapterDoc.close();
+
+      const contents = Object.assign(Object.create(Contents.prototype) as Contents, {
+        document: chapterDoc,
+        content: chapterDoc.body,
+        locationOf: vi.fn(async () => ({ left: 0, top: 0 })),
+      });
+      testState.activeSectionIndex = 0;
+      testState.sections = [{ href: 'chapter-one.xhtml', index: 0, contents }];
+
+      const realThemes = new Rendition(new Book(), {})
+        .themes as unknown as typeof mockRendition.themes & {
+        rendition: unknown;
+      };
+      realThemes.rendition = mockRendition;
+      mockRendition.themes = realThemes;
+      mockRendition.location = { start: { cfi: 'epubcfi(/6/2!/4/2:0)' } };
+      mockRendition.display.mockClear();
+
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      mockRendition.display.mockClear();
+
+      const styleOf = (id: string) =>
+        frame.contentWindow!.getComputedStyle(chapterDoc.getElementById(id)!);
+
+      expect(styleOf('body-copy').textAlign).toBe('start');
+      expect(styleOf('body-copy').marginBottom).toBe('10.8px');
+      expect(styleOf('scene-break').textAlign).toBe('center');
+      expect(styleOf('scene-break').marginBottom).toBe('27px');
+      expect(styleOf('epigraph-line').textAlign).toBe('right');
+      expect(styleOf('epigraph-line').marginBottom).toBe('4.5px');
+
+      session.applyAppearance({
+        ...defaultAppearance,
+        alignment: 'justify',
+        publisherStyles: false,
+      });
+
+      expect(styleOf('body-copy').textAlign).toBe('justify');
+      expect(styleOf('scene-break').textAlign).toBe('justify');
+      expect(styleOf('scene-break').marginBottom).toBe('10.8px');
+      expect(styleOf('epigraph-line').textAlign).toBe('justify');
+      expect(styleOf('epigraph-line').marginBottom).toBe('10.8px');
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/2!/4/2:0)');
+
+      mockRendition.display.mockClear();
+      session.applyAppearance({
+        ...defaultAppearance,
+        alignment: 'justify',
+        publisherStyles: true,
+      });
+
+      expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
+      expect(styleOf('body-copy').textAlign).toBe('justify');
+      expect(styleOf('scene-break').textAlign).toBe('center');
+      expect(styleOf('scene-break').marginBottom).toBe('27px');
+      expect(styleOf('epigraph-line').textAlign).toBe('right');
+      expect(styleOf('epigraph-line').marginBottom).toBe('4.5px');
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/2!/4/2:0)');
+
+      session.destroy();
+    } finally {
+      mockRendition.themes = originalThemes;
+      mockRendition.location = undefined;
+      testState.sections = [];
+      frame.remove();
+    }
   });
 });

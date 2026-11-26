@@ -1014,6 +1014,7 @@ export class ReaderSession {
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
+        previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
     const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
@@ -1158,10 +1159,15 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
+    const bodyTextAlign = value.publisherStyles ? value.alignment : `${value.alignment} !important`;
+    const paragraphRule = value.publisherStyles
+      ? `p { margin-bottom: ${value.paragraphSpacing}em; hyphens: ${hyphens}; }`
+      : `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${hyphens} !important; }`;
     return [
       `html { background: ${background} !important; box-sizing: border-box; }`,
-      `body { color: ${text} !important; background: ${background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; padding-top: 0.5rem !important; padding-right: 0 !important; padding-bottom: ${value.bottomMargin}px !important; padding-left: 0 !important; box-sizing: border-box; }`,
-      `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${value.hyphenation ? 'auto' : 'none'}; }`,
+      `body { color: ${text} !important; background: ${background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; text-align: ${bodyTextAlign}; padding-top: 0.5rem !important; padding-right: 0 !important; padding-bottom: ${value.bottomMargin}px !important; padding-left: 0 !important; box-sizing: border-box; }`,
+      paragraphRule,
       `img, svg, video, canvas, table, pre, blockquote { max-width: 100% !important; }`,
       `img { height: auto !important; }`,
       `a { color: ${link} !important; }`,

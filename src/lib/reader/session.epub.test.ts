@@ -1423,6 +1423,7 @@ describe('ReaderSession', () => {
       { bottomMargin: 16 },
       { paragraphSpacing: 1.0 },
       { alignment: 'justify' },
+      { publisherStyles: false },
       { hyphenation: true },
     ];
 
@@ -1464,7 +1465,6 @@ describe('ReaderSession', () => {
     for (const patch of [
       {},
       { margin: 32 },
-      { publisherStyles: false },
       { progressBar: false },
       { keepAwake: true },
       { volumeButtons: true },
