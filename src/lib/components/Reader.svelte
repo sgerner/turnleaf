@@ -20,6 +20,7 @@
   } from '../reader/appearance';
   import {
     ReaderSession,
+    resolveReaderKeyboardAction,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
@@ -43,7 +44,14 @@
     toggleBookmark,
     type StoredReaderLocation,
   } from '../reader/bookmarks';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusFirstElement,
+    focusModal,
+    restoreFocus,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   type SyncedLocation = {
     xpath: string | null;
@@ -63,6 +71,7 @@
     onRelocated,
     onSyncLatest,
     onRetryDownload,
+    onMountChange,
     registerBackHandler,
   }: {
     bookUrl: string;
@@ -76,6 +85,7 @@
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
+    onMountChange?: ((mounted: boolean) => void) | undefined;
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
@@ -114,6 +124,10 @@
   let exporting = $state(false);
   let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
+  let selectedTextGroup = $state<HTMLElement | null>(null);
+  let visiblePassages = $state<ReaderSelection[]>([]);
+  let selectedPassageIndex = $state(0);
+  let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
   let searchQuery = $state('');
@@ -150,6 +164,7 @@
     : null;
 
   onMount(async () => {
+    onMountChange?.(true);
     previousDocumentTitle = document.title;
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
@@ -194,7 +209,9 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
+        if (location?.cfi !== next.cfi) selectedText = null;
         location = next;
+        if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
         if (origin === 'link') {
           linkReturnTarget = returnTarget ?? null;
@@ -299,6 +316,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onMountChange?.(false);
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
@@ -318,20 +336,6 @@
     controlsVisible = true;
     scheduleChromeHide();
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
-  }
-
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusPanel(getPanel: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getPanel()));
-  }
-
-  function restorePanelFocus(opener: HTMLElement | null): void {
-    void tick().then(() => restoreFocus(opener));
   }
 
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
@@ -380,14 +384,14 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => settingsPanel);
+    focusModal(() => settingsPanel);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -403,14 +407,14 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => tocPanel);
+    focusModal(() => tocPanel);
   }
 
   function closeToc(): void {
     tocVisible = false;
     const opener = tocOpener;
     tocOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -426,7 +430,7 @@
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusPanel(() => bookmarksPanel);
+    focusModal(() => bookmarksPanel);
   }
 
   function closeBookmarks(): void {
@@ -434,14 +438,30 @@
     editingBookmarkId = null;
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
+  }
+
+  function refreshVisiblePassages(): void {
+    visiblePassages = session?.getVisiblePassages() ?? [];
+    selectedPassageIndex = 0;
+  }
+
+  function clipPassageOptionLabel(text: string, index: number): string {
+    const preview = text.length > 88 ? `${text.slice(0, 87).trimEnd()}…` : text;
+    return `Passage ${index + 1}: ${preview}`;
+  }
+
+  function restoreViewportFrameFocus(): void {
+    void tick().then(() => viewport?.querySelector<HTMLElement>('iframe')?.focus());
   }
 
   function openAnnotations(): void {
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
+    refreshVisiblePassages();
+    annotationMessage = '';
     annotationsVisible = true;
     settingsVisible = false;
     tocVisible = false;
@@ -454,14 +474,17 @@
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusPanel(() => annotationsPanel);
+    focusModal(() => annotationsPanel);
   }
 
   function closeAnnotations(): void {
     annotationsVisible = false;
     editingAnnotationId = null;
     selectedText = null;
+    visiblePassages = [];
+    selectedPassageIndex = 0;
     annotationDraft = '';
+    annotationMessage = '';
     exportFallback = '';
     exportMessage = '';
     const opener = annotationsOpener;
@@ -487,7 +510,7 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchError = '';
-    focusPanel(() => searchPanel);
+    focusModal(() => searchPanel);
   }
 
   function closeSearch(): void {
@@ -497,7 +520,7 @@
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -505,14 +528,14 @@
     pauseChromeHide();
     syncConfirmationOpener = activeElement();
     pendingSyncLocation = progress;
-    focusPanel(() => syncConfirmationPanel);
+    focusModal(() => syncConfirmationPanel);
   }
 
   function closeSyncConfirmation(): void {
     pendingSyncLocation = null;
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
-    restorePanelFocus(opener);
+    restoreModalFocus(opener);
     resumeChromeHide();
   }
 
@@ -658,12 +681,14 @@
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(): void {
-    if (!selectedText) return;
-    annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
+  function saveAnnotation(target: ReaderSelection | null = selectedText): void {
+    if (!target) return;
+    const hadNote = Boolean(annotationDraft.trim());
+    annotations = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
     session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
+    annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
@@ -693,10 +718,16 @@
   async function copySelection(): Promise<void> {
     const selection = selectedText;
     if (!selection) return;
+    const restoreFrameFocus = Boolean(
+      selectedTextGroup &&
+      document.activeElement &&
+      selectedTextGroup.contains(document.activeElement),
+    );
     try {
       await navigator.clipboard.writeText(selection.text);
       selectedText = null;
       selectionMessage = 'Selected text copied.';
+      if (restoreFrameFocus) restoreViewportFrameFocus();
     } catch {
       selectionMessage = 'Turnleaf could not copy the selection.';
     }
@@ -936,40 +967,25 @@
   }
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
-    if (destroyed || event.defaultPrevented) return;
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-    const target = event.target as Element | null;
-    if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
+    if (destroyed) return;
+    const action = resolveReaderKeyboardAction(event, {
+      hasOpenPanel: hasOpenReaderPanel(),
+      hasSelection: selectedText !== null,
+    });
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'clear-selection') {
+      const restoreFrameFocus = Boolean(
+        selectedTextGroup &&
+        document.activeElement &&
+        selectedTextGroup.contains(document.activeElement),
+      );
+      session?.clearTextSelection();
+      selectedText = null;
+      if (restoreFrameFocus) restoreViewportFrameFocus();
       return;
     }
-    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
-      event.preventDefault();
-      void turn('previous');
-      return;
-    }
-    if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
-      event.preventDefault();
-      void turn('next');
-      return;
-    }
-    if (
-      event.key === 'Escape' &&
-      (settingsVisible ||
-        tocVisible ||
-        bookmarksVisible ||
-        annotationsVisible ||
-        searchVisible ||
-        pendingSyncLocation)
-    ) {
-      event.preventDefault();
-      if (pendingSyncLocation) closeSyncConfirmation();
-      closeSettings();
-      closeToc();
-      closeBookmarks();
-      closeAnnotations();
-      closeSearch();
-      showControls();
-    }
+    void turn(action);
   }
 
   function handleBackButton(): boolean {
@@ -1027,6 +1043,50 @@
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport}></div>
 
+  <p class="sr-only" role="status">{selectionMessage}</p>
+  {#if selectedText && !hasOpenReaderPanel()}
+    <div
+      bind:this={selectedTextGroup}
+      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      role="group"
+      aria-label="Selected text"
+    >
+      <button
+        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => {
+          const restoreFrameFocus = Boolean(
+            selectedTextGroup &&
+            document.activeElement &&
+            selectedTextGroup.contains(document.activeElement),
+          );
+          saveAnnotation();
+          selectionMessage = 'Highlight saved.';
+          if (restoreFrameFocus) restoreViewportFrameFocus();
+        }}
+      >
+        Highlight
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={openAnnotations}
+      >
+        Add note
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => void copySelection()}
+      >
+        Copy text
+      </button>
+    </div>
+  {/if}
+
   <p class="sr-only" aria-live="polite" aria-atomic="true">
     {#if location}
       {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
@@ -1036,7 +1096,7 @@
 
   <p id="reader-keyboard-help" class="sr-only">
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
-    Press Escape to close an open reader panel.
+    Press Escape to close an open reader panel or clear selected text.
   </p>
 
   <nav
@@ -1089,42 +1149,6 @@
     >
       {readerSyncMessage}
     </p>
-  {/if}
-  <p class="sr-only" role="status">{selectionMessage}</p>
-  {#if selectedText && !hasOpenReaderPanel()}
-    <div
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
-      role="group"
-      aria-label="Selected text"
-    >
-      <button
-        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => {
-          saveAnnotation();
-          selectionMessage = 'Highlight saved.';
-        }}
-      >
-        Highlight
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}
-      >
-        Add note
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => void copySelection()}
-      >
-        Copy text
-      </button>
-    </div>
   {/if}
 
   {#if appearance.progressBar}
@@ -1371,6 +1395,29 @@
         </div>
       {/if}
 
+      {#snippet readerPanelHeader(
+        titleId: string,
+        heading: string,
+        closeLabel: string,
+        onClose: () => void,
+      )}
+        <button
+          class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+          type="button"
+          onclick={onClose}
+          aria-label={closeLabel}
+          title="Close"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+        <h2 id={titleId} class="font-serif text-xl">{heading}</h2>
+      {/snippet}
+
       {#if settingsVisible}
         <div
           bind:this={settingsPanel}
@@ -1383,21 +1430,12 @@
           onkeydown={(event) => trapModalKeydown(event, settingsPanel!, closeSettings)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeSettings}
-            aria-label="Close reading appearance"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-appearance-title" class="font-serif text-xl">Reading appearance</h2>
+          {@render readerPanelHeader(
+            'reader-appearance-title',
+            'Reading appearance',
+            'Close reading appearance',
+            closeSettings,
+          )}
           <div class="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
               <button
@@ -1576,21 +1614,12 @@
           onkeydown={(event) => trapModalKeydown(event, tocPanel!, closeToc)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeToc}
-            aria-label="Close table of contents"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-contents-title" class="font-serif text-xl">Contents</h2>
+          {@render readerPanelHeader(
+            'reader-contents-title',
+            'Contents',
+            'Close table of contents',
+            closeToc,
+          )}
           {#snippet contentsList(items: TocItem[])}
             <ul class="mt-2 grid list-none gap-1 p-0">
               {#each items as item, index (`${item.href}-${index}`)}
@@ -1642,21 +1671,12 @@
           onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeSearch}
-            aria-label="Close book search"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-search-title" class="font-serif text-xl">Search this book</h2>
+          {@render readerPanelHeader(
+            'reader-search-title',
+            'Search this book',
+            'Close book search',
+            closeSearch,
+          )}
           <form
             class="mt-4 flex gap-2"
             onsubmit={(event) => {
@@ -1723,21 +1743,12 @@
           onkeydown={(event) => trapModalKeydown(event, bookmarksPanel!, closeBookmarks)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeBookmarks}
-            aria-label="Close bookmarks and history"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-bookmarks-title" class="font-serif text-xl">Bookmarks and history</h2>
+          {@render readerPanelHeader(
+            'reader-bookmarks-title',
+            'Bookmarks and history',
+            'Close bookmarks and history',
+            closeBookmarks,
+          )}
           <p class="mt-2 text-sm text-surface-700-300">
             Saved on this device with EPUB locations. They are not sent to Kavita.
           </p>
@@ -1863,23 +1874,15 @@
           onkeydown={(event) => trapModalKeydown(event, annotationsPanel!, closeAnnotations)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeAnnotations}
-            aria-label="Close highlights and notes"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-annotations-title" class="font-serif text-xl">Highlights and notes</h2>
+          {@render readerPanelHeader(
+            'reader-annotations-title',
+            'Highlights and notes',
+            'Close highlights and notes',
+            closeAnnotations,
+          )}
           <p class="mt-2 text-sm text-surface-700-300">
-            Saved on this device. Select text in the book to add a highlight and an optional note.
+            Saved on this device. Choose a passage on this page or select text in the book to add a
+            highlight and an optional note.
           </p>
 
           {#if selectedText}
@@ -1911,7 +1914,49 @@
                 </button>
               </div>
             </form>
+          {:else if visiblePassages.length > 0}
+            {@const activePassage =
+              visiblePassages[selectedPassageIndex] ?? visiblePassages[0] ?? null}
+            <form
+              class="mt-4 rounded-lg preset-tonal-primary p-3"
+              onsubmit={(event) => {
+                event.preventDefault();
+                saveAnnotation(activePassage);
+              }}
+            >
+              <label class="label">
+                <span class="label-text">Passage on this page</span>
+                <select
+                  class="select"
+                  aria-label="Passage on this page"
+                  value={String(selectedPassageIndex)}
+                  onchange={(event) => {
+                    selectedPassageIndex = Number(event.currentTarget.value);
+                    annotationMessage = '';
+                  }}
+                >
+                  {#each visiblePassages as passage, index (`${passage.cfi}-${index}`)}
+                    <option value={String(index)}>
+                      {clipPassageOptionLabel(passage.text, index)}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+              {#if activePassage}
+                <p class="mt-2 line-clamp-4 text-sm italic">“{activePassage.text}”</p>
+              {/if}
+              <label class="label mt-3">
+                <span class="label-text">Note (optional)</span>
+                <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+              </label>
+              <div class="mt-3 flex gap-2">
+                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                  Save highlight
+                </button>
+              </div>
+            </form>
           {/if}
+          <p class="mt-2 text-sm text-surface-700-300" role="status">{annotationMessage}</p>
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3

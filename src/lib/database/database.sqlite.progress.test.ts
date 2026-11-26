@@ -200,6 +200,67 @@ describe('native progress transactions against SQLite', () => {
     });
   });
 
+  it('updates server_config in place without cascading deletes until removeServer runs', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    await database.markDownloaded(book.id, 'books/server-1-10.epub', 4096);
+
+    const baselineBook = (await database.getBooks(server.id))[0];
+    const baselineReading = await database.getReadingState(book.id);
+    const baselineQueue = await database.getPendingSync(server.id);
+    expect(baselineBook).toMatchObject({
+      downloadPath: 'books/server-1-10.epub',
+      downloadStatus: 'available',
+      fileSize: 4096,
+    });
+    expect(baselineReading).toMatchObject({ cfi: 'old-cfi', pendingSync: true });
+    expect(baselineQueue).toHaveLength(1);
+
+    const updatedServer = {
+      ...server,
+      displayName: 'Moved server',
+      baseUrl: 'https://moved.example.com',
+      credentialRef: 'credential_rotated',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-01-03T00:00:00.000Z',
+    };
+    await database.saveServer(updatedServer);
+
+    const reopened = await reopenDatabase(database);
+    expect(await reopened.getServer()).toEqual(updatedServer);
+    expect(await reopened.getBooks(server.id)).toEqual([baselineBook]);
+    expect(await reopened.getReadingState(book.id)).toEqual(baselineReading);
+    expect(await reopened.getPendingSync(server.id)).toEqual(baselineQueue);
+
+    const clearedVersionServer = {
+      ...updatedServer,
+      kavitaVersion: null,
+      lastConnectedAt: '2026-01-04T00:00:00.000Z',
+    };
+    await reopened.saveServer(clearedVersionServer);
+    expect(await reopened.getServer()).toEqual(clearedVersionServer);
+
+    await reopened.removeServer(server.id);
+    expect(await reopened.getServer()).toBeNull();
+    expect(await reopened.getBooks(server.id)).toEqual([]);
+    expect(await reopened.getReadingState(book.id)).toBeNull();
+    expect(await reopened.getPendingSync(server.id)).toEqual([]);
+    expect(
+      native.database
+        ?.prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM books) AS books_count,
+            (SELECT COUNT(*) FROM reading_state) AS reading_state_count,
+            (SELECT COUNT(*) FROM sync_queue) AS sync_queue_count`,
+        )
+        .get(),
+    ).toEqual({
+      books_count: 0,
+      reading_state_count: 0,
+      sync_queue_count: 0,
+    });
+  });
+
   it.each([0, 1, 2])(
     'rolls back every progress write when task %i fails and preserves the prior retryable state after reopen',
     async (failAt) => {
@@ -229,7 +290,7 @@ describe('native progress transactions against SQLite', () => {
     const baselineBook = (await database.getBooks(server.id))[0];
 
     native.failTransactionAt = 2;
-    await expect(database.markBookCompleted(book, baselineReading)).rejects.toThrow(
+    await expect(database.markBookCompleted(book)).rejects.toThrow(
       'injected transaction failure at 2',
     );
 
