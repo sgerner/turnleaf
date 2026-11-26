@@ -26,6 +26,27 @@ export interface ReaderSelection {
   text: string;
 }
 
+export type ReaderKeyboardAction = 'next' | 'previous' | 'clear-selection' | null;
+
+export function resolveReaderKeyboardAction(
+  event: KeyboardEvent,
+  options: { hasOpenPanel?: boolean; hasSelection?: boolean } = {},
+): ReaderKeyboardAction {
+  if (event.defaultPrevented) return null;
+  if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return null;
+  if (options.hasOpenPanel) return null;
+  if (event.key === 'Escape') {
+    return options.hasSelection ? 'clear-selection' : null;
+  }
+  const target = event.target as Element | null;
+  if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
+    return null;
+  }
+  if (event.key === 'ArrowLeft' || event.key === 'PageUp') return 'previous';
+  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') return 'next';
+  return null;
+}
+
 export interface TocItem {
   label: string;
   href: string;
@@ -78,6 +99,56 @@ const RESOURCE_ATTRIBUTES = new Set([
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:gif|jpe?g|png|webp|avif);base64,[a-z0-9+/=\s]+$/i;
 const SAFE_DATA_STYLESHEET = /^data:text\/css(?:;charset=[^;,]+)?(?:;base64)?,/i;
+const PASSAGE_BLOCK_SELECTOR = 'p, li, blockquote, pre, h1, h2, h3, h4, h5, h6, dt, dd, figcaption';
+const FOCUSABLE_LINK_SELECTOR = 'a[href], area[href]';
+const SAVED_TABINDEX_ATTR = 'data-turnleaf-tabindex';
+const VIEWPORT_RECT_EPSILON = 0.5;
+
+function normalizePassageText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function mergeCfiRange(startCfi: string, endCfi?: string | null): string {
+  if (!endCfi || startCfi === endCfi) return startCfi;
+  if (
+    !startCfi.startsWith('epubcfi(') ||
+    !startCfi.endsWith(')') ||
+    !endCfi.startsWith('epubcfi(') ||
+    !endCfi.endsWith(')')
+  ) {
+    return startCfi;
+  }
+  const startParts = startCfi.slice(8, -1).split('!');
+  const endParts = endCfi.slice(8, -1).split('!');
+  if (startParts.length !== 2 || endParts.length !== 2) return startCfi;
+  const [startBase, startPath] = startParts;
+  const [endBase, endPath] = endParts;
+  if (
+    !startBase ||
+    startBase !== endBase ||
+    !startPath ||
+    !endPath ||
+    startPath.includes(',') ||
+    endPath.includes(',')
+  ) {
+    return startCfi;
+  }
+  const startSteps = startPath.split('/').filter(Boolean);
+  const endSteps = endPath.split('/').filter(Boolean);
+  if (startSteps.length === 0 || endSteps.length === 0) return startCfi;
+  let commonLength = 0;
+  while (
+    commonLength < startSteps.length - 1 &&
+    commonLength < endSteps.length - 1 &&
+    startSteps[commonLength] === endSteps[commonLength]
+  ) {
+    commonLength += 1;
+  }
+  const common = commonLength > 0 ? `/${startSteps.slice(0, commonLength).join('/')}` : '';
+  const startRel = `/${startSteps.slice(commonLength).join('/')}`;
+  const endRel = `/${endSteps.slice(commonLength).join('/')}`;
+  return `epubcfi(${startBase}!${common},${startRel},${endRel})`;
+}
 
 function hasUnsafeControl(value: string): boolean {
   return [...value].some((character) => {
@@ -373,6 +444,15 @@ export class ReaderSession {
   private pendingContentWork = new Set<Promise<void>>();
   private contentObservers = new Map<Document, MutationObserver>();
   private pendingViewRenders = new Map<object, { promise: Promise<void>; resolve: () => void }>();
+  private viewportTarget: HTMLElement | null = null;
+  private epubContainer: HTMLElement | null = null;
+  private lockedScrollLeft = 0;
+  private displayOperationCount = 0;
+  private aligningFocusTarget: Element | null = null;
+  private resizedListener: (() => void) | null = null;
+  private unloadedHookRegistered = false;
+  private readonly trackedContents = new Set<Contents>();
+  private readonly contentCleanups = new Map<Contents, Array<() => void>>();
   private highlightCfis = new Set<string>();
   private onLocation:
     | ((
@@ -381,6 +461,18 @@ export class ReaderSession {
         returnTarget?: ReaderLinkReturnTarget,
       ) => void)
     | null = null;
+
+  private readonly handleContainerScroll = (): void => {
+    const container = this.epubContainer;
+    if (!container) return;
+    if (this.isProgrammaticScrollAllowed()) {
+      this.lockedScrollLeft = container.scrollLeft;
+      return;
+    }
+    if (container.scrollLeft !== this.lockedScrollLeft) {
+      container.scrollLeft = this.lockedScrollLeft;
+    }
+  };
 
   constructor(private readonly bookUrl: string) {
     this.book = ePub(bookUrl);
@@ -401,6 +493,7 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    this.viewportTarget = target;
     const initial = target.getBoundingClientRect();
     const initialWidth = Math.floor(initial.width);
     const initialHeight = Math.floor(initial.height);
@@ -418,9 +511,15 @@ export class ReaderSession {
       this.detachStageWindowListeners();
       this.normalizePaginatedManager();
       this.observeManagerViews();
+      this.bindEpubContainer();
     };
     this.rendition.on('attached', this.attached);
-    this.rendered = (_section, view) => this.settleViewRender(view);
+    this.rendered = (_section, view) => {
+      this.settleViewRender(view);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
     this.removed = (_section, view) => {
       const doc = (view as { document?: Document } | null)?.document;
       if (doc) {
@@ -431,27 +530,95 @@ export class ReaderSession {
     };
     this.rendition.on('rendered', this.rendered);
     this.rendition.on('removed', this.removed);
-    this.rendition.hooks.content.register((contents: Contents) => this.harden(contents));
+    this.bindEpubContainer();
+    this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
+    if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
+      this.unloadedHookRegistered = true;
+      this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
+        if (view?.contents) this.cleanupContents(view.contents);
+      });
+    }
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
+        this.registerContentFocusAndLinks(contents);
+        let tabKeyActive = false;
+        let blurredByTab = false;
+        let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const clearTabTimer = () => {
+          if (tabResetTimer !== null) {
+            clearTimeout(tabResetTimer);
+            tabResetTimer = null;
+          }
+        };
+        const handleKeydown = (event: KeyboardEvent) => {
+          if (event.key === 'Tab') {
+            tabKeyActive = true;
+            clearTabTimer();
+            tabResetTimer = setTimeout(() => {
+              tabResetTimer = null;
+              tabKeyActive = false;
+            }, 0);
+          } else {
+            clearTabTimer();
+            tabKeyActive = false;
+            blurredByTab = false;
+          }
+        };
+        const handleWindowBlur = () => {
+          if (tabKeyActive) blurredByTab = true;
+        };
+        const handleFocusOut = (event: FocusEvent) => {
+          if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
+        };
+        const clearBlurGuard = () => {
+          clearTabTimer();
+          tabKeyActive = false;
+          blurredByTab = false;
+        };
         const handler = () => {
           const selection = contents.window.getSelection();
-          if (!selection || selection.isCollapsed || !selection.rangeCount) {
+          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+          if (!hasRange || !text) {
+            const frame = contents.window.frameElement as HTMLElement | null | undefined;
+            const frameLostFocus = frame
+              ? frame.ownerDocument.activeElement !== frame
+              : typeof contents.document.hasFocus === 'function'
+                ? !contents.document.hasFocus()
+                : false;
+            if (blurredByTab || (tabKeyActive && frameLostFocus)) {
+              return;
+            }
             onSelection(null);
             return;
           }
-          const text = selection.toString().replace(/\s+/g, ' ').trim();
-          if (!text) {
-            onSelection(null);
-            return;
-          }
+          blurredByTab = false;
           try {
-            onSelection({ cfi: contents.cfiFromRange(selection.getRangeAt(0)), text });
+            onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
           } catch {
             // Selection can change while a section is being replaced.
           }
         };
+        contents.document.addEventListener('keydown', handleKeydown, true);
+        contents.document.addEventListener('focusout', handleFocusOut);
+        contents.document.addEventListener('focusin', clearBlurGuard);
+        contents.document.addEventListener('pointerdown', clearBlurGuard);
+        contents.document.addEventListener('mousedown', clearBlurGuard);
         contents.document.addEventListener('selectionchange', handler);
+        contents.window.addEventListener?.('blur', handleWindowBlur);
+        contents.window.addEventListener?.('focus', clearBlurGuard);
+        this.addContentCleanup(contents, () => {
+          clearTabTimer();
+          contents.document.removeEventListener('keydown', handleKeydown, true);
+          contents.document.removeEventListener('focusout', handleFocusOut);
+          contents.document.removeEventListener('focusin', clearBlurGuard);
+          contents.document.removeEventListener('pointerdown', clearBlurGuard);
+          contents.document.removeEventListener('mousedown', clearBlurGuard);
+          contents.document.removeEventListener('selectionchange', handler);
+          contents.window.removeEventListener?.('blur', handleWindowBlur);
+          contents.window.removeEventListener?.('focus', clearBlurGuard);
+        });
       });
     }
     this.onLocation = onLocation;
@@ -470,6 +637,9 @@ export class ReaderSession {
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
@@ -477,6 +647,12 @@ export class ReaderSession {
       }
     };
     this.rendition.on('relocated', this.relocated);
+    this.resizedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.rendition.on('resized', this.resizedListener);
     this.contentClick = (event, contents) => {
       const eventTarget = event.target as Element | null;
       const selection = contents.window.getSelection();
@@ -509,6 +685,7 @@ export class ReaderSession {
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
     await this.rendition.started;
+    this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
     this.normalizePaginatedManager();
     this.observeManagerViews();
@@ -626,6 +803,82 @@ export class ReaderSession {
     this.highlightCfis = applied;
   }
 
+  getVisiblePassages(): ReaderSelection[] {
+    if (!this.rendition) return [];
+    const contentsList = this.getActiveContents();
+    const passages: ReaderSelection[] = [];
+    const seenCfis = new Set<string>();
+
+    for (const contents of contentsList) {
+      const doc = contents.document;
+      if (!doc?.body) continue;
+      const metrics = this.getViewportMetrics(contents);
+      const pageRange = metrics === null ? this.resolveLocationRange(contents) : null;
+      if (metrics === null && pageRange === null) continue;
+      const candidates = Array.from(doc.body.querySelectorAll<HTMLElement>(PASSAGE_BLOCK_SELECTOR));
+
+      for (const block of candidates) {
+        if (block.querySelector(PASSAGE_BLOCK_SELECTOR)) continue;
+        if (metrics !== null) {
+          if (!this.isElementVisibleInViewport(block, contents, metrics)) continue;
+        } else if (pageRange && typeof pageRange.intersectsNode === 'function') {
+          try {
+            if (!pageRange.intersectsNode(block)) continue;
+          } catch {
+            // Fall through when range belongs to another document.
+          }
+        }
+        const text = normalizePassageText(block.textContent ?? '');
+        if (!text) continue;
+        try {
+          const range = doc.createRange();
+          range.selectNodeContents(block);
+          const cfi = contents.cfiFromRange(range);
+          if (cfi && !seenCfis.has(cfi)) {
+            seenCfis.add(cfi);
+            passages.push({ cfi, text });
+          }
+        } catch {
+          // Skip blocks whose CFI range cannot be computed while unloading.
+        }
+      }
+    }
+
+    if (passages.length > 0) return passages;
+    return this.getFallbackPagePassages(contentsList);
+  }
+
+  clearTextSelection(): void {
+    for (const contents of this.getActiveContents()) {
+      try {
+        contents.window.getSelection()?.removeAllRanges();
+      } catch {
+        // A contents document can unload while the selection is being cleared.
+      }
+    }
+  }
+
+  syncVisibleColumnLinks(): void {
+    if (!this.rendition) return;
+    for (const contents of this.getActiveContents()) {
+      const doc = contents.document;
+      if (!doc) continue;
+      const metrics = this.getViewportMetrics(contents);
+      if (!metrics) continue;
+      const links = doc.querySelectorAll<HTMLElement>(FOCUSABLE_LINK_SELECTOR);
+      for (const link of links) {
+        if (this.isElementVisibleInViewport(link, contents, metrics)) {
+          this.restoreSavedTabIndex(link);
+        } else {
+          if (!link.hasAttribute(SAVED_TABINDEX_ATTR)) {
+            link.setAttribute(SAVED_TABINDEX_ATTR, link.getAttribute('tabindex') ?? '');
+          }
+          link.setAttribute('tabindex', '-1');
+        }
+      }
+    }
+  }
+
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
     const normalizedQuery = normalizeReaderSearchQuery(query);
     if (!normalizedQuery) return [];
@@ -738,6 +991,7 @@ export class ReaderSession {
     });
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
+    this.syncVisibleColumnLinks();
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
@@ -749,6 +1003,15 @@ export class ReaderSession {
 
   destroy(): void {
     this.locationGeneration += 1;
+    for (const contents of [...this.trackedContents]) {
+      this.cleanupContents(contents);
+    }
+    this.trackedContents.clear();
+    this.contentCleanups.clear();
+    if (this.epubContainer) {
+      this.epubContainer.removeEventListener('scroll', this.handleContainerScroll);
+      this.epubContainer = null;
+    }
     if (this.observedManager && this.viewAdded) {
       this.observedManager.off?.('added', this.viewAdded);
     }
@@ -759,6 +1022,7 @@ export class ReaderSession {
     if (this.rendition && this.rendered) this.rendition.off('rendered', this.rendered);
     if (this.rendition && this.removed) this.rendition.off('removed', this.removed);
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
+    if (this.rendition && this.resizedListener) this.rendition.off('resized', this.resizedListener);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
@@ -779,11 +1043,17 @@ export class ReaderSession {
     this.observedManager = null;
     this.viewAdded = null;
     this.viewResized = null;
+    this.viewportTarget = null;
+    this.lockedScrollLeft = 0;
+    this.displayOperationCount = 0;
+    this.aligningFocusTarget = null;
+    this.unloadedHookRegistered = false;
     this.rendition = null;
     this.attached = null;
     this.rendered = null;
     this.removed = null;
     this.relocated = null;
+    this.resizedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
@@ -809,6 +1079,17 @@ export class ReaderSession {
       if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
     }
     this.book.destroy();
+  }
+
+  private prepareContents(contents: Contents): Promise<void> {
+    const work = this.harden(contents).then(() => {
+      if (!this.rendition) return;
+      this.registerContentFocusAndLinks(contents);
+      this.syncVisibleColumnLinks();
+    });
+    this.pendingContentWork.add(work);
+    void work.finally(() => this.pendingContentWork.delete(work));
+    return work;
   }
 
   private harden(contents: Contents): Promise<void> {
@@ -1124,6 +1405,319 @@ export class ReaderSession {
     await this.resizeViewport(Math.floor(current.width), Math.floor(current.height));
   }
 
+  private addContentCleanup(contents: Contents, cleanup: () => void): void {
+    const existing = this.contentCleanups.get(contents);
+    if (existing) existing.push(cleanup);
+    else this.contentCleanups.set(contents, [cleanup]);
+  }
+
+  private registerContentFocusAndLinks(contents: Contents): void {
+    if (this.trackedContents.has(contents)) return;
+    this.trackedContents.add(contents);
+    this.bindEpubContainer(contents);
+    const doc = contents.document;
+    if (!doc?.addEventListener) return;
+
+    const handleFocusIn = (event: FocusEvent) => {
+      const rawTarget = event.target as Element | null;
+      if (!rawTarget || rawTarget.nodeType !== 1 || rawTarget === this.aligningFocusTarget) return;
+      if (rawTarget === doc.documentElement || rawTarget === doc.body) return;
+
+      const container = this.bindEpubContainer(contents);
+      if (
+        container &&
+        !this.isProgrammaticScrollAllowed() &&
+        container.scrollLeft !== this.lockedScrollLeft
+      ) {
+        container.scrollLeft = this.lockedScrollLeft;
+      }
+
+      const focusTarget =
+        (rawTarget.closest?.(
+          'a[href], area[href], button, input, select, textarea, [tabindex]',
+        ) as HTMLElement | null) ?? (rawTarget as HTMLElement);
+      if (focusTarget === doc.documentElement || focusTarget === doc.body) return;
+
+      const metrics = this.getViewportMetrics(contents);
+      if (!metrics || this.isElementVisibleInViewport(focusTarget, contents, metrics)) {
+        if (
+          container &&
+          !this.isProgrammaticScrollAllowed() &&
+          container.scrollLeft !== this.lockedScrollLeft
+        ) {
+          container.scrollLeft = this.lockedScrollLeft;
+        }
+        return;
+      }
+
+      const cfi = this.cfiForElement(focusTarget, contents);
+      if (!cfi || !this.rendition) return;
+      void this.alignOffscreenFocus(cfi, focusTarget, contents);
+    };
+
+    doc.addEventListener('focusin', handleFocusIn);
+    this.addContentCleanup(contents, () => {
+      doc.removeEventListener('focusin', handleFocusIn);
+      if (doc.querySelectorAll) {
+        for (const link of doc.querySelectorAll<HTMLElement>(`[${SAVED_TABINDEX_ATTR}]`)) {
+          this.restoreSavedTabIndex(link);
+        }
+      }
+    });
+  }
+
+  private cleanupContents(contents: Contents): void {
+    const cleanups = this.contentCleanups.get(contents);
+    if (cleanups) {
+      for (const cleanup of cleanups) cleanup();
+      this.contentCleanups.delete(contents);
+    }
+    this.trackedContents.delete(contents);
+  }
+
+  private restoreSavedTabIndex(element: HTMLElement): void {
+    if (!element.hasAttribute(SAVED_TABINDEX_ATTR)) return;
+    const saved = element.getAttribute(SAVED_TABINDEX_ATTR) ?? '';
+    element.removeAttribute(SAVED_TABINDEX_ATTR);
+    if (saved === '') element.removeAttribute('tabindex');
+    else element.setAttribute('tabindex', saved);
+  }
+
+  private cfiForElement(element: Element, contents: Contents): string | null {
+    try {
+      const range = contents.document.createRange();
+      range.selectNodeContents(element);
+      const cfi = contents.cfiFromRange(range);
+      if (cfi) return cfi;
+    } catch {
+      // Fall back to node CFI when element contents cannot form a range.
+    }
+    try {
+      return contents.cfiFromNode?.(element) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async alignOffscreenFocus(
+    cfi: string,
+    element: HTMLElement,
+    contents: Contents,
+  ): Promise<void> {
+    if (!this.rendition) return;
+    try {
+      await this.navigate(() => this.rendition!.display(cfi));
+      const container = this.bindEpubContainer(contents);
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+      if (element.isConnected && contents.document?.activeElement !== element) {
+        this.aligningFocusTarget = element;
+        try {
+          element.focus({ preventScroll: true });
+        } finally {
+          this.aligningFocusTarget = null;
+        }
+      }
+    } catch {
+      // Ignore canceled or stale focus alignment when switching chapters.
+    }
+  }
+
+  private bindEpubContainer(contents?: Contents): HTMLElement | null {
+    const frameContainer = contents?.window?.frameElement?.closest?.(
+      '.epub-container',
+    ) as HTMLElement | null;
+    const queriedContainer =
+      frameContainer ?? this.viewportTarget?.querySelector<HTMLElement>('.epub-container') ?? null;
+    if (queriedContainer && queriedContainer !== this.epubContainer) {
+      this.epubContainer?.removeEventListener('scroll', this.handleContainerScroll);
+      this.epubContainer = queriedContainer;
+      this.lockedScrollLeft = queriedContainer.scrollLeft;
+      queriedContainer.addEventListener('scroll', this.handleContainerScroll);
+    }
+    return this.epubContainer;
+  }
+
+  private isProgrammaticScrollAllowed(): boolean {
+    return this.displayOperationCount > 0 || this.userNavigationPending;
+  }
+
+  private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.displayOperationCount += 1;
+    try {
+      return await operation();
+    } finally {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+      this.syncVisibleColumnLinks();
+    }
+  }
+
+  private getActiveContents(): Contents[] {
+    const rendition = this.rendition as
+      (Rendition & { getContents?: () => Contents | Contents[] }) | null;
+    const fromRendition =
+      typeof rendition?.getContents === 'function' ? rendition.getContents() : null;
+    const list = Array.isArray(fromRendition)
+      ? fromRendition
+      : fromRendition
+        ? [fromRendition]
+        : [];
+    const combined = list.length > 0 ? list : [...this.trackedContents];
+    const currentIndex = this.current?.start?.index;
+    if (typeof currentIndex === 'number') {
+      const matching = combined.filter(
+        (item) => item.sectionIndex === undefined || item.sectionIndex === currentIndex,
+      );
+      if (matching.length > 0) return matching;
+    }
+    return combined;
+  }
+
+  private getViewportMetrics(contents: Contents): {
+    viewportWidth: number;
+    viewportHeight: number;
+    frameOffsetLeft: number;
+    frameOffsetTop: number;
+  } | null {
+    const container = this.bindEpubContainer(contents) ?? this.viewportTarget;
+    if (!container) return null;
+    const viewportRect = container.getBoundingClientRect();
+    const viewportWidth =
+      viewportRect.width || container.clientWidth || this.viewportSize?.width || 0;
+    const viewportHeight =
+      viewportRect.height || container.clientHeight || this.viewportSize?.height || 0;
+    if (viewportWidth <= 0) return null;
+
+    const frame = contents.window?.frameElement as HTMLElement | null | undefined;
+    if (!frame || typeof frame.getBoundingClientRect !== 'function') {
+      return {
+        viewportWidth,
+        viewportHeight,
+        frameOffsetLeft: this.epubContainer ? -this.epubContainer.scrollLeft : 0,
+        frameOffsetTop: this.epubContainer ? -this.epubContainer.scrollTop : 0,
+      };
+    }
+
+    const frameRect = frame.getBoundingClientRect();
+    const rawLeft = frameRect.left - viewportRect.left;
+    const rawTop = frameRect.top - viewportRect.top;
+    const frameOffsetLeft =
+      this.epubContainer &&
+      this.epubContainer.scrollLeft !== 0 &&
+      Math.abs(rawLeft - (frame.offsetLeft || 0)) < VIEWPORT_RECT_EPSILON
+        ? (frame.offsetLeft || 0) - this.epubContainer.scrollLeft
+        : rawLeft;
+    const frameOffsetTop =
+      this.epubContainer &&
+      this.epubContainer.scrollTop !== 0 &&
+      Math.abs(rawTop - (frame.offsetTop || 0)) < VIEWPORT_RECT_EPSILON
+        ? (frame.offsetTop || 0) - this.epubContainer.scrollTop
+        : rawTop;
+
+    return { viewportWidth, viewportHeight, frameOffsetLeft, frameOffsetTop };
+  }
+
+  private getElementRects(element: Element): DOMRect[] {
+    const clientRects =
+      typeof element.getClientRects === 'function' ? Array.from(element.getClientRects()) : [];
+    const nonEmpty = clientRects.filter((rect) => rect.width > 0 || rect.height > 0);
+    if (nonEmpty.length > 0) return nonEmpty;
+    if (typeof element.getBoundingClientRect === 'function') {
+      const bounding = element.getBoundingClientRect();
+      if (bounding.width > 0 || bounding.height > 0) return [bounding];
+    }
+    return [];
+  }
+
+  private isElementVisibleInViewport(
+    element: Element,
+    contents: Contents,
+    precomputedMetrics?: {
+      viewportWidth: number;
+      viewportHeight: number;
+      frameOffsetLeft: number;
+      frameOffsetTop: number;
+    },
+  ): boolean {
+    const metrics = precomputedMetrics ?? this.getViewportMetrics(contents);
+    if (!metrics) return true;
+    const rects = this.getElementRects(element);
+    if (rects.length === 0) return false;
+    const { viewportWidth, viewportHeight, frameOffsetLeft, frameOffsetTop } = metrics;
+    return rects.some((rect) => {
+      const left = frameOffsetLeft + rect.left;
+      const right = frameOffsetLeft + rect.right;
+      const horizontallyVisible =
+        right > VIEWPORT_RECT_EPSILON && left < viewportWidth - VIEWPORT_RECT_EPSILON;
+      if (!horizontallyVisible) return false;
+      if (viewportHeight <= 0) return true;
+      const top = frameOffsetTop + rect.top;
+      const bottom = frameOffsetTop + rect.bottom;
+      return bottom > VIEWPORT_RECT_EPSILON && top < viewportHeight - VIEWPORT_RECT_EPSILON;
+    });
+  }
+
+  private resolveSingleCfiRange(cfi: string, contents?: Contents): Range | null {
+    if (!cfi) return null;
+    try {
+      const fromContents = contents?.range?.(cfi);
+      if (fromContents) return fromContents;
+    } catch {
+      // Try rendition range lookup next.
+    }
+    try {
+      return this.rendition?.getRange?.(cfi) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveLocationRange(contents?: Contents): Range | null {
+    const location = this.current ?? this.rendition?.location ?? null;
+    const startCfi = location?.start?.cfi;
+    if (!startCfi) return null;
+    const endCfi = location?.end?.cfi ?? startCfi;
+    const startRange = this.resolveSingleCfiRange(startCfi, contents);
+    const endRange =
+      endCfi === startCfi ? startRange : this.resolveSingleCfiRange(endCfi, contents);
+    if (!startRange || !endRange) return null;
+    const doc = startRange.startContainer.ownerDocument;
+    if (!doc || doc !== endRange.endContainer.ownerDocument) return null;
+    try {
+      const range = doc.createRange();
+      range.setStart(startRange.startContainer, startRange.startOffset);
+      range.setEnd(endRange.endContainer, endRange.endOffset);
+      return range;
+    } catch {
+      return null;
+    }
+  }
+
+  private getFallbackPagePassages(contentsList: Contents[]): ReaderSelection[] {
+    const location = this.current ?? this.rendition?.location ?? null;
+    const startCfi = location?.start?.cfi ?? '';
+    if (!startCfi) return [];
+    const endCfi = location?.end?.cfi ?? startCfi;
+    const primaryContents = contentsList[0];
+    const pageRange = this.resolveLocationRange(primaryContents);
+    let cfi = mergeCfiRange(startCfi, endCfi);
+    let text = '';
+
+    if (pageRange) {
+      text = normalizePassageText(pageRange.toString());
+      if (primaryContents?.cfiFromRange) {
+        try {
+          cfi = primaryContents.cfiFromRange(pageRange) || cfi;
+        } catch {
+          // Keep merged start..end CFI range fallback.
+        }
+      }
+    }
+    return cfi && text ? [{ cfi, text }] : [];
+  }
+
   private observeViewport(target: HTMLElement): void {
     if (typeof ResizeObserver === 'undefined') return;
 
@@ -1157,7 +1751,15 @@ export class ReaderSession {
       resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
     };
     if (!runtimeRendition.q?.enqueue) {
-      this.applyViewportResize(runtimeRendition, width, height);
+      this.displayOperationCount += 1;
+      try {
+        this.applyViewportResize(runtimeRendition, width, height);
+      } finally {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+        this.syncVisibleColumnLinks();
+      }
       return Promise.resolve();
     }
     this.pendingViewportSize = { width, height };
@@ -1189,25 +1791,27 @@ export class ReaderSession {
       let target: string | undefined;
       let resized = false;
       let generation = this.locationGeneration;
-      await runtimeRendition.q!.enqueue(() => {
-        const next = this.pendingViewportSize;
-        this.pendingViewportSize = null;
-        if (!next || this.rendition !== runtimeRendition) return;
-        generation = this.locationGeneration;
-        this.rearmSettledUserNavigation();
-        const applied = this.applyViewportResize(runtimeRendition, next.width, next.height);
-        resized = applied.resized;
-        target = applied.target;
-      });
-      if (resized && this.rendition === runtimeRendition) {
-        await runtimeRendition.q!.enqueue(() => {});
-        if (!this.pendingViewportSize && target?.startsWith('epubcfi(')) {
-          if (this.locationGeneration === generation) {
-            this.rearmSettledUserNavigation();
+      await this.runDisplayOperation(async () => {
+        await runtimeRendition.q!.enqueue(() => {
+          const next = this.pendingViewportSize;
+          this.pendingViewportSize = null;
+          if (!next || this.rendition !== runtimeRendition) return;
+          generation = this.locationGeneration;
+          this.rearmSettledUserNavigation();
+          const applied = this.applyViewportResize(runtimeRendition, next.width, next.height);
+          resized = applied.resized;
+          target = applied.target;
+        });
+        if (resized && this.rendition === runtimeRendition) {
+          await runtimeRendition.q!.enqueue(() => {});
+          if (!this.pendingViewportSize && target?.startsWith('epubcfi(')) {
+            if (this.locationGeneration === generation) {
+              this.rearmSettledUserNavigation();
+            }
+            await this.alignCfiAfterRender(target, generation);
           }
-          await this.alignCfiAfterRender(target, generation);
         }
-      }
+      });
       if (this.locationGeneration === generation) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -1242,9 +1846,9 @@ export class ReaderSession {
       runtimeRendition.resize(width, height);
     }
     if (runtimeRendition.manager && !hadRenditionLocation && !this.userNavigationPending) {
-      const displayPromise =
-        target === undefined ? runtimeRendition.display() : runtimeRendition.display(target);
-      void displayPromise.catch(() => {
+      void this.runDisplayOperation(() =>
+        target === undefined ? runtimeRendition.display() : runtimeRendition.display(target),
+      ).catch(() => {
         // The restored passage can be superseded by a newer navigation or resize.
       });
     }
@@ -1286,8 +1890,16 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    if (target === undefined) await rendition.display();
-    else await rendition.display(target);
+    this.displayOperationCount += 1;
+    try {
+      if (target === undefined) await rendition.display();
+      else await rendition.display(target);
+    } finally {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+      this.syncVisibleColumnLinks();
+    }
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -1299,7 +1911,7 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return null;
     try {
-      await rendition.display(section.href);
+      await this.runDisplayOperation(() => rendition.display(section.href));
       if (!this.isCurrentLocationOperation(generation)) return null;
       if (target.contentXPath === '/html/body') return section.href;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
@@ -1310,7 +1922,7 @@ export class ReaderSession {
       if (!node) return null;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return null;
-      await rendition.display(cfi);
+      await this.runDisplayOperation(() => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation) ? cfi : null;
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -1358,6 +1970,7 @@ export class ReaderSession {
       if (previousNavigation) await previousNavigation;
       while (this.resizeDrain) await this.resizeDrain;
       const generation = this.beginLocationOperation(true);
+      this.displayOperationCount += 1;
       try {
         await display();
         await this.settlePendingSectionRenders(generation, true);
@@ -1367,6 +1980,11 @@ export class ReaderSession {
           this.userNavigationStartCfi = null;
         }
         throw error;
+      } finally {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+        this.syncVisibleColumnLinks();
       }
     } finally {
       if (this.activeNavigation === gate) this.activeNavigation = null;
@@ -1472,7 +2090,7 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    void rendition.display(cfi).catch(() => {
+    void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
   }
