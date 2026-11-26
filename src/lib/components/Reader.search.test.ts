@@ -3,6 +3,7 @@
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReaderSearchBatch, ReaderSearchCursor, ReaderSearchResult } from '../reader/search';
+import type * as ReaderSessionModule from '../reader/session';
 import type {
   ReaderLinkReturnTarget,
   ReaderLocation,
@@ -47,33 +48,37 @@ vi.mock('../database/database', () => ({
   setPreferences: setPreferencesMock,
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class {
-    open(
-      _target: HTMLElement,
-      _cfi: string | null,
-      _xpath: string | null,
-      _percentage: number | null,
-      _appearance: unknown,
-      onLocation: NonNullable<typeof sessionMock.onLocation>,
-      onTap: NonNullable<typeof sessionMock.onTap>,
-    ): Promise<void> {
-      sessionMock.onLocation = onLocation;
-      sessionMock.onTap = onTap;
-      return sessionMock.open();
-    }
-    tableOfContents = sessionMock.tableOfContents;
-    updateHighlights = sessionMock.updateHighlights;
-    setSearchHighlight = sessionMock.setSearchHighlight;
-    search = sessionMock.search;
-    displayCfi = sessionMock.displayCfi;
-    display = sessionMock.display;
-    next = sessionMock.next;
-    previous = sessionMock.previous;
-    applyAppearance = sessionMock.applyAppearance;
-    destroy = sessionMock.destroy;
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof ReaderSessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class {
+      open(
+        _target: HTMLElement,
+        _cfi: string | null,
+        _xpath: string | null,
+        _percentage: number | null,
+        _appearance: unknown,
+        onLocation: NonNullable<typeof sessionMock.onLocation>,
+        onTap: NonNullable<typeof sessionMock.onTap>,
+      ): Promise<void> {
+        sessionMock.onLocation = onLocation;
+        sessionMock.onTap = onTap;
+        return sessionMock.open();
+      }
+      tableOfContents = sessionMock.tableOfContents;
+      updateHighlights = sessionMock.updateHighlights;
+      setSearchHighlight = sessionMock.setSearchHighlight;
+      search = sessionMock.search;
+      displayCfi = sessionMock.displayCfi;
+      display = sessionMock.display;
+      next = sessionMock.next;
+      previous = sessionMock.previous;
+      applyAppearance = sessionMock.applyAppearance;
+      destroy = sessionMock.destroy;
+    },
+  };
+});
 
 import Reader from './Reader.svelte';
 
