@@ -7,10 +7,15 @@ import {
   confirmSync,
   getBooks,
   getPendingSync,
+  getPreferences,
+  getReadingState,
   getSyncStatus,
+  markBookCompleted,
   reconcileBooks,
   replaceBooksInTransaction,
+  resetLocalDatabase,
   saveLocalProgress,
+  setPreference,
   type BookRecord,
 } from './database';
 
@@ -819,6 +824,96 @@ it('clears retry errors when a new browser progress revision replaces the failed
   });
 });
 
+it('preserves browser sync timestamps when marking a book completed', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const syncedLocalUpdatedAt = '2026-09-07T00:00:00.000Z';
+  const serverUpdatedAt = '2026-09-07T00:00:05.000Z';
+  const unreadBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:11',
+    volumeId: 11,
+    chapterId: 11,
+    pagesRead: 0,
+    lastReadAt: null,
+  };
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [existingBook, unreadBook],
+      readingState: {
+        [existingBook.id]: {
+          cfi: 'epubcfi(/6/4)',
+          xpath: '/html/body/p[2]',
+          percentage: 0.4,
+          localUpdatedAt: syncedLocalUpdatedAt,
+          syncedLocalUpdatedAt,
+          serverUpdatedAt,
+          pendingSync: false,
+          syncRevision: 2,
+        },
+      },
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  await markBookCompleted(existingBook);
+  await markBookCompleted(unreadBook);
+
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: '',
+    xpath: null,
+    percentage: 1,
+    syncedLocalUpdatedAt,
+    serverUpdatedAt,
+    pendingSync: true,
+    syncRevision: 3,
+  });
+  await expect(getReadingState(unreadBook.id)).resolves.toMatchObject({
+    cfi: '',
+    xpath: null,
+    percentage: 1,
+    syncedLocalUpdatedAt: null,
+    serverUpdatedAt: null,
+    pendingSync: true,
+    syncRevision: 1,
+  });
+  await expect(getBooks('server')).resolves.toMatchObject([
+    { id: existingBook.id, pagesRead: existingBook.pages },
+    { id: unreadBook.id, pagesRead: unreadBook.pages },
+  ]);
+  await expect(getPendingSync('server')).resolves.toEqual([
+    expect.objectContaining({
+      bookId: existingBook.id,
+      payload: JSON.stringify({
+        libraryId: existingBook.libraryId,
+        seriesId: existingBook.seriesId,
+        volumeId: existingBook.volumeId,
+        chapterId: existingBook.chapterId,
+        pageNum: existingBook.pages,
+        bookScrollId: null,
+      }),
+      revision: 3,
+    }),
+    expect.objectContaining({
+      bookId: unreadBook.id,
+      payload: JSON.stringify({
+        libraryId: unreadBook.libraryId,
+        seriesId: unreadBook.seriesId,
+        volumeId: unreadBook.volumeId,
+        chapterId: unreadBook.chapterId,
+        pageNum: unreadBook.pages,
+        bookScrollId: null,
+      }),
+      revision: 1,
+    }),
+  ]);
+});
+
 it('accepts the selected browser server progress and drops only the displayed local revision', async () => {
   Object.defineProperty(window, 'localStorage', {
     configurable: true,
@@ -885,4 +980,38 @@ it('accepts the selected browser server progress and drops only the displayed lo
   const newer = await getPendingSync('server');
   await expect(acceptRemoteProgress(existingBook, remote, 2, updatedAt)).resolves.toBe(false);
   await expect(getPendingSync('server')).resolves.toEqual(newer);
+});
+
+it('round-trips library filter preferences in browser storage and clears them on database reset', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+
+  const initial = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(initial.size).toBe(0);
+
+  await setPreference('libraryDownloadedOnly', 'true');
+  await setPreference('libraryHideCompleted', 'false');
+
+  const saved = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(saved.get('libraryDownloadedOnly')).toBe('true');
+  expect(saved.get('libraryHideCompleted')).toBe('false');
+  expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
+    preferences: {
+      libraryDownloadedOnly: 'true',
+      libraryHideCompleted: 'false',
+    },
+  });
+
+  await setPreference('libraryDownloadedOnly', 'false');
+  await setPreference('libraryHideCompleted', 'false');
+
+  const cleared = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(cleared.get('libraryDownloadedOnly')).toBe('false');
+  expect(cleared.get('libraryHideCompleted')).toBe('false');
+
+  await resetLocalDatabase();
+  const afterReset = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(afterReset.size).toBe(0);
 });

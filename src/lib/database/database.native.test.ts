@@ -12,8 +12,12 @@ const mocks = vi.hoisted(() => {
     executeTransaction,
     getVersion: vi.fn(async () => ({ version: databaseVersion })),
     open: vi.fn(async () => undefined),
-    query: vi.fn(async () => ({ values: [] as Record<string, unknown>[] })),
-    run: vi.fn(async () => ({ changes: { changes: 1 } })),
+    query: vi.fn<
+      (statement: string, values?: unknown[]) => Promise<{ values: Record<string, unknown>[] }>
+    >(async () => ({ values: [] })),
+    run: vi.fn<
+      (statement: string, values?: unknown[]) => Promise<{ changes: { changes: number } }>
+    >(async () => ({ changes: { changes: 1 } })),
   };
   const sqlite = {
     checkConnectionsConsistency: vi.fn(async () => ({ result: true })),
@@ -98,6 +102,46 @@ it('reads several preferences with one native query', async () => {
   );
   expect(values.get('uiTheme')).toBe('eink');
   expect(values.has('uiMode')).toBe(false);
+});
+
+it('round-trips library filter preferences through native SQLite upserts and batched reads', async () => {
+  const { getPreferences, setPreference } = await import('./database');
+  const stored = new Map<string, string>();
+  mocks.db.run.mockImplementation(async (_statement: string, values?: unknown[]) => {
+    if (Array.isArray(values)) {
+      for (let index = 0; index < values.length; index += 3) {
+        stored.set(String(values[index]), String(values[index + 1]));
+      }
+    }
+    return { changes: { changes: 1 } };
+  });
+  mocks.db.query.mockImplementation(async (_statement: string, values?: unknown[]) => ({
+    values: (values ?? [])
+      .map((key) => String(key))
+      .filter((key) => stored.has(key))
+      .map((key) => ({ key, value: stored.get(key)! })),
+  }));
+
+  const initial = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(initial.size).toBe(0);
+
+  await setPreference('libraryDownloadedOnly', 'true');
+  await setPreference('libraryHideCompleted', 'false');
+
+  const saved = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(mocks.db.query).toHaveBeenLastCalledWith(
+    'SELECT key, value FROM preferences WHERE key IN (?, ?)',
+    ['libraryDownloadedOnly', 'libraryHideCompleted'],
+  );
+  expect(saved.get('libraryDownloadedOnly')).toBe('true');
+  expect(saved.get('libraryHideCompleted')).toBe('false');
+
+  await setPreference('libraryDownloadedOnly', 'false');
+  await setPreference('libraryHideCompleted', 'false');
+
+  const reset = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(reset.get('libraryDownloadedOnly')).toBe('false');
+  expect(reset.get('libraryHideCompleted')).toBe('false');
 });
 
 it('groups progress, queue, and book updates into one native transaction', async () => {
@@ -193,7 +237,7 @@ it('keeps a failed native progress transaction atomic', async () => {
 it('groups completion and acknowledgement writes separately', async () => {
   const { confirmSync, markBookCompleted } = await import('./database');
 
-  await markBookCompleted(book, readingState);
+  await markBookCompleted(book);
   await confirmSync(book.id, '2026-01-02T00:00:00.000Z', 1, readingState.localUpdatedAt);
 
   expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);

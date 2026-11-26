@@ -32,13 +32,14 @@ jobs:
     env:
       TESTED_REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
     outputs:
+      already_released: ${{ steps.release_preflight.outputs.already_released }}
       release_tag: ${{ steps.release_version.outputs.release_tag }}
       version_base: ${{ steps.release_version.outputs.version_base }}
       tested_revision: ${{ steps.release_version.outputs.tested_revision }}
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TESTED_REVISION }}
 
@@ -54,26 +55,38 @@ jobs:
             exit 1
           fi
 
+      - name: Check for existing release
+        id: release_preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_REVISION: ${{ env.TESTED_REVISION }}
+        run: node scripts/github-release.mjs preflight
+
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
 
       - name: Set up Java
-        uses: actions/setup-java@v6
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: 21
           cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
 
       - name: Install dependencies
+        if: steps.release_preflight.outputs.already_released != 'true'
         run: npm ci
 
       - name: Derive release version
+        if: steps.release_preflight.outputs.already_released != 'true'
         id: release_version
         run: |
           set -eu
@@ -88,40 +101,67 @@ jobs:
           echo "tested_revision=${TESTED_REVISION}" >> "$GITHUB_OUTPUT"
 
       - name: Finalize release notes
+        if: steps.release_preflight.outputs.already_released != 'true'
         run: npm run release:finalize
 
       - name: Run release quality gates
+        if: steps.release_preflight.outputs.already_released != 'true'
         run: npm run verify
 
       - name: Build debug APK for manual release journey
-        if: github.event_name == 'workflow_dispatch'
+        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
         env:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
-      - name: Enable emulator hardware acceleration for manual journey
-        if: github.event_name == 'workflow_dispatch'
+      - name: Enable emulator hardware acceleration
+        if: steps.release_preflight.outputs.already_released != 'true'
         run: |
           if [ -c /dev/kvm ]; then
             sudo chgrp "$(id -gn)" /dev/kvm
             sudo chmod g+rw /dev/kvm
           fi
 
-      - name: Verify manually dispatched revision with reading journey
-        if: github.event_name == 'workflow_dispatch'
-        uses: reactivecircus/android-emulator-runner@v2
+      - name: Cache Android AVD snapshot
+        if: steps.release_preflight.outputs.already_released != 'true'
+        id: avd-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ runner.os }}-api-36-google_apis-x86_64-pixel_6-v1
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.release_preflight.outputs.already_released != 'true' && steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 36
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
+          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
           force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
+      - name: Verify manually dispatched revision with reading journey
+        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:journey
 
       - name: Confirm release revision is current before signing
+        if: steps.release_preflight.outputs.already_released != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TESTED_REVISION: ${{ env.TESTED_REVISION }}
@@ -134,6 +174,7 @@ jobs:
           fi
 
       - name: Restore signing key
+        if: steps.release_preflight.outputs.already_released != 'true'
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -166,19 +207,14 @@ jobs:
           EOF
 
       - name: Build signed release APK
+        if: steps.release_preflight.outputs.already_released != 'true'
         env:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:release
 
-      - name: Enable emulator hardware acceleration for signed APK smoke test
-        run: |
-          if [ -c /dev/kvm ]; then
-            sudo chgrp "$(id -gn)" /dev/kvm
-            sudo chmod g+rw /dev/kvm
-          fi
-
       - name: Smoke-test signed release APK
-        uses: reactivecircus/android-emulator-runner@v2
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         env:
           ANDROID_PACKAGE_NAME: app.turnleaf.reader
           ANDROID_APK_PATH: android/app/build/outputs/apk/release/app-release.apk
@@ -187,13 +223,14 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
-          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:smoke
 
       - name: Stage release artifacts and notes
+        if: steps.release_preflight.outputs.already_released != 'true'
         env:
           TESTED_REVISION: ${{ steps.release_version.outputs.tested_revision }}
         run: |
@@ -211,7 +248,8 @@ jobs:
           printf '%s\n' "$TESTED_REVISION" > release-payload/tested-revision.txt
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v7
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: turnleaf-release
           path: release-payload
@@ -219,14 +257,24 @@ jobs:
 
   publish-github-release:
     needs: build-release-apk
+    if: needs.build-release-apk.outputs.already_released != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
+      - name: Check out release helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build-release-apk.outputs.tested_revision }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/github-release.mjs
+          sparse-checkout-cone-mode: false
+
       - name: Download tested release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: turnleaf-release
           path: release-payload
@@ -260,16 +308,4 @@ jobs:
           RELEASE_TAG: ${{ needs.build-release-apk.outputs.release_tag }}
           VERSION_BASE: ${{ needs.build-release-apk.outputs.version_base }}
           TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
-        run: |
-          set -eu
-          PUBLISHED_NOTES="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" \
-            --jq '.[] | select(.draft == false) | .body')"
-          if printf '%s\n' "$PUBLISHED_NOTES" | grep -Fxq "Tested revision: \`$TESTED_REVISION\`"; then
-            echo "A release already exists for this tested revision."
-            exit 0
-          fi
-          gh release create "$RELEASE_TAG" "release-payload/app-release.apk" "release-payload/app-release.apk.sha256" \
-            --title "Turnleaf $VERSION_BASE" \
-            --notes-file "release-payload/turnleaf-release-notes.md" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$TESTED_REVISION"
+        run: node scripts/github-release.mjs publish

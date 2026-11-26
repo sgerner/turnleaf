@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- ci: pin AVD cache actions and retain Gradle cache
+- ci: cache Android AVD snapshots and prune unused Gradle cache
+- Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
 - Enforce zero Svelte warnings and TypeScript ESLint parsing
