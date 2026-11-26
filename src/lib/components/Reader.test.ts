@@ -94,7 +94,9 @@ const sessionState = vi.hoisted(() => {
     displayServerPercentage: vi.fn(async () => true),
     tableOfContents: vi.fn(() => toc),
     updateHighlights: vi.fn(),
+    getVisiblePassages: vi.fn((): ReaderSelection[] => []),
     clearSelection: vi.fn(),
+    clearTextSelection: vi.fn(),
     search: vi.fn(async () => [
       {
         cfi: 'epubcfi(/6/2!/4/2/8:0)',
@@ -547,6 +549,44 @@ describe('Reader overlays, focus, keyboard shortcuts, and Back navigation', () =
     revealButton.dispatchEvent(spaceOnReveal);
     expect(spaceOnReveal.defaultPrevented).toBe(false);
     expect(sessionState.mockSession.next).toHaveBeenCalledTimes(2);
+
+    // Shift+Arrow selection keys do not turn pages
+    const shiftRight = new KeyboardEvent('keydown', {
+      key: 'ArrowRight',
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    sessionState.emitIframeKeydown(shiftRight);
+    expect(shiftRight.defaultPrevented).toBe(false);
+    expect(sessionState.mockSession.next).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains modal focus when saving a visible page passage without an active text selection', async () => {
+    sessionState.mockSession.getVisiblePassages.mockReturnValueOnce([
+      { cfi: 'epubcfi(/6/2!/4/2/2:0)', text: 'Keyboard-selected visible passage' },
+    ]);
+    await renderReader();
+
+    host.querySelector<HTMLButtonElement>('.reader-top-reveal')!.click();
+    await flushReader();
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-annotations"]')!.click();
+    await flushReader();
+
+    const annotationsDialog = host.querySelector<HTMLElement>('#reader-annotations')!;
+    expect(
+      annotationsDialog.querySelector('select[aria-label="Passage on this page"]'),
+    ).not.toBeNull();
+
+    annotationsDialog
+      .querySelector<HTMLFormElement>('form')!
+      .dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+    await flushReader();
+
+    expect(annotationsDialog.contains(document.activeElement)).toBe(true);
+    expect((document.activeElement as HTMLElement)?.getAttribute('aria-label')).toBe(
+      'Edit note for Keyboard-selected visible passage',
+    );
   });
 
   it('stacks bottom overlays in one container above reading progress and lifts above footer details', async () => {

@@ -125,6 +125,9 @@
   let exporting = $state(false);
   let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
+  let visiblePassages = $state<ReaderSelection[]>([]);
+  let selectedPassageIndex = $state(0);
+  let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
   let searchQuery = $state('');
@@ -205,7 +208,9 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
+        if (location?.cfi !== next.cfi) selectedText = null;
         location = next;
+        if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
         if (origin === 'link') {
           linkReturnTarget = returnTarget ?? null;
@@ -496,10 +501,22 @@
     resumeChromeHide();
   }
 
+  function refreshVisiblePassages(): void {
+    visiblePassages = session?.getVisiblePassages() ?? [];
+    selectedPassageIndex = 0;
+  }
+
+  function clipPassageOptionLabel(text: string, index: number): string {
+    const preview = text.length > 88 ? `${text.slice(0, 87).trimEnd()}…` : text;
+    return `Passage ${index + 1}: ${preview}`;
+  }
+
   function openAnnotations(): void {
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
+    refreshVisiblePassages();
+    annotationMessage = '';
     annotationsVisible = true;
     settingsVisible = false;
     tocVisible = false;
@@ -522,7 +539,10 @@
       selectedText = null;
       session?.clearSelection();
     }
+    visiblePassages = [];
+    selectedPassageIndex = 0;
     annotationDraft = '';
+    annotationMessage = '';
     exportFallback = '';
     exportMessage = '';
     const opener = annotationsOpener;
@@ -720,14 +740,18 @@
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(): void {
-    if (!selectedText) return;
-    const savedCfi = selectedText.cfi.trim();
-    annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
+  function saveAnnotation(target: ReaderSelection | null = selectedText): void {
+    if (!target) return;
+    const savedCfi = target.cfi.trim();
+    const hadNote = Boolean(annotationDraft.trim());
+    annotations = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
     session?.updateHighlights(annotations);
     annotationDraft = '';
-    selectedText = null;
-    session?.clearSelection();
+    if (selectedText) {
+      selectedText = null;
+      session?.clearSelection();
+    }
+    annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     if (annotationsVisible) {
       const saved = annotations.find((entry) => entry.cfi === savedCfi) ?? annotations.at(-1);
@@ -1024,7 +1048,7 @@
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed || event.defaultPrevented) return;
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
     if (event.key === 'Escape') {
       if (closeActiveReaderPanel()) {
         event.preventDefault();
@@ -1115,51 +1139,6 @@
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport}></div>
 
-  <p class="sr-only" aria-live="polite" aria-atomic="true">
-    {#if location}
-      {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
-      {currentProgressLabel()} complete.
-    {/if}
-  </p>
-
-  <p id="reader-keyboard-help" class="sr-only">
-    Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
-    Press Escape to close an open reader panel.
-  </p>
-
-  <nav
-    class="tap-zones"
-    aria-label="Page navigation"
-    inert={Boolean(
-      settingsVisible ||
-      tocVisible ||
-      bookmarksVisible ||
-      annotationsVisible ||
-      searchVisible ||
-      pendingSyncLocation,
-    )}
-  >
-    <button
-      type="button"
-      aria-label="Previous page"
-      aria-keyshortcuts="ArrowLeft PageUp"
-      onclick={() => turn('previous')}
-    ></button>
-    <button
-      type="button"
-      aria-label={controlsVisible ? 'Hide reading controls' : 'Show reading controls'}
-      aria-keyshortcuts="Escape"
-      onclick={() => (controlsVisible ? dismissReaderChrome() : showControls())}
-    ></button>
-    <button
-      bind:this={nextPageButton}
-      type="button"
-      aria-label="Next page"
-      aria-keyshortcuts="ArrowRight PageDown Space"
-      onclick={() => turn('next')}
-    ></button>
-  </nav>
-
   <p class="sr-only" role="status">{selectionMessage}</p>
   {#if (readerSyncMessage && controlsVisible) || ((selectedText || linkReturnTarget) && !hasOpenReaderPanel())}
     <div class="reader-bottom-overlays" class:reader-bottom-overlays-lifted={footerVisible}>
@@ -1219,6 +1198,51 @@
       {/if}
     </div>
   {/if}
+
+  <p class="sr-only" aria-live="polite" aria-atomic="true">
+    {#if location}
+      {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
+      {currentProgressLabel()} complete.
+    {/if}
+  </p>
+
+  <p id="reader-keyboard-help" class="sr-only">
+    Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
+    Press Escape to close an open reader panel or clear selected text.
+  </p>
+
+  <nav
+    class="tap-zones"
+    aria-label="Page navigation"
+    inert={Boolean(
+      settingsVisible ||
+      tocVisible ||
+      bookmarksVisible ||
+      annotationsVisible ||
+      searchVisible ||
+      pendingSyncLocation,
+    )}
+  >
+    <button
+      type="button"
+      aria-label="Previous page"
+      aria-keyshortcuts="ArrowLeft PageUp"
+      onclick={() => turn('previous')}
+    ></button>
+    <button
+      type="button"
+      aria-label={controlsVisible ? 'Hide reading controls' : 'Show reading controls'}
+      aria-keyshortcuts="Escape"
+      onclick={() => (controlsVisible ? dismissReaderChrome() : showControls())}
+    ></button>
+    <button
+      bind:this={nextPageButton}
+      type="button"
+      aria-label="Next page"
+      aria-keyshortcuts="ArrowRight PageDown Space"
+      onclick={() => turn('next')}
+    ></button>
+  </nav>
 
   {#if appearance.progressBar}
     <div
@@ -1455,6 +1479,29 @@
         </div>
       {/if}
 
+      {#snippet readerPanelHeader(
+        titleId: string,
+        heading: string,
+        closeLabel: string,
+        onClose: () => void,
+      )}
+        <button
+          class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+          type="button"
+          onclick={onClose}
+          aria-label={closeLabel}
+          title="Close"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+        <h2 id={titleId} class="font-serif text-xl">{heading}</h2>
+      {/snippet}
+
       {#if settingsVisible}
         <div
           bind:this={settingsPanel}
@@ -1467,21 +1514,12 @@
           onkeydown={(event) => trapModalKeydown(event, settingsPanel!, closeSettings)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeSettings}
-            aria-label="Close reading appearance"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-appearance-title" class="font-serif text-xl">Reading appearance</h2>
+          {@render readerPanelHeader(
+            'reader-appearance-title',
+            'Reading appearance',
+            'Close reading appearance',
+            closeSettings,
+          )}
           <div class="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
               <button
@@ -1610,6 +1648,16 @@
             <input
               class="checkbox"
               type="checkbox"
+              checked={appearance.publisherStyles}
+              onchange={(event) =>
+                updateAppearance({ publisherStyles: event.currentTarget.checked })}
+            />
+            Respect publisher formatting
+          </label>
+          <label class="mt-4 flex min-h-12 items-center gap-3">
+            <input
+              class="checkbox"
+              type="checkbox"
               checked={appearance.hyphenation}
               onchange={(event) => updateAppearance({ hyphenation: event.currentTarget.checked })}
             />
@@ -1660,21 +1708,12 @@
           onkeydown={(event) => trapModalKeydown(event, tocPanel!, closeToc)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeToc}
-            aria-label="Close table of contents"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-contents-title" class="font-serif text-xl">Contents</h2>
+          {@render readerPanelHeader(
+            'reader-contents-title',
+            'Contents',
+            'Close table of contents',
+            closeToc,
+          )}
           {#snippet contentsList(items: TocItem[])}
             <ul class="mt-2 grid list-none gap-1 p-0">
               {#each items as item, index (`${item.href}-${index}`)}
@@ -1727,21 +1766,12 @@
           onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeSearch}
-            aria-label="Close book search"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-search-title" class="font-serif text-xl">Search this book</h2>
+          {@render readerPanelHeader(
+            'reader-search-title',
+            'Search this book',
+            'Close book search',
+            closeSearch,
+          )}
           <form
             class="mt-4 flex gap-2"
             onsubmit={(event) => {
@@ -1808,21 +1838,12 @@
           onkeydown={(event) => trapModalKeydown(event, bookmarksPanel!, closeBookmarks)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeBookmarks}
-            aria-label="Close bookmarks and history"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-bookmarks-title" class="font-serif text-xl">Bookmarks and history</h2>
+          {@render readerPanelHeader(
+            'reader-bookmarks-title',
+            'Bookmarks and history',
+            'Close bookmarks and history',
+            closeBookmarks,
+          )}
           <p class="mt-2 text-sm text-surface-700-300">
             Saved on this device with EPUB locations. They are not sent to Kavita.
           </p>
@@ -1948,23 +1969,15 @@
           onkeydown={(event) => trapModalKeydown(event, annotationsPanel!, closeAnnotations)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
-            type="button"
-            onclick={closeAnnotations}
-            aria-label="Close highlights and notes"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-annotations-title" class="font-serif text-xl">Highlights and notes</h2>
+          {@render readerPanelHeader(
+            'reader-annotations-title',
+            'Highlights and notes',
+            'Close highlights and notes',
+            closeAnnotations,
+          )}
           <p class="mt-2 text-sm text-surface-700-300">
-            Saved on this device. Select text in the book to add a highlight and an optional note.
+            Saved on this device. Choose a passage on this page or select text in the book to add a
+            highlight and an optional note.
           </p>
 
           {#if selectedText}
@@ -2003,7 +2016,49 @@
                 </button>
               </div>
             </form>
+          {:else if visiblePassages.length > 0}
+            {@const activePassage =
+              visiblePassages[selectedPassageIndex] ?? visiblePassages[0] ?? null}
+            <form
+              class="mt-4 rounded-lg preset-tonal-primary p-3"
+              onsubmit={(event) => {
+                event.preventDefault();
+                saveAnnotation(activePassage);
+              }}
+            >
+              <label class="label">
+                <span class="label-text">Passage on this page</span>
+                <select
+                  class="select"
+                  aria-label="Passage on this page"
+                  value={String(selectedPassageIndex)}
+                  onchange={(event) => {
+                    selectedPassageIndex = Number(event.currentTarget.value);
+                    annotationMessage = '';
+                  }}
+                >
+                  {#each visiblePassages as passage, index (`${passage.cfi}-${index}`)}
+                    <option value={String(index)}>
+                      {clipPassageOptionLabel(passage.text, index)}
+                    </option>
+                  {/each}
+                </select>
+              </label>
+              {#if activePassage}
+                <p class="mt-2 line-clamp-4 text-sm italic">“{activePassage.text}”</p>
+              {/if}
+              <label class="label mt-3">
+                <span class="label-text">Note (optional)</span>
+                <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
+              </label>
+              <div class="mt-3 flex gap-2">
+                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                  Save highlight
+                </button>
+              </div>
+            </form>
           {/if}
+          <p class="mt-2 text-sm text-surface-700-300" role="status">{annotationMessage}</p>
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3
