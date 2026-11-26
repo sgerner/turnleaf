@@ -356,4 +356,165 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
       mockRendition.getContents = originalGetContents;
     }
   });
+
+  it('toggles publisher formatting after coalesced slider input while reflowing to the saved CFI and preserving publisher-specific styles', async () => {
+    const frame = document.createElement('iframe');
+    document.body.appendChild(frame);
+    mountedFrames.push(frame);
+    const chapterDoc = frame.contentDocument!;
+    chapterDoc.open();
+    chapterDoc.write(`<!doctype html><html><head><style>
+      .scene-break { text-align: center; margin: 1.5em 0; }
+      .epigraph { text-align: right; margin: 1.5em 2em; }
+      .epigraph p { margin-bottom: 0.25em; }
+    </style></head><body>
+      <p id="body-copy">Ordinary paragraph</p>
+      <p id="scene-break" class="scene-break">* * *</p>
+      <blockquote class="epigraph"><p id="epigraph-line">Epigraph quote</p></blockquote>
+    </body></html>`);
+    chapterDoc.close();
+
+    mockRendition.setContents([{ document: chapterDoc }]);
+    const savedCfi = 'epubcfi(/6/2!/4/2/10:0)';
+    const onLocation = vi.fn();
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      savedCfi,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    await mockRendition.runContentHooks({
+      document: chapterDoc,
+      window: frame.contentWindow!,
+    } as unknown as Contents);
+    mockRendition.emit('relocated', makeLocation(savedCfi));
+    mockRendition.display.mockClear();
+    mockRendition.display.mockImplementation(async (target?: string) => {
+      if (target) mockRendition.emit('relocated', makeLocation(target));
+    });
+
+    const styleOf = (id: string) =>
+      frame.contentWindow!.getComputedStyle(chapterDoc.getElementById(id)!);
+
+    // 1. Coalesce rapid slider updates (fontSize 20..24, paragraphSpacing 0.8..1.0) with justified alignment.
+    for (const [fontSize, paragraphSpacing] of [
+      [20, 0.8],
+      [22, 0.9],
+      [24, 1.0],
+    ] as const) {
+      session.applyAppearance({
+        ...defaultAppearance,
+        fontSize,
+        paragraphSpacing,
+        alignment: 'justify',
+        publisherStyles: true,
+      });
+    }
+    await vi.advanceTimersByTimeAsync(16);
+
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(savedCfi);
+    expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
+    const styleEl = chapterDoc.getElementById(
+      'epubjs-inserted-css-turnleaf',
+    ) as HTMLStyleElement | null;
+    expect(styleEl?.sheet?.cssRules).toHaveLength(7);
+    expect(styleOf('body-copy').fontSize).toBe('24px');
+    expect(styleOf('body-copy').textAlign).toBe('justify');
+    expect(styleOf('body-copy').marginBottom).toBe('24px');
+    expect(styleOf('scene-break').textAlign).toBe('center');
+    expect(styleOf('scene-break').marginBottom).toBe('36px');
+    expect(styleOf('epigraph-line').textAlign).toBe('right');
+    expect(styleOf('epigraph-line').marginBottom).toBe('6px');
+
+    // 2. Toggle publisherStyles off after slider input settles: must detect layoutChanged,
+    // reflow to savedCFI, and override publisher classes with !important rules.
+    mockRendition.display.mockClear();
+    session.applyAppearance({
+      ...defaultAppearance,
+      fontSize: 24,
+      paragraphSpacing: 1.0,
+      alignment: 'justify',
+      publisherStyles: false,
+    });
+    await vi.advanceTimersByTimeAsync(16);
+
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(savedCfi);
+    expect(styleEl?.sheet?.cssRules).toHaveLength(7);
+    expect(styleOf('body-copy').textAlign).toBe('justify');
+    expect(styleOf('body-copy').marginBottom).toBe('24px');
+    expect(styleOf('scene-break').textAlign).toBe('justify');
+    expect(styleOf('scene-break').marginBottom).toBe('24px');
+    expect(styleOf('epigraph-line').textAlign).toBe('justify');
+    expect(styleOf('epigraph-line').marginBottom).toBe('24px');
+
+    // 3. Emit a new slider burst and immediately toggle publisherStyles back on while the
+    // slider reflow is still in flight with an intermediate drifted relocated event.
+    mockRendition.display.mockClear();
+    let resolveSliderReflow!: () => void;
+    mockRendition.display
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveSliderReflow = resolve;
+          }),
+      )
+      .mockImplementation(async (target?: string) => {
+        if (target) mockRendition.emit('relocated', makeLocation(target));
+      });
+
+    session.applyAppearance({
+      ...defaultAppearance,
+      fontSize: 19,
+      paragraphSpacing: 0.4,
+      alignment: 'justify',
+      publisherStyles: false,
+    });
+    session.applyAppearance({
+      ...defaultAppearance,
+      fontSize: 20,
+      paragraphSpacing: 0.5,
+      alignment: 'justify',
+      publisherStyles: false,
+    });
+    await vi.advanceTimersByTimeAsync(16);
+    expect(mockRendition.display).toHaveBeenCalledTimes(1);
+    expect(mockRendition.display).toHaveBeenLastCalledWith(savedCfi);
+
+    // Toggle publisherStyles back to true while the slider reflow is in flight and a drifted CFI fires.
+    session.applyAppearance({
+      ...defaultAppearance,
+      fontSize: 20,
+      paragraphSpacing: 0.5,
+      alignment: 'justify',
+      publisherStyles: true,
+    });
+    mockRendition.emit('relocated', makeLocation('epubcfi(/6/2!/4/2/48:0)', 8, 12));
+
+    resolveSliderReflow();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(16);
+
+    expect(mockRendition.display).toHaveBeenCalledTimes(2);
+    expect(mockRendition.display.mock.calls).toEqual([[savedCfi], [savedCfi]]);
+    expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
+    expect(styleEl?.sheet?.cssRules).toHaveLength(7);
+    expect(styleOf('body-copy').fontSize).toBe('20px');
+    expect(styleOf('body-copy').textAlign).toBe('justify');
+    expect(styleOf('body-copy').marginBottom).toBe('10px');
+    expect(styleOf('scene-break').textAlign).toBe('center');
+    expect(styleOf('scene-break').marginBottom).toBe('30px');
+    expect(styleOf('epigraph-line').textAlign).toBe('right');
+    expect(styleOf('epigraph-line').marginBottom).toBe('5px');
+    expect(onLocation.mock.calls.some(([loc]) => loc.cfi === 'epubcfi(/6/2!/4/2/48:0)')).toBe(
+      false,
+    );
+    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ cfi: savedCfi }));
+
+    session.destroy();
+  });
 });
