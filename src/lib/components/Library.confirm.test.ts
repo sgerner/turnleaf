@@ -203,7 +203,7 @@ describe('Library destructive action confirmations', () => {
     await flushUi();
 
     const actionsTrigger = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Book actions for The Left Hand of Darkness"]',
+      '[aria-label^="Book actions for The Left Hand of Darkness"]',
     )!;
     actionsTrigger.focus();
     actionsTrigger.click();
@@ -249,7 +249,7 @@ describe('Library destructive action confirmations', () => {
     const pending = await getPendingSync(server.id);
     expect(JSON.parse(pending[0]!.payload).pageNum).toBe(activeBook.pages);
     expect(
-      host.querySelector('[aria-label="Book actions for The Left Hand of Darkness"]'),
+      host.querySelector('[aria-label^="Book actions for The Left Hand of Darkness"]'),
     ).toBeNull();
     expect(document.activeElement?.id).toBe('library-results');
   });
@@ -274,7 +274,7 @@ describe('Library destructive action confirmations', () => {
     // 1. remoteAvailable === true removes immediately on one click without ConfirmDialog
     host
       .querySelector<HTMLButtonElement>(
-        '[aria-label="Book actions for The Left Hand of Darkness"]',
+        '[aria-label^="Book actions for The Left Hand of Darkness"]',
       )!
       .click();
     await flushUi();
@@ -290,7 +290,7 @@ describe('Library destructive action confirmations', () => {
     // 2. remoteAvailable === false opens ConfirmDialog before deleting the sole local copy
     mockDeleteDownloadedEpub.mockClear();
     const removedActions = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Book actions for Out of Print Edition"]',
+      '[aria-label^="Book actions for Out of Print Edition"]',
     )!;
     removedActions.focus();
     removedActions.click();
@@ -420,7 +420,7 @@ describe('Library destructive action confirmations', () => {
     await flushUi();
 
     const menuTrigger = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Book actions for The Left Hand of Darkness"]',
+      '[aria-label^="Book actions for The Left Hand of Darkness"]',
     )!;
     menuTrigger.focus();
     menuTrigger.click();
@@ -444,7 +444,7 @@ describe('Library destructive action confirmations', () => {
 
     // Card stays visible when persisted libraryHideCompleted is false, restoring focus to its menu trigger
     const remainingTrigger = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Book actions for The Left Hand of Darkness"]',
+      '[aria-label^="Book actions for The Left Hand of Darkness"]',
     );
     expect(remainingTrigger).not.toBeNull();
     expect(document.activeElement).toBe(remainingTrigger);
@@ -461,7 +461,7 @@ describe('Library destructive action confirmations', () => {
     expect(host.querySelector('[role="alertdialog"]')).toBeNull();
     expect(mockDeleteDownloadedEpub).toHaveBeenCalledWith(activeBook.downloadPath);
     expect(
-      host.querySelector('[aria-label="Book actions for The Left Hand of Darkness"]'),
+      host.querySelector('[aria-label^="Book actions for The Left Hand of Darkness"]'),
     ).toBeNull();
     expect(document.activeElement?.id).toBe('library-results');
   });
