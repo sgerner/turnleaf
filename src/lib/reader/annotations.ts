@@ -6,6 +6,8 @@ export interface StoredAnnotation {
   createdAt: string;
 }
 
+export const MAX_ANNOTATIONS = 200;
+
 function isAnnotation(value: unknown): value is StoredAnnotation {
   if (!value || typeof value !== 'object') return false;
   const annotation = value as Partial<StoredAnnotation>;
@@ -22,7 +24,7 @@ export function parseAnnotations(raw: string | null): StoredAnnotation[] {
   if (!raw) return [];
   try {
     const value: unknown = JSON.parse(raw);
-    return Array.isArray(value) ? value.filter(isAnnotation).slice(0, 200) : [];
+    return Array.isArray(value) ? value.filter(isAnnotation) : [];
   } catch {
     return [];
   }
@@ -38,22 +40,26 @@ export function addAnnotation(
   const trimmedCfi = cfi.trim();
   const trimmedExcerpt = excerpt.trim();
   if (!trimmedCfi || !trimmedExcerpt) return annotations;
+  const trimmedNote = note.trim().slice(0, 2000);
   const existing = annotations.find((annotation) => annotation.cfi === trimmedCfi);
   if (existing) {
     return annotations.map((annotation) =>
-      annotation.id === existing.id ? { ...annotation, note: note.trim() } : annotation,
+      annotation.id === existing.id
+        ? { ...annotation, note: trimmedNote || annotation.note }
+        : annotation,
     );
   }
+  if (annotations.length >= MAX_ANNOTATIONS) return annotations;
   return [
     ...annotations,
     {
       id: `${createdAt}:${trimmedCfi}`,
       cfi: trimmedCfi,
       excerpt: trimmedExcerpt.slice(0, 500),
-      note: note.trim().slice(0, 2000),
+      note: trimmedNote,
       createdAt,
     },
-  ].slice(-200);
+  ];
 }
 
 export function updateAnnotation(
