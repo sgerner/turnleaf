@@ -3,6 +3,7 @@ import {
   CapacitorSQLite,
   SQLiteConnection,
   type capTask,
+  type DBSQLiteValues,
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
@@ -341,6 +342,38 @@ async function executeNativeStatement(
   await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
 }
 
+async function executeNativeQuery(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  statement: string,
+  values?: unknown[],
+): Promise<DBSQLiteValues> {
+  return enqueueNativeWrite(() =>
+    values === undefined ? db.query(statement) : db.query(statement, values),
+  );
+}
+
+function parseReadingStateRow(row: Record<string, unknown> | undefined): StoredReadingState | null {
+  if (!row) return null;
+  return {
+    cfi: String(row.cfi),
+    xpath: row.kavita_xpath ? String(row.kavita_xpath) : null,
+    percentage: Number(row.percentage),
+    localUpdatedAt: String(row.local_updated_at),
+    syncedLocalUpdatedAt: row.synced_local_updated_at ? String(row.synced_local_updated_at) : null,
+    serverUpdatedAt: row.server_updated_at ? String(row.server_updated_at) : null,
+    pendingSync: Number(row.pending_sync) === 1,
+    syncRevision: Number(row.sync_revision ?? 0),
+  };
+}
+
+async function queryNativeReadingState(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  bookId: string,
+): Promise<StoredReadingState | null> {
+  const result = await db.query('SELECT * FROM reading_state WHERE book_id=?', [bookId]);
+  return parseReadingStateRow(result.values?.[0] as Record<string, unknown> | undefined);
+}
+
 function createBrowserState(): BrowserDatabaseState {
   return {
     serverConfig: null,
@@ -468,9 +501,9 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
 
 export async function saveServer(config: ServerConfig): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    state.serverConfig = config;
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      state.serverConfig = config;
+    });
     return;
   }
   const db = await openDatabase();
@@ -498,8 +531,8 @@ export async function saveServer(config: ServerConfig): Promise<void> {
 
 export async function removeServer(serverId: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    if (state.serverConfig?.id === serverId) {
+    updateBrowserState((state) => {
+      if (state.serverConfig?.id !== serverId) return false;
       for (const book of state.books) {
         for (const prefix of READER_PREFERENCE_PREFIXES) {
           delete state.preferences[`${prefix}${book.id}`];
@@ -509,8 +542,7 @@ export async function removeServer(serverId: string): Promise<void> {
       state.books = [];
       state.readingState = {};
       state.syncQueue = {};
-      writeBrowserState(state);
-    }
+    });
     return;
   }
   const db = await openDatabase();
@@ -537,7 +569,8 @@ export async function getServer(): Promise<ServerConfig | null> {
     return readBrowserState().serverConfig;
   }
   const db = await openDatabase();
-  const result = await db.query(
+  const result = await executeNativeQuery(
+    db,
     `SELECT id, display_name, base_url, credential_ref, kavita_version, last_connected_at
      FROM server_config ORDER BY last_connected_at DESC LIMIT 1`,
   );
@@ -1148,7 +1181,8 @@ export async function getBooks(
       .filter((book) => book.serverId === serverId)
       .map((book) => {
         const hasDownload = Boolean(book.downloadPath) || book.downloadStatus === 'available';
-        const remoteFileSize = book.remoteFileSize ?? book.fileSize ?? null;
+        const remoteFileSize =
+          book.remoteFileSize !== undefined ? book.remoteFileSize : (book.fileSize ?? null);
         const downloadedBytes = hasDownload
           ? (book.downloadedBytes ?? book.fileSize ?? null)
           : null;
@@ -1175,7 +1209,8 @@ export async function getBooks(
     return books;
   }
   const db = await openDatabase();
-  const result = await db.query(
+  const result = await executeNativeQuery(
+    db,
     `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
       format, pages, pages_read, created_at, last_read_at, download_path, download_status,
       file_size, remote_file_size, downloaded_bytes, downloaded_pages, chapter_key,
@@ -1190,7 +1225,12 @@ export async function getBooks(
     const hasDownload = Boolean(downloadPath) || downloadStatus === 'available';
     const pages = Number(row.pages ?? 0);
     const fileSize = row.file_size == null ? null : Number(row.file_size);
-    const remoteFileSize = row.remote_file_size == null ? fileSize : Number(row.remote_file_size);
+    const remoteFileSize =
+      row.remote_file_size == null
+        ? row.downloaded_bytes == null
+          ? fileSize
+          : null
+        : Number(row.remote_file_size);
     const downloadedBytes =
       row.downloaded_bytes == null ? (hasDownload ? fileSize : null) : Number(row.downloaded_bytes);
     const downloadedPages =
@@ -1247,6 +1287,13 @@ export async function markDownloaded(
     updateBrowserState((state) => {
       state.books = state.books.map((book) => {
         if (book.id !== bookId) return book;
+        const previouslyUndownloaded = !book.downloadPath && book.downloadStatus === 'none';
+        const remoteFileSize =
+          book.remoteFileSize !== undefined
+            ? book.remoteFileSize
+            : previouslyUndownloaded
+              ? (book.fileSize ?? null)
+              : null;
         const downloadedPages =
           baseline?.downloadedPages !== undefined
             ? baseline.downloadedPages
@@ -1258,7 +1305,7 @@ export async function markDownloaded(
           downloadPath: path,
           downloadStatus: 'available',
           fileSize: size,
-          remoteFileSize: book.remoteFileSize ?? book.fileSize ?? baselineBytes,
+          remoteFileSize,
           downloadedBytes: baselineBytes,
           downloadedPages,
           downloadOutdated: false,
@@ -1274,11 +1321,14 @@ export async function markDownloaded(
       download_path=?,
       download_status='available',
       file_size=?,
-      remote_file_size=COALESCE(remote_file_size, ?),
+      remote_file_size=COALESCE(
+        remote_file_size,
+        CASE WHEN download_path IS NULL AND download_status='none' THEN file_size ELSE NULL END
+      ),
       downloaded_bytes=?,
       downloaded_pages=COALESCE(?, CASE WHEN pages>0 THEN pages ELSE NULL END)
     WHERE id=?`,
-    [path, size, baselineBytes, baselineBytes, baseline?.downloadedPages ?? null, bookId],
+    [path, size, baselineBytes, baseline?.downloadedPages ?? null, bookId],
   );
 }
 
@@ -1355,18 +1405,21 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
     };
   }
   const db = await openDatabase();
-  const row = (await db.query('SELECT * FROM reading_state WHERE book_id=?', [bookId])).values?.[0];
-  if (!row) return null;
-  return {
-    cfi: String(row.cfi),
-    xpath: row.kavita_xpath ? String(row.kavita_xpath) : null,
-    percentage: Number(row.percentage),
-    localUpdatedAt: String(row.local_updated_at),
-    syncedLocalUpdatedAt: row.synced_local_updated_at ? String(row.synced_local_updated_at) : null,
-    serverUpdatedAt: row.server_updated_at ? String(row.server_updated_at) : null,
-    pendingSync: Number(row.pending_sync) === 1,
-    syncRevision: Number(row.sync_revision ?? 0),
-  };
+  const result = await executeNativeQuery(db, 'SELECT * FROM reading_state WHERE book_id=?', [
+    bookId,
+  ]);
+  return parseReadingStateRow(result.values?.[0] as Record<string, unknown> | undefined);
+}
+
+function updateBrowserBookProgress(
+  state: BrowserDatabaseState,
+  bookId: string,
+  pagesRead: number,
+  lastReadAt: string,
+): void {
+  state.books = state.books.map((item) =>
+    item.id === bookId ? { ...item, pagesRead, lastReadAt } : item,
+  );
 }
 
 export async function saveLocalProgress(
@@ -1424,15 +1477,7 @@ export async function saveLocalProgress(
         updatedAt: now,
         revision: syncRevision,
       };
-      state.books = state.books.map((item) =>
-        item.id === book.id
-          ? {
-              ...item,
-              pagesRead,
-              lastReadAt: now,
-            }
-          : item,
-      );
+      updateBrowserBookProgress(state, book.id, pagesRead, now);
     });
     return;
   }
@@ -1496,15 +1541,7 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
           Number(state.readingState[book.id]?.syncRevision ?? 0),
           Number(state.syncQueue[book.id]?.revision ?? 0),
         ) + 1;
-      state.books = state.books.map((item) =>
-        item.id === book.id
-          ? {
-              ...item,
-              pagesRead: completedPages,
-              lastReadAt: now,
-            }
-          : item,
-      );
+      updateBrowserBookProgress(state, book.id, completedPages, now);
       state.readingState[book.id] = {
         cfi: '',
         xpath: null,
@@ -1625,7 +1662,8 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
       }));
   }
   const db = await openDatabase();
-  const result = await db.query(
+  const result = await executeNativeQuery(
+    db,
     `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision,
       books.library_id,books.series_id,books.volume_id,books.chapter_id
     FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
@@ -1648,35 +1686,91 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
   });
 }
 
+function summarizeSyncRows(
+  rows: ReadonlyArray<{ updatedAt: string | null; lastError: string | null }>,
+): SyncStatus {
+  const firstFailed = rows.find((row) => Boolean(row.lastError));
+  return {
+    pendingCount: rows.length,
+    failedCount: rows.filter((row) => Boolean(row.lastError)).length,
+    lastError: firstFailed?.lastError ?? null,
+    lastUpdatedAt: rows[0]?.updatedAt ?? null,
+  };
+}
+
 export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    const rows = getBrowserSyncRows(state, serverId)
-      .map(({ row }) => row)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return {
-      pendingCount: rows.length,
-      failedCount: rows.filter((row) => Boolean(row.lastError)).length,
-      lastError: rows.find((row) => row.lastError)?.lastError ?? null,
-      lastUpdatedAt: rows[0]?.updatedAt ?? null,
-    };
+    return summarizeSyncRows(
+      getBrowserSyncRows(state, serverId)
+        .sort((a, b) => b.row.updatedAt.localeCompare(a.row.updatedAt))
+        .map(({ row }) => ({
+          updatedAt: row.updatedAt,
+          lastError: row.lastError || null,
+        })),
+    );
   }
   const db = await openDatabase();
-  const result = await db.query(
+  const result = await executeNativeQuery(
+    db,
     `SELECT sync_queue.updated_at,sync_queue.last_error
     FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
     WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
     [serverId],
   );
-  const rows = result.values ?? [];
+  return summarizeSyncRows(
+    (result.values ?? []).map((row) => ({
+      updatedAt: row.updated_at ? String(row.updated_at) : null,
+      lastError: row.last_error ? String(row.last_error) : null,
+    })),
+  );
+}
+
+interface NormalizedRemoteProgress {
+  now: string;
+  serverUpdatedAt: string;
+  pagesRead: number;
+  percentage: number;
+  xpath: string | null;
+  readingState: StoredReadingState;
+}
+
+function normalizeRemoteProgress(
+  book: BookRecord,
+  remote: KavitaProgress,
+  syncRevision: number,
+): NormalizedRemoteProgress {
+  const now = new Date().toISOString();
+  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
+  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+  const percentage = book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0;
+  const xpath = remote.bookScrollId ?? null;
   return {
-    pendingCount: rows.length,
-    failedCount: rows.filter((row) => row.last_error).length,
-    lastError: rows.find((row) => row.last_error)?.last_error
-      ? String(rows.find((row) => row.last_error)?.last_error)
-      : null,
-    lastUpdatedAt: rows[0]?.updated_at ? String(rows[0].updated_at) : null,
+    now,
+    serverUpdatedAt,
+    pagesRead,
+    percentage,
+    xpath,
+    readingState: {
+      cfi: '',
+      xpath,
+      percentage,
+      localUpdatedAt: now,
+      syncedLocalUpdatedAt: now,
+      serverUpdatedAt,
+      pendingSync: false,
+      syncRevision,
+    },
   };
+}
+
+function applyBrowserRemoteProgress(
+  state: BrowserDatabaseState,
+  bookId: string,
+  normalized: NormalizedRemoteProgress,
+): void {
+  state.readingState[bookId] = normalized.readingState;
+  updateBrowserBookProgress(state, bookId, normalized.pagesRead, normalized.serverUpdatedAt);
 }
 
 export async function saveRemoteProgress(
@@ -1684,19 +1778,7 @@ export async function saveRemoteProgress(
   remote: KavitaProgress,
   expected: StoredReadingState | null,
 ): Promise<boolean> {
-  const now = new Date().toISOString();
-  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-  const next: StoredReadingState = {
-    cfi: '',
-    xpath: remote.bookScrollId ?? null,
-    percentage: book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0,
-    localUpdatedAt: now,
-    syncedLocalUpdatedAt: now,
-    serverUpdatedAt,
-    pendingSync: false,
-    syncRevision: (expected?.syncRevision ?? 0) + 1,
-  };
+  const normalized = normalizeRemoteProgress(book, remote, (expected?.syncRevision ?? 0) + 1);
   const matches = (current: StoredReadingState | null) =>
     !expected?.pendingSync &&
     !current?.pendingSync &&
@@ -1711,16 +1793,13 @@ export async function saveRemoteProgress(
         !matches(state.readingState[book.id] ?? null)
       )
         return false;
-      state.readingState[book.id] = next;
-      state.books = state.books.map((item) =>
-        item.id === book.id ? { ...item, pagesRead, lastReadAt: serverUpdatedAt } : item,
-      );
+      applyBrowserRemoteProgress(state, book.id, normalized);
     });
   }
 
   const db = await openDatabase();
   return enqueueNativeWrite(async () => {
-    if (!matches(await getReadingState(book.id))) return false;
+    if (!matches(await queryNativeReadingState(db, book.id))) return false;
     const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
     if (queue.values?.length) return false;
     await db.executeTransaction([
@@ -1735,19 +1814,19 @@ export async function saveRemoteProgress(
           server_updated_at=excluded.server_updated_at,pending_sync=0,sync_revision=excluded.sync_revision`,
         values: [
           book.id,
-          next.xpath,
-          next.percentage,
-          now,
-          now,
+          normalized.xpath,
+          normalized.percentage,
+          normalized.now,
+          normalized.now,
           remote.pageNum,
-          next.xpath,
-          serverUpdatedAt,
-          next.syncRevision,
+          normalized.xpath,
+          normalized.serverUpdatedAt,
+          normalized.readingState.syncRevision,
         ],
       },
       {
         statement: 'UPDATE books SET pages_read=?,last_read_at=? WHERE id=?',
-        values: [pagesRead, serverUpdatedAt, book.id],
+        values: [normalized.pagesRead, normalized.serverUpdatedAt, book.id],
       },
     ]);
     return true;
@@ -1764,11 +1843,7 @@ export async function acceptRemoteProgress(
   expectedRevision: number,
   expectedUpdatedAt: string,
 ): Promise<boolean> {
-  const now = new Date().toISOString();
-  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const percentage = book.pages > 0 ? Math.max(0, Math.min(0.999, remote.pageNum / book.pages)) : 0;
-  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-  const xpath = remote.bookScrollId ?? null;
+  const normalized = normalizeRemoteProgress(book, remote, expectedRevision);
 
   if (!Capacitor.isNativePlatform()) {
     return updateBrowserState((state) => {
@@ -1785,76 +1860,71 @@ export async function acceptRemoteProgress(
       ) {
         return false;
       }
-      state.readingState[book.id] = {
-        ...reading,
-        cfi: '',
-        xpath,
-        percentage,
-        localUpdatedAt: now,
-        syncedLocalUpdatedAt: now,
-        serverUpdatedAt,
-        pendingSync: false,
-        syncRevision: expectedRevision,
-      };
       delete state.syncQueue[book.id];
-      state.books = state.books.map((item) =>
-        item.id === book.id ? { ...item, pagesRead, lastReadAt: serverUpdatedAt } : item,
-      );
+      applyBrowserRemoteProgress(state, book.id, normalized);
     });
   }
 
   const db = await openDatabase();
-  await executeNativeTransaction(db, [
-    {
-      statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
-        synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?,pending_sync=0
-        WHERE book_id=? AND pending_sync=1 AND local_updated_at=? AND sync_revision=?
-        AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?)`,
-      values: [
-        xpath,
-        percentage,
-        now,
-        now,
-        remote.pageNum,
-        xpath,
-        serverUpdatedAt,
-        book.id,
-        expectedUpdatedAt,
-        expectedRevision,
-        book.id,
-        expectedRevision,
-        expectedUpdatedAt,
-      ],
-    },
-    {
-      statement: `DELETE FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?
-        AND EXISTS (SELECT 1 FROM reading_state WHERE book_id=? AND pending_sync=0
-          AND cfi='' AND local_updated_at=?)`,
-      values: [book.id, expectedRevision, expectedUpdatedAt, book.id, now],
-    },
-    {
-      statement: `UPDATE books SET pages_read=?,last_read_at=?
-        WHERE id=? AND EXISTS (
-          SELECT 1 FROM reading_state WHERE book_id=? AND cfi=''
-          AND local_updated_at=? AND pending_sync=0
-        )`,
-      values: [pagesRead, serverUpdatedAt, book.id, book.id, now],
-    },
-  ]);
+  return enqueueNativeWrite(async () => {
+    await db.executeTransaction([
+      {
+        statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
+          synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?,pending_sync=0
+          WHERE book_id=? AND pending_sync=1 AND local_updated_at=? AND sync_revision=?
+          AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?)`,
+        values: [
+          normalized.xpath,
+          normalized.percentage,
+          normalized.now,
+          normalized.now,
+          remote.pageNum,
+          normalized.xpath,
+          normalized.serverUpdatedAt,
+          book.id,
+          expectedUpdatedAt,
+          expectedRevision,
+          book.id,
+          expectedRevision,
+          expectedUpdatedAt,
+        ],
+      },
+      {
+        statement: `DELETE FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?
+          AND EXISTS (SELECT 1 FROM reading_state WHERE book_id=? AND pending_sync=0
+            AND cfi='' AND local_updated_at=?)`,
+        values: [book.id, expectedRevision, expectedUpdatedAt, book.id, normalized.now],
+      },
+      {
+        statement: `UPDATE books SET pages_read=?,last_read_at=?
+          WHERE id=? AND EXISTS (
+            SELECT 1 FROM reading_state WHERE book_id=? AND cfi=''
+            AND local_updated_at=? AND pending_sync=0
+          )`,
+        values: [
+          normalized.pagesRead,
+          normalized.serverUpdatedAt,
+          book.id,
+          book.id,
+          normalized.now,
+        ],
+      },
+    ]);
 
-  const adopted = (
-    await db.query(
-      'SELECT cfi,local_updated_at,pending_sync,server_updated_at FROM reading_state WHERE book_id=?',
-      [book.id],
-    )
-  ).values?.[0];
-  return Boolean(
-    adopted &&
-    String(adopted.cfi) === '' &&
-    String(adopted.local_updated_at) === now &&
-    Number(adopted.pending_sync) === 0 &&
-    String(adopted.server_updated_at) === serverUpdatedAt,
-  );
+    const adopted = (
+      await db.query(
+        'SELECT cfi,local_updated_at,pending_sync,server_updated_at FROM reading_state WHERE book_id=?',
+        [book.id],
+      )
+    ).values?.[0];
+    return Boolean(
+      adopted &&
+      String(adopted.cfi) === '' &&
+      String(adopted.local_updated_at) === normalized.now &&
+      Number(adopted.pending_sync) === 0 &&
+      String(adopted.server_updated_at) === normalized.serverUpdatedAt,
+    );
+  });
 }
 
 export async function confirmSync(
@@ -1977,7 +2047,8 @@ export async function getPreferences(keys: readonly string[]): Promise<Map<strin
     return values;
   }
   const db = await openDatabase();
-  const result = await db.query(
+  const result = await executeNativeQuery(
+    db,
     `SELECT key, value FROM preferences WHERE key IN (${keys.map(() => '?').join(', ')})`,
     [...keys],
   );
@@ -1991,9 +2062,9 @@ export async function setPreference(key: string, value: string): Promise<void> {
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    for (const [key, value] of preferences) state.preferences[key] = value;
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      for (const [key, value] of preferences) state.preferences[key] = value;
+    });
     return;
   }
   const db = await openDatabase();

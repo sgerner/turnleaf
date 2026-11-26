@@ -13,12 +13,29 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const projectRoot = dirname(scriptDirectory);
 const androidDirectory = join(projectRoot, 'android');
 
-export function childEnvironment(sdkPath, environment = process.env) {
-  return {
+const SIGNING_ENV_KEYS = [
+  'TURNLEAF_STORE_FILE',
+  'TURNLEAF_STORE_PASSWORD',
+  'TURNLEAF_KEY_ALIAS',
+  'TURNLEAF_KEY_PASSWORD',
+];
+
+export function childEnvironment(
+  sdkPath,
+  environment = process.env,
+  { includeSigningSecrets = true } = {},
+) {
+  const next = {
     ...environment,
     ANDROID_HOME: sdkPath,
     ANDROID_SDK_ROOT: sdkPath,
   };
+  if (!includeSigningSecrets) {
+    for (const key of SIGNING_ENV_KEYS) {
+      delete next[key];
+    }
+  }
+  return next;
 }
 
 export function gradleTask(mode) {
@@ -27,49 +44,85 @@ export function gradleTask(mode) {
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 
+export function gradleArgs(mode, extraArgs = []) {
+  const forwarded = extraArgs[0] === '--' ? extraArgs.slice(1) : extraArgs;
+  return [gradleTask(mode), ...forwarded];
+}
+
 export function canReuseWebBuild(environment = process.env) {
   return environment.TURNLEAF_REUSE_WEB_BUILD === 'true';
 }
 
-export async function main(mode = process.argv[2]) {
-  let task;
+export async function main(
+  mode = process.argv[2],
+  extraArgs = process.argv.slice(3),
+  {
+    environment = process.env,
+    platform = process.platform,
+    validateSdk = () => validateAndroidSdk(sdkCandidates({ env: environment, platform })),
+    detectJava = detectJavaCompatibility,
+    run = runCommand,
+    log = console.log,
+    errorLog = console.error,
+  } = {},
+) {
+  let args;
   try {
-    task = gradleTask(mode);
+    args = gradleArgs(mode, extraArgs);
   } catch (error) {
-    console.error(error.message);
+    errorLog(error.message);
     process.exitCode = 1;
     return;
   }
 
-  const sdk = validateAndroidSdk(sdkCandidates());
+  const sdk = validateSdk();
   if (!sdk.ok) {
-    console.error(formatFailure(sdk));
+    errorLog(formatFailure(sdk));
     process.exitCode = 1;
     return;
   }
 
-  const java = detectJavaCompatibility();
+  const java = detectJava();
   if (!java.ok) {
-    console.error(formatJavaFailure(java));
+    errorLog(formatJavaFailure(java));
     process.exitCode = 1;
     return;
   }
 
-  const env = childEnvironment(sdk.sdk.path);
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const gradle = process.platform === 'win32' ? 'gradlew.bat' : './gradlew';
-  const reuseWebBuild = canReuseWebBuild(env);
-  console.log(`Using Android SDK at ${sdk.sdk.path} for Capacitor and Gradle.`);
+  const baseEnv = childEnvironment(sdk.sdk.path, environment, { includeSigningSecrets: false });
+  const gradleEnv = childEnvironment(sdk.sdk.path, environment, {
+    includeSigningSecrets: mode === 'release',
+  });
+  const npm = platform === 'win32' ? 'npm.cmd' : 'npm';
+  const gradle = platform === 'win32' ? 'gradlew.bat' : './gradlew';
+  const reuseWebBuild = canReuseWebBuild(baseEnv);
+  log(`Using Android SDK at ${sdk.sdk.path} for Capacitor and Gradle.`);
 
   try {
-    if (!reuseWebBuild) await runCommand(npm, ['run', 'build'], { cwd: projectRoot, env });
-    await runCommand(npm, ['exec', '--', 'cap', 'sync', 'android'], {
+    if (!reuseWebBuild) await run(npm, ['run', 'build'], { cwd: projectRoot, env: baseEnv });
+    await run(npm, ['exec', '--', 'cap', 'sync', 'android'], {
       cwd: projectRoot,
-      env,
+      env: baseEnv,
     });
-    await runCommand(gradle, [task], { cwd: androidDirectory, env });
+    let buildError;
+    let stopError;
+    try {
+      await run(gradle, args, { cwd: androidDirectory, env: gradleEnv });
+    } catch (error) {
+      buildError = error;
+    } finally {
+      if (mode === 'release') {
+        try {
+          await run(gradle, ['--stop'], { cwd: androidDirectory, env: baseEnv });
+        } catch (error) {
+          stopError = error;
+        }
+      }
+    }
+    if (buildError) throw buildError;
+    if (stopError) throw stopError;
   } catch (error) {
-    console.error(error.message);
+    errorLog(error.message);
     process.exitCode = error.exitCode ?? 1;
   }
 }

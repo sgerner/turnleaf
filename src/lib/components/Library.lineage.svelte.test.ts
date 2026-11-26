@@ -161,15 +161,19 @@ vi.mock('../database/database', async (importOriginal) => {
   };
 });
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class {
-    open = vi.fn(async () => undefined);
-    destroy = vi.fn();
-    tableOfContents = vi.fn(() => []);
-    updateHighlights = vi.fn();
-    applyAppearance = vi.fn();
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    ReaderSession: class {
+      open = vi.fn(async () => undefined);
+      destroy = vi.fn();
+      tableOfContents = vi.fn(() => []);
+      updateHighlights = vi.fn();
+      applyAppearance = vi.fn();
+    },
+  };
+});
 
 const server: ServerConfig = {
   id: 'primary',
@@ -334,7 +338,7 @@ describe('Library and Reader lineage UX', () => {
     expect(target.textContent).toContain('Update available');
 
     const actionsBtn = target.querySelector<HTMLButtonElement>(
-      '[aria-label="Book actions for Outdated Downloaded Book"]',
+      '[aria-label="Book actions for Outdated Downloaded Book, by Ursula K. Le Guin, Hainish Cycle, update available"]',
     );
     expect(actionsBtn).not.toBeNull();
     actionsBtn!.click();
