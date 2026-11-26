@@ -80,8 +80,25 @@ describe('Android reading journey WebView expressions', () => {
     expect(frame.contentWindow.getSelection().toString()).toBe('Chapter 1');
 
     document.querySelector('#reader-annotations').innerHTML =
-      '<p role="status">Saved notes as Turnleaf-CI-EPUB-notes.md.</p>';
+      '<p role="status">Highlight saved.</p><p role="status">Saved notes as Turnleaf-CI-EPUB-notes.md.</p>';
     expect(runExpr(journeyExpressions.hasSavedNoteExportConfirmation())).toBe(true);
+
+    const nav = document.createElement('nav');
+    nav.setAttribute('inert', '');
+    nav.innerHTML = '<button type="button" aria-label="Next page">Turn forward</button>';
+    document.body.appendChild(nav);
+    let nextClicks = 0;
+    nav.querySelector('button').addEventListener('click', () => {
+      nextClicks += 1;
+    });
+    expect(runExpr(journeyExpressions.click('[aria-label="Next page"]'))).toBe(false);
+    expect(runExpr(journeyExpressions.clickByText('nav', 'Turn forward'))).toBe(false);
+    expect(nextClicks).toBe(0);
+
+    nav.removeAttribute('inert');
+    expect(runExpr(journeyExpressions.click('[aria-label="Next page"]'))).toBe(true);
+    expect(runExpr(journeyExpressions.clickByText('nav', 'Turn forward'))).toBe(true);
+    expect(nextClicks).toBe(2);
   });
 });
 

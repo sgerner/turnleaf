@@ -271,6 +271,8 @@ async function startFixture() {
     }
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
@@ -308,7 +310,7 @@ export const journeyExpressions = {
   })()`,
   click: (selector) => `(() => {
     const button = document.querySelector(${JSON.stringify(selector)});
-    if (!button || button.disabled) return false;
+    if (!button || button.disabled || (button.closest && button.closest('[inert]'))) return false;
     button.click();
     return true;
   })()`,
@@ -316,7 +318,10 @@ export const journeyExpressions = {
     const root = document.querySelector(${JSON.stringify(containerSelector)});
     if (!root) return false;
     const button = Array.from(root.querySelectorAll('button')).find(
-      item => !item.disabled && item.textContent.trim() === ${JSON.stringify(label)}
+      item =>
+        !item.disabled &&
+        !(item.closest && item.closest('[inert]')) &&
+        item.textContent.trim() === ${JSON.stringify(label)}
     );
     if (!button) return false;
     button.click();
@@ -354,11 +359,9 @@ export const journeyExpressions = {
     );
   })()`,
   hasSavedNoteExportConfirmation: () => `(() => {
-    const status = document.querySelector('#reader-annotations [role="status"]');
+    const statuses = Array.from(document.querySelectorAll('#reader-annotations [role="status"]'));
     return Boolean(
-      status &&
-        status.textContent &&
-        status.textContent.includes('Saved notes as') &&
+      statuses.some(status => status.textContent && status.textContent.includes('Saved notes as')) &&
         !document.querySelector('#reader-annotations textarea[readonly]')
     );
   })()`,
