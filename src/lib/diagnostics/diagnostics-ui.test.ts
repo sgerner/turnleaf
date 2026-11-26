@@ -23,6 +23,12 @@ const env = vi.hoisted(() => ({
 }));
 
 vi.mock('@capacitor/core', () => ({
+  SystemBars: { setStyle: vi.fn().mockResolvedValue(undefined) },
+  SystemBarsStyle: {
+    Default: 'DEFAULT',
+    Dark: 'DARK',
+    Light: 'LIGHT',
+  },
   Capacitor: {
     isNativePlatform: () => env.native,
     getPlatform: () => (env.native ? 'android' : 'web'),
@@ -370,7 +376,7 @@ describe('shared diagnostics across onboarding and startup', () => {
     });
 
     // Native export succeeds and writes sanitized log to Directory.Documents.
-    const downloadButton = buttonByText(alert, 'Download log');
+    const downloadButton = buttonByText(container, 'Download log');
     downloadButton.click();
 
     await waitForUi(() => {
@@ -398,7 +404,7 @@ describe('shared diagnostics across onboarding and startup', () => {
     downloadButton.click();
 
     const textarea = await waitForUi(() => {
-      const field = alert.querySelector<HTMLTextAreaElement>(
+      const field = container.querySelector<HTMLTextAreaElement>(
         'textarea[aria-label="Turnleaf diagnostics log"]',
       );
       expect(field).not.toBeNull();
