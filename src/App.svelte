@@ -4,22 +4,19 @@
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
+  import DiagnosticsPanel from './lib/components/DiagnosticsPanel.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
+  import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
-  import {
-    getPreferences,
-    getServer,
-    resetLocalDatabase,
-    salvageOpenReadingNotePreferences,
-    setPreferences,
-    type ServerConfig,
-  } from './lib/database/database';
+  import * as database from './lib/database/database';
+  import type { ServerConfig } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
   import {
     collectLibraryReadingNotes,
     exportTextDocument,
     readingNotesBackupMarkdown,
     serializeReadingNotesBackup,
+    type BookNoteMetadata,
     type ReadingNotesBookBackup,
   } from './lib/reader/notes-backup';
   import { loadTheme } from './lib/themes/themes';
@@ -46,6 +43,27 @@
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
 
+  async function trySalvageReadingNotes(): Promise<{
+    preferences: Map<string, string>;
+    books: BookNoteMetadata[];
+  } | null> {
+    try {
+      if (!('salvageOpenReadingNotePreferences' in database)) return null;
+      return await database.salvageOpenReadingNotePreferences();
+    } catch {
+      return null;
+    }
+  }
+
+  async function tryRestorePreferences(prefs: ReadonlyMap<string, string>): Promise<void> {
+    try {
+      if (!('setPreferences' in database)) return;
+      await database.setPreferences(prefs);
+    } catch {
+      // Best effort only after database reset.
+    }
+  }
+
   async function loadLocalData(): Promise<void> {
     booting = true;
     startupError = '';
@@ -55,8 +73,8 @@
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
-        getServer(),
-        getPreferences([themePreferenceKey, modePreferenceKey]),
+        database.getServer(),
+        database.getPreferences([themePreferenceKey, modePreferenceKey]),
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
@@ -68,12 +86,22 @@
         try {
           apiKey = await getApiKey(saved.credentialRef);
         } catch {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/credentials',
+            detail: 'credential-read-failed',
+          });
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
       }
     } catch {
-      const salvaged = await salvageOpenReadingNotePreferences().catch(() => null);
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-open-failed',
+      });
+      const salvaged = await trySalvageReadingNotes();
       if (salvaged && salvaged.preferences.size > 0) {
         salvagedPreferences = salvaged.preferences;
         salvagedNotes = collectLibraryReadingNotes(salvaged.preferences, salvaged.books);
@@ -86,6 +114,7 @@
   }
 
   onMount(() => {
+    void hydrateDiagnostics();
     void loadLocalData();
   });
 
@@ -117,14 +146,15 @@
     try {
       let prefsToRestore = salvagedPreferences;
       if (!prefsToRestore) {
-        const salvaged = await salvageOpenReadingNotePreferences().catch(() => null);
+        const salvaged = await trySalvageReadingNotes();
         if (salvaged && salvaged.preferences.size > 0) {
           prefsToRestore = salvaged.preferences;
         }
       }
-      await resetLocalDatabase();
+      await database.resetLocalDatabase();
+      await clearDiagnostics();
       if (prefsToRestore && prefsToRestore.size > 0) {
-        await setPreferences(prefsToRestore).catch(() => undefined);
+        await tryRestorePreferences(prefsToRestore);
       }
       salvagedPreferences = null;
       salvagedNotes = [];
@@ -132,6 +162,11 @@
       startupExportFallback = '';
       await loadLocalData();
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-reset-failed',
+      });
       startupError =
         'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
       return;
@@ -316,6 +351,7 @@
             </button>
           {/if}
         </div>
+        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
     {:else}
       <Onboarding
