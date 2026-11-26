@@ -119,13 +119,37 @@ jobs:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
-      - name: Enable emulator hardware acceleration for manual journey
-        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
+      - name: Enable emulator hardware acceleration
+        if: steps.release_preflight.outputs.already_released != 'true'
         run: |
           if [ -c /dev/kvm ]; then
             sudo chgrp "$(id -gn)" /dev/kvm
             sudo chmod g+rw /dev/kvm
           fi
+
+      - name: Cache Android AVD snapshot
+        if: steps.release_preflight.outputs.already_released != 'true'
+        id: avd-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ runner.os }}-api-36-google_apis-x86_64-pixel_6-v1
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.release_preflight.outputs.already_released != 'true' && steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
 
       - name: Verify manually dispatched revision with reading journey
         if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
@@ -135,8 +159,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
-          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:journey
@@ -193,14 +217,6 @@ jobs:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:release
 
-      - name: Enable emulator hardware acceleration for signed APK smoke test
-        if: steps.release_preflight.outputs.already_released != 'true'
-        run: |
-          if [ -c /dev/kvm ]; then
-            sudo chgrp "$(id -gn)" /dev/kvm
-            sudo chmod g+rw /dev/kvm
-          fi
-
       - name: Smoke-test signed release APK
         if: steps.release_preflight.outputs.already_released != 'true'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
@@ -212,8 +228,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
-          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:smoke
