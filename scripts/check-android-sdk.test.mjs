@@ -10,7 +10,12 @@ import {
   validateJavaCompatibility,
   validateAndroidSdk,
 } from './check-android-sdk.mjs';
-import { childEnvironment, gradleTask } from './android-build.mjs';
+import {
+  childEnvironment,
+  gradleArgs,
+  gradleTask,
+  main as runAndroidBuild,
+} from './android-build.mjs';
 
 describe('Android SDK preflight', () => {
   it('parses a project SDK path from local.properties', () => {
@@ -124,18 +129,141 @@ describe('Android SDK preflight', () => {
   });
 
   it('propagates the resolved SDK to every Android child process', () => {
-    expect(
-      childEnvironment('/opt/android/sdk', {
-        ANDROID_HOME: '/old/sdk',
-        ANDROID_SDK_ROOT: '/old/sdk',
-        PATH: '/bin',
-      }),
-    ).toMatchObject({
+    const signingEnv = {
+      ANDROID_HOME: '/old/sdk',
+      ANDROID_SDK_ROOT: '/old/sdk',
+      PATH: '/bin',
+      TURNLEAF_STORE_FILE: '/tmp/runner/turnleaf-release.jks',
+      TURNLEAF_STORE_PASSWORD: ' store\\secret ',
+      TURNLEAF_KEY_ALIAS: 'turnleaf',
+      TURNLEAF_KEY_PASSWORD: ' key\\secret ',
+    };
+
+    expect(childEnvironment('/opt/android/sdk', signingEnv)).toMatchObject({
+      ANDROID_HOME: '/opt/android/sdk',
+      ANDROID_SDK_ROOT: '/opt/android/sdk',
+      PATH: '/bin',
+      TURNLEAF_STORE_FILE: '/tmp/runner/turnleaf-release.jks',
+      TURNLEAF_STORE_PASSWORD: ' store\\secret ',
+      TURNLEAF_KEY_ALIAS: 'turnleaf',
+      TURNLEAF_KEY_PASSWORD: ' key\\secret ',
+    });
+
+    const redacted = childEnvironment('/opt/android/sdk', signingEnv, {
+      includeSigningSecrets: false,
+    });
+    expect(redacted).toMatchObject({
       ANDROID_HOME: '/opt/android/sdk',
       ANDROID_SDK_ROOT: '/opt/android/sdk',
       PATH: '/bin',
     });
+    expect(redacted.TURNLEAF_STORE_FILE).toBeUndefined();
+    expect(redacted.TURNLEAF_STORE_PASSWORD).toBeUndefined();
+    expect(redacted.TURNLEAF_KEY_ALIAS).toBeUndefined();
+    expect(redacted.TURNLEAF_KEY_PASSWORD).toBeUndefined();
+
     expect(gradleTask('debug')).toBe('assembleDebug');
     expect(gradleTask('release')).toBe('assembleRelease');
+    expect(gradleArgs('debug')).toEqual(['assembleDebug']);
+    expect(gradleArgs('release', ['--no-daemon'])).toEqual(['assembleRelease', '--no-daemon']);
+    expect(gradleArgs('release', ['--', '--no-daemon', '--stacktrace'])).toEqual([
+      'assembleRelease',
+      '--no-daemon',
+      '--stacktrace',
+    ]);
+  });
+
+  it('forwards --no-daemon to Gradle, scopes signing env to assembleRelease, and stops Gradle afterward', async () => {
+    const calls = [];
+    await runAndroidBuild('release', ['--no-daemon'], {
+      platform: 'linux',
+      environment: {
+        PATH: '/usr/bin',
+        TURNLEAF_REUSE_WEB_BUILD: 'true',
+        TURNLEAF_STORE_FILE: '/tmp/runner/turnleaf-release.jks',
+        TURNLEAF_STORE_PASSWORD: 'secret-store-password',
+        TURNLEAF_KEY_ALIAS: 'turnleaf',
+        TURNLEAF_KEY_PASSWORD: 'secret-key-password',
+      },
+      validateSdk: () => ({
+        ok: true,
+        sdk: { path: '/opt/android/sdk', source: 'ANDROID_HOME' },
+        missing: [],
+        candidates: [],
+      }),
+      detectJava: () => ({ ok: true, major: 21, minimum: 17 }),
+      run: async (command, args, options) => {
+        calls.push({ command, args, env: options.env });
+      },
+      log: () => {},
+      errorLog: () => {},
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls[0]).toMatchObject({
+      command: 'npm',
+      args: ['exec', '--', 'cap', 'sync', 'android'],
+    });
+    expect(calls[0].env.TURNLEAF_STORE_PASSWORD).toBeUndefined();
+
+    expect(calls[1]).toMatchObject({
+      command: './gradlew',
+      args: ['assembleRelease', '--no-daemon'],
+    });
+    expect(calls[1].env).toMatchObject({
+      ANDROID_HOME: '/opt/android/sdk',
+      ANDROID_SDK_ROOT: '/opt/android/sdk',
+      TURNLEAF_STORE_FILE: '/tmp/runner/turnleaf-release.jks',
+      TURNLEAF_STORE_PASSWORD: 'secret-store-password',
+      TURNLEAF_KEY_ALIAS: 'turnleaf',
+      TURNLEAF_KEY_PASSWORD: 'secret-key-password',
+    });
+
+    expect(calls[2]).toMatchObject({
+      command: './gradlew',
+      args: ['--stop'],
+    });
+    expect(calls[2].env.TURNLEAF_STORE_PASSWORD).toBeUndefined();
+    expect(calls[2].env.TURNLEAF_KEY_PASSWORD).toBeUndefined();
+  });
+
+  it('still stops Gradle daemons when release signing fails', async () => {
+    const calls = [];
+    const previousExitCode = process.exitCode;
+    try {
+      await runAndroidBuild('release', ['--no-daemon'], {
+        platform: 'linux',
+        environment: {
+          PATH: '/usr/bin',
+          TURNLEAF_REUSE_WEB_BUILD: 'true',
+        },
+        validateSdk: () => ({
+          ok: true,
+          sdk: { path: '/opt/android/sdk', source: 'ANDROID_HOME' },
+          missing: [],
+          candidates: [],
+        }),
+        detectJava: () => ({ ok: true, major: 21, minimum: 17 }),
+        run: async (command, args) => {
+          calls.push({ command, args });
+          if (args[0] === 'assembleRelease') {
+            const error = new Error('Release signing is not configured.');
+            error.exitCode = 2;
+            throw error;
+          }
+        },
+        log: () => {},
+        errorLog: () => {},
+      });
+
+      expect(process.exitCode).toBe(2);
+      expect(calls).toEqual([
+        { command: 'npm', args: ['exec', '--', 'cap', 'sync', 'android'] },
+        { command: './gradlew', args: ['assembleRelease', '--no-daemon'] },
+        { command: './gradlew', args: ['--stop'] },
+      ]);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
   });
 });
