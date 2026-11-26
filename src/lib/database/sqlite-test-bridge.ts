@@ -14,6 +14,8 @@ interface NativeConnectionEntry {
 type StatementMatcher =
   string | RegExp | ((statement: string, values: unknown[], statementIndex: number) => boolean);
 
+type TransactionTaskHandler = (taskIndex: number) => void | Promise<void>;
+
 interface TransactionFault {
   kind: 'transaction';
   taskIndex: number;
@@ -66,6 +68,7 @@ export interface SQLiteTestBridge {
   isNativeHandleOpen(database?: string, readonly?: boolean): boolean;
   failTransactionAt(taskIndex: number, rejection?: Error | string): void;
   failStatement(matcher: StatementMatcher, rejection?: Error | string): void;
+  onTransactionTask(handler: TransactionTaskHandler | null): void;
   clearFaults(): void;
 }
 
@@ -74,6 +77,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
   const createdDirectories = new Set<string>();
   const connections = new Map<string, NativeConnectionEntry>();
   let pendingFaults: PendingFault[] = [];
+  let transactionTaskHandler: TransactionTaskHandler | null = null;
   let transactionTaskIndex = 0;
   let totalStatementIndex = 0;
 
@@ -131,7 +135,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
     return entry.handle;
   }
 
-  function maybeInjectFault(statement: string, values: unknown[], inTransaction: boolean): void {
+  function maybeInjectFault(statement: string, values: unknown[], inTransaction: boolean): number {
     const statementIndex = totalStatementIndex++;
     const currentTaskIndex = inTransaction ? transactionTaskIndex++ : -1;
 
@@ -146,6 +150,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
         throw fault.rejection;
       }
     }
+    return currentTaskIndex;
   }
 
   function deleteDatabaseFiles(filePath: string): void {
@@ -347,7 +352,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       }
       const entry = requireConnection(options.database, false);
       const handle = requireOpenHandle(options.database, false);
-      maybeInjectFault(options.statements, [], entry.inTransaction);
+      const taskIndex = maybeInjectFault(options.statements, [], entry.inTransaction);
       const useTransaction = options.transaction !== false && !entry.inTransaction;
       if (useTransaction) {
         handle.exec('BEGIN');
@@ -364,6 +369,9 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
         }
       } else {
         handle.exec(options.statements);
+      }
+      if (taskIndex >= 0 && transactionTaskHandler) {
+        await transactionTaskHandler(taskIndex);
       }
       return { changes: { changes: 0 } };
     },
@@ -382,7 +390,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       const entry = requireConnection(options.database, false);
       const handle = requireOpenHandle(options.database, false);
       const rawValues = options.values ?? [];
-      maybeInjectFault(options.statement, rawValues, entry.inTransaction);
+      const taskIndex = maybeInjectFault(options.statement, rawValues, entry.inTransaction);
       const sqlValues = normalizeSqlValues(rawValues);
       const useTransaction = options.transaction !== false && !entry.inTransaction;
 
@@ -419,7 +427,11 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
         }
       }
 
-      return runStatement();
+      const result = runStatement();
+      if (taskIndex >= 0 && transactionTaskHandler) {
+        await transactionTaskHandler(taskIndex);
+      }
+      return result;
     },
 
     async query(options: {
@@ -447,6 +459,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
     useNewDirectory(nextPrefix = prefix): string {
       closeAllNativeConnections();
       pendingFaults = [];
+      transactionTaskHandler = null;
       transactionTaskIndex = 0;
       totalStatementIndex = 0;
       currentDirectory = mkdtempSync(join(tmpdir(), nextPrefix));
@@ -456,6 +469,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
     cleanup(): void {
       closeAllNativeConnections();
       pendingFaults = [];
+      transactionTaskHandler = null;
       transactionTaskIndex = 0;
       totalStatementIndex = 0;
       for (const dir of createdDirectories) {
@@ -499,8 +513,12 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
         rejection,
       });
     },
+    onTransactionTask(handler: TransactionTaskHandler | null): void {
+      transactionTaskHandler = handler;
+    },
     clearFaults(): void {
       pendingFaults = [];
+      transactionTaskHandler = null;
     },
   };
 }
