@@ -869,6 +869,7 @@ export class ReaderSession {
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
+        previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
     const nextCss = this.buildThemeCss(value, this.resolveModeColors(value.mode));
     if (nextCss === this.themeCss && !layoutChanged) return;
@@ -1520,10 +1521,15 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
+    const bodyTextAlign = value.publisherStyles ? value.alignment : `${value.alignment} !important`;
+    const paragraphRule = value.publisherStyles
+      ? `p { margin-bottom: ${value.paragraphSpacing}em; hyphens: ${hyphens}; }`
+      : `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${hyphens} !important; }`;
     return [
       `html { background: ${colors.background} !important; box-sizing: border-box; }`,
-      `body { color: ${colors.text} !important; background: ${colors.background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; padding: 0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important; box-sizing: border-box; }`,
-      `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${value.hyphenation ? 'auto' : 'none'}; }`,
+      `body { color: ${colors.text} !important; background: ${colors.background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; text-align: ${bodyTextAlign}; padding: 0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important; box-sizing: border-box; }`,
+      paragraphRule,
       'img, svg, video, canvas, table, pre, blockquote { max-width: 100% !important; }',
       'img { height: auto !important; }',
       `a { color: ${colors.link} !important; }`,
