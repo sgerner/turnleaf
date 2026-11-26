@@ -622,7 +622,9 @@
   });
 
   $effect(() => {
-    const overlayActive = Boolean(reading || actionMenuBook || conflict || settingsVisible);
+    const overlayActive = Boolean(
+      reading || actionMenuBook || conflict || settingsVisible || libraryConfirm,
+    );
     onOverlayActiveChange?.(overlayActive);
     return () => onOverlayActiveChange?.(false);
   });
