@@ -1568,7 +1568,7 @@
               onchange={(event) =>
                 updateAppearance({ publisherStyles: event.currentTarget.checked })}
             />
-            Publisher styles
+            Respect publisher formatting
           </label>
           <label class="mt-4 flex min-h-12 items-center gap-3">
             <input

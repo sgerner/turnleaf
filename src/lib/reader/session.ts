@@ -982,6 +982,18 @@ export class ReaderSession {
         previous.hyphenation !== value.hyphenation);
     const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
+    const rawContents =
+      typeof (rendition as Partial<Rendition>).getContents === 'function'
+        ? (rendition.getContents() as unknown as Contents | Contents[])
+        : [];
+    const renderedContents = Array.isArray(rawContents)
+      ? rawContents
+      : rawContents
+        ? [rawContents]
+        : [];
+    for (const content of renderedContents) {
+      content?.document?.getElementById('epubjs-inserted-css-turnleaf')?.remove();
+    }
     const colors = MODE_COLORS[value.mode];
     const family =
       value.fontFamily === 'book'
@@ -989,11 +1001,13 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
     const bodyRules: Record<string, string> = {
       color: `${this.resolveToken(colors.text)} !important`,
       background: `${this.resolveToken(colors.background)} !important`,
       'font-size': `${value.fontSize}px !important`,
       'line-height': `${value.lineHeight} !important`,
+      'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
       padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
       'box-sizing': 'border-box',
     };
@@ -1003,13 +1017,12 @@ export class ReaderSession {
     const paragraphRules: Record<string, string> = value.publisherStyles
       ? {
           'margin-bottom': `${value.paragraphSpacing}em`,
-          'text-align': value.alignment,
-          hyphens: value.hyphenation ? 'auto' : 'none',
+          hyphens,
         }
       : {
           'margin-bottom': `${value.paragraphSpacing}em !important`,
           'text-align': `${value.alignment} !important`,
-          hyphens: `${value.hyphenation ? 'auto' : 'none'} !important`,
+          hyphens: `${hyphens} !important`,
         };
     rendition.themes.register('turnleaf', {
       html: {
@@ -1031,20 +1044,12 @@ export class ReaderSession {
       '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
     });
     rendition.themes.select('turnleaf');
-    const rawContents = (
-      rendition as unknown as { getContents?: () => Contents | Contents[] }
-    ).getContents?.();
-    const renderedContents = Array.isArray(rawContents)
-      ? rawContents
-      : rawContents
-        ? [rawContents]
-        : [];
     for (const contents of renderedContents) {
-      if (contents.document) {
+      if (contents?.document) {
         this.syncPublisherStyles(contents.document, value.publisherStyles);
       }
       if (layoutChanged) {
-        (contents as unknown as { expand?: () => void }).expand?.();
+        (contents as unknown as { expand?: () => void } | undefined)?.expand?.();
       }
     }
     if (!layoutChanged) return;
