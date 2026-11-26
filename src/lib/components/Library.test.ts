@@ -11,6 +11,7 @@ import type {
 } from '../database/database';
 import type { KavitaProgress } from '../kavita/types';
 import type { ReaderLocation } from '../reader/session';
+import { bookActionsLabel, openBookLabel } from '../a11y/book-labels';
 
 const mocks = vi.hoisted(() => ({
   getBooks:
@@ -454,7 +455,7 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
       const targetIndex = order === 'author' ? 25 : 1;
       const targetBook = catalog[targetIndex]!;
       const actionBtn = target.querySelector<HTMLButtonElement>(
-        `[aria-label="Book actions for ${targetBook.title}"]`,
+        `[aria-label="${bookActionsLabel(targetBook)}"]`,
       );
       expect(actionBtn).not.toBeNull();
       actionBtn!.click();
@@ -468,20 +469,16 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
       await settle();
 
       // Before markDownloaded resolves, book is not yet marked offline in memory.
-      expect(
-        target.querySelector(
-          `[aria-label="Open ${targetBook.title}, downloaded for offline reading"]`,
-        ),
-      ).toBeNull();
+      const targetDownloadedLabel = openBookLabel({
+        ...targetBook,
+        downloadPath: 'books/downloaded.epub',
+      });
+      expect(target.querySelector(`[aria-label="${targetDownloadedLabel}"]`)).toBeNull();
 
       downloadDeferred.resolve();
       await settle();
 
-      expect(
-        target.querySelector(
-          `[aria-label="Open ${targetBook.title}, downloaded for offline reading"]`,
-        ),
-      ).not.toBeNull();
+      expect(target.querySelector(`[aria-label="${targetDownloadedLabel}"]`)).not.toBeNull();
 
       // Open settings to check storage total updated (1.0 MB + 2.0 MB = 3.0 MB).
       target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
@@ -493,9 +490,7 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
       // 2. Relocated inside Reader: persists first, updates continueBook and visibleBooks without localeCompare.
       const downloadedBook = catalog[0]!;
       target
-        .querySelector<HTMLButtonElement>(
-          `[aria-label="Open ${downloadedBook.title}, downloaded for offline reading"]`,
-        )!
+        .querySelector<HTMLButtonElement>(`[aria-label="${openBookLabel(downloadedBook)}"]`)!
         .click();
       await settle();
       expect(mocks.readerProps).not.toBeNull();
@@ -518,11 +513,15 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
       mocks.readerProps!.onBack();
       await settle();
 
-      expect(
-        target.querySelector(
-          `[aria-label="Continue reading ${downloadedBook.title}, 45% complete"]`,
-        ),
-      ).not.toBeNull();
+      const findContinueButton = (expectedProgress: string) =>
+        Array.from(target.querySelectorAll<HTMLButtonElement>('button')).find(
+          (button) =>
+            button.textContent?.includes('Continue reading') &&
+            button.textContent?.includes(downloadedBook.title) &&
+            button.textContent?.includes(expectedProgress),
+        ) ?? null;
+
+      expect(findContinueButton('45%')).not.toBeNull();
 
       // 3. continueFromKavita on conflict: persists first, updates progress without localeCompare.
       mocks.getReadingState.mockResolvedValueOnce({
@@ -547,7 +546,7 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
 
       target
         .querySelector<HTMLButtonElement>(
-          `[aria-label="Open ${downloadedBook.title}, downloaded for offline reading, 45% complete"]`,
+          `[aria-label="${openBookLabel({ ...downloadedBook, pagesRead: 45 })}"]`,
         )!
         .click();
       await settle();
@@ -567,15 +566,11 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
       mocks.readerProps!.onBack();
       await settle();
 
-      expect(
-        target.querySelector(
-          `[aria-label="Continue reading ${downloadedBook.title}, 80% complete"]`,
-        ),
-      ).not.toBeNull();
+      expect(findContinueButton('80%')).not.toBeNull();
 
       // 4. Remove single download: persists first, updates storage total without localeCompare.
       target
-        .querySelector<HTMLButtonElement>(`[aria-label="Book actions for ${targetBook.title}"]`)!
+        .querySelector<HTMLButtonElement>(`[aria-label="${bookActionsLabel(targetBook)}"]`)!
         .click();
       await settle();
       const removeBtn = Array.from(target.querySelectorAll('button')).find((button) =>
@@ -590,9 +585,7 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
       const completeDeferred = createDeferred<void>();
       mocks.markBookCompleted.mockImplementationOnce(() => completeDeferred.promise);
       target
-        .querySelector<HTMLButtonElement>(
-          `[aria-label="Book actions for ${downloadedBook.title}"]`,
-        )!
+        .querySelector<HTMLButtonElement>(`[aria-label="${bookActionsLabel(downloadedBook)}"]`)!
         .click();
       await settle();
       const markReadBtn = Array.from(target.querySelectorAll('button')).find((button) =>
@@ -638,7 +631,9 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
     // While cleanupInProgress is active, overlapping single-book removal is blocked.
     target.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click();
     await settle();
-    target.querySelector<HTMLButtonElement>('[aria-label="Book actions for Book 00000"]')!.click();
+    target
+      .querySelector<HTMLButtonElement>(`[aria-label="${bookActionsLabel(catalog[0]!)}"]`)!
+      .click();
     await settle();
     const singleRemoveBtn = Array.from(target.querySelectorAll('button')).find((button) =>
       button.textContent?.includes('Remove download'),
