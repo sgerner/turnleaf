@@ -28,6 +28,7 @@
   } from '../reader/session';
   import type { ReaderSearchResult } from '../reader/search';
   import {
+    MAX_ANNOTATIONS,
     addAnnotation,
     annotationsMarkdown,
     parseAnnotations,
@@ -36,6 +37,7 @@
     type StoredAnnotation,
   } from '../reader/annotations';
   import {
+    MAX_BOOKMARKS,
     parseBookmarks,
     parseLocationHistory,
     recordLocation,
@@ -134,6 +136,7 @@
   let locationHistory = $state<StoredReaderLocation[]>([]);
   let editingBookmarkId = $state<string | null>(null);
   let bookmarkDraft = $state('');
+  let bookmarkLimitMessage = $state('');
   let annotations = $state<StoredAnnotation[]>([]);
   const androidReader = Capacitor.getPlatform() === 'android';
   let exportMessage = $state('');
@@ -147,6 +150,15 @@
   let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
+  let annotationLimitMessage = $state('');
+  const annotationDrafts = new SvelteMap<string, string>();
+
+  const BOOKMARK_LIMIT_MESSAGE = `You can save up to ${MAX_BOOKMARKS} bookmarks per book. Delete a bookmark to add another.`;
+  const ANNOTATION_LIMIT_MESSAGE = `You can save up to ${MAX_ANNOTATIONS} highlights per book. Delete a highlight to add another.`;
+
+  function hasSelectionDraft(): boolean {
+    return Boolean(selectedText && annotationDraft.trim());
+  }
   let searchQuery = $state('');
   let searched = $state(false);
   let searchResults = $state<ReaderSearchResult[]>([]);
@@ -226,7 +238,7 @@
       (next, origin, returnTarget) => {
         if (destroyed) return;
         if (!toc.length) toc = nextSession.tableOfContents();
-        if (location?.cfi !== next.cfi) selectedText = null;
+        if (location?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
@@ -254,8 +266,10 @@
         if (destroyed) return;
         if (selection) {
           selectionMessage = '';
-          selectedText = selection;
-        } else if (!annotationsVisible) {
+          if (!hasSelectionDraft()) {
+            selectedText = selection;
+          }
+        } else if (!annotationsVisible && !hasSelectionDraft()) {
           selectedText = null;
         }
       },
@@ -475,6 +489,7 @@
   function closeBookmarks(): void {
     bookmarksVisible = false;
     editingBookmarkId = null;
+    bookmarkLimitMessage = '';
     const opener = bookmarksOpener;
     bookmarksOpener = null;
     restoreModalFocus(opener);
@@ -495,7 +510,7 @@
     void tick().then(() => viewport?.querySelector<HTMLElement>('iframe')?.focus());
   }
 
-  function openAnnotations(): void {
+  function openAnnotations(focusAnnotationId?: string): void {
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
@@ -513,17 +528,23 @@
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusModal(() => annotationsPanel);
+    if (focusAnnotationId) {
+      focusReaderTarget(annotationsPanel, 'annotation-editor', focusAnnotationId);
+    } else {
+      focusModal(() => annotationsPanel);
+    }
   }
 
   function closeAnnotations(): void {
     annotationsVisible = false;
-    editingAnnotationId = null;
-    selectedText = null;
+    if (!hasSelectionDraft()) {
+      selectedText = null;
+      annotationDraft = '';
+    }
     visiblePassages = [];
     selectedPassageIndex = 0;
-    annotationDraft = '';
     annotationMessage = '';
+    annotationLimitMessage = '';
     exportFallback = '';
     exportMessage = '';
     const opener = annotationsOpener;
@@ -802,7 +823,16 @@
 
   function toggleCurrentBookmark(): void {
     if (!location) return;
-    bookmarks = toggleBookmark(bookmarks, readerLocation(location));
+    const id = `${location.cfi}|${location.href}`;
+    const wasBookmarked = bookmarks.some((bookmark) => bookmark.id === id);
+    const next = toggleBookmark(bookmarks, readerLocation(location));
+    if (!wasBookmarked && !next.some((bookmark) => bookmark.id === id)) {
+      bookmarkLimitMessage = BOOKMARK_LIMIT_MESSAGE;
+      showControls();
+      return;
+    }
+    bookmarks = next;
+    bookmarkLimitMessage = '';
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
     showControls();
   }
@@ -824,39 +854,95 @@
     const index = bookmarks.findIndex((entry) => entry.id === bookmark.id);
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
+    if (bookmarks.length < MAX_BOOKMARKS) bookmarkLimitMessage = '';
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
     const next = bookmarks[Math.min(Math.max(index, 0), bookmarks.length - 1)];
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(target: ReaderSelection | null = selectedText): void {
-    if (!target) return;
+  function saveAnnotation(
+    target: ReaderSelection | null = selectedText,
+    openOnLimit = false,
+  ): StoredAnnotation | null {
+    if (!target) return null;
+    const trimmedCfi = target.cfi.trim();
+    const trimmedExcerpt = target.text.trim();
+    if (!trimmedCfi || !trimmedExcerpt) return null;
     const hadNote = Boolean(annotationDraft.trim());
-    annotations = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
+    const next = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
+    const saved = next.find((annotation) => annotation.cfi === trimmedCfi) ?? null;
+    if (!saved) {
+      annotationLimitMessage = ANNOTATION_LIMIT_MESSAGE;
+      annotationMessage = '';
+      if (openOnLimit && !annotationsVisible) openAnnotations();
+      return null;
+    }
+    annotations = next;
+    annotationLimitMessage = '';
+    if (hadNote && annotationDrafts.has(saved.id)) {
+      annotationDrafts.set(saved.id, saved.note);
+    }
     session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
     annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    return saved;
+  }
+
+  function highlightSelection(): void {
+    const restoreFrameFocus = Boolean(
+      selectedTextGroup &&
+      document.activeElement &&
+      selectedTextGroup.contains(document.activeElement),
+    );
+    if (saveAnnotation(selectedText, true)) {
+      selectionMessage = 'Highlight saved.';
+      if (restoreFrameFocus) restoreViewportFrameFocus();
+    }
+  }
+
+  function startSelectionNote(): void {
+    const saved = saveAnnotation(selectedText, true);
+    if (!saved) return;
+    selectionMessage = 'Highlight saved.';
+    editingAnnotationId = saved.id;
+    if (!annotationDrafts.has(saved.id)) {
+      annotationDrafts.set(saved.id, saved.note);
+    }
+    openAnnotations(saved.id);
   }
 
   function editAnnotation(annotation: StoredAnnotation): void {
-    annotations = updateAnnotation(annotations, annotation.id, annotationDraft);
+    const draft = annotationDrafts.get(annotation.id) ?? annotation.note;
+    annotations = updateAnnotation(annotations, annotation.id, draft);
+    annotationDrafts.delete(annotation.id);
     editingAnnotationId = null;
-    annotationDraft = '';
+    annotationLimitMessage = '';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
   function startAnnotationEdit(annotation: StoredAnnotation): void {
     editingAnnotationId = annotation.id;
-    annotationDraft = annotation.note;
+    if (!annotationDrafts.has(annotation.id)) {
+      annotationDrafts.set(annotation.id, annotation.note);
+    }
     focusReaderTarget(annotationsPanel, 'annotation-editor', annotation.id);
+  }
+
+  function cancelAnnotationEdit(annotation: StoredAnnotation): void {
+    annotationDrafts.delete(annotation.id);
+    editingAnnotationId = null;
+    focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
   function deleteAnnotation(annotation: StoredAnnotation): void {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
+    annotationDrafts.delete(annotation.id);
+    if (editingAnnotationId === annotation.id) editingAnnotationId = null;
+    if (annotations.length < MAX_ANNOTATIONS) annotationLimitMessage = '';
     session?.updateHighlights(annotations);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
@@ -873,7 +959,7 @@
     );
     try {
       await navigator.clipboard.writeText(selection.text);
-      selectedText = null;
+      if (!hasSelectionDraft()) selectedText = null;
       selectionMessage = 'Selected text copied.';
       if (restoreFrameFocus) restoreViewportFrameFocus();
     } catch {
@@ -1122,6 +1208,25 @@
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed) return;
+    if (
+      !event.defaultPrevented &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key === 'Escape' &&
+      hasOpenReaderPanel()
+    ) {
+      event.preventDefault();
+      if (pendingSyncLocation) closeSyncConfirmation();
+      else if (settingsVisible) closeSettings();
+      else if (tocVisible) closeToc();
+      else if (bookmarksVisible) closeBookmarks();
+      else if (annotationsVisible) closeAnnotations();
+      else if (searchVisible) closeSearch();
+      showControls();
+      return;
+    }
     const action = resolveReaderKeyboardAction(event, {
       hasOpenPanel: hasOpenReaderPanel(),
       hasSelection: selectedText !== null,
@@ -1135,7 +1240,7 @@
         selectedTextGroup.contains(document.activeElement),
       );
       session?.clearTextSelection();
-      selectedText = null;
+      if (!hasSelectionDraft()) selectedText = null;
       if (restoreFrameFocus) restoreViewportFrameFocus();
       return;
     }
@@ -1209,16 +1314,7 @@
         class="btn btn-sm preset-filled-primary-700-300 min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={() => {
-          const restoreFrameFocus = Boolean(
-            selectedTextGroup &&
-            document.activeElement &&
-            selectedTextGroup.contains(document.activeElement),
-          );
-          saveAnnotation();
-          selectionMessage = 'Highlight saved.';
-          if (restoreFrameFocus) restoreViewportFrameFocus();
-        }}
+        onclick={highlightSelection}
       >
         Highlight
       </button>
@@ -1226,7 +1322,7 @@
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}
+        onclick={startSelectionNote}
       >
         Add note
       </button>
@@ -1977,6 +2073,9 @@
               {currentBookmark() ? 'Remove bookmark at this page' : 'Bookmark this page'}
             </button>
           {/if}
+          {#if bookmarkLimitMessage}
+            <p class="mt-3 text-sm text-error-700-300" role="alert">{bookmarkLimitMessage}</p>
+          {/if}
 
           <section class="mt-5" aria-labelledby="reader-bookmark-list-title">
             <h3
@@ -2099,13 +2198,18 @@
             Saved on this device. Choose a passage on this page or select text in the book to add a
             highlight and an optional note.
           </p>
+          {#if annotationLimitMessage}
+            <p class="mt-3 text-sm text-error-700-300" role="alert">{annotationLimitMessage}</p>
+          {/if}
 
           {#if selectedText}
             <form
               class="mt-4 rounded-lg preset-tonal-primary p-3"
               onsubmit={(event) => {
                 event.preventDefault();
-                saveAnnotation();
+                if (saveAnnotation()) {
+                  selectionMessage = 'Highlight saved.';
+                }
               }}
             >
               <p class="text-sm italic">“{selectedText.text}”</p>
@@ -2123,6 +2227,7 @@
                   onclick={() => {
                     selectedText = null;
                     annotationDraft = '';
+                    annotationLimitMessage = '';
                   }}
                 >
                   Cancel
@@ -2148,6 +2253,7 @@
                   onchange={(event) => {
                     selectedPassageIndex = Number(event.currentTarget.value);
                     annotationMessage = '';
+                    annotationLimitMessage = '';
                   }}
                 >
                   {#each visiblePassages as passage, index (`${passage.cfi}-${index}`)}
@@ -2235,7 +2341,10 @@
                           class="textarea min-h-20"
                           data-reader-focus="annotation-editor"
                           data-reader-focus-id={annotation.id}
-                          bind:value={annotationDraft}></textarea>
+                          value={annotationDrafts.get(annotation.id) ?? annotation.note}
+                          oninput={(event) =>
+                            annotationDrafts.set(annotation.id, event.currentTarget.value)}
+                        ></textarea>
                       </label>
                       <div class="flex gap-2">
                         <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
@@ -2244,11 +2353,7 @@
                         <button
                           class="btn btn-sm preset-tonal-surface"
                           type="button"
-                          onclick={() => {
-                            editingAnnotationId = null;
-                            annotationDraft = '';
-                            focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
-                          }}
+                          onclick={() => cancelAnnotationEdit(annotation)}
                         >
                           Cancel
                         </button>
