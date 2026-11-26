@@ -1,4 +1,3 @@
-import java.io.FileInputStream
 import java.util.Properties
 import groovy.json.JsonSlurper
 
@@ -7,13 +6,13 @@ apply plugin: 'com.android.application'
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file('keystore.properties')
 if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+    keystorePropertiesFile.withReader('UTF-8') { keystoreProperties.load(it) }
 }
 
-def releaseStoreFile = keystoreProperties.getProperty('TURNLEAF_STORE_FILE') ?: System.getenv('TURNLEAF_STORE_FILE')
-def releaseStorePassword = keystoreProperties.getProperty('TURNLEAF_STORE_PASSWORD') ?: System.getenv('TURNLEAF_STORE_PASSWORD')
-def releaseKeyAlias = keystoreProperties.getProperty('TURNLEAF_KEY_ALIAS') ?: System.getenv('TURNLEAF_KEY_ALIAS')
-def releaseKeyPassword = keystoreProperties.getProperty('TURNLEAF_KEY_PASSWORD') ?: System.getenv('TURNLEAF_KEY_PASSWORD')
+def releaseStoreFile = System.getenv('TURNLEAF_STORE_FILE') ?: keystoreProperties.getProperty('TURNLEAF_STORE_FILE')
+def releaseStorePassword = System.getenv('TURNLEAF_STORE_PASSWORD') ?: keystoreProperties.getProperty('TURNLEAF_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('TURNLEAF_KEY_ALIAS') ?: keystoreProperties.getProperty('TURNLEAF_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('TURNLEAF_KEY_PASSWORD') ?: keystoreProperties.getProperty('TURNLEAF_KEY_PASSWORD')
 def releaseSigningConfigured = releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
 def releaseStorePath = releaseSigningConfigured ? rootProject.file(releaseStoreFile) : null
 def packageVersion = new JsonSlurper().parse(rootProject.file('../package.json')).version
@@ -60,6 +59,12 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+    }
+    lint {
+        abortOnError = true
+        warningsAsErrors = true
+        baseline = file('lint-baseline.xml')
+        informational += ['AndroidGradlePluginVersion', 'GradleDependency', 'NewerVersionAvailable']
     }
 }
 
