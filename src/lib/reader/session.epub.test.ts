@@ -549,6 +549,159 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('defers viewport resizes fired during initial open until the first location settles', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveStarted!: () => void;
+    let resolveDisplay!: () => void;
+    mockRendition.started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveDisplay = resolve;
+        }),
+    );
+
+    const managedRendition = mockRendition as typeof mockRendition & {
+      manager?: { stage?: object } | undefined;
+    };
+    managedRendition.manager = undefined;
+
+    const viewport = document.createElement('div');
+    const viewportRect = vi
+      .spyOn(viewport, 'getBoundingClientRect')
+      .mockReturnValue(new DOMRect(0, 0, 411, 818));
+
+    const session = new ReaderSession('book.epub');
+    const openPromise = session.open(
+      viewport,
+      'epubcfi(/6/4!/4/2/1:0)',
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    expect(mockBook.renderTo).toHaveBeenCalledWith(
+      viewport,
+      expect.objectContaining({
+        width: 411,
+        height: 818,
+        resizeOnOrientationChange: false,
+      }),
+    );
+
+    // Resize fires while rendition.started is pending and manager is still undefined.
+    viewportRect.mockReturnValue(new DOMRect(0, 0, 411, 890));
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 890 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    managedRendition.manager = { stage: {} };
+    resolveStarted();
+    await vi.waitFor(() => {
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/4!/4/2/1:0)');
+    });
+
+    // Resize fires again mid-display while rendition.location is still undefined.
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 914 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    resolveDisplay();
+    await openPromise;
+    // Still waits for initial relocated when epubjs manager is present and location is unset.
+    expect(mockRendition.resize).not.toHaveBeenCalled();
+
+    mockRendition.location = { start: { cfi: 'epubcfi(/6/4!/4/2/1:0)' } };
+    const relocated = getRenditionListener('relocated');
+    relocated({
+      start: {
+        href: 'second.xhtml',
+        index: 1,
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        displayed: { page: 1, total: 2 },
+      },
+    });
+
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(411, 914);
+
+    session.destroy();
+    Reflect.deleteProperty(managedRendition, 'manager');
+    mockRendition.started = Promise.resolve();
+  });
+
+  it('preserves container scrollLeft while an async resize re-display drains the rendition queue', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const queuedTasks: Array<{ run: () => void; resolve: () => void }> = [];
+    const queuedRendition = mockRendition as typeof mockRendition & {
+      q?: { enqueue: (task: () => void) => Promise<void> };
+    };
+    queuedRendition.q = {
+      enqueue: (task: () => void) =>
+        new Promise<void>((resolve) => {
+          queuedTasks.push({ run: task, resolve });
+        }),
+    };
+
+    const viewport = document.createElement('div');
+    const container = document.createElement('div');
+    container.className = 'epub-container';
+    viewport.append(container);
+
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 890 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenCalledWith(411, 890);
+
+    // Simulate epubjs async post-resize _display scrolling to page 2 before queue barrier settles.
+    container.scrollLeft = 411;
+    container.dispatchEvent(new Event('scroll'));
+    expect(container.scrollLeft).toBe(411);
+
+    for (const item of queuedTasks.splice(0)) {
+      item.run();
+      item.resolve();
+    }
+    await Promise.resolve();
+
+    // Once the queue drains, accidental focus nudges snap back to the new stride (411).
+    container.scrollLeft = 520;
+    container.dispatchEvent(new Event('scroll'));
+    expect(container.scrollLeft).toBe(411);
+
+    session.destroy();
+    Reflect.deleteProperty(queuedRendition, 'q');
+  });
+
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const onLocation = vi.fn();

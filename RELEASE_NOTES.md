@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Serialize reader viewport resizes during initial EPUB open
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
