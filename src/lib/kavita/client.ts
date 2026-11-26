@@ -20,7 +20,7 @@ const MAX_SERIES_PAGES = MAX_SERIES_RESULTS / SERIES_PAGE_SIZE + 1;
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const SERIES_QUERY_BODY = JSON.stringify({
-  statements: [],
+  statements: [{ field: 21, comparison: 5, value: '3' }],
   combination: 0,
   sortOptions: { sortField: 1, isAscending: true },
   limitTo: 0,

@@ -47,6 +47,7 @@ export class ViewportResizeController {
     private readonly target: HTMLElement,
     private readonly rendition: Rendition,
     private readonly getCurrentCfi: () => string | null,
+    private readonly wrapResize?: <T>(execute: () => T) => T,
   ) {
     this.runtime = rendition as unknown as RenditionRuntimeLike;
     const initial = target.getBoundingClientRect();
@@ -87,6 +88,10 @@ export class ViewportResizeController {
     this.scheduleFlush();
   }
 
+  getSize(): ViewportDimensions {
+    return this.viewportSize;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -122,7 +127,7 @@ export class ViewportResizeController {
         }
         this.pendingSize = null;
         this.viewportSize = measured;
-        return originalResize(measured.width, measured.height, epubcfi);
+        return this.executeResize(() => originalResize(measured.width, measured.height, epubcfi));
       }
       this.pendingSize = measured;
       this.scheduleFlush();
@@ -187,14 +192,20 @@ export class ViewportResizeController {
       : undefined;
     this.applyingResize = true;
     try {
-      if (fallbackCfi) {
-        this.runtime.resize(width, height, fallbackCfi);
-      } else {
-        this.rendition.resize(width, height);
-      }
+      this.executeResize(() => {
+        if (fallbackCfi) {
+          this.runtime.resize(width, height, fallbackCfi);
+        } else {
+          this.rendition.resize(width, height);
+        }
+      });
     } finally {
       this.applyingResize = false;
     }
+  }
+
+  private executeResize<T>(execute: () => T): T {
+    return this.wrapResize ? this.wrapResize(execute) : execute();
   }
 
   private scheduleFlush(): void {
