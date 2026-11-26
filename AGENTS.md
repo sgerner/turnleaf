@@ -10,4 +10,5 @@
 - Use `npm run android:verify-release` to verify a signed release APK's signature and SHA-256 digest locally.
 - Pin external GitHub Actions in `.github/workflows/` to full 40-character lowercase commit SHAs with `# vX.Y.Z` version comments; run `npm run workflow:check` (included in `npm run verify`) to verify workflow pins and quality gates locally.
 - `scripts/github-release.mjs` handles paginated GitHub release preflight deduplication (`preflight`) and staged draft verification/promotion (`publish`), with unit coverage included in `npm run verify` (`scripts/github-release.test.mjs`).
+- Android release signing prefers `TURNLEAF_STORE_FILE`, `TURNLEAF_STORE_PASSWORD`, `TURNLEAF_KEY_ALIAS`, and `TURNLEAF_KEY_PASSWORD` environment variables over UTF-8 `android/keystore.properties` (which follows Java `Properties` escaping such as `\\` and leading `\ `); use `npm run android:release -- --no-daemon` for single-use signed builds and never write signing secrets into workspace files in CI.
 - Keep changes small and explicit; do not add abstractions unless they solve a real problem.

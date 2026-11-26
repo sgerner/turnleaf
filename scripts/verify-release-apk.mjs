@@ -386,7 +386,7 @@ export function verifyReleaseApk({
     ['verify', '--min-sdk-version', String(resolvedMinSdk), '--print-certs', targetApkPath],
     {
       encoding: 'utf8',
-      env: childEnvironment(apksigner.sdk.path, env),
+      env: childEnvironment(apksigner.sdk.path, env, { includeSigningSecrets: false }),
       shell: platform === 'win32',
     },
   );

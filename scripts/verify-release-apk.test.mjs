@@ -232,8 +232,13 @@ describe('Android release APK verification', () => {
       candidates: [{ path: '/sdk', source: 'ANDROID_HOME' }],
       ioOptions,
       platform: 'linux',
-      run: (command, args) => {
-        calls.push([command, args]);
+      env: {
+        PATH: '/usr/bin',
+        TURNLEAF_STORE_PASSWORD: 'secret-store-password',
+        TURNLEAF_KEY_PASSWORD: 'secret-key-password',
+      },
+      run: (command, args, options) => {
+        calls.push([command, args, options?.env]);
         if (command === 'java') {
           return { status: 0, stdout: '', stderr: 'openjdk version "21.0.4" 2026-07-16' };
         }
@@ -247,10 +252,10 @@ describe('Android release APK verification', () => {
 
     expect(verified.minSdkVersion).toBe(24);
     expect(verified.buildToolsVersion).toBe('36.0.0');
-    expect(calls[1]).toEqual([
-      '/sdk/build-tools/36.0.0/apksigner',
-      ['verify', '--min-sdk-version', '24', '--print-certs', apkPath],
-    ]);
+    expect(calls[1][0]).toBe('/sdk/build-tools/36.0.0/apksigner');
+    expect(calls[1][1]).toEqual(['verify', '--min-sdk-version', '24', '--print-certs', apkPath]);
+    expect(calls[1][2]?.TURNLEAF_STORE_PASSWORD).toBeUndefined();
+    expect(calls[1][2]?.TURNLEAF_KEY_PASSWORD).toBeUndefined();
 
     expect(() =>
       verifyReleaseApk({
@@ -430,6 +435,10 @@ describe('Android release APK verification', () => {
     ]);
 
     for (const step of buildSteps.slice(3)) {
+      if (step.name === 'Clean up signing files') {
+        expect(step.body).toContain('if: always()');
+        continue;
+      }
       expect(
         step.body,
         `Expected build-release-apk step "${step.name}" to guard against already_released`,
