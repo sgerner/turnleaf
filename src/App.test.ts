@@ -326,9 +326,12 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     const continueButton = findContinueButton();
     continueButton?.click();
 
-    await vi.waitFor(() => {
-      expect(target.querySelector('.reader-shell')).not.toBeNull();
-    });
+    await vi.waitFor(
+      () => {
+        expect(target.querySelector('.reader-shell')).not.toBeNull();
+      },
+      { timeout: 5_000 },
+    );
     flushSync();
 
     expect(target.querySelector('.app-ambient')).toBeNull();

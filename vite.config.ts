@@ -117,7 +117,6 @@ function epubjsDeadModuleStubs(): Plugin {
 
 export default defineConfig({
   plugins: [epubjsDeadModuleStubs(), tailwindcss(), svelte(), kavitaDevProxy()],
-  ...(process.env.VITEST ? { resolve: { conditions: ['browser'] } } : {}),
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },
