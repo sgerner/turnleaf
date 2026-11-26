@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Fix Android reading journey DPR pagination, ReaderChrome inset sync, post-reflow progress persistence, and reconnect sync races
+- ci: pin AVD cache actions and retain Gradle cache
+- ci: cache Android AVD snapshots and prune unused Gradle cache
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
