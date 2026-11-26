@@ -971,6 +971,7 @@ describe('ReaderSession', () => {
       { bottomMargin: 16 },
       { paragraphSpacing: 1.0 },
       { alignment: 'justify' },
+      { publisherStyles: false },
       { hyphenation: true },
     ];
 
@@ -1011,7 +1012,6 @@ describe('ReaderSession', () => {
     let current = { ...defaultAppearance };
     for (const patch of [
       {},
-      { publisherStyles: false },
       { progressBar: false },
       { keepAwake: true },
       { volumeButtons: true },
