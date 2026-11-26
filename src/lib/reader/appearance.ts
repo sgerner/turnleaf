@@ -81,10 +81,7 @@ export function parseAppearance(value: string): Appearance {
     margin: boundedNumber(parsed.margin, defaultAppearance.margin, 8, 56),
     bottomMargin: boundedNumber(parsed.bottomMargin, defaultAppearance.bottomMargin, 0, 64),
     alignment,
-    publisherStyles:
-      typeof parsed.publisherStyles === 'boolean'
-        ? parsed.publisherStyles
-        : defaultAppearance.publisherStyles,
+    publisherStyles: parsed.publisherStyles !== false,
     hyphenation: parsed.hyphenation === true,
     progressBar: parsed.progressBar !== false,
     keepAwake: parsed.keepAwake === true,
