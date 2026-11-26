@@ -94,7 +94,7 @@
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        networkAvailable,
       );
     }
     if (offline) throw new Error('Offline');
@@ -216,6 +216,8 @@
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
   let networkEventSequence = 0;
+  let reconnectTimer: number | null = null;
+  let syncController: AbortController | null = null;
   let message = $state('');
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
@@ -536,8 +538,18 @@
         await Network.addListener('networkStatusChange', async ({ connected }) => {
           if (destroyed) return;
           const eventId = ++networkEventSequence;
+          if (!connected) {
+            if (reconnectTimer !== null) {
+              window.clearTimeout(reconnectTimer);
+              reconnectTimer = null;
+            }
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
+          }
           let nextConnected = connected;
-          if (!nextConnected && Capacitor.isNativePlatform()) {
+          if (Capacitor.isNativePlatform()) {
             const currentStatus = await Network.getStatus().catch(() => null);
             if (destroyed || eventId !== networkEventSequence) return;
             nextConnected = currentStatus?.connected === true;
@@ -546,26 +558,39 @@
           const wasOffline = offline;
           offline = !nextConnected;
           if (!nextConnected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
+            if (reconnectTimer !== null) {
+              window.clearTimeout(reconnectTimer);
+              reconnectTimer = null;
+            }
             if (syncTimer !== null) {
               window.clearTimeout(syncTimer);
               syncTimer = null;
             }
-          }
-          const shouldReconnect = nextConnected && (wasOffline || kavitaUnreachable);
-          if (wasOffline === !nextConnected && !shouldReconnect) return;
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = nextConnected
-            ? ''
-            : displayableBooks.length
+            refreshController?.abort();
+            openProgressProbe?.abort();
+            syncController?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
+            kavitaUnreachable = false;
+            offlineMessage = displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (shouldReconnect)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+            return;
+          }
+          const shouldReconnect = wasOffline || kavitaUnreachable;
+          if (!shouldReconnect) return;
+          kavitaUnreachable = false;
+          offlineMessage = '';
+          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            void (async () => {
+              if (destroyed || offline || !(await networkAvailable())) return;
+              coverReloadRequest += 1;
+              await refresh();
+              if (!destroyed && !offline) await syncProgress(false);
+            })().catch(() => {});
+          }, 150);
         }),
       ),
     );
@@ -636,15 +661,23 @@
 
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    const controller = new AbortController();
+    syncController = controller;
     try {
-      if (!(await networkAvailable())) {
+      if (!(await networkAvailable()) || controller.signal.aborted) {
         if (showFeedback)
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
       }
-      await flushProgress(client, server.id);
-      if (showFeedback) message = 'Reading progress synced.';
+      await flushProgress(client, server.id, {
+        signal: controller.signal,
+        canContinue: networkAvailable,
+      });
+      if (showFeedback && !controller.signal.aborted && !offline) {
+        message = 'Reading progress synced.';
+      }
     } catch (error) {
+      if (controller.signal.aborted || offline) return;
       if (
         error instanceof AggregateError &&
         error.errors.some(
@@ -657,6 +690,7 @@
         message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
       }
     } finally {
+      if (syncController === controller) syncController = null;
       await refreshSyncStatus();
       syncing = false;
     }
@@ -665,12 +699,14 @@
   onDestroy(() => {
     destroyed = true;
     onReaderOpenChange?.(false);
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', scheduleVirtualWindow);
     openProgressProbe?.abort();
     refreshController?.abort();
+    syncController?.abort();
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -702,7 +738,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !(await networkAvailable())) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -717,7 +753,7 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !(await networkAvailable())) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -1169,8 +1205,13 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    if (!offline) {
+      syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    }
   }
 
   async function syncLatestForReader(

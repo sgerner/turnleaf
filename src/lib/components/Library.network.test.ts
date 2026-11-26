@@ -294,4 +294,58 @@ describe('Library native network handover handling', () => {
     });
     expect(target.textContent).not.toContain('No network connection. Showing your saved library.');
   });
+
+  it('does not send authenticated refresh or sync requests during a transient Cellular blip between Wi-Fi disable and mobile data disable', async () => {
+    networkGetStatusMock.mockResolvedValue({ connected: true, connectionType: 'wifi' });
+
+    mounted = mount(Library, {
+      target,
+      props: {
+        server,
+        apiKey: 'secret-key',
+        theme: 'fennec',
+        mode: 'dark',
+        onThemeChange: vi.fn(),
+        onModeChange: vi.fn(),
+        onApiKeyChange: vi.fn(),
+        onChangeServerAddress: vi.fn(),
+        onServerDeleted: vi.fn(),
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(networkListeners).toHaveLength(1);
+      expect(getBookSeriesMock).toHaveBeenCalledTimes(1);
+      expect(flushProgressMock).toHaveBeenCalledTimes(1);
+    });
+
+    getBookSeriesMock.mockClear();
+    flushProgressMock.mockClear();
+
+    // 1. svc wifi disable drops Wi-Fi before Cellular validates -> briefly offline
+    networkGetStatusMock.mockResolvedValue({ connected: false, connectionType: 'none' });
+    networkListeners[0]?.({ connected: false, connectionType: 'none' });
+    await vi.waitFor(() => {
+      expect(target.textContent).toContain('No network connection. Showing your saved library.');
+    });
+
+    // 2. Cellular briefly validates 50ms later, then svc data disable drops Cellular 60ms after that
+    networkGetStatusMock.mockResolvedValue({ connected: true, connectionType: 'cellular' });
+    networkListeners[0]?.({ connected: true, connectionType: 'cellular' });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    networkGetStatusMock.mockResolvedValue({ connected: false, connectionType: 'none' });
+    networkListeners[0]?.({ connected: false, connectionType: 'none' });
+
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(getBookSeriesMock).not.toHaveBeenCalled();
+    expect(flushProgressMock).not.toHaveBeenCalled();
+    expect(target.textContent).toContain('No network connection. Showing your saved library.');
+
+    // 3. Even a late stale queued connected: true callback arriving while native getStatus() is false sends nothing
+    networkListeners[0]?.({ connected: true, connectionType: 'cellular' });
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(getBookSeriesMock).not.toHaveBeenCalled();
+    expect(flushProgressMock).not.toHaveBeenCalled();
+  });
 });

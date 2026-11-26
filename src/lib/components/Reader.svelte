@@ -21,6 +21,7 @@
   } from '../reader/appearance';
   import {
     ReaderSession,
+    resolveReaderKeyboardAction,
     validateExternalBrowserUrl,
     validateExternalLaunchUrl,
     type ReaderExternalLink,
@@ -153,6 +154,8 @@
   let exporting = $state(false);
   let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
+  let selectedTextGroup = $state<HTMLElement | null>(null);
+  let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
   let searchQuery = $state('');
@@ -241,7 +244,9 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
+        if (location?.cfi !== next.cfi) selectedText = null;
         location = next;
+        if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
         if (origin === 'link') {
           linkReturnTarget = returnTarget ?? null;
@@ -508,6 +513,14 @@
     resumeChromeHide();
   }
 
+  function refreshVisiblePassages(): void {
+    visiblePassages = session?.getVisiblePassages() ?? [];
+  }
+
+  function restoreViewportFrameFocus(): void {
+    void tick().then(() => viewport?.querySelector<HTMLElement>('iframe')?.focus());
+  }
+
   function openAnnotations(): void {
     controlsVisible = true;
     pauseChromeHide();
@@ -515,7 +528,8 @@
     const opener = activeElement();
     clearToolbarPanels();
     annotationsOpener = opener;
-    visiblePassages = session?.getVisiblePassages() ?? [];
+    refreshVisiblePassages();
+    annotationMessage = '';
     annotationsVisible = true;
     focusModal(() => annotationsPanel);
   }
@@ -528,7 +542,8 @@
     clearToolbarPanels();
     annotationsOpener = opener ?? activeElement();
     activeAnnotationId = matched?.id ?? null;
-    visiblePassages = session?.getVisiblePassages() ?? [];
+    refreshVisiblePassages();
+    annotationMessage = '';
     annotationsVisible = true;
     if (matched) {
       void tick().then(() => {
@@ -548,7 +563,9 @@
     editingAnnotationId = null;
     activeAnnotationId = null;
     selectedText = null;
+    visiblePassages = [];
     annotationDraft = '';
+    annotationMessage = '';
     exportFallback = '';
     exportMessage = '';
     const opener = annotationsOpener;
@@ -564,6 +581,7 @@
   function selectVisiblePassage(passage: ReaderSelection): void {
     selectedText = passage;
     annotationDraft = '';
+    annotationMessage = '';
     focusReaderTarget(annotationsPanel, 'new-annotation-note');
   }
 
@@ -943,13 +961,15 @@
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(): void {
-    if (!selectedText) return;
-    annotations = addAnnotation(annotations, selectedText.cfi, selectedText.text, annotationDraft);
+  function saveAnnotation(target: ReaderSelection | null = selectedText): void {
+    if (!target) return;
+    const hadNote = Boolean(annotationDraft.trim());
+    annotations = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
     session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
-    visiblePassages = session?.getVisiblePassages() ?? [];
+    refreshVisiblePassages();
+    annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
   }
 
@@ -980,10 +1000,16 @@
   async function copySelection(): Promise<void> {
     const selection = selectedText;
     if (!selection) return;
+    const restoreFrameFocus = Boolean(
+      selectedTextGroup &&
+      document.activeElement &&
+      selectedTextGroup.contains(document.activeElement),
+    );
     try {
       await navigator.clipboard.writeText(selection.text);
       selectedText = null;
       selectionMessage = 'Selected text copied.';
+      if (restoreFrameFocus) restoreViewportFrameFocus();
     } catch {
       selectionMessage = 'Turnleaf could not copy the selection.';
     }
@@ -1249,30 +1275,36 @@
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed || event.defaultPrevented) return;
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-    if (event.key === 'Escape' && hasOpenReaderPanel()) {
+    if (
+      event.key === 'Escape' &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      hasOpenReaderPanel()
+    ) {
       event.preventDefault();
       closeActiveModal(false);
       return;
     }
-    if (hasOpenReaderPanel() || event.shiftKey) return;
-    const target = event.target as Element | null;
-    if (
-      target?.closest?.(
-        'button, a, input, select, textarea, [contenteditable="true"], [role="button"], [role="link"]',
-      )
-    ) {
+    const action = resolveReaderKeyboardAction(event, {
+      hasOpenPanel: hasOpenReaderPanel(),
+      hasSelection: selectedText !== null,
+    });
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'clear-selection') {
+      const restoreFrameFocus = Boolean(
+        selectedTextGroup &&
+        document.activeElement &&
+        selectedTextGroup.contains(document.activeElement),
+      );
+      session?.clearTextSelection();
+      selectedText = null;
+      if (restoreFrameFocus) restoreViewportFrameFocus();
       return;
     }
-    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
-      event.preventDefault();
-      void turn('previous');
-      return;
-    }
-    if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
-      event.preventDefault();
-      void turn('next');
-    }
+    void turn(action);
   }
 
   function handleBackButton(): boolean {
@@ -1327,6 +1359,50 @@
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
+  <p class="sr-only" role="status">{selectionMessage}</p>
+  {#if selectedText && !hasOpenReaderPanel()}
+    <div
+      bind:this={selectedTextGroup}
+      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      role="group"
+      aria-label="Selected text"
+    >
+      <button
+        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => {
+          const restoreFrameFocus = Boolean(
+            selectedTextGroup &&
+            document.activeElement &&
+            selectedTextGroup.contains(document.activeElement),
+          );
+          saveAnnotation();
+          selectionMessage = 'Highlight saved.';
+          if (restoreFrameFocus) restoreViewportFrameFocus();
+        }}
+      >
+        Highlight
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={openAnnotations}
+      >
+        Add note
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-surface min-h-11"
+        type="button"
+        onpointerdown={(event) => event.preventDefault()}
+        onclick={() => void copySelection()}
+      >
+        Copy text
+      </button>
+    </div>
+  {/if}
+
   <p class="sr-only" aria-live="polite" aria-atomic="true">
     {#if location}
       {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
@@ -1336,7 +1412,7 @@
 
   <p id="reader-keyboard-help" class="sr-only">
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
-    Press Escape to close an open reader panel.
+    Press Escape to close an open reader panel or clear selected text.
   </p>
 
   <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
@@ -1378,42 +1454,6 @@
     >
       {readerSyncMessage}
     </p>
-  {/if}
-  <p class="sr-only" role="status">{selectionMessage}</p>
-  {#if selectedText && !hasOpenReaderPanel()}
-    <div
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
-      role="group"
-      aria-label="Selected text"
-    >
-      <button
-        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => {
-          saveAnnotation();
-          selectionMessage = 'Highlight saved.';
-        }}
-      >
-        Highlight
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}
-      >
-        Add note
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => void copySelection()}
-      >
-        Copy text
-      </button>
-    </div>
   {/if}
 
   {#if appearance.progressBar}
@@ -1665,101 +1705,100 @@
         </div>
       {/if}
 
+      {#snippet readerPanelHeader(
+        titleId: string,
+        heading: string,
+        closeLabel: string,
+        onClose: () => void,
+      )}
+        <button
+          class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-11 w-11 p-0"
+          type="button"
+          onclick={onClose}
+          aria-label={closeLabel}
+          title="Close"
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+            <path
+              fill="currentColor"
+              d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+            />
+          </svg>
+        </button>
+        <h2 id={titleId} class="font-serif text-xl">{heading}</h2>
+      {/snippet}
+
       {#if activeFootnote}
-        <div
+        <dialog
+          open
           bind:this={footnotePanel}
           class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
           id="reader-footnote"
-          role="dialog"
           aria-modal="true"
           aria-labelledby="reader-footnote-title"
           tabindex="-1"
           onkeydown={(event) => trapModalKeydown(event, footnotePanel!, closeFootnoteDialog)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
-            type="button"
-            onclick={closeFootnoteDialog}
-            aria-label="Close footnote"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-footnote-title" class="pr-[52px] font-serif text-xl">
-            {activeFootnote.title}
-          </h2>
+          {@render readerPanelHeader(
+            'reader-footnote-title',
+            activeFootnote.title,
+            'Close footnote',
+            closeFootnoteDialog,
+          )}
           <div class="mt-3 grid gap-2 text-sm leading-relaxed">
             {#each activeFootnote.paragraphs as paragraph, index (index)}
               <p>{paragraph}</p>
             {/each}
           </div>
-        </div>
+        </dialog>
       {/if}
 
       {#if activeFigure}
-        <div
+        <dialog
+          open
           bind:this={figurePanel}
           class="reader-settings reader-figure-dialog card preset-filled-surface-50-950 relative flex flex-col gap-3"
           id="reader-figure-viewer"
-          role="dialog"
           aria-modal="true"
           aria-labelledby="reader-figure-title"
           tabindex="-1"
           onkeydown={handleFigureKeydown}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h2 id="reader-figure-title" class="min-w-0 flex-1 truncate font-serif text-xl">
-              {activeFigure.alt || 'Figure viewer'}
-            </h2>
-            <div class="flex flex-wrap items-center gap-1" role="group" aria-label="Figure zoom">
-              <button
-                class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] px-2"
-                type="button"
-                aria-label="Zoom out"
-                disabled={figureZoom <= 1}
-                onclick={() => adjustFigureZoom(-0.5)}
-              >
-                −
-              </button>
-              <button
-                class="btn btn-sm preset-tonal-surface min-h-[44px] px-3 tabular-nums"
-                type="button"
-                aria-label={`Reset zoom, currently ${Math.round(figureZoom * 100)}%`}
-                onclick={resetFigureTransform}
-              >
-                {Math.round(figureZoom * 100)}%
-              </button>
-              <button
-                class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] px-2"
-                type="button"
-                aria-label="Zoom in"
-                disabled={figureZoom >= 4}
-                onclick={() => adjustFigureZoom(0.5)}
-              >
-                +
-              </button>
-              <button
-                class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] p-0"
-                type="button"
-                onclick={closeFigureDialog}
-                aria-label="Close figure viewer"
-                title="Close"
-              >
-                <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                  <path
-                    fill="currentColor"
-                    d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-                  />
-                </svg>
-              </button>
-            </div>
+          {@render readerPanelHeader(
+            'reader-figure-title',
+            activeFigure.alt || 'Figure viewer',
+            'Close figure viewer',
+            closeFigureDialog,
+          )}
+          <div class="flex flex-wrap items-center gap-1" role="group" aria-label="Figure zoom">
+            <button
+              class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] px-2"
+              type="button"
+              aria-label="Zoom out"
+              disabled={figureZoom <= 1}
+              onclick={() => adjustFigureZoom(-0.5)}
+            >
+              −
+            </button>
+            <button
+              class="btn btn-sm preset-tonal-surface min-h-[44px] px-3 tabular-nums"
+              type="button"
+              aria-label={`Reset zoom, currently ${Math.round(figureZoom * 100)}%`}
+              onclick={resetFigureTransform}
+            >
+              {Math.round(figureZoom * 100)}%
+            </button>
+            <button
+              class="btn btn-sm preset-tonal-surface min-h-[44px] min-w-[44px] px-2"
+              type="button"
+              aria-label="Zoom in"
+              disabled={figureZoom >= 4}
+              onclick={() => adjustFigureZoom(0.5)}
+            >
+              +
+            </button>
           </div>
           <div
             class="reader-figure-stage rounded-lg preset-tonal-surface"
@@ -1782,7 +1821,7 @@
           {#if activeFigure.caption}
             <p class="text-sm text-surface-700-300">{activeFigure.caption}</p>
           {/if}
-        </div>
+        </dialog>
       {/if}
 
       {#if pendingSyncLocation}
@@ -1831,23 +1870,12 @@
           onkeydown={(event) => trapModalKeydown(event, settingsPanel!, closeSettings)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
-            type="button"
-            onclick={closeSettings}
-            aria-label="Close reading appearance"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-appearance-title" class="pr-[52px] font-serif text-xl">
-            Reading appearance
-          </h2>
+          {@render readerPanelHeader(
+            'reader-appearance-title',
+            'Reading appearance',
+            'Close reading appearance',
+            closeSettings,
+          )}
           <div class="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Reading color mode">
             {#each ['light', 'dark'] as mode (mode)}
               <button
@@ -2026,21 +2054,12 @@
           onkeydown={(event) => trapModalKeydown(event, tocPanel!, closeToc)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
-            type="button"
-            onclick={closeToc}
-            aria-label="Close table of contents"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-contents-title" class="pr-[52px] font-serif text-xl">Contents</h2>
+          {@render readerPanelHeader(
+            'reader-contents-title',
+            'Contents',
+            'Close table of contents',
+            closeToc,
+          )}
           {#snippet contentsList(items: TocItem[])}
             <ul class="mt-2 grid list-none gap-1 p-0">
               {#each items as item, index (`${item.href}-${index}`)}
@@ -2092,21 +2111,12 @@
           onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
-            type="button"
-            onclick={closeSearch}
-            aria-label="Close book search"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-search-title" class="pr-[52px] font-serif text-xl">Search this book</h2>
+          {@render readerPanelHeader(
+            'reader-search-title',
+            'Search this book',
+            'Close book search',
+            closeSearch,
+          )}
           <form
             class="mt-4 flex flex-wrap gap-2"
             onsubmit={(event) => {
@@ -2173,23 +2183,12 @@
           onkeydown={(event) => trapModalKeydown(event, bookmarksPanel!, closeBookmarks)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
-            type="button"
-            onclick={closeBookmarks}
-            aria-label="Close bookmarks and history"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-bookmarks-title" class="pr-[52px] font-serif text-xl">
-            Bookmarks and history
-          </h2>
+          {@render readerPanelHeader(
+            'reader-bookmarks-title',
+            'Bookmarks and history',
+            'Close bookmarks and history',
+            closeBookmarks,
+          )}
           <p class="mt-2 text-sm text-surface-700-300">
             Saved on this device with EPUB locations. They are not sent to Kavita.
           </p>
@@ -2315,25 +2314,15 @@
           onkeydown={(event) => trapModalKeydown(event, annotationsPanel!, closeAnnotations)}
           transition:fly={{ y: 12, duration: 150 }}
         >
-          <button
-            class="btn btn-sm preset-tonal-surface absolute right-3 top-3 h-[44px] w-[44px] p-0"
-            type="button"
-            onclick={closeAnnotations}
-            aria-label="Close highlights and notes"
-            title="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-              <path
-                fill="currentColor"
-                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-              />
-            </svg>
-          </button>
-          <h2 id="reader-annotations-title" class="pr-[52px] font-serif text-xl">
-            Highlights and notes
-          </h2>
+          {@render readerPanelHeader(
+            'reader-annotations-title',
+            'Highlights and notes',
+            'Close highlights and notes',
+            closeAnnotations,
+          )}
           <p class="mt-2 text-sm text-surface-700-300">
-            Saved on this device. Select text in the book to add a highlight and an optional note.
+            Saved on this device. Choose a passage on this page or select text in the book to add a
+            highlight and an optional note.
           </p>
 
           {#if selectedText}
@@ -2391,6 +2380,7 @@
               </ul>
             </section>
           {/if}
+          <p class="mt-2 text-sm text-surface-700-300" role="status">{annotationMessage}</p>
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3
@@ -2819,6 +2809,17 @@
     overflow: auto;
     padding: clamp(12px, 4vw, 20px);
     z-index: 1;
+  }
+
+  .reader-settings > :global(h2) {
+    padding-right: 52px;
+  }
+
+  dialog.reader-settings {
+    top: auto;
+    margin-block: 0;
+    border: 0;
+    color: inherit;
   }
 
   .reader-figure-dialog {
