@@ -56,9 +56,23 @@
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
+  import DialogShell from './DialogShell.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
-  import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
+  import {
+    calculateVirtualWindow,
+    columnsForWidth,
+    resultsContainerHeight,
+    rowHeightFor,
+    type LibraryViewMode,
+    type VirtualWindow,
+  } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import {
+    bookActionsLabel,
+    downloadProgressLabel,
+    downloadProgressValueText,
+    openBookLabel,
+  } from '../a11y/book-labels';
   import {
     activeElement,
     focusFirstElement,
@@ -80,6 +94,7 @@
     onServerDeleted,
     onReaderOpenChange,
     registerBackHandler,
+    onOverlayActiveChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -92,9 +107,9 @@
     onServerDeleted: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
     registerBackHandler?: ((handler: () => boolean) => () => void) | undefined;
+    onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
-  type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
@@ -276,10 +291,11 @@
   let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
   let focusedRow = $state(-1);
   const renderedRows = $derived.by(() => {
-    const { firstRow, lastRow } = virtualWindow;
+    const { firstRow, lastRow, totalRows } = virtualWindow;
     const rows = Array.from({ length: lastRow - firstRow + 1 }, (_, offset) => firstRow + offset);
-    if (focusedRow >= 0 && focusedRow < firstRow) rows.unshift(focusedRow);
-    if (focusedRow > lastRow) rows.push(focusedRow);
+    if (focusedRow >= 0 && focusedRow < firstRow && focusedRow < totalRows)
+      rows.unshift(focusedRow);
+    if (focusedRow > lastRow && focusedRow < totalRows) rows.push(focusedRow);
     return rows;
   });
   let visibleCoverKey = $derived.by(() => {
@@ -293,14 +309,21 @@
     const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
     return `${coverReloadRequest}:${[...new Set(booksToCover.map((book) => book.seriesId))].join(',')}`;
   });
+  let scrollContainer: HTMLElement | null = null;
   let scrollTarget: HTMLElement | Window | null = null;
+  let cachedGridWidth = 400;
+  let cachedListTop = 0;
+  let cachedViewportHeight = 0;
+  let cachedRootFontPx = 16;
+  let cachedTextScaling = 1;
+  let typographyMetricsDirty = true;
+  let layoutMetricsDirty = true;
+  let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
-  const GRID_GAP_PX = 16;
-  const GRID_ROW_GAP_PX = 32;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
@@ -321,19 +344,28 @@
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
   }
 
-  function openBookLabel(book: BookRecord, includeProgress = true): string {
-    const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
-    const progress =
-      includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
-    return `Open ${book.title}${downloaded}${progress}`;
-  }
-
   function parseSortOrder(value: string | null): LibrarySortOrder {
     return value === 'author' || value === 'recent' ? value : 'title';
   }
 
   function parseViewMode(value: string | null): LibraryViewMode {
     return value === 'list' ? 'list' : 'grid';
+  }
+
+  function parseBooleanPreference(value: string | undefined, fallback: boolean): boolean {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return fallback;
+  }
+
+  function toggleDownloadedOnly(): void {
+    downloadedOnly = !downloadedOnly;
+    void setPreference('libraryDownloadedOnly', String(downloadedOnly));
+  }
+
+  function toggleHideCompleted(): void {
+    hideCompleted = !hideCompleted;
+    void setPreference('libraryHideCompleted', String(hideCompleted));
   }
 
   function handleSortChange(event: Event): void {
@@ -365,6 +397,8 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
+    void setPreference('libraryDownloadedOnly', 'false');
+    void setPreference('libraryHideCompleted', 'false');
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
@@ -378,19 +412,101 @@
     return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
   }
 
-  function columnsForWidth(width: number): number {
-    if (viewMode === 'list') return 1;
-    if (width >= 1024) return 5;
-    if (width >= 768) return 4;
-    if (width >= 640) return 3;
-    return 2;
+  function isSameVirtualWindow(a: VirtualWindow, b: VirtualWindow): boolean {
+    return (
+      a.firstRow === b.firstRow &&
+      a.lastRow === b.lastRow &&
+      a.startIndex === b.startIndex &&
+      a.endIndex === b.endIndex &&
+      a.totalRows === b.totalRows &&
+      a.totalHeight === b.totalHeight
+    );
   }
 
-  function rowHeightFor(width: number, columns: number): number {
-    const rem = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-    if (viewMode === 'list') return Math.ceil(rem * 9.5);
-    const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
-    return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 5 + GRID_ROW_GAP_PX));
+  function resolveScrollContainer(): HTMLElement | null {
+    if (scrollContainer?.isConnected) return scrollContainer;
+    scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    return scrollContainer;
+  }
+
+  function refreshTypographyMetrics(): void {
+    if (typeof document !== 'undefined' && typeof getComputedStyle === 'function') {
+      const rootStyle = getComputedStyle(document.documentElement);
+      const parsedFontPx = Number.parseFloat(rootStyle.fontSize);
+      cachedRootFontPx = Number.isFinite(parsedFontPx) && parsedFontPx > 0 ? parsedFontPx : 16;
+      const parsedScaling = Number.parseFloat(rootStyle.getPropertyValue('--text-scaling'));
+      cachedTextScaling = Number.isFinite(parsedScaling) && parsedScaling > 0 ? parsedScaling : 1;
+    }
+    typographyMetricsDirty = false;
+  }
+
+  function refreshLayoutMetrics(): void {
+    const grid = virtualGrid;
+    if (!grid) return;
+    const container = resolveScrollContainer();
+    const gridRect = grid.getBoundingClientRect();
+    if (container) {
+      const width = grid.clientWidth || container.clientWidth;
+      if (width > 0) cachedGridWidth = width;
+      const containerRect = container.getBoundingClientRect();
+      cachedListTop = gridRect.top - containerRect.top + container.scrollTop;
+      cachedViewportHeight = container.clientHeight;
+    } else if (typeof window !== 'undefined') {
+      const width = grid.clientWidth || window.innerWidth;
+      if (width > 0) cachedGridWidth = width;
+      cachedListTop = gridRect.top + window.scrollY;
+      cachedViewportHeight = window.innerHeight;
+    }
+    layoutMetricsDirty = false;
+  }
+
+  function refreshVirtualMetrics(): void {
+    refreshTypographyMetrics();
+    refreshLayoutMetrics();
+  }
+
+  function handleWindowResize(): void {
+    typographyMetricsDirty = true;
+    layoutMetricsDirty = true;
+    scheduleVirtualWindow();
+  }
+
+  function bookIndexFromNode(node: EventTarget | null): number {
+    if (!virtualGrid || !(node instanceof Element)) return -1;
+    let current: Element | null = node;
+    while (current && current !== virtualGrid) {
+      if (current instanceof HTMLElement) {
+        const rawIndex = current.dataset.bookIndex;
+        if (rawIndex !== undefined) {
+          const parsed = Number(rawIndex);
+          return Number.isInteger(parsed) &&
+            parsed >= 0 &&
+            visibleBooks[parsed]?.id === current.dataset.bookId
+            ? parsed
+            : -1;
+        }
+      }
+      current = current.parentElement;
+    }
+    return -1;
+  }
+
+  function syncFocusedRow(columns = gridColumns): void {
+    const index = bookIndexFromNode(activeElement());
+    const nextFocused = index >= 0 ? Math.floor(index / columns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
+  }
+
+  function handleResultsFocusIn(event: FocusEvent): void {
+    const index = bookIndexFromNode(event.target);
+    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
+  }
+
+  function handleResultsFocusOut(event: FocusEvent): void {
+    const index = bookIndexFromNode(event.relatedTarget);
+    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
   }
 
   function scheduleVirtualWindow(): void {
@@ -410,53 +526,55 @@
 
   function updateVirtualWindow(): void {
     if (destroyed || !virtualGrid) return;
-    const width = virtualGrid.clientWidth;
-    const nextColumns = width > 0 ? columnsForWidth(width) : gridColumns;
-    const nextRowHeight = width > 0 ? rowHeightFor(width, nextColumns) : rowHeight;
-    if (gridColumns !== nextColumns) gridColumns = nextColumns;
+    if (typographyMetricsDirty) refreshTypographyMetrics();
+    if (layoutMetricsDirty) refreshLayoutMetrics();
+
+    const nextColumns = columnsForWidth(cachedGridWidth, viewMode);
+    const nextRowHeight = rowHeightFor(
+      cachedGridWidth,
+      nextColumns,
+      viewMode,
+      cachedRootFontPx,
+      cachedTextScaling,
+    );
+    const columnsChanged = gridColumns !== nextColumns;
+    if (columnsChanged) gridColumns = nextColumns;
     if (rowHeight !== nextRowHeight) rowHeight = nextRowHeight;
+    if (columnsChanged && focusedRow >= 0) syncFocusedRow(nextColumns);
 
-    const activeCard = document.activeElement?.closest<HTMLElement>('[data-book-index]');
-    const activeIndex = Number(activeCard?.dataset.bookIndex);
-    focusedRow =
-      activeCard && visibleBooks[activeIndex]?.id === activeCard.dataset.bookId
-        ? Math.floor(activeIndex / nextColumns)
-        : -1;
-
-    const gridRect = virtualGrid.getBoundingClientRect();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
+    let scrollOffset: number;
     if (scrollContainer) {
-      const containerRect = scrollContainer.getBoundingClientRect();
-      const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
-      virtualWindow = calculateVirtualWindow(
-        visibleBooks.length,
-        nextColumns,
-        nextRowHeight,
-        scrollContainer.scrollTop - listTop,
-        scrollContainer.clientHeight,
-        VIRTUALIZATION_OVERSCAN_ROWS,
-      );
+      scrollOffset = scrollContainer.scrollTop - cachedListTop;
+    } else if (typeof window !== 'undefined') {
+      scrollOffset = window.scrollY - cachedListTop;
+    } else {
       return;
     }
-    if (typeof window === 'undefined') return;
-    virtualWindow = calculateVirtualWindow(
+
+    const nextWindow = calculateVirtualWindow(
       visibleBooks.length,
       nextColumns,
       nextRowHeight,
-      -gridRect.top,
-      window.innerHeight,
+      scrollOffset,
+      cachedViewportHeight,
       VIRTUALIZATION_OVERSCAN_ROWS,
     );
+    if (!isSameVirtualWindow(virtualWindow, nextWindow)) {
+      virtualWindow = nextWindow;
+    }
   }
 
   async function scrollToBook(index: number): Promise<HTMLElement | null> {
     const grid = virtualGrid;
     if (!grid) return null;
+    refreshVirtualMetrics();
     updateVirtualWindow();
-    const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
-    const container = libraryMain?.closest<HTMLElement>('.app-stage');
-    if (container) container.scrollTop += top - container.getBoundingClientRect().top;
-    else window.scrollBy({ top, behavior: 'instant' });
+    const rowTop = Math.floor(index / gridColumns) * rowHeight;
+    if (scrollContainer) {
+      scrollContainer.scrollTop = cachedListTop + rowTop;
+    } else if (typeof window !== 'undefined') {
+      window.scrollBy({ top: cachedListTop - window.scrollY + rowTop, behavior: 'instant' });
+    }
     updateVirtualWindow();
     await tick();
     return grid.querySelector(`[data-book-index="${index}"]`);
@@ -490,7 +608,20 @@
   }
 
   $effect(() => {
-    if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
+    if (!reading && visibleBooks.length > 0) {
+      untrack(() => {
+        if (focusedRow >= 0) syncFocusedRow();
+        scheduleVirtualWindow();
+      });
+    } else if (untrack(() => focusedRow) !== -1) {
+      focusedRow = -1;
+    }
+  });
+
+  $effect(() => {
+    const overlayActive = Boolean(reading || actionMenuBook || conflict || settingsVisible);
+    onOverlayActiveChange?.(overlayActive);
+    return () => onOverlayActiveChange?.(false);
   });
 
   $effect(() => {
@@ -501,7 +632,9 @@
   });
 
   $effect(() => {
-    if (viewMode === 'grid' || viewMode === 'list') scheduleVirtualWindow();
+    if (viewMode === 'grid' || viewMode === 'list') {
+      untrack(() => scheduleVirtualWindow());
+    }
   });
 
   function handleBackNavigation(): boolean {
@@ -539,19 +672,71 @@
   });
 
   $effect(() => {
-    if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => scheduleVirtualWindow());
-    observer.observe(virtualGrid);
-    scheduleVirtualWindow();
-    return () => observer.disconnect();
+    if (theme === observedTheme) return;
+    observedTheme = theme;
+    untrack(() => {
+      typographyMetricsDirty = true;
+      layoutMetricsDirty = true;
+      scheduleVirtualWindow();
+    });
+  });
+
+  $effect(() => {
+    const grid = virtualGrid;
+    const main = libraryMain;
+    if (!grid) return;
+
+    return untrack(() => {
+      refreshVirtualMetrics();
+      updateVirtualWindow();
+
+      const resizeObserver =
+        typeof ResizeObserver !== 'undefined'
+          ? new ResizeObserver(() => {
+              typographyMetricsDirty = true;
+              layoutMetricsDirty = true;
+              scheduleVirtualWindow();
+            })
+          : null;
+      resizeObserver?.observe(grid);
+      if (main) resizeObserver?.observe(main);
+      if (scrollContainer) resizeObserver?.observe(scrollContainer);
+
+      const mutationObserver =
+        typeof MutationObserver !== 'undefined'
+          ? new MutationObserver((records) => {
+              for (const record of records) {
+                if (record.type === 'attributes') {
+                  typographyMetricsDirty = true;
+                }
+                layoutMetricsDirty = true;
+              }
+              scheduleVirtualWindow();
+            })
+          : null;
+      if (typeof document !== 'undefined') {
+        mutationObserver?.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: ['style', 'class', 'data-theme'],
+        });
+      }
+      if (main) mutationObserver?.observe(main, { childList: true });
+      if (scrollContainer) mutationObserver?.observe(scrollContainer, { childList: true });
+
+      return () => {
+        resizeObserver?.disconnect();
+        mutationObserver?.disconnect();
+      };
+    });
   });
 
   onMount(async () => {
     void cleanupInterruptedEpubDownloads();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
-    scrollTarget = scrollContainer ?? window;
+    const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    scrollContainer = container;
+    scrollTarget = container ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
-    window.addEventListener('resize', scheduleVirtualWindow);
+    window.addEventListener('resize', handleWindowResize);
     scheduleVirtualWindow();
 
     const [preferences, savedBooks] = await Promise.all([
@@ -561,6 +746,8 @@
         'libraryAuthor',
         'librarySeries',
         'libraryView',
+        'libraryDownloadedOnly',
+        'libraryHideCompleted',
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
@@ -568,6 +755,8 @@
     pendingTheme = theme as SkeletonTheme;
     pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
+    downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
+    hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
     sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
@@ -705,7 +894,7 @@
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
-    window.removeEventListener('resize', scheduleVirtualWindow);
+    window.removeEventListener('resize', handleWindowResize);
     openProgressProbe?.abort();
     refreshController?.abort();
     cancelCoverLoading();
@@ -1814,7 +2003,6 @@
       <button
         class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
         type="button"
-        aria-label={`Continue reading ${continueBook.title}, ${Math.round(progressOf(continueBook))}% complete`}
         onclick={() => void open(continueBook!)}
         transition:fade
       >
@@ -1852,6 +2040,11 @@
             </div>
             <span class="text-xs tabular-nums text-surface-700-300">
               {Math.round(progressOf(continueBook))}%
+              <span class="sr-only">
+                {continueBook.remoteAvailable === false
+                  ? 'complete, removed from server'
+                  : 'complete'}
+              </span>
             </span>
           </div>
         </div>
@@ -1906,7 +2099,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
-          onclick={() => (downloadedOnly = !downloadedOnly)}
+          onclick={toggleDownloadedOnly}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
@@ -1920,7 +2113,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
-          onclick={() => (hideCompleted = !hideCompleted)}
+          onclick={toggleHideCompleted}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path
@@ -2078,19 +2271,18 @@
       >
         <p class="min-w-0 flex-1">{message}</p>
         {#if downloadingBookId}
-          {@const downloadingTitle =
-            books.find((book) => book.id === downloadingBookId)?.title ?? 'book'}
+          {@const downloadingBook = books.find((book) => book.id === downloadingBookId)}
           <div class="flex shrink-0 items-center gap-2">
             <div
               class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
               role="progressbar"
-              aria-label={`Download progress for ${downloadingTitle}`}
+              aria-label={downloadingBook
+                ? downloadProgressLabel(downloadingBook)
+                : 'Download progress for book'}
               aria-valuemin="0"
               aria-valuemax="100"
               aria-valuenow={downloadPercent ?? undefined}
-              aria-valuetext={downloadPercent === null
-                ? 'Download in progress'
-                : `${downloadPercent}% downloaded`}
+              aria-valuetext={downloadProgressValueText(downloadPercent)}
             >
               <div
                 class="h-full preset-filled-primary-600-400"
@@ -2227,18 +2419,18 @@
         id="library-results"
         bind:this={virtualGrid}
         class="relative mt-8"
-        style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
+        style={`height: ${resultsContainerHeight(virtualWindow.totalHeight, viewMode)}px; contain: layout style;`}
         tabindex="-1"
         aria-label="Books"
-        onfocusin={scheduleVirtualWindow}
-        onfocusout={scheduleVirtualWindow}
+        onfocusin={handleResultsFocusIn}
+        onfocusout={handleResultsFocusOut}
       >
         {#each renderedRows as rowIndex (rowIndex)}
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
             class="absolute inset-x-0 grid gap-x-4"
-            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
+            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr)); contain: size layout style;`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}
@@ -2256,10 +2448,7 @@
                     <div
                       class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                     >
-                      <div
-                        class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
-                        aria-hidden="true"
-                      >
+                      <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
                         {#if covers.get(book.seriesId)}
                           <img
                             class="h-full w-full object-cover"
@@ -2271,6 +2460,7 @@
                         {/if}
                         {#if book.downloadPath && book.remoteAvailable !== false}
                           <span
+                            aria-hidden="true"
                             class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
                           >
                             <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2291,6 +2481,7 @@
                                 d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
                               />
                             </svg>
+                            <span class="sr-only">Removed from server</span>
                           </span>
                         {/if}
                       </div>
@@ -2310,13 +2501,11 @@
                           <div
                             class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
                             role="progressbar"
-                            aria-label={`Download progress for ${book.title}`}
+                            aria-label={downloadProgressLabel(book)}
                             aria-valuemin="0"
                             aria-valuemax="100"
                             aria-valuenow={downloadPercent ?? undefined}
-                            aria-valuetext={downloadPercent === null
-                              ? 'Download in progress'
-                              : `${downloadPercent}% downloaded`}
+                            aria-valuetext={downloadProgressValueText(downloadPercent)}
                           >
                             <div
                               class="h-full preset-filled-primary-600-400"
@@ -2349,10 +2538,20 @@
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book, false)}
+                      aria-label={openBookLabel(book, {
+                        includeProgress: false,
+                        downloadingBookId,
+                        downloadPercent,
+                      })}
                       disabled={downloadingBookId === book.id}
                     >
-                      <span class="sr-only">{openBookLabel(book)}</span>
+                      <span class="sr-only">
+                        {openBookLabel(book, {
+                          includeProgress: false,
+                          downloadingBookId,
+                          downloadPercent,
+                        })}
+                      </span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -2360,7 +2559,7 @@
                       data-book-actions
                       onclick={() => openMenu(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={`Book actions for ${book.title}`}
+                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
                       title="More actions"
                     >
                       <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2387,6 +2586,7 @@
                       {/if}
                       {#if book.downloadPath && book.remoteAvailable !== false}
                         <span
+                          aria-hidden="true"
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
                           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2407,11 +2607,18 @@
                               d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
                             />
                           </svg>
+                          <span class="sr-only">Removed from server</span>
                         </span>
                       {/if}
                       {#if downloadingBookId === book.id}
                         <span
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                          role="progressbar"
+                          aria-label={downloadProgressLabel(book)}
+                          aria-valuemin="0"
+                          aria-valuemax="100"
+                          aria-valuenow={downloadPercent ?? undefined}
+                          aria-valuetext={downloadProgressValueText(downloadPercent)}
                         >
                           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
                             <path
@@ -2444,10 +2651,12 @@
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book)}
+                      aria-label={openBookLabel(book, { downloadingBookId, downloadPercent })}
                       disabled={downloadingBookId === book.id}
                     >
-                      <span class="sr-only">{openBookLabel(book)}</span>
+                      <span class="sr-only">
+                        {openBookLabel(book, { downloadingBookId, downloadPercent })}
+                      </span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -2455,7 +2664,7 @@
                       data-book-actions
                       onclick={() => openMenu(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={`Book actions for ${book.title}`}
+                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
                       title="More actions"
                     >
                       <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2499,6 +2708,9 @@
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
+      aria-describedby={actionMenuBook.remoteAvailable === false
+        ? 'book-actions-removed-warning'
+        : undefined}
       tabindex="-1"
       onkeydown={(event) => trapModalKeydown(event, actionMenuDialog!, closeMenu)}
       transition:fly={{ y: 16, duration: 150 }}
@@ -2528,6 +2740,28 @@
           </svg>
         </button>
       </div>
+
+      {#if actionMenuBook.remoteAvailable === false}
+        <div
+          id="book-actions-removed-warning"
+          class="mt-4 flex items-start gap-2.5 rounded-xl border border-warning-600-400 bg-warning-500/15 p-3 text-sm text-surface-950-50"
+        >
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            class="mt-0.5 h-5 w-5 shrink-0 text-warning-800-200"
+          >
+            <path
+              fill="currentColor"
+              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+            />
+          </svg>
+          <p>
+            Removed from server. Removing this download deletes your saved copy, and it cannot be
+            downloaded again from Kavita.
+          </p>
+        </div>
+      {/if}
 
       <div class="mt-4 grid gap-2">
         <button
@@ -2598,6 +2832,9 @@
           <button
             class="btn preset-outlined-error-500 justify-start"
             type="button"
+            aria-describedby={actionMenuBook.remoteAvailable === false
+              ? 'book-actions-removed-warning'
+              : undefined}
             onclick={() => {
               const book = actionMenuBook;
               closeMenu();
@@ -2702,32 +2939,19 @@
 {/if}
 
 {#if settingsVisible}
-  <div
-    class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeSettings()}
+  <DialogShell
+    bind:dialogElement={settingsDialog}
+    labelledBy="library-settings-title"
+    onClose={() => {
+      if (editingServerAddress) {
+        cancelServerAddressEdit();
+      } else if (!savingServerAddress && !replacingApiKey && !deletingServer) {
+        closeSettings();
+      }
+    }}
   >
-    <div
-      bind:this={settingsDialog}
-      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="library-settings-title"
-      tabindex="-1"
-      onkeydown={(event) =>
-        trapModalKeydown(event, settingsDialog!, () => {
-          if (editingServerAddress) {
-            cancelServerAddressEdit();
-          } else if (!savingServerAddress && !replacingApiKey && !deletingServer) {
-            closeSettings();
-          }
-        })}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <div
-        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
-      >
+    {#snippet header()}
+      <div class="flex items-center justify-between gap-3">
         <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
         <button
           class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
@@ -2743,411 +2967,396 @@
           </svg>
         </button>
       </div>
+    {/snippet}
 
-      <section class="mt-6" aria-labelledby="library-settings-appearance-title">
-        <h3 id="library-settings-appearance-title" class="text-lg font-medium">
-          Application appearance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Choose the colors and theme that make reading comfortable. Changes apply immediately.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
+    <section class="mt-3" aria-labelledby="library-settings-appearance-title">
+      <h3 id="library-settings-appearance-title" class="text-lg font-medium">
+        Application appearance
+      </h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Choose the colors and theme that make reading comfortable. Changes apply immediately.
+      </p>
+      <div class="mt-3 grid grid-cols-2 gap-2">
+        <button
+          class="btn {pendingMode === 'light'
+            ? 'preset-filled-primary-700-300'
+            : 'preset-tonal-surface'}"
+          type="button"
+          aria-pressed={pendingMode === 'light'}
+          onclick={() => void updateMode('light')}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
+            />
+          </svg>
+          Light
+        </button>
+        <button
+          class="btn {pendingMode === 'dark'
+            ? 'preset-filled-primary-700-300'
+            : 'preset-tonal-surface'}"
+          type="button"
+          aria-pressed={pendingMode === 'dark'}
+          onclick={() => void updateMode('dark')}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
+            />
+          </svg>
+          Dark
+        </button>
+      </div>
+
+      <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
+      <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
+        {#each skeletonThemes as option (option)}
           <button
-            class="btn {pendingMode === 'light'
-              ? 'preset-filled-primary-700-300'
+            class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
+            option
+              ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
               : 'preset-tonal-surface'}"
             type="button"
-            aria-pressed={pendingMode === 'light'}
-            onclick={() => void updateMode('light')}
+            aria-pressed={pendingTheme === option}
+            aria-label={`Use ${option} theme`}
+            title={option}
+            onclick={() => void updateTheme(option)}
           >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
-              />
-            </svg>
-            Light
-          </button>
-          <button
-            class="btn {pendingMode === 'dark'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'dark'}
-            onclick={() => void updateMode('dark')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
-              />
-            </svg>
-            Dark
-          </button>
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
-        <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
-          {#each skeletonThemes as option (option)}
-            <button
-              class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
-              option
-                ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
-                : 'preset-tonal-surface'}"
-              type="button"
-              aria-pressed={pendingTheme === option}
-              aria-label={`Use ${option} theme`}
-              title={option}
-              onclick={() => void updateTheme(option)}
-            >
-              <span class="flex h-full w-full" data-theme={option}>
-                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
-                ></span>
+            <span class="flex h-full w-full" data-theme={option}>
+              <span class="h-full flex-1" style:background-color="var(--color-primary-500)"></span>
+              <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
+              ></span>
+              <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"></span>
+            </span>
+            {#if pendingTheme === option}
+              <span class="absolute inset-0 grid place-items-center bg-black/20" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
+                  <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
+                </svg>
               </span>
-              {#if pendingTheme === option}
-                <span
-                  class="absolute inset-0 grid place-items-center bg-black/20"
-                  aria-hidden="true"
-                >
-                  <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
-                    <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
-                  </svg>
-                </span>
-              {/if}
-            </button>
-          {/each}
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Turnleaf always saves your latest position on this device. Auto-sync furthest read also
-          lets a newer local position replace an older Kavita position when progress is uploaded.
-        </p>
-        <div
-          class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
-        >
-          <span class="min-w-0 flex-1 font-medium text-surface-950-50">
-            Auto-sync furthest read
-          </span>
-          <button
-            class="switch-button"
-            type="button"
-            role="switch"
-            aria-checked={pendingAutoSync}
-            aria-label="Auto-sync furthest read"
-            onclick={() => void updateAutoSync(!pendingAutoSync)}
-          >
-            <span
-              class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
-                pendingAutoSync
-                  ? 'preset-filled-primary-700-300'
-                  : 'preset-filled-secondary-700-300'
-              }`}
-              aria-hidden="true"
-            >
-              <span class="switch-thumb preset-filled-tertiary-100-900"></span>
-            </span>
-          </button>
-        </div>
-      </section>
-
-      <section class="mt-7" aria-labelledby="library-settings-connection-title">
-        <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Update the server address or replace the key used to access this library.
-        </p>
-        <dl class="mt-3 space-y-2 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Server</dt>
-            <dd class="truncate text-right">{server.displayName}</dd>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Address</dt>
-            <dd class="truncate text-right">{server.baseUrl}</dd>
-          </div>
-        </dl>
-        {#if editingServerAddress}
-          <form
-            bind:this={serverAddressEditor}
-            class="mt-3 grid gap-3 rounded-xl preset-tonal-surface p-4"
-            novalidate
-            onsubmit={updateServerAddress}
-          >
-            <label class="label">
-              <span class="label-text">New Kavita server address</span>
-              <input
-                id="settings-server-url"
-                class="input min-h-11"
-                type="url"
-                inputmode="url"
-                autocomplete="url"
-                autocapitalize="none"
-                autocorrect="off"
-                spellcheck="false"
-                placeholder="https://books.example.com"
-                bind:value={nextServerUrl}
-                onpaste={handleSettingsServerUrlPaste}
-                aria-invalid={addressInvalidField === 'address' || undefined}
-                aria-describedby={addressError ? 'settings-address-error' : undefined}
-                disabled={savingServerAddress}
-                required
-              />
-            </label>
-            <p class="text-xs text-surface-700-300">
-              Use this only when the new address reaches the same Kavita server and libraries. Leave
-              Replace API key blank to keep your current key, or paste a Kavita OPDS URL.
-            </p>
-            {#if nextServerUrl.trim().toLowerCase().startsWith('http://')}
-              <label
-                class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
-                transition:fade
-              >
-                <input
-                  class="checkbox mt-0.5"
-                  type="checkbox"
-                  bind:checked={allowInsecureServerUrl}
-                  disabled={savingServerAddress}
-                />
-                <span>
-                  Allow plain HTTP. Anyone on this network may be able to observe your reading
-                  traffic and auth key.
-                </span>
-              </label>
             {/if}
-            <div
-              id="settings-address-error"
-              role="alert"
-              class:alert={addressError}
-              class:preset-tonal-error={addressError}
-            >
-              {addressError}
-            </div>
-            <div class="flex flex-wrap gap-2">
-              <button
-                class="btn preset-filled-primary-700-300 min-h-11"
-                type="submit"
-                disabled={savingServerAddress}
-              >
-                {savingServerAddress ? 'Testing…' : 'Save address'}
-              </button>
-              <button
-                class="btn preset-tonal-surface min-h-11"
-                type="button"
-                onclick={cancelServerAddressEdit}
-                disabled={savingServerAddress}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-        {:else}
-          <button
-            bind:this={changeServerAddressButton}
-            class="btn preset-tonal-surface mt-3 min-h-11"
-            type="button"
-            disabled={Boolean(downloadingBookId) ||
-              cleanupInProgress ||
-              savingServerAddress ||
-              replacingApiKey ||
-              deletingServer}
-            onclick={openServerAddressEdit}
-          >
-            Change server address
           </button>
-        {/if}
-        {#if addressStatusMessage}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{addressStatusMessage}</p>
-        {/if}
-        {#if insecureServer()}
-          <div class="alert preset-tonal-warning mt-4" role="alert">
-            Plain HTTP is enabled. Anyone on this network may be able to observe your reading
-            traffic and Kavita auth key. HTTPS is strongly recommended.
-          </div>
-        {/if}
+        {/each}
+      </div>
 
-        <form class="mt-4 grid gap-3" novalidate onsubmit={updateApiKey}>
-          <div class="label">
-            <label for="replacement-api-key" class="label-text">Replace API key</label>
-            <div class="flex flex-wrap gap-2">
-              <input
-                id="replacement-api-key"
-                class="input min-h-11 min-w-0 max-w-96 flex-1"
-                type={showReplacementKey ? 'text' : 'password'}
-                autocapitalize="none"
-                autocorrect="off"
-                spellcheck="false"
-                autocomplete="off"
-                bind:value={replacementApiKey}
-                placeholder="Enter a new Kavita key"
-                aria-invalid={Boolean(settingsError) || addressInvalidField === 'key' || undefined}
-                aria-describedby={settingsError
-                  ? 'settings-key-error'
-                  : addressInvalidField === 'key' && addressError
-                    ? 'settings-address-error'
-                    : undefined}
-                required
-              />
-              <button
-                class="btn preset-tonal-surface min-h-11"
-                type="button"
-                onclick={() => (showReplacementKey = !showReplacementKey)}
-              >
-                {showReplacementKey ? 'Hide key' : 'Show key'}
-              </button>
-              <button
-                class="btn preset-filled-primary-700-300 min-h-11 shrink-0"
-                type="submit"
-                disabled={replacingApiKey || savingServerAddress}
-              >
-                {replacingApiKey ? 'Testing...' : 'Save'}
-              </button>
-            </div>
-            <span class="label-text text-xs text-surface-700-300">
-              The new key is tested before it is saved.
-            </span>
-          </div>
-          <div
-            id="settings-key-error"
-            role="alert"
-            class:alert={settingsError}
-            class:preset-tonal-error={settingsError}
+      <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Turnleaf always saves your latest position on this device. Auto-sync furthest read also lets
+        a newer local position replace an older Kavita position when progress is uploaded.
+      </p>
+      <div
+        class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
+      >
+        <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span>
+        <button
+          class="switch-button"
+          type="button"
+          role="switch"
+          aria-checked={pendingAutoSync}
+          aria-label="Auto-sync furthest read"
+          onclick={() => void updateAutoSync(!pendingAutoSync)}
+        >
+          <span
+            class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
+              pendingAutoSync ? 'preset-filled-primary-700-300' : 'preset-filled-secondary-700-300'
+            }`}
+            aria-hidden="true"
           >
-            {settingsError}
-          </div>
-          <button
-            class="btn preset-tonal-error min-h-11"
-            type="button"
-            onclick={() => (confirmDeleteServer = true)}
-            disabled={deletingServer || savingServerAddress}
-          >
-            Delete server
-          </button>
-        </form>
-      </section>
+            <span class="switch-thumb preset-filled-tertiary-100-900"></span>
+          </span>
+        </button>
+      </div>
+    </section>
 
-      <section class="mt-7" aria-labelledby="library-settings-storage-title">
-        <h3 id="library-settings-storage-title" class="text-lg font-medium">
-          Storage and maintenance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Downloads and reading progress stay on this device. Clearing covers is safe; removing
-          downloads deletes local EPUB files but does not change Kavita.
-        </p>
-        <div class="mt-3 grid gap-2">
-          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}>
-            Clear cover cache
-          </button>
-          <button
-            class="btn preset-tonal-error"
-            type="button"
-            disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-            onclick={removeAllDownloads}
-          >
-            Remove all downloaded books
-          </button>
+    <section class="mt-7" aria-labelledby="library-settings-connection-title">
+      <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Update the server address or replace the key used to access this library.
+      </p>
+      <dl class="mt-3 space-y-2 text-sm">
+        <div class="flex items-center justify-between gap-3">
+          <dt class="text-surface-700-300">Server</dt>
+          <dd class="truncate text-right">{server.displayName}</dd>
         </div>
-        <dl class="mt-4 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Downloaded storage</dt>
-            <dd class="tabular-nums">
-              {(
-                books.reduce(
-                  (sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0),
-                  0,
-                ) / 1_048_576
-              ).toFixed(1)} MB
-            </dd>
-          </div>
-        </dl>
-      </section>
-      <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-        <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Copy or download recent connection and book download details. The log includes API routes,
-          HTTP statuses, and failure categories. It stays in memory until the app closes or you
-          clear it. Review it before sharing.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn preset-tonal-surface"
-            type="button"
-            onclick={() => void copyDiagnostics()}
-          >
-            Copy diagnostics
-          </button>
-          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
-            Download log
-          </button>
+        <div class="flex items-center justify-between gap-3">
+          <dt class="text-surface-700-300">Address</dt>
+          <dd class="truncate text-right">{server.baseUrl}</dd>
         </div>
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={showDiagnostics}
+      </dl>
+      {#if editingServerAddress}
+        <form
+          bind:this={serverAddressEditor}
+          class="mt-3 grid gap-3 rounded-xl preset-tonal-surface p-4"
+          novalidate
+          onsubmit={updateServerAddress}
         >
-          {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-        </button>
-        {#if diagnosticsVisible}
-          <div class="mt-3 grid gap-2">
-            <p class="text-sm text-surface-700-300">
-              If copy or download is unavailable, select all text below, then copy it manually.
-            </p>
-            <textarea
-              id="turnleaf-diagnostics-output"
-              class="input min-h-48 w-full font-mono text-xs"
-              readonly
-              rows="10"
-              bind:value={diagnosticsOutput}
-              aria-label="Turnleaf diagnostics log"
-              onclick={selectDiagnostics}></textarea>
-            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
-              Select all text
-            </button>
-          </div>
-        {/if}
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={clearDiagnosticLog}
-        >
-          Clear diagnostics
-        </button>
-        {#if diagnosticsMessage}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-        {/if}
-      </section>
-      {#if confirmDeleteServer}
-        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-          <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
+          <label class="label">
+            <span class="label-text">New Kavita server address</span>
+            <input
+              id="settings-server-url"
+              class="input min-h-11"
+              type="url"
+              inputmode="url"
+              autocomplete="url"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              placeholder="https://books.example.com"
+              bind:value={nextServerUrl}
+              onpaste={handleSettingsServerUrlPaste}
+              aria-invalid={addressInvalidField === 'address' || undefined}
+              aria-describedby={addressError ? 'settings-address-error' : undefined}
+              disabled={savingServerAddress}
+              required
+            />
+          </label>
+          <p class="text-xs text-surface-700-300">
+            Use this only when the new address reaches the same Kavita server and libraries. Leave
+            Replace API key blank to keep your current key, or paste a Kavita OPDS URL.
           </p>
-          <div class="mt-4 flex gap-2">
-            <button
-              class="btn preset-outlined-error-500"
-              type="button"
-              onclick={() => void deleteServer()}
-              disabled={deletingServer}
+          {#if nextServerUrl.trim().toLowerCase().startsWith('http://')}
+            <label
+              class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
+              transition:fade
             >
-              {deletingServer ? 'Deleting...' : 'Delete now'}
+              <input
+                class="checkbox mt-0.5"
+                type="checkbox"
+                bind:checked={allowInsecureServerUrl}
+                disabled={savingServerAddress}
+              />
+              <span>
+                Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
+                and auth key.
+              </span>
+            </label>
+          {/if}
+          <div
+            id="settings-address-error"
+            role="alert"
+            class:alert={addressError}
+            class:preset-tonal-error={addressError}
+          >
+            {addressError}
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn preset-filled-primary-700-300 min-h-11"
+              type="submit"
+              disabled={savingServerAddress}
+            >
+              {savingServerAddress ? 'Testing…' : 'Save address'}
             </button>
             <button
-              class="btn preset-tonal-surface"
+              class="btn preset-tonal-surface min-h-11"
               type="button"
-              onclick={() => (confirmDeleteServer = false)}
-              disabled={deletingServer}
+              onclick={cancelServerAddressEdit}
+              disabled={savingServerAddress}
             >
               Cancel
             </button>
           </div>
+        </form>
+      {:else}
+        <button
+          bind:this={changeServerAddressButton}
+          class="btn preset-tonal-surface mt-3 min-h-11"
+          type="button"
+          disabled={Boolean(downloadingBookId) ||
+            cleanupInProgress ||
+            savingServerAddress ||
+            replacingApiKey ||
+            deletingServer}
+          onclick={openServerAddressEdit}
+        >
+          Change server address
+        </button>
+      {/if}
+      {#if addressStatusMessage}
+        <p class="mt-2 text-sm text-surface-700-300" role="status">{addressStatusMessage}</p>
+      {/if}
+      {#if insecureServer()}
+        <div class="alert preset-tonal-warning mt-4" role="alert">
+          Plain HTTP is enabled. Anyone on this network may be able to observe your reading traffic
+          and Kavita auth key. HTTPS is strongly recommended.
         </div>
       {/if}
-    </div>
-  </div>
+
+      <form class="mt-4 grid gap-3" novalidate onsubmit={updateApiKey}>
+        <div class="label">
+          <label for="replacement-api-key" class="label-text">Replace API key</label>
+          <div class="flex flex-wrap gap-2">
+            <input
+              id="replacement-api-key"
+              class="input min-h-11 min-w-0 max-w-96 flex-1"
+              type={showReplacementKey ? 'text' : 'password'}
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              autocomplete="off"
+              bind:value={replacementApiKey}
+              placeholder="Enter a new Kavita key"
+              aria-invalid={Boolean(settingsError) || addressInvalidField === 'key' || undefined}
+              aria-describedby={settingsError
+                ? 'settings-key-error'
+                : addressInvalidField === 'key' && addressError
+                  ? 'settings-address-error'
+                  : undefined}
+              required
+            />
+            <button
+              class="btn preset-tonal-surface min-h-11"
+              type="button"
+              onclick={() => (showReplacementKey = !showReplacementKey)}
+            >
+              {showReplacementKey ? 'Hide key' : 'Show key'}
+            </button>
+            <button
+              class="btn preset-filled-primary-700-300 min-h-11 shrink-0"
+              type="submit"
+              disabled={replacingApiKey || savingServerAddress}
+            >
+              {replacingApiKey ? 'Testing...' : 'Save'}
+            </button>
+          </div>
+          <span class="label-text text-xs text-surface-700-300">
+            The new key is tested before it is saved.
+          </span>
+        </div>
+        <div
+          id="settings-key-error"
+          role="alert"
+          class:alert={settingsError}
+          class:preset-tonal-error={settingsError}
+        >
+          {settingsError}
+        </div>
+        <button
+          class="btn preset-tonal-error min-h-11"
+          type="button"
+          onclick={() => (confirmDeleteServer = true)}
+          disabled={deletingServer || savingServerAddress}
+        >
+          Delete server
+        </button>
+      </form>
+    </section>
+
+    <section class="mt-7" aria-labelledby="library-settings-storage-title">
+      <h3 id="library-settings-storage-title" class="text-lg font-medium">
+        Storage and maintenance
+      </h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Downloads and reading progress stay on this device. Clearing covers is safe; removing
+        downloads deletes local EPUB files but does not change Kavita.
+      </p>
+      <div class="mt-3 grid gap-2">
+        <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}>
+          Clear cover cache
+        </button>
+        <button
+          class="btn preset-tonal-error"
+          type="button"
+          disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+          onclick={removeAllDownloads}
+        >
+          Remove all downloaded books
+        </button>
+      </div>
+      <dl class="mt-4 text-sm">
+        <div class="flex items-center justify-between gap-3">
+          <dt class="text-surface-700-300">Downloaded storage</dt>
+          <dd class="tabular-nums">
+            {(
+              books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
+              1_048_576
+            ).toFixed(1)} MB
+          </dd>
+        </div>
+      </dl>
+    </section>
+    <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
+      <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Copy or download recent connection and book download details. The log includes API routes,
+        HTTP statuses, and failure categories. It stays in memory until the app closes or you clear
+        it. Review it before sharing.
+      </p>
+      <div class="mt-3 grid grid-cols-2 gap-2">
+        <button
+          class="btn preset-tonal-surface"
+          type="button"
+          onclick={() => void copyDiagnostics()}
+        >
+          Copy diagnostics
+        </button>
+        <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
+          Download log
+        </button>
+      </div>
+      <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
+        {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
+      </button>
+      {#if diagnosticsVisible}
+        <div class="mt-3 grid gap-2">
+          <p class="text-sm text-surface-700-300">
+            If copy or download is unavailable, select all text below, then copy it manually.
+          </p>
+          <textarea
+            id="turnleaf-diagnostics-output"
+            class="input min-h-48 w-full font-mono text-xs"
+            readonly
+            rows="10"
+            bind:value={diagnosticsOutput}
+            aria-label="Turnleaf diagnostics log"
+            onclick={selectDiagnostics}></textarea>
+          <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
+            Select all text
+          </button>
+        </div>
+      {/if}
+      <button
+        class="btn preset-tonal-surface mt-2 w-full"
+        type="button"
+        onclick={clearDiagnosticLog}
+      >
+        Clear diagnostics
+      </button>
+      {#if diagnosticsMessage}
+        <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
+      {/if}
+    </section>
+    {#if confirmDeleteServer}
+      <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
+        <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
+        <p class="mt-2 text-sm text-surface-700-300">
+          This removes the server connection, downloaded books, cached covers, and local progress
+          from this device.
+        </p>
+        <div class="mt-4 flex gap-2">
+          <button
+            class="btn preset-outlined-error-500"
+            type="button"
+            onclick={() => void deleteServer()}
+            disabled={deletingServer}
+          >
+            {deletingServer ? 'Deleting...' : 'Delete now'}
+          </button>
+          <button
+            class="btn preset-tonal-surface"
+            type="button"
+            onclick={() => (confirmDeleteServer = false)}
+            disabled={deletingServer}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    {/if}
+  </DialogShell>
 {/if}
 
 <style>
