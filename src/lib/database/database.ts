@@ -267,9 +267,15 @@ export async function saveServer(config: ServerConfig): Promise<void> {
   const db = await openDatabase();
   await executeNativeRun(
     db,
-    `INSERT OR REPLACE INTO server_config
+    `INSERT INTO server_config
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
-      VALUES (?, ?, ?, ?, ?, ?)`,
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        display_name=excluded.display_name,
+        base_url=excluded.base_url,
+        credential_ref=excluded.credential_ref,
+        kavita_version=excluded.kavita_version,
+        last_connected_at=excluded.last_connected_at`,
     [
       config.id,
       config.displayName,
@@ -735,10 +741,7 @@ export async function saveLocalProgress(
   ]);
 }
 
-export async function markBookCompleted(
-  book: BookRecord,
-  readingState: StoredReadingState | null = null,
-): Promise<void> {
+export async function markBookCompleted(book: BookRecord): Promise<void> {
   const now = new Date().toISOString();
   const payload: PendingProgressPayload = {
     libraryId: book.libraryId,
@@ -769,8 +772,8 @@ export async function markBookCompleted(
         xpath: null,
         percentage: 1,
         localUpdatedAt: now,
-        syncedLocalUpdatedAt: readingState?.syncedLocalUpdatedAt ?? null,
-        serverUpdatedAt: readingState?.serverUpdatedAt ?? null,
+        syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
+        serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
         pendingSync: true,
         syncRevision,
       };

@@ -52,7 +52,13 @@
   import TurnleafLogo from './TurnleafLogo.svelte';
   import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
-  import { focusFirstElement, restoreFocus, trapModalKeydown } from '../a11y/modal-focus';
+  import {
+    activeElement,
+    focusModal,
+    restoreFocus,
+    restoreModalFocus,
+    trapModalKeydown,
+  } from '../a11y/modal-focus';
 
   let {
     server,
@@ -64,6 +70,7 @@
     onApiKeyChange,
     onServerDeleted,
     onChangeServerAddress,
+    onReaderOpenChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -74,6 +81,7 @@
     onApiKeyChange: (apiKey: string) => void;
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
+    onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   type LibraryViewMode = 'grid' | 'list';
@@ -308,6 +316,22 @@
     return value === 'list' ? 'list' : 'grid';
   }
 
+  function parseBooleanPreference(value: string | undefined, fallback: boolean): boolean {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return fallback;
+  }
+
+  function toggleDownloadedOnly(): void {
+    downloadedOnly = !downloadedOnly;
+    void setPreference('libraryDownloadedOnly', String(downloadedOnly));
+  }
+
+  function toggleHideCompleted(): void {
+    hideCompleted = !hideCompleted;
+    void setPreference('libraryHideCompleted', String(hideCompleted));
+  }
+
   function handleSortChange(event: Event): void {
     const value = (event.currentTarget as HTMLSelectElement).value;
     sortOrder = parseSortOrder(value);
@@ -337,19 +361,11 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
+    void setPreference('libraryDownloadedOnly', 'false');
+    void setPreference('libraryHideCompleted', 'false');
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
-  }
-
-  function activeElement(): HTMLElement | null {
-    return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  }
-
-  function focusModal(getDialog: () => HTMLElement | null): void {
-    void tick().then(() => focusFirstElement(getDialog()));
   }
 
   function insecureServer(): boolean {
@@ -509,6 +525,8 @@
         'libraryAuthor',
         'librarySeries',
         'libraryView',
+        'libraryDownloadedOnly',
+        'libraryHideCompleted',
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
@@ -516,6 +534,8 @@
     pendingTheme = theme as SkeletonTheme;
     pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
+    downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
+    hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
     sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
@@ -650,6 +670,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1216,8 +1237,7 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    const readingState = await getReadingState(book.id);
-    await markBookCompleted(book, readingState);
+    await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1289,7 +1309,7 @@
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1350,7 +1370,7 @@
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    void tick().then(() => restoreFocus(opener));
+    restoreModalFocus(opener);
   }
 
   function diagnosticsText(): string {
@@ -1583,6 +1603,7 @@
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined
         : retryReaderDownload}
+      onMountChange={onReaderOpenChange}
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
@@ -1752,7 +1773,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
-          onclick={() => (downloadedOnly = !downloadedOnly)}
+          onclick={toggleDownloadedOnly}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
@@ -1766,7 +1787,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
-          onclick={() => (hideCompleted = !hideCompleted)}
+          onclick={toggleHideCompleted}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path
