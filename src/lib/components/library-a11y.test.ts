@@ -438,20 +438,19 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
     const banner = host.querySelector<HTMLElement>('[data-release-banner]')!;
     expect(banner).not.toBeNull();
 
+    const feed = stage.querySelector<HTMLElement>('#library-results')!;
+    const listTop = 320;
     Object.defineProperty(stage, 'clientHeight', { value: 700, configurable: true });
     vi.spyOn(stage, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 800, 700));
     vi.spyOn(banner, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 800, 112));
+    vi.spyOn(feed, 'getBoundingClientRect').mockImplementation(
+      () => new DOMRect(0, listTop - stage.scrollTop, 800, 6000),
+    );
     window.dispatchEvent(new Event('resize'));
     await settle();
 
     expect(stage.dataset.stickyBannerHeight).toBe('112');
     expect(stage.style.getPropertyValue('--sticky-banner-height')).toBe('112px');
-
-    const feed = stage.querySelector<HTMLElement>('#library-results')!;
-    const listTop = 320;
-    vi.spyOn(feed, 'getBoundingClientRect').mockImplementation(
-      () => new DOMRect(0, listTop - stage.scrollTop, 800, 6000),
-    );
 
     // Scroll so row 0 is partially hidden behind the 112px sticky banner (listTop 320 - scrollTop 260 = 60 < 112).
     stage.scrollTop = 260;
