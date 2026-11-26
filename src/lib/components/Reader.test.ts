@@ -22,15 +22,21 @@ vi.mock('../database/database', () => ({
   setPreferences: setPreferencesMock,
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    open = openSessionMock;
-    next = nextSessionMock;
-    tableOfContents = () => [];
-    updateHighlights = vi.fn();
-    destroy = destroySessionMock;
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      open = openSessionMock;
+      next = nextSessionMock;
+      tableOfContents = () => [];
+      updateHighlights = vi.fn();
+      clearTextSelection = vi.fn();
+      getVisiblePassages = () => [];
+      destroy = destroySessionMock;
+    },
+  };
+});
 
 import Reader from './Reader.svelte';
 
@@ -201,10 +207,10 @@ describe('Reader mount lifecycle', () => {
 
     await vi.waitFor(() => {
       expect(onBookCompleted).toHaveBeenCalledOnce();
-      expect(target.querySelector('[role="dialog"]')).not.toBeNull();
+      expect(target.querySelector('dialog, [role="dialog"]')).not.toBeNull();
     });
 
-    const dialog = target.querySelector<HTMLElement>('[role="dialog"]');
+    const dialog = target.querySelector<HTMLElement>('dialog, [role="dialog"]');
     await vi.waitFor(() => {
       expect(dialog?.contains(document.activeElement)).toBe(true);
     });
@@ -213,7 +219,7 @@ describe('Reader mount lifecycle', () => {
     flushSync();
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="dialog"]')).toBeNull();
+      expect(target.querySelector('dialog, [role="dialog"]')).toBeNull();
       expect(document.activeElement).toBe(nextZone);
     });
   });

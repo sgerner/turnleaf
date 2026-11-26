@@ -61,7 +61,7 @@ it('loads covers with the api key header', async () => {
   );
 });
 
-it('requests the Kavita series list with POST', async () => {
+it('requests the Kavita series list with POST and an EPUB format filter', async () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
 
   await client.getBookSeries();
@@ -71,6 +71,12 @@ it('requests the Kavita series list with POST', async () => {
     'https://books.example.com/api/Series/v2?PageNumber=1&PageSize=500',
     expect.objectContaining({
       method: 'POST',
+      body: JSON.stringify({
+        statements: [{ field: 21, comparison: 5, value: '3' }],
+        combination: 0,
+        sortOptions: { sortField: 1, isAscending: true },
+        limitTo: 0,
+      }),
       redirect: 'manual',
       headers: expect.objectContaining({
         'x-api-key': 'abc123',
@@ -214,6 +220,13 @@ it('follows native same-origin redirects with redirects disabled on each request
   expect(CapacitorHttp.request).toHaveBeenCalledTimes(2);
   expect(vi.mocked(CapacitorHttp.request).mock.calls[0]?.[0]).toMatchObject({
     url: 'https://books.example.com/kavita/api/Series/v2?PageNumber=1&PageSize=500',
+    method: 'POST',
+    data: {
+      statements: [{ field: 21, comparison: 5, value: '3' }],
+      combination: 0,
+      sortOptions: { sortField: 1, isAscending: true },
+      limitTo: 0,
+    },
     disableRedirects: true,
     headers: { 'x-api-key': 'abc123' },
   });
