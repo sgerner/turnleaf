@@ -49,6 +49,7 @@
   import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
+  import DialogShell from './DialogShell.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import {
     calculateVirtualWindow,
@@ -85,6 +86,7 @@
     onServerDeleted,
     onChangeServerAddress,
     onReaderOpenChange,
+    onOverlayActiveChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -96,6 +98,7 @@
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
+    onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
@@ -591,6 +594,12 @@
     } else if (untrack(() => focusedRow) !== -1) {
       focusedRow = -1;
     }
+  });
+
+  $effect(() => {
+    const overlayActive = Boolean(reading || actionMenuBook || conflict || settingsVisible);
+    onOverlayActiveChange?.(overlayActive);
+    return () => onOverlayActiveChange?.(false);
   });
 
   $effect(() => {
@@ -2790,24 +2799,9 @@
 {/if}
 
 {#if settingsVisible}
-  <div
-    class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeSettings()}
-  >
-    <div
-      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="library-settings-title"
-      tabindex="-1"
-      use:modalFocusTrap={closeSettings}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <div
-        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
-      >
+  <DialogShell labelledBy="library-settings-title" onClose={closeSettings}>
+    {#snippet header()}
+      <div class="flex items-center justify-between gap-3">
         <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
         <button
           class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
@@ -2823,343 +2817,328 @@
           </svg>
         </button>
       </div>
+    {/snippet}
 
-      <section class="mt-6" aria-labelledby="library-settings-appearance-title">
-        <h3 id="library-settings-appearance-title" class="text-lg font-medium">
-          Application appearance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Choose the colors and theme that make reading comfortable. Changes apply immediately.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn {pendingMode === 'light'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'light'}
-            onclick={() => void updateMode('light')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
-              />
-            </svg>
-            Light
-          </button>
-          <button
-            class="btn {pendingMode === 'dark'
-              ? 'preset-filled-primary-700-300'
-              : 'preset-tonal-surface'}"
-            type="button"
-            aria-pressed={pendingMode === 'dark'}
-            onclick={() => void updateMode('dark')}
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
-              <path
-                fill="currentColor"
-                d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
-              />
-            </svg>
-            Dark
-          </button>
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
-        <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
-          {#each skeletonThemes as option (option)}
-            <button
-              class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
-              option
-                ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
-                : 'preset-tonal-surface'}"
-              type="button"
-              aria-pressed={pendingTheme === option}
-              aria-label={`Use ${option} theme`}
-              title={option}
-              onclick={() => void updateTheme(option)}
-            >
-              <span class="flex h-full w-full" data-theme={option}>
-                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
-                ></span>
-              </span>
-              {#if pendingTheme === option}
-                <span
-                  class="absolute inset-0 grid place-items-center bg-black/20"
-                  aria-hidden="true"
-                >
-                  <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
-                    <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
-                  </svg>
-                </span>
-              {/if}
-            </button>
-          {/each}
-        </div>
-
-        <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Turnleaf always saves your latest position on this device. Auto-sync furthest read also
-          lets a newer local position replace an older Kavita position when progress is uploaded.
-        </p>
-        <div
-          class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
-        >
-          <span class="min-w-0 flex-1 font-medium text-surface-950-50">
-            Auto-sync furthest read
-          </span>
-          <button
-            class="switch-button"
-            type="button"
-            role="switch"
-            aria-checked={pendingAutoSync}
-            aria-label="Auto-sync furthest read"
-            onclick={() => void updateAutoSync(!pendingAutoSync)}
-          >
-            <span
-              class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
-                pendingAutoSync
-                  ? 'preset-filled-primary-700-300'
-                  : 'preset-filled-secondary-700-300'
-              }`}
-              aria-hidden="true"
-            >
-              <span class="switch-thumb preset-filled-tertiary-100-900"></span>
-            </span>
-          </button>
-        </div>
-      </section>
-
-      <section class="mt-7" aria-labelledby="library-settings-connection-title">
-        <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Update the server address or replace the key used to access this library.
-        </p>
-        <dl class="mt-3 space-y-2 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Server</dt>
-            <dd class="truncate text-right">{server.displayName}</dd>
-          </div>
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Address</dt>
-            <dd class="truncate text-right">{server.baseUrl}</dd>
-          </div>
-        </dl>
+    <section class="mt-3" aria-labelledby="library-settings-appearance-title">
+      <h3 id="library-settings-appearance-title" class="text-lg font-medium">
+        Application appearance
+      </h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Choose the colors and theme that make reading comfortable. Changes apply immediately.
+      </p>
+      <div class="mt-3 grid grid-cols-2 gap-2">
         <button
-          class="btn preset-tonal-surface mt-3"
+          class="btn {pendingMode === 'light'
+            ? 'preset-filled-primary-700-300'
+            : 'preset-tonal-surface'}"
           type="button"
-          disabled={Boolean(downloadingBookId) ||
-            cleanupInProgress ||
-            replacingApiKey ||
-            deletingServer}
-          onclick={onChangeServerAddress}
+          aria-pressed={pendingMode === 'light'}
+          onclick={() => void updateMode('light')}
         >
-          Change server address
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"
+            />
+          </svg>
+          Light
         </button>
-        {#if insecureServer()}
-          <div class="alert preset-tonal-warning mt-4" role="alert">
-            Plain HTTP is enabled. Anyone on this network may be able to observe your reading
-            traffic and Kavita auth key. HTTPS is strongly recommended.
-          </div>
-        {/if}
+        <button
+          class="btn {pendingMode === 'dark'
+            ? 'preset-filled-primary-700-300'
+            : 'preset-tonal-surface'}"
+          type="button"
+          aria-pressed={pendingMode === 'dark'}
+          onclick={() => void updateMode('dark')}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+            <path
+              fill="currentColor"
+              d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"
+            />
+          </svg>
+          Dark
+        </button>
+      </div>
 
-        <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
-          <div class="label">
-            <label for="replacement-api-key" class="label-text">Replace API key</label>
-            <div class="flex flex-wrap gap-2">
-              <input
-                id="replacement-api-key"
-                class="input min-w-0 flex-1 max-w-96"
-                type={showReplacementKey ? 'text' : 'password'}
-                spellcheck="false"
-                autocomplete="off"
-                bind:value={replacementApiKey}
-                placeholder="Enter a new Kavita key"
-                aria-invalid={settingsError ? true : undefined}
-                aria-describedby={settingsError ? 'settings-key-error' : undefined}
-                required
-              />
+      <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
+      <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
+        {#each skeletonThemes as option (option)}
+          <button
+            class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
+            option
+              ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
+              : 'preset-tonal-surface'}"
+            type="button"
+            aria-pressed={pendingTheme === option}
+            aria-label={`Use ${option} theme`}
+            title={option}
+            onclick={() => void updateTheme(option)}
+          >
+            <span class="flex h-full w-full" data-theme={option}>
+              <span class="h-full flex-1" style:background-color="var(--color-primary-500)"></span>
+              <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
+              ></span>
+              <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"></span>
+            </span>
+            {#if pendingTheme === option}
+              <span class="absolute inset-0 grid place-items-center bg-black/20" aria-hidden="true">
+                <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
+                  <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
+                </svg>
+              </span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+
+      <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Turnleaf always saves your latest position on this device. Auto-sync furthest read also lets
+        a newer local position replace an older Kavita position when progress is uploaded.
+      </p>
+      <div
+        class="mt-2 flex min-h-12 items-center justify-between gap-4 rounded-xl preset-tonal-surface px-3 py-3"
+      >
+        <span class="min-w-0 flex-1 font-medium text-surface-950-50">Auto-sync furthest read</span>
+        <button
+          class="switch-button"
+          type="button"
+          role="switch"
+          aria-checked={pendingAutoSync}
+          aria-label="Auto-sync furthest read"
+          onclick={() => void updateAutoSync(!pendingAutoSync)}
+        >
+          <span
+            class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
+              pendingAutoSync ? 'preset-filled-primary-700-300' : 'preset-filled-secondary-700-300'
+            }`}
+            aria-hidden="true"
+          >
+            <span class="switch-thumb preset-filled-tertiary-100-900"></span>
+          </span>
+        </button>
+      </div>
+    </section>
+
+    <section class="mt-7" aria-labelledby="library-settings-connection-title">
+      <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Update the server address or replace the key used to access this library.
+      </p>
+      <dl class="mt-3 space-y-2 text-sm">
+        <div class="flex items-center justify-between gap-3">
+          <dt class="text-surface-700-300">Server</dt>
+          <dd class="truncate text-right">{server.displayName}</dd>
+        </div>
+        <div class="flex items-center justify-between gap-3">
+          <dt class="text-surface-700-300">Address</dt>
+          <dd class="truncate text-right">{server.baseUrl}</dd>
+        </div>
+      </dl>
+      <button
+        class="btn preset-tonal-surface mt-3"
+        type="button"
+        disabled={Boolean(downloadingBookId) ||
+          cleanupInProgress ||
+          replacingApiKey ||
+          deletingServer}
+        onclick={onChangeServerAddress}
+      >
+        Change server address
+      </button>
+      {#if insecureServer()}
+        <div class="alert preset-tonal-warning mt-4" role="alert">
+          Plain HTTP is enabled. Anyone on this network may be able to observe your reading traffic
+          and Kavita auth key. HTTPS is strongly recommended.
+        </div>
+      {/if}
+
+      <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
+        <div class="label">
+          <label for="replacement-api-key" class="label-text">Replace API key</label>
+          <div class="flex flex-wrap gap-2">
+            <input
+              id="replacement-api-key"
+              class="input min-w-0 flex-1 max-w-96"
+              type={showReplacementKey ? 'text' : 'password'}
+              spellcheck="false"
+              autocomplete="off"
+              bind:value={replacementApiKey}
+              placeholder="Enter a new Kavita key"
+              aria-invalid={settingsError ? true : undefined}
+              aria-describedby={settingsError ? 'settings-key-error' : undefined}
+              required
+            />
+            <button
+              class="btn preset-tonal-surface"
+              type="button"
+              onclick={() => (showReplacementKey = !showReplacementKey)}
+            >
+              {showReplacementKey ? 'Hide key' : 'Show key'}
+            </button>
+            <button
+              class="btn preset-filled-primary-700-300 shrink-0"
+              type="submit"
+              disabled={replacingApiKey}
+            >
+              {replacingApiKey ? 'Testing...' : 'Save'}
+            </button>
+          </div>
+          <span class="label-text text-xs text-surface-700-300">
+            The new key is tested before it is saved.
+          </span>
+        </div>
+        <div
+          id="settings-key-error"
+          role="alert"
+          class:alert={settingsError}
+          class:preset-tonal-error={settingsError}
+        >
+          {settingsError}
+        </div>
+        <button
+          id="delete-server-button"
+          class="btn preset-tonal-error"
+          type="button"
+          aria-expanded={confirmDeleteServer}
+          aria-controls={confirmDeleteServer ? 'delete-server-confirm' : undefined}
+          onclick={() => {
+            confirmDeleteServer = true;
+            document.getElementById('delete-server-confirm')?.focus({ preventScroll: true });
+          }}
+          disabled={deletingServer}
+        >
+          Delete server
+        </button>
+        {#if confirmDeleteServer}
+          <div
+            id="delete-server-confirm"
+            class="rounded-xl border border-error-500/35 p-4"
+            role="group"
+            aria-labelledby="delete-server-confirm-title"
+            aria-describedby="delete-server-confirm-description"
+            tabindex="-1"
+            use:focusViewEntry={{ force: true }}
+            transition:fade
+          >
+            <p id="delete-server-confirm-title" class="text-sm font-medium text-error-700-300">
+              Delete this server?
+            </p>
+            <p id="delete-server-confirm-description" class="mt-2 text-sm text-surface-700-300">
+              This removes the server connection, downloaded books, cached covers, and local
+              progress from this device.
+            </p>
+            <div class="mt-4 flex gap-2">
+              <button
+                class="btn preset-outlined-error-500"
+                type="button"
+                use:focusAfterUnmount={'#delete-server-button'}
+                onclick={() => void deleteServer()}
+                disabled={deletingServer}
+              >
+                {deletingServer ? 'Deleting...' : 'Delete now'}
+              </button>
               <button
                 class="btn preset-tonal-surface"
                 type="button"
-                onclick={() => (showReplacementKey = !showReplacementKey)}
+                use:focusAfterUnmount={'#delete-server-button'}
+                onclick={() => (confirmDeleteServer = false)}
+                disabled={deletingServer}
               >
-                {showReplacementKey ? 'Hide key' : 'Show key'}
-              </button>
-              <button
-                class="btn preset-filled-primary-700-300 shrink-0"
-                type="submit"
-                disabled={replacingApiKey}
-              >
-                {replacingApiKey ? 'Testing...' : 'Save'}
+                Cancel
               </button>
             </div>
-            <span class="label-text text-xs text-surface-700-300">
-              The new key is tested before it is saved.
-            </span>
           </div>
-          <div
-            id="settings-key-error"
-            role="alert"
-            class:alert={settingsError}
-            class:preset-tonal-error={settingsError}
-          >
-            {settingsError}
-          </div>
-          <button
-            id="delete-server-button"
-            class="btn preset-tonal-error"
-            type="button"
-            aria-expanded={confirmDeleteServer}
-            aria-controls={confirmDeleteServer ? 'delete-server-confirm' : undefined}
-            onclick={() => {
-              confirmDeleteServer = true;
-              document.getElementById('delete-server-confirm')?.focus({ preventScroll: true });
-            }}
-            disabled={deletingServer}
-          >
-            Delete server
-          </button>
-          {#if confirmDeleteServer}
-            <div
-              id="delete-server-confirm"
-              class="rounded-xl border border-error-500/35 p-4"
-              role="group"
-              aria-labelledby="delete-server-confirm-title"
-              aria-describedby="delete-server-confirm-description"
-              tabindex="-1"
-              use:focusViewEntry={{ force: true }}
-              transition:fade
-            >
-              <p id="delete-server-confirm-title" class="text-sm font-medium text-error-700-300">
-                Delete this server?
-              </p>
-              <p id="delete-server-confirm-description" class="mt-2 text-sm text-surface-700-300">
-                This removes the server connection, downloaded books, cached covers, and local
-                progress from this device.
-              </p>
-              <div class="mt-4 flex gap-2">
-                <button
-                  class="btn preset-outlined-error-500"
-                  type="button"
-                  use:focusAfterUnmount={'#delete-server-button'}
-                  onclick={() => void deleteServer()}
-                  disabled={deletingServer}
-                >
-                  {deletingServer ? 'Deleting...' : 'Delete now'}
-                </button>
-                <button
-                  class="btn preset-tonal-surface"
-                  type="button"
-                  use:focusAfterUnmount={'#delete-server-button'}
-                  onclick={() => (confirmDeleteServer = false)}
-                  disabled={deletingServer}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          {/if}
-        </form>
-      </section>
+        {/if}
+      </form>
+    </section>
 
-      <section class="mt-7" aria-labelledby="library-settings-storage-title">
-        <h3 id="library-settings-storage-title" class="text-lg font-medium">
-          Storage and maintenance
-        </h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Downloads and reading progress stay on this device. Clearing covers is safe; removing
-          downloads deletes local EPUB files but does not change Kavita.
-        </p>
+    <section class="mt-7" aria-labelledby="library-settings-storage-title">
+      <h3 id="library-settings-storage-title" class="text-lg font-medium">
+        Storage and maintenance
+      </h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Downloads and reading progress stay on this device. Clearing covers is safe; removing
+        downloads deletes local EPUB files but does not change Kavita.
+      </p>
+      <div class="mt-3 grid gap-2">
+        <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}>
+          Clear cover cache
+        </button>
+        <button
+          class="btn preset-tonal-error"
+          type="button"
+          disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+          onclick={removeAllDownloads}
+        >
+          Remove all downloaded books
+        </button>
+      </div>
+      <dl class="mt-4 text-sm">
+        <div class="flex items-center justify-between gap-3">
+          <dt class="text-surface-700-300">Downloaded storage</dt>
+          <dd class="tabular-nums">
+            {(
+              books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
+              1_048_576
+            ).toFixed(1)} MB
+          </dd>
+        </div>
+      </dl>
+    </section>
+    <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
+      <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
+      <p class="mt-1 text-sm text-surface-700-300">
+        Copy or download recent connection and book download details. The log includes API routes,
+        HTTP statuses, and failure categories. It stays in memory until the app closes or you clear
+        it. Review it before sharing.
+      </p>
+      <div class="mt-3 grid grid-cols-2 gap-2">
+        <button
+          class="btn preset-tonal-surface"
+          type="button"
+          onclick={() => void copyDiagnostics()}
+        >
+          Copy diagnostics
+        </button>
+        <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
+          Download log
+        </button>
+      </div>
+      <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
+        {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
+      </button>
+      {#if diagnosticsVisible}
         <div class="mt-3 grid gap-2">
-          <button class="btn preset-outlined-error-500" type="button" onclick={clearCache}>
-            Clear cover cache
-          </button>
-          <button
-            class="btn preset-tonal-error"
-            type="button"
-            disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
-            onclick={removeAllDownloads}
-          >
-            Remove all downloaded books
-          </button>
-        </div>
-        <dl class="mt-4 text-sm">
-          <div class="flex items-center justify-between gap-3">
-            <dt class="text-surface-700-300">Downloaded storage</dt>
-            <dd class="tabular-nums">
-              {(
-                books.reduce(
-                  (sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0),
-                  0,
-                ) / 1_048_576
-              ).toFixed(1)} MB
-            </dd>
-          </div>
-        </dl>
-      </section>
-      <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-        <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Copy or download recent connection and book download details. The log includes API routes,
-          HTTP statuses, and failure categories. It stays in memory until the app closes or you
-          clear it. Review it before sharing.
-        </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
-          <button
-            class="btn preset-tonal-surface"
-            type="button"
-            onclick={() => void copyDiagnostics()}
-          >
-            Copy diagnostics
-          </button>
-          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
-            Download log
+          <p class="text-sm text-surface-700-300">
+            If copy or download is unavailable, select all text below, then copy it manually.
+          </p>
+          <textarea
+            id="turnleaf-diagnostics-output"
+            class="input min-h-48 w-full font-mono text-xs"
+            readonly
+            rows="10"
+            bind:value={diagnosticsOutput}
+            aria-label="Turnleaf diagnostics log"
+            onclick={selectDiagnostics}></textarea>
+          <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
+            Select all text
           </button>
         </div>
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={showDiagnostics}
-        >
-          {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-        </button>
-        {#if diagnosticsVisible}
-          <div class="mt-3 grid gap-2">
-            <p class="text-sm text-surface-700-300">
-              If copy or download is unavailable, select all text below, then copy it manually.
-            </p>
-            <textarea
-              id="turnleaf-diagnostics-output"
-              class="input min-h-48 w-full font-mono text-xs"
-              readonly
-              rows="10"
-              bind:value={diagnosticsOutput}
-              aria-label="Turnleaf diagnostics log"
-              onclick={selectDiagnostics}></textarea>
-            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
-              Select all text
-            </button>
-          </div>
-        {/if}
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={clearDiagnosticLog}
-        >
-          Clear diagnostics
-        </button>
-        {#if diagnosticsMessage}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-        {/if}
-      </section>
-    </div>
-  </div>
+      {/if}
+      <button
+        class="btn preset-tonal-surface mt-2 w-full"
+        type="button"
+        onclick={clearDiagnosticLog}
+      >
+        Clear diagnostics
+      </button>
+      {#if diagnosticsMessage}
+        <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
+      {/if}
+    </section>
+  </DialogShell>
 {/if}
 
 <style>
