@@ -7,13 +7,16 @@ import {
   confirmSync,
   getBooks,
   getPendingSync,
+  getPreferences,
   getReadingState,
   getSyncStatus,
   markBookCompleted,
   reconcileBooks,
   replaceBooksInTransaction,
+  resetLocalDatabase,
   saveLocalProgress,
   saveRemoteProgress,
+  setPreference,
   type BookRecord,
 } from './database';
 
@@ -1072,4 +1075,38 @@ it('persists browser baselines across sync and local saves, clears synced unread
     serverXPath: '//body/DocFragment[9]/body/p[2]',
     pendingSync: true,
   });
+});
+
+it('round-trips library filter preferences in browser storage and clears them on database reset', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+
+  const initial = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(initial.size).toBe(0);
+
+  await setPreference('libraryDownloadedOnly', 'true');
+  await setPreference('libraryHideCompleted', 'false');
+
+  const saved = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(saved.get('libraryDownloadedOnly')).toBe('true');
+  expect(saved.get('libraryHideCompleted')).toBe('false');
+  expect(JSON.parse(localStorage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
+    preferences: {
+      libraryDownloadedOnly: 'true',
+      libraryHideCompleted: 'false',
+    },
+  });
+
+  await setPreference('libraryDownloadedOnly', 'false');
+  await setPreference('libraryHideCompleted', 'false');
+
+  const cleared = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(cleared.get('libraryDownloadedOnly')).toBe('false');
+  expect(cleared.get('libraryHideCompleted')).toBe('false');
+
+  await resetLocalDatabase();
+  const afterReset = await getPreferences(['libraryDownloadedOnly', 'libraryHideCompleted']);
+  expect(afterReset.size).toBe(0);
 });
