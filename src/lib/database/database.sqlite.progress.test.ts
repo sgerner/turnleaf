@@ -514,6 +514,88 @@ describe('native progress transactions against SQLite', () => {
     expect(await database.getPendingSync(server.id)).toMatchObject([{ bookId: book.id }]);
   });
 
+  it('marks and clears SQLite download metadata across reopen without touching other books', async () => {
+    const database = await importDatabase();
+    const sibling = { ...book, id: 'server:1:11', chapterId: 11, title: 'Sibling' };
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book, sibling]);
+
+    await database.markDownloaded(book.id, 'books/server-1-10.epub', 4096);
+    const afterMark = await reopenDatabase(database);
+    expect(await afterMark.getBooks(server.id)).toEqual([
+      expect.objectContaining({
+        id: book.id,
+        downloadPath: 'books/server-1-10.epub',
+        downloadStatus: 'available',
+        fileSize: 4096,
+      }),
+      expect.objectContaining({
+        id: sibling.id,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+      }),
+    ]);
+
+    await afterMark.removeDownload(book.id);
+    const afterRemove = await reopenDatabase(afterMark);
+    expect(await afterRemove.getBooks(server.id)).toEqual([
+      expect.objectContaining({
+        id: book.id,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: 4096,
+      }),
+      expect.objectContaining({
+        id: sibling.id,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+      }),
+    ]);
+    const rawRow = native.database
+      ?.prepare('SELECT download_path, download_status, file_size FROM books WHERE id=?')
+      .get(book.id);
+    expect(rawRow).toEqual({
+      download_path: null,
+      download_status: 'none',
+      file_size: 4096,
+    });
+  });
+
+  it('normalizes zero-page remote progress to zero percent while storing raw server_page_num', async () => {
+    const database = await importDatabase();
+    const zeroPageBook = { ...book, pages: 0 };
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [zeroPageBook]);
+    const remote = {
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 10,
+      chapterId: 10,
+      pageNum: 17,
+      bookScrollId: '/zero',
+      lastModifiedUtc: '2026-01-03T00:00:00.000Z',
+    };
+
+    expect(await database.saveRemoteProgress(zeroPageBook, remote, null)).toBe(true);
+    expect(await database.getReadingState(zeroPageBook.id)).toMatchObject({
+      cfi: '',
+      xpath: '/zero',
+      percentage: 0,
+      pendingSync: false,
+    });
+    expect((await database.getBooks(server.id))[0]?.pagesRead).toBe(0);
+    expect(
+      native.database
+        ?.prepare('SELECT percentage, server_page_num FROM reading_state WHERE book_id=?')
+        .get(zeroPageBook.id),
+    ).toEqual({
+      percentage: 0,
+      server_page_num: 17,
+    });
+  });
+
   it('seeds the persistent progress revision when upgrading a pending version-6 queue', async () => {
     const updatedAt = '2026-01-01T00:00:00.000Z';
     native.database = new DatabaseSync(native.databasePath);
