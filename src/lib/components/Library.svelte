@@ -46,9 +46,10 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
+  import { clearDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import DialogShell from './DialogShell.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
@@ -102,6 +103,7 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
@@ -111,6 +113,7 @@
         signal,
         server.id,
         await networkAvailable(),
+        serverOrigin,
       );
     }
     if (offline) throw new Error('Offline');
@@ -245,15 +248,12 @@
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
-  let diagnosticsVisible = $state(false);
-  let diagnosticsOutput = $state('');
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
   let settingsError = $state('');
-  let diagnosticsMessage = $state('');
   type LibraryConfirmation =
     | {
         kind: 'mark-done';
@@ -956,7 +956,6 @@
         detail:
           cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
       });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       const savedBooks = displayableBooks.length
         ? 'Showing your saved library.'
         : 'No saved books are available yet.';
@@ -1066,6 +1065,7 @@
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        serverOrigin,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1122,6 +1122,10 @@
         } else {
           message = 'The file transfer failed.';
         }
+      } else if (error instanceof KavitaError) {
+        status = error.status;
+        detail = 'download-transfer';
+        message = error.message;
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
@@ -1137,7 +1141,6 @@
           'The download finished, but its saved status could not be checked. Refresh before retrying.';
       }
       recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       message += ' Open Settings to copy diagnostics.';
       downloadFailureBook = book;
       return null;
@@ -1609,77 +1612,6 @@
     restoreModalFocus(opener);
   }
 
-  function diagnosticsText(): string {
-    return exportDiagnostics({
-      appVersion: __APP_VERSION__,
-      platform: Capacitor.getPlatform(),
-      kavitaVersion: server.kavitaVersion,
-    });
-  }
-
-  async function copyDiagnostics(): Promise<void> {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    try {
-      const text = diagnosticsOutput;
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const field = document.createElement('textarea');
-        field.value = text;
-        field.setAttribute('readonly', '');
-        field.style.position = 'fixed';
-        field.style.opacity = '0';
-        document.body.appendChild(field);
-        let copied = false;
-        try {
-          field.select();
-          copied = document.execCommand('copy');
-        } finally {
-          field.remove();
-        }
-        if (!copied) throw new Error('Clipboard unavailable');
-      }
-      diagnosticsMessage = 'Diagnostics copied. Review them before sharing.';
-    } catch {
-      diagnosticsVisible = true;
-      diagnosticsMessage =
-        'Copy is unavailable here. Open the log below to select and copy it, or download it.';
-    }
-  }
-
-  function downloadDiagnostics(): void {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    const file = new Blob([diagnosticsOutput], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'turnleaf-diagnostics.txt';
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    diagnosticsVisible = true;
-    diagnosticsMessage =
-      'Review the log before sharing. If the file did not download, select and copy it below.';
-  }
-
-  function showDiagnostics(): void {
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsVisible = !diagnosticsVisible;
-  }
-
-  function selectDiagnostics(): void {
-    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-diagnostics-output');
-    field?.focus();
-    field?.select();
-  }
-
-  function clearDiagnosticLog(): void {
-    clearDiagnostics();
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsMessage = 'Diagnostics cleared.';
-  }
-
   function requestRemoveAllDownloads(): void {
     const candidates = books.filter((item) => item.downloadPath);
     if (!candidates.length || downloadingBookId || cleanupInProgress) return;
@@ -1815,6 +1747,7 @@
         credentialCleanupComplete = true;
       }
       await removeServer(server.id);
+      await clearDiagnostics();
       libraryConfirm = null;
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
@@ -3115,57 +3048,7 @@
         </div>
       </dl>
     </section>
-    <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-      <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-      <p class="mt-1 text-sm text-surface-700-300">
-        Copy or download recent connection and book download details. The log includes API routes,
-        HTTP statuses, and failure categories. It stays in memory until the app closes or you clear
-        it. Review it before sharing.
-      </p>
-      <div class="mt-3 grid grid-cols-2 gap-2">
-        <button
-          class="btn preset-tonal-surface"
-          type="button"
-          onclick={() => void copyDiagnostics()}
-        >
-          Copy diagnostics
-        </button>
-        <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
-          Download log
-        </button>
-      </div>
-      <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
-        {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-      </button>
-      {#if diagnosticsVisible}
-        <div class="mt-3 grid gap-2">
-          <p class="text-sm text-surface-700-300">
-            If copy or download is unavailable, select all text below, then copy it manually.
-          </p>
-          <textarea
-            id="turnleaf-diagnostics-output"
-            class="input min-h-48 w-full font-mono text-xs"
-            readonly
-            rows="10"
-            bind:value={diagnosticsOutput}
-            aria-label="Turnleaf diagnostics log"
-            onclick={selectDiagnostics}></textarea>
-          <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
-            Select all text
-          </button>
-        </div>
-      {/if}
-      <button
-        class="btn preset-tonal-surface mt-2 w-full"
-        type="button"
-        onclick={clearDiagnosticLog}
-      >
-        Clear diagnostics
-      </button>
-      {#if diagnosticsMessage}
-        <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-      {/if}
-    </section>
+    <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
   </DialogShell>
 {/if}
 

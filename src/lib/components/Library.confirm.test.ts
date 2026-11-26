@@ -69,6 +69,7 @@ import {
   type BookRecord,
   type ServerConfig,
 } from '../database/database';
+import { clearDiagnostics, getDiagnosticCount, recordDiagnostic } from '../diagnostics/log';
 import Library from './Library.svelte';
 
 class MemoryStorage implements Storage {
@@ -375,9 +376,24 @@ describe('Library destructive action confirmations', () => {
     const booksAfterRemoveAll = await getBooks(server.id);
     expect(booksAfterRemoveAll.every((book) => book.downloadPath === null)).toBe(true);
 
-    // Reopen Settings and test Delete server via ConfirmDialog
+    // Reopen Settings and test Delete server via ConfirmDialog alongside shared DiagnosticsPanel
+    await clearDiagnostics();
+    recordDiagnostic({
+      category: 'download',
+      endpoint: '/api/Download/chapter',
+      detail: 'network-error',
+    });
+    expect(getDiagnosticCount()).toBe(1);
+
     host.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
     await flushUi();
+    const settingsDialog = host.querySelector<HTMLElement>(
+      '[aria-labelledby="library-settings-title"]',
+    )!;
+    expect(
+      settingsDialog.querySelector('[aria-labelledby="library-settings-diagnostics-title"]'),
+    ).not.toBeNull();
+
     const deleteServerButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
       (button) => button.textContent?.trim() === 'Delete server',
     )!;
@@ -388,14 +404,26 @@ describe('Library destructive action confirmations', () => {
     const deleteServerDialog = host.querySelector<HTMLElement>('[role="alertdialog"]');
     expect(deleteServerDialog).not.toBeNull();
     expect(deleteServerDialog?.textContent).toContain('Delete this server?');
+    expect(settingsDialog.parentElement?.inert).toBe(true);
+    expect(deleteServerDialog!.parentElement?.inert).toBeFalsy();
+    expect(getDiagnosticCount()).toBe(1);
 
-    const confirmDeleteServer = Array.from(deleteServerDialog!.querySelectorAll('button')).find(
-      (button) => button.textContent?.trim() === 'Delete now',
-    )!;
+    // Cancelling Delete server preserves diagnostics and restores focus to Delete server
+    deleteServerDialog!.querySelector<HTMLButtonElement>('button')!.click();
+    await flushUi();
+    expect(getDiagnosticCount()).toBe(1);
+    expect(document.activeElement).toBe(deleteServerButton);
+
+    deleteServerButton.click();
+    await flushUi();
+    const confirmDeleteServer = Array.from(
+      host.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button'),
+    ).find((button) => button.textContent?.trim() === 'Delete now')!;
     confirmDeleteServer.click();
     await flushUi();
 
     expect(mockRemoveApiKey).toHaveBeenCalledWith(server.credentialRef);
+    expect(getDiagnosticCount()).toBe(0);
     expect(onServerDeleted).toHaveBeenCalledOnce();
   });
 

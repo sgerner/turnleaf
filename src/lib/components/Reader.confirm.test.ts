@@ -43,8 +43,8 @@ vi.mock('../reader/session', async (importOriginal) => {
 });
 
 import { getPreferences, resetLocalDatabase, setPreferences } from '../database/database';
-import { addAnnotation } from '../reader/annotations';
-import { renameBookmark, toggleBookmark } from '../reader/bookmarks';
+import { MAX_ANNOTATIONS, addAnnotation } from '../reader/annotations';
+import { MAX_BOOKMARKS, renameBookmark, toggleBookmark } from '../reader/bookmarks';
 import Reader from './Reader.svelte';
 
 class MemoryStorage implements Storage {
@@ -516,5 +516,151 @@ describe('Reader destructive action confirmations', () => {
     expect((document.activeElement as HTMLElement | null)?.getAttribute('data-reader-focus')).toBe(
       'annotations-heading',
     );
+  });
+
+  it('clears bookmark and highlight cap alerts only after confirming deletion and preserves unsaved selection drafts', async () => {
+    let onSelectionCallback: ((selection: ReaderSelection | null) => void) | undefined;
+    mockOpen.mockImplementation(
+      async (
+        _viewport: HTMLElement,
+        _cfi: string | null,
+        _xpath: string | null,
+        _percentage: number | null,
+        _appearance: unknown,
+        onRelocated: (loc: ReaderLocation, origin: 'restore') => void,
+        _onTap: unknown,
+        onSelection?: (selection: ReaderSelection | null) => void,
+      ) => {
+        onSelectionCallback = onSelection;
+        onRelocated(currentLoc, 'restore');
+      },
+    );
+
+    let fullBookmarks = toggleBookmark(
+      [],
+      { cfi: 'epubcfi(/6/2!/4/100)', href: 'chapter-1.xhtml', percentage: 0.1 },
+      '2026-01-01T00:00:00.000Z',
+    );
+    fullBookmarks = renameBookmark(fullBookmarks, fullBookmarks[0]!.id, 'Saved chapter marker');
+    for (let index = 2; index <= MAX_BOOKMARKS; index += 1) {
+      fullBookmarks = toggleBookmark(
+        fullBookmarks,
+        {
+          cfi: `epubcfi(/6/2!/4/${100 + index})`,
+          href: `chapter-${index}.xhtml`,
+          percentage: index / 300,
+        },
+        `2026-01-01T00:00:${String(index % 60).padStart(2, '0')}.000Z`,
+      );
+    }
+
+    let fullAnnotations: ReturnType<typeof addAnnotation> = [];
+    for (let index = 1; index <= MAX_ANNOTATIONS; index += 1) {
+      fullAnnotations = addAnnotation(
+        fullAnnotations,
+        `epubcfi(/6/2!/4/${300 + index})`,
+        `Saved highlight ${index}`,
+        index === 1 ? 'Saved note 1' : '',
+        `2026-01-01T00:01:${String(index % 60).padStart(2, '0')}.000Z`,
+      );
+    }
+
+    await setPreferences(
+      new Map([
+        [`readerBookmarks:${bookId}`, JSON.stringify(fullBookmarks)],
+        [`readerAnnotations:${bookId}`, JSON.stringify(fullAnnotations)],
+      ]),
+    );
+
+    mounted = mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'blob:book',
+        bookId,
+        title: 'Test Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await flushUi();
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Show reading controls"]')!.click();
+    await flushUi();
+    host.querySelector<HTMLButtonElement>('[aria-label="Marks, bookmarks and history"]')!.click();
+    await flushUi();
+
+    // Attempting to add a bookmark beyond MAX_BOOKMARKS displays the cap alert
+    const currentToggle = host.querySelector<HTMLButtonElement>(
+      '[data-reader-focus="bookmark-current"]',
+    )!;
+    currentToggle.click();
+    await flushUi();
+    expect(host.textContent).toContain(`You can save up to ${MAX_BOOKMARKS} bookmarks per book.`);
+
+    // Cancelling bookmark deletion keeps the cap alert; confirming clears it
+    const deleteCustomBookmark = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Delete Saved chapter marker"]',
+    )!;
+    deleteCustomBookmark.click();
+    await flushUi();
+    host.querySelector<HTMLButtonElement>('[role="alertdialog"] button')!.click();
+    await flushUi();
+    expect(host.textContent).toContain(`You can save up to ${MAX_BOOKMARKS} bookmarks per book.`);
+
+    deleteCustomBookmark.click();
+    await flushUi();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button'))
+      .find((button) => button.textContent?.trim() === 'Delete bookmark')!
+      .click();
+    await flushUi();
+    expect(host.textContent).not.toContain(
+      `You can save up to ${MAX_BOOKMARKS} bookmarks per book.`,
+    );
+
+    // Switch to Highlights and notes with an unsaved selection draft at MAX_ANNOTATIONS
+    onSelectionCallback?.({ cfi: 'epubcfi(/6/2!/4/999)', text: 'Overflow passage' });
+    await flushUi();
+    host
+      .querySelector<HTMLButtonElement>('[aria-label="Notes: highlights and annotations"]')!
+      .click();
+    await flushUi();
+
+    const annotationsPanel = host.querySelector<HTMLElement>('#reader-annotations')!;
+    const selectionNoteTextarea = annotationsPanel.querySelector<HTMLTextAreaElement>('textarea')!;
+    selectionNoteTextarea.value = 'Draft note to preserve';
+    selectionNoteTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+    await flushUi();
+
+    annotationsPanel
+      .querySelector<HTMLFormElement>('form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushUi();
+    expect(annotationsPanel.textContent).toContain(
+      `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
+    );
+
+    // Deleting an existing highlight keeps cap alert on cancel, clears cap alert on confirm, and preserves selectionNoteTextarea draft
+    const deleteFirstHighlight = annotationsPanel.querySelector<HTMLButtonElement>(
+      '[aria-label="Delete highlight Saved highlight 1"]',
+    )!;
+    deleteFirstHighlight.click();
+    await flushUi();
+    host.querySelector<HTMLButtonElement>('[role="alertdialog"] button')!.click();
+    await flushUi();
+    expect(annotationsPanel.textContent).toContain(
+      `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
+    );
+    expect(selectionNoteTextarea.value).toBe('Draft note to preserve');
+
+    deleteFirstHighlight.click();
+    await flushUi();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button'))
+      .find((button) => button.textContent?.trim() === 'Delete highlight')!
+      .click();
+    await flushUi();
+    expect(annotationsPanel.textContent).not.toContain(
+      `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
+    );
+    expect(selectionNoteTextarea.value).toBe('Draft note to preserve');
   });
 });
