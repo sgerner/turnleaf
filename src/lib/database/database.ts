@@ -394,9 +394,9 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
 
 export async function saveServer(config: ServerConfig): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    state.serverConfig = config;
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      state.serverConfig = config;
+    });
     return;
   }
   const db = await openDatabase();
@@ -424,56 +424,60 @@ export async function saveServer(config: ServerConfig): Promise<void> {
 
 export async function removeServer(serverId: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    const matchedServer = state.serverConfig?.id === serverId;
-    const hasServerBooks = state.books.some((book) => book.serverId === serverId);
-    const hasServerQueue = Object.values(state.syncQueue).some((row) => row.serverId === serverId);
-    const serverPrefix = `${serverId}:`;
-    const hasPrefixedRecords =
-      Object.keys(state.annotations).some((id) => id.startsWith(serverPrefix)) ||
-      Object.keys(state.bookmarks).some((id) => id.startsWith(serverPrefix)) ||
-      Object.keys(state.readingHistory).some((id) => id.startsWith(serverPrefix)) ||
-      Object.keys(state.readingState).some((id) => id.startsWith(serverPrefix));
-    if (!matchedServer && !hasServerBooks && !hasServerQueue && !hasPrefixedRecords) return;
+    updateBrowserState((state) => {
+      const matchedServer = state.serverConfig?.id === serverId;
+      const hasServerBooks = state.books.some((book) => book.serverId === serverId);
+      const hasServerQueue = Object.values(state.syncQueue).some(
+        (row) => row.serverId === serverId,
+      );
+      const serverPrefix = `${serverId}:`;
+      const hasPrefixedRecords =
+        Object.keys(state.annotations).some((id) => id.startsWith(serverPrefix)) ||
+        Object.keys(state.bookmarks).some((id) => id.startsWith(serverPrefix)) ||
+        Object.keys(state.readingHistory).some((id) => id.startsWith(serverPrefix)) ||
+        Object.keys(state.readingState).some((id) => id.startsWith(serverPrefix));
+      if (!matchedServer && !hasServerBooks && !hasServerQueue && !hasPrefixedRecords) {
+        return false;
+      }
 
-    if (matchedServer) {
-      state.serverConfig = null;
-    }
-    state.books = state.books.filter((book) => book.serverId !== serverId);
-    const remainingBookIds = new Set(state.books.map((book) => book.id));
-    for (const bookId of Object.keys(state.readingState)) {
-      if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
-        delete state.readingState[bookId];
+      if (matchedServer) {
+        state.serverConfig = null;
       }
-    }
-    for (const [bookId, row] of Object.entries(state.syncQueue)) {
-      if (
-        !remainingBookIds.has(bookId) ||
-        row.serverId === serverId ||
-        bookId.startsWith(serverPrefix)
-      ) {
-        delete state.syncQueue[bookId];
+      state.books = state.books.filter((book) => book.serverId !== serverId);
+      const remainingBookIds = new Set(state.books.map((book) => book.id));
+      for (const bookId of Object.keys(state.readingState)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.readingState[bookId];
+        }
       }
-    }
-    for (const bookId of Object.keys(state.annotations)) {
-      if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
-        delete state.annotations[bookId];
+      for (const [bookId, row] of Object.entries(state.syncQueue)) {
+        if (
+          !remainingBookIds.has(bookId) ||
+          row.serverId === serverId ||
+          bookId.startsWith(serverPrefix)
+        ) {
+          delete state.syncQueue[bookId];
+        }
       }
-    }
-    for (const bookId of Object.keys(state.bookmarks)) {
-      if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
-        delete state.bookmarks[bookId];
+      for (const bookId of Object.keys(state.annotations)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.annotations[bookId];
+        }
       }
-    }
-    for (const bookId of Object.keys(state.readingHistory)) {
-      if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
-        delete state.readingHistory[bookId];
+      for (const bookId of Object.keys(state.bookmarks)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.bookmarks[bookId];
+        }
       }
-    }
-    for (const key of Object.keys(state.preferences)) {
-      if (isLegacyStudyPreferenceKey(key)) delete state.preferences[key];
-    }
-    writeBrowserState(state);
+      for (const bookId of Object.keys(state.readingHistory)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.readingHistory[bookId];
+        }
+      }
+      for (const key of Object.keys(state.preferences)) {
+        if (isLegacyStudyPreferenceKey(key)) delete state.preferences[key];
+      }
+    });
     return;
   }
   const db = await openDatabase();
@@ -523,64 +527,66 @@ export async function reconcileBooks(
   const preserveMissing = options.preserveMissing === true;
   const snapshotStartedAt = options.snapshotStartedAt ?? null;
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    const unknownProgress = new Set(
-      books.filter((book) => book.remoteProgressKnown === false).map((book) => book.id),
-    );
-    const unknownReadDate = new Set(
-      books.filter((book) => book.remoteReadDateKnown === false).map((book) => book.id),
-    );
-    const incoming = new Map(
-      books.map((book) => [book.id, { ...withoutRemoteProgressMarkers(book), serverId }]),
-    );
-    const existing = state.books.filter((book) => book.serverId === serverId);
-    const existingById = new Map(existing.map((book) => [book.id, book]));
-    const unmatched = existing.filter((book) => !incoming.has(book.id));
-    const retained = preserveMissing
-      ? unmatched
-      : unmatched
-          .filter(
-            (book) =>
-              Boolean(book.downloadPath) ||
-              book.downloadStatus === 'available' ||
-              Boolean(state.syncQueue[book.id]) ||
-              Boolean(state.readingState[book.id]) ||
-              (state.annotations[book.id] ?? []).some(
-                (item) => item.syncState !== 'pending_delete',
-              ) ||
-              (state.bookmarks[book.id] ?? []).some((item) => item.syncState !== 'pending_delete'),
-          )
-          .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
-    const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
-    const merged = [...incoming.values()].map((book) => {
-      const previous = existingById.get(book.id);
-      if (!previous) return { ...book, remoteAvailable: true };
-      const reading = state.readingState[book.id];
-      const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
-      const changedDuringRefresh =
-        reading &&
-        (Date.parse(reading.localUpdatedAt) >= began ||
-          Date.parse(reading.serverUpdatedAt ?? '') >= began);
-      const preserveProgress = pending || changedDuringRefresh || unknownProgress.has(book.id);
-      const preserveReadDate = preserveProgress || unknownReadDate.has(book.id);
-      return {
-        ...withoutRemoteProgressMarkers(previous),
-        ...book,
-        serverId,
-        remoteAvailable: true,
-        downloadPath: previous.downloadPath,
-        downloadStatus: previous.downloadStatus,
-        fileSize: previous.fileSize,
-        pagesRead: preserveProgress ? previous.pagesRead : book.pagesRead,
-        lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
-      };
+    updateBrowserState((state) => {
+      const unknownProgress = new Set(
+        books.filter((book) => book.remoteProgressKnown === false).map((book) => book.id),
+      );
+      const unknownReadDate = new Set(
+        books.filter((book) => book.remoteReadDateKnown === false).map((book) => book.id),
+      );
+      const incoming = new Map(
+        books.map((book) => [book.id, { ...withoutRemoteProgressMarkers(book), serverId }]),
+      );
+      const existing = state.books.filter((book) => book.serverId === serverId);
+      const existingById = new Map(existing.map((book) => [book.id, book]));
+      const unmatched = existing.filter((book) => !incoming.has(book.id));
+      const retained = preserveMissing
+        ? unmatched
+        : unmatched
+            .filter(
+              (book) =>
+                Boolean(book.downloadPath) ||
+                book.downloadStatus === 'available' ||
+                Boolean(state.syncQueue[book.id]) ||
+                Boolean(state.readingState[book.id]) ||
+                (state.annotations[book.id] ?? []).some(
+                  (item) => item.syncState !== 'pending_delete',
+                ) ||
+                (state.bookmarks[book.id] ?? []).some(
+                  (item) => item.syncState !== 'pending_delete',
+                ),
+            )
+            .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
+      const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
+      const merged = [...incoming.values()].map((book) => {
+        const previous = existingById.get(book.id);
+        if (!previous) return { ...book, remoteAvailable: true };
+        const reading = state.readingState[book.id];
+        const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
+        const changedDuringRefresh =
+          reading &&
+          (Date.parse(reading.localUpdatedAt) >= began ||
+            Date.parse(reading.serverUpdatedAt ?? '') >= began);
+        const preserveProgress = pending || changedDuringRefresh || unknownProgress.has(book.id);
+        const preserveReadDate = preserveProgress || unknownReadDate.has(book.id);
+        return {
+          ...withoutRemoteProgressMarkers(previous),
+          ...book,
+          serverId,
+          remoteAvailable: true,
+          downloadPath: previous.downloadPath,
+          downloadStatus: previous.downloadStatus,
+          fileSize: previous.fileSize,
+          pagesRead: preserveProgress ? previous.pagesRead : book.pagesRead,
+          lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
+        };
+      });
+      state.books = [
+        ...state.books.filter((book) => book.serverId !== serverId),
+        ...merged,
+        ...retained,
+      ];
     });
-    state.books = [
-      ...state.books.filter((book) => book.serverId !== serverId),
-      ...merged,
-      ...retained,
-    ];
-    writeBrowserState(state);
     return;
   }
   await reconcileBooksInTransaction(
@@ -752,23 +758,30 @@ export async function getBooks(
   }));
 }
 
-export async function markDownloaded(bookId: string, path: string, size: number): Promise<void> {
+async function updateBookDownloadState(
+  bookId: string,
+  downloadPath: string | null,
+  downloadStatus: string,
+  fileSize: number | null,
+): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    state.books = state.books.map((book) =>
-      book.id === bookId
-        ? { ...book, downloadPath: path, downloadStatus: 'available', fileSize: size }
-        : book,
-    );
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      state.books = state.books.map((book) =>
+        book.id === bookId ? { ...book, downloadPath, downloadStatus, fileSize } : book,
+      );
+    });
     return;
   }
   const db = await openDatabase();
   await executeNativeRun(
     db,
-    "UPDATE books SET download_path=?, download_status='available', file_size=? WHERE id=?",
-    [path, size, bookId],
+    'UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?',
+    [downloadPath, downloadStatus, fileSize, bookId],
   );
+}
+
+export async function markDownloaded(bookId: string, path: string, size: number): Promise<void> {
+  await updateBookDownloadState(bookId, path, 'available', size);
 }
 
 export interface StoredReadingState {
@@ -858,6 +871,17 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
   };
 }
 
+function updateBrowserBookProgress(
+  state: BrowserDatabaseState,
+  bookId: string,
+  pagesRead: number,
+  lastReadAt: string,
+): void {
+  state.books = state.books.map((item) =>
+    item.id === bookId ? { ...item, pagesRead, lastReadAt } : item,
+  );
+}
+
 export async function saveLocalProgress(
   book: BookRecord,
   cfi: string,
@@ -902,15 +926,7 @@ export async function saveLocalProgress(
         updatedAt: now,
         revision: syncRevision,
       };
-      state.books = state.books.map((item) =>
-        item.id === book.id
-          ? {
-              ...item,
-              pagesRead,
-              lastReadAt: now,
-            }
-          : item,
-      );
+      updateBrowserBookProgress(state, book.id, pagesRead, now);
     });
     return;
   }
@@ -950,15 +966,7 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
           Number(state.readingState[book.id]?.syncRevision ?? 0),
           Number(state.syncQueue[book.id]?.revision ?? 0),
         ) + 1;
-      state.books = state.books.map((item) =>
-        item.id === book.id
-          ? {
-              ...item,
-              pagesRead: book.pages,
-              lastReadAt: now,
-            }
-          : item,
-      );
+      updateBrowserBookProgress(state, book.id, book.pages, now);
       state.readingState[book.id] = {
         cfi: '',
         xpath: null,
@@ -1082,6 +1090,18 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
   });
 }
 
+function summarizeSyncRows(
+  rows: ReadonlyArray<{ updatedAt: string | null; lastError: string | null }>,
+): SyncStatus {
+  const firstFailed = rows.find((row) => Boolean(row.lastError));
+  return {
+    pendingCount: rows.length,
+    failedCount: rows.filter((row) => Boolean(row.lastError)).length,
+    lastError: firstFailed?.lastError ?? null,
+    lastUpdatedAt: rows[0]?.updatedAt ?? null,
+  };
+}
+
 export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
@@ -1093,28 +1113,23 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
     const entries: Array<{ updatedAt: string; lastError: string | null }> = [
       ...getBrowserSyncRows(state, serverId).map(({ row }) => ({
         updatedAt: row.updatedAt,
-        lastError: row.lastError,
+        lastError: row.lastError || null,
       })),
     ];
     for (const bookId of activeBookIds) {
       for (const item of state.annotations[bookId] ?? []) {
         if (item.syncState !== 'synced') {
-          entries.push({ updatedAt: item.updatedAt, lastError: item.lastError });
+          entries.push({ updatedAt: item.updatedAt, lastError: item.lastError || null });
         }
       }
       for (const item of state.bookmarks[bookId] ?? []) {
         if (item.syncState !== 'synced') {
-          entries.push({ updatedAt: item.updatedAt, lastError: item.lastError });
+          entries.push({ updatedAt: item.updatedAt, lastError: item.lastError || null });
         }
       }
     }
     entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return {
-      pendingCount: entries.length,
-      failedCount: entries.filter((row) => Boolean(row.lastError)).length,
-      lastError: entries.find((row) => row.lastError)?.lastError ?? null,
-      lastUpdatedAt: entries[0]?.updatedAt ?? null,
-    };
+    return summarizeSyncRows(entries);
   }
   const db = await openDatabase();
   const result = await db.query(
@@ -1133,15 +1148,59 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
     ) ORDER BY updated_at DESC`,
     [serverId, serverId, serverId],
   );
-  const rows = result.values ?? [];
+  return summarizeSyncRows(
+    (result.values ?? []).map((row) => ({
+      updatedAt: row.updated_at ? String(row.updated_at) : null,
+      lastError: row.last_error ? String(row.last_error) : null,
+    })),
+  );
+}
+
+interface NormalizedRemoteProgress {
+  now: string;
+  serverUpdatedAt: string;
+  pagesRead: number;
+  percentage: number;
+  xpath: string | null;
+  readingState: StoredReadingState;
+}
+
+function normalizeRemoteProgress(
+  book: BookRecord,
+  remote: KavitaProgress,
+  syncRevision: number,
+): NormalizedRemoteProgress {
+  const now = new Date().toISOString();
+  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
+  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+  const percentage = book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0;
+  const xpath = remote.bookScrollId ?? null;
   return {
-    pendingCount: rows.length,
-    failedCount: rows.filter((row) => row.last_error).length,
-    lastError: rows.find((row) => row.last_error)?.last_error
-      ? String(rows.find((row) => row.last_error)?.last_error)
-      : null,
-    lastUpdatedAt: rows[0]?.updated_at ? String(rows[0].updated_at) : null,
+    now,
+    serverUpdatedAt,
+    pagesRead,
+    percentage,
+    xpath,
+    readingState: {
+      cfi: '',
+      xpath,
+      percentage,
+      localUpdatedAt: now,
+      syncedLocalUpdatedAt: now,
+      serverUpdatedAt,
+      pendingSync: false,
+      syncRevision,
+    },
   };
+}
+
+function applyBrowserRemoteProgress(
+  state: BrowserDatabaseState,
+  bookId: string,
+  normalized: NormalizedRemoteProgress,
+): void {
+  state.readingState[bookId] = normalized.readingState;
+  updateBrowserBookProgress(state, bookId, normalized.pagesRead, normalized.serverUpdatedAt);
 }
 
 export async function saveRemoteProgress(
@@ -1149,19 +1208,7 @@ export async function saveRemoteProgress(
   remote: KavitaProgress,
   expected: StoredReadingState | null,
 ): Promise<boolean> {
-  const now = new Date().toISOString();
-  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-  const next: StoredReadingState = {
-    cfi: '',
-    xpath: remote.bookScrollId ?? null,
-    percentage: book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0,
-    localUpdatedAt: now,
-    syncedLocalUpdatedAt: now,
-    serverUpdatedAt,
-    pendingSync: false,
-    syncRevision: (expected?.syncRevision ?? 0) + 1,
-  };
+  const normalized = normalizeRemoteProgress(book, remote, (expected?.syncRevision ?? 0) + 1);
   const matches = (current: StoredReadingState | null) =>
     !expected?.pendingSync &&
     !current?.pendingSync &&
@@ -1176,10 +1223,7 @@ export async function saveRemoteProgress(
         !matches(state.readingState[book.id] ?? null)
       )
         return false;
-      state.readingState[book.id] = next;
-      state.books = state.books.map((item) =>
-        item.id === book.id ? { ...item, pagesRead, lastReadAt: serverUpdatedAt } : item,
-      );
+      applyBrowserRemoteProgress(state, book.id, normalized);
     });
   }
 
@@ -1200,19 +1244,19 @@ export async function saveRemoteProgress(
           server_updated_at=excluded.server_updated_at,pending_sync=0,sync_revision=excluded.sync_revision`,
         values: [
           book.id,
-          next.xpath,
-          next.percentage,
-          now,
-          now,
+          normalized.xpath,
+          normalized.percentage,
+          normalized.now,
+          normalized.now,
           remote.pageNum,
-          next.xpath,
-          serverUpdatedAt,
-          next.syncRevision,
+          normalized.xpath,
+          normalized.serverUpdatedAt,
+          normalized.readingState.syncRevision,
         ],
       },
       {
         statement: 'UPDATE books SET pages_read=?,last_read_at=? WHERE id=?',
-        values: [pagesRead, serverUpdatedAt, book.id],
+        values: [normalized.pagesRead, normalized.serverUpdatedAt, book.id],
       },
     ]);
     return true;
@@ -1229,11 +1273,7 @@ export async function acceptRemoteProgress(
   expectedRevision: number,
   expectedUpdatedAt: string,
 ): Promise<boolean> {
-  const now = new Date().toISOString();
-  const serverUpdatedAt = remote.lastModifiedUtc ?? now;
-  const percentage = book.pages > 0 ? Math.max(0, Math.min(0.999, remote.pageNum / book.pages)) : 0;
-  const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-  const xpath = remote.bookScrollId ?? null;
+  const normalized = normalizeRemoteProgress(book, remote, expectedRevision);
 
   if (!Capacitor.isNativePlatform()) {
     return updateBrowserState((state) => {
@@ -1250,21 +1290,8 @@ export async function acceptRemoteProgress(
       ) {
         return false;
       }
-      state.readingState[book.id] = {
-        ...reading,
-        cfi: '',
-        xpath,
-        percentage,
-        localUpdatedAt: now,
-        syncedLocalUpdatedAt: now,
-        serverUpdatedAt,
-        pendingSync: false,
-        syncRevision: expectedRevision,
-      };
       delete state.syncQueue[book.id];
-      state.books = state.books.map((item) =>
-        item.id === book.id ? { ...item, pagesRead, lastReadAt: serverUpdatedAt } : item,
-      );
+      applyBrowserRemoteProgress(state, book.id, normalized);
     });
   }
 
@@ -1276,13 +1303,13 @@ export async function acceptRemoteProgress(
         WHERE book_id=? AND pending_sync=1 AND local_updated_at=? AND sync_revision=?
         AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?)`,
       values: [
-        xpath,
-        percentage,
-        now,
-        now,
+        normalized.xpath,
+        normalized.percentage,
+        normalized.now,
+        normalized.now,
         remote.pageNum,
-        xpath,
-        serverUpdatedAt,
+        normalized.xpath,
+        normalized.serverUpdatedAt,
         book.id,
         expectedUpdatedAt,
         expectedRevision,
@@ -1295,7 +1322,7 @@ export async function acceptRemoteProgress(
       statement: `DELETE FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?
         AND EXISTS (SELECT 1 FROM reading_state WHERE book_id=? AND pending_sync=0
           AND cfi='' AND local_updated_at=?)`,
-      values: [book.id, expectedRevision, expectedUpdatedAt, book.id, now],
+      values: [book.id, expectedRevision, expectedUpdatedAt, book.id, normalized.now],
     },
     {
       statement: `UPDATE books SET pages_read=?,last_read_at=?
@@ -1303,7 +1330,7 @@ export async function acceptRemoteProgress(
           SELECT 1 FROM reading_state WHERE book_id=? AND cfi=''
           AND local_updated_at=? AND pending_sync=0
         )`,
-      values: [pagesRead, serverUpdatedAt, book.id, book.id, now],
+      values: [normalized.pagesRead, normalized.serverUpdatedAt, book.id, book.id, normalized.now],
     },
   ]);
 
@@ -1316,9 +1343,9 @@ export async function acceptRemoteProgress(
   return Boolean(
     adopted &&
     String(adopted.cfi) === '' &&
-    String(adopted.local_updated_at) === now &&
+    String(adopted.local_updated_at) === normalized.now &&
     Number(adopted.pending_sync) === 0 &&
-    String(adopted.server_updated_at) === serverUpdatedAt,
+    String(adopted.server_updated_at) === normalized.serverUpdatedAt,
   );
 }
 
@@ -1398,22 +1425,7 @@ export async function markSyncFailure(
 }
 
 export async function removeDownload(bookId: string): Promise<void> {
-  if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    state.books = state.books.map((book) =>
-      book.id === bookId
-        ? { ...book, downloadPath: null, downloadStatus: 'none', fileSize: null }
-        : book,
-    );
-    writeBrowserState(state);
-    return;
-  }
-  const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    "UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id=?",
-    [bookId],
-  );
+  await updateBookDownloadState(bookId, null, 'none', null);
 }
 
 export async function getPreferences(keys: readonly string[]): Promise<Map<string, string>> {
@@ -1442,9 +1454,9 @@ export async function setPreference(key: string, value: string): Promise<void> {
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
-    const state = readBrowserState();
-    for (const [key, value] of preferences) state.preferences[key] = value;
-    writeBrowserState(state);
+    updateBrowserState((state) => {
+      for (const [key, value] of preferences) state.preferences[key] = value;
+    });
     return;
   }
   const db = await openDatabase();
