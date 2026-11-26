@@ -6,51 +6,85 @@ import {
 } from '../database/database';
 import type { KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
+import {
+  clearUnconfirmedUploads,
+  deleteUnconfirmedUpload,
+  getUnconfirmedUpload,
+  recordUnconfirmedUpload,
+  UNCONFIRMED_SYNC_DIRECTORY,
+  UNCONFIRMED_SYNC_FILE_PATH,
+  UNCONFIRMED_SYNC_STORAGE_KEY,
+} from './unconfirmed-uploads';
+
+export {
+  clearUnconfirmedUploads,
+  UNCONFIRMED_SYNC_DIRECTORY,
+  UNCONFIRMED_SYNC_FILE_PATH,
+  UNCONFIRMED_SYNC_STORAGE_KEY,
+};
 
 interface ActiveFlush {
   client: KavitaClient;
   controller: AbortController;
-  promise: Promise<void>;
-}
-
-interface UnconfirmedUpload {
-  revision: number;
-  updatedAt: string;
-  payload: string;
-  serverUpdatedAt: string;
+  outcome: Promise<void>;
+  settlement: Promise<void>;
+  subscribers: Set<symbol>;
 }
 
 const flushing = new Map<string, ActiveFlush>();
-const unconfirmedUploads = new Map<string, UnconfirmedUpload>();
 
-function unconfirmedKeyFor(serverId: string, bookId: string): string {
-  return `${serverId}\0${bookId}`;
-}
-
-function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) {
-    promise.catch(() => {});
-    return Promise.reject(new DOMException('Aborted', 'AbortError'));
+function attachCaller(entry: ActiveFlush, signal?: AbortSignal): Promise<void> {
+  const subscriber = Symbol('flush-caller');
+  entry.subscribers.add(subscriber);
+  if (!signal) {
+    return entry.outcome.finally(() => {
+      entry.subscribers.delete(subscriber);
+    });
   }
-  return new Promise<T>((resolve, reject) => {
+  if (signal.aborted) {
+    entry.subscribers.delete(subscriber);
+    if (entry.subscribers.size === 0) entry.controller.abort();
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
     const onAbort = () => {
-      promise.catch(() => {});
-      reject(new DOMException('Aborted', 'AbortError'));
+      if (settled) return;
+      settled = true;
+      entry.subscribers.delete(subscriber);
+      // Caller-local cancellation: only abort the shared transport controller
+      // when no other caller is still awaiting this flush.
+      if (entry.subscribers.size === 0) {
+        entry.controller.abort();
+      }
+      resolve();
     };
     signal.addEventListener('abort', onAbort, { once: true });
-    promise.then(
-      (value) => {
+    entry.outcome.then(
+      () => {
         signal.removeEventListener('abort', onAbort);
-        resolve(value);
+        entry.subscribers.delete(subscriber);
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
       },
       (error: unknown) => {
         signal.removeEventListener('abort', onAbort);
-        reject(error);
+        entry.subscribers.delete(subscriber);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
       },
     );
   });
 }
 
+/**
+ * Explicitly cancel the shared progress flush for `serverId` (or all servers),
+ * such as on network disconnect, credential replacement, or Library teardown.
+ */
 export function cancelProgressFlush(serverId?: string): void {
   if (serverId !== undefined) {
     flushing.get(serverId)?.controller.abort();
@@ -61,6 +95,20 @@ export function cancelProgressFlush(serverId?: string): void {
   }
 }
 
+/**
+ * Flush queued reading progress for `serverId`.
+ *
+ * Cancellation and recovery policy:
+ * - Passing `signal` provides caller-local cancellation: aborting `signal`
+ *   resolves that caller's returned promise immediately, and only aborts the
+ *   underlying flush if no other callers remain subscribed to the shared run.
+ * - `cancelProgressFlush` or supplying a new `KavitaClient` instance explicitly
+ *   aborts the shared run, while keeping replacement uploads serialized behind
+ *   the real transport settlement of any in-flight request.
+ * - Server-accepted uploads are journaled to app-private storage before SQLite
+ *   confirmation so a retry after `SQLITE_BUSY` or an app restart confirms
+ *   locally without sending a duplicate `saveProgress` POST.
+ */
 export function flushProgress(
   client: KavitaClient,
   serverId: string,
@@ -69,36 +117,37 @@ export function flushProgress(
   if (signal?.aborted) return Promise.resolve();
   const existing = flushing.get(serverId);
   if (existing && existing.client === client && !existing.controller.signal.aborted) {
-    if (signal) {
-      const onAbort = () => existing.controller.abort();
-      signal.addEventListener('abort', onAbort, { once: true });
-      void existing.promise.finally(() => signal.removeEventListener('abort', onAbort));
-    }
-    return existing.promise;
+    return attachCaller(existing, signal);
   }
   existing?.controller.abort();
   const controller = new AbortController();
-  const onCallerAbort = () => controller.abort();
-  signal?.addEventListener('abort', onCallerAbort, { once: true });
+  const subscribers = new Set<symbol>();
 
   const entry: ActiveFlush = {
     client,
     controller,
-    promise: Promise.resolve(),
+    outcome: Promise.resolve(),
+    settlement: Promise.resolve(),
+    subscribers,
   };
-  const current = (async () => {
+  const outcome = (async () => {
     if (existing) {
-      await existing.promise.catch(() => {});
+      await existing.settlement;
     }
     if (controller.signal.aborted) return;
     await run(client, serverId, controller.signal);
-  })().finally(() => {
-    signal?.removeEventListener('abort', onCallerAbort);
+  })();
+  const settlement = outcome.then(
+    () => undefined,
+    () => undefined,
+  );
+  void settlement.finally(() => {
     if (flushing.get(serverId) === entry) flushing.delete(serverId);
   });
-  entry.promise = current;
+  entry.outcome = outcome;
+  entry.settlement = settlement;
   flushing.set(serverId, entry);
-  return current;
+  return attachCaller(entry, signal);
 }
 
 async function run(client: KavitaClient, serverId: string, signal: AbortSignal): Promise<void> {
@@ -113,25 +162,26 @@ async function run(client: KavitaClient, serverId: string, signal: AbortSignal):
     for (const item of pending) {
       if (signal.aborted) break;
       attempted.set(item.bookId, item);
-      const unconfirmedKey = unconfirmedKeyFor(serverId, item.bookId);
-      const cached = unconfirmedUploads.get(unconfirmedKey);
+      const cached = await getUnconfirmedUpload(serverId, item.bookId);
       const hasMatchingUpload =
         cached !== undefined &&
         cached.revision === item.revision &&
         cached.updatedAt === item.updatedAt &&
         cached.payload === item.payload;
       if (cached && !hasMatchingUpload) {
-        unconfirmedUploads.delete(unconfirmedKey);
+        await deleteUnconfirmedUpload(serverId, item.bookId);
       }
 
       let serverUpdatedAt = hasMatchingUpload ? cached.serverUpdatedAt : undefined;
       if (!serverUpdatedAt) {
         try {
           const payload = JSON.parse(item.payload) as KavitaProgress;
-          await awaitWithAbort(client.saveProgress(payload, signal), signal);
-          if (signal.aborted) break;
+          await client.saveProgress(payload, signal);
+          // Even if `signal` aborted while a non-cancellable native POST was in
+          // flight, resolving here means Kavita accepted the write: persist and
+          // confirm this item before exiting on the next loop check.
           serverUpdatedAt = new Date().toISOString();
-          unconfirmedUploads.set(unconfirmedKey, {
+          await recordUnconfirmedUpload(serverId, item.bookId, {
             revision: item.revision,
             updatedAt: item.updatedAt,
             payload: item.payload,
@@ -156,11 +206,12 @@ async function run(client: KavitaClient, serverId: string, signal: AbortSignal):
 
       try {
         await confirmSync(item.bookId, serverUpdatedAt, item.revision, item.updatedAt);
-        unconfirmedUploads.delete(unconfirmedKey);
+        await deleteUnconfirmedUpload(serverId, item.bookId);
         failures.delete(item.bookId);
       } catch (confirmError) {
         failures.set(item.bookId, confirmError);
       }
+      if (signal.aborted) break;
     }
   }
   if (signal.aborted) return;

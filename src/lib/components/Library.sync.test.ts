@@ -87,11 +87,10 @@ vi.mock('../downloads/native-download', () => ({
   EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
   EpubTransferError: class extends Error {
     constructor(
-      message: string,
-      readonly status?: number,
-      readonly connectionFailed = false,
+      readonly status: number | undefined,
+      readonly connectionFailed: boolean,
     ) {
-      super(message);
+      super('The EPUB transfer failed.');
     }
   },
   cacheCover: vi.fn(),

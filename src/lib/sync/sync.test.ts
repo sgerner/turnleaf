@@ -420,3 +420,186 @@ it('continues syncing remaining books when markSyncFailure throws SQLITE_BUSY', 
   expect(saved.syncQueue['book-2']).toBeUndefined();
   expect(saved.readingState['book-2']?.pendingSync).toBe(false);
 });
+
+it('uses caller-local cancellation when two callers share a flush and only one aborts', async () => {
+  // Case 1: joining caller aborts while initiating caller continues awaiting.
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T05:00:00.000Z', '{"pageNum":12}')),
+  );
+
+  let uploadSignal1: AbortSignal | undefined;
+  let resolveUpload1!: () => void;
+  let startedUpload1!: () => void;
+  const uploadStarted1 = new Promise<void>((resolve) => {
+    startedUpload1 = resolve;
+  });
+  const saveProgress1 = vi.fn((_payload: unknown, signal?: AbortSignal) => {
+    uploadSignal1 = signal;
+    startedUpload1();
+    return new Promise<void>((resolve, reject) => {
+      resolveUpload1 = resolve;
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+  const sharedClient1 = { saveProgress: saveProgress1 } as never;
+
+  const callerA = new AbortController();
+  const callerB = new AbortController();
+  const flushA = flushProgress(sharedClient1, 'server', callerA.signal);
+  const flushB = flushProgress(sharedClient1, 'server', callerB.signal);
+  await uploadStarted1;
+
+  callerB.abort();
+  await expect(flushB).resolves.toBeUndefined();
+  expect(uploadSignal1?.aborted).toBe(false);
+
+  resolveUpload1();
+  await expect(flushA).resolves.toBeUndefined();
+
+  const afterJoinerAbort = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(afterJoinerAbort.syncQueue['book-1']).toBeUndefined();
+  expect(afterJoinerAbort.readingState['book-1']?.pendingSync).toBe(false);
+
+  // Case 2: initiating caller aborts while joining caller continues awaiting.
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T05:05:00.000Z', '{"pageNum":15}')),
+  );
+
+  let uploadSignal2: AbortSignal | undefined;
+  let resolveUpload2!: () => void;
+  let startedUpload2!: () => void;
+  const uploadStarted2 = new Promise<void>((resolve) => {
+    startedUpload2 = resolve;
+  });
+  const saveProgress2 = vi.fn((_payload: unknown, signal?: AbortSignal) => {
+    uploadSignal2 = signal;
+    startedUpload2();
+    return new Promise<void>((resolve, reject) => {
+      resolveUpload2 = resolve;
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+  const sharedClient2 = { saveProgress: saveProgress2 } as never;
+
+  const initiator = new AbortController();
+  const joiner = new AbortController();
+  const initiatorFlush = flushProgress(sharedClient2, 'server', initiator.signal);
+  const joinerFlush = flushProgress(sharedClient2, 'server', joiner.signal);
+  await uploadStarted2;
+
+  initiator.abort();
+  await expect(initiatorFlush).resolves.toBeUndefined();
+  expect(uploadSignal2?.aborted).toBe(false);
+
+  resolveUpload2();
+  await expect(joinerFlush).resolves.toBeUndefined();
+
+  const afterInitiatorAbort = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(afterInitiatorAbort.syncQueue['book-1']).toBeUndefined();
+  expect(afterInitiatorAbort.readingState['book-1']?.pendingSync).toBe(false);
+
+  // Case 3: when every subscribed caller aborts, the underlying upload controller aborts.
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T05:10:00.000Z', '{"pageNum":18}')),
+  );
+  let uploadSignal3: AbortSignal | undefined;
+  let startedUpload3!: () => void;
+  const uploadStarted3 = new Promise<void>((resolve) => {
+    startedUpload3 = resolve;
+  });
+  const saveProgress3 = vi.fn((_payload: unknown, signal?: AbortSignal) => {
+    uploadSignal3 = signal;
+    startedUpload3();
+    return new Promise<void>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+  });
+  const sharedClient3 = { saveProgress: saveProgress3 } as never;
+  const c1 = new AbortController();
+  const c2 = new AbortController();
+  const f1 = flushProgress(sharedClient3, 'server', c1.signal);
+  const f2 = flushProgress(sharedClient3, 'server', c2.signal);
+  await uploadStarted3;
+  c1.abort();
+  expect(uploadSignal3?.aborted).toBe(false);
+  c2.abort();
+  expect(uploadSignal3?.aborted).toBe(true);
+  await Promise.all([f1, f2]);
+});
+
+it('suppresses duplicate uploads after an app restart when confirmSync previously failed', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T06:00:00.000Z', '{"pageNum":22}')),
+  );
+
+  vi.spyOn(database, 'confirmSync').mockRejectedValueOnce(
+    new Error('SQLITE_BUSY: database is locked'),
+  );
+  const saveProgressBeforeRestart = vi.fn().mockResolvedValue(undefined);
+
+  await expect(
+    flushProgress({ saveProgress: saveProgressBeforeRestart } as never, 'server'),
+  ).rejects.toThrow('1 reading progress item failed to sync.');
+  expect(saveProgressBeforeRestart).toHaveBeenCalledOnce();
+  expect(localStorage.getItem('turnleaf_unconfirmed_sync_v1')).not.toBeNull();
+
+  // Simulate full app restart: reload modules while retaining persistent storage.
+  vi.restoreAllMocks();
+  vi.resetModules();
+  const restartedSync = await import('./sync');
+  const saveProgressAfterRestart = vi.fn().mockResolvedValue(undefined);
+
+  await expect(
+    restartedSync.flushProgress({ saveProgress: saveProgressAfterRestart } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(saveProgressAfterRestart).not.toHaveBeenCalled();
+  expect(localStorage.getItem('turnleaf_unconfirmed_sync_v1')).toBeNull();
+
+  const confirmed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(confirmed.syncQueue['book-1']).toBeUndefined();
+  expect(confirmed.readingState['book-1']?.pendingSync).toBe(false);
+
+  // If newer local progress is saved after an unconfirmed upload before restart, the newer revision uploads.
+  const restartedDb = await import('../database/database');
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T06:05:00.000Z', '{"pageNum":24}', 1)),
+  );
+  vi.spyOn(restartedDb, 'confirmSync').mockRejectedValueOnce(
+    new Error('SQLITE_BUSY: database is locked'),
+  );
+  const firstAttempt = vi.fn().mockResolvedValue(undefined);
+  await expect(
+    restartedSync.flushProgress({ saveProgress: firstAttempt } as never, 'server'),
+  ).rejects.toThrow('1 reading progress item failed to sync.');
+  vi.restoreAllMocks();
+
+  await restartedDb.saveLocalProgress(book, 'cfi-newer', 'xpath-newer', 0.35);
+  vi.resetModules();
+  const thirdSync = await import('./sync');
+  const uploadNewer = vi.fn().mockResolvedValue(undefined);
+  await expect(
+    thirdSync.flushProgress({ saveProgress: uploadNewer } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(uploadNewer).toHaveBeenCalledOnce();
+  expect(uploadNewer).toHaveBeenCalledWith(
+    expect.objectContaining({ pageNum: 35, bookScrollId: 'xpath-newer' }),
+    expect.any(AbortSignal),
+  );
+});
