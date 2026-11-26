@@ -152,6 +152,7 @@ it('preserves RFC 2045 wrapped data:image and data:font assets while rejecting S
       </head>
       <body>
         <p id="unchanged" style="font-style: italic">Hello</p>
+        <a id="forged-tabindex" href="#note" tabindex="-1" data-turnleaf-tabindex="0">Note</a>
         <img id="rfc2045-image" src="${xmlWrappedPng}" />
         <img id="svg-base64" src="data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9ImFsZXJ0KDEpIi8+" />
         <img id="svg-utf8" src="data:image/svg+xml,&lt;svg onload=alert(1)/&gt;" />
@@ -166,6 +167,9 @@ it('preserves RFC 2045 wrapped data:image and data:font assets while rejecting S
   await sanitizeEpubDocument(document);
 
   expect(document.documentElement.getAttribute('data-turnleaf-sanitized')).toBeNull();
+  expect(
+    document.querySelector('#forged-tabindex')?.getAttribute('data-turnleaf-tabindex'),
+  ).toBeNull();
   expect(setAttributeSpy).not.toHaveBeenCalled();
   expect(document.querySelector('#rfc2045-image')?.getAttribute('src')).toBe(wrappedPng);
   expect(document.querySelector('#svg-base64')?.getAttribute('src')).toBeNull();

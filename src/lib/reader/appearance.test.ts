@@ -30,6 +30,13 @@ describe('appearance serialization', () => {
     expect(parseAppearance('{"keepAwake":true}').keepAwake).toBe(true);
   });
 
+  it('defaults publisher styles on while preserving an explicit opt-out', () => {
+    expect(defaultAppearance.publisherStyles).toBe(true);
+    expect(parseAppearance('{}').publisherStyles).toBe(true);
+    expect(parseAppearance('{"publisherStyles":true}').publisherStyles).toBe(true);
+    expect(parseAppearance('{"publisherStyles":false}').publisherStyles).toBe(false);
+  });
+
   it('defaults volume buttons off while preserving an explicit opt-in', () => {
     expect(defaultAppearance.volumeButtons).toBe(false);
     expect(parseAppearance('{}').volumeButtons).toBe(false);
