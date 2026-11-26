@@ -1510,4 +1510,75 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
 
     session.destroy();
   });
+
+  it('expands active views and defers concurrent viewport resizes during publisherStyles appearance reflow', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const targetCfi = 'epubcfi(/6/2!/4/2/14:0)';
+    const harness = createSimulatedEpubHarness([
+      {
+        href: 'chapter-1.xhtml',
+        index: 0,
+        html: '<html xmlns="http://www.w3.org/1999/xhtml"><head></head><body><p>Publisher formatted chapter</p></body></html>',
+        pagesAt16: 3,
+        pagesAt18: 7,
+        pagesAt34: 15,
+        cfiTargets: {
+          [targetCfi]: { unthemedPage: 3, pageAt18: 6, pageAt34: 13 },
+        },
+      },
+    ]);
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(
+      () => new DOMRect(0, 0, 411, 842),
+    );
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, targetCfi, null, null, defaultAppearance, onLocation, vi.fn());
+
+    const activeView = harness.activeViews[0]!;
+    activeView.contents!.resizeCheck.mockClear();
+    activeView.expand.mockClear();
+    harness.rendition.resize.mockClear();
+    onLocation.mockClear();
+
+    const reflowGate = createDeferred<void>();
+    const baseDisplay = harness.rendition.display.getMockImplementation()!;
+    harness.rendition.display.mockImplementationOnce(async (target?: string) => {
+      await reflowGate.promise;
+      return baseDisplay(target);
+    });
+
+    session.applyAppearance({ ...defaultAppearance, publisherStyles: false });
+
+    expect(activeView.contents!.resizeCheck).toHaveBeenCalledOnce();
+    expect(activeView.expand).toHaveBeenCalledOnce();
+    expect(harness.rendition.display).toHaveBeenCalledWith(targetCfi);
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 411, height: 900 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(harness.rendition.resize).not.toHaveBeenCalled();
+
+    reflowGate.resolve();
+    await vi.waitFor(() => expect(onLocation).toHaveBeenCalledOnce());
+    expect(onLocation).toHaveBeenCalledWith(
+      expect.objectContaining({ cfi: targetCfi, pageIndex: 5, pageCount: 7 }),
+      'restore',
+    );
+    expect(harness.rendition.resize).toHaveBeenCalledExactlyOnceWith(411, 900);
+
+    session.destroy();
+  });
 });
