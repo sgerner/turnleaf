@@ -4,6 +4,8 @@
 
 - fix(android): prevent offline journey relocation, resize, and request races
 - fix(reader): coordinate startup viewport resizes on Android
+- ci: pin AVD cache actions and retain Gradle cache
+- ci: cache Android AVD snapshots and prune unused Gradle cache
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
