@@ -271,7 +271,10 @@ vi.mock('../reader/session', () => ({
 
     updateHighlights() {}
     applyAppearance() {}
-    clearSelection() {}
+    getVisiblePassages() {
+      return [];
+    }
+    clearTextSelection() {}
 
     async next() {
       runtime.relocateCallback?.(
