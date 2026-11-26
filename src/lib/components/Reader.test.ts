@@ -2,6 +2,7 @@
 
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as SessionModule from '../reader/session';
 import type {
   ReaderLinkReturnTarget,
   ReaderLocation,
@@ -54,7 +55,9 @@ vi.mock('../database/database', () => ({
   setPreferences: setPreferencesMock,
 }));
 
-vi.mock('../reader/session', () => {
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+
   class MockReaderSession {
     onLocation:
       | ((
@@ -68,6 +71,8 @@ vi.mock('../reader/session', () => {
     displayServerPercentage = vi.fn(async () => true);
     applyAppearance = vi.fn();
     updateHighlights = vi.fn();
+    getVisiblePassages = vi.fn(() => []);
+    clearTextSelection = vi.fn();
     destroy = destroySessionMock;
 
     constructor(
@@ -108,7 +113,7 @@ vi.mock('../reader/session', () => {
     }
   }
 
-  return { ReaderSession: MockReaderSession };
+  return { ...actual, ReaderSession: MockReaderSession };
 });
 
 import Reader from './Reader.svelte';
