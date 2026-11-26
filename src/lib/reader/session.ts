@@ -846,6 +846,7 @@ export class ReaderSession {
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
+        previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
     const themeChanged =
       !previous || previous.mode !== value.mode || paletteChanged || layoutChanged;
@@ -857,6 +858,7 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
     this.clearInjectedThemeRules(rendition);
     rendition.themes.register('turnleaf', {
       html: {
@@ -870,14 +872,20 @@ export class ReaderSession {
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
+        'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
         padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
         'box-sizing': 'border-box',
       },
-      p: {
-        'margin-bottom': `${value.paragraphSpacing}em !important`,
-        'text-align': `${value.alignment} !important`,
-        hyphens: value.hyphenation ? 'auto' : 'none',
-      },
+      p: value.publisherStyles
+        ? {
+            'margin-bottom': `${value.paragraphSpacing}em`,
+            hyphens,
+          }
+        : {
+            'margin-bottom': `${value.paragraphSpacing}em !important`,
+            'text-align': `${value.alignment} !important`,
+            hyphens: `${hyphens} !important`,
+          },
       'img, svg, video, canvas, table, pre, blockquote': {
         'max-width': '100% !important',
       },
@@ -1505,14 +1513,17 @@ export class ReaderSession {
   }
 
   private clearInjectedThemeRules(rendition: Rendition): void {
-    const getContents = (rendition as unknown as { getContents?: () => Contents[] }).getContents;
-    if (typeof getContents !== 'function') return;
-    const contents = getContents.call(rendition);
-    if (!Array.isArray(contents)) return;
-    for (const content of contents) {
+    const loadedContents =
+      typeof (rendition as Partial<Rendition>).getContents === 'function'
+        ? (rendition.getContents() as unknown as Contents | Contents[])
+        : [];
+    for (const content of Array.isArray(loadedContents) ? loadedContents : [loadedContents]) {
       for (const id of ['epubjs-inserted-css-turnleaf', 'turnleaf']) {
-        const styleEl = content.document?.getElementById(id);
-        if (styleEl) styleEl.textContent = '';
+        const styleEl = content?.document?.getElementById(id);
+        if (styleEl) {
+          styleEl.textContent = '';
+          styleEl.remove();
+        }
       }
     }
   }
