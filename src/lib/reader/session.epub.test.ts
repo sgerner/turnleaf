@@ -2,7 +2,15 @@
 
 import type { Contents, Location } from 'epubjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { calculateVirtualWindow } from '../components/library-virtualization';
 import { defaultAppearance, type Appearance } from './appearance';
+import {
+  TOC_OVERSCAN_ROWS,
+  TOC_ROW_HEIGHT_PX,
+  getRenderedTocIndices,
+  indexToc,
+  sectionLabelForHref,
+} from './toc';
 
 type TestTocItem = { label: string; href: string; subitems?: TestTocItem[] };
 type TestSpineSection = { href: string; index: number };
@@ -38,6 +46,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
   const book = {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
+    packaging: { navPath: '' as string | false, ncxPath: '' as string | false },
     spine,
     navigation: { toc: [] as TestTocItem[] },
   };
@@ -74,6 +83,7 @@ describe('ReaderSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRendition.getContents.mockReturnValue([]);
+    mockBook.packaging = { navPath: '', ncxPath: '' };
     mockBook.navigation.toc = [];
     mockBook.spine.sections = [...defaultSpineSections];
     mockRendition.location = undefined;
@@ -490,6 +500,84 @@ describe('ReaderSession', () => {
         children: [{ label: 'Chapter One', href: 'chapter-one.xhtml', children: [] }],
       },
     ]);
+  });
+
+  it('normalizes subdirectory nav.xhtml and display targets to OPF-relative spine hrefs', async () => {
+    mockBook.spine.sections = [
+      { href: 'Text/part-one.xhtml', index: 0 },
+      { href: 'Text/Chapter%201.xhtml', index: 1 },
+    ];
+    mockBook.packaging = { navPath: 'Text/nav.xhtml', ncxPath: false };
+    mockBook.navigation.toc = [
+      {
+        label: 'Part One',
+        href: 'part-one.xhtml#opening',
+        subitems: [{ label: 'Chapter One', href: 'Chapter 1.xhtml#scene-1' }],
+      },
+    ];
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    const toc = session.tableOfContents();
+    expect(toc).toEqual([
+      {
+        label: 'Part One',
+        href: 'Text/part-one.xhtml#opening',
+        children: [{ label: 'Chapter One', href: 'Text/Chapter%201.xhtml#scene-1', children: [] }],
+      },
+    ]);
+
+    mockRendition.display.mockClear();
+    await session.display('Chapter 1.xhtml#scene-1');
+    expect(mockRendition.display).toHaveBeenCalledWith('Text/Chapter%201.xhtml#scene-1');
+    session.destroy();
+  });
+
+  it('indexes and windows a 1,500-chapter table of contents without scanning every row', () => {
+    const chapterCount = 1_500;
+    mockBook.spine.sections = Array.from({ length: chapterCount }, (_, index) => ({
+      href: `Text/ch-${index + 1}.xhtml`,
+      index,
+    }));
+    mockBook.packaging = { navPath: 'Text/nav.xhtml', ncxPath: 'toc.ncx' };
+    mockBook.navigation.toc = Array.from({ length: chapterCount }, (_, idx) => ({
+      label: `Chapter ${idx + 1}`,
+      href: `ch-${idx + 1}.xhtml#start`,
+    }));
+
+    const session = new ReaderSession('book.epub');
+    const indexed = indexToc(session.tableOfContents());
+    expect(indexed.items).toHaveLength(chapterCount);
+    expect(sectionLabelForHref(indexed.labels, 'Text/ch-1200.xhtml', 1_199)).toBe('Chapter 1200');
+    expect(sectionLabelForHref(indexed.labels, 'Text/missing.xhtml', 1_499)).toBe('Section 1500');
+
+    const activeRow = indexed.firstRowBySectionHref.get('Text/ch-900.xhtml')!;
+    expect(activeRow).toBe(899);
+
+    const window = calculateVirtualWindow(
+      indexed.items.length,
+      1,
+      TOC_ROW_HEIGHT_PX,
+      activeRow * TOC_ROW_HEIGHT_PX,
+      384,
+      TOC_OVERSCAN_ROWS,
+    );
+    const rendered = getRenderedTocIndices(indexed.items.length, window, -1);
+
+    expect(rendered[0]).toBe(0);
+    expect(rendered.at(-1)).toBe(1_499);
+    expect(rendered).toContain(activeRow);
+    expect(rendered.length).toBeLessThan(25);
+    session.destroy();
   });
 
   it('adds and removes persistent CFI highlights in the EPUB rendition', async () => {
