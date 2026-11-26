@@ -6,6 +6,8 @@
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { focusViewEntry } from '../a11y/modal-focus';
+  import { getDiagnosticCount, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
   let {
@@ -29,21 +31,47 @@
   let error = $state('');
   let invalidField = $state<'address' | 'key' | null>(null);
   let showKey = $state(false);
+  let diagnosticCount = $state(getDiagnosticCount());
+
+  $effect(() =>
+    subscribeDiagnostics((count) => {
+      diagnosticCount = count;
+    }),
+  );
 
   async function saveConnection(
     server: ServerConfig,
     key: string,
     messages: { saveFailed: string; cleanupFailed: string },
   ): Promise<void> {
-    await saveApiKey(server.credentialRef, key);
+    try {
+      await saveApiKey(server.credentialRef, key);
+    } catch (credentialError) {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/credentials',
+        detail: 'credential-save-failed',
+      });
+      throw credentialError;
+    }
     try {
       await saveServer(server);
     } catch (storageError) {
       try {
         await removeApiKey(server.credentialRef);
       } catch (cleanupError) {
+        recordDiagnostic({
+          category: 'startup',
+          endpoint: 'local/credentials',
+          detail: 'credential-cleanup-failed',
+        });
         throw new Error(messages.cleanupFailed, { cause: cleanupError });
       }
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'server-save-failed',
+      });
       throw new Error(messages.saveFailed, { cause: storageError });
     }
   }
@@ -54,22 +82,41 @@
     invalidField = null;
     busy = true;
     const changingServerAddress = Boolean(savedServer && changeServerAddress);
+    let eventsRecorded = -1;
+    const unsubscribe = subscribeDiagnostics(() => {
+      eventsRecorded += 1;
+    });
 
     try {
       const normalized = normalizeServerUrl(
         savedServer && !changingServerAddress ? savedServer.baseUrl : serverUrl,
       );
       if ((!savedServer || changingServerAddress) && normalized.insecure && !allowHttp) {
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'insecure-http-blocked',
+        });
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
       const key = apiKey.trim();
       if (!key) {
         invalidField = 'key';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'missing-auth-key',
+        });
         throw new Error('Enter a Kavita auth key.');
       }
 
       const result = await new KavitaClient(normalized.baseUrl, key).testConnection();
       if (result.bookLibraries.length === 0) {
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: '/api/Library/libraries',
+          detail: 'no-book-libraries',
+        });
         throw new Error(
           'This account has no book or light novel libraries. Other media types are not supported.',
         );
@@ -94,7 +141,16 @@
           });
           await removeApiKey(savedServer.credentialRef).catch(() => {});
         } else {
-          await saveApiKey(savedServer.credentialRef, key);
+          try {
+            await saveApiKey(savedServer.credentialRef, key);
+          } catch (credentialError) {
+            recordDiagnostic({
+              category: 'startup',
+              endpoint: 'local/credentials',
+              detail: 'credential-save-failed',
+            });
+            throw credentialError;
+          }
         }
         onConnected(connectedServer, key);
         return;
@@ -120,7 +176,29 @@
       apiKey = '';
       onConnected(server, key);
     } catch (cause) {
-      if (cause instanceof ServerUrlError) invalidField = 'address';
+      if (cause instanceof ServerUrlError) {
+        invalidField = 'address';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'invalid-server-url',
+        });
+      } else if (eventsRecorded === 0) {
+        if (cause instanceof KavitaError) {
+          recordDiagnostic({
+            category: cause.kind === 'invalid-response' ? 'response' : 'request',
+            endpoint: '/api/Library/libraries',
+            ...(cause.status !== undefined ? { status: cause.status } : {}),
+            detail: cause.kind,
+          });
+        } else {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/setup',
+            detail: 'setup-failed',
+          });
+        }
+      }
       if (cause instanceof KavitaError && cause.kind === 'authentication') invalidField = 'key';
       if (
         cause instanceof KavitaError ||
@@ -132,6 +210,7 @@
         error = 'Turnleaf could not complete setup.';
       }
     } finally {
+      unsubscribe();
       busy = false;
     }
   }
@@ -276,6 +355,10 @@
       >
         {error}
       </div>
+
+      {#if error || diagnosticCount > 0}
+        <DiagnosticsPanel compact kavitaVersion={savedServer?.kavitaVersion} />
+      {/if}
 
       <button class="btn btn-lg preset-filled-primary-700-300 w-full" type="submit" disabled={busy}>
         {#if busy}
