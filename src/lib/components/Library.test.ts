@@ -266,7 +266,7 @@ describe('Library.svelte notes retention, backup/restore, and safe server remova
     expect(document.body.textContent).toContain('Removed Remote Book');
 
     const actionsBtn = document.querySelector<HTMLButtonElement>(
-      `[aria-label="Book actions for ${sampleBook.title}"]`,
+      `[aria-label^="Book actions for ${sampleBook.title}"]`,
     );
     expect(actionsBtn).toBeTruthy();
     actionsBtn!.click();
@@ -283,7 +283,7 @@ describe('Library.svelte notes retention, backup/restore, and safe server remova
     expect(document.body.textContent).toContain('Removed Remote Book');
 
     const actionsAfterRemove = document.querySelector<HTMLButtonElement>(
-      `[aria-label="Book actions for ${sampleBook.title}"]`,
+      `[aria-label^="Book actions for ${sampleBook.title}"]`,
     );
     expect(actionsAfterRemove).toBeTruthy();
     actionsAfterRemove!.click();

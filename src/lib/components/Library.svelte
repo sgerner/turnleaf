@@ -63,6 +63,12 @@
   } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
   import {
+    bookActionsLabel,
+    downloadProgressLabel,
+    downloadProgressValueText,
+    openBookLabel,
+  } from '../a11y/book-labels';
+  import {
     activeElement,
     focusModal,
     restoreFocus,
@@ -350,17 +356,6 @@
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
-  }
-
-  function openBookLabel(book: BookRecord, includeProgress = true): string {
-    const downloaded = book.downloadPath
-      ? ', downloaded for offline reading'
-      : book.remoteAvailable === false
-        ? ', unavailable on Kavita'
-        : '';
-    const progress =
-      includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
-    return `Open ${book.title}${downloaded}${progress}`;
   }
 
   function parseSortOrder(value: string | null): LibrarySortOrder {
@@ -2125,7 +2120,6 @@
       <button
         class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
         type="button"
-        aria-label={`Continue reading ${continueBook.title}, ${Math.round(progressOf(continueBook))}% complete`}
         onclick={() => void open(continueBook!)}
         transition:fade
       >
@@ -2163,6 +2157,11 @@
             </div>
             <span class="text-xs tabular-nums text-surface-700-300">
               {Math.round(progressOf(continueBook))}%
+              <span class="sr-only">
+                {continueBook.remoteAvailable === false
+                  ? 'complete, removed from server'
+                  : 'complete'}
+              </span>
             </span>
           </div>
         </div>
@@ -2389,19 +2388,18 @@
       >
         <p class="min-w-0 flex-1">{message}</p>
         {#if downloadingBookId}
-          {@const downloadingTitle =
-            books.find((book) => book.id === downloadingBookId)?.title ?? 'book'}
+          {@const downloadingBook = books.find((book) => book.id === downloadingBookId)}
           <div class="flex shrink-0 items-center gap-2">
             <div
               class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
               role="progressbar"
-              aria-label={`Download progress for ${downloadingTitle}`}
+              aria-label={downloadingBook
+                ? downloadProgressLabel(downloadingBook)
+                : 'Download progress for book'}
               aria-valuemin="0"
               aria-valuemax="100"
               aria-valuenow={downloadPercent ?? undefined}
-              aria-valuetext={downloadPercent === null
-                ? 'Download in progress'
-                : `${downloadPercent}% downloaded`}
+              aria-valuetext={downloadProgressValueText(downloadPercent)}
             >
               <div
                 class="h-full preset-filled-primary-600-400"
@@ -2567,10 +2565,7 @@
                     <div
                       class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                     >
-                      <div
-                        class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
-                        aria-hidden="true"
-                      >
+                      <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
                         {#if covers.get(book.seriesId)}
                           <img
                             class="h-full w-full object-cover"
@@ -2582,6 +2577,7 @@
                         {/if}
                         {#if book.downloadPath && book.remoteAvailable !== false}
                           <span
+                            aria-hidden="true"
                             class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
                           >
                             <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2602,6 +2598,7 @@
                                 d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
                               />
                             </svg>
+                            <span class="sr-only">Removed from server</span>
                           </span>
                         {/if}
                       </div>
@@ -2621,13 +2618,11 @@
                           <div
                             class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
                             role="progressbar"
-                            aria-label={`Download progress for ${book.title}`}
+                            aria-label={downloadProgressLabel(book)}
                             aria-valuemin="0"
                             aria-valuemax="100"
                             aria-valuenow={downloadPercent ?? undefined}
-                            aria-valuetext={downloadPercent === null
-                              ? 'Download in progress'
-                              : `${downloadPercent}% downloaded`}
+                            aria-valuetext={downloadProgressValueText(downloadPercent)}
                           >
                             <div
                               class="h-full preset-filled-primary-600-400"
@@ -2660,10 +2655,20 @@
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book, false)}
+                      aria-label={openBookLabel(book, {
+                        includeProgress: false,
+                        downloadingBookId,
+                        downloadPercent,
+                      })}
                       disabled={downloadingBookId === book.id}
                     >
-                      <span class="sr-only">{openBookLabel(book)}</span>
+                      <span class="sr-only">
+                        {openBookLabel(book, {
+                          includeProgress: false,
+                          downloadingBookId,
+                          downloadPercent,
+                        })}
+                      </span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -2671,7 +2676,7 @@
                       data-book-actions
                       onclick={() => openMenu(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={`Book actions for ${book.title}`}
+                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
                       title="More actions"
                     >
                       <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2698,6 +2703,7 @@
                       {/if}
                       {#if book.downloadPath && book.remoteAvailable !== false}
                         <span
+                          aria-hidden="true"
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
                           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2718,11 +2724,18 @@
                               d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
                             />
                           </svg>
+                          <span class="sr-only">Removed from server</span>
                         </span>
                       {/if}
                       {#if downloadingBookId === book.id}
                         <span
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                          role="progressbar"
+                          aria-label={downloadProgressLabel(book)}
+                          aria-valuemin="0"
+                          aria-valuemax="100"
+                          aria-valuenow={downloadPercent ?? undefined}
+                          aria-valuetext={downloadProgressValueText(downloadPercent)}
                         >
                           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
                             <path
@@ -2755,10 +2768,12 @@
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book)}
+                      aria-label={openBookLabel(book, { downloadingBookId, downloadPercent })}
                       disabled={downloadingBookId === book.id}
                     >
-                      <span class="sr-only">{openBookLabel(book)}</span>
+                      <span class="sr-only">
+                        {openBookLabel(book, { downloadingBookId, downloadPercent })}
+                      </span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -2766,7 +2781,7 @@
                       data-book-actions
                       onclick={() => openMenu(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={`Book actions for ${book.title}`}
+                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
                       title="More actions"
                     >
                       <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2810,6 +2825,9 @@
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
+      aria-describedby={actionMenuBook.remoteAvailable === false
+        ? 'book-actions-removed-warning'
+        : undefined}
       tabindex="-1"
       onkeydown={(event) => trapModalKeydown(event, actionMenuDialog!, closeMenu)}
       transition:fly={{ y: 16, duration: 150 }}
@@ -2839,6 +2857,29 @@
           </svg>
         </button>
       </div>
+
+      {#if actionMenuBook.remoteAvailable === false}
+        <div
+          id="book-actions-removed-warning"
+          class="mt-4 flex items-start gap-2.5 rounded-xl border border-warning-600-400 bg-warning-500/15 p-3 text-sm text-surface-950-50"
+        >
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            class="mt-0.5 h-5 w-5 shrink-0 text-warning-800-200"
+          >
+            <path
+              fill="currentColor"
+              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+            />
+          </svg>
+          <p>
+            {actionMenuBook.downloadPath
+              ? 'Removed from server. Removing this download deletes your saved copy, and it cannot be downloaded again from Kavita.'
+              : 'Removed from server. Your local download was removed, and it cannot be downloaded again from Kavita. Saved bookmarks and notes can still be exported below.'}
+          </p>
+        </div>
+      {/if}
 
       <div class="mt-4 grid gap-2">
         <button
@@ -2947,6 +2988,9 @@
           <button
             class="btn preset-outlined-error-500 justify-start"
             type="button"
+            aria-describedby={actionMenuBook.remoteAvailable === false
+              ? 'book-actions-removed-warning'
+              : undefined}
             onclick={() => {
               const book = actionMenuBook;
               closeMenu();
