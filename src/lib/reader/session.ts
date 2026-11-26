@@ -850,9 +850,17 @@ export class ReaderSession {
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
+        previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
     const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
+    const loadedContents =
+      typeof (rendition as Partial<Rendition>).getContents === 'function'
+        ? (rendition.getContents() as unknown as Contents | Contents[])
+        : [];
+    for (const content of Array.isArray(loadedContents) ? loadedContents : [loadedContents]) {
+      content?.document?.getElementById('epubjs-inserted-css-turnleaf')?.remove();
+    }
     const colors = MODE_COLORS[value.mode];
     const family =
       value.fontFamily === 'book'
@@ -860,6 +868,7 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
     rendition.themes.register('turnleaf', {
       html: {
         background: `${this.resolveToken(colors.background)} !important`,
@@ -871,14 +880,20 @@ export class ReaderSession {
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
+        'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
         padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
         'box-sizing': 'border-box',
       },
-      p: {
-        'margin-bottom': `${value.paragraphSpacing}em !important`,
-        'text-align': `${value.alignment} !important`,
-        hyphens: value.hyphenation ? 'auto' : 'none',
-      },
+      p: value.publisherStyles
+        ? {
+            'margin-bottom': `${value.paragraphSpacing}em`,
+            hyphens,
+          }
+        : {
+            'margin-bottom': `${value.paragraphSpacing}em !important`,
+            'text-align': `${value.alignment} !important`,
+            hyphens: `${hyphens} !important`,
+          },
       'img, svg, video, canvas, table, pre, blockquote': {
         'max-width': '100% !important',
       },
