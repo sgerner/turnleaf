@@ -35,6 +35,7 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
 npm ci
 npm run android:debug
+npm run android:lint
 ```
 
 Debug APK: `android/app/build/outputs/apk/debug/app-debug.apk`.

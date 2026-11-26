@@ -42,6 +42,7 @@ export function childEnvironment(
 export function gradleTask(mode) {
   if (mode === 'debug') return 'assembleDebug';
   if (mode === 'release') return 'assembleRelease';
+  if (mode === 'lint') return ':app:lintDebug';
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 
@@ -109,13 +110,11 @@ export async function main(
     let buildError;
     let stopError;
     try {
-      const effectiveArgs = verifyManifests
-        ? [
-            args[0],
-            mode === 'debug' ? 'processReleaseMainManifest' : 'processDebugMainManifest',
-            ...args.slice(1),
-          ]
-        : args;
+      const manifestTasks =
+        mode === 'lint'
+          ? ['processDebugMainManifest', 'processReleaseMainManifest']
+          : [mode === 'debug' ? 'processReleaseMainManifest' : 'processDebugMainManifest'];
+      const effectiveArgs = verifyManifests ? [args[0], ...manifestTasks, ...args.slice(1)] : args;
       await run(gradle, effectiveArgs, { cwd: androidDirectory, env: gradleEnv });
       if (verifyManifests) {
         for (const variant of ['debug', 'release']) {
