@@ -391,8 +391,10 @@ it('aborts the 1,500 ms open progress probe across syncWork and getProgress with
     }
     expect(runtime.flushProgressImpl).toHaveBeenCalledOnce();
 
-    const continueButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label^="Continue reading Saved Offline Book"]',
+    const continueButton = [...container.querySelectorAll('button')].find(
+      (button) =>
+        button.textContent?.includes('Continue reading') &&
+        button.textContent.includes('Saved Offline Book'),
     );
     expect(continueButton).not.toBeNull();
     continueButton?.click();
@@ -423,8 +425,10 @@ it('aborts the 1,500 ms open progress probe across syncWork and getProgress with
     await vi.advanceTimersByTimeAsync(50);
     flushSync();
 
-    const secondContinueButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label^="Continue reading Saved Offline Book"]',
+    const secondContinueButton = [...container.querySelectorAll('button')].find(
+      (button) =>
+        button.textContent?.includes('Continue reading') &&
+        button.textContent.includes('Saved Offline Book'),
     );
     expect(secondContinueButton).not.toBeNull();
     secondContinueButton?.click();

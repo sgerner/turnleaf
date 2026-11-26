@@ -48,8 +48,9 @@ it('builds download URLs without putting the api key in the query string', () =>
 it('loads covers with the api key header', async () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
 
-  await client.getCover(4);
+  const cover = await client.getCover(4);
 
+  expect(cover).toBeInstanceOf(Blob);
   expect(fetch).toHaveBeenCalledWith(
     'https://books.example.com/api/Image/series-cover?seriesId=4',
     expect.objectContaining({
@@ -61,7 +62,17 @@ it('loads covers with the api key header', async () => {
   );
 });
 
-it('requests the Kavita series list with POST', async () => {
+it('does not duplicate cover loading on native platforms where covers stream via FileTransfer', async () => {
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await expect(client.getCover(4)).rejects.toThrow('cacheCover');
+  expect(CapacitorHttp.get).not.toHaveBeenCalled();
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('requests the Kavita series list with POST and an EPUB format filter', async () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
 
   await client.getBookSeries();
@@ -71,6 +82,12 @@ it('requests the Kavita series list with POST', async () => {
     'https://books.example.com/api/Series/v2?PageNumber=1&PageSize=500',
     expect.objectContaining({
       method: 'POST',
+      body: JSON.stringify({
+        statements: [{ field: 21, comparison: 5, value: '3' }],
+        combination: 0,
+        sortOptions: { sortField: 1, isAscending: true },
+        limitTo: 0,
+      }),
       redirect: 'manual',
       headers: expect.objectContaining({
         'x-api-key': 'abc123',
@@ -163,6 +180,23 @@ it('rejects cross-origin redirects before sending the auth key to the new origin
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
+it('rejects HTTPS-to-HTTP downgrade redirects before sending the auth key over HTTP', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 307,
+    type: 'basic',
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'location' ? 'http://books.example.com/api/Series/v2' : null,
+    },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toThrow('redirected from HTTPS to insecure HTTP');
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
 it('rejects POST redirects that would change the request method', async () => {
   vi.mocked(fetch).mockResolvedValueOnce({
     ok: false,
@@ -214,6 +248,13 @@ it('follows native same-origin redirects with redirects disabled on each request
   expect(CapacitorHttp.request).toHaveBeenCalledTimes(2);
   expect(vi.mocked(CapacitorHttp.request).mock.calls[0]?.[0]).toMatchObject({
     url: 'https://books.example.com/kavita/api/Series/v2?PageNumber=1&PageSize=500',
+    method: 'POST',
+    data: {
+      statements: [{ field: 21, comparison: 5, value: '3' }],
+      combination: 0,
+      sortOptions: { sortField: 1, isAscending: true },
+      limitTo: 0,
+    },
     disableRedirects: true,
     headers: { 'x-api-key': 'abc123' },
   });
@@ -223,42 +264,50 @@ it('follows native same-origin redirects with redirects disabled on each request
   });
 });
 
-it('settles pending native CapacitorHttp.request and CapacitorHttp.get calls immediately on abort and swallows late rejections', async () => {
+it('settles pending native CapacitorHttp.request calls immediately on abort and swallows late rejections', async () => {
   capacitorRuntime.native = true;
-  let rejectPendingRequest!: (reason?: unknown) => void;
-  let rejectPendingGet!: (reason?: unknown) => void;
-  vi.mocked(CapacitorHttp.request).mockImplementationOnce(
-    () =>
-      new Promise((_, reject) => {
-        rejectPendingRequest = reject;
-      }),
-  );
-  vi.mocked(CapacitorHttp.get).mockImplementationOnce(
-    () =>
-      new Promise((_, reject) => {
-        rejectPendingGet = reject;
-      }),
-  );
+  let rejectPendingDetail!: (reason?: unknown) => void;
+  let rejectPendingSeries!: (reason?: unknown) => void;
+  vi.mocked(CapacitorHttp.request)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectPendingDetail = reject;
+        }),
+    )
+    .mockResolvedValueOnce({
+      status: 307,
+      headers: { Location: '/api/Series/v2/?PageNumber=1&PageSize=500' },
+      data: '',
+      url: '',
+    })
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectPendingSeries = reject;
+        }),
+    );
 
   const client = new KavitaClient('https://books.example.com', 'abc123');
-  const requestController = new AbortController();
-  const coverController = new AbortController();
+  const detailController = new AbortController();
+  const seriesController = new AbortController();
 
-  const pendingDetail = client.getSeriesDetail(4, requestController.signal);
-  const pendingCover = client.getCover(4, coverController.signal);
+  const pendingDetail = client.getSeriesDetail(4, detailController.signal);
+  const pendingSeries = client.getBookSeries(seriesController.signal);
+  await vi.waitFor(() => expect(CapacitorHttp.request).toHaveBeenCalledTimes(3));
 
-  requestController.abort();
-  coverController.abort();
+  detailController.abort();
+  seriesController.abort();
 
   await expect(pendingDetail).rejects.toSatisfy(
     (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
   );
-  await expect(pendingCover).rejects.toSatisfy(
+  await expect(pendingSeries).rejects.toSatisfy(
     (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
   );
 
-  rejectPendingRequest(new Error('SocketTimeoutException: connect timed out'));
-  rejectPendingGet(new Error('SocketTimeoutException: read timed out'));
+  rejectPendingDetail(new Error('SocketTimeoutException: connect timed out'));
+  rejectPendingSeries(new Error('SocketTimeoutException: read timed out'));
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   expect(getDiagnosticCount()).toBe(0);
@@ -266,18 +315,25 @@ it('settles pending native CapacitorHttp.request and CapacitorHttp.get calls imm
 
 it('detaches abort listeners when native calls settle before a shared signal aborts', async () => {
   capacitorRuntime.native = true;
-  vi.mocked(CapacitorHttp.request).mockResolvedValue({
-    status: 200,
-    headers: {},
-    data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
-    url: '',
-  });
-  vi.mocked(CapacitorHttp.get).mockResolvedValue({
-    status: 200,
-    headers: {},
-    data: btoa('cover'),
-    url: '',
-  });
+  vi.mocked(CapacitorHttp.request)
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
+      url: '',
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
+      url: '',
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      data: '[]',
+      url: '',
+    });
 
   const controller = new AbortController();
   const addSpy = vi.spyOn(controller.signal, 'addEventListener');
@@ -286,7 +342,7 @@ it('detaches abort listeners when native calls settle before a shared signal abo
 
   await client.getSeriesDetail(1, controller.signal);
   await client.getSeriesDetail(2, controller.signal);
-  await client.getCover(1, controller.signal);
+  await client.getBookSeries(controller.signal);
 
   expect(addSpy).toHaveBeenCalledTimes(3);
   expect(removeSpy).toHaveBeenCalledTimes(3);
