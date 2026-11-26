@@ -8,6 +8,7 @@
     "dev": "vite",
     "check": "svelte-check --tsconfig ./tsconfig.app.json --fail-on-warnings && tsc -p tsconfig.node.json",
     "lint": "eslint --max-warnings=0 .",
+    "workflow:check": "node scripts/check-workflow-pins.mjs",
     "security:audit": "node scripts/security-audit.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -15,7 +16,7 @@
     "test:watch": "vitest",
     "benchmark:library": "vitest bench src/lib/components/library-virtualization.bench.ts",
     "build": "npm run check && vite build",
-    "verify": "npm run security:audit && npm run format:check && npm run lint && npm run check && npm test && vite build",
+    "verify": "npm run workflow:check && npm run security:audit && npm run format:check && npm run lint && npm run check && npm test && vite build",
     "dev:kavita": "docker compose -f dev/docker-compose.yml up -d",
     "dev:kavita:down": "docker compose -f dev/docker-compose.yml down",
     "dev:kavita:logs": "docker compose -f dev/docker-compose.yml logs -f kavita",
@@ -43,7 +44,7 @@
     "@capacitor/network": "^8.0.1",
     "@capacitor/status-bar": "^8.0.4",
     "epubjs": "^0.3.93",
-    "svelte": "^5.57.3"
+    "svelte": "^5.58.0"
   },
   "devDependencies": {
     "@capacitor/android": "^8.6.2",
