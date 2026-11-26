@@ -54,9 +54,16 @@
   import {
     calculateVirtualWindow,
     columnsForLibraryWidth,
+    GRID_GAP_PX,
+    GRID_ROW_GAP_PX,
+    LIST_ROW_GAP_PX,
+    resultsContainerHeight,
+    rowHeightFor,
+    type LibraryViewMode,
     type VirtualWindow,
   } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import { activeElement } from '../a11y/modal-focus';
 
   let {
     server,
@@ -82,7 +89,6 @@
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
-  type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
@@ -251,10 +257,11 @@
   let measuredLayoutKey = '';
   let cardResizeObserver: ResizeObserver | null = null;
   const renderedRows = $derived.by(() => {
-    const { firstRow, lastRow } = virtualWindow;
+    const { firstRow, lastRow, totalRows } = virtualWindow;
     const rows = Array.from({ length: lastRow - firstRow + 1 }, (_, offset) => firstRow + offset);
-    if (focusedRow >= 0 && focusedRow < firstRow) rows.unshift(focusedRow);
-    if (focusedRow > lastRow) rows.push(focusedRow);
+    if (focusedRow >= 0 && focusedRow < firstRow && focusedRow < totalRows)
+      rows.unshift(focusedRow);
+    if (focusedRow > lastRow && focusedRow < totalRows) rows.push(focusedRow);
     return rows;
   });
   let visibleCoverKey = $derived.by(() => {
@@ -268,15 +275,21 @@
     const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
     return `${coverReloadRequest}:${[...new Set(booksToCover.map((book) => book.seriesId))].join(',')}`;
   });
+  let scrollContainer: HTMLElement | null = null;
   let scrollTarget: HTMLElement | Window | null = null;
+  let cachedGridWidth = 400;
+  let cachedListTop = 0;
+  let cachedViewportHeight = 0;
+  let cachedRootFontPx = 16;
+  let cachedTextScaling = 1;
+  let typographyMetricsDirty = true;
+  let layoutMetricsDirty = true;
+  let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
-  const GRID_GAP_PX = 16;
-  const GRID_ROW_GAP_PX = 32;
-  const LIST_ROW_GAP_PX = 16;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
@@ -312,6 +325,22 @@
     return value === 'list' ? 'list' : 'grid';
   }
 
+  function parseBooleanPreference(value: string | undefined, fallback: boolean): boolean {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return fallback;
+  }
+
+  function toggleDownloadedOnly(): void {
+    downloadedOnly = !downloadedOnly;
+    void setPreference('libraryDownloadedOnly', String(downloadedOnly));
+  }
+
+  function toggleHideCompleted(): void {
+    hideCompleted = !hideCompleted;
+    void setPreference('libraryHideCompleted', String(hideCompleted));
+  }
+
   function handleSortChange(event: Event): void {
     const value = (event.currentTarget as HTMLSelectElement).value;
     sortOrder = parseSortOrder(value);
@@ -341,6 +370,8 @@
     authorFilter = '';
     seriesFilter = '';
     sortOrder = 'title';
+    void setPreference('libraryDownloadedOnly', 'false');
+    void setPreference('libraryHideCompleted', 'false');
     void setPreference('librarySort', sortOrder);
     void setPreference('libraryAuthor', authorFilter);
     void setPreference('librarySeries', seriesFilter);
@@ -354,13 +385,19 @@
     return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
   }
 
-  function currentRemPx(): number {
-    if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return 16;
-    return Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-  }
-
   function rowGapPx(): number {
     return viewMode === 'list' ? LIST_ROW_GAP_PX : GRID_ROW_GAP_PX;
+  }
+
+  function readEntryBorderBoxHeight(entry: ResizeObserverEntry): number {
+    const firstBox = entry.borderBoxSize?.[0];
+    if (firstBox && typeof firstBox.blockSize === 'number' && firstBox.blockSize > 0) {
+      return firstBox.blockSize;
+    }
+    if (entry.target instanceof HTMLElement && entry.target.offsetHeight > 0) {
+      return entry.target.offsetHeight;
+    }
+    return entry.contentRect.height;
   }
 
   function observeBookCard(node: HTMLElement): { destroy: () => void } {
@@ -372,14 +409,101 @@
     };
   }
 
-  function columnsForWidth(width: number, rem = currentRemPx()): number {
-    return columnsForLibraryWidth(width, viewMode, rem, GRID_GAP_PX);
+  function isSameVirtualWindow(a: VirtualWindow, b: VirtualWindow): boolean {
+    return (
+      a.firstRow === b.firstRow &&
+      a.lastRow === b.lastRow &&
+      a.startIndex === b.startIndex &&
+      a.endIndex === b.endIndex &&
+      a.totalRows === b.totalRows &&
+      a.totalHeight === b.totalHeight
+    );
   }
 
-  function rowHeightFor(width: number, columns: number, rem = currentRemPx()): number {
-    if (viewMode === 'list') return Math.ceil(rem * 9.5);
-    const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
-    return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 5 + GRID_ROW_GAP_PX));
+  function resolveScrollContainer(): HTMLElement | null {
+    if (scrollContainer?.isConnected) return scrollContainer;
+    scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    return scrollContainer;
+  }
+
+  function refreshTypographyMetrics(): void {
+    if (typeof document !== 'undefined' && typeof getComputedStyle === 'function') {
+      const rootStyle = getComputedStyle(document.documentElement);
+      const parsedFontPx = Number.parseFloat(rootStyle.fontSize);
+      cachedRootFontPx = Number.isFinite(parsedFontPx) && parsedFontPx > 0 ? parsedFontPx : 16;
+      const parsedScaling = Number.parseFloat(rootStyle.getPropertyValue('--text-scaling'));
+      cachedTextScaling = Number.isFinite(parsedScaling) && parsedScaling > 0 ? parsedScaling : 1;
+    }
+    typographyMetricsDirty = false;
+  }
+
+  function refreshLayoutMetrics(): void {
+    const grid = virtualGrid;
+    if (!grid) return;
+    const container = resolveScrollContainer();
+    const gridRect = grid.getBoundingClientRect();
+    if (container) {
+      const width = grid.clientWidth || container.clientWidth;
+      if (width > 0) cachedGridWidth = width;
+      const containerRect = container.getBoundingClientRect();
+      cachedListTop = gridRect.top - containerRect.top + container.scrollTop;
+      cachedViewportHeight = container.clientHeight;
+    } else if (typeof window !== 'undefined') {
+      const width = grid.clientWidth || window.innerWidth;
+      if (width > 0) cachedGridWidth = width;
+      cachedListTop = gridRect.top + window.scrollY;
+      cachedViewportHeight = window.innerHeight;
+    }
+    layoutMetricsDirty = false;
+  }
+
+  function refreshVirtualMetrics(): void {
+    refreshTypographyMetrics();
+    refreshLayoutMetrics();
+  }
+
+  function handleWindowResize(): void {
+    typographyMetricsDirty = true;
+    layoutMetricsDirty = true;
+    scheduleVirtualWindow();
+  }
+
+  function bookIndexFromNode(node: EventTarget | null): number {
+    if (!virtualGrid || !(node instanceof Element)) return -1;
+    let current: Element | null = node;
+    while (current && current !== virtualGrid) {
+      if (current instanceof HTMLElement) {
+        const rawIndex = current.dataset.bookIndex;
+        if (rawIndex !== undefined) {
+          const parsed = Number(rawIndex);
+          return Number.isInteger(parsed) &&
+            parsed >= 0 &&
+            visibleBooks[parsed]?.id === current.dataset.bookId
+            ? parsed
+            : -1;
+        }
+      }
+      current = current.parentElement;
+    }
+    return -1;
+  }
+
+  function syncFocusedRow(columns = gridColumns): void {
+    const index = bookIndexFromNode(activeElement());
+    const nextFocused = index >= 0 ? Math.floor(index / columns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
+  }
+
+  function handleResultsFocusIn(event: FocusEvent): void {
+    const index = bookIndexFromNode(event.target);
+    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
+  }
+
+  function handleResultsFocusOut(event: FocusEvent): void {
+    const index = bookIndexFromNode(event.relatedTarget);
+    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
   }
 
   function scheduleVirtualWindow(): void {
@@ -399,73 +523,74 @@
 
   function updateVirtualWindow(): void {
     if (destroyed || !virtualGrid) return;
-    const width = virtualGrid.clientWidth;
-    const rem = currentRemPx();
-    const nextColumns = width > 0 ? columnsForWidth(width, rem) : gridColumns;
-    const layoutKey = `${viewMode}:${nextColumns}:${width}:${rem}`;
+    if (typographyMetricsDirty) refreshTypographyMetrics();
+    if (layoutMetricsDirty) refreshLayoutMetrics();
+
+    const nextColumns = columnsForLibraryWidth(
+      cachedGridWidth,
+      viewMode,
+      cachedRootFontPx,
+      GRID_GAP_PX,
+    );
+    const layoutKey = `${viewMode}:${nextColumns}:${cachedGridWidth}:${cachedRootFontPx}:${cachedTextScaling}`;
     if (layoutKey !== measuredLayoutKey) {
       measuredLayoutKey = layoutKey;
       measuredCardHeight = 0;
-    }
-
-    let maxRenderedCardHeight = 0;
-    for (const card of virtualGrid.querySelectorAll<HTMLElement>('[data-book-index]')) {
-      const cardHeight = card.getBoundingClientRect().height || card.offsetHeight;
-      if (cardHeight > maxRenderedCardHeight) {
-        maxRenderedCardHeight = cardHeight;
+      if (cardResizeObserver) {
+        for (const card of virtualGrid.querySelectorAll<HTMLElement>('[data-book-index]')) {
+          cardResizeObserver.unobserve(card);
+          cardResizeObserver.observe(card);
+        }
       }
     }
-    if (maxRenderedCardHeight > 0) {
-      measuredCardHeight = Math.max(measuredCardHeight, Math.ceil(maxRenderedCardHeight));
-    }
 
-    const estimatedRowHeight = width > 0 ? rowHeightFor(width, nextColumns, rem) : rowHeight;
-    const nextRowHeight =
-      measuredCardHeight > 0 ? Math.max(1, measuredCardHeight + rowGapPx()) : estimatedRowHeight;
-    if (gridColumns !== nextColumns) gridColumns = nextColumns;
+    const estimatedRowHeight = rowHeightFor(
+      cachedGridWidth,
+      nextColumns,
+      viewMode,
+      cachedRootFontPx,
+      cachedTextScaling,
+    );
+    const measuredRowHeight = measuredCardHeight > 0 ? measuredCardHeight + rowGapPx() : 0;
+    const nextRowHeight = Math.max(estimatedRowHeight, measuredRowHeight);
+    const columnsChanged = gridColumns !== nextColumns;
+    if (columnsChanged) gridColumns = nextColumns;
     if (rowHeight !== nextRowHeight) rowHeight = nextRowHeight;
+    if (columnsChanged && focusedRow >= 0) syncFocusedRow(nextColumns);
 
-    const activeCard = document.activeElement?.closest<HTMLElement>('[data-book-index]');
-    const activeIndex = Number(activeCard?.dataset.bookIndex);
-    focusedRow =
-      activeCard && visibleBooks[activeIndex]?.id === activeCard.dataset.bookId
-        ? Math.floor(activeIndex / nextColumns)
-        : -1;
-
-    const gridRect = virtualGrid.getBoundingClientRect();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
+    let scrollOffset: number;
     if (scrollContainer) {
-      const containerRect = scrollContainer.getBoundingClientRect();
-      const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
-      virtualWindow = calculateVirtualWindow(
-        visibleBooks.length,
-        nextColumns,
-        nextRowHeight,
-        scrollContainer.scrollTop - listTop,
-        scrollContainer.clientHeight,
-        VIRTUALIZATION_OVERSCAN_ROWS,
-      );
+      scrollOffset = scrollContainer.scrollTop - cachedListTop;
+    } else if (typeof window !== 'undefined') {
+      scrollOffset = window.scrollY - cachedListTop;
+    } else {
       return;
     }
-    if (typeof window === 'undefined') return;
-    virtualWindow = calculateVirtualWindow(
+
+    const nextWindow = calculateVirtualWindow(
       visibleBooks.length,
       nextColumns,
       nextRowHeight,
-      -gridRect.top,
-      window.innerHeight,
+      scrollOffset,
+      cachedViewportHeight,
       VIRTUALIZATION_OVERSCAN_ROWS,
     );
+    if (!isSameVirtualWindow(virtualWindow, nextWindow)) {
+      virtualWindow = nextWindow;
+    }
   }
 
   async function scrollToBook(index: number): Promise<HTMLElement | null> {
     const grid = virtualGrid;
     if (!grid) return null;
+    refreshVirtualMetrics();
     updateVirtualWindow();
-    const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
-    const container = libraryMain?.closest<HTMLElement>('.app-stage');
-    if (container) container.scrollTop += top - container.getBoundingClientRect().top;
-    else window.scrollBy({ top, behavior: 'instant' });
+    const rowTop = Math.floor(index / gridColumns) * rowHeight;
+    if (scrollContainer) {
+      scrollContainer.scrollTop = cachedListTop + rowTop;
+    } else if (typeof window !== 'undefined') {
+      window.scrollBy({ top: cachedListTop - window.scrollY + rowTop, behavior: 'instant' });
+    }
     updateVirtualWindow();
     await tick();
     return grid.querySelector(`[data-book-index="${index}"]`);
@@ -499,7 +624,14 @@
   }
 
   $effect(() => {
-    if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
+    if (!reading && visibleBooks.length > 0) {
+      untrack(() => {
+        if (focusedRow >= 0) syncFocusedRow();
+        scheduleVirtualWindow();
+      });
+    } else if (untrack(() => focusedRow) !== -1) {
+      focusedRow = -1;
+    }
   });
 
   $effect(() => {
@@ -510,30 +642,107 @@
   });
 
   $effect(() => {
-    if (viewMode === 'grid' || viewMode === 'list') scheduleVirtualWindow();
+    if (viewMode === 'grid' || viewMode === 'list') {
+      untrack(() => scheduleVirtualWindow());
+    }
   });
 
   $effect(() => {
-    if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => scheduleVirtualWindow());
-    cardResizeObserver = observer;
-    observer.observe(virtualGrid);
-    for (const card of virtualGrid.querySelectorAll<HTMLElement>('[data-book-index]')) {
-      observer.observe(card);
-    }
-    scheduleVirtualWindow();
-    return () => {
-      if (cardResizeObserver === observer) cardResizeObserver = null;
-      observer.disconnect();
-    };
+    if (theme === observedTheme) return;
+    observedTheme = theme;
+    untrack(() => {
+      typographyMetricsDirty = true;
+      layoutMetricsDirty = true;
+      scheduleVirtualWindow();
+    });
+  });
+
+  $effect(() => {
+    const grid = virtualGrid;
+    const main = libraryMain;
+    if (!grid) return;
+
+    return untrack(() => {
+      refreshVirtualMetrics();
+      updateVirtualWindow();
+
+      const resizeObserver =
+        typeof ResizeObserver !== 'undefined'
+          ? new ResizeObserver(() => {
+              typographyMetricsDirty = true;
+              layoutMetricsDirty = true;
+              scheduleVirtualWindow();
+            })
+          : null;
+      resizeObserver?.observe(grid);
+      if (main) resizeObserver?.observe(main);
+      if (scrollContainer) resizeObserver?.observe(scrollContainer);
+
+      const cardsObserver =
+        typeof ResizeObserver !== 'undefined'
+          ? new ResizeObserver((entries) => {
+              const currentKey = `${viewMode}:${gridColumns}:${cachedGridWidth}:${cachedRootFontPx}:${cachedTextScaling}`;
+              if (currentKey !== measuredLayoutKey) {
+                measuredLayoutKey = currentKey;
+                measuredCardHeight = 0;
+              }
+              let updated = false;
+              for (const entry of entries) {
+                const cardHeight = Math.ceil(readEntryBorderBoxHeight(entry));
+                if (cardHeight > measuredCardHeight) {
+                  measuredCardHeight = cardHeight;
+                  updated = true;
+                }
+              }
+              if (updated && measuredCardHeight + rowGapPx() > rowHeight) {
+                scheduleVirtualWindow();
+              }
+            })
+          : null;
+      cardResizeObserver = cardsObserver;
+      if (cardsObserver) {
+        for (const card of grid.querySelectorAll<HTMLElement>('[data-book-index]')) {
+          cardsObserver.observe(card);
+        }
+      }
+
+      const mutationObserver =
+        typeof MutationObserver !== 'undefined'
+          ? new MutationObserver((records) => {
+              for (const record of records) {
+                if (record.type === 'attributes') {
+                  typographyMetricsDirty = true;
+                }
+                layoutMetricsDirty = true;
+              }
+              scheduleVirtualWindow();
+            })
+          : null;
+      if (typeof document !== 'undefined') {
+        mutationObserver?.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: ['style', 'class', 'data-theme'],
+        });
+      }
+      if (main) mutationObserver?.observe(main, { childList: true });
+      if (scrollContainer) mutationObserver?.observe(scrollContainer, { childList: true });
+
+      return () => {
+        if (cardResizeObserver === cardsObserver) cardResizeObserver = null;
+        cardsObserver?.disconnect();
+        resizeObserver?.disconnect();
+        mutationObserver?.disconnect();
+      };
+    });
   });
 
   onMount(async () => {
     void cleanupInterruptedEpubDownloads();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
-    scrollTarget = scrollContainer ?? window;
+    const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    scrollContainer = container;
+    scrollTarget = container ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
-    window.addEventListener('resize', scheduleVirtualWindow);
+    window.addEventListener('resize', handleWindowResize);
     scheduleVirtualWindow();
 
     const [preferences, savedBooks] = await Promise.all([
@@ -543,6 +752,8 @@
         'libraryAuthor',
         'librarySeries',
         'libraryView',
+        'libraryDownloadedOnly',
+        'libraryHideCompleted',
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
@@ -550,6 +761,8 @@
     pendingTheme = theme as SkeletonTheme;
     pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
+    downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
+    hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
     sortOrder = parseSortOrder(preferences.get('librarySort') ?? null);
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
@@ -688,7 +901,7 @@
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
-    window.removeEventListener('resize', scheduleVirtualWindow);
+    window.removeEventListener('resize', handleWindowResize);
     openProgressProbe?.abort();
     refreshController?.abort();
     cancelCoverLoading();
@@ -1771,7 +1984,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
-          onclick={() => (downloadedOnly = !downloadedOnly)}
+          onclick={toggleDownloadedOnly}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
@@ -1785,7 +1998,7 @@
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
-          onclick={() => (hideCompleted = !hideCompleted)}
+          onclick={toggleHideCompleted}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
             <path
@@ -2092,18 +2305,18 @@
         id="library-results"
         bind:this={virtualGrid}
         class="relative mt-8"
-        style={`height: ${Math.max(0, virtualWindow.totalHeight - rowGapPx())}px`}
+        style={`height: ${resultsContainerHeight(virtualWindow.totalHeight, viewMode)}px; contain: layout style;`}
         tabindex="-1"
         aria-label="Books"
-        onfocusin={scheduleVirtualWindow}
-        onfocusout={scheduleVirtualWindow}
+        onfocusin={handleResultsFocusIn}
+        onfocusout={handleResultsFocusOut}
       >
         {#each renderedRows as rowIndex (rowIndex)}
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
             class="absolute inset-x-0 grid items-start gap-x-4"
-            style={`top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
+            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr)); contain: size layout style;`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}

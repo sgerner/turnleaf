@@ -1,3 +1,20 @@
+export type LibraryViewMode = 'grid' | 'list';
+
+export const GRID_GAP_PX = 16;
+export const GRID_ROW_GAP_PX = 32;
+export const LIST_ROW_GAP_PX = 16;
+
+// Skeleton scales font sizes by --text-scaling (`scale`):
+// - Title (`line-clamp-2 text-base leading-snug`): unitless 1.375 line-height -> 2 * 1.375rem * scale
+// - Author (`truncate text-sm`): (0.875rem * scale) * ((1.25 / 0.875) * scale) -> 1.25rem * scale^2
+// - Series (`truncate text-xs`): (0.75rem * scale) * ((1 / 0.75) * scale) -> 1rem * scale^2
+const TITLE_TWO_LINES_REM = 2.75;
+const TEXT_SM_LINE_REM = 1.25;
+const TEXT_XS_LINE_REM = 1;
+const GRID_META_SPACING_REM = 1.25;
+const LIST_NON_TEXT_REM = 4.5;
+const LIST_MIN_ROW_REM = 7.25;
+
 export interface VirtualWindow {
   firstRow: number;
   lastRow: number;
@@ -7,19 +24,68 @@ export interface VirtualWindow {
   totalHeight: number;
 }
 
+export function columnsForWidth(width: number, viewMode: LibraryViewMode = 'grid'): number {
+  if (viewMode === 'list') return 1;
+  if (width >= 1024) return 5;
+  if (width >= 768) return 4;
+  if (width >= 640) return 3;
+  return 2;
+}
+
+export function rowHeightFor(
+  width: number,
+  columns: number,
+  viewMode: LibraryViewMode = 'grid',
+  rootFontPx = 16,
+  textScaling = 1,
+): number {
+  const rem = Number.isFinite(rootFontPx) && rootFontPx > 0 ? rootFontPx : 16;
+  const scale = Number.isFinite(textScaling) && textScaling > 0 ? textScaling : 1;
+  const scaleSquared = scale * scale;
+
+  if (viewMode === 'list') {
+    const listRem = Math.max(
+      LIST_MIN_ROW_REM,
+      LIST_NON_TEXT_REM +
+        TITLE_TWO_LINES_REM * scale +
+        (TEXT_SM_LINE_REM + TEXT_XS_LINE_REM) * scaleSquared,
+    );
+    return Math.max(1, Math.ceil(rem * listRem));
+  }
+
+  const safeWidth = Number.isFinite(width) ? Math.max(0, width) : 0;
+  const safeColumns = Math.max(1, Math.floor(Number.isFinite(columns) ? columns : 1));
+  const cardWidth = Math.max(0, (safeWidth - (safeColumns - 1) * GRID_GAP_PX) / safeColumns);
+  const metaHeight =
+    rem *
+    (GRID_META_SPACING_REM +
+      TITLE_TWO_LINES_REM * scale +
+      (TEXT_SM_LINE_REM + TEXT_XS_LINE_REM) * scaleSquared);
+  return Math.max(1, Math.ceil(cardWidth * 1.5 + metaHeight + GRID_ROW_GAP_PX));
+}
+
+export function resultsContainerHeight(
+  totalHeight: number,
+  viewMode: LibraryViewMode = 'grid',
+): number {
+  const height = Number.isFinite(totalHeight) ? Math.max(0, totalHeight) : 0;
+  if (height === 0) return 0;
+  return viewMode === 'grid' ? Math.max(0, height - GRID_ROW_GAP_PX) : height;
+}
+
 /**
  * Minimum Grid card width in rem units so the top-left `.badge-icon`
  * (`left-2` + `w-7` = `2.25rem`) and top-right `[data-book-actions]` button
- * (`right-3` + `w-11` = `3.5rem`) keep at least `0.75rem` of horizontal
+ * (`right-3` + `w-11` = `3.5rem`) keep at least `0.25rem` of horizontal
  * separation when root text size scales up to 200%.
  */
-const MIN_GRID_CARD_REM = 6.5;
+const MIN_GRID_CARD_REM = 6;
 
 export function columnsForLibraryWidth(
   width: number,
-  viewMode: 'grid' | 'list',
+  viewMode: LibraryViewMode,
   remPx = 16,
-  gapPx = 16,
+  gapPx = GRID_GAP_PX,
 ): number {
   if (viewMode === 'list') return 1;
   const safeWidth = Math.max(0, Number.isFinite(width) ? width : 0);

@@ -76,8 +76,6 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-          cache: gradle
-          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
@@ -95,6 +93,29 @@ jobs:
             sudo chmod g+rw /dev/kvm
           fi
 
+      - name: Cache Android AVD snapshot
+        id: avd-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ runner.os }}-api-36-google_apis-x86_64-pixel_6-v1
+
+      - name: Create AVD and generate snapshot for caching
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
+
       - name: Verify the Android reading journey
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
@@ -102,8 +123,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim
-          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
+          force-avd-creation: false
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:journey
