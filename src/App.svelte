@@ -28,6 +28,8 @@
     'libraryAuthor',
     'librarySeries',
     'libraryView',
+    'libraryDownloadedOnly',
+    'libraryHideCompleted',
   ] as const;
   const defaultTheme = 'fennec';
   const defaultMode = 'dark';

@@ -229,7 +229,7 @@ describe('App cold-launch parallel hydration', () => {
     mounted = mount(App, { target: container });
     await flushMicrotasks(2);
 
-    // Stage 1: prepareCredentials, getServer, merged 7-key getPreferences, and Network.getStatus all started concurrently.
+    // Stage 1: prepareCredentials, getServer, merged 9-key getPreferences, and Network.getStatus all started concurrently.
     expect(mocks.prepareCredentials).toHaveBeenCalledOnce();
     expect(mocks.getServer).toHaveBeenCalledOnce();
     expect(mocks.getPreferences).toHaveBeenCalledExactlyOnceWith([
@@ -240,6 +240,8 @@ describe('App cold-launch parallel hydration', () => {
       'libraryAuthor',
       'librarySeries',
       'libraryView',
+      'libraryDownloadedOnly',
+      'libraryHideCompleted',
     ]);
     expect(mocks.networkGetStatus).toHaveBeenCalledOnce();
     expect(mocks.fetchLatestGithubRelease).not.toHaveBeenCalled();
@@ -252,6 +254,8 @@ describe('App cold-launch parallel hydration', () => {
         ['uiTheme', 'vintage'],
         ['uiMode', 'dark'],
         ['librarySort', 'recent'],
+        ['libraryDownloadedOnly', 'true'],
+        ['libraryHideCompleted', 'false'],
       ]),
     );
     await flushMicrotasks(4);
@@ -277,6 +281,19 @@ describe('App cold-launch parallel hydration', () => {
     expect(document.documentElement.dataset.theme).toBe('vintage');
     expect(container.textContent).toContain('The Left Hand of Darkness');
     expect(container.textContent).toContain('No network connection. Showing your saved library.');
+    const filterButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        '[role="group"][aria-label="Library filters"] button',
+      ),
+    );
+    const downloadedButton = filterButtons.find((btn) =>
+      btn.textContent?.includes('Downloaded Only'),
+    );
+    const hideCompletedButton = filterButtons.find((btn) =>
+      btn.textContent?.includes('Hide completed'),
+    );
+    expect(downloadedButton?.getAttribute('aria-pressed')).toBe('true');
+    expect(hideCompletedButton?.getAttribute('aria-pressed')).toBe('false');
     expect(mocks.getPreferences).toHaveBeenCalledOnce();
     expect(mocks.getBooks).toHaveBeenCalledOnce();
     expect(mocks.networkGetStatus).toHaveBeenCalledOnce();
