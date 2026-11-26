@@ -1,8 +1,13 @@
 import type { Rendition } from 'epubjs';
 
-interface ViewportDimensions {
+export interface ViewportDimensions {
   width: number;
   height: number;
+}
+
+export interface ViewportResizeHooks {
+  runResize?: ((resize: () => unknown) => unknown) | undefined;
+  runDisplay?: ((target: string) => Promise<unknown>) | undefined;
 }
 
 interface RenditionManagerLike {
@@ -53,6 +58,7 @@ export class ViewportResizeController {
     private readonly target: HTMLElement,
     private readonly rendition: Rendition,
     private readonly getCurrentCfi: () => string | null,
+    private readonly hooks: ViewportResizeHooks = {},
   ) {
     this.runtime = rendition as unknown as RenditionRuntimeLike;
     const initial = target.getBoundingClientRect();
@@ -117,6 +123,10 @@ export class ViewportResizeController {
     this.scheduleFlush();
   }
 
+  getSize(): ViewportDimensions | null {
+    return this.viewportSize.width > 0 && this.viewportSize.height > 0 ? this.viewportSize : null;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -124,6 +134,7 @@ export class ViewportResizeController {
     this.runtime.off?.('started', this.handleStarted);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    this.viewportSize = { width: 0, height: 0 };
     this.pendingSize = null;
     this.activeOperations = 0;
     this.awaitingRelocation = false;
@@ -164,15 +175,23 @@ export class ViewportResizeController {
         const hasRuntimeLocation = Boolean(this.runtime.location?.start?.cfi);
         const fallbackCfi =
           epubcfi ?? (!hasRuntimeLocation ? (this.getCurrentCfi() ?? undefined) : undefined);
-        const result = originalResize(measured.width, measured.height, fallbackCfi);
+        const result = this.executeResize(() =>
+          originalResize(measured.width, measured.height, fallbackCfi),
+        );
         if (
           fallbackCfi &&
           !this.runtime.location?.start &&
-          typeof this.runtime.display === 'function'
+          (typeof this.hooks.runDisplay === 'function' ||
+            typeof this.runtime.display === 'function')
         ) {
-          void this.runtime.display(fallbackCfi);
+          this.executeFallbackDisplay(fallbackCfi);
         }
-        if (hasRuntimeLocation || (fallbackCfi && typeof this.runtime.display === 'function')) {
+        if (
+          hasRuntimeLocation ||
+          (fallbackCfi &&
+            (typeof this.hooks.runDisplay === 'function' ||
+              typeof this.runtime.display === 'function'))
+        ) {
           this.awaitRelocation();
         }
         return result;
@@ -239,19 +258,41 @@ export class ViewportResizeController {
     const fallbackCfi = !hasRuntimeLocation ? (this.getCurrentCfi() ?? undefined) : undefined;
     this.applyingResize = true;
     try {
-      if (fallbackCfi) {
-        this.runtime.resize(width, height, fallbackCfi);
-        if (!this.runtime.location?.start && typeof this.runtime.display === 'function') {
-          void this.runtime.display(fallbackCfi);
+      this.executeResize(() => {
+        if (fallbackCfi) {
+          this.runtime.resize(width, height, fallbackCfi);
+        } else {
+          this.rendition.resize(width, height);
         }
-      } else {
-        this.rendition.resize(width, height);
+      });
+      if (
+        fallbackCfi &&
+        !this.runtime.location?.start &&
+        (typeof this.hooks.runDisplay === 'function' || typeof this.runtime.display === 'function')
+      ) {
+        this.executeFallbackDisplay(fallbackCfi);
       }
     } finally {
       this.applyingResize = false;
     }
-    if (hasRuntimeLocation || (fallbackCfi && typeof this.runtime.display === 'function')) {
+    if (
+      hasRuntimeLocation ||
+      (fallbackCfi &&
+        (typeof this.hooks.runDisplay === 'function' || typeof this.runtime.display === 'function'))
+    ) {
       this.awaitRelocation();
+    }
+  }
+
+  private executeResize<T>(resize: () => T): T {
+    return this.hooks.runResize ? (this.hooks.runResize(resize) as T) : resize();
+  }
+
+  private executeFallbackDisplay(cfi: string): void {
+    if (this.hooks.runDisplay) {
+      void this.hooks.runDisplay(cfi).catch(() => {});
+    } else if (typeof this.runtime.display === 'function') {
+      void this.runtime.display(cfi).catch(() => {});
     }
   }
 

@@ -277,7 +277,10 @@
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   let reconnectTimer: number | null = null;
+  let reconnectNeeded = false;
   const RECONNECT_SETTLE_MS = 150;
+  const RECONNECT_RETRY_MS = 250;
+  const MAX_RECONNECT_VALIDATION_RETRIES = 20;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -521,6 +524,7 @@
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     offline = !(await Network.getStatus().catch(() => null))?.connected;
+    reconnectNeeded = offline;
     if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
@@ -539,6 +543,7 @@
           const wasOffline = offline;
           offline = !connected;
           if (!connected) {
+            reconnectNeeded = true;
             if (reconnectTimer !== null) {
               window.clearTimeout(reconnectTimer);
               reconnectTimer = null;
@@ -560,18 +565,9 @@
               : 'No network connection. Connect to Kavita to load your library.';
             return;
           }
-          if (!wasOffline && !kavitaUnreachable) return;
+          if (!wasOffline && !kavitaUnreachable && !reconnectNeeded) return;
           offlineMessage = '';
-          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-          reconnectTimer = window.setTimeout(() => {
-            reconnectTimer = null;
-            if (destroyed || offline) return;
-            coverReloadRequest += 1;
-            kavitaUnreachable = false;
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
-          }, RECONNECT_SETTLE_MS);
+          scheduleReconnect();
         }),
       ),
     );
@@ -613,6 +609,34 @@
     return handle.remove;
   }
 
+  function scheduleReconnect(
+    delayMs = RECONNECT_SETTLE_MS,
+    retriesRemaining = MAX_RECONNECT_VALIDATION_RETRIES,
+  ): void {
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      void (async () => {
+        if (destroyed || offline) return;
+        if (!(await networkAvailable())) {
+          reconnectNeeded = true;
+          if (!destroyed && !offline && retriesRemaining > 0) {
+            scheduleReconnect(RECONNECT_RETRY_MS, retriesRemaining - 1);
+          }
+          return;
+        }
+        reconnectNeeded = false;
+        coverReloadRequest += 1;
+        kavitaUnreachable = false;
+        await refresh().catch(() => {});
+        await syncProgress(false).catch(() => {});
+        if (reconnectNeeded && !destroyed && !offline && retriesRemaining > 0) {
+          scheduleReconnect(RECONNECT_RETRY_MS, retriesRemaining - 1);
+        }
+      })();
+    }, delayMs);
+  }
+
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
@@ -644,6 +668,7 @@
     syncing = true;
     try {
       if (!(await networkAvailable())) {
+        if (!offline && !destroyed) reconnectNeeded = true;
         if (showFeedback)
           message = 'Offline. Reading progress will retry when Kavita is available.';
         return;
@@ -703,13 +728,18 @@
     let diagnosticEndpoint = '/api/unknown';
     message = '';
     try {
-      if (!(await networkAvailable()) || controller.signal.aborted) return;
+      if (!(await networkAvailable())) {
+        if (!offline && !destroyed) reconnectNeeded = true;
+        return;
+      }
+      if (controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
         if (!(await networkAvailable())) {
+          if (!offline && !destroyed) reconnectNeeded = true;
           controller.abort();
           return;
         }

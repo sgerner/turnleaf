@@ -726,6 +726,37 @@ describe('Library card snippets', () => {
       });
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(mocks.getSeriesDetail).not.toHaveBeenCalled();
+
+      // Once native Network.getStatus() validates connected=true (even if connected=true had already fired earlier),
+      // pending reconnect work completes both catalog refresh and queued progress flush.
+      mocks.getBookSeries.mockClear();
+      mocks.flushProgress.mockClear();
+      mocks.connected = true;
+      await vi.waitFor(() => {
+        expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
+        expect(mocks.getSeriesDetail).toHaveBeenCalledTimes(1);
+        expect(mocks.flushProgress).toHaveBeenCalledTimes(1);
+      });
+
+      // Also handles networkStatusChange({ connected: true }) arriving while Network.getStatus() is still unvalidated.
+      emitNetwork(false);
+      mocks.getBookSeries.mockClear();
+      mocks.getSeriesDetail.mockClear();
+      mocks.flushProgress.mockClear();
+      for (const listener of [...mocks.networkListeners]) {
+        listener({ connected: true, connectionType: 'wifi' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(mocks.getBookSeries).not.toHaveBeenCalled();
+      expect(mocks.flushProgress).not.toHaveBeenCalled();
+
+      mocks.connected = true;
+      emitNetwork(true, 'wifi');
+      await vi.waitFor(() => {
+        expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
+        expect(mocks.getSeriesDetail).toHaveBeenCalledTimes(1);
+        expect(mocks.flushProgress).toHaveBeenCalledTimes(1);
+      });
     } finally {
       mocks.isNativePlatform = false;
       mocks.networkListeners.length = 0;
