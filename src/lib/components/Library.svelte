@@ -50,8 +50,21 @@
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import TurnleafLogo from './TurnleafLogo.svelte';
-  import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
+  import {
+    calculateVirtualWindow,
+    columnsForWidth,
+    resultsContainerHeight,
+    rowHeightFor,
+    type LibraryViewMode,
+    type VirtualWindow,
+  } from './library-virtualization';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import {
+    bookActionsLabel,
+    downloadProgressLabel,
+    downloadProgressValueText,
+    openBookLabel,
+  } from '../a11y/book-labels';
   import {
     activeElement,
     focusAfterUnmount,
@@ -85,7 +98,6 @@
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
-  type LibraryViewMode = 'grid' | 'list';
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
@@ -254,10 +266,11 @@
   let virtualWindow = $state<VirtualWindow>(calculateVirtualWindow(0, 2, 400, 0, 0));
   let focusedRow = $state(-1);
   const renderedRows = $derived.by(() => {
-    const { firstRow, lastRow } = virtualWindow;
+    const { firstRow, lastRow, totalRows } = virtualWindow;
     const rows = Array.from({ length: lastRow - firstRow + 1 }, (_, offset) => firstRow + offset);
-    if (focusedRow >= 0 && focusedRow < firstRow) rows.unshift(focusedRow);
-    if (focusedRow > lastRow) rows.push(focusedRow);
+    if (focusedRow >= 0 && focusedRow < firstRow && focusedRow < totalRows)
+      rows.unshift(focusedRow);
+    if (focusedRow > lastRow && focusedRow < totalRows) rows.push(focusedRow);
     return rows;
   });
   let visibleCoverKey = $derived.by(() => {
@@ -271,14 +284,21 @@
     const booksToCover = continueBook ? [continueBook, ...viewportBooks] : viewportBooks;
     return `${coverReloadRequest}:${[...new Set(booksToCover.map((book) => book.seriesId))].join(',')}`;
   });
+  let scrollContainer: HTMLElement | null = null;
   let scrollTarget: HTMLElement | Window | null = null;
+  let cachedGridWidth = 400;
+  let cachedListTop = 0;
+  let cachedViewportHeight = 0;
+  let cachedRootFontPx = 16;
+  let cachedTextScaling = 1;
+  let typographyMetricsDirty = true;
+  let layoutMetricsDirty = true;
+  let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
-  const GRID_GAP_PX = 16;
-  const GRID_ROW_GAP_PX = 32;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
   let destroyed = false;
@@ -297,13 +317,6 @@
 
   function progressOf(book: BookRecord): number {
     return book.pages ? Math.min(100, (book.pagesRead / book.pages) * 100) : 0;
-  }
-
-  function openBookLabel(book: BookRecord, includeProgress = true): string {
-    const downloaded = book.downloadPath ? ', downloaded for offline reading' : '';
-    const progress =
-      includeProgress && progressOf(book) > 0 ? `, ${Math.round(progressOf(book))}% complete` : '';
-    return `Open ${book.title}${downloaded}${progress}`;
   }
 
   function parseSortOrder(value: string | null): LibrarySortOrder {
@@ -374,19 +387,101 @@
     return (error as { code?: unknown } | null)?.code === 'OS-PLUG-FILE-0008';
   }
 
-  function columnsForWidth(width: number): number {
-    if (viewMode === 'list') return 1;
-    if (width >= 1024) return 5;
-    if (width >= 768) return 4;
-    if (width >= 640) return 3;
-    return 2;
+  function isSameVirtualWindow(a: VirtualWindow, b: VirtualWindow): boolean {
+    return (
+      a.firstRow === b.firstRow &&
+      a.lastRow === b.lastRow &&
+      a.startIndex === b.startIndex &&
+      a.endIndex === b.endIndex &&
+      a.totalRows === b.totalRows &&
+      a.totalHeight === b.totalHeight
+    );
   }
 
-  function rowHeightFor(width: number, columns: number): number {
-    const rem = Number.parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
-    if (viewMode === 'list') return Math.ceil(rem * 9.5);
-    const cardWidth = Math.max(0, (width - (columns - 1) * GRID_GAP_PX) / columns);
-    return Math.max(1, Math.ceil(cardWidth * 1.5 + rem * 5 + GRID_ROW_GAP_PX));
+  function resolveScrollContainer(): HTMLElement | null {
+    if (scrollContainer?.isConnected) return scrollContainer;
+    scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    return scrollContainer;
+  }
+
+  function refreshTypographyMetrics(): void {
+    if (typeof document !== 'undefined' && typeof getComputedStyle === 'function') {
+      const rootStyle = getComputedStyle(document.documentElement);
+      const parsedFontPx = Number.parseFloat(rootStyle.fontSize);
+      cachedRootFontPx = Number.isFinite(parsedFontPx) && parsedFontPx > 0 ? parsedFontPx : 16;
+      const parsedScaling = Number.parseFloat(rootStyle.getPropertyValue('--text-scaling'));
+      cachedTextScaling = Number.isFinite(parsedScaling) && parsedScaling > 0 ? parsedScaling : 1;
+    }
+    typographyMetricsDirty = false;
+  }
+
+  function refreshLayoutMetrics(): void {
+    const grid = virtualGrid;
+    if (!grid) return;
+    const container = resolveScrollContainer();
+    const gridRect = grid.getBoundingClientRect();
+    if (container) {
+      const width = grid.clientWidth || container.clientWidth;
+      if (width > 0) cachedGridWidth = width;
+      const containerRect = container.getBoundingClientRect();
+      cachedListTop = gridRect.top - containerRect.top + container.scrollTop;
+      cachedViewportHeight = container.clientHeight;
+    } else if (typeof window !== 'undefined') {
+      const width = grid.clientWidth || window.innerWidth;
+      if (width > 0) cachedGridWidth = width;
+      cachedListTop = gridRect.top + window.scrollY;
+      cachedViewportHeight = window.innerHeight;
+    }
+    layoutMetricsDirty = false;
+  }
+
+  function refreshVirtualMetrics(): void {
+    refreshTypographyMetrics();
+    refreshLayoutMetrics();
+  }
+
+  function handleWindowResize(): void {
+    typographyMetricsDirty = true;
+    layoutMetricsDirty = true;
+    scheduleVirtualWindow();
+  }
+
+  function bookIndexFromNode(node: EventTarget | null): number {
+    if (!virtualGrid || !(node instanceof Element)) return -1;
+    let current: Element | null = node;
+    while (current && current !== virtualGrid) {
+      if (current instanceof HTMLElement) {
+        const rawIndex = current.dataset.bookIndex;
+        if (rawIndex !== undefined) {
+          const parsed = Number(rawIndex);
+          return Number.isInteger(parsed) &&
+            parsed >= 0 &&
+            visibleBooks[parsed]?.id === current.dataset.bookId
+            ? parsed
+            : -1;
+        }
+      }
+      current = current.parentElement;
+    }
+    return -1;
+  }
+
+  function syncFocusedRow(columns = gridColumns): void {
+    const index = bookIndexFromNode(activeElement());
+    const nextFocused = index >= 0 ? Math.floor(index / columns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
+  }
+
+  function handleResultsFocusIn(event: FocusEvent): void {
+    const index = bookIndexFromNode(event.target);
+    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
+  }
+
+  function handleResultsFocusOut(event: FocusEvent): void {
+    const index = bookIndexFromNode(event.relatedTarget);
+    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
+    if (focusedRow !== nextFocused) focusedRow = nextFocused;
   }
 
   function scheduleVirtualWindow(): void {
@@ -406,53 +501,55 @@
 
   function updateVirtualWindow(): void {
     if (destroyed || !virtualGrid) return;
-    const width = virtualGrid.clientWidth;
-    const nextColumns = width > 0 ? columnsForWidth(width) : gridColumns;
-    const nextRowHeight = width > 0 ? rowHeightFor(width, nextColumns) : rowHeight;
-    if (gridColumns !== nextColumns) gridColumns = nextColumns;
+    if (typographyMetricsDirty) refreshTypographyMetrics();
+    if (layoutMetricsDirty) refreshLayoutMetrics();
+
+    const nextColumns = columnsForWidth(cachedGridWidth, viewMode);
+    const nextRowHeight = rowHeightFor(
+      cachedGridWidth,
+      nextColumns,
+      viewMode,
+      cachedRootFontPx,
+      cachedTextScaling,
+    );
+    const columnsChanged = gridColumns !== nextColumns;
+    if (columnsChanged) gridColumns = nextColumns;
     if (rowHeight !== nextRowHeight) rowHeight = nextRowHeight;
+    if (columnsChanged && focusedRow >= 0) syncFocusedRow(nextColumns);
 
-    const activeCard = document.activeElement?.closest<HTMLElement>('[data-book-index]');
-    const activeIndex = Number(activeCard?.dataset.bookIndex);
-    focusedRow =
-      activeCard && visibleBooks[activeIndex]?.id === activeCard.dataset.bookId
-        ? Math.floor(activeIndex / nextColumns)
-        : -1;
-
-    const gridRect = virtualGrid.getBoundingClientRect();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
+    let scrollOffset: number;
     if (scrollContainer) {
-      const containerRect = scrollContainer.getBoundingClientRect();
-      const listTop = gridRect.top - containerRect.top + scrollContainer.scrollTop;
-      virtualWindow = calculateVirtualWindow(
-        visibleBooks.length,
-        nextColumns,
-        nextRowHeight,
-        scrollContainer.scrollTop - listTop,
-        scrollContainer.clientHeight,
-        VIRTUALIZATION_OVERSCAN_ROWS,
-      );
+      scrollOffset = scrollContainer.scrollTop - cachedListTop;
+    } else if (typeof window !== 'undefined') {
+      scrollOffset = window.scrollY - cachedListTop;
+    } else {
       return;
     }
-    if (typeof window === 'undefined') return;
-    virtualWindow = calculateVirtualWindow(
+
+    const nextWindow = calculateVirtualWindow(
       visibleBooks.length,
       nextColumns,
       nextRowHeight,
-      -gridRect.top,
-      window.innerHeight,
+      scrollOffset,
+      cachedViewportHeight,
       VIRTUALIZATION_OVERSCAN_ROWS,
     );
+    if (!isSameVirtualWindow(virtualWindow, nextWindow)) {
+      virtualWindow = nextWindow;
+    }
   }
 
   async function scrollToBook(index: number): Promise<HTMLElement | null> {
     const grid = virtualGrid;
     if (!grid) return null;
+    refreshVirtualMetrics();
     updateVirtualWindow();
-    const top = grid.getBoundingClientRect().top + Math.floor(index / gridColumns) * rowHeight;
-    const container = libraryMain?.closest<HTMLElement>('.app-stage');
-    if (container) container.scrollTop += top - container.getBoundingClientRect().top;
-    else window.scrollBy({ top, behavior: 'instant' });
+    const rowTop = Math.floor(index / gridColumns) * rowHeight;
+    if (scrollContainer) {
+      scrollContainer.scrollTop = cachedListTop + rowTop;
+    } else if (typeof window !== 'undefined') {
+      window.scrollBy({ top: cachedListTop - window.scrollY + rowTop, behavior: 'instant' });
+    }
     updateVirtualWindow();
     await tick();
     return grid.querySelector(`[data-book-index="${index}"]`);
@@ -486,7 +583,14 @@
   }
 
   $effect(() => {
-    if (!reading && visibleBooks.length > 0) scheduleVirtualWindow();
+    if (!reading && visibleBooks.length > 0) {
+      untrack(() => {
+        if (focusedRow >= 0) syncFocusedRow();
+        scheduleVirtualWindow();
+      });
+    } else if (untrack(() => focusedRow) !== -1) {
+      focusedRow = -1;
+    }
   });
 
   $effect(() => {
@@ -497,23 +601,77 @@
   });
 
   $effect(() => {
-    if (viewMode === 'grid' || viewMode === 'list') scheduleVirtualWindow();
+    if (viewMode === 'grid' || viewMode === 'list') {
+      untrack(() => scheduleVirtualWindow());
+    }
   });
 
   $effect(() => {
-    if (!virtualGrid || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => scheduleVirtualWindow());
-    observer.observe(virtualGrid);
-    scheduleVirtualWindow();
-    return () => observer.disconnect();
+    if (theme === observedTheme) return;
+    observedTheme = theme;
+    untrack(() => {
+      typographyMetricsDirty = true;
+      layoutMetricsDirty = true;
+      scheduleVirtualWindow();
+    });
+  });
+
+  $effect(() => {
+    const grid = virtualGrid;
+    const main = libraryMain;
+    if (!grid) return;
+
+    return untrack(() => {
+      refreshVirtualMetrics();
+      updateVirtualWindow();
+
+      const resizeObserver =
+        typeof ResizeObserver !== 'undefined'
+          ? new ResizeObserver(() => {
+              typographyMetricsDirty = true;
+              layoutMetricsDirty = true;
+              scheduleVirtualWindow();
+            })
+          : null;
+      resizeObserver?.observe(grid);
+      if (main) resizeObserver?.observe(main);
+      if (scrollContainer) resizeObserver?.observe(scrollContainer);
+
+      const mutationObserver =
+        typeof MutationObserver !== 'undefined'
+          ? new MutationObserver((records) => {
+              for (const record of records) {
+                if (record.type === 'attributes') {
+                  typographyMetricsDirty = true;
+                }
+                layoutMetricsDirty = true;
+              }
+              scheduleVirtualWindow();
+            })
+          : null;
+      if (typeof document !== 'undefined') {
+        mutationObserver?.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: ['style', 'class', 'data-theme'],
+        });
+      }
+      if (main) mutationObserver?.observe(main, { childList: true });
+      if (scrollContainer) mutationObserver?.observe(scrollContainer, { childList: true });
+
+      return () => {
+        resizeObserver?.disconnect();
+        mutationObserver?.disconnect();
+      };
+    });
   });
 
   onMount(async () => {
     void cleanupInterruptedEpubDownloads();
-    const scrollContainer = libraryMain?.closest<HTMLElement>('.app-stage');
-    scrollTarget = scrollContainer ?? window;
+    const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
+    scrollContainer = container;
+    scrollTarget = container ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
-    window.addEventListener('resize', scheduleVirtualWindow);
+    window.addEventListener('resize', handleWindowResize);
     scheduleVirtualWindow();
 
     const [preferences, savedBooks] = await Promise.all([
@@ -672,7 +830,7 @@
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
-    window.removeEventListener('resize', scheduleVirtualWindow);
+    window.removeEventListener('resize', handleWindowResize);
     openProgressProbe?.abort();
     refreshController?.abort();
     cancelCoverLoading();
@@ -1685,7 +1843,6 @@
       <button
         class="card preset-tonal-surface mt-6 flex w-full cursor-pointer items-center gap-4 p-3 text-left sm:gap-5 sm:p-4"
         type="button"
-        aria-label={`Continue reading ${continueBook.title}, ${Math.round(progressOf(continueBook))}% complete`}
         onclick={() => void open(continueBook!)}
         transition:fade
       >
@@ -1723,6 +1880,11 @@
             </div>
             <span class="text-xs tabular-nums text-surface-700-300">
               {Math.round(progressOf(continueBook))}%
+              <span class="sr-only">
+                {continueBook.remoteAvailable === false
+                  ? 'complete, removed from server'
+                  : 'complete'}
+              </span>
             </span>
           </div>
         </div>
@@ -1952,19 +2114,18 @@
       >
         <p class="min-w-0 flex-1">{message}</p>
         {#if downloadingBookId}
-          {@const downloadingTitle =
-            books.find((book) => book.id === downloadingBookId)?.title ?? 'book'}
+          {@const downloadingBook = books.find((book) => book.id === downloadingBookId)}
           <div class="flex shrink-0 items-center gap-2">
             <div
               class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
               role="progressbar"
-              aria-label={`Download progress for ${downloadingTitle}`}
+              aria-label={downloadingBook
+                ? downloadProgressLabel(downloadingBook)
+                : 'Download progress for book'}
               aria-valuemin="0"
               aria-valuemax="100"
               aria-valuenow={downloadPercent ?? undefined}
-              aria-valuetext={downloadPercent === null
-                ? 'Download in progress'
-                : `${downloadPercent}% downloaded`}
+              aria-valuetext={downloadProgressValueText(downloadPercent)}
             >
               <div
                 class="h-full preset-filled-primary-600-400"
@@ -2111,18 +2272,18 @@
         id="library-results"
         bind:this={virtualGrid}
         class="relative mt-8"
-        style={`height: ${Math.max(0, virtualWindow.totalHeight - GRID_ROW_GAP_PX)}px`}
+        style={`height: ${resultsContainerHeight(virtualWindow.totalHeight, viewMode)}px; contain: layout style;`}
         tabindex="-1"
         aria-label="Books"
-        onfocusin={scheduleVirtualWindow}
-        onfocusout={scheduleVirtualWindow}
+        onfocusin={handleResultsFocusIn}
+        onfocusout={handleResultsFocusOut}
       >
         {#each renderedRows as rowIndex (rowIndex)}
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
             class="absolute inset-x-0 grid gap-x-4"
-            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr));`}
+            style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr)); contain: size layout style;`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}
@@ -2140,10 +2301,7 @@
                     <div
                       class="preset-tonal-surface relative flex min-h-24 items-center gap-4 rounded-lg p-3 pr-16 text-left shadow-md transition-shadow duration-300 group-hover:shadow-xl"
                     >
-                      <div
-                        class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md"
-                        aria-hidden="true"
-                      >
+                      <div class="relative h-20 w-14 shrink-0 overflow-hidden rounded-md">
                         {#if covers.get(book.seriesId)}
                           <img
                             class="h-full w-full object-cover"
@@ -2155,6 +2313,7 @@
                         {/if}
                         {#if book.downloadPath && book.remoteAvailable !== false}
                           <span
+                            aria-hidden="true"
                             class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
                           >
                             <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2175,6 +2334,7 @@
                                 d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
                               />
                             </svg>
+                            <span class="sr-only">Removed from server</span>
                           </span>
                         {/if}
                       </div>
@@ -2194,13 +2354,11 @@
                           <div
                             class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
                             role="progressbar"
-                            aria-label={`Download progress for ${book.title}`}
+                            aria-label={downloadProgressLabel(book)}
                             aria-valuemin="0"
                             aria-valuemax="100"
                             aria-valuenow={downloadPercent ?? undefined}
-                            aria-valuetext={downloadPercent === null
-                              ? 'Download in progress'
-                              : `${downloadPercent}% downloaded`}
+                            aria-valuetext={downloadProgressValueText(downloadPercent)}
                           >
                             <div
                               class="h-full preset-filled-primary-600-400"
@@ -2233,10 +2391,20 @@
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book, false)}
+                      aria-label={openBookLabel(book, {
+                        includeProgress: false,
+                        downloadingBookId,
+                        downloadPercent,
+                      })}
                       disabled={downloadingBookId === book.id}
                     >
-                      <span class="sr-only">{openBookLabel(book)}</span>
+                      <span class="sr-only">
+                        {openBookLabel(book, {
+                          includeProgress: false,
+                          downloadingBookId,
+                          downloadPercent,
+                        })}
+                      </span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -2244,7 +2412,7 @@
                       data-book-actions
                       onclick={() => openMenu(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={`Book actions for ${book.title}`}
+                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
                       title="More actions"
                     >
                       <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2271,6 +2439,7 @@
                       {/if}
                       {#if book.downloadPath && book.remoteAvailable !== false}
                         <span
+                          aria-hidden="true"
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
                         >
                           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2291,11 +2460,18 @@
                               d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
                             />
                           </svg>
+                          <span class="sr-only">Removed from server</span>
                         </span>
                       {/if}
                       {#if downloadingBookId === book.id}
                         <span
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
+                          role="progressbar"
+                          aria-label={downloadProgressLabel(book)}
+                          aria-valuemin="0"
+                          aria-valuemax="100"
+                          aria-valuenow={downloadPercent ?? undefined}
+                          aria-valuetext={downloadProgressValueText(downloadPercent)}
                         >
                           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 animate-spin">
                             <path
@@ -2328,10 +2504,12 @@
                       data-book-open
                       onclick={() => void open(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book)}
+                      aria-label={openBookLabel(book, { downloadingBookId, downloadPercent })}
                       disabled={downloadingBookId === book.id}
                     >
-                      <span class="sr-only">{openBookLabel(book)}</span>
+                      <span class="sr-only">
+                        {openBookLabel(book, { downloadingBookId, downloadPercent })}
+                      </span>
                     </button>
                     <button
                       class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
@@ -2339,7 +2517,7 @@
                       data-book-actions
                       onclick={() => openMenu(book)}
                       onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={`Book actions for ${book.title}`}
+                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
                       title="More actions"
                     >
                       <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
@@ -2382,6 +2560,9 @@
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
+      aria-describedby={actionMenuBook.remoteAvailable === false
+        ? 'book-actions-removed-warning'
+        : undefined}
       tabindex="-1"
       use:modalFocusTrap={closeMenu}
       transition:fly={{ y: 16, duration: 150 }}
@@ -2411,6 +2592,28 @@
           </svg>
         </button>
       </div>
+
+      {#if actionMenuBook.remoteAvailable === false}
+        <div
+          id="book-actions-removed-warning"
+          class="mt-4 flex items-start gap-2.5 rounded-xl border border-warning-600-400 bg-warning-500/15 p-3 text-sm text-surface-950-50"
+        >
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            class="mt-0.5 h-5 w-5 shrink-0 text-warning-800-200"
+          >
+            <path
+              fill="currentColor"
+              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+            />
+          </svg>
+          <p>
+            Removed from server. Removing this download deletes your saved copy, and it cannot be
+            downloaded again from Kavita.
+          </p>
+        </div>
+      {/if}
 
       <div class="mt-4 grid gap-2">
         <button
@@ -2481,6 +2684,9 @@
           <button
             class="btn preset-outlined-error-500 justify-start"
             type="button"
+            aria-describedby={actionMenuBook.remoteAvailable === false
+              ? 'book-actions-removed-warning'
+              : undefined}
             onclick={() => {
               const book = actionMenuBook;
               closeMenu();
