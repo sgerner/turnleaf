@@ -156,6 +156,7 @@ import {
   type ServerConfig,
 } from '../database/database';
 import { EpubTransferError } from '../downloads/native-download';
+import { KavitaError } from '../kavita/client';
 import Library from './Library.svelte';
 
 const server: ServerConfig = {
@@ -774,5 +775,33 @@ describe('Library download banners, cancellation, and offline guards', () => {
     mocks.emitNetworkEvent(false);
 
     await vi.waitFor(() => expect(callOrder).toEqual(['flushProgress', 'getBookSeries']));
+  });
+
+  it('passes serverOrigin to downloadEpub and surfaces redirect KavitaError on the decoupled failure alert', async () => {
+    const book = makeBook({ chapterId: 1, title: 'Redirect Guard Book' });
+    await reconcileBooks(server.id, [book]);
+    setupCatalogFromBooks([book]);
+
+    mocks.downloadEpub.mockRejectedValueOnce(
+      new KavitaError(
+        'Kavita redirected to a different server. Update the saved address to its final address.',
+        'server',
+        302,
+      ),
+    );
+
+    await mountLibrary();
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(1));
+    await flushUi();
+
+    expect(mocks.downloadEpub.mock.calls[0]?.[4]).toBeInstanceOf(AbortSignal);
+    expect(mocks.downloadEpub.mock.calls[0]?.[5]).toBe('https://kavita.example');
+    const failureBanner = document.querySelector('[data-banner="download-failure"]');
+    expect(failureBanner?.getAttribute('role')).toBe('alert');
+    expect(failureBanner?.textContent).toContain('Kavita redirected to a different server.');
+    expect(document.querySelector('[data-banner="status-message"]')).toBeNull();
   });
 });

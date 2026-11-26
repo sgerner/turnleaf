@@ -2,6 +2,13 @@ import { Capacitor } from '@capacitor/core';
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { recordDiagnostic } from '../diagnostics/log';
+import {
+  advanceRedirect,
+  assertSafeTransferTarget,
+  createRedirectState,
+  KavitaError,
+  nativeHeader,
+} from '../kavita/redirects';
 import { EpubValidationError, validateEpubArchive } from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
@@ -75,13 +82,12 @@ function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function isTimeoutFailure(
-  failure: {
+function isTimeoutFailure(error: unknown): boolean {
+  const failure = error as {
     code?: unknown;
     message?: unknown;
     data?: { exception?: unknown };
-  } | null,
-): boolean {
+  } | null;
   const text = `${typeof failure?.message === 'string' ? failure.message : ''} ${
     typeof failure?.data?.exception === 'string' ? failure.data.exception : ''
   }`;
@@ -171,20 +177,107 @@ export function cleanupInterruptedEpubDownloads(): Promise<void> {
   return interruptedDownloadCleanup;
 }
 
+interface NativeTransferFailure {
+  code?: unknown;
+  data?: {
+    code?: unknown;
+    httpStatus?: unknown;
+    headers?: unknown;
+  };
+}
+
+function readTransferFailure(error: unknown): {
+  code: string | undefined;
+  status: number | undefined;
+  headers: Record<string, unknown> | null;
+} {
+  const failure = error as NativeTransferFailure | null;
+  const code =
+    typeof failure?.code === 'string'
+      ? failure.code
+      : typeof failure?.data?.code === 'string'
+        ? failure.data.code
+        : undefined;
+  const httpStatus = failure?.data?.httpStatus;
+  const status =
+    typeof httpStatus === 'number' &&
+    Number.isInteger(httpStatus) &&
+    httpStatus >= 100 &&
+    httpStatus <= 599
+      ? httpStatus
+      : undefined;
+  const headers =
+    failure?.data?.headers && typeof failure.data.headers === 'object'
+      ? (failure.data.headers as Record<string, unknown>)
+      : null;
+  return { code, status, headers };
+}
+
+async function downloadFileWithRedirects(options: {
+  initialUrl: string;
+  normalizedInitialUrl: string;
+  serverOrigin: string;
+  path: string;
+  apiKey: string;
+  progress?: boolean;
+  connectTimeout?: number;
+  readTimeout?: number;
+  signal?: AbortSignal | undefined;
+  onHop?: ((url: string) => void) | undefined;
+}): Promise<void> {
+  const redirects = createRedirectState(
+    options.initialUrl,
+    options.serverOrigin,
+    'GET',
+    options.normalizedInitialUrl,
+  );
+  while (true) {
+    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    options.onHop?.(redirects.currentUrl);
+    try {
+      await FileTransfer.downloadFile({
+        url: redirects.currentUrl,
+        path: options.path,
+        headers: { 'x-api-key': options.apiKey },
+        disableRedirects: true,
+        ...(options.progress ? { progress: true } : {}),
+        ...(options.connectTimeout !== undefined ? { connectTimeout: options.connectTimeout } : {}),
+        ...(options.readTimeout !== undefined ? { readTimeout: options.readTimeout } : {}),
+      });
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      return;
+    } catch (error) {
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const { code, status, headers } = readTransferFailure(error);
+      if (code === 'OS-PLUG-FLTR-0010' && status !== undefined && status >= 300 && status < 400) {
+        const nextUrl = advanceRedirect(redirects, status, nativeHeader(headers, 'location'));
+        if (nextUrl) continue;
+      }
+      throw error;
+    }
+  }
+}
+
 export async function downloadEpub(
   downloadUrl: string,
   apiKey: string,
   bookId: string,
   onProgress?: (percent: number) => void,
   signal?: AbortSignal,
+  serverOrigin?: string,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
-  if (!/^https?:\/\//i.test(downloadUrl)) throw new Error('Invalid Kavita download address.');
+  const target = assertSafeTransferTarget(
+    downloadUrl,
+    serverOrigin,
+    'Invalid Kavita download address.',
+  );
   assertSafeBookId(bookId);
 
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   let temporaryPath: string | null = null;
   let activeAttemptId = 0;
+  let activeHopUrl = target.url;
   let listener: { remove: () => Promise<void> } | null = null;
 
   try {
@@ -201,7 +294,7 @@ export async function downloadEpub(
                 !signal?.aborted &&
                 latestAttemptByBook.get(bookId) === activeAttemptId &&
                 event.type === 'download' &&
-                event.url === downloadUrl &&
+                event.url === activeHopUrl &&
                 event.lengthComputable &&
                 event.contentLength > 0 &&
                 Number.isFinite(event.bytes)
@@ -231,13 +324,19 @@ export async function downloadEpub(
         );
         let attemptAbandoned = false;
         let transferSettled = false;
-        const transfer = FileTransfer.downloadFile({
-          url: downloadUrl,
+        const transfer = downloadFileWithRedirects({
+          initialUrl: target.url,
+          normalizedInitialUrl: target.normalizedUrl,
+          serverOrigin: target.serverOrigin,
           path: destination.uri,
-          headers: { 'x-api-key': apiKey },
+          apiKey,
+          progress: Boolean(listener),
           connectTimeout: EPUB_CONNECT_TIMEOUT_MS,
           readTimeout: EPUB_READ_TIMEOUT_MS,
-          ...(listener ? { progress: true } : {}),
+          signal,
+          onHop: (url) => {
+            activeHopUrl = url;
+          },
         });
         void transfer
           .finally(() => {
@@ -264,21 +363,10 @@ export async function downloadEpub(
         if (isAbortError(error) || signal?.aborted) {
           throw createAbortError();
         }
-        const failure = error as {
-          code?: unknown;
-          message?: unknown;
-          data?: { httpStatus?: unknown; exception?: unknown };
-        } | null;
-        const httpStatus = failure?.data?.httpStatus;
-        const status =
-          typeof httpStatus === 'number' &&
-          Number.isInteger(httpStatus) &&
-          httpStatus >= 100 &&
-          httpStatus <= 599
-            ? httpStatus
-            : undefined;
-        const timedOut = status === undefined && isTimeoutFailure(failure);
-        const connectionFailed = failure?.code === 'OS-PLUG-FLTR-0008';
+        if (error instanceof KavitaError) throw error;
+        const { code, status } = readTransferFailure(error);
+        const timedOut = status === undefined && isTimeoutFailure(error);
+        const connectionFailed = code === 'OS-PLUG-FLTR-0008';
         const retryable =
           status === undefined ? connectionFailed || timedOut : RETRYABLE_HTTP_STATUSES.has(status);
         if (attempt > 0 || !retryable) {
@@ -433,8 +521,14 @@ export async function cacheCover(
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
+  serverOrigin?: string,
 ): Promise<string> {
   if (signal?.aborted) throw createAbortError();
+  const target = assertSafeTransferTarget(
+    downloadUrl,
+    serverOrigin,
+    'Invalid Kavita cover address.',
+  );
   const namespace = safeCoverNamespace(cacheNamespace);
   const directory = `covers/${namespace}`;
   const path = `${directory}/${seriesId}.img`;
@@ -451,12 +545,15 @@ export async function cacheCover(
     if (signal?.aborted) throw createAbortError();
     if (!(await canDownload())) throw new Error('Offline');
     try {
-      await FileTransfer.downloadFile({
-        url: downloadUrl,
+      await downloadFileWithRedirects({
+        initialUrl: target.url,
+        normalizedInitialUrl: target.normalizedUrl,
+        serverOrigin: target.serverOrigin,
         path: temporary.uri,
-        headers: { 'x-api-key': apiKey },
+        apiKey,
         connectTimeout: 5_000,
         readTimeout: 5_000,
+        signal,
       });
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)
