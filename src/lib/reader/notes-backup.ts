@@ -42,9 +42,6 @@ export interface ExportDocumentResult {
   fallbackText: string;
 }
 
-const MAX_BOOKMARKS = 100;
-const MAX_ANNOTATIONS = 200;
-
 export function bookmarksPreferenceKey(bookId: string): string {
   return `${BOOKMARKS_PREFERENCE_PREFIX}${bookId}`;
 }
@@ -362,9 +359,7 @@ export function mergeBookmarks(
   for (const item of existing) {
     if (!merged.has(item.id)) merged.set(item.id, item);
   }
-  return [...merged.values()]
-    .sort((a, b) => b.savedAt.localeCompare(a.savedAt))
-    .slice(0, MAX_BOOKMARKS);
+  return [...merged.values()].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
 }
 
 export function mergeAnnotations(
@@ -374,9 +369,7 @@ export function mergeAnnotations(
   const byCfi = new Map<string, StoredAnnotation>();
   for (const item of existing) byCfi.set(item.cfi, item);
   for (const item of incoming) byCfi.set(item.cfi, item);
-  return [...byCfi.values()]
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-    .slice(-MAX_ANNOTATIONS);
+  return [...byCfi.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 export function buildRestorePreferencesUpdate(
