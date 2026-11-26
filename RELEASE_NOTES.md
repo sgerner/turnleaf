@@ -6,6 +6,8 @@
 - Stop in-flight Kavita study sync, cover, and download requests when connectivity drops
 - Replace regex HTML tag stripping in annotation comment normalization
 - Sync annotations and bookmarks with Kavita and isolate study data per server
+- ci: pin AVD cache actions and retain Gradle cache
+- ci: cache Android AVD snapshots and prune unused Gradle cache
 - Remove unreachable guards in ReaderSession
 - fix: format Svelte components with plugin 4.2
 - Set autocomplete off on library name input
