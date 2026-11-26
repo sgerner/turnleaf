@@ -14,11 +14,11 @@ import {
 const scriptPath = resolve(dirname(fileURLToPath(import.meta.url)), 'check-workflow-pins.mjs');
 
 describe('workflow SHA pin verification', () => {
-  it('passes on all repository workflows with 27 pinned uses steps', async () => {
+  it('passes on all repository workflows with 28 pinned uses steps', async () => {
     const result = await checkWorkflowPins();
     expect(result.ok).toBe(true);
     expect(result.workflowCount).toBe(4);
-    expect(result.checkedCount).toBe(27);
+    expect(result.checkedCount).toBe(28);
     expect(result.violations).toEqual([]);
   });
 
