@@ -899,7 +899,7 @@ it('fetches remaining series pages with bounded concurrency of 4 and no trailing
   let maxActive = 0;
   const pending: Array<() => void> = [];
 
-  const fetchMock = vi.fn((input: string | URL | Request) => {
+  const fetchMock = vi.fn((input: string | URL | Request, _init?: RequestInit) => {
     const url = new URL(String(input));
     const pageNumber = Number(url.searchParams.get('PageNumber'));
     if (pageNumber === 1) {
@@ -943,6 +943,20 @@ it('fetches remaining series pages with bounded concurrency of 4 and no trailing
   const series = await promise;
   expect(maxActive).toBe(4);
   expect(fetchMock).toHaveBeenCalledTimes(totalPages);
+  const expectedBody = JSON.stringify({
+    statements: [{ field: 21, comparison: 5, value: '3' }],
+    combination: 0,
+    sortOptions: { sortField: 1, isAscending: true },
+    limitTo: 0,
+  });
+  for (const [, init] of fetchMock.mock.calls) {
+    expect(init).toEqual(
+      expect.objectContaining({
+        method: 'POST',
+        body: expectedBody,
+      }),
+    );
+  }
   expect(series).toHaveLength(totalPages * 500);
   expect(series[0]?.id).toBe(1);
   expect(series[series.length - 1]?.id).toBe(5000);
@@ -1136,7 +1150,7 @@ it('rejects excessive totalPages in Pagination header immediately on page 1', as
 });
 
 it('fetches trailing pages sequentially when concurrent server writes increase totalPages', async () => {
-  const fetchMock = vi.fn((input: string | URL | Request) => {
+  const fetchMock = vi.fn((input: string | URL | Request, _init?: RequestInit) => {
     const url = new URL(String(input));
     const pageNumber = Number(url.searchParams.get('PageNumber'));
     if (pageNumber === 1) {
@@ -1167,6 +1181,20 @@ it('fetches trailing pages sequentially when concurrent server writes increase t
   const series = await new KavitaClient('https://books.example.com', 'abc123').getBookSeries();
 
   expect(fetchMock).toHaveBeenCalledTimes(3);
+  const expectedBody = JSON.stringify({
+    statements: [{ field: 21, comparison: 5, value: '3' }],
+    combination: 0,
+    sortOptions: { sortField: 1, isAscending: true },
+    limitTo: 0,
+  });
+  for (const [, init] of fetchMock.mock.calls) {
+    expect(init).toEqual(
+      expect.objectContaining({
+        method: 'POST',
+        body: expectedBody,
+      }),
+    );
+  }
   expect(series).toHaveLength(1005);
   expect(series[1004]?.id).toBe(1005);
 });

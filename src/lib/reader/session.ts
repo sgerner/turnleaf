@@ -550,7 +550,11 @@ export class ReaderSession {
       if (this.userNavigationPending && !isUserNavigation && !this.userNavigationStartCfi) {
         this.userNavigationStartCfi = location.start.cfi;
       }
-      if (isUserNavigation || (this.userNavigationReady && !this.reflowPending)) {
+      if (
+        isUserNavigation ||
+        this.userNavigationOrigin === 'link' ||
+        (this.userNavigationReady && !this.reflowPending)
+      ) {
         this.userNavigationPending = false;
         this.userNavigationReady = false;
         this.userNavigationStartCfi = null;
