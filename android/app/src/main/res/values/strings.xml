@@ -2,6 +2,4 @@
 <resources>
     <string name="app_name">Turnleaf</string>
     <string name="title_activity_main">Turnleaf</string>
-    <string name="package_name">app.turnleaf.reader</string>
-    <string name="custom_url_scheme">app.turnleaf.reader</string>
 </resources>
