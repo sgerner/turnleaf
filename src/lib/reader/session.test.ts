@@ -18,8 +18,12 @@ const { testState, mockBook, mockRendition, createBookMock } = vi.hoisted(() => 
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
-    themes: { register: vi.fn(), select: vi.fn() },
+    themes: { register: vi.fn(), select: vi.fn() } as {
+      register: (...args: unknown[]) => void;
+      select: (name: string) => void;
+    },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
+    location: undefined as { start: { cfi: string } } | undefined,
     getContents: vi.fn(() => {
       const active = state.sections[state.activeSectionIndex];
       return active ? [active.contents] : [];
@@ -69,7 +73,7 @@ vi.mock('epubjs', async (importOriginal) => {
   };
 });
 
-import { Contents } from 'epubjs';
+import { Book, Contents, Rendition } from 'epubjs';
 import { ReaderSession } from './session';
 
 function createSectionContents(
@@ -758,6 +762,102 @@ describe('ReaderSession XPath restoration', () => {
   });
 });
 
+describe('ReaderSession publisher formatting cascade', () => {
+  it('preserves .scene-break and .epigraph styles when publisherStyles is true and overrides cleanly on toggle', async () => {
+    const frame = document.createElement('iframe');
+    document.body.appendChild(frame);
+    const originalThemes = mockRendition.themes;
+    try {
+      const chapterDoc = frame.contentDocument!;
+      chapterDoc.open();
+      chapterDoc.write(`<!doctype html><html><head><style>
+        .scene-break { text-align: center; margin: 1.5em 0; }
+        .epigraph { text-align: right; margin: 1.5em 2em; }
+        .epigraph p { margin-bottom: 0.25em; }
+      </style></head><body>
+        <p id="body-copy">Ordinary paragraph</p>
+        <p id="scene-break" class="scene-break">* * *</p>
+        <blockquote class="epigraph"><p id="epigraph-line">Epigraph quote</p></blockquote>
+      </body></html>`);
+      chapterDoc.close();
+
+      const contents = Object.assign(Object.create(Contents.prototype) as Contents, {
+        document: chapterDoc,
+        content: chapterDoc.body,
+        locationOf: vi.fn(async () => ({ left: 0, top: 0 })),
+      });
+      testState.activeSectionIndex = 0;
+      testState.sections = [{ href: 'chapter-one.xhtml', index: 0, contents }];
+
+      const realThemes = new Rendition(new Book(), {})
+        .themes as unknown as typeof mockRendition.themes & {
+        rendition: unknown;
+      };
+      realThemes.rendition = mockRendition;
+      mockRendition.themes = realThemes;
+      mockRendition.location = { start: { cfi: 'epubcfi(/6/2!/4/2:0)' } };
+      mockRendition.display.mockClear();
+
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      mockRendition.display.mockClear();
+
+      const styleOf = (id: string) =>
+        frame.contentWindow!.getComputedStyle(chapterDoc.getElementById(id)!);
+
+      expect(styleOf('body-copy').textAlign).toBe('start');
+      expect(styleOf('body-copy').marginBottom).toBe('10.8px');
+      expect(styleOf('scene-break').textAlign).toBe('center');
+      expect(styleOf('scene-break').marginBottom).toBe('27px');
+      expect(styleOf('epigraph-line').textAlign).toBe('right');
+      expect(styleOf('epigraph-line').marginBottom).toBe('4.5px');
+
+      session.applyAppearance({
+        ...defaultAppearance,
+        alignment: 'justify',
+        publisherStyles: false,
+      });
+
+      expect(styleOf('body-copy').textAlign).toBe('justify');
+      expect(styleOf('scene-break').textAlign).toBe('justify');
+      expect(styleOf('scene-break').marginBottom).toBe('10.8px');
+      expect(styleOf('epigraph-line').textAlign).toBe('justify');
+      expect(styleOf('epigraph-line').marginBottom).toBe('10.8px');
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/2!/4/2:0)');
+
+      mockRendition.display.mockClear();
+      session.applyAppearance({
+        ...defaultAppearance,
+        alignment: 'justify',
+        publisherStyles: true,
+      });
+
+      expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
+      expect(styleOf('body-copy').textAlign).toBe('justify');
+      expect(styleOf('scene-break').textAlign).toBe('center');
+      expect(styleOf('scene-break').marginBottom).toBe('27px');
+      expect(styleOf('epigraph-line').textAlign).toBe('right');
+      expect(styleOf('epigraph-line').marginBottom).toBe('4.5px');
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/2!/4/2:0)');
+
+      session.destroy();
+    } finally {
+      mockRendition.themes = originalThemes;
+      mockRendition.location = undefined;
+      testState.sections = [];
+      frame.remove();
+    }
+  });
+});
+
 describe('ReaderSession styled iframe expansion before CFI positioning', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -917,7 +1017,7 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
     },
   );
 
-  it('expands active views via non-iterable Views.forEach before preserveCfi reflows on appearance changes', async () => {
+  it('expands only active rendered views via non-iterable Views.forEach before preserveCfi reflows on appearance changes', async () => {
     const targetCfi = 'epubcfi(/6/2!/4/2/12:0)';
     const harness = createSimulatedEpubHarness([
       {
@@ -945,6 +1045,25 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
       vi.fn(),
     );
 
+    const unrenderedExpand = vi.fn<() => void>();
+    const unrenderedResizeCheck = vi.fn<() => void>();
+    harness.activeViews.push({
+      section: harness.activeViews[0]!.section,
+      displayed: false,
+      width: () => 0,
+      destroy: vi.fn(),
+      expand: unrenderedExpand,
+      contents: {
+        document: document.implementation.createHTMLDocument('unrendered'),
+        window: window as unknown as Window,
+        sectionIndex: 1,
+        cfiFromRange: () => '',
+        resizeCheck: unrenderedResizeCheck,
+      },
+      pane: { render: vi.fn<() => void>() },
+      locationOf: () => ({ left: 0, top: 0 }),
+    });
+
     const activeView = harness.activeViews[0]!;
     activeView.contents!.resizeCheck.mockClear();
     activeView.expand.mockClear();
@@ -952,15 +1071,16 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
     onLocation.mockClear();
 
     session.applyAppearance({ ...defaultAppearance, fontSize: 34 });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(onLocation).toHaveBeenCalledOnce());
 
     expect(harness.rendition.views).toHaveBeenCalled();
     expect(activeView.contents!.resizeCheck).toHaveBeenCalled();
     expect(activeView.expand).toHaveBeenCalled();
     expect(activeView.pane!.render).toHaveBeenCalled();
+    expect(unrenderedResizeCheck).not.toHaveBeenCalled();
+    expect(unrenderedExpand).not.toHaveBeenCalled();
     expect(harness.getScrollWidth()).toBe(14 * 300);
     expect(harness.getScrollLeft()).toBe(11 * 300);
-    expect(onLocation).toHaveBeenCalledOnce();
     expect(onLocation).toHaveBeenCalledWith(
       expect.objectContaining({
         cfi: targetCfi,
@@ -972,11 +1092,10 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
 
     onLocation.mockClear();
     session.applyAppearance({ ...defaultAppearance, fontSize: 18 });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(onLocation).toHaveBeenCalledOnce());
 
     expect(harness.getScrollWidth()).toBe(6 * 300);
     expect(harness.getScrollLeft()).toBe(4 * 300);
-    expect(onLocation).toHaveBeenCalledOnce();
     expect(onLocation).toHaveBeenCalledWith(
       expect.objectContaining({
         cfi: targetCfi,
@@ -984,6 +1103,81 @@ describe('ReaderSession styled iframe expansion before CFI positioning', () => {
         pageCount: 6,
       }),
       'restore',
+    );
+
+    session.destroy();
+  });
+
+  it('cancels stale restore operations when superseded by user navigation before open finishes', async () => {
+    const staleRestoreCfi = 'epubcfi(/6/2!/4/2/18:0)';
+    const freshNavCfi = 'epubcfi(/6/4!/4/2/24:0)';
+    const chapter1Css = createDeferred<Response>();
+    const chapter2Css = createDeferred<Response>();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL | Request) => {
+        const href = String(input);
+        return href.includes('chapter-1.css') ? chapter1Css.promise : chapter2Css.promise;
+      }),
+    );
+
+    const harness = createSimulatedEpubHarness([
+      {
+        href: 'chapter-1.xhtml',
+        index: 0,
+        html: '<html xmlns="http://www.w3.org/1999/xhtml"><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/chapter-1.css" /></head><body><p>Stale chapter</p></body></html>',
+        pagesAt16: 2,
+        pagesAt18: 6,
+        pagesAt34: 12,
+        cfiTargets: {
+          [staleRestoreCfi]: { unthemedPage: 2, pageAt18: 5, pageAt34: 10 },
+        },
+      },
+      {
+        href: 'chapter-2.xhtml',
+        index: 1,
+        html: '<html xmlns="http://www.w3.org/1999/xhtml"><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/chapter-2.css" /></head><body><p>Fresh chapter</p></body></html>',
+        pagesAt16: 3,
+        pagesAt18: 8,
+        pagesAt34: 16,
+        cfiTargets: {
+          [freshNavCfi]: { unthemedPage: 3, pageAt18: 7, pageAt34: 14 },
+        },
+      },
+    ]);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    const openPromise = session.open(
+      document.createElement('div'),
+      'epubcfi(/6/99!/4/2:0)',
+      '//body/DocFragment[2]/body/p[1]',
+      0.5,
+      { ...defaultAppearance, fontSize: 34 },
+      onLocation,
+      vi.fn(),
+    );
+
+    // Let open() fail the missing CFI and begin fallback while we supersede with displayCfi().
+    await Promise.resolve();
+    const navPromise = session.displayCfi(freshNavCfi);
+    await vi.waitFor(() => expect(harness.activeViews).toHaveLength(1));
+
+    chapter2Css.resolve(new Response(':root { --chapter-ready: 1; }', { status: 200 }));
+    chapter1Css.resolve(new Response(':root { --chapter-ready: 1; }', { status: 200 }));
+
+    await expect(navPromise).resolves.toBe(true);
+    await expect(openPromise).resolves.toBeUndefined();
+
+    expect(harness.getScrollLeft()).toBe(13 * 300);
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        cfi: freshNavCfi,
+        href: 'chapter-2.xhtml',
+        pageIndex: 13,
+        pageCount: 16,
+      }),
+      'navigation',
     );
 
     session.destroy();
