@@ -3,10 +3,11 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushSync, mount, unmount } from 'svelte';
+import { flushSync, mount, tick, unmount } from 'svelte';
 import type { BookRecord, ServerConfig } from './lib/database/database';
 
 const {
+  fetchLatestGithubReleaseMock,
   getServerMock,
   getPreferencesMock,
   setPreferenceMock,
@@ -25,6 +26,7 @@ const {
   openSessionMock,
   destroySessionMock,
 } = vi.hoisted(() => ({
+  fetchLatestGithubReleaseMock: vi.fn(),
   getServerMock: vi.fn(),
   getPreferencesMock: vi.fn(),
   setPreferenceMock: vi.fn(),
@@ -45,7 +47,7 @@ const {
 }));
 
 vi.mock('./lib/github/releases', () => ({
-  fetchLatestGithubRelease: vi.fn().mockResolvedValue(null),
+  fetchLatestGithubRelease: fetchLatestGithubReleaseMock,
 }));
 
 vi.mock('./lib/themes/themes', () => ({
@@ -115,6 +117,97 @@ vi.mock('./lib/reader/session', () => ({
 
 import App from './App.svelte';
 
+function ensureElementAnimate(): void {
+  if (typeof Element.prototype.animate !== 'function') {
+    Element.prototype.animate = (() => {
+      const anim = {
+        currentTime: 0,
+        playState: 'running',
+        effect: null,
+        onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+        cancel() {
+          anim.playState = 'idle';
+        },
+        finish() {
+          anim.playState = 'finished';
+        },
+      };
+      queueMicrotask(() => {
+        if (anim.playState !== 'idle') {
+          anim.playState = 'finished';
+          anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+        }
+      });
+      return anim as unknown as Animation;
+    }) as typeof Element.prototype.animate;
+  }
+}
+
+describe('App shell releaseBanner layout', () => {
+  let host: HTMLDivElement;
+  let instance: Record<string, unknown> | null = null;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    ensureElementAnimate();
+    fetchLatestGithubReleaseMock.mockResolvedValue({
+      version: '0.4.0',
+      title: 'Accessibility Update',
+      releaseUrl: 'https://github.com/sgerner/turnleaf/releases/tag/v0.4.0',
+      downloadUrl: 'https://github.com/sgerner/turnleaf/releases/download/v0.4.0/turnleaf.apk',
+    });
+    getServerMock.mockResolvedValue(null);
+    getPreferencesMock.mockResolvedValue(new Map());
+    resetLocalDatabaseMock.mockResolvedValue(undefined);
+    getApiKeyMock.mockResolvedValue(null);
+    removeApiKeyMock.mockResolvedValue(undefined);
+    loadThemeMock.mockResolvedValue(true);
+
+    host = document.createElement('div');
+    document.body.append(host);
+  });
+
+  afterEach(async () => {
+    if (instance) {
+      await unmount(instance);
+      instance = null;
+    }
+    host.remove();
+  });
+
+  it('renders releaseBanner as a non-sticky sibling above .app-stage and allows dismissal', async () => {
+    instance = mount(App, { target: host });
+    await vi.waitFor(() => {
+      expect(host.querySelector('.release-banner')).not.toBeNull();
+    });
+    await tick();
+
+    const shell = host.querySelector<HTMLElement>('.app-shell')!;
+    const banner = host.querySelector<HTMLElement>('.release-banner')!;
+    const stage = host.querySelector<HTMLElement>('.app-stage')!;
+
+    expect(banner.parentElement).toBe(shell);
+    expect(stage.parentElement).toBe(shell);
+    expect(stage.contains(banner)).toBe(false);
+    expect(banner.classList.contains('sticky')).toBe(false);
+    expect(stage.querySelector('.sticky')).toBeNull();
+    expect(Boolean(banner.compareDocumentPosition(stage) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(
+      true,
+    );
+
+    const dismissButton = Array.from(banner.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Dismiss',
+    )!;
+    flushSync(() => {
+      dismissButton.click();
+    });
+
+    await vi.waitFor(() => {
+      expect(host.querySelector('.release-banner')).toBeNull();
+    });
+  });
+});
+
 const savedServer: ServerConfig = {
   id: 'server-1',
   baseUrl: 'https://books.example.com',
@@ -152,32 +245,11 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    if (typeof Element.prototype.animate !== 'function') {
-      Element.prototype.animate = (() => {
-        const anim = {
-          currentTime: 0,
-          playState: 'running',
-          effect: null,
-          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
-          cancel() {
-            anim.playState = 'idle';
-          },
-          finish() {
-            anim.playState = 'finished';
-          },
-        };
-        queueMicrotask(() => {
-          if (anim.playState !== 'idle') {
-            anim.playState = 'finished';
-            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
-          }
-        });
-        return anim as unknown as Animation;
-      }) as typeof Element.prototype.animate;
-    }
+    ensureElementAnimate();
     document.documentElement.removeAttribute('data-theme');
     document.documentElement.removeAttribute('data-mode');
 
+    fetchLatestGithubReleaseMock.mockResolvedValue(null);
     getServerMock.mockResolvedValue(savedServer);
     getApiKeyMock.mockResolvedValue('secret-api-key');
     removeApiKeyMock.mockResolvedValue(undefined);
@@ -234,10 +306,15 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
   it('mounts static .app-ambient in the library and unmounts it while Reader.svelte is open', async () => {
     mounted = mount(App, { target });
 
+    const findContinueButton = () =>
+      [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+        (btn) =>
+          btn.textContent?.includes('Continue reading') &&
+          btn.textContent?.includes('Static Glows Handbook'),
+      ) ?? null;
+
     await vi.waitFor(() => {
-      expect(
-        target.querySelector('button[aria-label^="Continue reading Static Glows Handbook"]'),
-      ).not.toBeNull();
+      expect(findContinueButton()).not.toBeNull();
     });
 
     const ambient = target.querySelector('.app-ambient');
@@ -246,9 +323,7 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     expect(ambient?.querySelector('.vignette')).not.toBeNull();
     expect(ambient?.querySelector('.mesh')).toBeNull();
 
-    const continueButton = target.querySelector<HTMLButtonElement>(
-      'button[aria-label^="Continue reading Static Glows Handbook"]',
-    );
+    const continueButton = findContinueButton();
     continueButton?.click();
 
     await vi.waitFor(() => {

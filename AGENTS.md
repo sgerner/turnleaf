@@ -11,4 +11,5 @@
 - `scripts/github-release.mjs` handles paginated GitHub release preflight deduplication (`preflight`) and staged draft verification/promotion (`publish`), with unit coverage included in `npm run verify` (`scripts/github-release.test.mjs`).
 - Run `npm run ios:sync` after Capacitor, dependency, or version changes to update `ios/App/CapApp-SPM/Package.swift` and `MARKETING_VERSION`, and run `npm run ios:check` to verify zero iOS manifest or git drift.
 - On macOS with Xcode installed, run `npm run ios:simulator` to compile the unsigned iPhone Simulator `App.app` bundle and verify `PrivacyInfo.xcprivacy` and `CFBundleShortVersionString`.
+- Android release signing prefers `TURNLEAF_STORE_FILE`, `TURNLEAF_STORE_PASSWORD`, `TURNLEAF_KEY_ALIAS`, and `TURNLEAF_KEY_PASSWORD` environment variables over UTF-8 `android/keystore.properties` (which follows Java `Properties` escaping such as `\\` and leading `\ `); use `npm run android:release -- --no-daemon` for single-use signed builds and never write signing secrets into workspace files in CI.
 - Keep changes small and explicit; do not add abstractions unless they solve a real problem.
