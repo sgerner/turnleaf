@@ -22,70 +22,79 @@ vi.mock('../database/database', () => ({
   setPreferences: vi.fn(async () => {}),
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    async open(
-      viewport: HTMLElement,
-      _initialCfi: string | null,
-      _initialXPath: string | null,
-      _initialPercentage: number | null,
-      _appearance: unknown,
-      onLocation: (
-        loc: {
-          cfi: string;
-          href: string;
-          xpath: string | null;
-          percentage: number;
-          spineIndex: number;
-          pageIndex: number;
-          pageCount: number;
-        },
-        origin: 'restore' | 'navigation' | 'link',
-      ) => void,
-    ): Promise<void> {
-      const container = document.createElement('div');
-      container.className = 'epub-container';
-      const iframe = document.createElement('iframe');
-      container.append(iframe);
-      viewport.append(container);
-      onLocation(
-        {
-          cfi: 'epubcfi(/6/2!/4/2:0)',
-          href: 'chapter-1.xhtml',
-          xpath: '/body/p[1]',
-          percentage: 0.25,
-          spineIndex: 0,
-          pageIndex: 0,
-          pageCount: 4,
-        },
-        'restore',
-      );
-    }
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      async open(
+        viewport: HTMLElement,
+        _initialCfi: string | null,
+        _initialXPath: string | null,
+        _initialPercentage: number | null,
+        _appearance: unknown,
+        onLocation: (
+          loc: {
+            cfi: string;
+            href: string;
+            xpath: string | null;
+            percentage: number;
+            spineIndex: number;
+            pageIndex: number;
+            pageCount: number;
+          },
+          origin: 'restore' | 'navigation' | 'link',
+        ) => void,
+      ): Promise<void> {
+        const container = document.createElement('div');
+        container.className = 'epub-container';
+        const iframe = document.createElement('iframe');
+        container.append(iframe);
+        viewport.append(container);
+        onLocation(
+          {
+            cfi: 'epubcfi(/6/2!/4/2:0)',
+            href: 'chapter-1.xhtml',
+            xpath: '/body/p[1]',
+            percentage: 0.25,
+            spineIndex: 0,
+            pageIndex: 0,
+            pageCount: 4,
+          },
+          'restore',
+        );
+      }
 
-    tableOfContents() {
-      return [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
-    }
+      tableOfContents() {
+        return [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
+      }
 
-    updateHighlights(): void {}
-    applyAppearance(): void {}
-    async display(): Promise<boolean> {
-      return true;
-    }
-    async displayCfi(): Promise<boolean> {
-      return true;
-    }
-    async displayServerLocation(): Promise<boolean> {
-      return true;
-    }
-    async displayServerPercentage(): Promise<void> {}
-    async next(): Promise<void> {}
-    async previous(): Promise<void> {}
-    async search() {
-      return [];
-    }
-    destroy(): void {}
-  },
-}));
+      getVisiblePassages() {
+        return [];
+      }
+
+      clearTextSelection(): void {}
+      updateHighlights(): void {}
+      applyAppearance(): void {}
+      async display(): Promise<boolean> {
+        return true;
+      }
+      async displayCfi(): Promise<boolean> {
+        return true;
+      }
+      async displayServerLocation(): Promise<boolean> {
+        return true;
+      }
+      async displayServerPercentage(): Promise<void> {}
+      async next(): Promise<void> {}
+      async previous(): Promise<void> {}
+      async search() {
+        return [];
+      }
+      destroy(): void {}
+    },
+  };
+});
 
 import Reader from './Reader.svelte';
 
