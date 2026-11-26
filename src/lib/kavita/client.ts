@@ -209,7 +209,7 @@ export class KavitaClient {
       const options: RequestInit = {
         method: 'POST',
         body: JSON.stringify({
-          statements: [],
+          statements: [{ field: 21, comparison: 5, value: '3' }],
           combination: 0,
           sortOptions: { sortField: 1, isAscending: true },
           limitTo: 0,
