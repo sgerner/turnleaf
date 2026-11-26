@@ -105,6 +105,7 @@ function createAdapter() {
       statement: string,
       values: unknown[] = [],
     ): Promise<{ changes: { changes: number } }> {
+      await Promise.resolve();
       const result = native.database?.prepare(statement).run(...(values as SQLInputValue[]));
       return { changes: { changes: Number(result?.changes ?? 0) } };
     },
@@ -112,6 +113,7 @@ function createAdapter() {
       statement: string,
       values: unknown[] = [],
     ): Promise<{ values: Record<string, unknown>[] }> {
+      await Promise.resolve();
       const rows = native.database?.prepare(statement).all(...(values as SQLInputValue[])) as
         Record<string, unknown>[] | undefined;
       return { values: rows ?? [] };
@@ -850,6 +852,97 @@ describe('native progress transactions against SQLite', () => {
     expect(await database.getReadingState(book.id)).toMatchObject({
       cfi: 'newer-cfi',
       pendingSync: true,
+    });
+  });
+
+  it('prevents a concurrent saveLocalProgress from slipping between acceptRemoteProgress commit and verification', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    const initial = (await database.getReadingState(book.id))!;
+    const remote = {
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 10,
+      chapterId: 10,
+      pageNum: 140,
+      bookScrollId: '/remote-clamped',
+      lastModifiedUtc: '2026-01-02T00:00:00.000Z',
+    };
+
+    let queuedLocalSave: Promise<void> | undefined;
+    native.onTransactionTask = async (index) => {
+      if (index !== 2) return;
+      native.onTransactionTask = null;
+      queuedLocalSave = database.saveLocalProgress(book, 'interleaved-cfi', '/interleaved', 0.35);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    expect(
+      await database.acceptRemoteProgress(
+        book,
+        remote,
+        initial.syncRevision!,
+        initial.localUpdatedAt,
+      ),
+    ).toBe(true);
+
+    await queuedLocalSave;
+    expect(await database.getReadingState(book.id)).toMatchObject({
+      cfi: 'interleaved-cfi',
+      xpath: '/interleaved',
+      percentage: 0.35,
+      pendingSync: true,
+      syncRevision: initial.syncRevision! + 1,
+    });
+    expect(await database.getPendingSync(server.id)).toMatchObject([
+      { bookId: book.id, revision: initial.syncRevision! + 1 },
+    ]);
+  });
+
+  it('stamps normalized remote adoption timestamps when the queued write executes', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    const initial = (await database.getReadingState(book.id))!;
+    const remote = {
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 10,
+      chapterId: 10,
+      pageNum: 125,
+      bookScrollId: '/remote-clamped',
+      lastModifiedUtc: '2026-01-02T00:00:00.000Z',
+    };
+
+    let snapshotStartedAt = '';
+    let acceptPromise: Promise<boolean> | undefined;
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      acceptPromise = database.acceptRemoteProgress(
+        book,
+        remote,
+        initial.syncRevision!,
+        initial.localUpdatedAt,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      snapshotStartedAt = new Date().toISOString();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    };
+
+    await database.reconcileBooks(server.id, [book]);
+    expect(await acceptPromise).toBe(true);
+    expect(await database.getReadingState(book.id)).toMatchObject({
+      cfi: '',
+      xpath: '/remote-clamped',
+      percentage: 0.999,
+      pendingSync: false,
+      syncRevision: initial.syncRevision,
+    });
+
+    await database.reconcileBooks(server.id, [{ ...book, pagesRead: 12 }], { snapshotStartedAt });
+    expect((await database.getBooks(server.id))[0]).toMatchObject({
+      pagesRead: 100,
+      lastReadAt: remote.lastModifiedUtc,
     });
   });
 });

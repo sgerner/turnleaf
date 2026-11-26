@@ -284,18 +284,41 @@ it('recovers nativeTransactionQueue after a rejected native query', async () => 
 
 it('keeps internal queries unqueued inside saveRemoteProgress and acceptRemoteProgress', async () => {
   const events: string[] = [];
-  const { acceptRemoteProgress, markSyncFailure, saveRemoteProgress } = await import('./database');
+  let adoptedNow: string | null = null;
+  const { acceptRemoteProgress, markSyncFailure, saveLocalProgress, saveRemoteProgress } =
+    await import('./database');
   await openAndClearMocks();
 
   mocks.db.query.mockImplementation(async (statement: string) => {
-    events.push(`query:${statement.includes('sync_queue') ? 'queue' : 'reading'}`);
+    const kind = statement.includes('sync_queue') ? 'queue' : 'reading';
+    events.push(`query:${kind}:start`);
     await new Promise((resolve) => setTimeout(resolve, 2));
+    events.push(`query:${kind}:end`);
+    if (adoptedNow && statement.includes('SELECT cfi,local_updated_at')) {
+      return {
+        values: [
+          {
+            cfi: '',
+            local_updated_at: adoptedNow,
+            pending_sync: 0,
+            server_updated_at: '2026-01-02T00:00:00.000Z',
+          },
+        ],
+      };
+    }
     return { values: [] as Record<string, unknown>[] };
   });
-  mocks.executeTransaction.mockImplementation(async () => {
-    events.push('transaction:start');
+  mocks.executeTransaction.mockImplementation(async (tasks: capTask[]) => {
+    const isAccept = tasks[0]?.statement.includes('UPDATE reading_state SET cfi=');
+    const label = isAccept ? 'accept' : tasks.length === 3 ? 'local' : 'remote';
+    if (isAccept) {
+      adoptedNow = String(tasks[0]?.values?.[2] ?? '');
+    } else if (label === 'local') {
+      adoptedNow = null;
+    }
+    events.push(`transaction:${label}:start`);
     await new Promise((resolve) => setTimeout(resolve, 5));
-    events.push('transaction:end');
+    events.push(`transaction:${label}:end`);
     return { changes: { changes: 1 } };
   });
   mocks.db.run.mockImplementation(async () => {
@@ -314,14 +337,31 @@ it('keeps internal queries unqueued inside saveRemoteProgress and acceptRemotePr
   };
 
   expect(await saveRemoteProgress(book, remote, null)).toBe(true);
-  expect(events).toEqual(['query:reading', 'query:queue', 'transaction:start', 'transaction:end']);
+  expect(events).toEqual([
+    'query:reading:start',
+    'query:reading:end',
+    'query:queue:start',
+    'query:queue:end',
+    'transaction:remote:start',
+    'transaction:remote:end',
+  ]);
 
   events.length = 0;
-  await Promise.all([
+  const [accepted] = await Promise.all([
     acceptRemoteProgress(book, remote, 1, readingState.localUpdatedAt),
+    saveLocalProgress(book, 'newer-cfi', '/newer', 0.9),
     markSyncFailure(book.id, 'offline', 1, readingState.localUpdatedAt),
   ]);
-  expect(events).toEqual(['transaction:start', 'transaction:end', 'query:reading', 'run']);
+  expect(accepted).toBe(true);
+  expect(events).toEqual([
+    'transaction:accept:start',
+    'transaction:accept:end',
+    'query:reading:start',
+    'query:reading:end',
+    'transaction:local:start',
+    'transaction:local:end',
+    'run',
+  ]);
 });
 
 async function openAndClearMocks(): Promise<void> {

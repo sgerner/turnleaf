@@ -988,7 +988,7 @@ export async function saveRemoteProgress(
   remote: KavitaProgress,
   expected: StoredReadingState | null,
 ): Promise<boolean> {
-  const normalized = normalizeRemoteProgress(book, remote, (expected?.syncRevision ?? 0) + 1);
+  const nextRevision = (expected?.syncRevision ?? 0) + 1;
   const matches = (current: StoredReadingState | null) =>
     !expected?.pendingSync &&
     !current?.pendingSync &&
@@ -1003,7 +1003,11 @@ export async function saveRemoteProgress(
         !matches(state.readingState[book.id] ?? null)
       )
         return false;
-      applyBrowserRemoteProgress(state, book.id, normalized);
+      applyBrowserRemoteProgress(
+        state,
+        book.id,
+        normalizeRemoteProgress(book, remote, nextRevision),
+      );
     });
   }
 
@@ -1012,6 +1016,7 @@ export async function saveRemoteProgress(
     if (!matches(await queryNativeReadingState(db, book.id))) return false;
     const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
     if (queue.values?.length) return false;
+    const normalized = normalizeRemoteProgress(book, remote, nextRevision);
     await db.executeTransaction([
       {
         statement: `INSERT INTO reading_state
@@ -1053,8 +1058,6 @@ export async function acceptRemoteProgress(
   expectedRevision: number,
   expectedUpdatedAt: string,
 ): Promise<boolean> {
-  const normalized = normalizeRemoteProgress(book, remote, expectedRevision);
-
   if (!Capacitor.isNativePlatform()) {
     return updateBrowserState((state) => {
       const queue = state.syncQueue[book.id];
@@ -1071,12 +1074,17 @@ export async function acceptRemoteProgress(
         return false;
       }
       delete state.syncQueue[book.id];
-      applyBrowserRemoteProgress(state, book.id, normalized);
+      applyBrowserRemoteProgress(
+        state,
+        book.id,
+        normalizeRemoteProgress(book, remote, expectedRevision),
+      );
     });
   }
 
   const db = await openDatabase();
   return enqueueNativeWrite(async () => {
+    const normalized = normalizeRemoteProgress(book, remote, expectedRevision);
     await db.executeTransaction([
       {
         statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
