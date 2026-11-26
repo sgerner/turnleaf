@@ -48,8 +48,9 @@ it('builds download URLs without putting the api key in the query string', () =>
 it('loads covers with the api key header', async () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
 
-  await client.getCover(4);
+  const cover = await client.getCover(4);
 
+  expect(cover).toBeInstanceOf(Blob);
   expect(fetch).toHaveBeenCalledWith(
     'https://books.example.com/api/Image/series-cover?seriesId=4',
     expect.objectContaining({
@@ -59,6 +60,16 @@ it('loads covers with the api key header', async () => {
       }),
     }),
   );
+});
+
+it('does not duplicate cover loading on native platforms where covers stream via FileTransfer', async () => {
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await expect(client.getCover(4)).rejects.toThrow('cacheCover');
+  expect(CapacitorHttp.get).not.toHaveBeenCalled();
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
 });
 
 it('requests the Kavita series list with POST and an EPUB format filter', async () => {
@@ -166,6 +177,23 @@ it('rejects cross-origin redirects before sending the auth key to the new origin
   await expect(
     new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
   ).rejects.toThrow('Kavita redirected to a different server');
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it('rejects HTTPS-to-HTTP downgrade redirects before sending the auth key over HTTP', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 307,
+    type: 'basic',
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'location' ? 'http://books.example.com/api/Series/v2' : null,
+    },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toThrow('redirected from HTTPS to insecure HTTP');
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
