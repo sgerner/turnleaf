@@ -54,12 +54,23 @@ public class MainActivity extends BridgeActivity {
         );
     }
 
+    interface WindowJsEventSink {
+        void trigger(String eventName, String data);
+    }
+
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
-        int action = event.getAction();
         if (
-            (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) &&
-            handleReaderKey(event.getKeyCode(), event, action == KeyEvent.ACTION_DOWN)
+            getBridge() != null &&
+            dispatchReaderKey(
+                event.getKeyCode(),
+                event.getAction(),
+                event.getRepeatCount(),
+                event.hasNoModifiers(),
+                VolumeButtonsPlugin.enabled,
+                ReaderChromePlugin.enabled,
+                (eventName, data) -> getBridge().triggerWindowJSEvent(eventName, data)
+            )
         ) {
             return true;
         }
@@ -67,18 +78,22 @@ public class MainActivity extends BridgeActivity {
         return super.dispatchKeyEvent(event);
     }
 
-    private boolean handleReaderKey(int keyCode, KeyEvent event, boolean down) {
-        if (getBridge() == null) {
-            return false;
-        }
-
+    static boolean dispatchReaderKey(
+        int keyCode,
+        int action,
+        int repeatCount,
+        boolean hasNoModifiers,
+        boolean volumeButtonsEnabled,
+        boolean readerChromeEnabled,
+        WindowJsEventSink sink
+    ) {
         if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            if (!VolumeButtonsPlugin.enabled) {
+            if (!volumeButtonsEnabled) {
                 return false;
             }
-            if (down && event.getRepeatCount() == 0) {
+            if (action == KeyEvent.ACTION_DOWN && repeatCount == 0) {
                 String direction = keyCode == KeyEvent.KEYCODE_VOLUME_UP ? "previous" : "next";
-                getBridge().triggerWindowJSEvent(
+                sink.trigger(
                     "turnleafVolumeButton",
                     "{\"direction\":\"" + direction + "\"}"
                 );
@@ -87,12 +102,12 @@ public class MainActivity extends BridgeActivity {
         }
 
         if (keyCode == KeyEvent.KEYCODE_PAGE_UP || keyCode == KeyEvent.KEYCODE_PAGE_DOWN) {
-            if (!ReaderChromePlugin.enabled || !event.hasNoModifiers()) {
+            if (!readerChromeEnabled || !hasNoModifiers) {
                 return false;
             }
-            if (down && event.getRepeatCount() == 0) {
+            if (action == KeyEvent.ACTION_DOWN && repeatCount == 0) {
                 String direction = keyCode == KeyEvent.KEYCODE_PAGE_UP ? "previous" : "next";
-                getBridge().triggerWindowJSEvent(
+                sink.trigger(
                     "turnleafPageButton",
                     "{\"direction\":\"" + direction + "\"}"
                 );

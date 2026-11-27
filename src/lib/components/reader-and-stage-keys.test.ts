@@ -3,6 +3,7 @@
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as ReaderSessionModule from '../reader/session';
+import type * as ThemesModule from '../themes/themes';
 
 const mocks = vi.hoisted(() => {
   let currentPlatform = 'ios';
@@ -16,6 +17,14 @@ const mocks = vi.hoisted(() => {
   const setVolumeButtonsSpy = vi.fn(async () => undefined);
   const setReaderChromeSpy = vi.fn(async () => undefined);
   const setKeepAwakeSpy = vi.fn(async () => undefined);
+  const fetchLatestGithubReleaseSpy = vi.fn<
+    () => Promise<{
+      version: string;
+      title: string;
+      releaseUrl: string;
+      downloadUrl: string;
+    } | null>
+  >(async () => null);
 
   return {
     getPlatform: () => currentPlatform,
@@ -40,6 +49,7 @@ const mocks = vi.hoisted(() => {
     setVolumeButtonsSpy,
     setReaderChromeSpy,
     setKeepAwakeSpy,
+    fetchLatestGithubReleaseSpy,
   };
 });
 
@@ -58,9 +68,16 @@ vi.mock('@capacitor/core', () => ({
 
 vi.mock('@capacitor/status-bar', () => ({
   Animation: { None: 'NONE' },
+  Style: {
+    Dark: 'DARK',
+    Light: 'LIGHT',
+    Default: 'DEFAULT',
+  },
   StatusBar: {
     hide: vi.fn(async () => undefined),
     show: vi.fn(async () => undefined),
+    setStyle: vi.fn(async () => undefined),
+    setBackgroundColor: vi.fn(async () => undefined),
   },
 }));
 
@@ -149,13 +166,17 @@ vi.mock('../native/credentials', () => ({
 }));
 
 vi.mock('../github/releases', () => ({
-  fetchLatestGithubRelease: vi.fn(async () => null),
+  fetchLatestGithubRelease: () => mocks.fetchLatestGithubReleaseSpy(),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 vi.mock('../downloads/native-download', () => ({
   cacheCover: vi.fn(async () => ''),
@@ -267,16 +288,31 @@ describe('Reader and .app-stage keyboard and hardware button behavior', () => {
     dbMocks.server = null;
     dbMocks.preferences.clear();
     dbMocks.books = [];
+    mocks.fetchLatestGithubReleaseSpy.mockResolvedValue(null);
     mocks.setPlatform('ios', true);
-    if (!Element.prototype.animate) {
-      Element.prototype.animate = vi.fn(
-        () =>
-          ({
-            finished: Promise.resolve(),
-            cancel: vi.fn(),
-            onfinish: null,
-          }) as unknown as Animation,
-      );
+    if (typeof Element.prototype.animate !== 'function') {
+      Element.prototype.animate = (() => {
+        const anim = {
+          currentTime: 0,
+          playState: 'running',
+          effect: null,
+          finished: Promise.resolve(),
+          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+          cancel() {
+            anim.playState = 'idle';
+          },
+          finish() {
+            anim.playState = 'finished';
+          },
+        };
+        queueMicrotask(() => {
+          if (anim.playState !== 'idle') {
+            anim.playState = 'finished';
+            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+          }
+        });
+        return anim as unknown as Animation;
+      }) as typeof Element.prototype.animate;
     }
     host = document.createElement('div');
     document.body.innerHTML = '';
@@ -385,6 +421,120 @@ describe('Reader and .app-stage keyboard and hardware button behavior', () => {
     expect(document.activeElement).toBe(document.body);
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', cancelable: true }));
     expect(libraryStage.scrollTop).toBe(390);
+
+    // Search with no matching books -> click Clear search and filters -> immediately operable
+    searchInput.focus();
+    searchInput.value = 'nonexistent-query-xyz';
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await flushAll();
+
+    const clearEmptyStateButton = [...host.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Clear search and filters',
+    )!;
+    expect(clearEmptyStateButton).toBeTruthy();
+    clearEmptyStateButton.focus();
+    flushSync(() => clearEmptyStateButton.click());
+
+    expect(document.activeElement).toBe(document.body);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', cancelable: true }));
+    expect(libraryStage.scrollTop).toBe(40);
+  });
+
+  it('preserves releaseBanner inert coordination and suppresses .app-stage scroll forwarding while stageOverlayActive is true', async () => {
+    mocks.setPlatform('web', false);
+    mocks.fetchLatestGithubReleaseSpy.mockResolvedValue({
+      version: '0.9.0',
+      title: 'Reader Update',
+      releaseUrl: 'https://github.com/sgerner/turnleaf/releases/tag/v0.9.0',
+      downloadUrl: 'https://github.com/sgerner/turnleaf/releases/download/v0.9.0/turnleaf.apk',
+    });
+    dbMocks.server = {
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: 'https://books.example.com',
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.0',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    };
+    dbMocks.books = [
+      {
+        id: 'book-0',
+        serverId: 'primary',
+        seriesId: 1,
+        chapterId: 100,
+        title: 'Book Title 0',
+        author: 'Author 0',
+        series: 'Series 0',
+        pages: 300,
+        pagesRead: 10,
+        downloadPath: 'books/book.epub',
+        downloadStatus: 'available',
+        fileSize: 1024,
+        lastReadAt: null,
+        remoteAvailable: true,
+      },
+    ];
+
+    mounted = mount(App, { target: host });
+    await flushAll();
+
+    const banner = host.querySelector<HTMLElement>('.release-banner')!;
+    const stage = host.querySelector<HTMLElement>('.app-stage')!;
+    expect(banner).toBeTruthy();
+    expect(banner.inert).toBe(false);
+
+    Object.defineProperty(stage, 'clientHeight', { value: 400, configurable: true });
+    Object.defineProperty(stage, 'scrollHeight', { value: 2000, configurable: true });
+    stage.scrollTop = 0;
+    document.body.focus();
+
+    // Body focus scrolls .app-stage even when release banner is visible
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', cancelable: true }));
+    expect(stage.scrollTop).toBe(350);
+
+    // Focusing a control inside releaseBanner does not forward Space to .app-stage
+    const dismissButton = [...banner.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Dismiss',
+    )!;
+    dismissButton.focus();
+    const spaceOnDismiss = new KeyboardEvent('keydown', {
+      key: ' ',
+      bubbles: true,
+      cancelable: true,
+    });
+    dismissButton.dispatchEvent(spaceOnDismiss);
+    expect(spaceOnDismiss.defaultPrevented).toBe(false);
+    expect(stage.scrollTop).toBe(350);
+
+    // Opening Library settings activates stageOverlayActive -> banner becomes inert and stage scroll is suppressed
+    const openSettingsButton = host.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open settings"]',
+    )!;
+    openSettingsButton.focus();
+    openSettingsButton.click();
+    await flushAll();
+    expect(banner.inert).toBe(true);
+
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.activeElement).toBe(document.body);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', cancelable: true }));
+    expect(stage.scrollTop).toBe(350);
+
+    // Closing Library settings restores banner interactivity, returns focus to Open settings, and restores stage scroll on body focus
+    host.querySelector<HTMLButtonElement>('button[aria-label="Close settings"]')!.click();
+    await flushAll();
+    expect(banner.inert).toBe(false);
+    expect(document.activeElement).toBe(openSettingsButton);
+
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.activeElement).toBe(document.body);
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', cancelable: true }));
+    expect(stage.scrollTop).toBe(390);
+
+    // Dismissing the release banner still works after overlay close
+    dismissButton.click();
+    await flushAll();
+    expect(host.querySelector('.release-banner')).toBeNull();
   });
 
   it('turns pages with ArrowUp, ArrowDown, PageUp, PageDown, and Shift+Space on window and EPUB iframe with defaultPrevented, and blocks all open reader panels', async () => {
