@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test(android): disable mobile data before Wi-Fi in reading journey
 - Edit Kavita server addresses inline from Settings with retryable credential cleanup and OPDS URL paste support without exposing tokens in diagnostics.
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
