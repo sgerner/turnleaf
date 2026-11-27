@@ -135,12 +135,17 @@ describe('App.svelte repairLocalData on corrupt native SQLite', () => {
   });
 
   it('resets corrupt SQLite files via SqliteReset without opening the corrupt DB and preserves downloaded EPUBs', async () => {
+    const { clearDiagnostics, exportDiagnostics } = await import('./lib/diagnostics/log');
+    await clearDiagnostics();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     mounted = mount(App, { target: document.body });
     await settle();
 
     const alert = document.querySelector('[role="alert"]');
     expect(alert?.textContent).toContain('Turnleaf could not open its local data');
+    expect(exportDiagnostics({ appVersion: '0.3.5', platform: 'android' })).toContain(
+      'startup endpoint=local/database detail=database-open-failed',
+    );
 
     const resetButton = [...document.querySelectorAll('button')].find((btn) =>
       btn.textContent?.includes('Reset local data'),
@@ -159,8 +164,10 @@ describe('App.svelte repairLocalData on corrupt native SQLite', () => {
     expect(document.querySelector('#connection-error')).toBeTruthy();
   });
 
-  it('preserves salvaged notes in memory with export, copy, and retry when post-reset setPreferences rejects', async () => {
+  it('never discards the salvaged note backup when native reset fails or when post-reset setPreferences rejects', async () => {
     const { openDatabase, resetLocalDatabase } = await import('./lib/database/database');
+    const { clearDiagnostics, exportDiagnostics } = await import('./lib/diagnostics/log');
+    await clearDiagnostics();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     const writeText = vi.fn(async (_text: string) => undefined);
@@ -233,34 +240,60 @@ describe('App.svelte repairLocalData on corrupt native SQLite', () => {
     mounted = mount(App, { target: document.body });
     await settle();
 
-    const resetButton = [...document.querySelectorAll('button')].find((btn) =>
-      btn.textContent?.includes('Reset local data'),
-    );
-    expect(resetButton).toBeTruthy();
+    // 1. Failed reset: native unlink throws (e.g. file locked). Salvaged notes must stay exportable.
+    mocks.nativeUnlinkDatabase.mockRejectedValueOnce(new Error('EBUSY: database file locked'));
 
-    resetButton!.click();
+    const findButton = (label: string) =>
+      [...document.querySelectorAll('button')].find((btn) => btn.textContent?.includes(label));
+
+    const firstResetButton = findButton('Reset local data');
+    expect(firstResetButton).toBeTruthy();
+    firstResetButton!.click();
     await settle();
 
-    // Reset ran once, setPreferences failed, explicit warning is shown, and notes remain exportable.
     expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      'Local data could not be reset.',
+    );
+    expect(exportDiagnostics({ appVersion: '0.3.5', platform: 'android' })).toContain(
+      'startup endpoint=local/database detail=database-reset-failed',
+    );
+
+    const copyAfterFailedReset = findButton('Copy JSON');
+    expect(copyAfterFailedReset).toBeTruthy();
+    copyAfterFailedReset!.click();
+    await settle();
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(String(writeText.mock.calls[0]?.[0] ?? '')).toContain('Salvaged chapter bookmark');
+
+    // 2. Reset succeeds on second attempt, but post-reset setPreferences rejects (failed restore).
+    // Salvaged notes must STILL stay in memory with an explicit warning, diagnostic, export, and retry.
+    const secondResetButton = findButton('Reset local data');
+    expect(secondResetButton).toBeTruthy();
+    secondResetButton!.click();
+    await settle();
+
+    expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledTimes(2);
     const alert = document.querySelector('[role="alert"]');
     expect(alert?.textContent).toContain(
       'Local data was reset, but Turnleaf could not restore your saved bookmarks and notes.',
     );
-
-    const copyJsonButton = [...document.querySelectorAll('button')].find((btn) =>
-      btn.textContent?.includes('Copy JSON'),
+    expect(exportDiagnostics({ appVersion: '0.3.5', platform: 'android' })).toContain(
+      'startup endpoint=local/database detail=notes-restore-failed',
     );
+
+    const copyJsonButton = findButton('Copy JSON');
     expect(copyJsonButton).toBeTruthy();
     copyJsonButton!.click();
     await settle();
 
-    expect(writeText).toHaveBeenCalledTimes(1);
-    const exportedJson = String(writeText.mock.calls[0]?.[0] ?? '');
+    expect(writeText).toHaveBeenCalledTimes(2);
+    const exportedJson = String(writeText.mock.calls[1]?.[0] ?? '');
     expect(exportedJson).toContain('Salvaged chapter bookmark');
     expect(exportedJson).toContain('Left Hand of Darkness');
 
-    // Once storage write succeeds, Retry persists the salvaged notes without re-deleting the DB.
+    // 3. Once storage write succeeds, Retry persists the salvaged notes without re-deleting the DB.
     failPreferencesWrite = false;
     mocks.db.query.mockImplementation(async () => ({ values: [] }));
     const retryButton = [...document.querySelectorAll('button')].find(
@@ -270,7 +303,7 @@ describe('App.svelte repairLocalData on corrupt native SQLite', () => {
     retryButton!.click();
     await settle();
 
-    expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledTimes(1);
+    expect(mocks.nativeUnlinkDatabase).toHaveBeenCalledTimes(2);
     expect(mocks.db.run).toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO preferences'),
       expect.arrayContaining(['readerBookmarks:primary:1:10']),

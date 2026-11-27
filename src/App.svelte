@@ -361,8 +361,9 @@
         {#if salvagedNotes.length > 0 && !server}
           <div class="rounded-lg preset-tonal-surface p-3">
             <p class="text-sm text-surface-950-50">
-              Readable bookmarks or notes were found and will be kept if possible. Export a backup
-              before resetting local data.
+              {salvagedRestorePending
+                ? 'Your salvaged bookmarks and notes are still held in memory. Export or copy a backup before closing Turnleaf, or retry saving them.'
+                : 'Readable bookmarks or notes were found and will be kept if possible. Export a backup before resetting local data.'}
             </p>
             <div class="mt-2 flex flex-wrap gap-2">
               <button

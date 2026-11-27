@@ -388,9 +388,22 @@ describe('Library.svelte notes retention, backup/restore, and safe server remova
     pasteArea!.dispatchEvent(new Event('input', { bubbles: true }));
     await settle();
 
+    const { setPreferences } = await import('../database/database');
+    vi.mocked(setPreferences).mockRejectedValueOnce(new Error('SQLiteFullException: disk full'));
+
     const restoreBtn = [...document.querySelectorAll('button')].find((btn) =>
       btn.textContent?.includes('Restore pasted JSON'),
     );
+    restoreBtn!.click();
+    await settle();
+
+    // Failed restore preserves both existing notes and the pasted JSON backup for retry.
+    expect(document.body.textContent).toContain('SQLiteFullException: disk full');
+    expect(pasteArea!.value).toBe(backupToRestore);
+    expect(mocks.preferences.get(`readerAnnotations:${sampleBook.id}`)).toContain(
+      'Light is the left hand of darkness.',
+    );
+
     restoreBtn!.click();
     await settle();
 

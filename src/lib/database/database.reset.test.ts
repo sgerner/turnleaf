@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => {
     close: vi.fn(async () => {
       events.push('db.close');
     }),
-    execute: vi.fn(async () => ({ changes: { changes: 0 } })),
+    execute: vi.fn(async (_sql = '') => ({ changes: { changes: 0 } })),
     executeTransaction: vi.fn(async () => ({ changes: { changes: 0 } })),
     getVersion: vi.fn(async () => ({ version: 7 })),
     open: vi.fn(async () => {
@@ -123,15 +123,43 @@ describe('native SQLite reset without opening corrupt database files', () => {
     await expect(openDatabase()).resolves.toBe(mocks.db);
   });
 
-  it('closes an active SQLite handle before invoking native file deletion', async () => {
-    const { openDatabase, resetLocalDatabase } = await import('./database');
+  it('serializes queued writes, WAL checkpoint, journal-mode revert, close, and native file deletion', async () => {
+    const { openDatabase, resetLocalDatabase, setPreference } = await import('./database');
     mocks.setOpenShouldFail(false);
     await openDatabase();
     mocks.events.length = 0;
 
-    await resetLocalDatabase();
+    let releaseWrite!: () => void;
+    mocks.db.run.mockImplementationOnce(async () => {
+      mocks.events.push('queuedWrite:start');
+      await new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      mocks.events.push('queuedWrite:done');
+      return { changes: { changes: 1 } };
+    });
+    mocks.db.execute.mockImplementation(async (sql: string) => {
+      mocks.events.push(`db.execute:${sql}`);
+      return { changes: { changes: 0 } };
+    });
+
+    const writePromise = setPreference('uiTheme', 'vintage');
+    await vi.waitFor(() => {
+      expect(mocks.events).toContain('queuedWrite:start');
+    });
+
+    const resetPromise = resetLocalDatabase();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(mocks.events).toEqual(['queuedWrite:start']);
+
+    releaseWrite();
+    await Promise.all([writePromise, resetPromise]);
 
     expect(mocks.events).toEqual([
+      'queuedWrite:start',
+      'queuedWrite:done',
+      'db.execute:PRAGMA wal_checkpoint(TRUNCATE);',
+      'db.execute:PRAGMA journal_mode = DELETE;',
       'db.close',
       'CapacitorSQLite.closeConnection',
       'SqliteReset.deleteDatabase:turnleaf',
@@ -146,6 +174,7 @@ describe('native SQLite reset without opening corrupt database files', () => {
     mocks.sqlite.createConnection.mockClear();
     mocks.sqlite.retrieveConnection.mockClear();
     mocks.db.open.mockClear();
+    mocks.db.execute.mockImplementation(async () => ({ changes: { changes: 0 } }));
 
     let finishUnlink!: () => void;
     mocks.nativeUnlinkDatabase.mockImplementationOnce(
@@ -164,12 +193,13 @@ describe('native SQLite reset without opening corrupt database files', () => {
       expect(mocks.events).toContain('SqliteReset.deleteDatabase:start:turnleaf');
     });
 
-    // Trigger concurrent openDatabase() and saveServer() while native unlink is in progress.
+    // Trigger multiple concurrent openDatabase() and saveServer() callers while native unlink is in progress.
     let concurrentOpenSettled = false;
-    const concurrentOpen = openDatabase().then((handle) => {
+    const concurrentOpenA = openDatabase().then((handle) => {
       concurrentOpenSettled = true;
       return handle;
     });
+    const concurrentOpenB = openDatabase();
     const concurrentWrite = saveServer({
       id: 'primary',
       displayName: 'Home Kavita',
@@ -188,7 +218,7 @@ describe('native SQLite reset without opening corrupt database files', () => {
     expect(mocks.db.open).not.toHaveBeenCalled();
 
     finishUnlink();
-    await Promise.all([resetPromise, concurrentOpen, concurrentWrite]);
+    await Promise.all([resetPromise, concurrentOpenA, concurrentOpenB, concurrentWrite]);
 
     expect(concurrentOpenSettled).toBe(true);
     expect(mocks.events).toEqual([

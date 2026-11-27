@@ -229,6 +229,13 @@ function updateBrowserState(mutate: (state: BrowserDatabaseState) => boolean | v
   return true;
 }
 
+class ResetInProgressError extends Error {
+  constructor() {
+    super('Local database reset is in progress.');
+    this.name = 'ResetInProgressError';
+  }
+}
+
 async function waitForActiveReset(): Promise<void> {
   while (resetting) {
     await resetting.catch(() => undefined);
@@ -243,35 +250,66 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
-  await waitForActiveReset();
-  if (connection) return connection;
-
-  if (opening) return opening;
-  const pendingOpen = openNativeDatabase();
-  opening = pendingOpen;
-  try {
-    const db = await pendingOpen;
-    if (isResetting()) {
-      await waitForActiveReset();
-      return openDatabase();
+  for (;;) {
+    await waitForActiveReset();
+    if (connection && !closedConnections.has(connection)) {
+      return connection;
     }
-    connection = db;
-    return db;
-  } finally {
-    if (opening === pendingOpen) {
-      opening = null;
+
+    if (opening) {
+      try {
+        const db = await opening;
+        if (isResetting() || closedConnections.has(db)) {
+          continue;
+        }
+        return db;
+      } catch (error) {
+        if (error instanceof ResetInProgressError || isResetting()) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    const pendingOpen = openNativeDatabase();
+    opening = pendingOpen;
+    try {
+      const db = await pendingOpen;
+      if (isResetting() || closedConnections.has(db)) {
+        continue;
+      }
+      connection = db;
+      return db;
+    } catch (error) {
+      if (error instanceof ResetInProgressError || isResetting()) {
+        continue;
+      }
+      throw error;
+    } finally {
+      if (opening === pendingOpen) {
+        opening = null;
+      }
     }
   }
 }
 
 async function openNativeDatabase(): Promise<SQLiteDBConnection> {
+  if (isResetting()) {
+    throw new ResetInProgressError();
+  }
   const sqlite = new SQLiteConnection(CapacitorSQLite);
   const consistency = await sqlite.checkConnectionsConsistency();
   const existing = (await sqlite.isConnection('turnleaf', false)).result;
+  if (isResetting()) {
+    throw new ResetInProgressError();
+  }
   const db =
     consistency.result && existing
       ? await sqlite.retrieveConnection('turnleaf', false)
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
+  if (isResetting()) {
+    throw new ResetInProgressError();
+  }
   await db.open();
   closedConnections.delete(db);
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
@@ -315,6 +353,16 @@ async function performNativeDatabaseReset(): Promise<void> {
 
       for (const handle of handlesToClose) {
         closedConnections.add(handle);
+        try {
+          await handle.execute('PRAGMA wal_checkpoint(TRUNCATE);');
+        } catch {
+          // Best effort only; corrupt or non-WAL databases may reject checkpointing.
+        }
+        try {
+          await handle.execute('PRAGMA journal_mode = DELETE;');
+        } catch {
+          // Best effort only; corrupt databases may reject pragma updates.
+        }
         try {
           await handle.close();
         } catch {
