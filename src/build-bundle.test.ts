@@ -60,6 +60,9 @@ describe('production bundle budgets and module exclusions', () => {
     expect(
       indexModules.some((id) => id.endsWith('/src/lib/components/LibrarySettingsModal.svelte')),
     ).toBe(false);
+    expect(
+      indexModules.some((id) => id.endsWith('/src/lib/components/DiagnosticsPanel.svelte')),
+    ).toBe(false);
     expect(indexModules.some((id) => id.endsWith('/src/lib/components/Reader.svelte'))).toBe(false);
     expect(indexModules.some((id) => id.endsWith('/src/lib/downloads/epub-validation.ts'))).toBe(
       false,

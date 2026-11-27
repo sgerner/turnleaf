@@ -1212,3 +1212,104 @@ it('saves normalized browser remote progress and guards against concurrent local
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
 });
+
+it('interleaves browser writes with localStorage.clear(), removeServer, and resetLocalDatabase without stale rows or lost writes', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  const staleServer = {
+    id: 'server',
+    displayName: 'Stale Kavita',
+    baseUrl: 'https://stale.example.com',
+    credentialRef: 'stale-cred',
+    kavitaVersion: '0.8.0',
+    lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  };
+  const freshServer = {
+    id: 'fresh-server',
+    displayName: 'Fresh Kavita',
+    baseUrl: 'https://fresh.example.com',
+    credentialRef: 'fresh-cred',
+    kavitaVersion: '0.8.5',
+    lastConnectedAt: '2026-09-08T00:00:00.000Z',
+  };
+  const freshBook: BookRecord = {
+    ...existingBook,
+    id: 'fresh-server:2:20',
+    serverId: freshServer.id,
+    libraryId: 2,
+    seriesId: 2,
+    volumeId: 20,
+    chapterId: 20,
+    title: 'Fresh Book',
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+
+  await saveServer(staleServer);
+  await reconcileBooks(staleServer.id, [existingBook]);
+  await saveLocalProgress(existingBook, 'stale-cfi', '/stale', 0.3);
+  await setPreference('uiTheme', 'eink');
+
+  // Clear localStorage directly and verify delayed stale progress/download writes do not leave orphan rows:
+  storage.clear();
+  await saveLocalProgress(existingBook, 'orphan-after-clear', '/orphan', 0.5);
+  await markBookCompleted(existingBook);
+  await markDownloaded(existingBook.id, 'books/orphan.epub', 512);
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBeNull();
+
+  // Seed again, removeServer + resetLocalDatabase, and interleave delayed stale writes with fresh writes:
+  await saveServer(staleServer);
+  await reconcileBooks(staleServer.id, [existingBook]);
+  await saveLocalProgress(existingBook, 'stale-cfi-2', '/stale-2', 0.4);
+  await removeServer(staleServer.id);
+  await saveLocalProgress(existingBook, 'orphan-after-remove', '/orphan', 0.6);
+  await resetLocalDatabase();
+  await markBookCompleted(existingBook);
+
+  await saveServer(freshServer);
+  await reconcileBooks(freshServer.id, [freshBook]);
+  await saveLocalProgress(freshBook, 'fresh-cfi', '/fresh', 0.75);
+  await setPreferences(
+    new Map([
+      ['uiTheme', 'crimson'],
+      ['uiMode', 'light'],
+    ]),
+  );
+
+  // Even if staleServer's book ID were reconciled fresh later, no orphaned readingState/syncQueue exists:
+  await expect(getServer()).resolves.toEqual(freshServer);
+  await expect(getBooks(staleServer.id)).resolves.toEqual([]);
+  await expect(getReadingState(existingBook.id)).resolves.toBeNull();
+  await expect(getPendingSync(staleServer.id)).resolves.toEqual([]);
+
+  await expect(getBooks(freshServer.id)).resolves.toEqual([
+    expect.objectContaining({ id: freshBook.id, pagesRead: 75, remoteAvailable: true }),
+  ]);
+  await expect(getReadingState(freshBook.id)).resolves.toMatchObject({
+    cfi: 'fresh-cfi',
+    xpath: '/fresh',
+    percentage: 0.75,
+    pendingSync: true,
+    syncRevision: 1,
+  });
+  await expect(getPendingSync(freshServer.id)).resolves.toEqual([
+    expect.objectContaining({ bookId: freshBook.id, revision: 1 }),
+  ]);
+  await expect(getPreferences(['uiTheme', 'uiMode'])).resolves.toEqual(
+    new Map([
+      ['uiTheme', 'crimson'],
+      ['uiMode', 'light'],
+    ]),
+  );
+  expect(JSON.parse(storage.getItem(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+    theme: 'crimson',
+    mode: 'light',
+  });
+});

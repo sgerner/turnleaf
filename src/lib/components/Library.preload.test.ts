@@ -105,60 +105,50 @@ describe('Library parallel reader preload', () => {
         status?: number;
       },
       KavitaClient: class MockKavitaClient {
-        coverUrl(seriesId: number) {
-          return `https://kavita.example.com/cover/${seriesId}`;
-        }
-        async getCover() {
-          return new Blob(['cover']);
-        }
-        async getBookLibraries() {
-          return [{ id: 1, name: 'Books', type: 2 }];
-        }
-        async getAllSeriesForLibrary() {
-          return [
+        coverUrl = (seriesId: number) => `https://kavita.example.com/cover/${seriesId}`;
+        getCover = async () => new Blob(['cover']);
+        getBookLibraries = async () => [{ id: 1, name: 'Books', type: 2 }];
+        getAllSeriesForLibrary = async () => [
+          {
+            id: 1,
+            libraryId: 1,
+            name: downloadedBook.title,
+            format: 3,
+            pages: downloadedBook.pages,
+            pagesRead: downloadedBook.pagesRead,
+            created: downloadedBook.createdAt,
+            latestReadDate: downloadedBook.lastReadAt,
+          },
+        ];
+        getSeriesDetail = async () => ({
+          volumes: [
             {
-              id: 1,
-              libraryId: 1,
-              name: downloadedBook.title,
-              format: 3,
+              id: 10,
+              number: 1,
+              name: '1',
               pages: downloadedBook.pages,
               pagesRead: downloadedBook.pagesRead,
-              created: downloadedBook.createdAt,
-              latestReadDate: downloadedBook.lastReadAt,
+              chapters: [
+                {
+                  id: 10,
+                  range: '1',
+                  titleName: downloadedBook.title,
+                  pages: downloadedBook.pages,
+                  pagesRead: downloadedBook.pagesRead,
+                  files: [{ id: 100, format: 3, bytes: 2048 }],
+                },
+              ],
             },
-          ];
-        }
-        async getSeriesDetail() {
-          return {
-            volumes: [
-              {
-                id: 10,
-                number: 1,
-                name: '1',
-                pages: downloadedBook.pages,
-                pagesRead: downloadedBook.pagesRead,
-                chapters: [
-                  {
-                    id: 10,
-                    range: '1',
-                    titleName: downloadedBook.title,
-                    pages: downloadedBook.pages,
-                    pagesRead: downloadedBook.pagesRead,
-                    files: [{ id: 100, format: 3, bytes: 2048 }],
-                  },
-                ],
-              },
-            ],
-            storylineChapters: [],
-            chapters: [],
-          };
-        }
-        async getSeriesMetadata() {
-          return { summary: '', writers: [{ name: downloadedBook.author }] };
-        }
-        async getProgress() {
-          if (hooks.progressGate) return hooks.progressGate;
-          return {
+          ],
+          storylineChapters: [],
+          chapters: [],
+        });
+        getSeriesMetadata = async () => ({
+          summary: '',
+          writers: [{ name: downloadedBook.author }],
+        });
+        getProgress = async () =>
+          hooks.progressGate ?? {
             libraryId: 1,
             seriesId: 1,
             volumeId: 10,
@@ -166,7 +156,6 @@ describe('Library parallel reader preload', () => {
             pageNum: 30,
             bookScrollId: null,
           };
-        }
       },
     }));
 
@@ -175,10 +164,9 @@ describe('Library parallel reader preload', () => {
       return {
         EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
         EpubValidationError: class EpubValidationError extends Error {},
-        verifyDownloadedEpub: vi.fn(async () => {
-          if (hooks.verifyGate) return hooks.verifyGate;
-          return { webViewUrl: 'blob:test-book', size: 1024 };
-        }),
+        verifyDownloadedEpub: vi.fn(
+          async () => hooks.verifyGate ?? { webViewUrl: 'blob:test-book', size: 1024 },
+        ),
         cleanupInterruptedEpubDownloads: vi.fn(async () => undefined),
         clearCoverCache: vi.fn(async () => undefined),
         cacheCover: vi.fn(async () => 'blob:test-cover'),
@@ -189,9 +177,7 @@ describe('Library parallel reader preload', () => {
 
     vi.doMock('./Reader.svelte', async () => {
       hooks.readerLoads += 1;
-      if (hooks.readerGate) {
-        await hooks.readerGate;
-      }
+      await hooks.readerGate;
       return {
         default: function MockReader(anchor: Comment) {
           const marker = document.createElement('div');
@@ -204,7 +190,6 @@ describe('Library parallel reader preload', () => {
     });
 
     vi.stubGlobal('scrollBy', () => {});
-
     vi.stubGlobal(
       'ResizeObserver',
       class {
@@ -212,27 +197,6 @@ describe('Library parallel reader preload', () => {
         unobserve() {}
         disconnect() {}
       },
-    );
-
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.includes('/api/Reader/get-progress')) {
-          if (hooks.progressGate) await hooks.progressGate;
-          return new Response(JSON.stringify({ pageNum: 30, chapterId: 10 }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
-        }
-        if (url.includes('/api/Library')) {
-          return new Response(JSON.stringify([]), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
-        }
-        return new Response(new Blob(['cover']), { status: 200 });
-      }),
     );
 
     const database = await import('../database/database');

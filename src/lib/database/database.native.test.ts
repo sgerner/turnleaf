@@ -32,6 +32,7 @@ const mocks = vi.hoisted(() => {
     }),
     checkConnectionsConsistency: vi.fn(async () => ({ result: true })),
     close: vi.fn(async () => db.close()),
+    closeConnection: vi.fn(async () => undefined),
     commitTransaction: vi.fn(async () => {
       const tasks = pendingTasks;
       inTransaction = false;
@@ -640,4 +641,54 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+it('serializes resetLocalDatabase behind in-flight writes and fences pre-reset handles', async () => {
+  const { openDatabase, replaceBooksInTransaction, resetLocalDatabase, saveLocalProgress } =
+    await import('./database');
+  const staleHandle = await openDatabase();
+  const events: string[] = [];
+
+  mocks.executeTransaction
+    .mockImplementationOnce(async () => {
+      events.push('pre-reset-tx:start');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      events.push('pre-reset-tx:end');
+      return { changes: { changes: 3 } };
+    })
+    .mockImplementationOnce(async () => {
+      events.push('post-reset-tx');
+      return { changes: { changes: 3 } };
+    });
+  mocks.plugin.close.mockImplementationOnce(async () => {
+    events.push('close');
+  });
+  mocks.plugin.deleteDatabase.mockImplementationOnce(async () => {
+    events.push('delete');
+  });
+  mocks.plugin.closeConnection.mockImplementationOnce(async () => {
+    events.push('closeConnection');
+  });
+  mocks.plugin.open.mockImplementationOnce(async () => {
+    events.push('reopen');
+  });
+
+  await Promise.all([
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
+    resetLocalDatabase(),
+    saveLocalProgress(book, 'fresh-cfi', '/fresh', 0.8),
+  ]);
+
+  expect(events).toEqual([
+    'pre-reset-tx:start',
+    'pre-reset-tx:end',
+    'close',
+    'delete',
+    'closeConnection',
+    'reopen',
+    'post-reset-tx',
+  ]);
+  await expect(replaceBooksInTransaction(staleHandle, book.serverId, [book])).rejects.toThrow(
+    'Connection to turnleaf is closed',
+  );
 });

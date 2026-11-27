@@ -2,7 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Library from './lib/components/Library.svelte';
-  import DiagnosticsPanel from './lib/components/DiagnosticsPanel.svelte';
+  import type DiagnosticsPanelComponent from './lib/components/DiagnosticsPanel.svelte';
   import type OnboardingComponent from './lib/components/Onboarding.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
   import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
@@ -66,8 +66,18 @@
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
   let onboardingAttempt = $state(0);
+  let StartupDiagnosticsPanel = $state<typeof DiagnosticsPanelComponent | null>(null);
   type OnboardingModule = { default: typeof OnboardingComponent };
   let onboardingPromise: Promise<OnboardingModule> | null = null;
+
+  async function ensureDiagnosticsPanel(): Promise<void> {
+    if (StartupDiagnosticsPanel) return;
+    try {
+      StartupDiagnosticsPanel = (await import('./lib/components/DiagnosticsPanel.svelte')).default;
+    } catch {
+      // Recovery actions remain usable even if the diagnostics panel chunk cannot load.
+    }
+  }
 
   function loadOnboarding(): Promise<OnboardingModule> {
     if (!onboardingPromise) {
@@ -114,6 +124,7 @@
             endpoint: 'local/credentials',
             detail: 'credential-read-failed',
           });
+          await ensureDiagnosticsPanel();
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
@@ -124,6 +135,7 @@
         endpoint: 'local/database',
         detail: 'database-open-failed',
       });
+      await ensureDiagnosticsPanel();
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
@@ -148,6 +160,7 @@
         endpoint: 'local/database',
         detail: 'database-reset-failed',
       });
+      await ensureDiagnosticsPanel();
       startupError =
         'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
       return;
@@ -302,7 +315,9 @@
             </button>
           {/if}
         </div>
-        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
+        {#if StartupDiagnosticsPanel}
+          <StartupDiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
+        {/if}
       </div>
     {:else}
       {#key onboardingAttempt}

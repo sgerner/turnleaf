@@ -23,113 +23,94 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
-vi.mock('@capacitor-community/sqlite', () => ({
-  CapacitorSQLite: {
-    checkConnectionsConsistency: async (): Promise<{ result: boolean }> => ({ result: true }),
-    createConnection: async (): Promise<void> => undefined,
-    open: async (): Promise<void> => {
-      if (!native.database) native.database = new DatabaseSync(native.databasePath);
-      native.isOpen = true;
-    },
-    close: async (): Promise<void> => {
-      if (native.database) native.database.close();
-      native.database = null;
-      native.isOpen = false;
-      native.inTransaction = false;
-    },
-    deleteDatabase: async (): Promise<void> => {
-      if (native.database) native.database.close();
-      native.database = null;
-      native.isOpen = false;
-      native.inTransaction = false;
-      rmSync(native.databasePath, { force: true });
-    },
-    getVersion: async (): Promise<{ version: number }> => {
-      const row = native.database?.prepare('PRAGMA user_version').get() as
-        { user_version?: number } | undefined;
-      return { version: Number(row?.user_version ?? 0) };
-    },
-    beginTransaction: async (): Promise<{ changes: { changes: number } }> => {
-      const database = native.database;
-      if (!database) throw new Error('database is not open');
-      database.exec('BEGIN');
-      native.inTransaction = true;
-      native.transactionTaskIndex = 0;
-      return { changes: { changes: 0 } };
-    },
-    commitTransaction: async (): Promise<{ changes: { changes: number } }> => {
-      const database = native.database;
-      if (!database) throw new Error('database is not open');
-      native.inTransaction = false;
+vi.mock('@capacitor-community/sqlite', () => {
+  const closeDb = () => {
+    native.database?.close();
+    native.database = null;
+    native.isOpen = false;
+    native.inTransaction = false;
+  };
+  const stepTransaction = async <T>(exec: () => T): Promise<T> => {
+    const currentIndex = native.transactionTaskIndex;
+    native.transactionTaskIndex += 1;
+    if (currentIndex === native.failTransactionAt) {
       native.failTransactionAt = null;
-      database.exec('COMMIT');
-      return { changes: { changes: 0 } };
-    },
-    rollbackTransaction: async (): Promise<{ changes: { changes: number } }> => {
-      const database = native.database;
-      native.inTransaction = false;
-      if (database) database.exec('ROLLBACK');
-      return { changes: { changes: 0 } };
-    },
-    execute: async (options: {
-      statements: string;
-      transaction?: boolean;
-    }): Promise<{ changes: { changes: number } }> => {
-      const database = native.database;
-      if (!database) throw new Error('database is not open');
-      if (native.inTransaction && options.transaction === false) {
-        const currentIndex = native.transactionTaskIndex;
-        native.transactionTaskIndex += 1;
-        if (currentIndex === native.failTransactionAt) {
-          native.failTransactionAt = null;
-          throw new Error(`injected transaction failure at ${currentIndex}`);
-        }
-        database.exec(options.statements);
-        await Promise.resolve();
-        await native.onTransactionTask?.(currentIndex);
+      throw new Error(`injected transaction failure at ${currentIndex}`);
+    }
+    const out = exec();
+    await Promise.resolve();
+    await native.onTransactionTask?.(currentIndex);
+    return out;
+  };
+  return {
+    CapacitorSQLite: {
+      checkConnectionsConsistency: async () => ({ result: true }),
+      createConnection: async () => undefined,
+      closeConnection: async () => undefined,
+      open: async () => {
+        if (!native.database) native.database = new DatabaseSync(native.databasePath);
+        native.isOpen = true;
+      },
+      close: async () => closeDb(),
+      deleteDatabase: async () => {
+        closeDb();
+        rmSync(native.databasePath, { force: true });
+      },
+      getVersion: async () => {
+        const row = native.database?.prepare('PRAGMA user_version').get() as
+          { user_version?: number } | undefined;
+        return { version: Number(row?.user_version ?? 0) };
+      },
+      beginTransaction: async () => {
+        if (!native.database) throw new Error('database is not open');
+        native.database.exec('BEGIN');
+        native.inTransaction = true;
+        native.transactionTaskIndex = 0;
         return { changes: { changes: 0 } };
-      }
-      database.exec(options.statements);
-      return { changes: { changes: 0 } };
-    },
-    run: async (options: {
-      statement: string;
-      values?: unknown[];
-      transaction?: boolean;
-    }): Promise<{ changes: { changes: number } }> => {
-      const database = native.database;
-      if (!database) throw new Error('database is not open');
-      if (native.inTransaction && options.transaction === false) {
-        const currentIndex = native.transactionTaskIndex;
-        native.transactionTaskIndex += 1;
-        if (currentIndex === native.failTransactionAt) {
-          native.failTransactionAt = null;
-          throw new Error(`injected transaction failure at ${currentIndex}`);
+      },
+      commitTransaction: async () => {
+        if (!native.database) throw new Error('database is not open');
+        native.inTransaction = false;
+        native.failTransactionAt = null;
+        native.database.exec('COMMIT');
+        return { changes: { changes: 0 } };
+      },
+      rollbackTransaction: async () => {
+        native.inTransaction = false;
+        native.database?.exec('ROLLBACK');
+        return { changes: { changes: 0 } };
+      },
+      execute: async (options: { statements: string; transaction?: boolean }) => {
+        const db = native.database;
+        if (!db) throw new Error('database is not open');
+        if (native.inTransaction && options.transaction === false) {
+          await stepTransaction(() => db.exec(options.statements));
+        } else {
+          db.exec(options.statements);
         }
-        const result = database
-          .prepare(options.statement)
-          .run(...((options.values ?? []) as SQLInputValue[]));
-        await Promise.resolve();
-        await native.onTransactionTask?.(currentIndex);
+        return { changes: { changes: 0 } };
+      },
+      run: async (options: { statement: string; values?: unknown[]; transaction?: boolean }) => {
+        const db = native.database;
+        if (!db) throw new Error('database is not open');
+        const exec = () =>
+          db.prepare(options.statement).run(...((options.values ?? []) as SQLInputValue[]));
+        const result =
+          native.inTransaction && options.transaction === false
+            ? await stepTransaction(exec)
+            : exec();
         return { changes: { changes: Number(result?.changes ?? 0) } };
-      }
-      const result = database
-        .prepare(options.statement)
-        .run(...((options.values ?? []) as SQLInputValue[]));
-      return { changes: { changes: Number(result?.changes ?? 0) } };
+      },
+      query: async (options: { statement: string; values?: unknown[] }) => ({
+        values:
+          (native.database
+            ?.prepare(options.statement)
+            .all(...((options.values ?? []) as SQLInputValue[])) as
+            Record<string, unknown>[] | undefined) ?? [],
+      }),
     },
-    query: async (options: {
-      statement: string;
-      values?: unknown[];
-    }): Promise<{ values: Record<string, unknown>[] }> => {
-      const rows = native.database
-        ?.prepare(options.statement)
-        .all(...((options.values ?? []) as SQLInputValue[])) as
-        Record<string, unknown>[] | undefined;
-      return { values: rows ?? [] };
-    },
-  },
-}));
+  };
+});
 
 const server = {
   id: 'server',
@@ -864,5 +845,149 @@ describe('native progress transactions against SQLite', () => {
       cfi: 'newer-cfi',
       pendingSync: true,
     });
+  });
+
+  it('interleaves native writes with localStorage.clear() and resetLocalDatabase so no stale row survives and nothing is lost', async () => {
+    const storageMap = new Map<string, string>();
+    vi.stubGlobal('window', {
+      localStorage: {
+        clear: () => storageMap.clear(),
+        getItem: (key: string) => storageMap.get(key) ?? null,
+        setItem: (key: string, value: string) => void storageMap.set(key, value),
+        removeItem: (key: string) => void storageMap.delete(key),
+      },
+    });
+
+    try {
+      const database = await importDatabase();
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+
+      const staleBookTwo = { ...book, id: 'server:1:11', chapterId: 11, title: 'Stale Book Two' };
+      const freshServer = {
+        id: 'fresh-server',
+        displayName: 'Fresh Kavita',
+        baseUrl: 'https://fresh.example.com',
+        credentialRef: 'fresh-cred',
+        kavitaVersion: '0.8.5',
+        lastConnectedAt: '2026-02-01T00:00:00.000Z',
+      };
+      const freshBook = {
+        ...book,
+        id: 'fresh-server:2:20',
+        serverId: freshServer.id,
+        libraryId: 2,
+        seriesId: 2,
+        volumeId: 20,
+        chapterId: 20,
+        title: 'Fresh Book',
+      };
+
+      await database.saveServer(server);
+      await database.reconcileBooks(server.id, [book, staleBookTwo]);
+      await database.saveLocalProgress(book, 'seed-cfi', '/seed', 0.2);
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'dark'],
+        ]),
+      );
+      const staleConnection = await database.openDatabase();
+
+      const interleaved: Promise<unknown>[] = [];
+      native.onTransactionTask = async (index) => {
+        if (index !== 0) return;
+        native.onTransactionTask = null;
+        // Pre-reset writes queued while a progress transaction is mid-flight:
+        interleaved.push(
+          database.markBookCompleted(staleBookTwo),
+          database.reconcileBooks(server.id, [{ ...book, title: 'Stale Refresh' }, staleBookTwo]),
+          database.setPreference('uiTheme', 'pine'),
+        );
+        // Clear WebView localStorage and reset native SQLite without waiting first:
+        window.localStorage.clear();
+        const resetPromise = database.resetLocalDatabase();
+        interleaved.push(resetPromise);
+        // Post-reset writes queued immediately behind reset:
+        interleaved.push(
+          database.saveServer(freshServer),
+          database.reconcileBooks(freshServer.id, [freshBook]),
+          database.saveLocalProgress(freshBook, 'fresh-cfi', '/fresh', 0.65),
+          database.setPreference('uiTheme', 'crimson'),
+        );
+      };
+
+      await database.saveLocalProgress(book, 'inflight-stale-cfi', '/inflight-stale', 0.55);
+      await Promise.all(interleaved);
+
+      // Stale connection handles and delayed writes for removed books must fail without side effects:
+      await expect(
+        database.replaceBooksInTransaction(staleConnection, freshServer.id, [
+          { ...staleBookTwo, id: 'fresh-server:stale-handle', serverId: freshServer.id },
+        ]),
+      ).rejects.toThrow('Connection to turnleaf is closed');
+      await expect(
+        database.saveLocalProgress(book, 'late-stale-cfi', '/late-stale', 0.9),
+      ).rejects.toThrow();
+
+      // Clearing localStorage between theme and mode updates must preserve SQLite uiTheme in boot cache:
+      window.localStorage.clear();
+      await database.setPreference('uiMode', 'light');
+
+      const reopened = await reopenDatabase(database);
+      expect(await reopened.getServer()).toEqual(freshServer);
+      expect(await reopened.getBooks(server.id)).toEqual([]);
+      expect(await reopened.getReadingState(book.id)).toBeNull();
+      expect(await reopened.getReadingState(staleBookTwo.id)).toBeNull();
+      expect(await reopened.getPendingSync(server.id)).toEqual([]);
+
+      expect(await reopened.getBooks(freshServer.id)).toEqual([
+        expect.objectContaining({
+          id: freshBook.id,
+          serverId: freshServer.id,
+          title: 'Fresh Book',
+          pagesRead: 65,
+          remoteAvailable: true,
+        }),
+      ]);
+      expect(await reopened.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'fresh-cfi',
+        xpath: '/fresh',
+        percentage: 0.65,
+        pendingSync: true,
+        syncRevision: 1,
+      });
+      expect(await reopened.getPendingSync(freshServer.id)).toEqual([
+        expect.objectContaining({ bookId: freshBook.id, revision: 1 }),
+      ]);
+      expect(await reopened.getPreferences(['uiTheme', 'uiMode'])).toEqual(
+        new Map([
+          ['uiTheme', 'crimson'],
+          ['uiMode', 'light'],
+        ]),
+      );
+      expect(JSON.parse(storageMap.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+        theme: 'crimson',
+        mode: 'light',
+      });
+
+      expect(
+        native.database
+          ?.prepare(
+            `SELECT
+              (SELECT COUNT(*) FROM server_config) AS servers,
+              (SELECT COUNT(*) FROM books) AS books,
+              (SELECT COUNT(*) FROM reading_state) AS reading_states,
+              (SELECT COUNT(*) FROM sync_queue) AS sync_rows`,
+          )
+          .get(),
+      ).toEqual({
+        servers: 1,
+        books: 1,
+        reading_states: 1,
+        sync_rows: 1,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
