@@ -461,12 +461,8 @@ it('checks PRAGMA table_info before ALTER TABLE ADD COLUMN and skips pre-existin
   expect(mocks.executeTransaction).toHaveBeenCalledOnce();
   const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
   expect(tasks).toEqual([
-    {
-      statement: [
-        'ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;',
-        'ALTER TABLE books ADD COLUMN chapter_key TEXT;',
-      ].join('\n'),
-    },
+    { statement: 'ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;' },
+    { statement: 'ALTER TABLE books ADD COLUMN chapter_key TEXT;' },
     { statement: 'PRAGMA user_version = 8;' },
   ]);
 });

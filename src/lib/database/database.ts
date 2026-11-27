@@ -551,11 +551,11 @@ async function queryExistingTableColumns(
   return columns;
 }
 
-async function buildIdempotentMigrationStatements(
+async function buildIdempotentMigrationTasks(
   db: Partial<Pick<SQLiteDBConnection, 'query'>>,
   statements: string,
-): Promise<string | null> {
-  if (typeof db.query !== 'function') return statements;
+): Promise<capTask[]> {
+  if (typeof db.query !== 'function') return [{ statement: statements }];
   const parsed = splitSqlStatements(statements).map((statement) => {
     const match = ALTER_TABLE_ADD_COLUMN_PATTERN.exec(statement);
     return match
@@ -566,7 +566,7 @@ async function buildIdempotentMigrationStatements(
   for (const item of parsed) {
     if (item.table) tablesToInspect.add(item.table);
   }
-  if (tablesToInspect.size === 0) return statements;
+  if (tablesToInspect.size === 0) return [{ statement: statements }];
 
   const columnsByTable = new Map<string, Set<string>>();
   for (const table of tablesToInspect) {
@@ -574,16 +574,16 @@ async function buildIdempotentMigrationStatements(
   }
 
   let skippedColumn = false;
-  const kept: string[] = [];
+  const kept: capTask[] = [];
   for (const item of parsed) {
     if (item.table && item.column && columnsByTable.get(item.table)?.has(item.column)) {
       skippedColumn = true;
       continue;
     }
-    kept.push(`${item.statement};`);
+    kept.push({ statement: `${item.statement};` });
   }
-  if (!skippedColumn) return statements;
-  return kept.length > 0 ? kept.join('\n') : null;
+  if (!skippedColumn) return [{ statement: statements }];
+  return kept;
 }
 
 export async function migrateDatabase(
@@ -594,9 +594,9 @@ export async function migrateDatabase(
   const currentVersion = current.version ?? 0;
   for (const migration of migrations) {
     if (migration.version <= currentVersion) continue;
-    const statements = await buildIdempotentMigrationStatements(db, migration.statements);
+    const migrationTasks = await buildIdempotentMigrationTasks(db, migration.statements);
     await executeNativeTransaction(db, [
-      ...(statements ? [{ statement: statements }] : []),
+      ...migrationTasks,
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
   }
@@ -610,13 +610,12 @@ export async function migrateDatabase(
         (column) => !existingBooksColumns.has(column.name.toLowerCase()),
       );
       if (missingV8Columns.length > 0) {
-        await executeNativeTransaction(db, [
-          {
-            statement: missingV8Columns
-              .map((column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`)
-              .join('\n'),
-          },
-        ]);
+        await executeNativeTransaction(
+          db,
+          missingV8Columns.map((column) => ({
+            statement: `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+          })),
+        );
       }
     }
   }
