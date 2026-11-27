@@ -19,12 +19,33 @@ function deferred<T>() {
 }
 
 const mocks = vi.hoisted(() => {
-  const removeHandle = async () => undefined;
+  const networkListeners = new Set<
+    (status: { connected: boolean; connectionType: string }) => void
+  >();
   return {
     isNative: true,
+    networkListeners,
     networkGetStatus: vi.fn(async () => ({ connected: false, connectionType: 'none' })),
-    networkAddListener: vi.fn(async () => ({ remove: removeHandle })),
-    appAddListener: vi.fn(async () => ({ remove: removeHandle })),
+    networkAddListener: vi.fn(
+      async (
+        _event: string,
+        listener: (status: { connected: boolean; connectionType: string }) => void,
+      ) => {
+        networkListeners.add(listener);
+        return {
+          remove: async () => {
+            networkListeners.delete(listener);
+          },
+        };
+      },
+    ),
+    capacitorHttpRequest: vi.fn(async () => ({
+      status: 200,
+      headers: {},
+      url: 'https://books.example.com/api/Series/v2',
+      data: [],
+    })),
+    appAddListener: vi.fn(async () => ({ remove: async () => undefined })),
     appExitApp: vi.fn(async () => undefined),
     getServer: vi.fn<() => Promise<ServerConfig | null>>(async () => null),
     getPreferences: vi.fn<(keys: readonly string[]) => Promise<Map<string, string>>>(
@@ -56,6 +77,9 @@ vi.mock('@capacitor/core', () => ({
     isNativePlatform: () => mocks.isNative,
     getPlatform: () => (mocks.isNative ? 'android' : 'web'),
     convertFileSrc: (uri: string) => uri,
+  },
+  CapacitorHttp: {
+    request: mocks.capacitorHttpRequest,
   },
 }));
 
@@ -194,6 +218,8 @@ beforeEach(async () => {
     }) as typeof Element.prototype.animate;
   }
   mocks.isNative = true;
+  Object.defineProperty(window.navigator, 'onLine', { configurable: true, value: true });
+  mocks.networkListeners.clear();
   document.documentElement.dataset.theme = 'fennec';
   document.documentElement.dataset.mode = 'dark';
   container = document.createElement('div');
@@ -202,6 +228,12 @@ beforeEach(async () => {
   mocks.networkGetStatus
     .mockReset()
     .mockResolvedValue({ connected: false, connectionType: 'none' });
+  mocks.capacitorHttpRequest.mockReset().mockResolvedValue({
+    status: 200,
+    headers: {},
+    url: 'https://books.example.com/api/Series/v2',
+    data: [],
+  });
   mocks.networkAddListener.mockClear();
   mocks.appAddListener.mockClear();
   mocks.getServer.mockReset().mockResolvedValue(savedServer);
@@ -420,5 +452,51 @@ describe('App cold-launch parallel hydration', () => {
       'database-open-failed',
     );
     expect(mocks.fetchLatestGithubRelease).not.toHaveBeenCalled();
+  });
+
+  it('reconciles WebView offline state and stale startup Network.getStatus so offline cold launch blocks requests and still refreshes on reconnect', async () => {
+    // Case A: plugin reports connected=true at startup while WebView navigator.onLine is false.
+    Object.defineProperty(window.navigator, 'onLine', { configurable: true, value: false });
+    mocks.networkGetStatus.mockResolvedValue({ connected: true, connectionType: 'wifi' });
+
+    mounted = mount(App, { target: container });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('The Left Hand of Darkness');
+      expect(container.textContent).toContain('No network connection. Showing your saved library.');
+    });
+    await flushMicrotasks(6);
+    expect(mocks.capacitorHttpRequest).not.toHaveBeenCalled();
+
+    // When WebView comes back online, Library transitions offline -> online and refreshes.
+    Object.defineProperty(window.navigator, 'onLine', { configurable: true, value: true });
+    window.dispatchEvent(new Event('online'));
+    await vi.waitFor(() => {
+      expect(mocks.capacitorHttpRequest).toHaveBeenCalled();
+    });
+
+    unmount(mounted);
+    mounted = null;
+    container.innerHTML = '';
+    mocks.capacitorHttpRequest.mockClear();
+
+    // Case B: App startup sees stale connected=true, Library networkAvailable() sees connected=false, then networkStatusChange reconnects.
+    mocks.networkGetStatus
+      .mockResolvedValueOnce({ connected: true, connectionType: 'wifi' })
+      .mockResolvedValue({ connected: false, connectionType: 'none' });
+
+    mounted = mount(App, { target: container });
+    await vi.waitFor(() => {
+      expect(container.textContent).toContain('The Left Hand of Darkness');
+      expect(container.textContent).toContain('No network connection. Showing your saved library.');
+    });
+    expect(mocks.capacitorHttpRequest).not.toHaveBeenCalled();
+
+    mocks.networkGetStatus.mockResolvedValue({ connected: true, connectionType: 'wifi' });
+    for (const listener of mocks.networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await vi.waitFor(() => {
+      expect(mocks.capacitorHttpRequest).toHaveBeenCalled();
+    });
   });
 });

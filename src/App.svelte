@@ -67,6 +67,10 @@
     return { theme: DEFAULT_THEME, mode: DEFAULT_MODE };
   }
 
+  function isBrowserOffline(): boolean {
+    return typeof navigator !== 'undefined' && navigator.onLine === false;
+  }
+
   const bootAppearance = resolveInitialAppearance();
 
   type StartupLibraryHydration = {
@@ -102,6 +106,12 @@
 
     const credentialsReady = prepareCredentials();
     void credentialsReady.catch(() => {});
+    let latestNetworkConnected: boolean | undefined;
+    const startupNetworkListener = Promise.resolve(
+      Network.addListener('networkStatusChange', ({ connected }) => {
+        latestNetworkConnected = connected;
+      }),
+    ).catch(() => null);
     const networkStatusPromise = Network.getStatus().catch(() => null);
 
     try {
@@ -137,13 +147,14 @@
         if (savedTheme !== undefined || savedMode !== undefined) {
           writeBootThemeCache(resolvedTheme, resolvedMode);
         }
+        const effectiveConnected = latestNetworkConnected ?? networkStatus?.connected === true;
         server = saved;
         apiKey = loadedKey;
         startupLibrary = {
           serverId: saved.id,
           books: savedBooks,
           preferences,
-          offline: !networkStatus?.connected,
+          offline: !effectiveConnected || isBrowserOffline(),
         };
         if (credentialFailed) {
           recordDiagnostic({
@@ -178,6 +189,7 @@
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
+      void startupNetworkListener.then((handle) => handle?.remove()).catch(() => {});
       if (!destroyed && generation === loadGeneration) {
         booting = false;
       }

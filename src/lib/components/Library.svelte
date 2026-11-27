@@ -120,6 +120,12 @@
       initialPreferences !== undefined &&
       initialOffline !== undefined,
   );
+  function isBrowserOffline(): boolean {
+    return typeof navigator !== 'undefined' && navigator.onLine === false;
+  }
+  const initialResolvedOffline = untrack(
+    () => (preloadedStartup ? Boolean(initialOffline) : false) || isBrowserOffline(),
+  );
   function offlineStartupNotice(isOffline: boolean, items: readonly BookRecord[]): string {
     if (!isOffline) return '';
     const hasDisplayable = items.some(
@@ -156,7 +162,7 @@
   let query = $state('');
   let offlineMessage = $state(
     untrack(() =>
-      preloadedStartup ? offlineStartupNotice(initialOffline ?? false, initialBooks ?? []) : '',
+      preloadedStartup ? offlineStartupNotice(initialResolvedOffline, initialBooks ?? []) : '',
     ),
   );
   let downloadedOnly = $state(
@@ -289,7 +295,7 @@
   let downloadFailureBook = $state<BookRecord | null>(null);
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
-  let offline = $state(untrack(() => (preloadedStartup ? (initialOffline ?? false) : false)));
+  let offline = $state(initialResolvedOffline);
   let message = $state('');
   let messageRevision = 0;
   let syncStatus = $state<SyncStatus>({
@@ -774,7 +780,7 @@
       authorFilter = preferences.get('libraryAuthor') ?? '';
       seriesFilter = preferences.get('librarySeries') ?? '';
       viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-      offline = !networkStatus?.connected;
+      offline = !networkStatus?.connected || isBrowserOffline();
       books = savedBooks;
       retainCoversFor(books);
       loading = false;
@@ -782,28 +788,26 @@
     }
     void refreshSyncStatus();
     if (destroyed) return;
+    const handleWindowOffline = () => applyConnectivityChange(false);
+    const handleWindowOnline = () => {
+      void (async () => {
+        if (destroyed) return;
+        const connected = Capacitor.isNativePlatform()
+          ? (await Network.getStatus().catch(() => null))?.connected === true
+          : true;
+        applyConnectivityChange(connected);
+      })();
+    };
+    window.addEventListener('offline', handleWindowOffline);
+    window.addEventListener('online', handleWindowOnline);
+    cleanups.push(async () => {
+      window.removeEventListener('offline', handleWindowOffline);
+      window.removeEventListener('online', handleWindowOnline);
+    });
     cleanups.push(
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
-          if (destroyed) return;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
-          }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected) {
-            const baselineRevision = activeSyncStartRevision ?? messageRevision;
-            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-            void syncProgress(false);
-            void startRefresh(false, baselineRevision, baselineMessage);
-          }
+          applyConnectivityChange(connected);
         }),
       ),
     );
@@ -847,11 +851,44 @@
     return handle.remove;
   }
 
+  function applyConnectivityChange(pluginConnected: boolean): void {
+    if (destroyed) return;
+    const effectiveConnected = pluginConnected && !isBrowserOffline();
+    const wasOffline = offline;
+    offline = !effectiveConnected;
+    if (!effectiveConnected) {
+      refreshController?.abort();
+      openProgressProbe?.abort();
+    }
+    coverReloadRequest += 1;
+    kavitaUnreachable = false;
+    offlineMessage = effectiveConnected
+      ? ''
+      : displayableBooks.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.';
+    if (effectiveConnected && wasOffline) {
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+      void syncProgress(false);
+      void startRefresh(false, baselineRevision, baselineMessage);
+    }
+  }
+
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
+    if (isBrowserOffline()) {
+      applyConnectivityChange(false);
+      return false;
+    }
     if (!Capacitor.isNativePlatform()) return true;
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    if (destroyed) return false;
+    if (status?.connected !== true || isBrowserOffline()) {
+      applyConnectivityChange(false);
+      return false;
+    }
+    return !offline;
   }
 
   async function refreshSyncStatus(): Promise<void> {
