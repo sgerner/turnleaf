@@ -772,8 +772,10 @@ describe('Reader alert modals and focus containment', () => {
     expect(target.querySelector('#reader-footnote')).not.toBeNull();
     expect(document.activeElement).toBe(stayBtn);
 
-    // Dismissing the top-level sync alert un-inerts .reader-overlay and moves focus to #reader-footnote
-    stayBtn.click();
+    // Dismissing the top-level sync alert via Escape un-inerts .reader-overlay and moves focus to #reader-footnote
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+    );
     await settle();
 
     expect(target.querySelector('.z-40 [role="alertdialog"]')).toBeNull();
@@ -785,8 +787,10 @@ describe('Reader alert modals and focus containment', () => {
     )!;
     expect(document.activeElement).toBe(closeFootnoteBtn);
 
-    // Closing #reader-footnote now un-inerts .reader-viewport and restores focus to the iframe opener
-    closeFootnoteBtn.click();
+    // Pressing Escape again closes #reader-footnote, un-inerts .reader-viewport, and restores focus to the iframe opener
+    window.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+    );
     await settle();
 
     expect(target.querySelector('#reader-footnote')).toBeNull();

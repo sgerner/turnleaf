@@ -242,6 +242,29 @@ describe('Reader inspectors, keyboard selection, and Dynamic Type', () => {
     expect(reopenedDialog).not.toBeNull();
     expect(reopenedDialog?.textContent).toContain('Important orbital assumption');
 
+    // Start editing the saved note, close Notes, and reopen via highlight overlay -> unsaved draft stays open and focused
+    reopenedDialog!
+      .querySelector<HTMLButtonElement>('[data-reader-focus="annotation-edit"]')!
+      .click();
+    await flushAsync();
+    const editTextarea = reopenedDialog!.querySelector<HTMLTextAreaElement>(
+      '[data-reader-focus="annotation-editor"]',
+    )!;
+    editTextarea.value = 'Important orbital assumption (revised draft)';
+    editTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+
+    backHandler?.();
+    await flushAsync();
+    expect(host.querySelector('#reader-annotations')).toBeNull();
+
+    sessionMock.inspectors.onHighlight?.('epubcfi(/6/2!/4/2/1:0,/1:0,/1:34)', highlightOpener);
+    await flushAsync();
+    const preservedEditor = host.querySelector<HTMLTextAreaElement>(
+      '#reader-annotations [data-reader-focus="annotation-editor"]',
+    );
+    expect(preservedEditor?.value).toBe('Important orbital assumption (revised draft)');
+    expect(document.activeElement).toBe(preservedEditor);
+
     backHandler?.();
     await flushAsync();
     expect(document.activeElement).toBe(highlightOpener);

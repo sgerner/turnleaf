@@ -742,7 +742,11 @@
           annotationsPanel?.querySelectorAll<HTMLElement>('[data-annotation-card]') ?? [];
         const card = [...cards].find((node) => node.dataset.annotationCard === matched.id);
         card?.scrollIntoView?.({ block: 'nearest' });
-        focusReaderTarget(annotationsPanel, 'annotation-edit', matched.id);
+        focusReaderTarget(
+          annotationsPanel,
+          editingAnnotationId === matched.id ? 'annotation-editor' : 'annotation-edit',
+          matched.id,
+        );
       });
     } else {
       focusModal(() => annotationsPanel);
@@ -751,7 +755,6 @@
 
   function closeAnnotations(): void {
     annotationsVisible = false;
-    editingAnnotationId = null;
     activeAnnotationId = null;
     if (!hasSelectionDraft()) {
       selectedText = null;
@@ -775,6 +778,7 @@
     selectedText = passage;
     annotationDraft = '';
     annotationMessage = '';
+    annotationLimitMessage = '';
     focusReaderTarget(annotationsPanel, 'new-annotation-note');
   }
 

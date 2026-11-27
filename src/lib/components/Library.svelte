@@ -858,7 +858,10 @@
   }
 
   function syncProgress(showFeedback = true): Promise<void> {
-    if (syncWork) return syncWork;
+    if (syncWork) {
+      if (!relocationWork) return syncWork;
+      return syncWork.then(() => syncProgress(showFeedback));
+    }
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
@@ -895,7 +898,7 @@
     syncing = true;
     activeSyncStartRevision = messageRevision;
     try {
-      if (relocationWork) await relocationWork;
+      while (relocationWork) await relocationWork;
       const available = Capacitor.isNativePlatform()
         ? await networkAvailable()
         : !offline && !destroyed;
@@ -1295,7 +1298,7 @@
 
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
     try {
-      if (relocationWork) await relocationWork;
+      while (relocationWork) await relocationWork;
       let remote: KavitaProgress | null = null;
       if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
         const probe = new AbortController();
@@ -1500,7 +1503,7 @@
     percentage: number | null;
     accept?: () => Promise<void>;
   } | null> {
-    if (relocationWork) await relocationWork;
+    while (relocationWork) await relocationWork;
     if (!manual && !pendingAutoSync) return null;
     if (book.remoteAvailable === false || !(await networkAvailable())) {
       if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
@@ -1523,10 +1526,10 @@
       } finally {
         void refreshSyncStatus();
       }
-    } else if (syncWork) {
-      await syncWork;
+    } else {
+      while (syncWork) await syncWork;
     }
-    if (relocationWork) await relocationWork;
+    while (relocationWork) await relocationWork;
     const local = await getReadingState(book.id);
     if (local?.pendingSync) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
@@ -1540,9 +1543,9 @@
       accept: async () => {
         acceptingRemoteProgress = true;
         try {
-          if (relocationWork) await relocationWork;
+          while (relocationWork) await relocationWork;
           // An upload cannot race with deletion of the exact revision it is sending.
-          if (syncWork) await syncWork;
+          while (syncWork) await syncWork;
           const accepted = await saveRemoteProgress(book, remote, local);
           if (!accepted)
             throw new Error('The saved reading position changed. Sync again to retry.');
@@ -1564,7 +1567,7 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    if (relocationWork) await relocationWork;
+    while (relocationWork) await relocationWork;
     await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
