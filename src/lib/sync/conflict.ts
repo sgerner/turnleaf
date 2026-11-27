@@ -60,6 +60,47 @@ export interface OpenRemoteProgress {
 
 export type OpenProgressDecision = 'local' | 'remote' | 'conflict' | 'none';
 
+export interface OpenReaderLocators {
+  cfi: string | null;
+  xpath: string | null;
+  percentage: number | null;
+}
+
+function boundedPagePercentage(pageNum: number, totalPages: number): number | null {
+  if (!totalPages || pageNum <= 0) return null;
+  return Math.max(0, Math.min(0.999, pageNum / totalPages));
+}
+
+export function resolveOpenReaderLocators(
+  decision: OpenProgressDecision,
+  local: Pick<OpenLocalProgress, 'cfi' | 'percentage' | 'xpath'> | null,
+  remote: OpenRemoteProgress | null,
+  bookPages: number,
+  pagesRead = 0,
+): OpenReaderLocators {
+  if (decision === 'remote' && remote) {
+    return {
+      cfi: null,
+      xpath: remote.bookScrollId ?? null,
+      percentage: boundedPagePercentage(remote.pageNum, bookPages),
+    };
+  }
+  if (local) {
+    return {
+      cfi: local.cfi || null,
+      xpath: local.xpath ?? null,
+      percentage: Number.isFinite(local.percentage) ? local.percentage : null,
+    };
+  }
+  return {
+    cfi: null,
+    xpath: remote?.bookScrollId ?? null,
+    percentage: remote
+      ? boundedPagePercentage(remote.pageNum, bookPages)
+      : boundedPagePercentage(pagesRead, bookPages),
+  };
+}
+
 export function chooseOpenProgress(
   local: OpenLocalProgress | null,
   remote: OpenRemoteProgress | null,

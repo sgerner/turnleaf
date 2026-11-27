@@ -21,6 +21,7 @@
   import {
     ReaderSession,
     resolveReaderKeyboardAction,
+    type ReaderCfiDisplayStatus,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
@@ -33,6 +34,7 @@
     annotationsMarkdown,
     parseAnnotations,
     removeAnnotation,
+    repairAnnotations,
     updateAnnotation,
     type StoredAnnotation,
   } from '../reader/annotations';
@@ -152,10 +154,12 @@
   let selectedTextGroup = $state<HTMLElement | null>(null);
   let visiblePassages = $state<ReaderSelection[]>([]);
   let selectedPassageIndex = $state(0);
-  let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
+  let annotationMessage = $state('');
   let annotationLimitMessage = $state('');
+  let highlightNotice = $state('');
+  let unanchoredAnnotationIds = $state<string[]>([]);
   const annotationDrafts = new SvelteMap<string, string>();
 
   const BOOKMARK_LIMIT_MESSAGE = `You can save up to ${MAX_BOOKMARKS} bookmarks per book. Delete a bookmark to add another.`;
@@ -171,6 +175,7 @@
   let readerSyncMessage = $state('');
   let searchError = $state('');
   let searchController: AbortController | null = null;
+  let navigationController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
@@ -281,6 +286,32 @@
         }
       },
       handleKeyboardNavigation,
+      (resolution) => {
+        if (destroyed || session !== nextSession) return;
+        if (resolution.repaired.length > 0) {
+          const next = repairAnnotations(annotations, resolution.repaired);
+          if (next !== annotations) {
+            const appliedIds = new Set(
+              next.filter((entry, index) => entry !== annotations[index]).map((entry) => entry.id),
+            );
+            annotations = next;
+            unanchoredAnnotationIds = unanchoredAnnotationIds.filter((id) => !appliedIds.has(id));
+            queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+          }
+        }
+        const activeMissingIds = resolution.missingIds.filter((id) =>
+          annotations.some((entry) => entry.id === id),
+        );
+        if (activeMissingIds.length > 0) {
+          unanchoredAnnotationIds = [...new Set([...unanchoredAnnotationIds, ...activeMissingIds])];
+          const message =
+            activeMissingIds.length === 1
+              ? '1 saved highlight no longer matches the text in this EPUB. Your note is still saved.'
+              : `${activeMissingIds.length} saved highlights no longer match the text in this EPUB. Your notes are still saved.`;
+          annotationMessage = message;
+          highlightNotice = message;
+        }
+      },
     );
     if (!destroyed) {
       sessionReady = true;
@@ -384,6 +415,8 @@
     if (tocVirtualizationFrame !== null) window.cancelAnimationFrame(tocVirtualizationFrame);
     flushPendingPreferences();
     searchController?.abort();
+    navigationController?.abort();
+    navigationController = null;
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
@@ -973,7 +1006,19 @@
     const trimmedExcerpt = target.text.trim();
     if (!trimmedCfi || !trimmedExcerpt) return null;
     const hadNote = Boolean(annotationDraft.trim());
-    const next = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
+    const sectionHref = target.href ?? location?.href;
+    const next = addAnnotation(
+      annotations,
+      target.cfi,
+      target.text,
+      annotationDraft,
+      new Date().toISOString(),
+      {
+        ...(sectionHref ? { href: sectionHref } : {}),
+        ...(target.prefix ? { prefix: target.prefix } : {}),
+        ...(target.suffix ? { suffix: target.suffix } : {}),
+      },
+    );
     const saved = next.find((annotation) => annotation.cfi === trimmedCfi) ?? null;
     if (!saved) {
       annotationLimitMessage = ANNOTATION_LIMIT_MESSAGE;
@@ -1044,6 +1089,7 @@
   function deleteAnnotation(annotation: StoredAnnotation): void {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
+    unanchoredAnnotationIds = unanchoredAnnotationIds.filter((id) => id !== annotation.id);
     annotationDrafts.delete(annotation.id);
     if (editingAnnotationId === annotation.id) editingAnnotationId = null;
     if (annotations.length < MAX_ANNOTATIONS) annotationLimitMessage = '';
@@ -1051,6 +1097,98 @@
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
+  }
+
+  function beginNavigationRequest(): AbortSignal {
+    navigationController?.abort();
+    const controller = new AbortController();
+    navigationController = controller;
+    return controller.signal;
+  }
+
+  function cancelNavigationRequest(): void {
+    navigationController?.abort();
+    navigationController = null;
+  }
+
+  async function tryDisplayCfi(
+    reader: ReaderSession,
+    cfi: string,
+    fallbackHref: string | undefined,
+    signal: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (typeof reader.displayCfiStatus === 'function') {
+      return reader.displayCfiStatus(cfi, fallbackHref, signal);
+    }
+    const ok = await reader.displayCfi(cfi, fallbackHref, signal);
+    if (signal.aborted || destroyed || session !== reader) return 'aborted';
+    return ok ? 'displayed' : 'missing';
+  }
+
+  async function tryDisplayHref(
+    reader: ReaderSession,
+    href: string,
+    signal: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (typeof reader.displayHrefStatus === 'function') {
+      return reader.displayHrefStatus(href, signal);
+    }
+    if (typeof reader.displayHref === 'function') {
+      const ok = await reader.displayHref(href, signal);
+      return signal.aborted || destroyed || session !== reader
+        ? 'aborted'
+        : ok
+          ? 'displayed'
+          : 'missing';
+    }
+    await reader.display(href);
+    return signal.aborted || destroyed || session !== reader ? 'aborted' : 'displayed';
+  }
+
+  async function selectAnnotation(annotation: StoredAnnotation): Promise<void> {
+    const reader = session;
+    if (!reader) return;
+    const signal = beginNavigationRequest();
+    annotationMessage = '';
+    highlightNotice = '';
+    const result = await reader.displayAnnotation(annotation, signal);
+    if (result.status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+    if (result.status === 'displayed' || result.status === 'repaired') {
+      if (
+        result.status === 'repaired' &&
+        annotations.some((entry) => entry.id === annotation.id && entry.cfi === annotation.cfi)
+      ) {
+        const next = repairAnnotations(annotations, [
+          { id: annotation.id, cfi: result.cfi, href: result.href },
+        ]);
+        if (next !== annotations) {
+          annotations = next;
+          queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+        }
+      }
+      unanchoredAnnotationIds = unanchoredAnnotationIds.filter((id) => id !== annotation.id);
+      closeAnnotations();
+      showControls();
+      return;
+    }
+    if (
+      annotations.some((entry) => entry.id === annotation.id) &&
+      !unanchoredAnnotationIds.includes(annotation.id)
+    ) {
+      unanchoredAnnotationIds = [...unanchoredAnnotationIds, annotation.id];
+    }
+    if (annotation.href) {
+      try {
+        const fallbackStatus = await tryDisplayHref(reader, annotation.href, signal);
+        if (fallbackStatus === 'aborted') return;
+      } catch {
+        // Keep the saved note accessible in the panel even if the chapter href also disappeared.
+      }
+      if (signal.aborted || destroyed || session !== reader) return;
+    }
+    if (!annotations.some((entry) => entry.id === annotation.id)) return;
+    annotationMessage =
+      'This highlighted text is no longer available in the current EPUB. Your note is still saved.';
   }
 
   async function copySelection(): Promise<void> {
@@ -1142,50 +1280,104 @@
   }
 
   async function openSearchResult(result: ReaderSearchResult): Promise<void> {
-    if (!session) return;
+    const reader = session;
+    if (!reader) return;
+    const signal = beginNavigationRequest();
     try {
-      await session.displayCfi(result.cfi);
-      closeSearch();
-      showControls();
+      const status = await tryDisplayCfi(reader, result.cfi, result.href, signal);
+      if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      if (status === 'displayed') {
+        closeSearch();
+        showControls();
+      } else {
+        searchError = 'This search result is no longer available in the current EPUB.';
+      }
     } catch {
-      searchError = 'This search result is no longer available in the current EPUB.';
+      if (!signal.aborted && !destroyed && session === reader) {
+        searchError = 'This search result is no longer available in the current EPUB.';
+      }
     }
   }
 
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
-    if (!session) return;
+    const reader = session;
+    if (!reader) return;
+    const signal = beginNavigationRequest();
+    highlightNotice = '';
     const opener = activeElement();
     try {
-      const restored = await session.displayCfi(saved.cfi);
-      if (!restored && saved.href) await session.display(saved.href);
-      closeBookmarks();
-      showControls();
+      let status = await tryDisplayCfi(reader, saved.cfi, saved.href, signal);
+      if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      if (status === 'missing' && saved.href) {
+        status = await tryDisplayHref(reader, saved.href, signal);
+        if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      }
+      if (
+        status === 'missing' &&
+        Number.isFinite(saved.percentage) &&
+        saved.percentage >= 0 &&
+        typeof reader.displayPercentageLocation === 'function'
+      ) {
+        status =
+          typeof reader.displayPercentageLocationStatus === 'function'
+            ? await reader.displayPercentageLocationStatus(saved.percentage, signal)
+            : (await reader.displayPercentageLocation(saved.percentage, signal))
+              ? 'displayed'
+              : 'missing';
+        if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      }
+      if (status === 'displayed') {
+        closeBookmarks();
+        showControls();
+      } else {
+        openReaderError('This saved location is no longer available in the current EPUB.', opener);
+      }
     } catch {
-      openReaderError('This saved location is no longer available in the current EPUB.', opener);
+      if (!signal.aborted && !destroyed && session === reader) {
+        openReaderError('This saved location is no longer available in the current EPUB.', opener);
+      }
     }
   }
 
   async function returnToLink(): Promise<void> {
-    if (!session || !linkReturnTarget) return;
+    const reader = session;
+    if (!reader || !linkReturnTarget) return;
+    const signal = beginNavigationRequest();
     const opener = activeElement();
     const restoreLink = opener === returnToLinkButton;
     const target = linkReturnTarget;
     try {
-      const restored = await session.displayCfi(target.cfi);
-      if (!restored && target.href) await session.display(target.href);
-      linkReturnTarget = null;
-      showControls();
+      let status = await tryDisplayCfi(reader, target.cfi, target.href, signal);
+      if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      if (status === 'missing' && target.href) {
+        status = await tryDisplayHref(reader, target.href, signal);
+        if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      }
+      if (status === 'displayed') {
+        linkReturnTarget = null;
+        showControls();
+      } else {
+        openReaderError(
+          'The location before this link is no longer available in the current EPUB.',
+          opener,
+          restoreLink,
+        );
+      }
     } catch {
-      openReaderError(
-        'The location before this link is no longer available in the current EPUB.',
-        opener,
-        restoreLink,
-      );
+      if (!signal.aborted && !destroyed && session === reader) {
+        openReaderError(
+          'The location before this link is no longer available in the current EPUB.',
+          opener,
+          restoreLink,
+        );
+      }
     }
   }
 
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     if (!session || Boolean(error)) return;
+    cancelNavigationRequest();
+    highlightNotice = '';
     const opener = activeElement();
     try {
       if (direction === 'next') await session.next();
@@ -1527,7 +1719,23 @@
     </button>
   {/if}
 
-  {#if readerSyncMessage && controlsVisible}
+  {#if highlightNotice && !hasOpenReaderPanel()}
+    <div
+      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full items-center gap-2 rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
+      role="status"
+    >
+      <span>{highlightNotice}</span>
+      <button
+        class="btn btn-sm min-h-11 preset-tonal-surface"
+        type="button"
+        onclick={() => {
+          highlightNotice = '';
+        }}
+      >
+        Dismiss
+      </button>
+    </div>
+  {:else if readerSyncMessage && controlsVisible}
     <p
       class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
       role="status"
@@ -1971,6 +2179,7 @@
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
                     onclick={() => {
+                      cancelNavigationRequest();
                       void session?.display(item.href);
                       closeToc();
                     }}
@@ -2025,6 +2234,7 @@
                           type="button"
                           onkeydown={(event) => void continueTocTabbing(event, row.index)}
                           onclick={() => {
+                            cancelNavigationRequest();
                             void session?.display(row.href);
                             closeToc();
                           }}
@@ -2354,7 +2564,14 @@
               </div>
             </form>
           {/if}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{annotationMessage}</p>
+          <p
+            class="mt-2 text-sm {annotationMessage.includes('no longer')
+              ? 'text-error-700-300'
+              : 'text-surface-700-300'}"
+            role="status"
+          >
+            {annotationMessage}
+          </p>
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3
@@ -2393,17 +2610,20 @@
           {:else}
             <div class="mt-2 grid gap-2">
               {#each annotations as annotation (annotation.id)}
+                {@const unanchored = unanchoredAnnotationIds.includes(annotation.id)}
                 <article class="rounded-lg preset-tonal-surface p-3">
                   <button
                     class="w-full text-left text-sm italic"
                     type="button"
-                    onclick={() => {
-                      void session?.displayCfi(annotation.cfi);
-                      closeAnnotations();
-                    }}
+                    onclick={() => void selectAnnotation(annotation)}
                   >
                     “{annotation.excerpt}”
                   </button>
+                  {#if unanchored}
+                    <p class="mt-1 text-xs text-error-700-300">
+                      Highlighted text is no longer in this edition.
+                    </p>
+                  {/if}
                   {#if editingAnnotationId === annotation.id}
                     <form
                       class="mt-2 grid gap-2"

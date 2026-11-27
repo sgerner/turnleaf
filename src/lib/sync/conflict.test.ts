@@ -3,6 +3,7 @@ import {
   chooseOpenProgress,
   chooseFurthestProgress,
   compareKavitaLocations,
+  resolveOpenReaderLocators,
   shouldPreferFurthest,
   toKavitaPageNumber,
 } from './conflict';
@@ -135,5 +136,59 @@ describe('Kavita page updates', () => {
   it('uses the EPUB spine for Kavita page progress when available', () => {
     expect(toKavitaPageNumber(0.94, 16, 8)).toBe(9);
     expect(toKavitaPageNumber(0.1, 16, 15)).toBe(15);
+  });
+});
+
+describe('resolveOpenReaderLocators', () => {
+  const local = {
+    cfi: 'epubcfi(/6/4!/4/8/1:42)',
+    xpath: '//body/DocFragment[2]/body/p[4]',
+    percentage: 0.62,
+    pendingSync: false,
+  };
+
+  const remote = {
+    pageNum: 80,
+    bookScrollId: '//body/DocFragment[3]/body/p[2]',
+  };
+
+  it('preserves local cfi, xpath, and percentage when local progress wins', () => {
+    expect(resolveOpenReaderLocators('local', local, remote, 100, 20)).toEqual({
+      cfi: 'epubcfi(/6/4!/4/8/1:42)',
+      xpath: '//body/DocFragment[2]/body/p[4]',
+      percentage: 0.62,
+    });
+  });
+
+  it('preserves local xpath and percentage fallbacks in the offline/no-remote branch when local state exists', () => {
+    expect(resolveOpenReaderLocators('none', local, null, 100, 20)).toEqual({
+      cfi: 'epubcfi(/6/4!/4/8/1:42)',
+      xpath: '//body/DocFragment[2]/body/p[4]',
+      percentage: 0.62,
+    });
+  });
+
+  it('preserves local xpath and percentage fallbacks even when conflict defaults to local state', () => {
+    expect(resolveOpenReaderLocators('conflict', local, remote, 100, 20)).toEqual({
+      cfi: 'epubcfi(/6/4!/4/8/1:42)',
+      xpath: '//body/DocFragment[2]/body/p[4]',
+      percentage: 0.62,
+    });
+  });
+
+  it('clears local cfi and uses remote xpath and percentage when remote progress is chosen', () => {
+    expect(resolveOpenReaderLocators('remote', local, remote, 100, 20)).toEqual({
+      cfi: null,
+      xpath: '//body/DocFragment[3]/body/p[2]',
+      percentage: 0.8,
+    });
+  });
+
+  it('falls back to book metadata percentage when neither local nor remote state exists', () => {
+    expect(resolveOpenReaderLocators('none', null, null, 100, 35)).toEqual({
+      cfi: null,
+      xpath: null,
+      percentage: 0.35,
+    });
   });
 });

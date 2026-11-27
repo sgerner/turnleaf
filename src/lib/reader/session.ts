@@ -1,6 +1,29 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
 import {
+  MAX_STORED_EXCERPT_LENGTH,
+  buildDocumentTextMap,
+  extractSelectionContext,
+  findExcerptMatchInDocument,
+  findExcerptRangeInDocument,
+  getEpubCfiConstructor,
+  normalizeSpineHref,
+  normalizeWhitespace,
+  parseRuntimeCfi,
+  recordRangeInTextMap,
+  validateAndClampReadingCfi,
+  validateHighlightRangeInDocument,
+  type ClaimedTextSpan,
+  type DocumentTextMap,
+  type EpubCfiConstructor,
+  type ReaderAnnotationDisplayResult,
+  type ReaderCfiDisplayStatus,
+  type ReaderHighlightInput,
+  type ReaderHighlightResolution,
+  type RenderedEpubView,
+  type RuntimeParsedCfi,
+} from './cfi-anchors';
+import {
   clipReaderSearchExcerpt,
   normalizeReaderSearchQuery,
   type ReaderSearchResult,
@@ -14,6 +37,13 @@ import {
   type TocItem,
 } from './toc';
 
+export {
+  findExcerptRangeInDocument,
+  type ReaderAnnotationDisplayResult,
+  type ReaderCfiDisplayStatus,
+  type ReaderHighlightInput,
+  type ReaderHighlightResolution,
+};
 export type { TocItem } from './toc';
 
 export interface ReaderLocation {
@@ -33,6 +63,9 @@ export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
 export interface ReaderSelection {
   cfi: string;
   text: string;
+  href?: string;
+  prefix?: string;
+  suffix?: string;
 }
 
 export type ReaderKeyboardAction = 'next' | 'previous' | 'clear-selection' | null;
@@ -57,8 +90,13 @@ export function resolveReaderKeyboardAction(
 }
 
 interface SpineSection {
+  id?: string | null;
+  idref?: string | null;
+  cfiBase?: string;
   href: string;
   index: number;
+  contents?: unknown;
+  document?: Document;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
 }
@@ -67,6 +105,12 @@ interface EpubTocItem {
   label: string;
   href: string;
   subitems?: EpubTocItem[];
+}
+
+interface ActiveDisplayContext {
+  generation: number;
+  signal: AbortSignal;
+  isAborted: () => boolean;
 }
 
 const MODE_COLORS = {
@@ -368,6 +412,26 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
+function raceWithAbort<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work();
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  let pending: Promise<T>;
+  try {
+    pending = Promise.resolve(work());
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  void pending.catch(() => {});
+  let onAbort: (() => void) | null = null;
+  const abortPromise = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([pending, abortPromise]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  });
+}
+
 export class ReaderSession {
   private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
@@ -390,17 +454,26 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private pendingObservedSize: { width: number; height: number } | null = null;
   private viewportTarget: HTMLElement | null = null;
+  private openingInitialLocation = false;
+  private initialDisplayTarget: string | null = null;
   private epubContainer: HTMLElement | null = null;
   private lockedScrollLeft = 0;
   private displayOperationCount = 0;
+  private inFlightDisplayCount = 0;
+  private activeDisplayAbort: AbortController | null = null;
   private aligningFocusTarget: Element | null = null;
+  private displayedListener: (() => void) | null = null;
   private renderedListener: (() => void) | null = null;
   private resizedListener: (() => void) | null = null;
   private unloadedHookRegistered = false;
   private readonly trackedContents = new Set<Contents>();
   private readonly contentCleanups = new Map<Contents, Array<() => void>>();
   private highlightCfis = new Set<string>();
+  private storedHighlights: ReaderHighlightInput[] = [];
+  private reportedMissingHighlightIds = new Set<string>();
+  private onHighlightResolution: ((resolution: ReaderHighlightResolution) => void) | null = null;
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -439,8 +512,10 @@ export class ReaderSession {
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
+    onHighlightResolution?: (resolution: ReaderHighlightResolution) => void,
   ): Promise<void> {
     this.viewportTarget = target;
+    this.onHighlightResolution = onHighlightResolution ?? null;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
@@ -457,6 +532,7 @@ export class ReaderSession {
       this.unloadedHookRegistered = true;
       this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
         if (view?.contents) this.cleanupContents(view.contents);
+        this.syncRenderedHighlights();
       });
     }
     if (onSelection) {
@@ -516,7 +592,18 @@ export class ReaderSession {
           }
           blurredByTab = false;
           try {
-            onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
+            const range = selection!.getRangeAt(0);
+            const sectionIndex = (contents as unknown as { sectionIndex?: number }).sectionIndex;
+            const href =
+              typeof sectionIndex === 'number'
+                ? this.getSpine().sections[sectionIndex]?.href
+                : undefined;
+            onSelection({
+              cfi: contents.cfiFromRange(range),
+              text,
+              ...(href ? { href } : {}),
+              ...extractSelectionContext(contents.document, range),
+            });
           } catch {
             // Selection can change while a section is being replaced.
           }
@@ -542,6 +629,8 @@ export class ReaderSession {
         });
       });
     }
+    this.displayedListener = () => this.syncRenderedHighlights();
+    this.rendition.on('displayed', this.displayedListener);
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
@@ -552,6 +641,7 @@ export class ReaderSession {
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
+      this.initialDisplayTarget = null;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -614,22 +704,28 @@ export class ReaderSession {
     await this.rendition.started;
     this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
+    this.syncViewportSize(target);
+    this.openingInitialLocation = true;
+    try {
+      if (cfi) {
+        if (await this.displaySavedCfi(cfi, restoreGeneration)) return;
+        if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      }
+      if (serverXPath) {
+        if (await this.displayXPath(serverXPath, restoreGeneration)) return;
+        if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      }
+      if (serverPercentage && serverPercentage > 0) {
+        if (await this.displayPercentage(serverPercentage, restoreGeneration)) return;
+        if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      }
+      await this.displayAtGeneration(undefined, restoreGeneration);
+    } finally {
+      this.openingInitialLocation = false;
+      if (this.isCurrentLocationOperation(restoreGeneration)) {
+        this.syncViewportSize(target);
       }
     }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -665,12 +761,12 @@ export class ReaderSession {
 
   async next(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.next());
+    await this.navigatePage(() => this.rendition!.next());
   }
 
   async previous(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.prev());
+    await this.navigatePage(() => this.rendition!.prev());
   }
 
   tableOfContents(): TocItem[] {
@@ -686,32 +782,103 @@ export class ReaderSession {
     return mapItems(this.book.navigation?.toc ?? []);
   }
 
-  updateHighlights(annotations: Array<{ cfi: string }>): void {
-    const rendition = this.rendition;
-    if (!rendition) return;
-
-    const next = new Set(annotations.map((annotation) => annotation.cfi));
-    for (const cfi of this.highlightCfis) {
-      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+  updateHighlights(annotations: readonly ReaderHighlightInput[]): void {
+    this.storedHighlights = annotations.map((annotation) => ({ ...annotation }));
+    const activeIds = new Set(
+      annotations
+        .map((annotation) => annotation.id)
+        .filter((id): id is string => typeof id === 'string'),
+    );
+    for (const id of [...this.reportedMissingHighlightIds]) {
+      if (!activeIds.has(id)) this.reportedMissingHighlightIds.delete(id);
     }
+    this.syncRenderedHighlights();
+  }
 
-    const applied = new Set<string>();
-    for (const cfi of next) {
-      if (this.highlightCfis.has(cfi)) {
-        applied.add(cfi);
-        continue;
-      }
-      try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
-          fill: '#facc15',
-          'fill-opacity': '0.38',
-        });
-        applied.add(cfi);
-      } catch {
-        // A saved CFI can stop matching after an EPUB is replaced or changed.
-      }
-    }
-    this.highlightCfis = applied;
+  async displayAnnotation(
+    annotation: ReaderHighlightInput,
+    signal?: AbortSignal,
+  ): Promise<ReaderAnnotationDisplayResult> {
+    if (!this.rendition) return { status: 'missing' };
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderAnnotationDisplayResult> => {
+        const CfiClass = getEpubCfiConstructor(this.rendition);
+        if (!CfiClass) return { status: 'missing' };
+
+        const trackedBefore = Boolean(
+          annotation.id && this.storedHighlights.some((item) => item.id === annotation.id),
+        );
+        const finalizeDisplay = (
+          cfi: string,
+          href: string,
+          canRepair: boolean,
+        ): ReaderAnnotationDisplayResult => {
+          if (!canRepair) return { status: 'displayed', cfi, href };
+          if (!trackedBefore) return { status: 'repaired', cfi, href };
+          const current = this.storedHighlights.find((item) => item.id === annotation.id);
+          if (!current) return { status: 'displayed', cfi, href };
+          if (current.cfi === cfi && (!current.href || current.href === href)) {
+            return { status: 'repaired', cfi, href };
+          }
+          const applied = this.recordRepairedHighlight(annotation.id, annotation.cfi, cfi, href);
+          return { status: applied ? 'repaired' : 'displayed', cfi, href };
+        };
+
+        const parsed = parseRuntimeCfi(annotation.cfi, CfiClass);
+        const primarySection =
+          (annotation.href ? this.findSpineSectionByHref(annotation.href) : null) ??
+          (parsed ? this.resolveSpineSectionForCfi(parsed) : null);
+
+        if (primarySection) {
+          const outcome = await this.resolveAnnotationInSection(
+            annotation,
+            parsed,
+            primarySection,
+            CfiClass,
+            op.isAborted,
+          );
+          if (op.isAborted()) return { status: 'aborted' };
+          if (outcome) {
+            try {
+              await this.awaitRenditionDisplay(outcome.cfi, op.signal);
+              if (op.isAborted()) return { status: 'aborted' };
+              return finalizeDisplay(outcome.cfi, primarySection.href, outcome.repaired);
+            } catch {
+              return op.isAborted() ? { status: 'aborted' } : { status: 'missing' };
+            }
+          }
+        }
+
+        if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
+          const crossChapter = await this.findCrossChapterAnnotation(
+            annotation,
+            primarySection,
+            CfiClass,
+            op.isAborted,
+          );
+          if (op.isAborted()) return { status: 'aborted' };
+          if (crossChapter) {
+            const canPersistRepair = annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
+            try {
+              await this.awaitRenditionDisplay(crossChapter.cfi, op.signal);
+              if (op.isAborted()) {
+                crossChapter.unloadAfterFailure();
+                return { status: 'aborted' };
+              }
+              return finalizeDisplay(crossChapter.cfi, crossChapter.section.href, canPersistRepair);
+            } catch {
+              crossChapter.unloadAfterFailure();
+              return op.isAborted() ? { status: 'aborted' } : { status: 'missing' };
+            }
+          }
+        }
+
+        return op.isAborted() ? { status: 'aborted' } : { status: 'missing' };
+      },
+      () => ({ status: 'aborted' }),
+    );
   }
 
   getVisiblePassages(): ReaderSelection[] {
@@ -828,25 +995,119 @@ export class ReaderSession {
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     const target = this.resolveDisplayTarget(href);
-    await this.navigate(() => this.rendition!.display(target));
+    await this.navigate((signal) => this.awaitRenditionDisplay(target, signal));
   }
 
-  async displayCfi(cfi: string): Promise<boolean> {
-    if (!this.rendition) return false;
-    try {
-      await this.navigate(() => this.rendition!.display(cfi));
-      return true;
-    } catch {
-      return false;
-    }
+  async displayHrefStatus(href: string, signal?: AbortSignal): Promise<ReaderCfiDisplayStatus> {
+    if (!this.rendition) return 'missing';
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderCfiDisplayStatus> => {
+        const section = this.findSpineSectionByHref(href);
+        if (!section) return 'missing';
+        let target = section.href;
+        const fragment = href.includes('#') ? href.slice(href.indexOf('#') + 1).trim() : '';
+        if (fragment) {
+          const loaded = await this.loadSectionDocument(section);
+          if (op.isAborted()) {
+            loaded?.unloadAfterFailure();
+            return 'aborted';
+          }
+          if (loaded?.document.getElementById(fragment)) {
+            target = `${section.href}#${fragment}`;
+          } else {
+            loaded?.unloadAfterFailure();
+          }
+        }
+        try {
+          await this.awaitRenditionDisplay(target, op.signal);
+          return op.isAborted() ? 'aborted' : 'displayed';
+        } catch {
+          return op.isAborted() ? 'aborted' : 'missing';
+        }
+      },
+      () => 'aborted',
+    );
   }
 
-  displayServerLocation(xpath: string): Promise<boolean> {
-    return this.displayXPath(xpath, this.beginLocationOperation(false));
+  async displayHref(href: string, signal?: AbortSignal): Promise<boolean> {
+    return (await this.displayHrefStatus(href, signal)) === 'displayed';
   }
 
-  displayServerPercentage(percentage: number): Promise<boolean> {
-    return this.displayPercentage(percentage, this.beginLocationOperation(false));
+  async displayCfiStatus(
+    cfi: string,
+    fallbackHref?: string,
+    signal?: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (!this.rendition) return 'missing';
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderCfiDisplayStatus> => {
+        const resolvedCfi = await this.resolveValidCfi(cfi, fallbackHref, op.isAborted);
+        if (op.isAborted()) return 'aborted';
+        if (!resolvedCfi || !this.rendition) return 'missing';
+        try {
+          await this.awaitRenditionDisplay(resolvedCfi, op.signal);
+          return op.isAborted() ? 'aborted' : 'displayed';
+        } catch {
+          return op.isAborted() ? 'aborted' : 'missing';
+        }
+      },
+      () => 'aborted',
+    );
+  }
+
+  async displayCfi(cfi: string, fallbackHref?: string, signal?: AbortSignal): Promise<boolean> {
+    return (await this.displayCfiStatus(cfi, fallbackHref, signal)) === 'displayed';
+  }
+
+  async displayPercentageLocationStatus(
+    percentage: number,
+    signal?: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (!this.rendition || !Number.isFinite(percentage) || percentage < 0) return 'missing';
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderCfiDisplayStatus> => {
+        const { sections } = this.getSpine();
+        if (!sections.length) return 'missing';
+        const position = Math.max(0, Math.min(0.999, percentage));
+        const section = sections[Math.floor(position * sections.length)];
+        if (!section) return 'missing';
+        try {
+          await this.awaitRenditionDisplay(section.href, op.signal);
+          return op.isAborted() ? 'aborted' : 'displayed';
+        } catch {
+          return op.isAborted() ? 'aborted' : 'missing';
+        }
+      },
+      () => 'aborted',
+    );
+  }
+
+  async displayPercentageLocation(percentage: number, signal?: AbortSignal): Promise<boolean> {
+    return (await this.displayPercentageLocationStatus(percentage, signal)) === 'displayed';
+  }
+
+  displayServerLocation(xpath: string, signal?: AbortSignal): Promise<boolean> {
+    return this.runAbortableDisplay(
+      false,
+      signal,
+      (op) => this.displayXPath(xpath, op.generation, op.signal),
+      () => false,
+    );
+  }
+
+  displayServerPercentage(percentage: number, signal?: AbortSignal): Promise<boolean> {
+    return this.runAbortableDisplay(
+      false,
+      signal,
+      (op) => this.displayPercentage(percentage, op.generation, op.signal),
+      () => false,
+    );
   }
 
   applyAppearance(value: Appearance): void {
@@ -929,7 +1190,7 @@ export class ReaderSession {
   }
 
   destroy(): void {
-    this.locationGeneration += 1;
+    this.abortInFlightDisplay();
     for (const contents of [...this.trackedContents]) {
       this.cleanupContents(contents);
     }
@@ -940,6 +1201,8 @@ export class ReaderSession {
       this.epubContainer = null;
     }
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
+    if (this.rendition && this.displayedListener)
+      this.rendition.off('displayed', this.displayedListener);
     if (this.rendition && this.renderedListener)
       this.rendition.off('rendered', this.renderedListener);
     if (this.rendition && this.resizedListener) this.rendition.off('resized', this.resizedListener);
@@ -950,22 +1213,30 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
+    this.pendingObservedSize = null;
     this.viewportTarget = null;
+    this.openingInitialLocation = false;
+    this.initialDisplayTarget = null;
     this.lockedScrollLeft = 0;
     this.displayOperationCount = 0;
+    this.inFlightDisplayCount = 0;
     this.aligningFocusTarget = null;
     this.unloadedHookRegistered = false;
     this.rendition = null;
     this.relocated = null;
+    this.displayedListener = null;
     this.renderedListener = null;
     this.resizedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
+    this.onHighlightResolution = null;
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
+    this.storedHighlights = [];
+    this.reportedMissingHighlightIds.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
@@ -988,6 +1259,7 @@ export class ReaderSession {
     await this.harden(contents);
     this.registerContentFocusAndLinks(contents);
     this.syncVisibleColumnLinks();
+    this.syncRenderedHighlights();
   }
 
   private harden(contents: Contents): Promise<void> {
@@ -1095,7 +1367,8 @@ export class ReaderSession {
   ): Promise<void> {
     if (!this.rendition) return;
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
+      const completed = await this.navigate((signal) => this.awaitRenditionDisplay(cfi, signal));
+      if (!completed) return;
       const container = this.bindEpubContainer(contents);
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
@@ -1307,9 +1580,64 @@ export class ReaderSession {
     return cfi && text ? [{ cfi, text }] : [];
   }
 
+  private isRealEpubRendition(): boolean {
+    return Boolean(this.rendition && 'q' in this.rendition);
+  }
+
+  private isRenditionStageReady(): boolean {
+    if (!this.rendition) return false;
+    if (this.isRealEpubRendition()) {
+      return Boolean((this.rendition as { manager?: { stage?: unknown } }).manager?.stage);
+    }
+    return true;
+  }
+
+  private syncViewportSize(target: HTMLElement): void {
+    if (!this.rendition || !this.isRenditionStageReady()) return;
+    const rect = target.getBoundingClientRect();
+    const rectWidth = Math.floor(rect.width);
+    const rectHeight = Math.floor(rect.height);
+    const pending = this.pendingObservedSize;
+    this.pendingObservedSize = null;
+    const width = pending?.width || rectWidth;
+    const height = pending?.height || rectHeight;
+    if (!width || !height) return;
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    this.applyViewportResize(width, height);
+  }
+
+  private applyViewportResize(width: number, height: number): void {
+    if (!this.rendition) return;
+    this.viewportSize = { width, height };
+    if (this.inFlightDisplayCount > 0) {
+      this.abortInFlightDisplay();
+    }
+    this.displayOperationCount += 1;
+    try {
+      this.rendition.resize(width, height);
+    } finally {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+      this.syncVisibleColumnLinks();
+    }
+    if (
+      !this.current &&
+      !this.rendition.location?.start &&
+      this.initialDisplayTarget !== null &&
+      this.isRealEpubRendition()
+    ) {
+      const restoreTarget = this.initialDisplayTarget;
+      void this.runDisplayOperation(() =>
+        restoreTarget === '' ? this.rendition!.display() : this.rendition!.display(restoreTarget),
+      ).catch(() => {});
+    }
+  }
+
   private observeViewport(target: HTMLElement): void {
     const initial = target.getBoundingClientRect();
     this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
+    this.pendingObservedSize = null;
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -1319,16 +1647,12 @@ export class ReaderSession {
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.displayOperationCount += 1;
-      try {
-        this.rendition.resize(width, height);
-      } finally {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-        this.syncVisibleColumnLinks();
+      if (!this.isRenditionStageReady() || this.openingInitialLocation) {
+        this.pendingObservedSize = { width, height };
+        return;
       }
+      this.pendingObservedSize = null;
+      this.applyViewportResize(width, height);
     });
     this.resizeObserver.observe(target);
   }
@@ -1362,20 +1686,123 @@ export class ReaderSession {
     }
   }
 
+  private abortInFlightDisplay(): void {
+    this.locationGeneration += 1;
+    this.userNavigationPending = false;
+    this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
+    this.activeDisplayAbort?.abort();
+    this.activeDisplayAbort = null;
+  }
+
+  private async runAbortableDisplay<T>(
+    userNavigation: boolean,
+    externalSignal: AbortSignal | undefined,
+    work: (context: ActiveDisplayContext) => Promise<T>,
+    onAborted: () => T,
+  ): Promise<T> {
+    if (externalSignal?.aborted || !this.rendition) return onAborted();
+    this.activeDisplayAbort?.abort();
+    const generation = this.beginLocationOperation(userNavigation);
+    const controller = new AbortController();
+    this.activeDisplayAbort = controller;
+    const forwardAbort = () => controller.abort();
+    externalSignal?.addEventListener('abort', forwardAbort, { once: true });
+    const isAborted = () =>
+      controller.signal.aborted ||
+      Boolean(externalSignal?.aborted) ||
+      !this.isCurrentLocationOperation(generation);
+    this.inFlightDisplayCount += 1;
+    try {
+      const result = await work({ generation, signal: controller.signal, isAborted });
+      return isAborted() ? onAborted() : result;
+    } catch (error) {
+      if (isAborted()) return onAborted();
+      if (userNavigation && this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+      }
+      throw error;
+    } finally {
+      externalSignal?.removeEventListener('abort', forwardAbort);
+      this.inFlightDisplayCount = Math.max(0, this.inFlightDisplayCount - 1);
+      if (this.activeDisplayAbort === controller) {
+        this.activeDisplayAbort = null;
+      }
+    }
+  }
+
+  private async awaitRenditionDisplay(target?: string, signal?: AbortSignal): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition) throw new Error('Reader is not open.');
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const canListenForError =
+      typeof rendition.on === 'function' && typeof rendition.off === 'function';
+    let onError: ((error: unknown) => void) | null = null;
+    try {
+      await this.runDisplayOperation(async () => {
+        if (this.openingInitialLocation && !this.current) {
+          this.initialDisplayTarget = target ?? '';
+        }
+        const invoke = () =>
+          target === undefined ? rendition.display() : rendition.display(target);
+        if (!canListenForError) {
+          await raceWithAbort(invoke, signal);
+          return;
+        }
+        const errorPromise = new Promise<never>((_, reject) => {
+          onError = (error: unknown) => {
+            reject(error instanceof Error ? error : new Error('Failed to display EPUB section.'));
+          };
+          rendition.on('displayError', onError);
+        });
+        await raceWithAbort(async () => {
+          const displayPromise = invoke();
+          void Promise.resolve(displayPromise).catch(() => {});
+          await Promise.race([displayPromise, errorPromise]);
+        }, signal);
+      });
+    } finally {
+      if (onError && canListenForError) rendition.off('displayError', onError);
+    }
+  }
+
   private async displayAtGeneration(
     target: string | undefined,
     generation: number,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    await this.runDisplayOperation(async () => {
-      if (target === undefined) await rendition.display();
-      else await rendition.display(target);
-    });
+    await this.awaitRenditionDisplay(target, signal);
     return this.isCurrentLocationOperation(generation);
   }
 
-  private async displayXPath(xpath: string, generation: number): Promise<boolean> {
+  private async displaySavedCfi(
+    cfi: string,
+    generation: number,
+    fallbackHref?: string,
+  ): Promise<boolean> {
+    if (!this.rendition || !this.isCurrentLocationOperation(generation)) return false;
+    const resolvedCfi = await this.resolveValidCfi(
+      cfi,
+      fallbackHref,
+      () => !this.isCurrentLocationOperation(generation),
+    );
+    if (!resolvedCfi || !this.isCurrentLocationOperation(generation)) return false;
+    try {
+      return await this.displayAtGeneration(resolvedCfi, generation);
+    } catch {
+      return false;
+    }
+  }
+
+  private async displayXPath(
+    xpath: string,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
     const target = parseKavitaXPath(xpath);
@@ -1383,7 +1810,7 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      await this.runDisplayOperation(() => rendition.display(section.href));
+      await this.awaitRenditionDisplay(section.href, signal);
       if (!this.isCurrentLocationOperation(generation)) return false;
       if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
@@ -1394,7 +1821,7 @@ export class ReaderSession {
       if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
-      await this.runDisplayOperation(() => rendition.display(cfi));
+      await this.awaitRenditionDisplay(cfi, signal);
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -1417,7 +1844,11 @@ export class ReaderSession {
     return contents.cfiFromNode(node);
   }
 
-  private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
+  private async displayPercentage(
+    percentage: number,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
     const { sections } = this.getSpine();
     if (!sections.length) return false;
@@ -1425,13 +1856,15 @@ export class ReaderSession {
     const section = sections[Math.floor(position * sections.length)];
     if (!section) return false;
     try {
-      return await this.displayAtGeneration(section.href, generation);
+      return await this.displayAtGeneration(section.href, generation, signal);
     } catch {
       return false;
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
+  private async navigatePage(display: () => Promise<unknown>): Promise<void> {
+    this.activeDisplayAbort?.abort();
+    this.activeDisplayAbort = null;
     const generation = this.beginLocationOperation(true);
     try {
       await this.runDisplayOperation(display);
@@ -1442,6 +1875,22 @@ export class ReaderSession {
       }
       throw error;
     }
+  }
+
+  private navigate(
+    display: (signal: AbortSignal) => Promise<unknown>,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!this.rendition) return Promise.reject(new Error('Reader is not open.'));
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op) => {
+        await this.runDisplayOperation(() => display(op.signal));
+        return true;
+      },
+      () => false,
+    );
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
@@ -1458,6 +1907,8 @@ export class ReaderSession {
   private beginLinkedNavigation(): void {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
+    this.activeDisplayAbort?.abort();
+    this.activeDisplayAbort = null;
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
@@ -1477,6 +1928,632 @@ export class ReaderSession {
     void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
+  }
+
+  private findSpineSectionByHref(href: string): SpineSection | null {
+    const clean = normalizeSpineHref(href);
+    if (!clean) return null;
+    const { sections, indexes } = this.getSpine();
+    const candidates = [clean];
+    try {
+      const decoded = decodeURIComponent(clean);
+      if (decoded !== clean) candidates.push(decoded);
+    } catch {
+      // Ignore malformed URI escapes.
+    }
+    const encoded = encodeURI(clean);
+    if (encoded !== clean) candidates.push(encoded);
+
+    for (const candidate of candidates) {
+      const index = indexes.get(candidate);
+      if (index !== undefined) return sections[index] ?? null;
+    }
+    const spine = this.book.spine as unknown as {
+      get?: (target: string) => SpineSection | null;
+    };
+    if (typeof spine?.get === 'function') {
+      const found = spine.get(clean);
+      if (found && typeof found.href === 'string') return found;
+    }
+    return null;
+  }
+
+  private resolveSpineSectionForCfi(
+    parsed: RuntimeParsedCfi,
+    fallbackHref?: string,
+  ): SpineSection | null {
+    if (fallbackHref) {
+      const byHref = this.findSpineSectionByHref(fallbackHref);
+      if (byHref) return byHref;
+    }
+    const { sections } = this.getSpine();
+    const spineStep = parsed.base.steps[1];
+    if (spineStep?.id) {
+      const byId = sections.find(
+        (section) => section.id === spineStep.id || section.idref === spineStep.id,
+      );
+      if (byId) return byId;
+      const atPos = sections[parsed.spinePos];
+      if (atPos && !atPos.id && !atPos.idref) return atPos;
+      return null;
+    }
+    return sections[parsed.spinePos] ?? null;
+  }
+
+  private getRenderedViews(): RenderedEpubView[] {
+    const rendition = this.rendition as unknown as {
+      views?: () => { forEach?: (visit: (view: RenderedEpubView) => void) => void };
+    } | null;
+    if (!rendition || typeof rendition.views !== 'function') return [];
+    const collection = rendition.views();
+    if (!collection || typeof collection.forEach !== 'function') return [];
+    const rendered: RenderedEpubView[] = [];
+    collection.forEach((view) => {
+      if (view && view.displayed !== false && view.contents?.document) {
+        rendered.push(view);
+      }
+    });
+    return rendered;
+  }
+
+  private async loadSectionDocument(section: SpineSection): Promise<{
+    document: Document;
+    cfiBase: string | undefined;
+    unloadAfterFailure: () => void;
+  } | null> {
+    const targetSection = this.findSpineSectionByHref(section.href) ?? section;
+    const rendered = this.getRenderedViews().find((view) => view.index === targetSection.index);
+    if (rendered?.contents?.document) {
+      return {
+        document: rendered.contents.document,
+        cfiBase: rendered.contents.cfiBase ?? rendered.section?.cfiBase ?? targetSection.cfiBase,
+        unloadAfterFailure: () => {},
+      };
+    }
+
+    const bookLoader = (this.book as unknown as { load?: (url: string) => Promise<Document> }).load;
+    if (typeof targetSection.load !== 'function' || typeof bookLoader !== 'function') return null;
+    const wasLoaded = Boolean(targetSection.contents && targetSection.document);
+    try {
+      await targetSection.load(bookLoader.bind(this.book));
+      const rawDoc = targetSection.document;
+      if (!rawDoc?.documentElement) {
+        if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
+        return null;
+      }
+      const missingHead =
+        rawDoc.documentElement.localName.toLowerCase() === 'html' && !rawDoc.querySelector('head');
+      const hasBodyUnsafeNodes = Boolean(
+        rawDoc.querySelector(
+          'body script, body iframe, body object, body embed, body form, body meta[http-equiv]',
+        ),
+      );
+      let document = rawDoc;
+      if (missingHead || hasBodyUnsafeNodes) {
+        document = rawDoc.cloneNode(true) as Document;
+        if (missingHead) {
+          const headNode = document.documentElement.namespaceURI
+            ? document.createElementNS(document.documentElement.namespaceURI, 'head')
+            : document.createElement('head');
+          document.documentElement.insertBefore(headNode, document.documentElement.firstChild);
+        }
+        if (hasBodyUnsafeNodes) {
+          document
+            .querySelectorAll('script, iframe, object, embed, form, meta[http-equiv]')
+            .forEach((node) => node.remove());
+        }
+      }
+      return {
+        document,
+        cfiBase: targetSection.cfiBase,
+        unloadAfterFailure: () => {
+          if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
+        },
+      };
+    } catch {
+      if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
+      return null;
+    }
+  }
+
+  private async resolveValidCfi(
+    cfi: string,
+    fallbackHref?: string,
+    isAborted?: () => boolean,
+  ): Promise<string | null> {
+    const CfiClass = getEpubCfiConstructor(this.rendition);
+    if (!CfiClass) return cfi.trim() || null;
+    const parsed = parseRuntimeCfi(cfi, CfiClass);
+    if (!parsed) return null;
+    const section = this.resolveSpineSectionForCfi(parsed, fallbackHref);
+    if (!section) return null;
+    const loaded = await this.loadSectionDocument(section);
+    if (!loaded) return null;
+    if (isAborted?.()) {
+      loaded.unloadAfterFailure();
+      return null;
+    }
+    const validated = validateAndClampReadingCfi(
+      loaded.document,
+      parsed,
+      cfi,
+      loaded.cfiBase,
+      section.index,
+      CfiClass,
+    );
+    if (!validated) {
+      loaded.unloadAfterFailure();
+      return null;
+    }
+    return validated;
+  }
+
+  private isHighlightCandidateForView(
+    annotation: ReaderHighlightInput,
+    parsed: RuntimeParsedCfi | null,
+    viewIndex: number,
+    viewHref: string,
+  ): { matches: boolean; authoritative: boolean } {
+    if (annotation.href) {
+      const byHref = this.findSpineSectionByHref(annotation.href);
+      if (!byHref) return { matches: false, authoritative: false };
+      const same = byHref.index === viewIndex || normalizeSpineHref(viewHref) === byHref.href;
+      return { matches: same, authoritative: same };
+    }
+    if (!parsed) return { matches: false, authoritative: false };
+    const targetSection = this.resolveSpineSectionForCfi(parsed);
+    const same = Boolean(targetSection && targetSection.index === viewIndex);
+    return { matches: same, authoritative: same };
+  }
+
+  private collectClaimedSpansForSection(
+    doc: Document,
+    textMap: DocumentTextMap,
+    section: SpineSection,
+    cfiBase: string | undefined,
+    CfiClass: EpubCfiConstructor,
+    excludeAnnotation: ReaderHighlightInput,
+  ): { claimedSpans: ClaimedTextSpan[]; ownedCfis: Set<string>; competingBrokenCount: number } {
+    const claimedSpans: ClaimedTextSpan[] = [];
+    const ownedCfis = new Set<string>();
+    const targetExcerpt = excludeAnnotation.excerpt
+      ? normalizeWhitespace(excludeAnnotation.excerpt)
+      : '';
+    let competingBrokenCount = 1;
+    for (const other of this.storedHighlights) {
+      const sameAnnotation =
+        excludeAnnotation.id !== undefined && other.id !== undefined
+          ? other.id === excludeAnnotation.id
+          : other.cfi === excludeAnnotation.cfi;
+      if (sameAnnotation) continue;
+      const otherParsed = parseRuntimeCfi(other.cfi, CfiClass);
+      if (
+        !this.isHighlightCandidateForView(other, otherParsed, section.index, section.href).matches
+      )
+        continue;
+      ownedCfis.add(other.cfi.trim());
+      const otherTargetSection = otherParsed
+        ? this.resolveSpineSectionForCfi(otherParsed, other.href)
+        : null;
+      const validated =
+        otherParsed && otherTargetSection?.index === section.index
+          ? validateHighlightRangeInDocument(
+              doc,
+              otherParsed,
+              other,
+              cfiBase,
+              section.index,
+              CfiClass,
+            )
+          : null;
+      if (validated) {
+        ownedCfis.add(validated.cfi.trim());
+        recordRangeInTextMap(textMap, validated.range, claimedSpans);
+      } else if (
+        targetExcerpt &&
+        other.excerpt &&
+        normalizeWhitespace(other.excerpt) === targetExcerpt
+      ) {
+        competingBrokenCount += 1;
+      }
+    }
+    return { claimedSpans, ownedCfis, competingBrokenCount };
+  }
+
+  private async resolveAnnotationInSection(
+    annotation: ReaderHighlightInput,
+    parsed: RuntimeParsedCfi | null,
+    section: SpineSection,
+    CfiClass: EpubCfiConstructor,
+    isAborted: () => boolean,
+  ): Promise<{ cfi: string; repaired: boolean } | null> {
+    const loaded = await this.loadSectionDocument(section);
+    if (!loaded) return null;
+    if (isAborted()) {
+      loaded.unloadAfterFailure();
+      return null;
+    }
+    const cfiMatchesSection =
+      parsed !== null &&
+      this.resolveSpineSectionForCfi(parsed, annotation.href)?.index === section.index;
+    const direct =
+      parsed && cfiMatchesSection
+        ? validateHighlightRangeInDocument(
+            loaded.document,
+            parsed,
+            annotation,
+            loaded.cfiBase,
+            section.index,
+            CfiClass,
+          )
+        : null;
+    if (direct) return { cfi: direct.cfi, repaired: direct.repaired };
+    if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
+      const textMap = buildDocumentTextMap(loaded.document);
+      const { claimedSpans, ownedCfis, competingBrokenCount } = this.collectClaimedSpansForSection(
+        loaded.document,
+        textMap,
+        section,
+        loaded.cfiBase,
+        CfiClass,
+        annotation,
+      );
+      const matched = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
+        prefix: annotation.prefix,
+        suffix: annotation.suffix,
+        textMap,
+        claimedSpans,
+        competingBrokenCount,
+        requireUnambiguous: true,
+      });
+      if (matched && loaded.cfiBase) {
+        try {
+          const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
+          if (!ownedCfis.has(freshCfi.trim())) {
+            const repaired =
+              freshCfi !== annotation.cfi && annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
+            return { cfi: freshCfi, repaired };
+          }
+        } catch {
+          // Fall through and unload temporary section.
+        }
+      }
+    }
+    loaded.unloadAfterFailure();
+    return null;
+  }
+
+  private async findCrossChapterAnnotation(
+    annotation: ReaderHighlightInput,
+    primarySection: SpineSection | null,
+    CfiClass: EpubCfiConstructor,
+    isAborted: () => boolean,
+  ): Promise<{ section: SpineSection; cfi: string; unloadAfterFailure: () => void } | null> {
+    const excerpt = annotation.excerpt ?? '';
+    const { sections } = this.getSpine();
+    const candidates: Array<{
+      section: SpineSection;
+      cfi: string;
+      score: number;
+      unambiguousInSection: boolean;
+      unloadAfterFailure: () => void;
+    }> = [];
+    let totalOccurrences = 0;
+
+    for (const section of sections) {
+      if (isAborted()) {
+        for (const candidate of candidates) candidate.unloadAfterFailure();
+        return null;
+      }
+      if (primarySection && section.index === primarySection.index) continue;
+      const loaded = await this.loadSectionDocument(section);
+      if (!loaded) continue;
+      if (isAborted()) {
+        loaded.unloadAfterFailure();
+        for (const candidate of candidates) candidate.unloadAfterFailure();
+        return null;
+      }
+      const textMap = buildDocumentTextMap(loaded.document);
+      const { claimedSpans, ownedCfis, competingBrokenCount } = this.collectClaimedSpansForSection(
+        loaded.document,
+        textMap,
+        section,
+        loaded.cfiBase,
+        CfiClass,
+        annotation,
+      );
+      const matched = findExcerptMatchInDocument(loaded.document, excerpt, {
+        prefix: annotation.prefix,
+        suffix: annotation.suffix,
+        textMap,
+        claimedSpans,
+        competingBrokenCount,
+      });
+      if (!matched || !loaded.cfiBase) {
+        if (claimedSpans.length > 0) {
+          const anyOccurrence = findExcerptMatchInDocument(loaded.document, excerpt, { textMap });
+          if (anyOccurrence) totalOccurrences += anyOccurrence.candidateCount;
+        }
+        loaded.unloadAfterFailure();
+        continue;
+      }
+      totalOccurrences += matched.candidateCount;
+      try {
+        const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
+        if (ownedCfis.has(freshCfi.trim())) {
+          loaded.unloadAfterFailure();
+          continue;
+        }
+        candidates.push({
+          section,
+          cfi: freshCfi,
+          score: matched.score,
+          unambiguousInSection: matched.unambiguous,
+          unloadAfterFailure: loaded.unloadAfterFailure,
+        });
+      } catch {
+        loaded.unloadAfterFailure();
+      }
+    }
+
+    if (candidates.length === 0) return null;
+    let winner = candidates[0]!;
+    let bestScore = winner.score;
+    let tiedBestCount = 1;
+    for (let index = 1; index < candidates.length; index += 1) {
+      const candidate = candidates[index]!;
+      if (candidate.score > bestScore) {
+        bestScore = candidate.score;
+        tiedBestCount = 1;
+        winner = candidate;
+      } else if (candidate.score === bestScore) {
+        tiedBestCount += 1;
+      }
+    }
+
+    const expectedContextLength =
+      (annotation.prefix ? normalizeWhitespace(annotation.prefix).length : 0) +
+      (annotation.suffix ? normalizeWhitespace(annotation.suffix).length : 0);
+    const minContextScore = Math.max(1, Math.min(4, expectedContextLength));
+    const globallyUnambiguous =
+      (totalOccurrences === 1 && winner.unambiguousInSection) ||
+      (bestScore >= minContextScore && tiedBestCount === 1 && winner.unambiguousInSection);
+
+    for (const candidate of candidates) {
+      if (candidate !== winner || !globallyUnambiguous) candidate.unloadAfterFailure();
+    }
+    return globallyUnambiguous ? winner : null;
+  }
+
+  private isRangeUsableOnView(view: RenderedEpubView, cfi: string): boolean {
+    if (!view.contents || typeof view.contents.range !== 'function') return false;
+    try {
+      const resolved = view.contents.range(cfi);
+      return Boolean(resolved && !resolved.collapsed);
+    } catch {
+      return false;
+    }
+  }
+
+  private recordRepairedHighlight(
+    id: string | undefined,
+    expectedOriginalCfi: string,
+    cfi: string,
+    href: string,
+  ): boolean {
+    if (!id) return false;
+    const existing = this.storedHighlights.find((item) => item.id === id);
+    if (!existing || existing.cfi !== expectedOriginalCfi) return false;
+    const occupied = this.storedHighlights.some(
+      (item) =>
+        item.id !== id && item.cfi.trim() === cfi.trim() && (!item.href || item.href === href),
+    );
+    if (occupied) return false;
+    this.reportedMissingHighlightIds.delete(id);
+    this.storedHighlights = this.storedHighlights.map((item) =>
+      item.id === id ? { ...item, cfi, href } : item,
+    );
+    return true;
+  }
+
+  private syncRenderedHighlights(): void {
+    const rendition = this.rendition;
+    if (!rendition) return;
+
+    if (typeof (rendition as unknown as { views?: unknown }).views !== 'function') {
+      const next = new Set(this.storedHighlights.map((annotation) => annotation.cfi));
+      for (const cfi of this.highlightCfis) {
+        if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+      }
+      const applied = new Set<string>();
+      for (const cfi of next) {
+        if (this.highlightCfis.has(cfi)) {
+          applied.add(cfi);
+          continue;
+        }
+        try {
+          rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
+            fill: '#facc15',
+            'fill-opacity': '0.38',
+          });
+          applied.add(cfi);
+        } catch {
+          // A saved CFI can stop matching after an EPUB is replaced or changed.
+        }
+      }
+      this.highlightCfis = applied;
+      return;
+    }
+
+    const renderedViews = this.getRenderedViews();
+    if (renderedViews.length === 0) return;
+
+    const CfiClass = getEpubCfiConstructor(rendition);
+    const desired = new Set<string>();
+    const repaired: Array<{ id: string; cfi: string; href: string }> = [];
+    const newlyMissingIds: string[] = [];
+
+    for (const view of renderedViews) {
+      const contents = view.contents;
+      if (!contents?.document) continue;
+      const viewHref = view.section?.href ?? this.getSpine().sections[view.index]?.href ?? '';
+      const cfiBase = contents.cfiBase ?? view.section?.cfiBase;
+      const claimedSpans: ClaimedTextSpan[] = [];
+      let cachedMap: DocumentTextMap | null = null;
+      const getTextMap = (): DocumentTextMap => {
+        if (!cachedMap) cachedMap = buildDocumentTextMap(contents.document);
+        return cachedMap;
+      };
+
+      const viewCandidates: Array<{
+        annotation: ReaderHighlightInput;
+        parsed: RuntimeParsedCfi | null;
+        authoritative: boolean;
+      }> = [];
+      for (const annotation of this.storedHighlights) {
+        const parsed = CfiClass ? parseRuntimeCfi(annotation.cfi, CfiClass) : null;
+        const candidate = this.isHighlightCandidateForView(
+          annotation,
+          parsed,
+          view.index,
+          viewHref,
+        );
+        if (candidate.matches) {
+          viewCandidates.push({ annotation, parsed, authoritative: candidate.authoritative });
+        }
+      }
+
+      const directResolved = new Map<ReaderHighlightInput, { cfi: string; repaired: boolean }>();
+      for (const { annotation, parsed } of viewCandidates) {
+        if (!parsed || !CfiClass) continue;
+        const targetSection = this.resolveSpineSectionForCfi(parsed, annotation.href);
+        if (!targetSection || targetSection.index !== view.index) continue;
+        const validated = validateHighlightRangeInDocument(
+          contents.document,
+          parsed,
+          annotation,
+          cfiBase,
+          view.index,
+          CfiClass,
+        );
+        if (!validated) continue;
+        if (this.isRangeUsableOnView(view, validated.cfi)) {
+          directResolved.set(annotation, { cfi: validated.cfi, repaired: validated.repaired });
+          recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
+        } else if (typeof contents.cfiFromRange === 'function') {
+          try {
+            const regenerated = contents.cfiFromRange(validated.range);
+            if (this.isRangeUsableOnView(view, regenerated)) {
+              directResolved.set(annotation, {
+                cfi: regenerated,
+                repaired: validated.repaired && regenerated !== annotation.cfi,
+              });
+              recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
+            }
+          } catch {
+            // Fall back to excerpt search below.
+          }
+        }
+      }
+
+      const brokenExcerptCounts = new Map<string, number>();
+      for (const { annotation } of viewCandidates) {
+        if (directResolved.has(annotation) || !annotation.excerpt) continue;
+        const normalizedExcerpt = normalizeWhitespace(annotation.excerpt);
+        if (!normalizedExcerpt) continue;
+        brokenExcerptCounts.set(
+          normalizedExcerpt,
+          (brokenExcerptCounts.get(normalizedExcerpt) ?? 0) + 1,
+        );
+      }
+
+      for (const { annotation, authoritative } of viewCandidates) {
+        let resolvedCfi: string | null = null;
+        let wasRepaired = false;
+        const direct = directResolved.get(annotation);
+        if (direct) {
+          resolvedCfi = direct.cfi;
+          wasRepaired = direct.repaired;
+        } else if (annotation.excerpt && typeof contents.cfiFromRange === 'function') {
+          const normalizedExcerpt = normalizeWhitespace(annotation.excerpt);
+          const matched = findExcerptMatchInDocument(contents.document, annotation.excerpt, {
+            prefix: annotation.prefix,
+            suffix: annotation.suffix,
+            textMap: getTextMap(),
+            claimedSpans,
+            competingBrokenCount: brokenExcerptCounts.get(normalizedExcerpt) ?? 1,
+            requireUnambiguous: true,
+          });
+          if (matched) {
+            try {
+              const freshCfi = contents.cfiFromRange(matched.range);
+              if (!desired.has(freshCfi) && this.isRangeUsableOnView(view, freshCfi)) {
+                resolvedCfi = freshCfi;
+                wasRepaired =
+                  annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH &&
+                  (freshCfi !== annotation.cfi || annotation.href !== viewHref);
+              }
+            } catch {
+              resolvedCfi = null;
+            }
+          }
+        }
+
+        if (resolvedCfi) {
+          desired.add(resolvedCfi);
+          if (annotation.id) this.reportedMissingHighlightIds.delete(annotation.id);
+          if (wasRepaired && annotation.id && viewHref) {
+            repaired.push({ id: annotation.id, cfi: resolvedCfi, href: viewHref });
+          }
+        } else if (
+          authoritative &&
+          annotation.id &&
+          !this.reportedMissingHighlightIds.has(annotation.id)
+        ) {
+          this.reportedMissingHighlightIds.add(annotation.id);
+          newlyMissingIds.push(annotation.id);
+        }
+      }
+    }
+
+    for (const cfi of this.highlightCfis) {
+      if (!desired.has(cfi)) {
+        try {
+          rendition.annotations.remove(cfi, 'highlight');
+        } catch {
+          // Ignore removal errors on destroyed views.
+        }
+      }
+    }
+
+    const applied = new Set<string>();
+    for (const cfi of desired) {
+      if (this.highlightCfis.has(cfi)) {
+        applied.add(cfi);
+        continue;
+      }
+      try {
+        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
+          fill: '#facc15',
+          'fill-opacity': '0.38',
+        });
+        applied.add(cfi);
+      } catch {
+        // Skip unrenderable ranges without aborting remaining chapter highlights.
+      }
+    }
+    this.highlightCfis = applied;
+
+    const appliedRepairs = repaired.filter((entry) => {
+      const current = this.storedHighlights.find((item) => item.id === entry.id);
+      return Boolean(
+        current && this.recordRepairedHighlight(entry.id, current.cfi, entry.cfi, entry.href),
+      );
+    });
+
+    if ((appliedRepairs.length > 0 || newlyMissingIds.length > 0) && this.onHighlightResolution) {
+      this.onHighlightResolution({ repaired: appliedRepairs, missingIds: newlyMissingIds });
+    }
   }
 
   private getSpine(): NonNullable<ReaderSession['spine']> {

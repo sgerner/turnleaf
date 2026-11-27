@@ -47,7 +47,12 @@
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, recordDiagnostic } from '../diagnostics/log';
-  import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
+  import {
+    chooseOpenProgress,
+    resolveOpenReaderLocators,
+    shouldPreferFurthest,
+    toKavitaPageNumber,
+  } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import DialogShell from './DialogShell.svelte';
@@ -1323,9 +1328,7 @@
       reading = {
         book,
         url: file.webViewUrl,
-        cfi: null,
-        xpath: remote.bookScrollId ?? null,
-        percentage: remotePercentage(remote, book),
+        ...resolveOpenReaderLocators('remote', local, remote, book.pages, book.pagesRead),
       };
       return;
     }
@@ -1333,9 +1336,7 @@
       reading = {
         book,
         url: file.webViewUrl,
-        cfi: local?.cfi || null,
-        xpath: local?.xpath ?? null,
-        percentage: local?.percentage ?? null,
+        ...resolveOpenReaderLocators('local', local, remote, book.pages, book.pagesRead),
       };
       if (preferFurthest) void syncProgress(false);
       return;
@@ -1347,14 +1348,7 @@
     reading = {
       book,
       url: file.webViewUrl,
-      cfi: local?.cfi ?? null,
-      xpath: local ? null : (remote?.bookScrollId ?? null),
-      percentage:
-        !local && remote
-          ? remotePercentage(remote, book)
-          : !local
-            ? metadataPercentage(book)
-            : null,
+      ...resolveOpenReaderLocators(openProgress, local, remote, book.pages, book.pagesRead),
     };
   }
 
@@ -1371,11 +1365,6 @@
   function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
     if (!book.pages || remote.pageNum <= 0) return null;
     return Math.max(0, Math.min(0.999, remote.pageNum / book.pages));
-  }
-
-  function metadataPercentage(book: BookRecord): number | null {
-    if (!book.pages || book.pagesRead <= 0) return null;
-    return Math.max(0, Math.min(0.999, book.pagesRead / book.pages));
   }
 
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
