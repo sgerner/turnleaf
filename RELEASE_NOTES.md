@@ -5,6 +5,9 @@
 - Fix EPUB relocation and viewport resize races during reader open
 - Abort EPUB open when pre-serialization spine sanitizer hook fails
 - Harden EPUB CSS token sanitization, fail-closed hooks, and scoped CSP
+- chore: retrigger required PR checks
+- chore(ci): align CodeQL action pins
+- test: avoid Svelte runtime internals in panel tests
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache
