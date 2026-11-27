@@ -18,3 +18,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+
+  - package-ecosystem: swift
+    directory: /ios/App/CapApp-SPM
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    ignore:
+      # Managed by @capacitor/ios via `npm run ios:sync`.
+      - dependency-name: '*capacitor-swift-pm*'

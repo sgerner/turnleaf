@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- fix: harden Android reading journey network sync and viewport resize races
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache

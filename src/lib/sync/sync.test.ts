@@ -140,6 +140,47 @@ it('keeps and uploads a newer local relocation when an older upload completes', 
   });
 });
 
+it('records acknowledged server baseline when an older upload succeeds after a newer local save and the newer upload fails', async () => {
+  vi.useFakeTimers();
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  vi.setSystemTime(new Date(updatedAt));
+  let resolveUploaded!: () => void;
+  const uploaded = new Promise<void>((resolve) => {
+    resolveUploaded = resolve;
+  });
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const first = pendingState(updatedAt, '{"pageNum":10,"bookScrollId":"xpath-a"}');
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(first));
+
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      resolveStarted();
+      return uploaded;
+    })
+    .mockRejectedValueOnce(new Error('network dropped'));
+  const flush = flushProgress({ saveProgress } as never, 'server');
+  await started;
+
+  await saveLocalProgress(book, 'cfi-b', 'xpath-b', 0.2);
+  resolveUploaded();
+  await expect(flush).rejects.toThrow('1 reading progress item failed to sync.');
+
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof first;
+  expect(saved.syncQueue['book-1']).toMatchObject({
+    revision: 2,
+    lastError: 'network dropped',
+  });
+  expect(saved.readingState['book-1']).toMatchObject({
+    pendingSync: true,
+    serverPageNum: 10,
+    serverXPath: 'xpath-a',
+  });
+});
+
 it('continues syncing later items when an earlier item fails', async () => {
   type PendingFixture = ReturnType<typeof pendingState>;
   type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {

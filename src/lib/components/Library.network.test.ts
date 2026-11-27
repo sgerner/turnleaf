@@ -217,7 +217,7 @@ describe('Library native network status and reconnect progress sync', () => {
     flushSync();
   }
 
-  it('flushes queued progress when native Wi-Fi reconnects before captive-portal validation and ignores false onLost events', async () => {
+  it('ignores stale native connected events after radios disconnect and ignores false onLost events while Wi-Fi remains connected', async () => {
     let abortedDuringRefresh = false;
     let resolveSeries!: (value: never[]) => void;
     getBookSeriesMock.mockImplementation(
@@ -234,17 +234,25 @@ describe('Library native network status and reconnect progress sync', () => {
     expect(target.textContent).toContain('No network connection. Showing your saved library.');
     expect(flushProgressMock).not.toHaveBeenCalled();
 
-    // Wi-Fi transport comes up before Google captive-portal NET_CAPABILITY_VALIDATED completes.
-    runtime.status = { connected: false, connectionType: 'wifi' };
-    runtime.networkListener?.({ connected: false, connectionType: 'wifi' });
+    // A stale Cellular handover event reports connected: true after both radios are already disabled.
+    runtime.status = { connected: false, connectionType: 'cellular' };
+    runtime.networkListener?.({ connected: true, connectionType: 'cellular' });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(flushProgressMock).not.toHaveBeenCalled();
+    expect(getBookSeriesMock).not.toHaveBeenCalled();
+
+    // Validated Wi-Fi reconnect triggers concurrent progress upload and catalog refresh.
+    runtime.status = { connected: true, connectionType: 'wifi' };
+    runtime.networkListener?.({ connected: true, connectionType: 'wifi' });
 
     await vi.waitFor(() => {
-      expect(flushProgressMock).toHaveBeenCalled();
+      expect(flushProgressMock).toHaveBeenCalledOnce();
       expect(getBookSeriesMock).toHaveBeenCalledOnce();
     });
 
     // Cellular lingers and fires NetworkPlugin wasLostEvent ({ connected: false, connectionType: 'none' })
-    // while Wi-Fi is already the active network.
+    // while Wi-Fi is already the active validated network.
     runtime.status = { connected: true, connectionType: 'wifi' };
     runtime.networkListener?.({ connected: false, connectionType: 'none' });
     await Promise.resolve();

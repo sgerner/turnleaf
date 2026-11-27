@@ -67,16 +67,11 @@ function normalizeXPath(xpath?: string | null): string | null {
 }
 
 function remoteMatchesBaseline(local: OpenLocalProgress, remote: OpenRemoteProgress): boolean {
-  if (
-    local.serverXPath !== undefined &&
-    normalizeXPath(local.serverXPath) !== normalizeXPath(remote.bookScrollId)
-  ) {
-    return false;
-  }
-  if (local.serverPageNum != null && remote.pageNum !== local.serverPageNum) {
-    return false;
-  }
-  return true;
+  return (
+    local.serverPageNum != null &&
+    remote.pageNum === local.serverPageNum &&
+    normalizeXPath(local.serverXPath) === normalizeXPath(remote.bookScrollId)
+  );
 }
 
 export function chooseOpenProgress(
@@ -95,10 +90,6 @@ export function chooseOpenProgress(
 
   if (local.pendingSync) {
     if (remoteUnchanged) return 'local';
-    if (local.xpath && remote.bookScrollId === local.xpath) {
-      const remoteCompleted = bookPages > 0 && remote.pageNum >= bookPages;
-      return remoteCompleted && local.percentage < 1 ? 'conflict' : 'local';
-    }
     if (
       !local.xpath &&
       local.percentage >= 1 &&
@@ -112,15 +103,7 @@ export function chooseOpenProgress(
   }
 
   if (hasBaseline) {
-    if (remoteUnchanged) return 'local';
-    if (
-      local.xpath &&
-      remote.bookScrollId === local.xpath &&
-      !(bookPages > 0 && remote.pageNum >= bookPages && local.percentage < 1)
-    ) {
-      return 'local';
-    }
-    return 'remote';
+    return remoteUnchanged ? 'local' : 'remote';
   }
 
   if (!hasRemoteLocation) return 'local';

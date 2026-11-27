@@ -32,30 +32,23 @@ public class MainActivity extends BridgeActivity {
     }
 
     void applyReaderChrome(boolean enabled) {
-        applyReaderChrome(enabled, null);
-    }
-
-    void applyReaderChrome(boolean enabled, Runnable onComplete) {
         runOnUiThread(
             () -> {
                 Window window = getWindow();
                 WindowCompat.setDecorFitsSystemWindows(window, !enabled);
                 WindowInsetsControllerCompat controller =
                     WindowCompat.getInsetsController(window, window.getDecorView());
-                if (controller != null) {
-                    if (enabled) {
-                        controller.hide(WindowInsetsCompat.Type.systemBars());
-                        controller.setSystemBarsBehavior(
-                            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                        );
-                    } else {
-                        controller.show(WindowInsetsCompat.Type.systemBars());
-                    }
+                if (controller == null) {
+                    return;
                 }
-                if (onComplete != null) {
-                    if (!window.getDecorView().post(onComplete)) {
-                        onComplete.run();
-                    }
+
+                if (enabled) {
+                    controller.hide(WindowInsetsCompat.Type.systemBars());
+                    controller.setSystemBarsBehavior(
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                } else {
+                    controller.show(WindowInsetsCompat.Type.systemBars());
                 }
             }
         );

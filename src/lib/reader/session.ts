@@ -376,7 +376,6 @@ export class ReaderSession {
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private current: Location | null = null;
-  private lastRequestedTarget: string | undefined = undefined;
   private spine: {
     sections: SpineSection[];
     indexes: Map<string, number>;
@@ -396,7 +395,6 @@ export class ReaderSession {
   private lockedScrollLeft = 0;
   private displayOperationCount = 0;
   private aligningFocusTarget: Element | null = null;
-  private attachedListener: (() => void) | null = null;
   private renderedListener: (() => void) | null = null;
   private resizedListener: (() => void) | null = null;
   private unloadedHookRegistered = false;
@@ -443,21 +441,16 @@ export class ReaderSession {
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.viewportTarget = target;
-    const initialRect = target.getBoundingClientRect();
-    const initialSize = {
-      width: Math.floor(initialRect.width),
-      height: Math.floor(initialRect.height),
-    };
-    this.viewportSize = initialSize;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: false,
+      resizeOnOrientationChange: true,
       allowScriptedContent: false,
     });
+    this.observeViewport(target);
     this.bindEpubContainer();
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
     if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
@@ -559,7 +552,6 @@ export class ReaderSession {
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      this.lastRequestedTarget = location.start.cfi;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -576,9 +568,6 @@ export class ReaderSession {
       }
     };
     this.rendition.on('relocated', this.relocated);
-    this.attachedListener = () => {
-      this.detachStageWindowListeners();
-    };
     this.renderedListener = () => {
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
@@ -589,7 +578,6 @@ export class ReaderSession {
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
     };
-    this.rendition.on('attached', this.attachedListener);
     this.rendition.on('rendered', this.renderedListener);
     this.rendition.on('resized', this.resizedListener);
     this.contentClick = (event, contents) => {
@@ -624,21 +612,8 @@ export class ReaderSession {
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
     await this.rendition.started;
-    this.detachStageWindowListeners();
     this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    await this.restoreInitialLocation(cfi, serverXPath, serverPercentage, restoreGeneration);
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    this.detachStageWindowListeners();
-    await this.finishViewportSetup(target, initialSize);
-  }
-
-  private async restoreInitialLocation(
-    cfi: string | null,
-    serverXPath: string | null,
-    serverPercentage: number | null,
-    restoreGeneration: number,
-  ): Promise<void> {
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -964,10 +939,7 @@ export class ReaderSession {
       this.epubContainer.removeEventListener('scroll', this.handleContainerScroll);
       this.epubContainer = null;
     }
-    this.detachStageWindowListeners();
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
-    if (this.rendition && this.attachedListener)
-      this.rendition.off('attached', this.attachedListener);
     if (this.rendition && this.renderedListener)
       this.rendition.off('rendered', this.renderedListener);
     if (this.rendition && this.resizedListener) this.rendition.off('resized', this.resizedListener);
@@ -985,14 +957,12 @@ export class ReaderSession {
     this.unloadedHookRegistered = false;
     this.rendition = null;
     this.relocated = null;
-    this.attachedListener = null;
     this.renderedListener = null;
     this.resizedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
-    this.lastRequestedTarget = undefined;
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
@@ -1337,67 +1307,6 @@ export class ReaderSession {
     return cfi && text ? [{ cfi, text }] : [];
   }
 
-  private detachStageWindowListeners(): void {
-    if (typeof window === 'undefined' || !this.rendition) return;
-    const stage = (
-      this.rendition as Rendition & {
-        manager?: {
-          stage?: {
-            resizeFunc?: EventListener;
-            orientationChangeFunc?: EventListener;
-          };
-        };
-      }
-    ).manager?.stage;
-    if (!stage) return;
-    if (stage.resizeFunc) {
-      window.removeEventListener('resize', stage.resizeFunc, false);
-      window.removeEventListener('resize', stage.resizeFunc);
-    }
-    if (stage.orientationChangeFunc) {
-      window.removeEventListener('orientationchange', stage.orientationChangeFunc, false);
-      window.removeEventListener('orientationchange', stage.orientationChangeFunc);
-    }
-  }
-
-  private async finishViewportSetup(
-    target: HTMLElement,
-    initialSize: { width: number; height: number },
-  ): Promise<void> {
-    this.observeViewport(target);
-    const settled = target.getBoundingClientRect();
-    const width = Math.floor(settled.width);
-    const height = Math.floor(settled.height);
-    if (width > 0 && height > 0 && (width !== initialSize.width || height !== initialSize.height)) {
-      this.viewportSize = { width, height };
-      await this.resizeRendition(width, height);
-    }
-  }
-
-  private async resizeRendition(width: number, height: number): Promise<void> {
-    const rendition = this.rendition;
-    if (!rendition) return;
-    const hasManager = 'manager' in rendition;
-    const manager = (rendition as Rendition & { manager?: { stage?: unknown } }).manager;
-    if (hasManager && !manager?.stage) return;
-    const hadLocation = Boolean(rendition.location?.start?.cfi);
-    const fallbackTarget = this.current?.start.cfi ?? this.lastRequestedTarget;
-    await this.runDisplayOperation(async () => {
-      rendition.resize(width, height);
-      if (hasManager && !hadLocation) {
-        if (fallbackTarget !== undefined) await rendition.display(fallbackTarget);
-        else await rendition.display();
-        return;
-      }
-      const queue = (
-        rendition as Rendition & { q?: { enqueue?: (task: () => void) => Promise<void> } }
-      ).q;
-      if (typeof queue?.enqueue === 'function') {
-        await queue.enqueue(() => {});
-      }
-    });
-  }
-
   private observeViewport(target: HTMLElement): void {
     const initial = target.getBoundingClientRect();
     this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
@@ -1411,7 +1320,15 @@ export class ReaderSession {
       if (!width || !height) return;
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
       this.viewportSize = { width, height };
-      void this.resizeRendition(width, height);
+      this.displayOperationCount += 1;
+      try {
+        this.rendition.resize(width, height);
+      } finally {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+        this.syncVisibleColumnLinks();
+      }
     });
     this.resizeObserver.observe(target);
   }
@@ -1451,7 +1368,6 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    this.lastRequestedTarget = target;
     await this.runDisplayOperation(async () => {
       if (target === undefined) await rendition.display();
       else await rendition.display(target);
@@ -1467,7 +1383,6 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      this.lastRequestedTarget = section.href;
       await this.runDisplayOperation(() => rendition.display(section.href));
       if (!this.isCurrentLocationOperation(generation)) return false;
       if (target.contentXPath === '/html/body') return true;
@@ -1479,7 +1394,6 @@ export class ReaderSession {
       if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
-      this.lastRequestedTarget = cfi;
       await this.runDisplayOperation(() => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation);
     } catch {

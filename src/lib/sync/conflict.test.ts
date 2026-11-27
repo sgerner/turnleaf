@@ -204,6 +204,68 @@ describe('reader open progress selection', () => {
     );
   });
 
+  it('flags a conflict when pending local progress shares the chapter XPath but Kavita pageNum moved forward or backward from baseline', () => {
+    const chapterXPath = '//body/DocFragment[2]/body/section[1]';
+    const pendingSameChapter = {
+      cfi: 'epubcfi(/6/6!/4/2/8:0)',
+      percentage: 0.35,
+      pendingSync: true,
+      xpath: chapterXPath,
+      serverPageNum: 25,
+      serverXPath: chapterXPath,
+    };
+    expect(
+      chooseOpenProgress(
+        pendingSameChapter,
+        { pageNum: 42, bookScrollId: chapterXPath },
+        100,
+        false,
+      ),
+    ).toBe('conflict');
+    expect(
+      chooseOpenProgress(
+        pendingSameChapter,
+        { pageNum: 12, bookScrollId: chapterXPath },
+        100,
+        true,
+      ),
+    ).toBe('conflict');
+  });
+
+  it('adopts same-chapter Kavita pageNum changes including backward moves when local state is not pending', () => {
+    const chapterXPath = '//body/DocFragment[2]/body/section[1]';
+    const syncedSameChapter = {
+      cfi: 'epubcfi(/6/6!/4/2/12:0)',
+      percentage: 0.4,
+      pendingSync: false,
+      xpath: chapterXPath,
+      serverPageNum: 40,
+      serverXPath: chapterXPath,
+    };
+    expect(
+      chooseOpenProgress(
+        syncedSameChapter,
+        { pageNum: 55, bookScrollId: chapterXPath },
+        100,
+        false,
+      ),
+    ).toBe('remote');
+    expect(
+      chooseOpenProgress(syncedSameChapter, { pageNum: 55, bookScrollId: chapterXPath }, 100, true),
+    ).toBe('remote');
+    expect(
+      chooseOpenProgress(
+        syncedSameChapter,
+        { pageNum: 15, bookScrollId: chapterXPath },
+        100,
+        false,
+      ),
+    ).toBe('remote');
+    expect(
+      chooseOpenProgress(syncedSameChapter, { pageNum: 15, bookScrollId: chapterXPath }, 100, true),
+    ).toBe('remote');
+  });
+
   it('returns local when reopening a completed remote book that matches the stored baseline', () => {
     const completedLocal = {
       cfi: '',
