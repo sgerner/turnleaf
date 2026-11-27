@@ -310,13 +310,11 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
-  let reconnectTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
-  const NATIVE_RECONNECT_SETTLE_MS = 1_200;
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
@@ -789,9 +787,7 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    const initialNetwork = await Network.getStatus().catch(() => null);
-    offline = !initialNetwork?.connected;
-    let lastConnectionType = initialNetwork?.connectionType ?? (offline ? 'none' : 'unknown');
+    offline = !(await Network.getStatus().catch(() => null))?.connected;
     if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
@@ -805,51 +801,25 @@
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', ({ connected, connectionType }) => {
+        await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
-          const nextConnectionType = connectionType ?? (connected ? 'unknown' : 'none');
+          offline = !connected;
           if (!connected) {
-            clearReconnectTimer();
-            const wasOffline = offline;
-            lastConnectionType = nextConnectionType;
-            offline = true;
             refreshController?.abort();
             openProgressProbe?.abort();
-            if (wasOffline) return;
-            coverReloadRequest += 1;
-            kavitaUnreachable = false;
-            offlineMessage = displayableBooks.length
+          }
+          coverReloadRequest += 1;
+          kavitaUnreachable = false;
+          offlineMessage = connected
+            ? ''
+            : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-            return;
-          }
-          const wasOffline = offline;
-          const connectionTypeChanged = nextConnectionType !== lastConnectionType;
-          lastConnectionType = nextConnectionType;
-          if (!wasOffline && !(kavitaUnreachable && connectionTypeChanged)) {
-            return;
-          }
-          const baselineRevision = activeSyncStartRevision ?? messageRevision;
-          const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-          const runReconnect = () => {
-            reconnectTimer = null;
-            if (destroyed) return;
-            offline = false;
-            coverReloadRequest += 1;
-            kavitaUnreachable = false;
-            offlineMessage = '';
+          if (connected) {
+            const baselineRevision = activeSyncStartRevision ?? messageRevision;
+            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
             void syncProgress(false);
-            void startRefresh(
-              Boolean(downloadingBookId || cleanupInProgress || downloadFailureBook),
-              baselineRevision,
-              baselineMessage,
-            );
-          };
-          if (Capacitor.isNativePlatform()) {
-            clearReconnectTimer();
-            reconnectTimer = window.setTimeout(runReconnect, NATIVE_RECONNECT_SETTLE_MS);
-          } else {
-            runReconnect();
+            void startRefresh(false, baselineRevision, baselineMessage);
           }
         }),
       ),
@@ -921,13 +891,6 @@
     return syncWork;
   }
 
-  function clearReconnectTimer(): void {
-    if (reconnectTimer !== null) {
-      window.clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-  }
-
   function setMessage(next: string): void {
     messageRevision += 1;
     message = next;
@@ -971,7 +934,6 @@
     destroyed = true;
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    clearReconnectTimer();
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
@@ -1062,18 +1024,17 @@
         downloadNeedsRefresh = false;
         if (refreshedFailure?.downloadPath) {
           downloadFailureBook = null;
-          setMessage(`${refreshedFailure.title} is ready offline.`);
+          message = `${refreshedFailure.title} is ready offline.`;
         } else {
           if (refreshedFailure) downloadFailureBook = refreshedFailure;
-          setMessage('Library state refreshed. You can retry the download.');
+          message = 'Library state refreshed. You can retry the download.';
         }
       }
       kavitaUnreachable = false;
       offlineMessage = '';
       if (incomplete)
-        setMessage(
-          'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.',
-        );
+        message =
+          'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
       if (controller.signal.aborted) return;
       recordDiagnostic({
@@ -1177,7 +1138,7 @@
 
   async function download(book: BookRecord): Promise<BookRecord | null> {
     if (downloadingBookId || cleanupInProgress) {
-      setMessage('A book is already downloading or being cleaned up. Try again when it finishes.');
+      message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
     downloadingBookId = book.id;
@@ -1185,7 +1146,7 @@
     downloadFailureBook = null;
     failedDownloadCleanupPath = null;
     downloadNeedsRefresh = false;
-    setMessage(`Downloading ${book.title}...`);
+    message = `Downloading ${book.title}...`;
     let downloadedPath: string | null = null;
     try {
       const file = await downloadEpub(
@@ -1207,7 +1168,7 @@
         fileSize: file.size,
       };
       books = books.map((item) => (item.id === book.id ? refreshed : item));
-      setMessage(`${book.title} is ready offline.`);
+      message = `${book.title} is ready offline.`;
       return refreshed;
     } catch (error) {
       let detail = 'download-storage';
@@ -1222,7 +1183,7 @@
           null;
         if (persistedBook && savedBooks) {
           books = savedBooks;
-          setMessage(`${book.title} is ready offline.`);
+          message = `${book.title} is ready offline.`;
           return persistedBook;
         }
         if (savedBooks) {
@@ -1238,42 +1199,40 @@
         }
       }
 
-      let failureMessage: string;
       if (error instanceof EpubTransferError) {
         status = error.status;
         detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
         if (status === 401) {
-          failureMessage = 'Kavita rejected authentication for this download. Check your API key.';
+          message = 'Kavita rejected authentication for this download. Check your API key.';
         } else if (status === 403) {
-          failureMessage = 'Kavita denied the download. Check your account’s download permissions.';
+          message = 'Kavita denied the download. Check your account’s download permissions.';
         } else if (status !== undefined) {
-          failureMessage = `Kavita returned HTTP ${status} during the download.`;
+          message = `Kavita returned HTTP ${status} during the download.`;
         } else if (error.connectionFailed) {
-          failureMessage = 'Turnleaf could not connect to Kavita to download this book.';
+          message = 'Turnleaf could not connect to Kavita to download this book.';
         } else {
-          failureMessage = 'The file transfer failed.';
+          message = 'The file transfer failed.';
         }
       } else if (error instanceof KavitaError) {
         status = error.status;
         detail = 'download-transfer';
-        failureMessage = error.message;
+        message = error.message;
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
-        failureMessage = error.message;
+        message = error.message;
       } else {
-        failureMessage = 'Turnleaf could not save the book on this device.';
+        message = 'Turnleaf could not save the book on this device.';
       }
       if (cleanupFailed) {
         detail = 'download-storage-cleanup';
-        failureMessage =
-          'Turnleaf could not save the book or remove its local file. Retry cleanup.';
+        message = 'Turnleaf could not save the book or remove its local file. Retry cleanup.';
       } else if (downloadNeedsRefresh) {
         detail = 'download-status-unconfirmed';
-        failureMessage =
+        message =
           'The download finished, but its saved status could not be checked. Refresh before retrying.';
       }
       recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
-      setMessage(`${failureMessage} Open Settings to copy diagnostics.`);
+      message += ' Open Settings to copy diagnostics.';
       downloadFailureBook = book;
       return null;
     } finally {
@@ -1286,13 +1245,13 @@
     const path = failedDownloadCleanupPath;
     if (!path || downloadingBookId || cleanupInProgress) return;
     cleanupInProgress = true;
-    setMessage('Removing the leftover local file…');
+    message = 'Removing the leftover local file…';
     try {
       await deleteDownloadedEpub(path);
       failedDownloadCleanupPath = null;
-      setMessage('The leftover local file was removed. You can retry the download.');
+      message = 'The leftover local file was removed. You can retry the download.';
     } catch {
-      setMessage('Turnleaf still could not remove the local file. Try cleanup again later.');
+      message = 'Turnleaf still could not remove the local file. Try cleanup again later.';
     } finally {
       cleanupInProgress = false;
     }
@@ -1300,7 +1259,7 @@
 
   async function remove(book: BookRecord): Promise<boolean> {
     if (downloadingBookId || cleanupInProgress) {
-      setMessage('Wait for the current download or cleanup to finish before removing a book.');
+      message = 'Wait for the current download or cleanup to finish before removing a book.';
       return false;
     }
     let fileCleared = false;
@@ -1316,11 +1275,9 @@
       await removeDownload(book.id);
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'storage error';
-      setMessage(
-        fileCleared
-          ? `${book.title}'s file was removed, but Turnleaf could not update its saved status. Try removing it again.`
-          : `Could not remove ${book.title}: ${detail}`,
-      );
+      message = fileCleared
+        ? `${book.title}'s file was removed, but Turnleaf could not update its saved status. Try removing it again.`
+        : `Could not remove ${book.title}: ${detail}`;
       return false;
     }
     books = books.map((item) =>
@@ -1390,21 +1347,18 @@
         checkOpenProgress(book, options.preferFurthest),
       ]);
       if (!verification.ok) {
-        setMessage(
-          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.',
-        );
+        message =
+          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
         return;
       }
       file = verification.verified;
       if (file && !progress.ok) {
-        setMessage(
-          'Turnleaf could not load the saved reading position. Try opening the book again.',
-        );
+        message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
         return;
       }
       if (file && progress.ok) [local, remote] = [progress.local, progress.remote];
     } catch {
-      setMessage('Turnleaf could not load the saved reading position. Try opening the book again.');
+      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
       return;
     } finally {
       resolvingOpenProgress = false;
@@ -1412,7 +1366,7 @@
     if (destroyed) return;
     if (!file) {
       await removeDownload(book.id);
-      setMessage('The downloaded file is missing. Download it again.');
+      message = 'The downloaded file is missing. Download it again.';
       books = await getBooks(server.id, { includeDescription: false });
       const refreshed = books.find((item) => item.id === book.id) ?? null;
       if (refreshed) await open(refreshed, options);
@@ -1424,12 +1378,12 @@
       resolvingOpenProgress = true;
       try {
         if (!(await saveRemoteProgress(book, remote, local))) {
-          setMessage('The saved reading position changed. Open the book again.');
+          message = 'The saved reading position changed. Open the book again.';
           return;
         }
         updateRemoteBookProgress(book, remote);
       } catch {
-        setMessage('Turnleaf could not save the Kavita reading position. Open the book again.');
+        message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
         return;
       } finally {
         resolvingOpenProgress = false;
@@ -1577,7 +1531,7 @@
       savedBook.lastReadAt = new Date().toISOString();
     }
     void syncProgress(false);
-    setMessage(`${book.title} marked as read.`);
+    message = `${book.title} marked as read.`;
     closeMenu();
   }
 
@@ -1711,17 +1665,13 @@
       if (!(await remove(book))) failed.push(book.title);
     }
     if (failed.length === 0) {
-      setMessage(
-        candidates.length
-          ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
-          : 'No downloaded books to remove.',
-      );
+      message = candidates.length
+        ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
+        : 'No downloaded books to remove.';
     } else {
       const succeeded = candidates.length - failed.length;
       const names = failed.slice(0, 2).join(', ');
-      setMessage(
-        `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`,
-      );
+      message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
     }
     closeSettings();
   }
@@ -1735,7 +1685,7 @@
     if (destroyed) return;
     clearCovers();
     coverReloadRequest += 1;
-    setMessage('Cover cache cleared.');
+    message = 'Cover cache cleared.';
     closeSettings();
   }
 
@@ -1834,7 +1784,7 @@
       await removeServer(server.id);
       await clearDiagnostics();
       onServerDeleted();
-      setMessage('Server removed. Add it again to browse the library.');
+      message = 'Server removed. Add it again to browse the library.';
       closeSettings();
     } catch (cause) {
       settingsError = credentialCleanupComplete
