@@ -28,7 +28,7 @@ export interface ReaderLocation {
 
 export type ReaderLinkReturnTarget = Pick<ReaderLocation, 'cfi' | 'href'>;
 
-export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
+export type ReaderLocationOrigin = 'jump' | 'link' | 'navigation' | 'restore';
 
 export interface ReaderSelection {
   cfi: string;
@@ -547,12 +547,16 @@ export class ReaderSession {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
       const isUserNavigation =
         this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+        (this.userNavigationOrigin === 'jump'
+          ? !this.reflowPending
+          : startCfi
+            ? startCfi !== location.start.cfi
+            : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
+      if (isUserNavigation || this.userNavigationOrigin !== 'navigation') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
         this.userNavigationOrigin = 'navigation';
@@ -759,14 +763,26 @@ export class ReaderSession {
     return this.getFallbackPagePassages(contentsList);
   }
 
-  clearTextSelection(): void {
-    for (const contents of this.getActiveContents()) {
+  clearSelection(): void {
+    const activeContents = new Set<Contents>([
+      ...this.trackedContents,
+      ...this.getActiveContents(),
+    ]);
+    for (const contents of activeContents) {
+      if (!contents.window || contents.window.closed) {
+        this.trackedContents.delete(contents);
+        continue;
+      }
       try {
-        contents.window.getSelection()?.removeAllRanges();
+        contents.window.getSelection?.()?.removeAllRanges();
       } catch {
         // A contents document can unload while the selection is being cleared.
       }
     }
+  }
+
+  clearTextSelection(): void {
+    this.clearSelection();
   }
 
   syncVisibleColumnLinks(): void {
@@ -828,13 +844,13 @@ export class ReaderSession {
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     const target = this.resolveDisplayTarget(href);
-    await this.navigate(() => this.rendition!.display(target));
+    await this.navigate(() => this.rendition!.display(target), 'jump');
   }
 
   async displayCfi(cfi: string): Promise<boolean> {
     if (!this.rendition) return false;
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
+      await this.navigate(() => this.rendition!.display(cfi), 'jump');
       return true;
     } catch {
       return false;
@@ -1431,23 +1447,30 @@ export class ReaderSession {
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
-    const generation = this.beginLocationOperation(true);
+  private async navigate(
+    display: () => Promise<unknown>,
+    origin: 'navigation' | 'jump' = 'navigation',
+  ): Promise<void> {
+    const generation = this.beginLocationOperation(true, origin);
     try {
       await this.runDisplayOperation(display);
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
       }
       throw error;
     }
   }
 
-  private beginLocationOperation(userNavigation: boolean): number {
+  private beginLocationOperation(
+    userNavigation: boolean,
+    origin: 'navigation' | 'jump' = 'navigation',
+  ): number {
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
-    this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
+    this.userNavigationOrigin = userNavigation ? origin : 'restore';
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)

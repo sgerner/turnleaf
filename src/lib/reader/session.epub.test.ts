@@ -29,6 +29,8 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    next: vi.fn(async () => {}),
+    prev: vi.fn(async () => {}),
     getContents: vi.fn((): unknown[] => []),
     resize: vi.fn(),
     destroy: vi.fn(),
@@ -680,6 +682,89 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('distinguishes page turns from explicit display and CFI jumps', async () => {
+    mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = getRenditionListener('relocated');
+
+    relocated(location('page-1'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    mockRendition.next.mockImplementationOnce(async () => {
+      relocated(location('page-2'));
+    });
+    await session.next();
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+
+    mockRendition.prev.mockImplementationOnce(async () => {
+      relocated(location('page-1'));
+    });
+    await session.previous();
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+
+    mockRendition.display.mockImplementationOnce(async () => {
+      relocated(location('chapter-start'));
+    });
+    await session.display('chapter.xhtml');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('jump');
+
+    mockRendition.display.mockImplementationOnce(async () => {
+      relocated(location('chapter-start'));
+    });
+    await expect(session.displayCfi('chapter-start')).resolves.toBe(true);
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('jump');
+
+    relocated(location('reflow-cfi'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    session.destroy();
+  });
+
+  it('collapses active iframe selection ranges on clearSelection', async () => {
+    const removeHookRanges = vi.fn();
+    const removeRenditionRanges = vi.fn();
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+      vi.fn(),
+    );
+    const registerSelection = mockRendition.hooks.content.register.mock.calls[1]?.[0];
+    registerSelection({
+      window: { closed: false, getSelection: () => ({ removeAllRanges: removeHookRanges }) },
+      document: new Document(),
+      cfiFromRange: () => 'cfi-1',
+    });
+    mockRendition.getContents.mockReturnValueOnce([
+      {
+        window: {
+          closed: false,
+          getSelection: () => ({ removeAllRanges: removeRenditionRanges }),
+        },
+      },
+    ]);
+
+    session.clearSelection();
+    expect(removeHookRanges).toHaveBeenCalledOnce();
+    expect(removeRenditionRanges).toHaveBeenCalledOnce();
+    session.destroy();
+  });
+
   it('scopes Tab order to visible columns without aria-hidden or inert and restores tabindex on destroy', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const session = new ReaderSession('book.epub');
@@ -883,6 +968,107 @@ describe('ReaderSession', () => {
     expect(onTap.mock.calls).toEqual(
       Array.from({ length: 4 }, () => [['previous'], ['center'], ['next']]).flat(),
     );
+    session.destroy();
+  });
+
+  it('aborts a display that is in flight during a resize and preserves the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 826));
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+    relocated(location('epubcfi(/6/6!/4/2/1:0)'));
+    mockRendition.display.mockClear();
+
+    // 1. In-flight display aborts during a viewport resize with no replacement jump:
+    //    navigation state resets cleanly and post-resize relocation keeps the prior CFI as restore.
+    let abortFirstDisplay!: (reason?: unknown) => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          abortFirstDisplay = reject;
+        }),
+    );
+
+    const abortedJump = session.displayCfi('epubcfi(/6/8!/4/2/1:0)');
+    await Promise.resolve();
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/8!/4/2/1:0)');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 891 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(412, 891);
+
+    abortFirstDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+    await expect(abortedJump).resolves.toBe(false);
+
+    relocated(location('epubcfi(/6/6!/4/2/1:0)'));
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/6!/4/2/1:0)');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    mockRendition.display.mockClear();
+    session.applyAppearance({ ...defaultAppearance, fontSize: defaultAppearance.fontSize + 2 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/6!/4/2/1:0)');
+
+    // 2. In-flight display aborts during a resize after a newer jump supersedes it:
+    //    stale abort does not clear the newer jump and final CFI settles on the replacement target.
+    mockRendition.display.mockClear();
+    let abortSupersededDisplay!: (reason?: unknown) => void;
+    let resolveFinalDisplay!: () => void;
+    mockRendition.display
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            abortSupersededDisplay = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveFinalDisplay = () => {
+              relocated(location('epubcfi(/6/10!/4/2/1:0)'));
+              resolve();
+            };
+          }),
+      );
+
+    const supersededJump = session.displayCfi('epubcfi(/6/8!/4/2/1:0)');
+    await Promise.resolve();
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 891, height: 412 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenLastCalledWith(891, 412);
+
+    const finalJump = session.displayCfi('epubcfi(/6/10!/4/2/1:0)');
+    await Promise.resolve();
+
+    abortSupersededDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+    await expect(supersededJump).resolves.toBe(false);
+
+    resolveFinalDisplay();
+    await expect(finalJump).resolves.toBe(true);
+
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/10!/4/2/1:0)');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('jump');
+
+    mockRendition.display.mockClear();
+    session.applyAppearance({ ...defaultAppearance, fontSize: defaultAppearance.fontSize + 4 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/10!/4/2/1:0)');
     session.destroy();
   });
 

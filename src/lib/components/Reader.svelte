@@ -20,7 +20,6 @@
   } from '../reader/appearance';
   import {
     ReaderSession,
-    resolveReaderKeyboardAction,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
@@ -105,6 +104,8 @@
   let viewport: HTMLDivElement;
   let readerToolbar = $state<HTMLElement | null>(null);
   let topRevealButton = $state<HTMLButtonElement | null>(null);
+  let nextPageButton = $state<HTMLButtonElement | null>(null);
+  let selectionToolbar = $state<HTMLElement | null>(null);
   let returnToLinkButton = $state<HTMLButtonElement | null>(null);
   let session: ReaderSession | null = null;
   let sessionReady = $state(false);
@@ -149,7 +150,6 @@
   let exporting = $state(false);
   let selectionMessage = $state('');
   let selectedText = $state<ReaderSelection | null>(null);
-  let selectedTextGroup = $state<HTMLElement | null>(null);
   let visiblePassages = $state<ReaderSelection[]>([]);
   let selectedPassageIndex = $state(0);
   let annotationMessage = $state('');
@@ -251,21 +251,20 @@
         updateDocumentTitle();
         if (origin === 'link') {
           linkReturnTarget = returnTarget ?? null;
-        } else if (origin === 'navigation') {
+        } else if (origin === 'jump') {
           linkReturnTarget = null;
         }
-        if (origin === 'navigation' || origin === 'link') {
+        if (origin === 'navigation' || origin === 'jump' || origin === 'link') {
           localNavigationDuringSession = true;
           onRelocated(next);
           locationHistory = recordLocation(locationHistory, next);
           queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
-          if (origin === 'link') showControls();
         }
       },
       (zone) => {
         if (destroyed) return;
         if (zone === 'center') {
-          if (controlsVisible) controlsVisible = false;
+          if (controlsVisible) dismissReaderChrome();
           else showControls();
         } else void turn(zone);
       },
@@ -408,6 +407,78 @@
       );
       (element ?? panel)?.focus();
     });
+  }
+
+  function focusReaderFallback(): void {
+    void tick().then(() => {
+      if (controlsVisible) focusFirstElement(readerToolbar);
+      else topRevealButton?.focus();
+    });
+  }
+
+  function clearSessionSelection(): void {
+    if (typeof session?.clearSelection === 'function') {
+      session.clearSelection();
+    } else {
+      session?.clearTextSelection?.();
+    }
+  }
+
+  function closeActiveReaderPanel(): boolean {
+    if (error) {
+      handleErrorDialogClose();
+      return true;
+    }
+    if (pendingSyncLocation) {
+      closeSyncConfirmation();
+      return true;
+    }
+    if (settingsVisible) {
+      closeSettings();
+      return true;
+    }
+    if (tocVisible) {
+      closeToc();
+      return true;
+    }
+    if (bookmarksVisible) {
+      closeBookmarks();
+      return true;
+    }
+    if (annotationsVisible) {
+      closeAnnotations();
+      return true;
+    }
+    if (searchVisible) {
+      closeSearch();
+      return true;
+    }
+    return false;
+  }
+
+  function dismissSelectedText(): void {
+    const active = activeElement();
+    const restoreFallback =
+      !active || active === document.body || Boolean(selectionToolbar?.contains(active));
+    selectedText = null;
+    clearSessionSelection();
+    if (restoreFallback) focusReaderFallback();
+  }
+
+  function dismissReaderChrome(moveFocus = false): void {
+    const active = activeElement();
+    const toolbarFocused = Boolean(active && readerToolbar?.contains(active));
+    const wasControlsVisible = controlsVisible;
+    controlsVisible = false;
+    footerVisible = false;
+    readerSyncMessage = '';
+    pauseChromeHide();
+    if (
+      toolbarFocused ||
+      (moveFocus && (wasControlsVisible || !active || active === document.body))
+    ) {
+      void tick().then(() => topRevealButton?.focus());
+    }
   }
 
   function hasOpenReaderPanel(): boolean {
@@ -571,10 +642,6 @@
     return `Passage ${index + 1}: ${preview}`;
   }
 
-  function restoreViewportFrameFocus(): void {
-    void tick().then(() => viewport?.querySelector<HTMLElement>('iframe')?.focus());
-  }
-
   function openAnnotations(focusAnnotationId?: string): void {
     controlsVisible = true;
     pauseChromeHide();
@@ -603,7 +670,10 @@
   function closeAnnotations(): void {
     annotationsVisible = false;
     if (!hasSelectionDraft()) {
-      selectedText = null;
+      if (selectedText) {
+        selectedText = null;
+        clearSessionSelection();
+      }
       annotationDraft = '';
     }
     visiblePassages = [];
@@ -668,7 +738,10 @@
     editingBookmarkId = null;
     bookmarkLimitMessage = '';
     if (!hasSelectionDraft()) {
-      selectedText = null;
+      if (selectedText) {
+        selectedText = null;
+        clearSessionSelection();
+      }
       annotationDraft = '';
     }
     visiblePassages = [];
@@ -863,6 +936,7 @@
       );
       controlsVisible = false;
       footerVisible = false;
+      readerSyncMessage = '';
       if (restoreToolbarFocus) void tick().then(() => topRevealButton?.focus());
     }, 5_000);
   }
@@ -988,21 +1062,22 @@
     }
     session?.updateHighlights(annotations);
     annotationDraft = '';
-    selectedText = null;
+    if (selectedText) {
+      selectedText = null;
+      clearSessionSelection();
+    }
     annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    if (annotationsVisible) {
+      focusReaderTarget(annotationsPanel, 'annotation-edit', saved.id);
+    }
     return saved;
   }
 
   function highlightSelection(): void {
-    const restoreFrameFocus = Boolean(
-      selectedTextGroup &&
-      document.activeElement &&
-      selectedTextGroup.contains(document.activeElement),
-    );
     if (saveAnnotation(selectedText, true)) {
       selectionMessage = 'Highlight saved.';
-      if (restoreFrameFocus) restoreViewportFrameFocus();
+      focusReaderFallback();
     }
   }
 
@@ -1056,16 +1131,14 @@
   async function copySelection(): Promise<void> {
     const selection = selectedText;
     if (!selection) return;
-    const restoreFrameFocus = Boolean(
-      selectedTextGroup &&
-      document.activeElement &&
-      selectedTextGroup.contains(document.activeElement),
-    );
     try {
       await navigator.clipboard.writeText(selection.text);
-      if (!hasSelectionDraft()) selectedText = null;
+      if (!hasSelectionDraft()) {
+        selectedText = null;
+        clearSessionSelection();
+        focusReaderFallback();
+      }
       selectionMessage = 'Selected text copied.';
-      if (restoreFrameFocus) restoreViewportFrameFocus();
     } catch {
       selectionMessage = 'Turnleaf could not copy the selection.';
     }
@@ -1145,6 +1218,7 @@
     if (!session) return;
     try {
       await session.displayCfi(result.cfi);
+      linkReturnTarget = null;
       closeSearch();
       showControls();
     } catch {
@@ -1158,6 +1232,7 @@
     try {
       const restored = await session.displayCfi(saved.cfi);
       if (!restored && saved.href) await session.display(saved.href);
+      linkReturnTarget = null;
       closeBookmarks();
       showControls();
     } catch {
@@ -1172,9 +1247,12 @@
     const target = linkReturnTarget;
     try {
       const restored = await session.displayCfi(target.cfi);
-      if (!restored && target.href) await session.display(target.href);
+      if (!restored) {
+        if (!target.href) throw new Error('Unavailable');
+        await session.display(target.href);
+      }
       linkReturnTarget = null;
-      showControls();
+      focusReaderFallback();
     } catch {
       openReaderError(
         'The location before this link is no longer available in the current EPUB.',
@@ -1243,14 +1321,19 @@
   ): Promise<void> {
     if (progress.xpath) {
       const restored = await reader.displayServerLocation(progress.xpath);
-      if (restored) return;
+      if (restored) {
+        linkReturnTarget = null;
+        return;
+      }
     }
     if (
       typeof progress.percentage === 'number' &&
       Number.isFinite(progress.percentage) &&
       progress.percentage > 0
     ) {
-      await reader.displayServerPercentage(progress.percentage);
+      if (await reader.displayServerPercentage(progress.percentage)) {
+        linkReturnTarget = null;
+      }
     }
   }
 
@@ -1336,79 +1419,64 @@
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed || event.defaultPrevented) return;
-    if (
-      !event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key === 'Escape' &&
-      hasOpenReaderPanel()
-    ) {
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (event.key === 'Escape') {
+      if (closeActiveReaderPanel()) {
+        event.preventDefault();
+        return;
+      }
+      if (selectedText && !hasSelectionDraft()) {
+        event.preventDefault();
+        dismissSelectedText();
+        return;
+      }
+      if (selectedText) {
+        event.preventDefault();
+        clearSessionSelection();
+      }
+      if (controlsVisible || footerVisible) {
+        event.preventDefault();
+        dismissReaderChrome(true);
+      }
+      return;
+    }
+    if (hasOpenReaderPanel() || error) return;
+    const target = event.target as Element | null;
+    if (target?.closest?.('a, input, select, textarea, [contenteditable="true"]')) {
+      return;
+    }
+    const button = target?.closest?.('button');
+    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
       event.preventDefault();
-      if (error) {
-        handleErrorDialogClose();
-        return;
-      }
-      if (pendingSyncLocation) {
-        closeSyncConfirmation();
-        return;
-      }
-      if (settingsVisible) closeSettings();
-      else if (tocVisible) closeToc();
-      else if (bookmarksVisible) closeBookmarks();
-      else if (annotationsVisible) closeAnnotations();
-      else if (searchVisible) closeSearch();
-      showControls();
+      void turn('previous');
       return;
     }
-    const action = resolveReaderKeyboardAction(event, {
-      hasOpenPanel: hasOpenReaderPanel(),
-      hasSelection: selectedText !== null,
-    });
-    if (!action) return;
-    event.preventDefault();
-    if (action === 'clear-selection') {
-      const restoreFrameFocus = Boolean(
-        selectedTextGroup &&
-        document.activeElement &&
-        selectedTextGroup.contains(document.activeElement),
-      );
-      session?.clearTextSelection();
-      if (!hasSelectionDraft()) selectedText = null;
-      if (restoreFrameFocus) restoreViewportFrameFocus();
+    if (event.key === 'ArrowRight' || event.key === 'PageDown') {
+      event.preventDefault();
+      void turn('next');
       return;
     }
-    void turn(action);
+    if (event.key === ' ' && (!button || button === nextPageButton)) {
+      event.preventDefault();
+      void turn('next');
+    }
   }
 
   function handleBackButton(): boolean {
-    if (error) {
-      handleErrorDialogClose();
+    if (closeActiveReaderPanel()) return true;
+    if (selectedText && !hasSelectionDraft()) {
+      dismissSelectedText();
       return true;
     }
-    if (pendingSyncLocation) {
-      closeSyncConfirmation();
+    if (controlsVisible || footerVisible) {
+      dismissReaderChrome(true);
       return true;
     }
-    if (settingsVisible) closeSettings();
-    else if (tocVisible) closeToc();
-    else if (bookmarksVisible) closeBookmarks();
-    else if (annotationsVisible) closeAnnotations();
-    else if (searchVisible) closeSearch();
-    else if (linkReturnTarget) {
+    if (linkReturnTarget) {
       void returnToLink();
       return true;
-    } else if (controlsVisible) {
-      controlsVisible = false;
-      footerVisible = false;
-      pauseChromeHide();
-      void tick().then(() => topRevealButton?.focus());
-      return true;
-    } else {
-      onBack();
-      return true;
     }
-    showControls();
+    onBack();
     return true;
   }
 
@@ -1448,37 +1516,64 @@
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
   <p class="sr-only" role="status">{selectionMessage}</p>
-  {#if selectedText && !hasOpenReaderPanel()}
+  {#if (readerSyncMessage && controlsVisible) || ((selectedText || linkReturnTarget) && !hasOpenReaderPanel())}
     <div
-      bind:this={selectedTextGroup}
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
-      role="group"
-      aria-label="Selected text"
+      class="reader-bottom-overlays"
+      class:reader-bottom-overlays-lifted={footerVisible}
+      inert={hasOpenReaderPanel()}
     >
-      <button
-        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={highlightSelection}
-      >
-        Highlight
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={startSelectionNote}
-      >
-        Add note
-      </button>
-      <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
-        type="button"
-        onpointerdown={(event) => event.preventDefault()}
-        onclick={() => void copySelection()}
-      >
-        Copy text
-      </button>
+      {#if readerSyncMessage && controlsVisible}
+        <p
+          class="mx-auto w-fit max-w-full rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
+          role="status"
+        >
+          {readerSyncMessage}
+        </p>
+      {/if}
+      {#if selectedText && !hasOpenReaderPanel()}
+        <div
+          bind:this={selectionToolbar}
+          class="mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 rounded-md preset-filled-surface-50-950 p-2 shadow-lg"
+          role="group"
+          aria-label="Selected text"
+        >
+          <button
+            class="btn btn-sm preset-filled-primary-700-300 min-h-11"
+            type="button"
+            onpointerdown={(event) => event.preventDefault()}
+            onclick={highlightSelection}
+          >
+            Highlight
+          </button>
+          <button
+            class="btn btn-sm preset-tonal-surface min-h-11"
+            type="button"
+            onpointerdown={(event) => event.preventDefault()}
+            onclick={startSelectionNote}
+          >
+            Add note
+          </button>
+          <button
+            class="btn btn-sm preset-tonal-surface min-h-11"
+            type="button"
+            onpointerdown={(event) => event.preventDefault()}
+            onclick={() => void copySelection()}
+          >
+            Copy text
+          </button>
+        </div>
+      {/if}
+      {#if linkReturnTarget && !hasOpenReaderPanel()}
+        <button
+          bind:this={returnToLinkButton}
+          class="btn min-h-11 self-end preset-filled-primary-700-300 shadow"
+          type="button"
+          aria-label="Return to the location before this link"
+          onclick={() => void returnToLink()}
+        >
+          Return to link
+        </button>
+      {/if}
     </div>
   {/if}
 
@@ -1505,36 +1600,16 @@
       type="button"
       aria-label={controlsVisible ? 'Hide reading controls' : 'Show reading controls'}
       aria-keyshortcuts="Escape"
-      onclick={() => (controlsVisible ? (controlsVisible = false) : showControls())}
+      onclick={() => (controlsVisible ? dismissReaderChrome() : showControls())}
     ></button>
     <button
+      bind:this={nextPageButton}
       type="button"
       aria-label="Next page"
       aria-keyshortcuts="ArrowRight PageDown Space"
       onclick={() => turn('next')}
     ></button>
   </nav>
-
-  {#if linkReturnTarget && !hasOpenReaderPanel()}
-    <button
-      bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
-      type="button"
-      aria-label="Return to the location before this link"
-      onclick={() => void returnToLink()}
-    >
-      Return to link
-    </button>
-  {/if}
-
-  {#if readerSyncMessage && controlsVisible}
-    <p
-      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
-      role="status"
-    >
-      {readerSyncMessage}
-    </p>
-  {/if}
 
   {#if appearance.progressBar}
     <div
@@ -1709,16 +1784,9 @@
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
-          onclick={() =>
-            settingsVisible
-              ? closeSettings()
-              : tocVisible
-                ? closeToc()
-                : bookmarksVisible
-                  ? closeBookmarks()
-                  : annotationsVisible
-                    ? closeAnnotations()
-                    : closeSearch()}
+          onclick={() => {
+            closeActiveReaderPanel();
+          }}
         ></button>
       {/if}
 
@@ -1971,6 +2039,7 @@
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
                     onclick={() => {
+                      linkReturnTarget = null;
                       void session?.display(item.href);
                       closeToc();
                     }}
@@ -2025,6 +2094,7 @@
                           type="button"
                           onkeydown={(event) => void continueTocTabbing(event, row.index)}
                           onclick={() => {
+                            linkReturnTarget = null;
                             void session?.display(row.href);
                             closeToc();
                           }}
@@ -2305,6 +2375,13 @@
                     selectedText = null;
                     annotationDraft = '';
                     annotationLimitMessage = '';
+                    clearSessionSelection();
+                    const first = annotations[0];
+                    focusReaderTarget(
+                      annotationsPanel,
+                      first ? 'annotation-edit' : 'annotations-heading',
+                      first?.id,
+                    );
                   }}
                 >
                   Cancel
@@ -2398,6 +2475,7 @@
                     class="w-full text-left text-sm italic"
                     type="button"
                     onclick={() => {
+                      linkReturnTarget = null;
                       void session?.displayCfi(annotation.cfi);
                       closeAnnotations();
                     }}
@@ -2831,9 +2909,39 @@
   }
 
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    bottom: calc(
+      max(0.25rem, env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 3rem
+    );
+    z-index: 19;
     justify-content: space-between;
     padding-bottom: 0;
+  }
+
+  .reader-bottom-overlays {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(
+      max(0.25rem, env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 3.25rem
+    );
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    padding-left: max(1rem, env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
+    padding-right: max(1rem, env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
+    pointer-events: none;
+  }
+
+  .reader-bottom-overlays-lifted {
+    bottom: calc(
+      max(0.25rem, env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 4.75rem
+    );
+  }
+
+  .reader-bottom-overlays > * {
+    pointer-events: auto;
   }
 
   .reader-progress {
