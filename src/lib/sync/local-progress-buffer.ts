@@ -24,7 +24,7 @@ export interface LocalProgressBuffer {
   flush: () => Promise<void>;
   clear: (bookId?: string) => Promise<void>;
   runAuthoritative: <T>(bookId: string | undefined, action: () => Promise<T>) => Promise<T>;
-  hasPending: (bookId: string) => boolean;
+  hasPending: (bookId?: string) => boolean;
 }
 
 function defaultWriteLocalProgress(
@@ -208,8 +208,9 @@ export function createLocalProgressBuffer(
       });
     },
 
-    hasPending(bookId: string): boolean {
-      return pending.has(bookId);
+    hasPending(bookId?: string): boolean {
+      if (bookId !== undefined) return pending.has(bookId);
+      return pending.size > 0 || activeDrain !== null || inFlight !== null;
     },
   };
 }

@@ -1,0 +1,225 @@
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { syncIosProject } from './ios-sync.mjs';
+
+const scriptDirectory = dirname(fileURLToPath(import.meta.url));
+const projectRoot = dirname(scriptDirectory);
+
+export function defaultSpmCacheDir(environment = process.env, home = homedir()) {
+  return environment.TURNLEAF_SPM_CACHE_DIR || join(home, '.cache', 'turnleaf-spm');
+}
+
+export function shouldCleanXcodeBuild(environment = process.env) {
+  return environment.TURNLEAF_XCODE_CLEAN === 'true';
+}
+
+export function shouldSkipIosSync(environment = process.env) {
+  return environment.TURNLEAF_SKIP_IOS_SYNC === 'true';
+}
+
+export function buildXcodeSimulatorArgs({
+  projectPath = join(projectRoot, 'ios', 'App', 'App.xcodeproj'),
+  derivedDataPath = join(projectRoot, 'ios', 'App', 'DerivedData'),
+  spmCachePath = defaultSpmCacheDir(),
+  clean = false,
+} = {}) {
+  return [
+    '-project',
+    projectPath,
+    '-scheme',
+    'App',
+    '-configuration',
+    'Debug',
+    '-destination',
+    'generic/platform=iOS Simulator',
+    '-derivedDataPath',
+    derivedDataPath,
+    '-clonedSourcePackagesDirPath',
+    spmCachePath,
+    'CODE_SIGNING_ALLOWED=NO',
+    ...(clean ? ['clean', 'build'] : ['build']),
+  ];
+}
+
+export function extractXcodeErrors(lines, maxLines = 12) {
+  const matched = lines.filter((line) => /\b(error:|fatal error:|xcodebuild: error:)/i.test(line));
+  const selected = matched.length > 0 ? matched.slice(-maxLines) : lines.slice(-maxLines);
+  return selected.map((line) => line.trim()).filter(Boolean);
+}
+
+function formatActionsAnnotationMessage(lines) {
+  return lines.join('\n').replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+}
+
+export function runXcodeBuild(
+  args,
+  {
+    cwd = projectRoot,
+    env = process.env,
+    spawnImpl = spawn,
+    stdout = process.stdout,
+    stderr = process.stderr,
+    onErrorAnnotation = (annotation) => console.error(annotation),
+  } = {},
+) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const recentLines = [];
+    const errorLines = [];
+    const pendingByStream = new Map();
+
+    const recordLine = (rawLine) => {
+      const line = rawLine.trim();
+      if (!line) {
+        return;
+      }
+      recentLines.push(line);
+      if (recentLines.length > 40) {
+        recentLines.shift();
+      }
+      if (/\b(error:|fatal error:|xcodebuild: error:)/i.test(line)) {
+        errorLines.push(line);
+        if (errorLines.length > 20) {
+          errorLines.shift();
+        }
+      }
+    };
+
+    const recordChunk = (chunk, targetStream) => {
+      targetStream.write(chunk);
+      const combined = (pendingByStream.get(targetStream) ?? '') + chunk.toString('utf8');
+      const parts = combined.split(/\r?\n/);
+      pendingByStream.set(targetStream, parts.pop() ?? '');
+      for (const part of parts) {
+        recordLine(part);
+      }
+    };
+
+    const child = spawnImpl('xcodebuild', args, {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', (chunk) => recordChunk(chunk, stdout));
+    child.stderr.on('data', (chunk) => recordChunk(chunk, stderr));
+    child.once('error', rejectPromise);
+    child.once('close', (code, signal) => {
+      for (const trailing of pendingByStream.values()) {
+        recordLine(trailing);
+      }
+      if (code === 0) {
+        resolvePromise();
+        return;
+      }
+      const summaryLines = extractXcodeErrors(errorLines.length > 0 ? errorLines : recentLines);
+      if (env.GITHUB_ACTIONS === 'true' && summaryLines.length > 0) {
+        onErrorAnnotation(
+          `::error title=xcodebuild simulator build failed::${formatActionsAnnotationMessage(summaryLines)}`,
+        );
+      }
+      const error = new Error(
+        signal ? `xcodebuild terminated by ${signal}` : `xcodebuild exited with code ${code}`,
+      );
+      error.exitCode = code ?? 1;
+      rejectPromise(error);
+    });
+  });
+}
+
+export function readPlistShortVersion(infoPlistPath, execFileSyncImpl = execFileSync) {
+  return execFileSyncImpl(
+    'plutil',
+    ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', infoPlistPath],
+    { encoding: 'utf8' },
+  ).trim();
+}
+
+export function lintPlistFile(plistPath, execFileSyncImpl = execFileSync) {
+  execFileSyncImpl('plutil', ['-lint', plistPath], { encoding: 'utf8' });
+}
+
+export function verifyBuiltSimulatorApp({
+  appBundlePath,
+  expectedVersion,
+  existsSyncImpl = existsSync,
+  statSyncImpl = statSync,
+  readShortVersionImpl = readPlistShortVersion,
+  lintPlistImpl = lintPlistFile,
+}) {
+  if (!existsSyncImpl(appBundlePath)) {
+    throw new Error(`Expected built simulator app bundle at ${appBundlePath}.`);
+  }
+
+  const privacyManifestPath = join(appBundlePath, 'PrivacyInfo.xcprivacy');
+  if (!existsSyncImpl(privacyManifestPath) || statSyncImpl(privacyManifestPath).size === 0) {
+    throw new Error(
+      `Built simulator app bundle omits PrivacyInfo.xcprivacy (${privacyManifestPath}).`,
+    );
+  }
+  lintPlistImpl(privacyManifestPath);
+
+  const infoPlistPath = join(appBundlePath, 'Info.plist');
+  if (!existsSyncImpl(infoPlistPath)) {
+    throw new Error(`Built simulator app bundle omits Info.plist (${infoPlistPath}).`);
+  }
+
+  const bundleVersion = readShortVersionImpl(infoPlistPath);
+  if (bundleVersion !== expectedVersion) {
+    throw new Error(
+      `Built App.app CFBundleShortVersionString (${bundleVersion}) does not match package.json version (${expectedVersion}).`,
+    );
+  }
+}
+
+export async function main({
+  platform = process.platform,
+  env = process.env,
+  rootDir = projectRoot,
+} = {}) {
+  if (platform !== 'darwin') {
+    console.error('Building the iOS Simulator app requires macOS with Xcode installed.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const derivedDataPath = join(rootDir, 'ios', 'App', 'DerivedData');
+  const projectPath = join(rootDir, 'ios', 'App', 'App.xcodeproj');
+  const spmCachePath = defaultSpmCacheDir(env);
+  const appBundlePath = join(
+    derivedDataPath,
+    'Build',
+    'Products',
+    'Debug-iphonesimulator',
+    'App.app',
+  );
+  const expectedVersion = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8')).version;
+
+  try {
+    if (!shouldSkipIosSync(env)) {
+      await syncIosProject({ env, rootDir });
+    }
+    const xcodeArgs = buildXcodeSimulatorArgs({
+      projectPath,
+      derivedDataPath,
+      spmCachePath,
+      clean: shouldCleanXcodeBuild(env),
+    });
+    await runXcodeBuild(xcodeArgs, {
+      cwd: rootDir,
+      env,
+    });
+    verifyBuiltSimulatorApp({ appBundlePath, expectedVersion });
+    console.log(
+      `Verified iOS Simulator bundle at ${appBundlePath} (version ${expectedVersion}, PrivacyInfo.xcprivacy included).`,
+    );
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = error.exitCode ?? 1;
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}
