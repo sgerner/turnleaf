@@ -113,6 +113,7 @@
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const coverMetaByBookId = new SvelteMap<string, { chapterId: number; seriesId: number }>();
   const sharedCoverLoader = createSharedCoverLoader<string | Blob, string>(
     async (bookId, signal) => {
@@ -127,6 +128,7 @@
           seriesId: meta.seriesId,
           signal,
           cacheNamespace: server.id,
+          serverOrigin,
           canDownload: networkAvailable,
         });
       }
@@ -1095,6 +1097,7 @@
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        serverOrigin,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1151,6 +1154,10 @@
         } else {
           message = 'The file transfer failed.';
         }
+      } else if (error instanceof KavitaError) {
+        status = error.status;
+        detail = 'download-transfer';
+        message = error.message;
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
