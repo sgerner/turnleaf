@@ -133,6 +133,9 @@ describe('Library Settings appearance and palette switching', () => {
     )!;
     expect(settingsButton).toBeTruthy();
     settingsButton.click();
+    await vi.waitFor(() => {
+      expect(target.querySelector('[role="group"][aria-label="Theme palette"]')).toBeTruthy();
+    });
     flushSync();
 
     expect(mocks.loadTheme).not.toHaveBeenCalled();
@@ -196,6 +199,9 @@ describe('Library Settings appearance and palette switching', () => {
       'button[aria-label="Open settings"]',
     )!;
     settingsButton.click();
+    await vi.waitFor(() => {
+      expect(target.querySelector('button[aria-label="Use cerberus theme"]')).toBeTruthy();
+    });
     flushSync();
 
     const cerberusBtn = target.querySelector<HTMLButtonElement>(
@@ -250,6 +256,11 @@ describe('Library Settings appearance and palette switching', () => {
       'button[aria-label="Open settings"]',
     )!;
     settingsButton.click();
+    await vi.waitFor(() => {
+      expect(
+        target.querySelector('section[aria-labelledby="library-settings-appearance-title"]'),
+      ).toBeTruthy();
+    });
     flushSync();
 
     const appearanceSection = target.querySelector(
@@ -306,6 +317,11 @@ describe('Library Settings appearance and palette switching', () => {
     flushSync();
 
     target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')!.click();
+    await vi.waitFor(() => {
+      expect(
+        target.querySelector('section[aria-labelledby="library-settings-appearance-title"]'),
+      ).toBeTruthy();
+    });
     flushSync();
 
     const appearanceSection = target.querySelector(

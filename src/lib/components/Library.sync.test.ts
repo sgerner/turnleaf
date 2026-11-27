@@ -474,7 +474,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     const settingsButton = target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]');
     expect(settingsButton).not.toBeNull();
     settingsButton!.click();
-    flushSync();
+    await waitForCondition(() => Boolean(target.querySelector('#replacement-api-key')));
 
     const keyInput = target.querySelector<HTMLInputElement>('#replacement-api-key');
     expect(keyInput).not.toBeNull();

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preload reader in parallel, trim bundles, and enable Android R8
+- fix: serialize native SQLite resets and guard clear/reset interleaving
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

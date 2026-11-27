@@ -1,15 +1,20 @@
 import { Capacitor } from '@capacitor/core';
 import {
   CapacitorSQLite,
-  SQLiteConnection,
+  type CapacitorSQLitePlugin,
+  type capSQLiteChanges,
   type capTask,
-  type DBSQLiteValues,
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
-import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import {
+  clearBootThemeCache,
+  mirrorBootThemePreferences,
+  readBootThemeCache,
+} from '../themes/themes';
+
+export const LATEST_SCHEMA_VERSION = 7;
 
 export interface ServerConfig {
   id: string;
@@ -54,8 +59,33 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
   return record;
 }
 
-let connection: SQLiteDBConnection | null = null;
-let opening: Promise<SQLiteDBConnection> | null = null;
+export type NativeSQLiteConnection = Pick<
+  SQLiteDBConnection,
+  'close' | 'execute' | 'executeTransaction' | 'getVersion' | 'open' | 'query' | 'run'
+>;
+
+type NativeSQLiteClient = Pick<
+  CapacitorSQLitePlugin,
+  | 'beginTransaction'
+  | 'checkConnectionsConsistency'
+  | 'close'
+  | 'commitTransaction'
+  | 'createConnection'
+  | 'deleteDatabase'
+  | 'execute'
+  | 'getVersion'
+  | 'open'
+  | 'query'
+  | 'rollbackTransaction'
+  | 'run'
+> &
+  Partial<Pick<CapacitorSQLitePlugin, 'closeConnection'>>;
+
+const NATIVE_DATABASE = 'turnleaf';
+const sqlitePlugin: NativeSQLiteClient = CapacitorSQLite;
+
+let connection: NativeSQLiteConnection | null = null;
+let connectionGeneration = 0;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
@@ -96,29 +126,8 @@ async function executeNativeTransaction(
   await enqueueNativeWrite(() => db.executeTransaction(tasks).then(() => undefined));
 }
 
-async function executeNativeRun(
-  db: Pick<SQLiteDBConnection, 'run'>,
-  statement: string,
-  values: unknown[] = [],
-): Promise<void> {
-  await enqueueNativeWrite(() => db.run(statement, values).then(() => undefined));
-}
-
-async function executeNativeStatement(
-  db: Pick<SQLiteDBConnection, 'execute'>,
-  statement: string,
-): Promise<void> {
-  await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
-}
-
-async function executeNativeQuery(
-  db: Pick<SQLiteDBConnection, 'query'>,
-  statement: string,
-  values?: unknown[],
-): Promise<DBSQLiteValues> {
-  return enqueueNativeWrite(() =>
-    values === undefined ? db.query(statement) : db.query(statement, values),
-  );
+function withNativeDatabase<T>(operation: (db: NativeSQLiteConnection) => Promise<T>): Promise<T> {
+  return enqueueNativeWrite(async () => operation(await ensureNativeDatabase()));
 }
 
 function parseReadingStateRow(row: Record<string, unknown> | undefined): StoredReadingState | null {
@@ -205,34 +214,186 @@ function updateBrowserState(mutate: (state: BrowserDatabaseState) => boolean | v
   return true;
 }
 
-export async function openDatabase(): Promise<SQLiteDBConnection> {
+export async function openDatabase(): Promise<NativeSQLiteConnection> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
-  if (connection) return connection;
+  return enqueueNativeWrite(() => ensureNativeDatabase());
+}
 
-  if (opening) return opening;
-  opening = openNativeDatabase();
+function normalizeQueryRows(
+  values: Record<string, unknown>[] | undefined,
+): Record<string, unknown>[] {
+  if (!values?.length || typeof values[0] !== 'object' || values[0] === null) {
+    return values ?? [];
+  }
+  if (!('ios_columns' in values[0]) || !Array.isArray(values[0].ios_columns)) {
+    return values;
+  }
+  const columns = values[0].ios_columns as string[];
+  return values.slice(1).map((row) => {
+    const ordered: Record<string, unknown> = {};
+    for (const column of columns) {
+      ordered[column] = row[column];
+    }
+    return ordered;
+  });
+}
+
+function createNativeConnection(database: string, generation: number): NativeSQLiteConnection {
+  const dbRef = { database, readonly: false as const };
+  const assertActive = (): void => {
+    if (generation !== connectionGeneration) {
+      throw new Error(`Connection to ${database} is closed`);
+    }
+  };
+  return {
+    open: async () => {
+      assertActive();
+      await sqlitePlugin.open(dbRef);
+    },
+    close: async () => {
+      if (generation === connectionGeneration) {
+        connectionGeneration += 1;
+        connection = null;
+      }
+      await sqlitePlugin.close(dbRef);
+    },
+    getVersion: async () => {
+      assertActive();
+      return sqlitePlugin.getVersion(dbRef);
+    },
+    execute: async (statements, transaction = true, isSQL92 = true) => {
+      assertActive();
+      return sqlitePlugin.execute({ ...dbRef, statements, transaction, isSQL92 });
+    },
+    async query(statement, values, isSQL92 = true) {
+      assertActive();
+      const queryValues = values && values.length > 0 ? values : [];
+      const result = await sqlitePlugin.query({
+        ...dbRef,
+        statement,
+        values: queryValues,
+        isSQL92: queryValues.length > 0 ? true : isSQL92,
+      });
+      return {
+        ...result,
+        values: normalizeQueryRows(result.values as Record<string, unknown>[] | undefined),
+      };
+    },
+    async run(statement, values, transaction = true, returnMode = 'no', isSQL92 = true) {
+      assertActive();
+      const runValues = values && values.length > 0 ? values : [];
+      const result = await sqlitePlugin.run({
+        ...dbRef,
+        statement,
+        values: runValues,
+        transaction,
+        returnMode: returnMode as 'all' | 'one' | 'no',
+        isSQL92: runValues.length > 0 ? true : isSQL92,
+      });
+      if (!result.changes?.values) return result;
+      return {
+        ...result,
+        changes: {
+          ...result.changes,
+          values: normalizeQueryRows(result.changes.values as Record<string, unknown>[]),
+        },
+      };
+    },
+    async executeTransaction(tasks, isSQL92 = true): Promise<capSQLiteChanges> {
+      assertActive();
+      await sqlitePlugin.beginTransaction({ database });
+      let changes = 0;
+      try {
+        for (const task of tasks) {
+          assertActive();
+          if (task.values && task.values.length > 0) {
+            const returnMode = task.statement.toUpperCase().includes('RETURNING') ? 'all' : 'no';
+            const result = await sqlitePlugin.run({
+              ...dbRef,
+              statement: task.statement,
+              values: task.values,
+              transaction: false,
+              returnMode,
+              isSQL92,
+            });
+            const count = result.changes?.changes ?? 0;
+            if (count < 0) throw new Error('Error in transaction method run');
+            changes += count;
+          } else {
+            const result = await sqlitePlugin.execute({
+              ...dbRef,
+              statements: task.statement,
+              transaction: false,
+              isSQL92,
+            });
+            const count = result.changes?.changes ?? 0;
+            if (count < 0) throw new Error('Error in transaction method execute');
+            changes += count;
+          }
+        }
+        const committed = await sqlitePlugin.commitTransaction({ database });
+        changes += committed.changes?.changes ?? 0;
+        return { changes: { changes } };
+      } catch (error) {
+        await sqlitePlugin.rollbackTransaction({ database }).catch(() => {});
+        throw error;
+      }
+    },
+  };
+}
+
+async function ensureNativeDatabase(): Promise<NativeSQLiteConnection> {
+  if (connection) return connection;
+  const generation = connectionGeneration;
+  await sqlitePlugin.checkConnectionsConsistency({ dbNames: [], openModes: [] });
+  await sqlitePlugin.createConnection({
+    database: NATIVE_DATABASE,
+    encrypted: false,
+    mode: 'no-encryption',
+    version: 1,
+    readonly: false,
+  });
+  const db = createNativeConnection(NATIVE_DATABASE, generation);
   try {
-    connection = await opening;
-    return connection;
-  } finally {
-    opening = null;
+    await db.open();
+    await db.execute('PRAGMA foreign_keys = ON;');
+    await migrate(db);
+    connection = db;
+    return db;
+  } catch (error) {
+    await db.close().catch(() => {});
+    await sqlitePlugin
+      .closeConnection?.({ database: NATIVE_DATABASE, readonly: false })
+      .catch(() => {});
+    throw error;
   }
 }
 
-async function openNativeDatabase(): Promise<SQLiteDBConnection> {
-  const sqlite = new SQLiteConnection(CapacitorSQLite);
-  const consistency = await sqlite.checkConnectionsConsistency();
-  const existing = (await sqlite.isConnection('turnleaf', false)).result;
-  const db =
-    consistency.result && existing
-      ? await sqlite.retrieveConnection('turnleaf', false)
-      : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
-  await db.open();
-  await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
-  return db;
+async function deleteNativeDatabase(): Promise<void> {
+  try {
+    await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
+  } catch (error) {
+    const message = String(error);
+    if (
+      !message.includes(`No available connection for database ${NATIVE_DATABASE}`) &&
+      !message.includes(`Connection to ${NATIVE_DATABASE} not available`)
+    ) {
+      throw error;
+    }
+    await sqlitePlugin.createConnection({
+      database: NATIVE_DATABASE,
+      encrypted: false,
+      mode: 'no-encryption',
+      version: 1,
+      readonly: false,
+    });
+    await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
+  }
+  await sqlitePlugin
+    .closeConnection?.({ database: NATIVE_DATABASE, readonly: false })
+    .catch(() => {});
 }
 
 export async function resetLocalDatabase(): Promise<void> {
@@ -242,28 +403,33 @@ export async function resetLocalDatabase(): Promise<void> {
     return;
   }
 
-  try {
-    if (connection) {
-      try {
-        await connection.close();
-      } catch {
-        // Best effort only; a broken connection can still be removed.
-      }
-    }
+  await enqueueNativeWrite(async () => {
+    const active = connection;
+    connectionGeneration += 1;
     connection = null;
-    opening = null;
-    await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
-    clearBootThemeCache();
-  } catch (error) {
-    throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
-  }
+    try {
+      if (active) {
+        try {
+          await active.close();
+        } catch {
+          // Best effort only; a broken connection can still be removed.
+        }
+      }
+      await deleteNativeDatabase();
+      clearBootThemeCache();
+    } catch (error) {
+      throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
+    }
+  });
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+async function migrate(db: NativeSQLiteConnection): Promise<void> {
   const current = await db.getVersion();
+  if ((current.version ?? 0) >= LATEST_SCHEMA_VERSION) return;
+  const { migrations } = await import('./schema');
   for (const migration of migrations) {
     if (migration.version <= (current.version ?? 0)) continue;
-    await executeNativeTransaction(db, [
+    await db.executeTransaction([
       { statement: migration.statements },
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
@@ -277,26 +443,18 @@ export async function saveServer(config: ServerConfig): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    `INSERT INTO server_config
-      (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        display_name=excluded.display_name,
-        base_url=excluded.base_url,
-        credential_ref=excluded.credential_ref,
-        kavita_version=excluded.kavita_version,
-        last_connected_at=excluded.last_connected_at`,
-    [
-      config.id,
-      config.displayName,
-      config.baseUrl,
-      config.credentialRef,
-      config.kavitaVersion,
-      config.lastConnectedAt,
-    ],
+  await withNativeDatabase((db) =>
+    db.run(
+      'INSERT INTO server_config (id,display_name,base_url,credential_ref,kavita_version,last_connected_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,base_url=excluded.base_url,credential_ref=excluded.credential_ref,kavita_version=excluded.kavita_version,last_connected_at=excluded.last_connected_at',
+      [
+        config.id,
+        config.displayName,
+        config.baseUrl,
+        config.credentialRef,
+        config.kavitaVersion,
+        config.lastConnectedAt,
+      ],
+    ),
   );
 }
 
@@ -311,30 +469,28 @@ export async function removeServer(serverId: string): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
+  await withNativeDatabase((db) => db.run('DELETE FROM server_config WHERE id=?', [serverId]));
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
   if (!Capacitor.isNativePlatform()) {
     return readBrowserState().serverConfig;
   }
-  const db = await openDatabase();
-  const result = await executeNativeQuery(
-    db,
-    `SELECT id, display_name, base_url, credential_ref, kavita_version, last_connected_at
-     FROM server_config ORDER BY last_connected_at DESC LIMIT 1`,
-  );
-  const row = result.values?.[0] as Record<string, unknown> | undefined;
-  if (!row) return null;
-  return {
-    id: String(row.id),
-    displayName: String(row.display_name),
-    baseUrl: String(row.base_url),
-    credentialRef: String(row.credential_ref),
-    kavitaVersion: row.kavita_version ? String(row.kavita_version) : null,
-    lastConnectedAt: String(row.last_connected_at),
-  };
+  return withNativeDatabase(async (db) => {
+    const result = await db.query(
+      'SELECT id,display_name,base_url,credential_ref,kavita_version,last_connected_at FROM server_config ORDER BY last_connected_at DESC LIMIT 1',
+    );
+    const row = result.values?.[0] as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      displayName: String(row.display_name),
+      baseUrl: String(row.base_url),
+      credentialRef: String(row.credential_ref),
+      kavitaVersion: row.kavita_version ? String(row.kavita_version) : null,
+      lastConnectedAt: String(row.last_connected_at),
+    };
+  });
 }
 
 /**
@@ -406,14 +562,15 @@ export async function reconcileBooks(
     });
     return;
   }
-  await reconcileBooksInTransaction(
-    await openDatabase(),
+  const tasks = buildReconcileBookTasks(
     serverId,
     books,
-    undefined,
+    new Date().toISOString(),
     preserveMissing,
     snapshotStartedAt,
   );
+  if (!tasks.length) return;
+  await withNativeDatabase((db) => db.executeTransaction(tasks));
 }
 
 // An upload can finish while the catalog is in flight and clear pending_sync.
@@ -502,15 +659,13 @@ const retainedBookCondition = `(download_path IS NOT NULL OR download_status='av
   OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id)
   OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
 
-/** Apply metadata and optional removal reconciliation atomically on native SQLite. */
-export async function reconcileBooksInTransaction(
-  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+function buildReconcileBookTasks(
   serverId: string,
   books: BookRecord[],
-  refreshedAt = new Date().toISOString(),
-  preserveMissing = false,
-  snapshotStartedAt: string | null = null,
-): Promise<void> {
+  refreshedAt: string,
+  preserveMissing: boolean,
+  snapshotStartedAt: string | null,
+): capTask[] {
   const tasks: capTask[] = [];
   if (!preserveMissing) {
     tasks.push({
@@ -530,6 +685,25 @@ export async function reconcileBooksInTransaction(
       values: [serverId],
     });
   }
+  return tasks;
+}
+
+/** Apply metadata and optional removal reconciliation atomically on native SQLite. */
+export async function reconcileBooksInTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  serverId: string,
+  books: BookRecord[],
+  refreshedAt = new Date().toISOString(),
+  preserveMissing = false,
+  snapshotStartedAt: string | null = null,
+): Promise<void> {
+  const tasks = buildReconcileBookTasks(
+    serverId,
+    books,
+    refreshedAt,
+    preserveMissing,
+    snapshotStartedAt,
+  );
   if (!tasks.length) return;
   await executeNativeTransaction(db, tasks);
 }
@@ -542,36 +716,33 @@ export async function getBooks(
     const books = readBrowserState().books.filter((book) => book.serverId === serverId);
     return includeDescription ? books : books.map((book) => ({ ...book, descriptionHtml: null }));
   }
-  const db = await openDatabase();
-  const result = await executeNativeQuery(
-    db,
-    `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
-      format, pages, pages_read, created_at, last_read_at, download_path, download_status,
-      file_size, remote_available${includeDescription ? ', description_html' : ''}
-      FROM books WHERE server_id = ? ORDER BY title`,
-    [serverId],
-  );
-  return (result.values ?? []).map((row) => ({
-    id: String(row.id),
-    serverId: String(row.server_id),
-    libraryId: Number(row.library_id),
-    seriesId: Number(row.series_id),
-    volumeId: Number(row.volume_id),
-    chapterId: Number(row.chapter_id),
-    title: String(row.title),
-    author: row.author ? String(row.author) : null,
-    series: row.series ? String(row.series) : null,
-    descriptionHtml: row.description_html ? String(row.description_html) : null,
-    format: String(row.format),
-    pages: Number(row.pages ?? 0),
-    pagesRead: Number(row.pages_read ?? 0),
-    createdAt: String(row.created_at ?? ''),
-    lastReadAt: row.last_read_at ? String(row.last_read_at) : null,
-    downloadPath: row.download_path ? String(row.download_path) : null,
-    downloadStatus: String(row.download_status),
-    fileSize: row.file_size == null ? null : Number(row.file_size),
-    remoteAvailable: Number(row.remote_available ?? 1) !== 0,
-  }));
+  return withNativeDatabase(async (db) => {
+    const result = await db.query(
+      `SELECT id,server_id,library_id,series_id,volume_id,chapter_id,title,author,series,format,pages,pages_read,created_at,last_read_at,download_path,download_status,file_size,remote_available${includeDescription ? ',description_html' : ''} FROM books WHERE server_id=? ORDER BY title`,
+      [serverId],
+    );
+    return (result.values ?? []).map((row) => ({
+      id: String(row.id),
+      serverId: String(row.server_id),
+      libraryId: Number(row.library_id),
+      seriesId: Number(row.series_id),
+      volumeId: Number(row.volume_id),
+      chapterId: Number(row.chapter_id),
+      title: String(row.title),
+      author: row.author ? String(row.author) : null,
+      series: row.series ? String(row.series) : null,
+      descriptionHtml: row.description_html ? String(row.description_html) : null,
+      format: String(row.format),
+      pages: Number(row.pages ?? 0),
+      pagesRead: Number(row.pages_read ?? 0),
+      createdAt: String(row.created_at ?? ''),
+      lastReadAt: row.last_read_at ? String(row.last_read_at) : null,
+      downloadPath: row.download_path ? String(row.download_path) : null,
+      downloadStatus: String(row.download_status),
+      fileSize: row.file_size == null ? null : Number(row.file_size),
+      remoteAvailable: Number(row.remote_available ?? 1) !== 0,
+    }));
+  });
 }
 
 async function updateBookDownloadState(
@@ -582,17 +753,20 @@ async function updateBookDownloadState(
 ): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (!state.books.some((book) => book.id === bookId)) return false;
       state.books = state.books.map((book) =>
         book.id === bookId ? { ...book, downloadPath, downloadStatus, fileSize } : book,
       );
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    'UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?',
-    [downloadPath, downloadStatus, fileSize, bookId],
+  await withNativeDatabase((db) =>
+    db.run('UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?', [
+      downloadPath,
+      downloadStatus,
+      fileSize,
+      bookId,
+    ]),
   );
 }
 
@@ -672,11 +846,7 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
       ),
     };
   }
-  const db = await openDatabase();
-  const result = await executeNativeQuery(db, 'SELECT * FROM reading_state WHERE book_id=?', [
-    bookId,
-  ]);
-  return parseReadingStateRow(result.values?.[0] as Record<string, unknown> | undefined);
+  return withNativeDatabase((db) => queryNativeReadingState(db, bookId));
 }
 
 function updateBrowserBookProgress(
@@ -701,6 +871,7 @@ export async function saveLocalProgress(
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
@@ -738,7 +909,6 @@ export async function saveLocalProgress(
     });
     return;
   }
-  const db = await openDatabase();
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -747,14 +917,16 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await executeNativeTransaction(db, [
-    createReadingStateTask(book.id, cfi, xpath, percentage, now),
-    createSyncQueueTask(book.id, payload, now),
-    {
-      statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
-      values: [pagesRead, now, book.id],
-    },
-  ]);
+  await withNativeDatabase((db) =>
+    db.executeTransaction([
+      createReadingStateTask(book.id, cfi, xpath, percentage, now),
+      createSyncQueueTask(book.id, payload, now),
+      {
+        statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+        values: [pagesRead, now, book.id],
+      },
+    ]),
+  );
 }
 
 export async function markBookCompleted(book: BookRecord): Promise<void> {
@@ -769,6 +941,7 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
   };
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
@@ -799,16 +972,15 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
   const tasks: capTask[] = [
     {
       statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
       values: [book.pages, now, book.id],
     },
+    createReadingStateTask(book.id, '', null, 1, now),
+    createSyncQueueTask(book.id, payload, now),
   ];
-  tasks.push(createReadingStateTask(book.id, '', null, 1, now));
-  tasks.push(createSyncQueueTask(book.id, payload, now));
-  await executeNativeTransaction(db, tasks);
+  await withNativeDatabase((db) => db.executeTransaction(tasks));
 }
 
 export interface PendingSyncItem {
@@ -874,28 +1046,28 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
         revision: row.revision,
       }));
   }
-  const db = await openDatabase();
-  const result = await executeNativeQuery(
-    db,
-    `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision,
-      books.library_id,books.series_id,books.volume_id,books.chapter_id
-    FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at`,
-    [serverId],
-  );
-  return (result.values ?? []).map((row) => {
-    const bookId = String(row.book_id);
-    return {
-      bookId,
-      payload: updatePendingProgressRouting(String(row.payload_json), {
-        libraryId: Number(row.library_id),
-        seriesId: Number(row.series_id),
-        volumeId: Number(row.volume_id),
-        chapterId: Number(row.chapter_id),
-      }),
-      updatedAt: String(row.updated_at),
-      revision: Number(row.revision),
-    };
+  return withNativeDatabase(async (db) => {
+    const result = await db.query(
+      `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision,
+        books.library_id,books.series_id,books.volume_id,books.chapter_id
+      FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
+      WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at`,
+      [serverId],
+    );
+    return (result.values ?? []).map((row) => {
+      const bookId = String(row.book_id);
+      return {
+        bookId,
+        payload: updatePendingProgressRouting(String(row.payload_json), {
+          libraryId: Number(row.library_id),
+          seriesId: Number(row.series_id),
+          volumeId: Number(row.volume_id),
+          chapterId: Number(row.chapter_id),
+        }),
+        updatedAt: String(row.updated_at),
+        revision: Number(row.revision),
+      };
+    });
   });
 }
 
@@ -923,20 +1095,20 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
         })),
     );
   }
-  const db = await openDatabase();
-  const result = await executeNativeQuery(
-    db,
-    `SELECT sync_queue.updated_at,sync_queue.last_error
-    FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
-    [serverId],
-  );
-  return summarizeSyncRows(
-    (result.values ?? []).map((row) => ({
-      updatedAt: row.updated_at ? String(row.updated_at) : null,
-      lastError: row.last_error ? String(row.last_error) : null,
-    })),
-  );
+  return withNativeDatabase(async (db) => {
+    const result = await db.query(
+      `SELECT sync_queue.updated_at,sync_queue.last_error
+      FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
+      WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
+      [serverId],
+    );
+    return summarizeSyncRows(
+      (result.values ?? []).map((row) => ({
+        updatedAt: row.updated_at ? String(row.updated_at) : null,
+        lastError: row.last_error ? String(row.last_error) : null,
+      })),
+    );
+  });
 }
 
 interface NormalizedRemoteProgress {
@@ -1010,8 +1182,7 @@ export async function saveRemoteProgress(
     });
   }
 
-  const db = await openDatabase();
-  return enqueueNativeWrite(async () => {
+  return withNativeDatabase(async (db) => {
     if (!matches(await queryNativeReadingState(db, book.id))) return false;
     const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
     if (queue.values?.length) return false;
@@ -1078,8 +1249,7 @@ export async function acceptRemoteProgress(
     });
   }
 
-  const db = await openDatabase();
-  return enqueueNativeWrite(async () => {
+  return withNativeDatabase(async (db) => {
     await db.executeTransaction([
       {
         statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
@@ -1167,27 +1337,27 @@ export async function confirmSync(
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeTransaction(db, [
-    {
-      statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=?,
-        server_updated_at=? WHERE book_id=? AND local_updated_at=?
-        AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?)`,
-      values: [
-        expectedUpdatedAt,
-        serverUpdatedAt,
-        bookId,
-        expectedUpdatedAt,
-        bookId,
-        expectedUpdatedAt,
-        expectedRevision,
-      ],
-    },
-    {
-      statement: 'DELETE FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?',
-      values: [bookId, expectedUpdatedAt, expectedRevision],
-    },
-  ]);
+  await withNativeDatabase((db) =>
+    db.executeTransaction([
+      {
+        statement:
+          'UPDATE reading_state SET pending_sync=0,synced_local_updated_at=?,server_updated_at=? WHERE book_id=? AND local_updated_at=? AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?)',
+        values: [
+          expectedUpdatedAt,
+          serverUpdatedAt,
+          bookId,
+          expectedUpdatedAt,
+          bookId,
+          expectedUpdatedAt,
+          expectedRevision,
+        ],
+      },
+      {
+        statement: 'DELETE FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?',
+        values: [bookId, expectedUpdatedAt, expectedRevision],
+      },
+    ]),
+  );
 }
 
 export async function markSyncFailure(
@@ -1206,12 +1376,11 @@ export async function markSyncFailure(
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    `UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=?
-    WHERE book_id=? AND updated_at=? AND revision=?`,
-    [new Date().toISOString(), error.slice(0, 240), bookId, expectedUpdatedAt, expectedRevision],
+  await withNativeDatabase((db) =>
+    db.run(
+      'UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=? WHERE book_id=? AND updated_at=? AND revision=?',
+      [new Date().toISOString(), error.slice(0, 240), bookId, expectedUpdatedAt, expectedRevision],
+    ),
   );
 }
 
@@ -1230,13 +1399,13 @@ export async function getPreferences(keys: readonly string[]): Promise<Map<strin
     }
     return values;
   }
-  const db = await openDatabase();
-  const result = await executeNativeQuery(
-    db,
-    `SELECT key, value FROM preferences WHERE key IN (${keys.map(() => '?').join(', ')})`,
-    [...keys],
-  );
-  return new Map((result.values ?? []).map((row) => [String(row.key), String(row.value)]));
+  return withNativeDatabase(async (db) => {
+    const result = await db.query(
+      `SELECT key, value FROM preferences WHERE key IN (${keys.map(() => '?').join(', ')})`,
+      [...keys],
+    );
+    return new Map((result.values ?? []).map((row) => [String(row.key), String(row.value)]));
+  });
 }
 
 export async function setPreference(key: string, value: string): Promise<void> {
@@ -1259,14 +1428,32 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     });
     return;
   }
-  const db = await openDatabase();
-  const now = new Date().toISOString();
-  await executeNativeRun(
-    db,
-    `INSERT INTO preferences (key,value,updated_at)
-    VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
-    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
-    Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
-  );
-  mirrorBootThemePreferences(preferences);
+  await withNativeDatabase(async (db) => {
+    const now = new Date().toISOString();
+    await db.run(
+      `INSERT INTO preferences (key,value,updated_at)
+      VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
+      Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
+    );
+    let fallback: { theme?: string | undefined; mode?: string | undefined } | undefined;
+    if (
+      typeof window !== 'undefined' &&
+      window.localStorage &&
+      preferences.has('uiTheme') !== preferences.has('uiMode') &&
+      readBootThemeCache() === null
+    ) {
+      const saved = await db.query(
+        "SELECT key, value FROM preferences WHERE key IN ('uiTheme', 'uiMode')",
+      );
+      const byKey = new Map(
+        (saved.values ?? []).map((row) => [String(row.key), String(row.value)]),
+      );
+      fallback = {
+        theme: byKey.get('uiTheme'),
+        mode: byKey.get('uiMode'),
+      };
+    }
+    mirrorBootThemePreferences(preferences, fallback);
+  });
 }
