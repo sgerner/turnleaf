@@ -1,4 +1,5 @@
-import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
+import ePub, { type Book, type Contents, type Location, type Rendition } from 'epubjs';
+import type { RenditionOptions } from 'epubjs/types/rendition';
 import type { Appearance } from './appearance';
 import {
   clipReaderSearchExcerpt,
@@ -68,6 +69,10 @@ interface EpubTocItem {
   href: string;
   subitems?: EpubTocItem[];
 }
+
+type PaginatedRenditionOptions = RenditionOptions & {
+  gap?: number;
+};
 
 const MODE_COLORS = {
   light: {
@@ -441,9 +446,14 @@ export class ReaderSession {
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.viewportTarget = target;
-    this.rendition = this.book.renderTo(target, {
+    this.rendition = (
+      this.book as Book & {
+        renderTo: (element: Element | string, options?: PaginatedRenditionOptions) => Rendition;
+      }
+    ).renderTo(target, {
       width: '100%',
       height: '100%',
+      gap: 0,
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
@@ -597,7 +607,8 @@ export class ReaderSession {
         return;
       }
       const frame = contents.window.frameElement;
-      const viewport = target.getBoundingClientRect();
+      const tapSurface = target.closest('.reader-shell') ?? target;
+      const viewport = tapSurface.getBoundingClientRect();
       if (!frame || viewport.width === 0) return;
       // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
       const position =
@@ -645,7 +656,7 @@ export class ReaderSession {
       ? start.href
       : (matchSpineHref(start.href, hrefs) ?? start.href);
     const sectionIndex = indexes.get(matchedHref) ?? 0;
-    const pageIndex = this.pageIndex(start.displayed.page);
+    const pageIndex = this.pageIndex(start.displayed.page, start.displayed.total);
     const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
     const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
     const reported: ReaderLocation = {
@@ -859,7 +870,6 @@ export class ReaderSession {
       (previous.fontFamily !== value.fontFamily ||
         previous.fontSize !== value.fontSize ||
         previous.lineHeight !== value.lineHeight ||
-        previous.margin !== value.margin ||
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
@@ -894,7 +904,7 @@ export class ReaderSession {
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
         'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
+        padding: `0.5rem 0 ${value.bottomMargin}px 0 !important`,
         'box-sizing': 'border-box',
       },
       p: value.publisherStyles
@@ -1524,7 +1534,15 @@ export class ReaderSession {
     return resolveDisplayHref(trimmed, this.navigationBasePath(), hrefs, currentHref);
   }
 
-  private pageIndex(page: number): number {
+  private pageIndex(page: number, total: number): number {
+    const container = this.epubContainer;
+    if (total > 1 && container && container.clientWidth > 0 && container.scrollLeft > 0) {
+      const scrolledPage = Math.min(
+        total - 1,
+        Math.round(container.scrollLeft / container.clientWidth),
+      );
+      return Math.max(0, page - 1, scrolledPage);
+    }
     return Math.max(0, page - 1);
   }
 

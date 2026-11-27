@@ -618,15 +618,17 @@ describe('ReaderSession', () => {
     }
     vi.stubGlobal('ResizeObserver', TestResizeObserver);
 
+    const viewport = document.createElement('div');
     const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      null,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+    expect(mockBook.renderTo).toHaveBeenCalledWith(
+      viewport,
+      expect.objectContaining({
+        gap: 0,
+        flow: 'paginated',
+        spread: 'none',
+        allowScriptedContent: false,
+      }),
     );
     resizeCallbacks[0]?.(
       [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
@@ -634,6 +636,155 @@ describe('ReaderSession', () => {
     );
 
     expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+    session.destroy();
+  });
+
+  it('aborts a display that is in flight during a resize and checks the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const initialCfi = 'epubcfi(/6/2!/4/2/1:0)';
+    const abortedCfi = 'epubcfi(/6/4!/4/2/1:0)';
+    const resizedFinalCfi = 'epubcfi(/6/2!/4/2/1:6)';
+    const supersededFinalCfi = 'epubcfi(/6/4!/4/8/1:0)';
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      initialCfi,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+
+    const relocated = getRenditionListener('relocated');
+    relocated(location(initialCfi));
+    onLocation.mockClear();
+
+    // 1. Start an in-flight display that is aborted when ResizeObserver triggers rendition.resize().
+    let rejectInFlightDisplay = null as ((reason?: unknown) => void) | null;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectInFlightDisplay = reject;
+        }),
+    );
+    const inFlightDisplay = session.displayCfi(abortedCfi);
+
+    mockRendition.resize.mockImplementationOnce(() => {
+      rejectInFlightDisplay?.(new Error('Display aborted during resize'));
+    });
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 640);
+    await expect(inFlightDisplay).resolves.toBe(false);
+
+    // Resize reflow settles on resizedFinalCfi and reports it as a restore without reporting abortedCfi.
+    relocated({
+      start: {
+        cfi: resizedFinalCfi,
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0.1,
+        displayed: { page: 1, total: 6 },
+      },
+    } as Location);
+
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ cfi: resizedFinalCfi }),
+      'restore',
+    );
+
+    // 2. Start a multi-step server XPath display in flight during another resize, then abort it with a newer CFI navigation.
+    onLocation.mockClear();
+    mockRendition.display.mockClear();
+    let resolveChapterLoad = null as (() => void) | null;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveChapterLoad = resolve;
+        }),
+    );
+    const inFlightServerRestore = session.displayServerLocation('//body/DocFragment[1]/body/p[2]');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 360, height: 740 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    const finalNavigation = session.displayCfi(supersededFinalCfi);
+    resolveChapterLoad?.();
+
+    await expect(inFlightServerRestore).resolves.toBe(false);
+    await expect(finalNavigation).resolves.toBe(true);
+    expect(mockRendition.display.mock.calls).toEqual([['first.xhtml'], [supersededFinalCfi]]);
+
+    relocated({
+      start: {
+        cfi: supersededFinalCfi,
+        href: 'second.xhtml',
+        index: 1,
+        percentage: 0.75,
+        displayed: { page: 3, total: 4 },
+      },
+    } as Location);
+
+    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ cfi: supersededFinalCfi }),
+    );
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+
+    session.destroy();
+  });
+
+  it('computes fractional-DPR scrolled page progress from .epub-container without mutating epub.js manager', async () => {
+    const viewport = document.createElement('div');
+    const container = document.createElement('div');
+    container.className = 'epub-container';
+    viewport.append(container);
+    Object.defineProperty(container, 'clientWidth', { value: 364, configurable: true });
+    Object.defineProperty(container, 'scrollLeft', {
+      value: 363.80950927734375,
+      writable: true,
+      configurable: true,
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+
+    const relocated = getRenditionListener('relocated');
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/6:0)',
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 2 },
+      },
+    } as Location);
+
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        cfi: 'epubcfi(/6/2!/4/2/6:0)',
+        pageIndex: 1,
+        pageCount: 2,
+        percentage: 0.25,
+      }),
+      'restore',
+    );
     session.destroy();
   });
 
@@ -886,6 +1037,33 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('measures tap zones against the outer .reader-shell when .reader-viewport is inset', async () => {
+    const shell = document.createElement('main');
+    shell.className = 'reader-shell';
+    const viewport = document.createElement('div');
+    viewport.className = 'reader-viewport';
+    shell.append(viewport);
+    vi.spyOn(shell, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 390, 844));
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(56, 8, 278, 772));
+
+    const frame = document.createElement('iframe');
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(56, 8, 1112, 772));
+    const contents = {
+      window: { frameElement: frame, innerWidth: 1112, getSelection: () => null },
+    } as unknown as Contents;
+    const onTap = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), onTap);
+    const click = getRenditionListener('click');
+
+    for (const clientX of [60, 80, 215]) {
+      click(new MouseEvent('click', { clientX }), contents);
+    }
+
+    expect(onTap.mock.calls).toEqual([['previous'], ['center'], ['next']]);
+    session.destroy();
+  });
+
   it('registers themes on initial mount and mode updates without reflowing the CFI', async () => {
     const unopened = new ReaderSession('book.epub');
     unopened.applyAppearance(defaultAppearance);
@@ -911,6 +1089,9 @@ describe('ReaderSession', () => {
       'turnleaf',
       expect.objectContaining({
         a: { color: '--color-primary-700 !important' },
+        body: expect.objectContaining({
+          padding: '0.5rem 0 0px 0 !important',
+        }),
       }),
     );
     expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
@@ -964,7 +1145,6 @@ describe('ReaderSession', () => {
       { fontFamily: 'sans' },
       { fontSize: 22 },
       { lineHeight: 1.8 },
-      { margin: 32 },
       { bottomMargin: 16 },
       { paragraphSpacing: 1.0 },
       { alignment: 'justify' },
@@ -984,7 +1164,7 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
-  it('skips theme registration and CFI reflow for non-theme appearance toggles', async () => {
+  it('skips theme registration and CFI reflow for non-theme and outer-viewport appearance toggles', async () => {
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
@@ -1009,6 +1189,7 @@ describe('ReaderSession', () => {
     let current = { ...defaultAppearance };
     for (const patch of [
       {},
+      { margin: 32 },
       { progressBar: false },
       { keepAwake: true },
       { volumeButtons: true },

@@ -8,10 +8,52 @@ describe('appearance serialization', () => {
   });
 
   it('bounds unsafe numeric values', () => {
-    expect(parseAppearance('{"fontSize":200,"lineHeight":0,"bottomMargin":200}')).toMatchObject({
+    expect(
+      parseAppearance(
+        '{"fontSize":200,"lineHeight":0,"paragraphSpacing":9,"margin":120,"bottomMargin":200}',
+      ),
+    ).toMatchObject({
       fontSize: 34,
       lineHeight: 1.2,
+      paragraphSpacing: 1.5,
+      margin: 56,
       bottomMargin: 64,
+    });
+    expect(
+      parseAppearance(
+        '{"fontSize":4,"lineHeight":5,"paragraphSpacing":-1,"margin":0,"bottomMargin":-8}',
+      ),
+    ).toMatchObject({
+      fontSize: 14,
+      lineHeight: 2,
+      paragraphSpacing: 0,
+      margin: 8,
+      bottomMargin: 0,
+    });
+  });
+
+  it('falls back to defaults for non-numeric and non-finite inputs', () => {
+    expect(
+      parseAppearance(
+        '{"fontSize":"wide","lineHeight":"","paragraphSpacing":null,"margin":[],"bottomMargin":{}}',
+      ),
+    ).toMatchObject({
+      fontSize: defaultAppearance.fontSize,
+      lineHeight: defaultAppearance.lineHeight,
+      paragraphSpacing: defaultAppearance.paragraphSpacing,
+      margin: defaultAppearance.margin,
+      bottomMargin: defaultAppearance.bottomMargin,
+    });
+    expect(
+      parseAppearance(
+        '{"fontSize":1e400,"lineHeight":-1e400,"paragraphSpacing":true,"margin":"nan","bottomMargin":false}',
+      ),
+    ).toMatchObject({
+      fontSize: defaultAppearance.fontSize,
+      lineHeight: defaultAppearance.lineHeight,
+      paragraphSpacing: defaultAppearance.paragraphSpacing,
+      margin: defaultAppearance.margin,
+      bottomMargin: defaultAppearance.bottomMargin,
     });
   });
 

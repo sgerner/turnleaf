@@ -32,6 +32,14 @@ export const defaultAppearance: Appearance = {
   volumeButtons: false,
 };
 
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  if (typeof value !== 'number' && typeof value !== 'string') return fallback;
+  if (typeof value === 'string' && value.trim() === '') return fallback;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
 export function serializeAppearance(value: Appearance): string {
   return JSON.stringify(value);
 }
@@ -43,15 +51,16 @@ export function parseAppearance(value: string): Appearance {
     ...defaultAppearance,
     ...parsed,
     mode,
-    fontSize: Math.min(34, Math.max(14, Number(parsed.fontSize ?? defaultAppearance.fontSize))),
-    lineHeight: Math.min(
-      2,
-      Math.max(1.2, Number(parsed.lineHeight ?? defaultAppearance.lineHeight)),
+    fontSize: clampNumber(parsed.fontSize, 14, 34, defaultAppearance.fontSize),
+    lineHeight: clampNumber(parsed.lineHeight, 1.2, 2, defaultAppearance.lineHeight),
+    paragraphSpacing: clampNumber(
+      parsed.paragraphSpacing,
+      0,
+      1.5,
+      defaultAppearance.paragraphSpacing,
     ),
-    bottomMargin: Math.min(
-      64,
-      Math.max(0, Number(parsed.bottomMargin ?? defaultAppearance.bottomMargin)),
-    ),
+    margin: clampNumber(parsed.margin, 8, 56, defaultAppearance.margin),
+    bottomMargin: clampNumber(parsed.bottomMargin, 0, 64, defaultAppearance.bottomMargin),
     publisherStyles: parsed.publisherStyles !== false,
     progressBar: parsed.progressBar !== false,
     volumeButtons: parsed.volumeButtons === true,

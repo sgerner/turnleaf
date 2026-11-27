@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { startFixture } from './android-reading-journey.mjs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { startFixture, turnUntilChapter } from './android-reading-journey.mjs';
 
 const fixtures = [];
 
@@ -74,5 +74,25 @@ describe('Android reading journey fixture', () => {
     });
     expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
     expect(fixture.foreignAuthHeaders).toBe(1);
+  });
+
+  it('turns across multiple pages in chapter 1 until chapter 2 is visible', async () => {
+    let page = 0;
+    const evaluate = vi.fn(async (expression) => {
+      if (expression.includes("textContent === 'Chapter 2'")) {
+        return page >= 2;
+      }
+      if (expression.includes('.reader-progress')) {
+        return page * 25;
+      }
+      if (expression.includes('Next page')) {
+        page += 1;
+        return true;
+      }
+      return false;
+    });
+
+    await turnUntilChapter({ evaluate }, 2);
+    expect(page).toBe(2);
   });
 });

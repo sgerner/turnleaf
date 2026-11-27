@@ -253,6 +253,27 @@ const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).som
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
 
+export async function turnUntilChapter(web, number) {
+  const targetChapter = chapter(number);
+  for (let turn = 0; turn < 20; turn += 1) {
+    if (await web.evaluate(targetChapter)) return;
+    const previousProgress = await web.evaluate(
+      "Number(document.querySelector('.reader-progress')?.getAttribute('aria-valuenow'))",
+    );
+    if (!(await web.evaluate(click('[aria-label="Next page"]')))) {
+      throw new Error('The next-page control is unavailable.');
+    }
+    await waitFor(`chapter ${number} page turn`, async () => {
+      if (await web.evaluate(targetChapter)) return true;
+      const nextProgress = await web.evaluate(
+        "Number(document.querySelector('.reader-progress')?.getAttribute('aria-valuenow'))",
+      );
+      return Number.isFinite(previousProgress) && nextProgress > previousProgress;
+    });
+  }
+  throw new Error(`Could not reach chapter ${number} after 20 page turns.`);
+}
+
 const renderedCover = `(() => {
   const image = document.querySelector('[data-book-open]')?.parentElement?.querySelector('img');
   return Boolean(image && image.complete && image.naturalWidth > 0);
@@ -362,8 +383,8 @@ async function run() {
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
-    await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
-    await waitFor('second chapter', () => web.evaluate(chapter(2)));
+    // The outer reader margins change how many pages a chapter needs on each device.
+    await turnUntilChapter(web, 2);
     await waitFor('reader position in the second chapter', () =>
       web.evaluate(
         'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
