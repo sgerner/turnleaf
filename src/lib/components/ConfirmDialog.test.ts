@@ -165,6 +165,42 @@ describe('ConfirmDialog', () => {
     await tick();
   });
 
+  it('keeps the dialog usable and restores focus if confirming fails', async () => {
+    const onConfirm = vi.fn(async () => {
+      throw new Error('storage failed');
+    });
+    const onCancel = vi.fn();
+    mounted = mount(ConfirmDialog, {
+      target: host,
+      props: {
+        title: 'Mark as read?',
+        description: 'This updates the saved reading position.',
+        confirmLabel: 'Mark as read',
+        onConfirm,
+        onCancel,
+      },
+    });
+    await tick();
+
+    const dialog = host.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    const [cancelButton, confirmButton] = Array.from(dialog.querySelectorAll('button'));
+    confirmButton!.click();
+    await vi.waitFor(() => expect(dialog.querySelector('[role="alert"]')).not.toBeNull());
+
+    expect(onConfirm).toHaveBeenCalledOnce();
+    expect(confirmButton!.disabled).toBe(false);
+    expect(dialog.querySelector('[role="alert"]')?.textContent).toContain(
+      'The action could not be completed. Try again.',
+    );
+
+    cancelButton!.click();
+    expect(onCancel).toHaveBeenCalledOnce();
+    await unmount(mounted);
+    mounted = null;
+    await tick();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it('supports z-40 backdrop layering and restores focus to fallbackFocus when opener disconnects', async () => {
     const fallback = document.createElement('button');
     fallback.type = 'button';

@@ -47,6 +47,7 @@
 
   let dialogElement = $state<HTMLElement | null>(null);
   let submitting = $state(false);
+  let confirmationFailed = $state(false);
   let confirmed = false;
   const capturedOpener = untrack(() => (opener !== undefined ? opener : activeElement()));
 
@@ -72,8 +73,12 @@
     if (isBusy) return;
     confirmed = true;
     submitting = true;
+    confirmationFailed = false;
     try {
       await onConfirm();
+    } catch {
+      confirmed = false;
+      confirmationFailed = true;
     } finally {
       submitting = false;
     }
@@ -106,6 +111,9 @@
     </h2>
     <div id={descriptionId} class="mt-3 grid gap-2 text-sm text-surface-700-300">
       <p>{description}</p>
+      {#if confirmationFailed}
+        <p class="text-error-700-300" role="alert">The action could not be completed. Try again.</p>
+      {/if}
       {#if children}
         {@render children()}
       {/if}
