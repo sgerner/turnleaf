@@ -4,6 +4,9 @@
 
 - Add reader external link, footnote, and figure inspectors, accessible highlight overlays, pinch-zoom, and iOS Dynamic Type scaling
 - Stabilize Android reader viewport resizes, next-page relocations, and offline network transitions
+- chore: retrigger required PR checks
+- chore(ci): align CodeQL action pins
+- test: avoid Svelte runtime internals in panel tests
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache
