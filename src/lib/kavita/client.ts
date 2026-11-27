@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -19,10 +20,11 @@ import {
   assertSafeTransferTarget,
   createRedirectState,
   KavitaError,
+  KavitaOfflineError,
   nativeHeader,
 } from './redirects';
 
-export { KavitaError };
+export { KavitaError, KavitaOfflineError };
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
@@ -55,11 +57,15 @@ function normalizePayload<T>(endpoint: string, read: () => T, context = ''): T {
 export interface KavitaClientOptions {
   credentialEpoch?: number | undefined;
   probe?: boolean | undefined;
+  beforeDispatch?: (() => void | Promise<void>) | undefined;
+  onOffline?: (() => void) | undefined;
 }
 
 export class KavitaClient {
   private readonly credentialEpoch: number | undefined;
   private readonly probe: boolean;
+  private readonly beforeDispatch: (() => void | Promise<void>) | undefined;
+  private readonly onOffline: (() => void) | undefined;
   private localRejectedStatus: number | undefined;
 
   constructor(
@@ -68,6 +74,8 @@ export class KavitaClient {
     options: KavitaClientOptions = {},
   ) {
     this.probe = options.probe === true;
+    this.beforeDispatch = options.beforeDispatch;
+    this.onOffline = options.onOffline;
     this.credentialEpoch = this.probe
       ? undefined
       : resolveCredentialEpoch(apiKey, options.credentialEpoch);
@@ -91,6 +99,44 @@ export class KavitaClient {
     ) {
       const status = this.localRejectedStatus ?? getCredentialState().statusCode;
       throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+    }
+  }
+
+  private assertTransportReady(
+    signal?: AbortSignal | null,
+    probe = this.probe,
+  ): void | Promise<void> {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    this.assertCredentialReady(probe);
+    const preflight = this.beforeDispatch?.();
+    if (!preflight && !Capacitor.isNativePlatform()) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      this.assertCredentialReady(probe);
+      return;
+    }
+    return this.awaitTransportReady(preflight, signal, probe);
+  }
+
+  private async awaitTransportReady(
+    preflight: void | Promise<void>,
+    signal?: AbortSignal | null,
+    probe = this.probe,
+  ): Promise<void> {
+    if (preflight) await preflight;
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    this.assertCredentialReady(probe);
+    if (Capacitor.isNativePlatform()) {
+      const status = await Network.getStatus().catch(() => null);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      this.assertCredentialReady(probe);
+      if (status?.connected !== true) {
+        this.onOffline?.();
+        throw new KavitaOfflineError();
+      }
+      const postCheck = this.beforeDispatch?.();
+      if (postCheck) await postCheck;
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      this.assertCredentialReady(probe);
     }
   }
 
@@ -207,6 +253,7 @@ export class KavitaClient {
       }
       return progress;
     } catch (error) {
+      if (error instanceof KavitaOfflineError) throw error;
       const retryable =
         error instanceof KavitaError &&
         (error.kind === 'network' ||
@@ -292,7 +339,8 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
-        this.assertCredentialReady(probe);
+        const gate = this.assertTransportReady(init.signal, probe);
+        if (gate) await gate;
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (!probe && (response.status === 401 || response.status === 403)) {
           this.localRejectedStatus = response.status;
@@ -332,7 +380,8 @@ export class KavitaClient {
   ): Promise<Response> {
     const redirects = createRedirectState(url, new URL(this.baseUrl).origin, init.method ?? 'GET');
     while (true) {
-      this.assertCredentialReady(probe);
+      const gate = this.assertTransportReady(init.signal, probe);
+      if (gate) await gate;
       const response = await fetch(redirects.currentUrl, { ...init, redirect: 'manual' });
       if (!probe && init.signal?.aborted && (response.status === 401 || response.status === 403)) {
         this.localRejectedStatus = response.status;

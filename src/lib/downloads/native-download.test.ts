@@ -7,6 +7,7 @@ const native = vi.hoisted(() => ({
   body: new Uint8Array(),
   deleted: [] as string[],
   renamed: false,
+  connected: true,
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -35,8 +36,18 @@ vi.mock('@capacitor/filesystem', () => ({
   },
 }));
 
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    })),
+  },
+}));
+
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
+import { Network } from '@capacitor/network';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import {
   getCredentialState,
@@ -57,6 +68,13 @@ beforeEach(() => {
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
+  native.connected = true;
+  vi.mocked(Network.getStatus)
+    .mockReset()
+    .mockImplementation(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    }));
   vi.mocked(FileTransfer.downloadFile)
     .mockReset()
     .mockResolvedValue({} as never);
@@ -735,5 +753,148 @@ describe('native EPUB credential gating', () => {
     ).rejects.toMatchObject({ name: 'AbortError' });
     expect(Filesystem.rename).not.toHaveBeenCalled();
     expect(native.deleted).toContain('books/server-book.epub.partial');
+  });
+
+  it('gates initial, retry, and redirect native transfers against live Network.getStatus() while serving cached covers offline', async () => {
+    const state = syncLoadedCredential('transfer-key', 'server_primary_api_key');
+    const onOffline = vi.fn();
+
+    // 1) Initial downloadEpub and uncached cacheCover blocked when Network.getStatus() reports disconnected
+    native.connected = false;
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'transfer-key',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        state.epoch,
+        undefined,
+        { onOffline },
+      ),
+    ).rejects.toMatchObject({ status: undefined, connectionFailed: true });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+    expect(onOffline).toHaveBeenCalledTimes(1);
+
+    // Cached cover still resolves locally while offline without touching FileTransfer
+    vi.mocked(Filesystem.stat).mockResolvedValueOnce({
+      type: 'file',
+      size: 128,
+      name: 'covers/primary/12.img',
+      mtime: 0,
+      uri: 'file://covers/primary/12.img',
+    });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'transfer-key',
+        12,
+        undefined,
+        'primary',
+        true,
+        'https://books.example.com',
+        state.epoch,
+        { onOffline },
+      ),
+    ).resolves.toBe('web://file://covers/primary/12.img');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    // Uncached cover is blocked before FileTransfer.downloadFile when offline
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'transfer-key',
+        13,
+        undefined,
+        'primary',
+        true,
+        'https://books.example.com',
+        state.epoch,
+        { onOffline },
+      ),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+    expect(onOffline).toHaveBeenCalledTimes(2);
+
+    // 2) downloadEpub retry blocked when transport drops after attempt 1
+    vi.useFakeTimers();
+    native.connected = true;
+    onOffline.mockClear();
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      native.connected = false;
+      throw { code: 'OS-PLUG-FLTR-0010', data: { httpStatus: 503 } };
+    });
+
+    const retryAttempt = expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'transfer-key',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        state.epoch,
+        undefined,
+        { onOffline },
+      ),
+    ).rejects.toMatchObject({ status: 503, connectionFailed: true });
+    await Promise.all([retryAttempt, vi.runAllTimersAsync()]);
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(onOffline).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+
+    // 3) Redirect hop blocked in downloadEpub and cacheCover when transport drops after hop 1
+    native.connected = true;
+    onOffline.mockClear();
+    vi.mocked(FileTransfer.downloadFile).mockReset();
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      native.connected = false;
+      throw {
+        code: 'OS-PLUG-FLTR-0010',
+        data: { httpStatus: 302, headers: { Location: '/redirected.epub' } },
+      };
+    });
+
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'transfer-key',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        state.epoch,
+        undefined,
+        { onOffline },
+      ),
+    ).rejects.toMatchObject({ status: undefined, connectionFailed: true });
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(onOffline).toHaveBeenCalledTimes(1);
+
+    native.connected = true;
+    onOffline.mockClear();
+    vi.mocked(FileTransfer.downloadFile).mockReset();
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      native.connected = false;
+      throw {
+        code: 'OS-PLUG-FLTR-0010',
+        data: { httpStatus: 302, headers: { Location: '/redirected-cover.img' } },
+      };
+    });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'transfer-key',
+        14,
+        undefined,
+        'primary',
+        true,
+        'https://books.example.com',
+        state.epoch,
+        { onOffline },
+      ),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(onOffline).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,6 +1,7 @@
 import { Capacitor } from '@capacitor/core';
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
+import { Network } from '@capacitor/network';
 import { recordDiagnostic } from '../diagnostics/log';
 import {
   advanceRedirect,
@@ -150,6 +151,11 @@ function readTransferFailure(error: unknown): {
   return { code, status, headers };
 }
 
+export interface NativeTransferGate {
+  beforeDispatch?: (() => void | Promise<void>) | undefined;
+  onOffline?: (() => void) | undefined;
+}
+
 async function downloadFileWithRedirects(options: {
   initialUrl: string;
   normalizedInitialUrl: string;
@@ -161,7 +167,9 @@ async function downloadFileWithRedirects(options: {
   readTimeout?: number;
   signal?: AbortSignal | undefined;
   onHop?: ((url: string) => void) | undefined;
-  beforeHop?: (() => void) | undefined;
+  beforeHop?: (() => void | Promise<void>) | undefined;
+  onOffline?: (() => void) | undefined;
+  createOfflineError: () => Error;
   onHttpError?: ((status: number) => void) | undefined;
 }): Promise<void> {
   const redirects = createRedirectState(
@@ -172,7 +180,18 @@ async function downloadFileWithRedirects(options: {
   );
   while (true) {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    options.beforeHop?.();
+    await options.beforeHop?.();
+    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (Capacitor.isNativePlatform()) {
+      const status = await Network.getStatus().catch(() => null);
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (status?.connected !== true) {
+        options.onOffline?.();
+        throw options.createOfflineError();
+      }
+      await options.beforeHop?.();
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    }
     options.onHop?.(redirects.currentUrl);
     try {
       await FileTransfer.downloadFile({
@@ -207,6 +226,7 @@ export async function downloadEpub(
   serverOrigin?: string,
   credentialEpoch?: number,
   signal?: AbortSignal,
+  transportGate?: NativeTransferGate,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -258,11 +278,22 @@ export async function downloadEpub(
           apiKey,
           progress: Boolean(listener),
           signal,
-          beforeHop: () => {
+          beforeHop: async () => {
+            if (!canSendCredential(apiKey, epoch)) {
+              throw new EpubTransferError(401, false);
+            }
+            try {
+              await transportGate?.beforeDispatch?.();
+            } catch (error) {
+              if (error instanceof DOMException && error.name === 'AbortError') throw error;
+              throw new EpubTransferError(undefined, true);
+            }
             if (!canSendCredential(apiKey, epoch)) {
               throw new EpubTransferError(401, false);
             }
           },
+          onOffline: transportGate?.onOffline,
+          createOfflineError: () => new EpubTransferError(undefined, true),
           onHop: (url) => {
             activeHopUrl = url;
           },
@@ -290,6 +321,13 @@ export async function downloadEpub(
           status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
         if (attempt > 0 || !retryable || signal?.aborted || !canSendCredential(apiKey, epoch)) {
           throw new EpubTransferError(status, connectionFailed);
+        }
+        if (Capacitor.isNativePlatform()) {
+          const networkStatus = await Network.getStatus().catch(() => null);
+          if (networkStatus?.connected !== true) {
+            transportGate?.onOffline?.();
+            throw new EpubTransferError(status, true);
+          }
         }
 
         await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
@@ -393,6 +431,7 @@ export async function cacheCover(
   allowDownload = true,
   serverOrigin?: string,
   credentialEpoch?: number,
+  transportGate?: NativeTransferGate,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const target = assertSafeTransferTarget(
@@ -425,9 +464,18 @@ export async function cacheCover(
         connectTimeout: 5_000,
         readTimeout: 5_000,
         signal,
-        beforeHop: () => {
+        beforeHop: async () => {
+          if (!canSendCredential(apiKey, epoch)) throw new Error('Offline');
+          try {
+            await transportGate?.beforeDispatch?.();
+          } catch (error) {
+            if (error instanceof DOMException && error.name === 'AbortError') throw error;
+            throw new Error('Offline', { cause: error });
+          }
           if (!canSendCredential(apiKey, epoch)) throw new Error('Offline');
         },
+        onOffline: transportGate?.onOffline,
+        createOfflineError: () => new Error('Offline'),
         onHttpError: (httpStatus) => {
           if (!recordedAuthRejection && (httpStatus === 401 || httpStatus === 403)) {
             recordedAuthRejection = true;

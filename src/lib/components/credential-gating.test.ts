@@ -515,15 +515,18 @@ function seedDatabase({
   window.localStorage.setItem(DB_STORAGE_KEY, JSON.stringify(db));
 }
 
-async function waitForCondition(check: () => boolean, timeoutMs = 3_000): Promise<void> {
+async function waitForCondition(
+  check: () => boolean | Promise<boolean>,
+  timeoutMs = 3_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     flushSync();
-    if (check()) return;
+    if (await check()) return;
     await new Promise((resolve) => setTimeout(resolve, 15));
   }
   flushSync();
-  expect(check()).toBe(true);
+  expect(await check()).toBe(true);
 }
 
 describe('credential state and 401 gating across App, Library, Onboarding, and Reader', () => {
@@ -1270,7 +1273,7 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     }
     runtime.online = false;
 
-    await new Promise((resolve) => setTimeout(resolve, 180));
+    await new Promise((resolve) => setTimeout(resolve, 560));
     expect(offlineRequests).toEqual([]);
 
     await unmount(mounted);
@@ -1431,5 +1434,160 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     expect(
       target.querySelector<HTMLButtonElement>('[aria-label="Refresh library"]')?.disabled,
     ).toBe(false);
+  });
+
+  it('cancels active catalog and queued progress work with zero offline requests when native transport drops after initial networkAvailable() checks', async () => {
+    runtime.native = true;
+    runtime.online = false;
+    secureStorageMock.values.set('server_primary_api_key', 'valid-native-key');
+    seedDatabase({
+      books: [downloadedBook, onlineOnlyBook],
+      pendingSync: true,
+      secondPendingSync: true,
+    });
+
+    let fixtureOffline = true;
+    const offlineRequests: string[] = [];
+    const onlineRequests: string[] = [];
+
+    // Phase 1 (Race A): runReconnect(), runProgressSync.networkAvailable(), and
+    // refreshCatalog.networkAvailable() (polls 1..3) all observe connected: true during
+    // a transient cellular handoff, then cellular tears down before either /api/Series/v2
+    // or /api/Reader/progress dispatches.
+    let handoffPolls = 0;
+    let phase: 'steady' | 'drop-after-preflight' | 'drop-between-uploads' = 'steady';
+    vi.mocked(Network.getStatus).mockImplementation(async () => {
+      if (phase === 'drop-after-preflight') {
+        handoffPolls += 1;
+        if (handoffPolls <= 3) {
+          return { connected: true, connectionType: 'cellular' };
+        }
+        runtime.online = false;
+        fixtureOffline = true;
+        return { connected: false, connectionType: 'none' };
+      }
+      return {
+        connected: runtime.online,
+        connectionType: runtime.online ? 'wifi' : 'none',
+      };
+    });
+
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      if (fixtureOffline) {
+        offlineRequests.push(`${options.method ?? 'GET'} ${options.url}`);
+      } else {
+        onlineRequests.push(`${options.method ?? 'GET'} ${options.url}`);
+      }
+      if (options.url.includes('/api/Reader/progress')) {
+        if (phase === 'drop-between-uploads') {
+          // Transport drops right after the first progress upload completes,
+          // before the second queued progress item or series-detail dispatches.
+          runtime.online = false;
+          fixtureOffline = true;
+        }
+        return { status: 204, headers: {}, url: options.url, data: '' };
+      }
+      if (options.url.includes('/api/Series/v2')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify([
+            {
+              id: 101,
+              libraryId: 1,
+              name: 'Offline Novel',
+              localizedName: null,
+              sortName: 'Offline Novel',
+              pages: 200,
+              pagesRead: 20,
+              format: 3,
+              created: '2026-01-01T00:00:00Z',
+              lastChapterAdded: '2026-01-01T00:00:00Z',
+            },
+          ]),
+        };
+      }
+      if (options.url.includes('/api/Series/series-detail')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({
+            volumes: [],
+            chapters: [
+              {
+                id: 301,
+                volumeId: 201,
+                range: 'Offline Novel',
+                title: 'Offline Novel',
+                titleName: 'Offline Novel',
+                pages: 200,
+                pagesRead: 20,
+                files: [{ id: 1, format: 3, bytes: 4096 }],
+                writers: [{ id: 1, name: 'Ada Author' }],
+              },
+            ],
+            specials: [],
+            storylineChapters: [],
+          }),
+        };
+      }
+      throw new Error(`Unexpected native request ${options.url}`);
+    });
+
+    mounted = mount(App, { target });
+    await waitForCondition(() => target.querySelector('[data-book-open]') !== null);
+    expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+    // Trigger Race A: cellular handoff drops right after networkAvailable() preflights
+    runtime.online = true;
+    fixtureOffline = false;
+    phase = 'drop-after-preflight';
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: true });
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 650));
+
+    // Zero requests at all because live pre-dispatch Network.getStatus() caught the drop!
+    expect(offlineRequests).toEqual([]);
+    expect(onlineRequests).toEqual([]);
+    expect(await Database.getPendingSync('primary')).toHaveLength(2);
+
+    // Trigger Race B: reconnect succeeds long enough for book-1 upload + /api/Series/v2,
+    // then drops right after book-1 finishes before book-2 or /api/Series/series-detail dispatches!
+    phase = 'drop-between-uploads';
+    runtime.online = true;
+    fixtureOffline = false;
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: true });
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 650));
+
+    expect(offlineRequests).toEqual([]);
+    expect(onlineRequests.filter((entry) => entry.includes('/api/Reader/progress'))).toHaveLength(
+      1,
+    );
+    const pendingAfterDrop = await Database.getPendingSync('primary');
+    expect(pendingAfterDrop).toHaveLength(1);
+    expect(pendingAfterDrop[0]?.bookId).toBe(onlineOnlyBook.id);
+
+    // Phase 3: Stable Wi-Fi reconnect flushes the remaining queued progress item and completes catalog refresh
+    phase = 'steady';
+    runtime.online = true;
+    fixtureOffline = false;
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: true });
+    }
+
+    await waitForCondition(
+      async () =>
+        (await Database.getPendingSync('primary')).length === 0 &&
+        onlineRequests.some((entry) => entry.includes('/api/Series/series-detail')),
+      2500,
+    );
+    expect(offlineRequests).toEqual([]);
   });
 });

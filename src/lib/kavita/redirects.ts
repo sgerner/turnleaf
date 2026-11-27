@@ -13,6 +13,12 @@ export class KavitaError extends Error {
   }
 }
 
+export class KavitaOfflineError extends KavitaError {
+  constructor(message = 'No network connection.') {
+    super(message, 'network');
+  }
+}
+
 export function hasSensitiveAuthQuery(url: URL): boolean {
   return [...url.searchParams.keys()].some((key) => SENSITIVE_AUTH_QUERY.test(key));
 }

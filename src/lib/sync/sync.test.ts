@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
-import { KavitaError } from '../kavita/client';
+import { KavitaError, KavitaOfflineError } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -322,4 +322,81 @@ it('stops cleanly without attempting queued books or recording sync failures whe
   expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
   expect(saved.readingState['book-1']?.pendingSync).toBe(true);
   expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+});
+
+it('stops between queued uploads without dispatching or penalizing remaining items when transport drops', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+
+  const buildThreeBookQueue = (): ExpandableFixture => {
+    const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+    for (const [id, chapterId, sec] of [
+      ['book-2', 2, '01'],
+      ['book-3', 3, '02'],
+    ] as const) {
+      state.books.push({ ...book, id, chapterId });
+      state.readingState[id] = {
+        ...state.readingState['book-1']!,
+        localUpdatedAt: `2026-09-07T00:00:${sec}.000Z`,
+      };
+      state.syncQueue[id] = {
+        ...state.syncQueue['book-1']!,
+        bookId: id,
+        serverId: 'server',
+        payloadJson: JSON.stringify({ pageNum: chapterId }),
+        createdAt: `2026-09-07T00:00:${sec}.000Z`,
+        updatedAt: `2026-09-07T00:00:${sec}.000Z`,
+        revision: 1,
+      };
+    }
+    return state;
+  };
+
+  // Case A: queueSignal aborts when connectivity drops right after book-1 finishes uploading
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
+  const queueController = new AbortController();
+  let transportOnline = true;
+  const saveProgressOnQueueAbort = vi.fn(async () => {
+    transportOnline = false;
+    queueController.abort();
+  });
+
+  await expect(
+    flushProgress({ saveProgress: saveProgressOnQueueAbort } as never, 'server', {
+      queueSignal: queueController.signal,
+      canContinue: () => transportOnline,
+    }),
+  ).resolves.toBeUndefined();
+  expect(saveProgressOnQueueAbort).toHaveBeenCalledTimes(1);
+
+  const afterQueueAbort = JSON.parse(
+    localStorage.getItem(STORAGE_KEY) ?? '{}',
+  ) as ExpandableFixture;
+  expect(afterQueueAbort.syncQueue['book-1']).toBeUndefined();
+  expect(afterQueueAbort.readingState['book-1']?.pendingSync).toBe(false);
+  expect(afterQueueAbort.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
+  expect(afterQueueAbort.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
+
+  // Case B: live pre-dispatch gate in client.saveProgress throws KavitaOfflineError on book-2
+  // before any HTTP request is transmitted -> stops immediately without touching book-3 or marking failure
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
+  const saveProgressOfflineGate = vi
+    .fn()
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(new KavitaOfflineError());
+
+  await expect(
+    flushProgress({ saveProgress: saveProgressOfflineGate } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(saveProgressOfflineGate).toHaveBeenCalledTimes(2);
+
+  const afterOfflineGate = JSON.parse(
+    localStorage.getItem(STORAGE_KEY) ?? '{}',
+  ) as ExpandableFixture;
+  expect(afterOfflineGate.syncQueue['book-1']).toBeUndefined();
+  expect(afterOfflineGate.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
+  expect(afterOfflineGate.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
 });

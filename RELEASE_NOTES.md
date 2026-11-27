@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Harden fail-closed credential gate across startup, sync, covers, and downloads
+- Gate native Kavita requests on live connectivity and credential state
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache
