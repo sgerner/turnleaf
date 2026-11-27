@@ -232,7 +232,7 @@ export class KavitaClient {
       while (true) {
         const networkStatus = await Network.getStatus().catch(() => null);
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        if (networkStatus?.connected !== true) {
+        if (networkStatus?.connected !== true || navigator.onLine === false) {
           throw new KavitaError('Kavita could not be reached while offline.', 'network');
         }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });

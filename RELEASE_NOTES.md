@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline
 - Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2

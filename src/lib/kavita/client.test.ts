@@ -30,6 +30,7 @@ vi.mock('@capacitor/network', () => ({
 
 beforeEach(() => {
   clearDiagnostics();
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   capacitorRuntime.native = false;
   capacitorRuntime.connected = true;
   vi.mocked(CapacitorHttp.get).mockReset();
@@ -286,6 +287,22 @@ it('blocks native authenticated requests when the transport is offline', async (
     .mockResolvedValueOnce({ connected: true, connectionType: 'wifi' })
     .mockResolvedValueOnce({ connected: false, connectionType: 'none' });
   await Network.getStatus(); // Library's earlier availability check sees the transient reconnect.
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'network',
+  });
+
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('blocks native requests when WebView is offline despite a stale connected plugin status', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
+  await Network.getStatus(); // Library's earlier availability check sees the connected status.
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
 
   await expect(
     new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
