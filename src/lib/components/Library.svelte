@@ -1564,6 +1564,8 @@
 
     acceptingRemoteProgress = true;
     try {
+      // An upload cannot race with deletion of the exact revision it is sending.
+      await syncWork;
       const accepted = await acceptRemoteProgress(
         current.book,
         current.remote,

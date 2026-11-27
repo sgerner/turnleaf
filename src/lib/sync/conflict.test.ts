@@ -230,6 +230,14 @@ describe('reader open progress selection', () => {
         true,
       ),
     ).toBe('conflict');
+    expect(
+      chooseOpenProgress(
+        pendingSameChapter,
+        { pageNum: 25, bookScrollId: '//body/DocFragment[2]/body/section[2]' },
+        100,
+        false,
+      ),
+    ).toBe('conflict');
   });
 
   it('adopts same-chapter Kavita pageNum changes including backward moves when local state is not pending', () => {
@@ -263,6 +271,14 @@ describe('reader open progress selection', () => {
     ).toBe('remote');
     expect(
       chooseOpenProgress(syncedSameChapter, { pageNum: 15, bookScrollId: chapterXPath }, 100, true),
+    ).toBe('remote');
+    expect(
+      chooseOpenProgress(
+        syncedSameChapter,
+        { pageNum: 40, bookScrollId: '//body/DocFragment[2]/body/section[2]' },
+        100,
+        false,
+      ),
     ).toBe('remote');
   });
 

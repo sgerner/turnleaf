@@ -180,14 +180,13 @@ function readBrowserState(): BrowserDatabaseState {
     );
     const readingState = Object.fromEntries(
       Object.entries(parsed.readingState ?? {}).map(([bookId, entry]) => {
-        if (!entry.pendingSync && !syncQueue[bookId] && entry.serverPageNum === undefined) {
+        if (!entry.pendingSync && !syncQueue[bookId] && entry.serverPageNum == null) {
           return [
             bookId,
             {
               ...entry,
               serverPageNum: booksById.get(bookId)?.pagesRead ?? 0,
-              serverXPath:
-                entry.serverXPath !== undefined ? entry.serverXPath : (entry.xpath ?? null),
+              serverXPath: entry.serverXPath ?? entry.xpath ?? null,
             },
           ];
         }
@@ -1243,9 +1242,17 @@ export async function confirmSync(
       const queued = state.syncQueue[bookId];
       const current = state.readingState[bookId];
       if (queued?.revision !== expectedRevision || queued?.updatedAt !== expectedUpdatedAt) {
-        if (baseline && current?.pendingSync && queued && queued.revision > expectedRevision) {
+        if (
+          baseline &&
+          current?.pendingSync &&
+          queued &&
+          queued.revision > expectedRevision &&
+          (!current.syncedLocalUpdatedAt ||
+            Date.parse(current.syncedLocalUpdatedAt) <= Date.parse(expectedUpdatedAt))
+        ) {
           state.readingState[bookId] = {
             ...current,
+            syncedLocalUpdatedAt: expectedUpdatedAt,
             serverPageNum: baseline.pageNum,
             serverXPath: baseline.bookScrollId ?? null,
             serverUpdatedAt,
@@ -1255,7 +1262,7 @@ export async function confirmSync(
         return false;
       }
       delete state.syncQueue[bookId];
-      if (current) {
+      if (current && current.localUpdatedAt === expectedUpdatedAt) {
         const fallbackBook = state.books.find((item) => item.id === bookId);
         const resolved = baseline
           ? { serverPageNum: baseline.pageNum, serverXPath: baseline.bookScrollId ?? null }
@@ -1282,7 +1289,7 @@ export async function confirmSync(
   const tasks: capTask[] = [
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=?,
-        server_page_num=CASE WHEN ? THEN ? ELSE (SELECT pages_read FROM books WHERE id=reading_state.book_id) END,
+        server_page_num=CASE WHEN ? THEN ? ELSE COALESCE((SELECT pages_read FROM books WHERE id=reading_state.book_id), 0) END,
         server_xpath=CASE WHEN ? THEN ? ELSE reading_state.kavita_xpath END,
         server_updated_at=? WHERE book_id=? AND local_updated_at=?
         AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?)`,
@@ -1307,14 +1314,17 @@ export async function confirmSync(
   ];
   if (baseline) {
     tasks.push({
-      statement: `UPDATE reading_state SET server_page_num=?,server_xpath=?,server_updated_at=?
+      statement: `UPDATE reading_state SET synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?
         WHERE book_id=? AND pending_sync=1
+        AND (synced_local_updated_at IS NULL OR julianday(synced_local_updated_at)<=julianday(?))
         AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision>?)`,
       values: [
+        expectedUpdatedAt,
         baseline.pageNum,
         baseline.bookScrollId ?? null,
         serverUpdatedAt,
         bookId,
+        expectedUpdatedAt,
         bookId,
         expectedRevision,
       ],

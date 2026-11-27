@@ -844,6 +844,67 @@ describe('native progress transactions against SQLite', () => {
     ).toBe('local');
   });
 
+  it('prevents a stale confirmSync from overwriting a newer server baseline adopted via acceptRemoteProgress', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-02T00:00:01.000Z'));
+      const database = await importDatabase();
+      await database.saveServer(server);
+      await database.reconcileBooks(server.id, [book]);
+
+      await database.saveLocalProgress(
+        book,
+        'epubcfi(/6/4!/4/2/1:0)',
+        '//body/DocFragment[1]/body/p[1]',
+        0.1,
+      );
+      const firstPending = (await database.getPendingSync(server.id))[0]!;
+
+      vi.setSystemTime(new Date('2026-01-02T00:00:05.000Z'));
+      const accepted = await database.acceptRemoteProgress(
+        book,
+        {
+          libraryId: book.libraryId,
+          seriesId: book.seriesId,
+          volumeId: book.volumeId,
+          chapterId: book.chapterId,
+          pageNum: 70,
+          bookScrollId: '//body/DocFragment[7]/body/p[2]',
+          lastModifiedUtc: '2026-01-02T00:00:04.000Z',
+        },
+        firstPending.revision,
+        firstPending.updatedAt,
+      );
+      expect(accepted).toBe(true);
+
+      vi.setSystemTime(new Date('2026-01-02T00:00:06.000Z'));
+      await database.saveLocalProgress(
+        book,
+        'epubcfi(/6/14!/4/2/4:0)',
+        '//body/DocFragment[7]/body/p[8]',
+        0.74,
+      );
+
+      await database.confirmSync(
+        book.id,
+        '2026-01-02T00:00:02.000Z',
+        firstPending.revision,
+        firstPending.updatedAt,
+        { pageNum: 10, bookScrollId: '//body/DocFragment[1]/body/p[1]' },
+      );
+
+      expect(await database.getReadingState(book.id)).toMatchObject({
+        cfi: 'epubcfi(/6/14!/4/2/4:0)',
+        xpath: '//body/DocFragment[7]/body/p[8]',
+        serverPageNum: 70,
+        serverXPath: '//body/DocFragment[7]/body/p[2]',
+        pendingSync: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('removes synced reading_state rows on zero-pagesRead catalog refresh while preserving pending offline rows', async () => {
     const database = await importDatabase();
     const { flushProgress } = await import('../sync/sync');

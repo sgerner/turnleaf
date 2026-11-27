@@ -3,10 +3,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import {
+  confirmSync,
   getBooks,
   getPendingSync,
+  getReadingState,
   reconcileBooks,
   saveLocalProgress,
+  saveRemoteProgress,
   saveServer,
   type BookRecord,
   type ServerConfig,
@@ -80,6 +83,18 @@ vi.mock('../themes/themes', async (importOriginal) => ({
   ...(await importOriginal<typeof ThemesModule>()),
   skeletonThemes: ['fennec', 'vintage'],
   loadTheme: vi.fn(async () => true),
+}));
+
+vi.mock('../reader/session', () => ({
+  resolveReaderKeyboardAction: vi.fn(() => null),
+  ReaderSession: class MockReaderSession {
+    open = vi.fn(async () => undefined);
+    tableOfContents = () => [];
+    getVisiblePassages = () => [];
+    clearTextSelection = vi.fn();
+    updateHighlights = vi.fn();
+    destroy = vi.fn();
+  },
 }));
 
 class MemoryStorage implements Storage {
@@ -628,5 +643,143 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('opens a conflict dialog instead of uploading pending local progress when Kavita pageNum changed within the same chapter XPath', async () => {
+    const chapterXPath = '//body/DocFragment[2]/body/section[1]';
+    let progressSaveCount = 0;
+    let remotePageNum = 42;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        progressSaveCount += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Reader/get-progress') {
+        return jsonResponse({
+          libraryId: 1,
+          seriesId: 1,
+          volumeId: 1,
+          chapterId: 10,
+          pageNum: remotePageNum,
+          bookScrollId: chapterXPath,
+          lastModifiedUtc: '2026-09-08T00:00:00.000Z',
+        });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(25)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(25));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+
+    // Establish acknowledged baseline at pageNum 25 in chapterXPath, then advance locally within the same chapterXPath
+    await saveLocalProgress(seededBook, 'epubcfi(/6/6!/4/2/2:0)', chapterXPath, 0.25);
+    const baselineItem = (await getPendingSync(server.id))[0]!;
+    await confirmSync(
+      seededBook.id,
+      '2026-09-07T00:00:01.000Z',
+      baselineItem.revision,
+      baselineItem.updatedAt,
+      { pageNum: 25, bookScrollId: chapterXPath },
+    );
+    await saveLocalProgress(seededBook, 'epubcfi(/6/6!/4/2/10:0)', chapterXPath, 0.32);
+
+    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
+    flushSync();
+
+    await waitForCondition(() => Boolean(target.textContent?.includes('Choose where to continue')));
+    expect(progressSaveCount).toBe(0);
+
+    // Dismiss and verify a backward same-chapter Kavita move (pageNum 12 < baseline 25) also prompts for conflict
+    const cancelButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Cancel',
+    );
+    cancelButton!.click();
+    flushSync();
+
+    remotePageNum = 12;
+    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
+    flushSync();
+
+    await waitForCondition(() => Boolean(target.textContent?.includes('Page 12 of 100')));
+    expect(progressSaveCount).toBe(0);
+  });
+
+  it('adopts a backward same-chapter Kavita pageNum move on open when local progress has no pending upload', async () => {
+    const chapterXPath = '//body/DocFragment[2]/body/section[1]';
+
+    await saveRemoteProgress(
+      seededBook,
+      {
+        libraryId: 1,
+        seriesId: 1,
+        volumeId: 1,
+        chapterId: 10,
+        pageNum: 40,
+        bookScrollId: chapterXPath,
+        lastModifiedUtc: '2026-09-07T00:00:00.000Z',
+      },
+      null,
+    );
+
+    let progressSaveCount = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        progressSaveCount += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Reader/get-progress') {
+        return jsonResponse({
+          libraryId: 1,
+          seriesId: 1,
+          volumeId: 1,
+          chapterId: 10,
+          pageNum: 15,
+          bookScrollId: chapterXPath,
+          lastModifiedUtc: '2026-09-08T00:00:00.000Z',
+        });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(40)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(40));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+
+    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
+    flushSync();
+
+    await waitForCondition(async () => {
+      const state = await getReadingState(seededBook.id);
+      return state?.serverPageNum === 15;
+    });
+    expect(progressSaveCount).toBe(0);
+    expect((await getBooks(server.id))[0]?.pagesRead).toBe(15);
+    expect(await getReadingState(seededBook.id)).toMatchObject({
+      xpath: chapterXPath,
+      percentage: 0.15,
+      serverPageNum: 15,
+      serverXPath: chapterXPath,
+      pendingSync: false,
+    });
   });
 });

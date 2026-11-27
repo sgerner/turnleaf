@@ -63,7 +63,7 @@ export interface OpenRemoteProgress {
 export type OpenProgressDecision = 'local' | 'remote' | 'conflict' | 'none';
 
 function normalizeXPath(xpath?: string | null): string | null {
-  return xpath || null;
+  return xpath?.trim() || null;
 }
 
 function remoteMatchesBaseline(local: OpenLocalProgress, remote: OpenRemoteProgress): boolean {
@@ -80,20 +80,22 @@ export function chooseOpenProgress(
   bookPages: number,
   preferFurthest: boolean,
 ): OpenProgressDecision {
-  const hasRemoteLocation = Boolean(remote?.bookScrollId || (remote && remote.pageNum > 0));
+  const hasRemoteLocation = Boolean(
+    normalizeXPath(remote?.bookScrollId) || (remote && remote.pageNum > 0),
+  );
   if (!local && hasRemoteLocation) return 'remote';
   if (!local) return 'none';
   if (!remote) return 'local';
 
-  const hasBaseline = local.serverPageNum != null || Boolean(local.serverXPath);
+  const hasBaseline = local.serverPageNum != null || Boolean(normalizeXPath(local.serverXPath));
   const remoteUnchanged = hasBaseline ? remoteMatchesBaseline(local, remote) : !hasRemoteLocation;
 
   if (local.pendingSync) {
     if (remoteUnchanged) return 'local';
     if (
-      !local.xpath &&
+      !normalizeXPath(local.xpath) &&
       local.percentage >= 1 &&
-      !remote.bookScrollId &&
+      !normalizeXPath(remote.bookScrollId) &&
       bookPages > 0 &&
       remote.pageNum >= bookPages
     ) {
@@ -115,7 +117,9 @@ export function chooseOpenProgress(
   // Kavita's XPath does not retain EPUB.js's exact CFI. When both snapshots
   // point at the same element, keep the finer local locator even with
   // automatic furthest selection turned off.
-  if (local.xpath && remote.bookScrollId === local.xpath) return 'local';
+  if (local.xpath && normalizeXPath(remote.bookScrollId) === normalizeXPath(local.xpath)) {
+    return 'local';
+  }
 
   if (preferFurthest) {
     if (local.percentage >= 1) return 'local';
