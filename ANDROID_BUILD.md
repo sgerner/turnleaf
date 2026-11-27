@@ -35,6 +35,7 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
 npm ci
 npm run android:debug
+npm run android:lint
 ```
 
 Debug APK: `android/app/build/outputs/apk/debug/app-debug.apk`.
@@ -42,18 +43,29 @@ Debug APK: `android/app/build/outputs/apk/debug/app-debug.apk`.
 For release readiness:
 
 ```bash
-keytool -genkeypair -v -keystore turnleaf-release.jks -alias turnleaf -keyalg RSA -keysize 4096 -validity 10000
-npm run android:release
+keytool -genkeypair -v -keystore android/turnleaf-release.jks -alias turnleaf -keyalg RSA -keysize 4096 -validity 10000
+npm run android:release -- --no-daemon
 ```
 
-Configure the signing secret outside Git in `android/keystore.properties` or a CI secret before distributing the generated APK. The repo includes `android/keystore.properties.example` as a template. GitHub Actions expects these secrets:
+Extra flags after `--` (such as `--no-daemon`) are forwarded to Gradle, and release builds stop the Gradle daemon after signing so credentials do not remain in background daemon memory.
+
+Configure signing credentials outside Git using step-scoped `TURNLEAF_*` environment variables or `android/keystore.properties` (see `android/keystore.properties.example`):
+
+- `TURNLEAF_STORE_FILE` (resolved relative to `android/` or as an absolute path)
+- `TURNLEAF_STORE_PASSWORD`
+- `TURNLEAF_KEY_ALIAS`
+- `TURNLEAF_KEY_PASSWORD`
+
+`TURNLEAF_*` environment variables take precedence over `android/keystore.properties`. Gradle reads `android/keystore.properties` as UTF-8 `java.util.Properties`, which strips unescaped leading whitespace and interprets backslash escapes—escape `\\` and leading `\ ` (and leading `\#` or `\!`), or pass raw values via `TURNLEAF_*` environment variables.
+
+GitHub Actions expects these repository secrets, decodes the keystore into an owner-only `$RUNNER_TEMP` file, scopes `TURNLEAF_*` variables to the `--no-daemon` signing step, and shreds temporary signing files immediately after signing:
 
 - `ANDROID_KEYSTORE_BASE64`
 - `ANDROID_KEYSTORE_PASSWORD`
 - `ANDROID_KEY_ALIAS`
 - `ANDROID_KEY_PASSWORD`
 
-The current release script produces a signed APK when those values are present and fails loudly if release signing is missing.
+The release script produces a signed APK when all four signing values are present and fails loudly if any release signing value is missing or empty.
 
 Device commands used:
 
