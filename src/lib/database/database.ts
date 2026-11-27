@@ -57,6 +57,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
+let resetGeneration = 0;
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -236,12 +237,19 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 }
 
 export async function resetLocalDatabase(): Promise<void> {
+  resetGeneration += 1;
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
     clearBootThemeCache();
     return;
   }
 
+  if (opening) await opening.catch(() => undefined);
+  let pending: Promise<void>;
+  do {
+    pending = nativeTransactionQueue;
+    await pending;
+  } while (pending !== nativeTransactionQueue);
   try {
     if (connection) {
       try {
@@ -702,12 +710,15 @@ export async function saveLocalProgress(
   spineIndex?: number,
   options?: SaveLocalProgressOptions,
 ): Promise<void> {
-  if (options?.shouldCommit && !options.shouldCommit()) return;
+  const generation = resetGeneration;
+  const canCommit = () =>
+    generation === resetGeneration && (!options?.shouldCommit || options.shouldCommit());
+  if (!canCommit()) return;
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
-      if (options?.shouldCommit && !options.shouldCommit()) return false;
+      if (!canCommit()) return false;
       if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
@@ -747,7 +758,7 @@ export async function saveLocalProgress(
     return;
   }
   const db = await openDatabase();
-  if (options?.shouldCommit && !options.shouldCommit()) return;
+  if (!canCommit()) return;
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -757,7 +768,7 @@ export async function saveLocalProgress(
     bookScrollId: xpath,
   };
   await enqueueNativeWrite(async () => {
-    if (options?.shouldCommit && !options.shouldCommit()) return;
+    if (!canCommit() || connection !== db) return;
     await db.executeTransaction([
       createReadingStateTask(book.id, cfi, xpath, percentage, now),
       createSyncQueueTask(book.id, payload, now),

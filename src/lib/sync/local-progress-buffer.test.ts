@@ -10,6 +10,7 @@ import {
   markBookCompleted,
   reconcileBooks,
   removeServer,
+  resetLocalDatabase,
   saveLocalProgress,
   saveRemoteProgress,
   saveServer,
@@ -494,5 +495,97 @@ describe('createLocalProgressBuffer', () => {
       percentage: 0.25,
     });
     expect(saved.books[0]?.pagesRead).toBe(5);
+  });
+
+  it('interleaves buffered writes with clear() and resetLocalDatabase() without stale rows or lost post-reset writes', async () => {
+    await saveServer(server);
+    const secondBook: BookRecord = { ...book, id: 'book-2', chapterId: 31 };
+    const thirdBook: BookRecord = { ...book, id: 'book-3', chapterId: 32 };
+    await reconcileBooks(server.id, [book, secondBook, thirdBook]);
+
+    let activeGate: ReturnType<typeof createGate> | null = null;
+    const buffer = createLocalProgressBuffer(async (target, location, context) => {
+      if (activeGate && target.id === book.id) {
+        const gate = activeGate;
+        activeGate = null;
+        gate.notifyStarted();
+        await gate.gate;
+      }
+      await saveLocalProgress(
+        target,
+        location.cfi,
+        location.xpath,
+        location.percentage,
+        location.spineIndex,
+        { shouldCommit: context.isCurrent },
+      );
+    });
+
+    // Phase 1: clear(book.id) invalidates the in-flight write without losing secondBook's write.
+    const clearGate = createGate();
+    activeGate = clearGate;
+    const staleBookWrite = buffer.queue(book, makeLocation(15));
+    await clearGate.started;
+    const preservedSecondWrite = buffer.queue(secondBook, makeLocation(31));
+    const clearOne = buffer.clear(book.id);
+    clearGate.release();
+    await Promise.all([staleBookWrite, preservedSecondWrite, clearOne]);
+
+    expect(await getReadingState(book.id)).toBeNull();
+    expect(await getReadingState(secondBook.id)).toMatchObject({
+      percentage: 0.31,
+      pendingSync: true,
+    });
+
+    // Phase 2: clear() + resetLocalDatabase() while book is in flight and secondBook is queued,
+    // followed by re-seeding the same book IDs and queuing fresh post-reset progress on thirdBook
+    // before the pre-reset write gate releases.
+    const resetGate = createGate();
+    activeGate = resetGate;
+    const preResetInFlight = buffer.queue(book, makeLocation(48));
+    await resetGate.started;
+    const preResetQueued = buffer.queue(secondBook, makeLocation(56));
+
+    let triggeredMidCallReset = false;
+    await saveLocalProgress(book, 'epubcfi(/6/2!/4/2/61:0)', '//p[61]', 0.61, 0, {
+      shouldCommit: () => {
+        if (!triggeredMidCallReset) {
+          triggeredMidCallReset = true;
+          void resetLocalDatabase();
+        }
+        return true;
+      },
+    });
+
+    const clearAll = buffer.clear();
+    await resetLocalDatabase();
+
+    await saveServer(server);
+    await reconcileBooks(server.id, [book, secondBook, thirdBook]);
+    const postResetLocation = { ...makeLocation(78), spineIndex: 77 };
+    const postResetWrite = buffer.queue(thirdBook, postResetLocation);
+
+    resetGate.release();
+    await Promise.all([preResetInFlight, preResetQueued, clearAll, postResetWrite]);
+
+    expect(await getReadingState(book.id)).toBeNull();
+    expect(await getReadingState(secondBook.id)).toBeNull();
+    expect(await getReadingState(thirdBook.id)).toMatchObject({
+      cfi: postResetLocation.cfi,
+      xpath: postResetLocation.xpath,
+      percentage: 0.78,
+      pendingSync: true,
+    });
+    const booksAfterReset = await getBooks(server.id);
+    expect(booksAfterReset.find((item) => item.id === book.id)?.pagesRead).toBe(0);
+    expect(booksAfterReset.find((item) => item.id === secondBook.id)?.pagesRead).toBe(0);
+    expect(booksAfterReset.find((item) => item.id === thirdBook.id)?.pagesRead).toBe(78);
+    const pending = await getPendingSync(server.id);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.bookId).toBe(thirdBook.id);
+    expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+      chapterId: thirdBook.chapterId,
+      pageNum: 78,
+    });
   });
 });
