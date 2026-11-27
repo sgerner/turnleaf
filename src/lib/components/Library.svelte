@@ -318,7 +318,14 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  let reconnectTimer: number | null = null;
+  let deferredRefresh: {
+    preserveMessage: boolean;
+    requestedRevision: number;
+    requestedMessage: string;
+  } | null = null;
   const cleanups: Array<() => Promise<void>> = [];
+  const NATIVE_RECONNECT_SETTLE_MS = 750;
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const COVER_LOAD_CONCURRENCY = 6;
@@ -738,18 +745,23 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          if (reconnectTimer !== null) {
+            window.clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
           offline = !connected;
           if (!connected) {
             if (syncTimer !== null) {
               window.clearTimeout(syncTimer);
               syncTimer = null;
             }
+            deferredRefresh = null;
             refreshController?.abort();
             openProgressProbe?.abort();
             readerSyncController?.abort();
             if (syncWork) syncSawDisconnect = true;
+            coverReloadRequest += 1;
           }
-          coverReloadRequest += 1;
           kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
@@ -757,14 +769,25 @@
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
           if (connected) {
-            if (syncWork && syncSawDisconnect) {
-              syncController?.abort();
-              cancelProgressFlush(server.id);
+            if (Capacitor.isNativePlatform()) {
+              reconnectTimer = window.setTimeout(() => {
+                reconnectTimer = null;
+                void (async () => {
+                  if (!(await networkAvailable())) {
+                    if (!destroyed && !offline) {
+                      offline = true;
+                      offlineMessage = displayableBooks.length
+                        ? 'No network connection. Showing your saved library.'
+                        : 'No network connection. Connect to Kavita to load your library.';
+                    }
+                    return;
+                  }
+                  triggerReconnectActions();
+                })();
+              }, NATIVE_RECONNECT_SETTLE_MS);
+            } else {
+              triggerReconnectActions();
             }
-            const baselineRevision = activeSyncStartRevision ?? messageRevision;
-            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-            void syncProgress(false);
-            void startRefresh(false, baselineRevision, baselineMessage);
           }
         }),
       ),
@@ -807,6 +830,19 @@
       return async () => {};
     }
     return handle.remove;
+  }
+
+  function triggerReconnectActions(): void {
+    if (destroyed || offline) return;
+    coverReloadRequest += 1;
+    if (syncWork && syncSawDisconnect) {
+      syncController?.abort();
+      cancelProgressFlush(server.id);
+    }
+    const baselineRevision = activeSyncStartRevision ?? messageRevision;
+    const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+    void syncProgress(false);
+    void startRefresh(false, baselineRevision, baselineMessage);
   }
 
   async function networkAvailable(): Promise<boolean> {
@@ -920,7 +956,9 @@
   onDestroy(() => {
     destroyed = true;
     deferredSync = null;
+    deferredRefresh = null;
     onReaderOpenChange?.(false);
+    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -946,6 +984,15 @@
     requestedMessage = message,
   ): Promise<void> {
     if (destroyed || offline) return Promise.resolve();
+    if (reading) {
+      deferredRefresh = {
+        preserveMessage: Boolean(deferredRefresh?.preserveMessage || preserveMessage),
+        requestedRevision: deferredRefresh ? deferredRefresh.requestedRevision : requestedRevision,
+        requestedMessage: deferredRefresh ? deferredRefresh.requestedMessage : requestedMessage,
+      };
+      return Promise.resolve();
+    }
+    deferredRefresh = null;
     if (refreshWork && refreshController?.signal.aborted) {
       return refreshWork.then(() =>
         startRefresh(preserveMessage, requestedRevision, requestedMessage),
@@ -1566,6 +1613,15 @@
   async function closeReader(): Promise<void> {
     const bookId = reading?.book.id;
     reading = null;
+    if (deferredRefresh && !offline && !destroyed) {
+      const pending = deferredRefresh;
+      deferredRefresh = null;
+      void startRefresh(
+        pending.preserveMessage,
+        pending.requestedRevision,
+        pending.requestedMessage,
+      );
+    }
     await tick();
     if (reading || !libraryMain) return;
 
@@ -1807,6 +1863,11 @@
     settingsError = '';
     deletingServer = true;
     try {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      deferredRefresh = null;
       syncController?.abort();
       cancelProgressFlush(server.id);
       for (const book of books.filter((item) => item.downloadPath)) await remove(book);

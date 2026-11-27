@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- ci(android): emit GitHub Actions failure annotations in reading journey
-- Guard native sync and catalog requests against mid-read offline transitions
+- Settle native reconnect transitions and defer catalog refresh while reading
+- Abort stalled progress flushes, replay deferred sync retries, and settle native offline transitions
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache
