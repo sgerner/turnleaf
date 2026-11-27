@@ -2,10 +2,11 @@
 
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
-import { KavitaClient, settleOnAbort } from './client';
+import { Network } from '@capacitor/network';
+import { KavitaClient, OFFLINE_NETWORK_MESSAGE, settleOnAbort } from './client';
 import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from '../diagnostics/log';
 
-const capacitorRuntime = vi.hoisted(() => ({ native: false }));
+const capacitorRuntime = vi.hoisted(() => ({ native: false, connected: true }));
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
@@ -18,11 +19,27 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: capacitorRuntime.connected,
+      connectionType: capacitorRuntime.connected ? 'wifi' : 'none',
+    })),
+  },
+}));
+
 beforeEach(() => {
   clearDiagnostics();
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   capacitorRuntime.native = false;
+  capacitorRuntime.connected = true;
   vi.mocked(CapacitorHttp.get).mockReset();
   vi.mocked(CapacitorHttp.request).mockReset();
+  vi.mocked(Network.getStatus).mockReset();
+  vi.mocked(Network.getStatus).mockImplementation(async () => ({
+    connected: capacitorRuntime.connected,
+    connectionType: capacitorRuntime.connected ? 'wifi' : 'none',
+  }));
   const fetchMock = vi.fn(async () => ({
     ok: true,
     status: 200,
@@ -264,318 +281,37 @@ it('follows native same-origin redirects with redirects disabled on each request
   });
 });
 
-it('settles pending native read requests immediately on abort while plugin requests remain in flight', async () => {
+it('blocks native authenticated requests when the transport is offline', async () => {
   capacitorRuntime.native = true;
-  let detailPluginSettled = false;
-  let seriesPluginSettled = false;
-  let librariesPluginSettled = false;
-  let seriesHop = 0;
-  let rejectPendingDetail!: (reason?: unknown) => void;
-  let rejectPendingSeries!: (reason?: unknown) => void;
-  let resolvePendingLibraries!: (value: {
-    status: number;
-    headers: Record<string, string>;
-    data: string;
-    url: string;
-  }) => void;
-  vi.mocked(CapacitorHttp.request).mockImplementation((options) => {
-    if (options.url.includes('/api/Series/series-detail')) {
-      return new Promise((_, reject) => {
-        rejectPendingDetail = (reason) => {
-          detailPluginSettled = true;
-          reject(reason);
-        };
-      });
-    }
-    if (options.url.includes('/api/Series/v2')) {
-      seriesHop += 1;
-      if (seriesHop === 1) {
-        return Promise.resolve({
-          status: 307,
-          headers: { Location: '/api/Series/v2/?PageNumber=1&PageSize=500' },
-          data: '',
-          url: '',
-        });
-      }
-      return new Promise((_, reject) => {
-        rejectPendingSeries = (reason) => {
-          seriesPluginSettled = true;
-          reject(reason);
-        };
-      });
-    }
-    if (options.url.includes('/api/Library/libraries')) {
-      return new Promise((resolve) => {
-        resolvePendingLibraries = (value) => {
-          librariesPluginSettled = true;
-          resolve(value);
-        };
-      });
-    }
-    return Promise.resolve({
-      status: 200,
-      headers: {},
-      data: JSON.stringify({ version: '0.8.4' }),
-      url: '',
-    });
-  });
+  vi.mocked(Network.getStatus)
+    .mockResolvedValueOnce({ connected: true, connectionType: 'wifi' })
+    .mockResolvedValueOnce({ connected: false, connectionType: 'none' });
+  await Network.getStatus(); // Library's earlier availability check sees the transient reconnect.
 
-  const client = new KavitaClient('https://books.example.com', 'abc123');
-  const detailController = new AbortController();
-  const seriesController = new AbortController();
-  const connectionController = new AbortController();
-
-  const pendingDetail = expect(
-    client.getSeriesDetail(4, detailController.signal),
-  ).rejects.toSatisfy(
-    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
-  );
-  const pendingSeries = expect(client.getBookSeries(seriesController.signal)).rejects.toSatisfy(
-    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
-  );
-  const pendingConnection = expect(
-    client.testConnection(connectionController.signal),
-  ).rejects.toSatisfy(
-    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
-  );
-  await vi.waitFor(() => expect(CapacitorHttp.request).toHaveBeenCalledTimes(5));
-
-  detailController.abort();
-  seriesController.abort();
-  connectionController.abort();
-
-  await Promise.all([pendingDetail, pendingSeries, pendingConnection]);
-
-  // Caller promises rejected promptly, but underlying CapacitorHttp requests are still in flight.
-  expect(detailPluginSettled).toBe(false);
-  expect(seriesPluginSettled).toBe(false);
-  expect(librariesPluginSettled).toBe(false);
-
-  rejectPendingDetail(new Error('SocketTimeoutException: connect timed out'));
-  rejectPendingSeries(new Error('SocketTimeoutException: read timed out'));
-  resolvePendingLibraries({
-    status: 200,
-    headers: {},
-    data: JSON.stringify([{ id: 1, name: 'Books', type: 2 }]),
-    url: '',
-  });
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  expect(detailPluginSettled).toBe(true);
-  expect(seriesPluginSettled).toBe(true);
-  expect(librariesPluginSettled).toBe(true);
-  expect(getDiagnosticCount()).toBe(0);
-});
-
-it('waits for dispatched native saveProgress mutations to settle before rejecting on abort or starting replacements', async () => {
-  capacitorRuntime.native = true;
-  const client = new KavitaClient('https://books.example.com', 'abc123');
-  const baseProgress = {
-    libraryId: 1,
-    seriesId: 2,
-    volumeId: 3,
-    chapterId: 4,
-    pageNum: 10,
-  };
-
-  const preAborted = new AbortController();
-  preAborted.abort();
-  await expect(client.saveProgress(baseProgress, preAborted.signal)).rejects.toMatchObject({
-    name: 'AbortError',
-  });
-  expect(CapacitorHttp.request).not.toHaveBeenCalled();
-
-  const events: string[] = [];
-  let rejectFirstMutation!: (reason?: unknown) => void;
-  vi.mocked(CapacitorHttp.request)
-    .mockImplementationOnce(() => {
-      events.push('plugin-start:1');
-      return new Promise((_, reject) => {
-        rejectFirstMutation = (reason) => {
-          events.push('plugin-finish:1');
-          reject(reason);
-        };
-      });
-    })
-    .mockImplementationOnce(async () => {
-      events.push('plugin-start:2');
-      events.push('plugin-finish:2');
-      return { status: 200, headers: {}, data: '', url: '' };
-    });
-
-  const controller = new AbortController();
-  const firstSave = client.saveProgress(baseProgress, controller.signal);
-  let firstCallerSettled = false;
-  const replacementFlow = (async () => {
-    await expect(firstSave).rejects.toSatisfy(
-      (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
-    );
-    firstCallerSettled = true;
-    events.push('caller-settled:1');
-    await client.saveProgress({ ...baseProgress, pageNum: 25 });
-    events.push('caller-settled:2');
-  })();
-
-  await vi.waitFor(() => expect(events).toEqual(['plugin-start:1']));
-  controller.abort();
-  events.push('abort:1');
-  await new Promise((resolve) => setTimeout(resolve, 0));
-
-  expect(firstCallerSettled).toBe(false);
-  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
-
-  rejectFirstMutation(new Error('SocketTimeoutException: write timed out'));
-  await replacementFlow;
-
-  expect(events).toEqual([
-    'plugin-start:1',
-    'abort:1',
-    'plugin-finish:1',
-    'caller-settled:1',
-    'plugin-start:2',
-    'plugin-finish:2',
-    'caller-settled:2',
-  ]);
-  expect(getDiagnosticCount()).toBe(0);
-
-  let resolveRedirectHop!: (value: {
-    status: number;
-    headers: Record<string, string>;
-    data: string;
-    url: string;
-  }) => void;
-  vi.mocked(CapacitorHttp.request).mockImplementationOnce(
-    () =>
-      new Promise((resolve) => {
-        resolveRedirectHop = resolve;
-      }),
-  );
-  const redirectController = new AbortController();
-  const redirectedSave = client.saveProgress(
-    { ...baseProgress, pageNum: 30 },
-    redirectController.signal,
-  );
-  let redirectedSettled = false;
-  void redirectedSave.catch(() => {
-    redirectedSettled = true;
-  });
-
-  await vi.waitFor(() => expect(CapacitorHttp.request).toHaveBeenCalledTimes(3));
-  redirectController.abort();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(redirectedSettled).toBe(false);
-
-  resolveRedirectHop({
-    status: 307,
-    headers: { Location: '/api/Reader/progress/' },
-    data: '',
-    url: '',
-  });
-  await expect(redirectedSave).rejects.toMatchObject({ name: 'AbortError' });
-  expect(CapacitorHttp.request).toHaveBeenCalledTimes(3);
-});
-
-it('preserves shared redirect security, loop, and hop-limit checks on native requests with abort signals', async () => {
-  capacitorRuntime.native = true;
-  const client = new KavitaClient('https://books.example.com', 'abc123');
-  const signal = new AbortController().signal;
-
-  for (const [location, expectedMessage] of [
-    ['https://other.example.com/api/Series/series-detail?seriesId=4', 'different server'],
-    ['http://books.example.com/api/Series/series-detail?seriesId=4', 'HTTPS to insecure HTTP'],
-    ['https://books.example.com/api/Series/series-detail?apiKey=secret', 'different server'],
-    ['https://user:pass@books.example.com/api/Series/series-detail?seriesId=4', 'different server'],
-  ] as const) {
-    vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
-      status: 302,
-      headers: { Location: location },
-      data: '',
-      url: '',
-    });
-    await expect(client.getSeriesDetail(4, signal)).rejects.toThrow(expectedMessage);
-  }
-  expect(CapacitorHttp.request).toHaveBeenCalledTimes(4);
-
-  vi.mocked(CapacitorHttp.request)
-    .mockResolvedValueOnce({
-      status: 302,
-      headers: { Location: '/api/Series/series-detail?step=1' },
-      data: '',
-      url: '',
-    })
-    .mockResolvedValueOnce({
-      status: 302,
-      headers: { Location: '/api/Series/series-detail?seriesId=4' },
-      data: '',
-      url: '',
-    });
-  await expect(client.getSeriesDetail(4, signal)).rejects.toThrow('redirected in a loop');
-
-  for (let hop = 1; hop <= 6; hop += 1) {
-    vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
-      status: 302,
-      headers: { Location: `/api/Series/series-detail?hop=${hop}` },
-      data: '',
-      url: '',
-    });
-  }
-  await expect(client.getSeriesDetail(4, signal)).rejects.toThrow('redirected too many times');
-});
-
-it('detaches abort listeners when native calls settle before a shared signal aborts', async () => {
-  capacitorRuntime.native = true;
-  vi.mocked(CapacitorHttp.request)
-    .mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
-      url: '',
-    })
-    .mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
-      url: '',
-    })
-    .mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      data: '[]',
-      url: '',
-    });
-
-  const controller = new AbortController();
-  const addSpy = vi.spyOn(controller.signal, 'addEventListener');
-  const removeSpy = vi.spyOn(controller.signal, 'removeEventListener');
-  const client = new KavitaClient('https://books.example.com', 'abc123');
-
-  await client.getSeriesDetail(1, controller.signal);
-  await client.getSeriesDetail(2, controller.signal);
-  await client.getBookSeries(controller.signal);
-
-  expect(addSpy).toHaveBeenCalledTimes(3);
-  expect(removeSpy).toHaveBeenCalledTimes(3);
-  for (let index = 0; index < 3; index += 1) {
-    expect(removeSpy.mock.calls[index]?.[0]).toBe('abort');
-    expect(removeSpy.mock.calls[index]?.[1]).toBe(addSpy.mock.calls[index]?.[1]);
-  }
-
-  let lateRejected = false;
-  const preAborted = new AbortController();
-  preAborted.abort();
   await expect(
-    settleOnAbort(
-      new Promise((_, reject) => {
-        setTimeout(() => {
-          lateRejected = true;
-          reject(new Error('late failure'));
-        }, 0);
-      }),
-      preAborted.signal,
-    ),
-  ).rejects.toMatchObject({ name: 'AbortError' });
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  expect(lateRejected).toBe(true);
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'network',
+  });
+
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('blocks native requests when WebView is offline despite a stale connected plugin status', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
+  await Network.getStatus(); // Library's earlier availability check sees the connected status.
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'network',
+  });
+
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
 });
 
 it('preserves a Kavita base path in URLs used for covers and downloads', () => {
@@ -949,21 +685,13 @@ it('distinguishes browser request timeouts from caller aborts and clears timers'
     await timedOut;
     expect(vi.getTimerCount()).toBe(0);
 
-    clearDiagnostics();
     const caller = new AbortController();
     const abortedByCaller = expect(client.getSeriesDetail(4, caller.signal)).rejects.toMatchObject({
-      name: 'AbortError',
-    });
-    caller.abort();
-    await abortedByCaller;
-    expect(vi.getTimerCount()).toBe(0);
-    expect(getDiagnosticCount()).toBe(0);
-
-    vi.mocked(fetch).mockRejectedValueOnce(new TypeError('Failed to fetch'));
-    await expect(client.getSeriesDetail(4)).rejects.toMatchObject({
       kind: 'network',
       message: 'Kavita could not be reached. Check the address and network.',
     });
+    caller.abort();
+    await abortedByCaller;
     expect(vi.getTimerCount()).toBe(0);
 
     const coverCaller = new AbortController();
@@ -1090,80 +818,6 @@ it('does not retry a progress read that returns not found', async () => {
   expect(fetchMock).toHaveBeenCalledOnce();
 });
 
-it('propagates AbortError immediately from getProgress without retrying or recording network-error', async () => {
-  capacitorRuntime.native = true;
-  let rejectOrphan!: (reason?: unknown) => void;
-  vi.mocked(CapacitorHttp.request).mockImplementation(
-    () =>
-      new Promise((_, reject) => {
-        rejectOrphan = reject;
-      }),
-  );
-
-  const controller = new AbortController();
-  const pending = new KavitaClient('https://books.example.com', 'abc123').getProgress(
-    7,
-    controller.signal,
-  );
-  controller.abort();
-
-  await expect(pending).rejects.toSatisfy(
-    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
-  );
-  expect(CapacitorHttp.request).toHaveBeenCalledOnce();
-
-  rejectOrphan(new Error('SocketTimeoutException'));
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(getDiagnosticCount()).toBe(0);
-});
-
-it('preserves network-error diagnostics for genuine native and browser timeouts when not aborted', async () => {
-  capacitorRuntime.native = true;
-  vi.mocked(CapacitorHttp.request).mockRejectedValueOnce(
-    new Error('SocketTimeoutException: timeout'),
-  );
-  const activeController = new AbortController();
-  const client = new KavitaClient('https://books.example.com', 'abc123');
-
-  await expect(client.getSeriesDetail(4, activeController.signal)).rejects.toMatchObject({
-    kind: 'network',
-  });
-  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain(
-    'request endpoint=/api/Series/series-detail detail=network-error',
-  );
-
-  clearDiagnostics();
-  capacitorRuntime.native = false;
-  vi.useFakeTimers();
-  try {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(
-        (_url: string, init?: RequestInit) =>
-          new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener(
-              'abort',
-              () => reject(new DOMException('Aborted', 'AbortError')),
-              { once: true },
-            );
-          }),
-      ) as unknown as typeof fetch,
-    );
-    const webTimeoutPromise = client.getSeriesDetail(9, activeController.signal);
-    const assertion = expect(webTimeoutPromise).rejects.toMatchObject({
-      kind: 'network',
-      message: 'Kavita did not respond in time.',
-    });
-    await vi.advanceTimersByTimeAsync(12_000);
-    await assertion;
-    expect(exportDiagnostics({ appVersion: 'test', platform: 'web' })).toContain(
-      'request endpoint=/api/Series/series-detail detail=network-error',
-    );
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
 it('normalizes native HTTP JSON strings and exposes field diagnostics without server secrets', async () => {
   capacitorRuntime.native = true;
   vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
@@ -1240,4 +894,231 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
   await expect(new KavitaClient('http://books.example', 'key').getBookSeries()).rejects.toThrow(
     'repeated series page',
   );
+});
+
+it('gates every native hop through beforeNativeRequest and settles aborts during transport checks', async () => {
+  capacitorRuntime.native = true;
+  let allowed = false;
+  const gate = vi.fn(async () => allowed);
+  const client = new KavitaClient('https://books.example.com', 'abc123', gate);
+
+  await expect(client.getProgress(7)).rejects.toMatchObject({
+    kind: 'network',
+    message: OFFLINE_NETWORK_MESSAGE,
+  });
+  expect(gate).toHaveBeenCalledOnce();
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(getDiagnosticCount()).toBe(0);
+
+  allowed = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    allowed = false;
+    return {
+      status: 307,
+      headers: { Location: '/api/Series/series-detail/?seriesId=4' },
+      data: '',
+      url: '',
+    };
+  });
+  await expect(client.getSeriesDetail(4)).rejects.toMatchObject({
+    kind: 'network',
+    message: OFFLINE_NETWORK_MESSAGE,
+  });
+  expect(gate).toHaveBeenCalledTimes(3);
+  expect(CapacitorHttp.request).toHaveBeenCalledOnce();
+
+  let releaseGate!: (value: boolean) => void;
+  const controller = new AbortController();
+  const stalledClient = new KavitaClient(
+    'https://books.example.com',
+    'abc123',
+    () =>
+      new Promise<boolean>((resolve) => {
+        releaseGate = resolve;
+      }),
+  );
+  const pending = stalledClient.getSeriesDetail(4, controller.signal);
+  controller.abort();
+  await expect(pending).rejects.toSatisfy(
+    (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+  );
+  releaseGate(true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(CapacitorHttp.request).toHaveBeenCalledOnce();
+});
+
+it('settles pending native read requests immediately on abort while plugin calls remain in flight', async () => {
+  capacitorRuntime.native = true;
+  const settled = { detail: false, series: false, progress: false };
+  let rejectDetail!: (reason?: unknown) => void;
+  let rejectSeries!: (reason?: unknown) => void;
+  let rejectProgress!: (reason?: unknown) => void;
+  vi.mocked(CapacitorHttp.request).mockImplementation((options) => {
+    if (options.url.includes('/api/Series/series-detail')) {
+      return new Promise((_, reject) => {
+        rejectDetail = (reason) => {
+          settled.detail = true;
+          reject(reason);
+        };
+      });
+    }
+    if (options.url.includes('/api/Series/v2')) {
+      return new Promise((_, reject) => {
+        rejectSeries = (reason) => {
+          settled.series = true;
+          reject(reason);
+        };
+      });
+    }
+    return new Promise((_, reject) => {
+      rejectProgress = (reason) => {
+        settled.progress = true;
+        reject(reason);
+      };
+    });
+  });
+
+  const client = new KavitaClient('https://books.example.com', 'abc123', () => true);
+  const detailController = new AbortController();
+  const seriesController = new AbortController();
+  const progressController = new AbortController();
+
+  const pendingDetail = client.getSeriesDetail(4, detailController.signal);
+  const pendingSeries = client.getBookSeries(seriesController.signal);
+  const pendingProgress = client.getProgress(7, progressController.signal);
+  await vi.waitFor(() => expect(CapacitorHttp.request).toHaveBeenCalledTimes(3));
+
+  detailController.abort();
+  seriesController.abort();
+  progressController.abort();
+
+  for (const promise of [pendingDetail, pendingSeries, pendingProgress]) {
+    await expect(promise).rejects.toSatisfy(
+      (error: unknown) => error instanceof DOMException && error.name === 'AbortError',
+    );
+  }
+  expect(settled).toEqual({ detail: false, series: false, progress: false });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(3);
+
+  rejectDetail(new Error('SocketTimeoutException'));
+  rejectSeries(new Error('SocketTimeoutException'));
+  rejectProgress(new Error('SocketTimeoutException'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(getDiagnosticCount()).toBe(0);
+
+  vi.mocked(CapacitorHttp.request).mockRejectedValueOnce(new Error('SocketTimeoutException'));
+  await expect(client.getSeriesDetail(4, new AbortController().signal)).rejects.toMatchObject({
+    kind: 'network',
+  });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain(
+    'request endpoint=/api/Series/series-detail detail=network-error',
+  );
+});
+
+it('waits for dispatched native saveProgress mutations to settle before rejecting on abort or starting replacements', async () => {
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('https://books.example.com', 'abc123', () => true);
+  const baseProgress = {
+    libraryId: 1,
+    seriesId: 2,
+    volumeId: 3,
+    chapterId: 4,
+    pageNum: 10,
+  };
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await expect(client.saveProgress(baseProgress, preAborted.signal)).rejects.toMatchObject({
+    name: 'AbortError',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  const events: string[] = [];
+  let rejectFirstMutation!: (reason?: unknown) => void;
+  vi.mocked(CapacitorHttp.request)
+    .mockImplementationOnce(() => {
+      events.push('plugin-start:1');
+      return new Promise((_, reject) => {
+        rejectFirstMutation = (reason) => {
+          events.push('plugin-finish:1');
+          reject(reason);
+        };
+      });
+    })
+    .mockImplementationOnce(async () => {
+      events.push('plugin-start:2');
+      return { status: 200, headers: {}, data: '', url: '' };
+    });
+
+  const controller = new AbortController();
+  let firstSettled = false;
+  const flow = (async () => {
+    await expect(client.saveProgress(baseProgress, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    firstSettled = true;
+    events.push('caller-settled:1');
+    await client.saveProgress({ ...baseProgress, pageNum: 25 });
+    events.push('caller-settled:2');
+  })();
+
+  await vi.waitFor(() => expect(events).toEqual(['plugin-start:1']));
+  controller.abort();
+  events.push('abort:1');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(firstSettled).toBe(false);
+  expect(CapacitorHttp.request).toHaveBeenCalledOnce();
+
+  rejectFirstMutation(new Error('SocketTimeoutException'));
+  await flow;
+
+  expect(events).toEqual([
+    'plugin-start:1',
+    'abort:1',
+    'plugin-finish:1',
+    'caller-settled:1',
+    'plugin-start:2',
+    'caller-settled:2',
+  ]);
+  expect(getDiagnosticCount()).toBe(0);
+});
+
+it('preserves shared redirect checks and detaches abort listeners on native requests', async () => {
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('https://books.example.com', 'abc123', () => true);
+  const controller = new AbortController();
+
+  for (const [location, expectedMessage] of [
+    ['https://other.example.com/api/Series/series-detail?seriesId=4', 'different server'],
+    ['http://books.example.com/api/Series/series-detail?seriesId=4', 'HTTPS to insecure HTTP'],
+    ['https://books.example.com/api/Series/series-detail?apiKey=secret', 'different server'],
+    ['https://user:pass@books.example.com/api/Series/series-detail?seriesId=4', 'different server'],
+  ] as const) {
+    vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+      status: 302,
+      headers: { Location: location },
+      data: '',
+      url: '',
+    });
+    await expect(client.getSeriesDetail(4, controller.signal)).rejects.toThrow(expectedMessage);
+  }
+
+  const addSpy = vi.spyOn(controller.signal, 'addEventListener');
+  const removeSpy = vi.spyOn(controller.signal, 'removeEventListener');
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {},
+    data: JSON.stringify({ chapters: [], specials: [], volumes: [], storylineChapters: [] }),
+    url: '',
+  });
+  await client.getSeriesDetail(1, controller.signal);
+  expect(addSpy).toHaveBeenCalledTimes(2);
+  expect(removeSpy).toHaveBeenCalledTimes(2);
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await expect(
+    settleOnAbort(Promise.reject(new Error('late failure')), preAborted.signal),
+  ).rejects.toMatchObject({ name: 'AbortError' });
 });

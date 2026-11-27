@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -11,6 +12,8 @@ import { recordDiagnostic } from '../diagnostics/log';
 import { advanceRedirect, createRedirectState, KavitaError, nativeHeader } from './redirects';
 
 export { KavitaError };
+
+export const OFFLINE_NETWORK_MESSAGE = 'Kavita could not be reached while offline.';
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
@@ -74,10 +77,13 @@ export function settleOnAbort<T>(promise: Promise<T>, signal?: AbortSignal | nul
     if (onAbort) signal.removeEventListener('abort', onAbort);
   });
 }
+
 export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
+    private readonly beforeNativeRequest?:
+      ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -169,7 +175,7 @@ export class KavitaClient {
         headers: { 'x-api-key': this.apiKey },
       });
       this.assertStatus(response.status);
-      return await settleOnAbort(response.blob(), combined);
+      return await response.blob();
     });
   }
 
@@ -186,17 +192,14 @@ export class KavitaClient {
       }
       return progress;
     } catch (error) {
-      if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) {
-        throw error instanceof DOMException && error.name === 'AbortError' ? error : abortError();
-      }
       const retryable =
         error instanceof KavitaError &&
-        (error.kind === 'network' ||
+        ((error.kind === 'network' && error.message !== OFFLINE_NETWORK_MESSAGE) ||
           (error.kind === 'server' &&
             error.status !== undefined &&
             error.status >= 500 &&
             error.status < 600));
-      if (!retryable) throw error;
+      if (signal?.aborted || !retryable) throw error;
       const progress = await this.request<unknown>(path, options);
       if (!isKavitaProgress(progress)) {
         throw new KavitaError(
@@ -225,16 +228,18 @@ export class KavitaClient {
 
   private async request<T>(path: string, init: ClientRequestInit = {}): Promise<T> {
     if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
-    return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
+    const fetchInit: RequestInit & { settleOnAbort?: boolean } = { ...init };
+    delete fetchInit.settleOnAbort;
+    return this.withBrowserTimeout(fetchInit.signal, async (signal, timeoutSignal) => {
       try {
         const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
-          ...init,
+          ...fetchInit,
           signal,
           headers: {
             Accept: 'application/json',
             'Content-Type': 'application/json',
             'x-api-key': this.apiKey,
-            ...init.headers,
+            ...fetchInit.headers,
           },
         });
 
@@ -242,15 +247,8 @@ export class KavitaClient {
         if (response.status === 204 || response.headers.get('content-length') === '0') {
           return undefined as T;
         }
-        return await this.parseJsonPayload<T>(
-          path,
-          () => settleOnAbort(response.json() as Promise<T>, signal),
-          signal,
-        );
+        return await this.parseJsonPayload<T>(path, () => response.json() as Promise<T>);
       } catch (error) {
-        if (init.signal?.aborted) {
-          throw error instanceof DOMException && error.name === 'AbortError' ? error : abortError();
-        }
         if (error instanceof KavitaError) throw error;
         recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
         const message = timeoutSignal.aborted
@@ -285,6 +283,21 @@ export class KavitaClient {
       let response: HttpResponse;
       while (true) {
         if (init.signal?.aborted) throw abortError();
+        const allowed = this.beforeNativeRequest
+          ? await settleOnAbort(
+              Promise.resolve(this.beforeNativeRequest(init.signal ?? undefined)),
+              init.signal,
+            )
+          : (
+              await settleOnAbort(
+                Network.getStatus().catch(() => null),
+                init.signal,
+              )
+            )?.connected === true;
+        if (init.signal?.aborted) throw abortError();
+        if (!allowed || navigator.onLine === false) {
+          throw new KavitaError(OFFLINE_NETWORK_MESSAGE, 'network');
+        }
         const pendingHop = CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         response = canSettleInFlight
           ? await settleOnAbort(pendingHop, init.signal)
@@ -300,18 +313,14 @@ export class KavitaClient {
       if (init.signal?.aborted) throw abortError();
       if (typeof response.data === 'string') {
         if (!response.data.trim()) return undefined as T;
-        return await this.parseJsonPayload<T>(
-          path,
-          () => JSON.parse(response.data) as T,
-          init.signal,
-        );
+        return await this.parseJsonPayload<T>(path, () => JSON.parse(response.data) as T);
       }
       return response.data as T;
     } catch (error) {
       if (init.signal?.aborted) {
         throw error instanceof DOMException && error.name === 'AbortError' ? error : abortError();
       }
-      if (error instanceof KavitaError) throw error;
+      if (error instanceof KavitaError || error instanceof DOMException) throw error;
       recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
       throw new KavitaError(
         'Kavita could not be reached. Check the address and network.',
@@ -341,7 +350,6 @@ export class KavitaClient {
     signal: AbortSignal | null | undefined,
     run: (combinedSignal: AbortSignal, timeoutSignal: AbortSignal) => Promise<T>,
   ): Promise<T> {
-    if (signal?.aborted) throw abortError();
     const timeout = new AbortController();
     const timer = window.setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
     try {
@@ -352,15 +360,10 @@ export class KavitaClient {
     }
   }
 
-  private async parseJsonPayload<T>(
-    endpoint: string,
-    parse: () => T | Promise<T>,
-    signal?: AbortSignal | null,
-  ): Promise<T> {
+  private async parseJsonPayload<T>(endpoint: string, parse: () => T | Promise<T>): Promise<T> {
     try {
       return await parse();
-    } catch (error) {
-      if (signal?.aborted) throw error;
+    } catch {
       if (endpoint === '/api/Health') return undefined as T;
       recordDiagnostic({ category: 'validation', endpoint, detail: 'invalid-json' });
       throw new KavitaError(

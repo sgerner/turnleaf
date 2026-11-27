@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
-import { settleOnAbort } from '../kavita/client';
+import { KavitaError, OFFLINE_NETWORK_MESSAGE, settleOnAbort } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -229,7 +229,63 @@ it('allows a manual retry after an authorization failure', async () => {
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
 
-it('serializes replacement progress uploads behind an in-flight upload when a caller stops waiting on abort', async () => {
+it('stops between requests when aborted or denied transport without marking skipped items failed', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const controller = new AbortController();
+  let releaseFirst!: () => void;
+  let firstStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    firstStarted = resolve;
+  });
+  const saveProgress = vi.fn().mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        firstStarted();
+        releaseFirst = resolve;
+      }),
+  );
+
+  const flush = flushProgress({ saveProgress } as never, 'server', controller.signal);
+  await started;
+  controller.abort();
+  releaseFirst();
+  await expect(flush).resolves.toBeUndefined();
+
+  expect(saveProgress).toHaveBeenCalledOnce();
+  let saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']).toBeUndefined();
+  expect(saved.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
+  expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+
+  saveProgress.mockRejectedValueOnce(new KavitaError(OFFLINE_NETWORK_MESSAGE, 'network'));
+  await expect(flushProgress({ saveProgress } as never, 'server')).resolves.toBeUndefined();
+
+  saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
+});
+
+it('serializes replacement and reconnect flushes behind an in-flight saveProgress write', async () => {
   vi.useFakeTimers();
   const updatedAt = '2026-09-07T00:00:00.000Z';
   vi.setSystemTime(new Date(updatedAt));
@@ -260,7 +316,8 @@ it('serializes replacement progress uploads behind an in-flight upload when a ca
     });
 
   const client = { saveProgress } as never;
-  const firstFlush = flushProgress(client, 'server');
+  const firstController = new AbortController();
+  const firstFlush = flushProgress(client, 'server', firstController.signal);
   await firstStarted;
 
   const probe = new AbortController();
@@ -268,16 +325,17 @@ it('serializes replacement progress uploads behind an in-flight upload when a ca
   probe.abort();
   await expect(callerWait).rejects.toMatchObject({ name: 'AbortError' });
 
+  firstController.abort();
   vi.setSystemTime(new Date('2026-09-07T00:00:05.000Z'));
   await saveLocalProgress(book, 'cfi-newer', 'xpath-newer', 0.4);
-  const secondFlush = flushProgress(client, 'server');
+  const reconnectFlush = flushProgress(client, 'server', new AbortController().signal);
+  await Promise.resolve();
 
-  expect(secondFlush).toBe(firstFlush);
-  expect(saveProgress).toHaveBeenCalledTimes(1);
+  expect(saveProgress).toHaveBeenCalledOnce();
   expect(events).toEqual(['upload:1:start']);
 
   resolveFirstUpload();
-  await secondFlush;
+  await Promise.all([firstFlush, reconnectFlush]);
 
   expect(events).toEqual([
     'upload:1:start',
@@ -289,9 +347,4 @@ it('serializes replacement progress uploads behind an in-flight upload when a ca
     2,
     expect.objectContaining({ pageNum: 40, bookScrollId: 'xpath-newer' }),
   );
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
-    typeof pendingState
-  >;
-  expect(saved.syncQueue['book-1']).toBeUndefined();
-  expect(saved.readingState['book-1']?.pendingSync).toBe(false);
 });

@@ -3,8 +3,13 @@
 import { flushSync, mount, onDestroy, unmount } from 'svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
-import { clearDiagnostics, getDiagnosticCount } from '../diagnostics/log';
-import type { BookRecord, PendingSyncItem, StoredReadingState } from '../database/database';
+import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import {
+  markSyncFailure,
+  type BookRecord,
+  type PendingSyncItem,
+  type StoredReadingState,
+} from '../database/database';
 import { cacheCover, downloadEpub } from '../downloads/native-download';
 import type { ReaderLocation } from '../reader/session';
 import type * as ThemesModule from '../themes/themes';
@@ -14,7 +19,6 @@ const runtime = vi.hoisted(() => ({
   native: true,
   connected: true,
   networkListeners: new Set<(status: { connected: boolean; connectionType: string }) => void>(),
-  appStateListeners: new Set<(state: { isActive: boolean }) => void>(),
   savedBooks: [] as BookRecord[],
   readingState: null as StoredReadingState | null,
   syncQueue: new Map<string, PendingSyncItem & { serverId: string; lastError: string | null }>(),
@@ -29,9 +33,7 @@ vi.mock('@capacitor/core', () => ({
     isNativePlatform: () => runtime.native,
     convertFileSrc: (value: string) => value,
   },
-  CapacitorHttp: {
-    request: vi.fn(),
-  },
+  CapacitorHttp: { request: vi.fn() },
   registerPlugin: () => ({}),
 }));
 
@@ -47,11 +49,7 @@ vi.mock('@capacitor/network', () => ({
         listener: (status: { connected: boolean; connectionType: string }) => void,
       ) => {
         runtime.networkListeners.add(listener);
-        return {
-          remove: async () => {
-            runtime.networkListeners.delete(listener);
-          },
-        };
+        return { remove: async () => void runtime.networkListeners.delete(listener) };
       },
     ),
   },
@@ -59,14 +57,7 @@ vi.mock('@capacitor/network', () => ({
 
 vi.mock('@capacitor/app', () => ({
   App: {
-    addListener: vi.fn(async (event: string, listener: (state: { isActive: boolean }) => void) => {
-      if (event === 'appStateChange') runtime.appStateListeners.add(listener);
-      return {
-        remove: async () => {
-          runtime.appStateListeners.delete(listener);
-        },
-      };
-    }),
+    addListener: vi.fn(async () => ({ remove: async () => {} })),
     exitApp: vi.fn(async () => {}),
   },
 }));
@@ -90,7 +81,7 @@ vi.mock('../database/database', () => ({
       const current = runtime.syncQueue.get(bookId);
       if (current && current.revision === revision && current.updatedAt === updatedAt) {
         runtime.syncQueue.delete(bookId);
-        if (runtime.readingState) {
+        if (runtime.readingState && bookId === savedBook.id) {
           runtime.readingState = {
             ...runtime.readingState,
             pendingSync: false,
@@ -144,7 +135,6 @@ vi.mock('../database/database', () => ({
     async (book: BookRecord, cfi: string, xpath: string | null, percentage: number) => {
       const now = new Date().toISOString();
       const nextRevision = (runtime.readingState?.syncRevision ?? 0) + 1;
-      const pageNum = Math.round(percentage * book.pages);
       runtime.readingState = {
         cfi,
         xpath,
@@ -163,7 +153,7 @@ vi.mock('../database/database', () => ({
           seriesId: book.seriesId,
           volumeId: book.volumeId,
           chapterId: book.chapterId,
-          pageNum,
+          pageNum: Math.round(percentage * book.pages),
           bookScrollId: xpath,
         }),
         revision: nextRevision,
@@ -198,23 +188,18 @@ vi.mock('../downloads/native-download', () => ({
   })),
 }));
 
-vi.mock('../themes/themes', async (importOriginal) => {
-  const actual = await importOriginal<typeof ThemesModule>();
-  return {
-    ...actual,
-    loadTheme: vi.fn(async () => true),
-    skeletonThemes: ['vintage'],
-  };
-});
+vi.mock('../themes/themes', async (importOriginal) => ({
+  ...(await importOriginal<typeof ThemesModule>()),
+  loadTheme: vi.fn(async () => true),
+  skeletonThemes: ['vintage'],
+}));
 
 vi.mock('./Reader.svelte', () => ({
   default: (_anchor: unknown, props: Record<string, unknown>) => {
     runtime.openedReaderProps = props;
     const onMountChange = props.onMountChange as ((open: boolean) => void) | undefined;
     onMountChange?.(true);
-    onDestroy(() => {
-      onMountChange?.(false);
-    });
+    onDestroy(() => onMountChange?.(false));
     return {};
   },
 }));
@@ -244,12 +229,51 @@ const savedBook: BookRecord = {
 let mounted: Record<string, unknown> | null = null;
 let container: HTMLDivElement;
 
+function emitNetwork(connected: boolean): void {
+  for (const listener of runtime.networkListeners) {
+    listener({ connected, connectionType: connected ? 'wifi' : 'none' });
+  }
+}
+
+function mountLibrary(): void {
+  mounted = mount(Library, {
+    target: container,
+    props: {
+      server: {
+        id: 'primary',
+        displayName: 'Primary',
+        baseUrl: 'https://books.example.com/kavita',
+        credentialRef: 'cred-1',
+        kavitaVersion: '0.8.4',
+        lastConnectedAt: '2026-01-01T00:00:00Z',
+      },
+      apiKey: 'secret',
+      theme: 'vintage',
+      mode: 'light',
+      onThemeChange: () => {},
+      onModeChange: () => {},
+      onApiKeyChange: () => {},
+      onServerDeleted: () => {},
+      onChangeServerAddress: () => {},
+      onOverlayActiveChange: (active: boolean) => void runtime.overlayStates.push(active),
+      onReaderOpenChange: (open: boolean) => void runtime.readerOpenStates.push(open),
+    },
+  });
+}
+
 beforeEach(() => {
   clearDiagnostics();
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
+  Element.prototype.animate ??= () =>
+    ({
+      cancel: () => {},
+      finish: () => {},
+      onfinish: null,
+      finished: Promise.resolve(),
+    }) as unknown as Animation;
   runtime.native = true;
   runtime.connected = true;
   runtime.networkListeners.clear();
-  runtime.appStateListeners.clear();
   runtime.savedBooks = [{ ...savedBook }];
   runtime.readingState = {
     cfi: 'epubcfi(/6/4!/4/2:0)',
@@ -269,17 +293,16 @@ beforeEach(() => {
   vi.mocked(CapacitorHttp.request).mockReset();
   vi.mocked(cacheCover).mockClear();
   vi.mocked(downloadEpub).mockClear();
-  (Element.prototype as { animate?: unknown }).animate ??= () => ({
-    cancel() {},
-    finish() {},
-    onfinish: null,
-    finished: Promise.resolve(),
-  });
+  vi.mocked(markSyncFailure).mockClear();
   container = document.createElement('div');
-  document.body.append(container);
+  container.className = 'app-stage';
+  Object.defineProperty(container, 'clientWidth', { value: 900, configurable: true });
+  Object.defineProperty(container, 'clientHeight', { value: 800, configurable: true });
+  document.body.appendChild(container);
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   if (mounted) {
     unmount(mounted);
     mounted = null;
@@ -287,365 +310,286 @@ afterEach(() => {
   container.remove();
 });
 
-function mountLibrary(): void {
-  mounted = mount(Library, {
-    target: container,
-    props: {
-      server: {
-        id: 'primary',
-        displayName: 'Books',
-        baseUrl: 'https://books.example.com/kavita',
-        credentialRef: 'server_primary_api_key',
-        kavitaVersion: '0.8.0',
-        lastConnectedAt: '2026-01-01T00:00:00Z',
-      },
-      apiKey: 'secret-key',
-      theme: 'vintage',
-      mode: 'dark',
-      onThemeChange: () => {},
-      onModeChange: () => {},
-      onApiKeyChange: () => {},
-      onServerDeleted: () => {},
-      onChangeServerAddress: () => {},
-      onReaderOpenChange: (open) => {
-        runtime.readerOpenStates.push(open);
-      },
-      onOverlayActiveChange: (active) => {
-        runtime.overlayStates.push(active);
-      },
-    },
-  });
-  flushSync();
-}
-
-it('re-enables Refresh immediately on disconnect abort, preserves saved books and transfer origin, and refreshes on reconnect', async () => {
-  const orphanRejects: Array<(reason?: unknown) => void> = [];
-  let healthy = false;
-
-  vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
-    const url = options.url;
-    if (url.includes('/api/Series/v2')) {
-      return {
+it('settles stalled native refresh on disconnect, ignores stale reconnect events, and preserves origin checks', async () => {
+  let rejectOrphanedDetail!: (reason?: unknown) => void;
+  let refreshPhase: 'stalled' | 'recovered' = 'stalled';
+  vi.mocked(CapacitorHttp.request).mockImplementation((options) => {
+    if (options.url.includes('/api/Series/v2')) {
+      return Promise.resolve({
         status: 200,
         headers: {},
-        url,
         data: JSON.stringify([
-          {
-            id: 1,
-            name: 'Saved Series',
-            libraryId: 1,
-            format: 3,
-            pages: 100,
-            pagesRead: 25,
-            created: '2026-01-01T00:00:00Z',
-            latestReadDate: '2026-01-01T00:00:00Z',
-            coverImage: '',
-          },
-          {
-            id: 2,
-            name: 'Remote Series',
-            libraryId: 1,
-            format: 3,
-            pages: 80,
-            pagesRead: 0,
-            created: '2026-01-02T00:00:00Z',
-            latestReadDate: null,
-            coverImage: '',
-          },
+          { id: 1, libraryId: 1, format: 3, name: 'Saved Series', pages: 100 },
         ]),
-      };
-    }
-    if (!healthy) {
-      return new Promise((_, reject) => {
-        orphanRejects.push(reject);
+        url: '',
       });
     }
-    if (url.includes('seriesId=2')) {
-      return {
-        status: 200,
-        headers: {},
-        url,
-        data: JSON.stringify({
-          chapters: [
-            {
-              id: 20,
-              title: 'Remote Downloadable Book',
-              titleName: 'Remote Downloadable Book',
-              volumeId: 2,
-              pages: 80,
-              pagesRead: 0,
-              summary: '',
-              format: 3,
-              files: [{ id: 200, bytes: 2048, extension: '.epub', format: 3 }],
-              writers: [{ name: 'Grace Hopper' }],
-            },
-          ],
-          specials: [],
-          volumes: [],
-          storylineChapters: [],
-        }),
-      };
+    if (refreshPhase === 'stalled') {
+      return new Promise((_, reject) => {
+        rejectOrphanedDetail = reject;
+      });
     }
-    return {
+    return Promise.resolve({
       status: 200,
       headers: {},
-      url,
       data: JSON.stringify({
         chapters: [
           {
-            id: 10,
-            title: 'Refreshed Book',
-            titleName: 'Refreshed Book',
+            id: 20,
             volumeId: 1,
-            pages: 100,
-            pagesRead: 30,
-            summary: '',
             format: 3,
-            files: [{ id: 100, bytes: 1024, extension: '.epub', format: 3 }],
-            writers: [{ name: 'Ada Lovelace' }],
+            pages: 120,
+            pagesRead: 0,
+            titleName: 'Remote Ready Book',
+            files: [{ id: 1, format: 3, pages: 120 }],
           },
         ],
         specials: [],
         volumes: [],
         storylineChapters: [],
       }),
-    };
+      url: '',
+    });
   });
 
   mountLibrary();
-  await vi.waitFor(() => expect(orphanRejects).toHaveLength(2));
+  await vi.waitFor(() => expect(CapacitorHttp.request).toHaveBeenCalledTimes(2));
 
-  const refreshButton = container.querySelector<HTMLButtonElement>(
-    'button[aria-label="Refresh library"]',
-  );
-  expect(refreshButton?.disabled).toBe(true);
-  expect(runtime.overlayStates.at(-1)).toBe(false);
+  const refreshBtn = container.querySelector<HTMLButtonElement>('[aria-label="Refresh library"]');
+  expect(refreshBtn?.disabled).toBe(true);
 
   runtime.connected = false;
-  for (const listener of runtime.networkListeners) {
-    listener({ connected: false, connectionType: 'none' });
-  }
-  flushSync();
-
-  expect(refreshButton?.disabled).toBe(false);
+  emitNetwork(false);
+  await vi.waitFor(() => expect(refreshBtn?.disabled).toBe(false));
   expect(runtime.reconcileCalls).toBe(0);
   expect(container.textContent).toContain('Saved Offline Book');
 
-  healthy = true;
-  runtime.connected = true;
-  for (const listener of runtime.networkListeners) {
-    listener({ connected: true, connectionType: 'wifi' });
-  }
+  const callsWhileOffline = vi.mocked(CapacitorHttp.request).mock.calls.length;
+  emitNetwork(true);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(callsWhileOffline);
+  expect(container.textContent).toContain('No network connection.');
 
+  rejectOrphanedDetail(new Error('SocketTimeoutException'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).not.toContain(
+    'network-error',
+  );
+
+  refreshPhase = 'recovered';
+  runtime.connected = true;
+  emitNetwork(true);
   await vi.waitFor(() => expect(runtime.reconcileCalls).toBe(1));
   flushSync();
-  expect(container.textContent).toContain('Refreshed Book');
-  expect(container.textContent).toContain('Remote Downloadable Book');
 
-  await vi.waitFor(() => expect(cacheCover).toHaveBeenCalled());
-  expect(vi.mocked(cacheCover).mock.calls[0]?.[6]).toBe('https://books.example.com');
+  expect(cacheCover).toHaveBeenCalledWith(
+    'https://books.example.com/kavita/api/Image/series-cover?seriesId=1',
+    'secret',
+    1,
+    expect.any(AbortSignal),
+    'primary',
+    true,
+    'https://books.example.com',
+  );
 
-  const downloadOpenButton = [
-    ...container.querySelectorAll<HTMLButtonElement>('[data-book-open]'),
-  ].find((button) => button.textContent?.includes('Remote Downloadable Book'));
-  expect(downloadOpenButton).toBeDefined();
-  downloadOpenButton?.click();
-  await vi.waitFor(() => expect(downloadEpub).toHaveBeenCalledOnce());
-  expect(vi.mocked(downloadEpub).mock.calls[0]?.[4]).toBe('https://books.example.com');
+  container.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')?.click();
+  flushSync();
+  expect(runtime.overlayStates.at(-1)).toBe(true);
+  container.querySelector<HTMLButtonElement>('[aria-label="Close"]')?.click();
+  flushSync();
 
-  orphanRejects.forEach((reject) => reject(new Error('SocketTimeoutException')));
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(getDiagnosticCount()).toBe(0);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  flushSync();
+  container.querySelector<HTMLButtonElement>('[data-book-open]')?.click();
+  await vi.waitFor(() =>
+    expect(downloadEpub).toHaveBeenCalledWith(
+      'https://books.example.com/kavita/api/Download/chapter?chapterId=20',
+      'secret',
+      'primary-1-20',
+      expect.any(Function),
+      'https://books.example.com',
+    ),
+  );
 });
 
-it('aborts the open progress probe while serializing replacement progress uploads behind in-flight saveProgress and preserving overlay state', async () => {
-  vi.useFakeTimers();
-  try {
-    runtime.readingState = {
-      cfi: 'epubcfi(/6/4!/4/2:0)',
-      xpath: '/body/p[2]',
-      percentage: 0.25,
-      localUpdatedAt: '2026-01-01T00:00:05Z',
-      syncedLocalUpdatedAt: '2026-01-01T00:00:00Z',
-      serverUpdatedAt: '2026-01-01T00:00:00Z',
-      pendingSync: true,
-      syncRevision: 1,
-    };
-    runtime.syncQueue.set(savedBook.id, {
-      bookId: savedBook.id,
+it('stops native progress flush between requests on disconnect and waits for held saveProgress before retrying on reconnect', async () => {
+  runtime.connected = false;
+  for (const [bookId, chapterId, pageNum, updatedAt] of [
+    [savedBook.id, 10, 25, '2026-01-01T00:00:00Z'],
+    ['primary:1:11', 11, 40, '2026-01-01T00:00:01Z'],
+  ] as const) {
+    runtime.syncQueue.set(bookId, {
+      bookId,
       serverId: 'primary',
-      payload: JSON.stringify({
-        libraryId: 1,
-        seriesId: 1,
-        volumeId: 1,
-        chapterId: 10,
-        pageNum: 25,
-        bookScrollId: '/body/p[2]',
-      }),
+      payload: JSON.stringify({ libraryId: 1, seriesId: 1, volumeId: 1, chapterId, pageNum }),
       revision: 1,
-      updatedAt: '2026-01-01T00:00:05Z',
+      updatedAt,
       lastError: null,
     });
+  }
 
-    const seriesPayload = JSON.stringify([
-      {
-        id: 1,
-        name: 'Saved Series',
-        libraryId: 1,
-        format: 3,
-        pages: 100,
-        pagesRead: 25,
-        created: '2026-01-01T00:00:00Z',
-        latestReadDate: '2026-01-01T00:00:00Z',
-        coverImage: '',
-      },
-    ]);
-    const detailPayload = JSON.stringify({
-      chapters: [
-        {
-          id: 10,
-          title: 'Saved Offline Book',
-          titleName: 'Saved Offline Book',
-          volumeId: 1,
-          pages: 100,
-          pagesRead: 25,
-          summary: '',
-          format: 3,
-          files: [{ id: 100, bytes: 1024, extension: '.epub', format: 3 }],
-          writers: [{ name: 'Ada Lovelace' }],
-        },
-      ],
-      specials: [],
-      volumes: [],
-      storylineChapters: [],
-    });
-
-    const uploadedPages: number[] = [];
-    let resolveInitialUpload!: () => void;
-    let rejectProgressOrphan!: (reason?: unknown) => void;
-    let progressCalls = 0;
-
-    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
-      if (options.url.includes('/api/Series/v2')) {
-        return { status: 200, headers: {}, url: options.url, data: seriesPayload };
-      }
-      if (options.url.includes('/api/Series/series-detail')) {
-        return { status: 200, headers: {}, url: options.url, data: detailPayload };
-      }
-      if (options.url.includes('/api/Reader/progress')) {
-        const pageNum = (options.data as { pageNum: number }).pageNum;
-        uploadedPages.push(pageNum);
-        if (uploadedPages.length === 1) {
-          return new Promise((resolve) => {
-            resolveInitialUpload = () =>
-              resolve({ status: 200, headers: {}, url: options.url, data: '' });
-          });
-        }
-        return { status: 200, headers: {}, url: options.url, data: '' };
-      }
-      if (options.url.includes('/api/Reader/get-progress')) {
-        progressCalls += 1;
-        return new Promise((_, reject) => {
-          rejectProgressOrphan = reject;
+  let releaseHeldSave!: () => void;
+  const savedChapterIds: number[] = [];
+  vi.mocked(CapacitorHttp.request).mockImplementation((options) => {
+    if (options.url.includes('/api/Reader/progress')) {
+      const data = options.data as { chapterId: number };
+      savedChapterIds.push(data.chapterId);
+      if (savedChapterIds.length === 1) {
+        return new Promise((resolve) => {
+          releaseHeldSave = () => resolve({ status: 204, headers: {}, data: '', url: '' });
         });
       }
-      return { status: 200, headers: {}, url: options.url, data: '[]' };
-    });
+      return Promise.resolve({ status: 204, headers: {}, data: '', url: '' });
+    }
+    return Promise.resolve({ status: 200, headers: {}, data: '[]', url: '' });
+  });
 
-    mountLibrary();
-    await vi.advanceTimersByTimeAsync(50);
-    flushSync();
+  mountLibrary();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
 
-    // Initial mount started real flushProgress -> CapacitorHttp.request POST /api/Reader/progress (page 25)
-    expect(uploadedPages).toEqual([25]);
-    expect(runtime.overlayStates.at(-1)).toBe(false);
+  runtime.connected = true;
+  emitNetwork(true);
+  await vi.waitFor(() => expect(savedChapterIds).toEqual([10]));
 
-    const continueButton = [...container.querySelectorAll('button')].find(
-      (button) =>
-        button.textContent?.includes('Continue reading') &&
-        button.textContent.includes('Saved Offline Book'),
-    );
-    expect(continueButton).toBeDefined();
-    continueButton?.click();
-    flushSync();
+  runtime.connected = false;
+  emitNetwork(false);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(savedChapterIds).toEqual([10]);
+  expect(markSyncFailure).not.toHaveBeenCalled();
 
-    // While resolvingOpenProgress banner is visible, overlayActive stays false
-    expect(container.textContent).toContain('Opening downloaded book…');
-    expect(runtime.overlayStates.at(-1)).toBe(false);
+  runtime.connected = true;
+  emitNetwork(true);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  expect(savedChapterIds).toEqual([10]);
 
-    await vi.advanceTimersByTimeAsync(1_500);
-    flushSync();
+  releaseHeldSave();
+  await vi.waitFor(() => expect(savedChapterIds).toEqual([10, 11]));
+  expect(runtime.syncQueue.size).toBe(0);
+  expect(markSyncFailure).not.toHaveBeenCalled();
+});
 
-    // Book opened from local state; overlayActive transitioned to true; syncWork is still in flight
-    expect(runtime.openedReaderProps).toMatchObject({ initialCfi: 'epubcfi(/6/4!/4/2:0)' });
-    expect(runtime.overlayStates.at(-1)).toBe(true);
-    expect(runtime.readerOpenStates.at(-1)).toBe(true);
-    expect(progressCalls).toBe(0);
-    expect(uploadedPages).toEqual([25]);
+it('settles checkOpenProgress on 1,500ms timeout without aborting held saveProgress', async () => {
+  runtime.readingState = { ...runtime.readingState!, pendingSync: true };
+  runtime.syncQueue.set(savedBook.id, {
+    bookId: savedBook.id,
+    serverId: 'primary',
+    payload: JSON.stringify({
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 1,
+      chapterId: 10,
+      pageNum: 25,
+      bookScrollId: '/body/p[2]',
+    }),
+    revision: 1,
+    updatedAt: '2026-01-01T00:00:00Z',
+    lastError: null,
+  });
 
-    // Reader saves a newer relocation (page 40) and triggers debounce timer while upload 1 is still pending
-    const onRelocated = runtime.openedReaderProps?.onRelocated as
-      ((location: ReaderLocation) => void) | undefined;
-    expect(onRelocated).toBeTypeOf('function');
-    onRelocated?.({
-      cfi: 'epubcfi(/6/4!/4/8:0)',
-      xpath: '/body/p[8]',
-      href: 'chapter-1.xhtml',
-      percentage: 0.4,
-      spineIndex: 1,
-      pageIndex: 4,
-      pageCount: 10,
-    });
-    await vi.advanceTimersByTimeAsync(2_600);
+  const events: string[] = [];
+  let releaseFirstSave!: () => void;
+  vi.mocked(CapacitorHttp.request).mockImplementation((options) => {
+    if (options.url.includes('/api/Series/v2')) {
+      return Promise.resolve({
+        status: 200,
+        headers: {},
+        data: JSON.stringify([
+          {
+            id: 1,
+            libraryId: 1,
+            format: 3,
+            name: 'Saved Series',
+            pages: 100,
+            pagesRead: 25,
+            latestReadDate: '2026-01-01T00:00:00Z',
+          },
+        ]),
+        url: '',
+      });
+    }
+    if (options.url.includes('/api/Series/series-detail')) {
+      return Promise.resolve({
+        status: 200,
+        headers: {},
+        data: JSON.stringify({
+          chapters: [
+            {
+              id: 10,
+              volumeId: 1,
+              format: 3,
+              pages: 100,
+              pagesRead: 25,
+              titleName: 'Saved Offline Book',
+              files: [{ id: 1, format: 3, pages: 100 }],
+            },
+          ],
+          specials: [],
+          volumes: [],
+          storylineChapters: [],
+        }),
+        url: '',
+      });
+    }
+    if (options.url.includes('/api/Reader/progress')) {
+      const data = options.data as { pageNum: number };
+      events.push(`save:${data.pageNum}:start`);
+      if (events.length === 1) {
+        return new Promise((resolve) => {
+          releaseFirstSave = () => {
+            events.push(`save:${data.pageNum}:settled`);
+            resolve({ status: 204, headers: {}, data: '', url: '' });
+          };
+        });
+      }
+      events.push(`save:${data.pageNum}:settled`);
+      return Promise.resolve({ status: 204, headers: {}, data: '', url: '' });
+    }
+    return new Promise(() => {});
+  });
 
-    // Replacement mutation MUST NOT start until the original saveProgress request actually settles
-    expect(uploadedPages).toEqual([25]);
+  mountLibrary();
+  await vi.waitFor(() => expect(events).toEqual(['save:25:start']));
+  flushSync();
 
-    resolveInitialUpload();
-    await vi.advanceTimersByTimeAsync(50);
+  vi.useFakeTimers();
+  const continueButton = [...container.querySelectorAll<HTMLButtonElement>('button')].find((btn) =>
+    btn.textContent?.includes('Continue reading'),
+  );
+  expect(continueButton).toBeDefined();
+  continueButton?.click();
+  await vi.advanceTimersByTimeAsync(0);
+  flushSync();
 
-    expect(uploadedPages).toEqual([25, 40]);
-    expect(runtime.syncQueue.size).toBe(0);
+  expect(
+    [...container.querySelectorAll('button')].some(
+      (btn) => btn.textContent?.trim() === 'Open offline',
+    ),
+  ).toBe(true);
+  await vi.advanceTimersByTimeAsync(1_500);
+  await vi.waitFor(() => expect(runtime.openedReaderProps).not.toBeNull());
+  expect(runtime.readerOpenStates).toContain(true);
 
-    // Close reader and verify overlayActive returns to false, then test "Open offline" during getProgress
-    const onBack = runtime.openedReaderProps?.onBack as (() => void) | undefined;
-    expect(onBack).toBeTypeOf('function');
-    onBack?.();
-    await vi.advanceTimersByTimeAsync(0);
-    flushSync();
-    expect(runtime.overlayStates.at(-1)).toBe(false);
-    expect(runtime.readerOpenStates.at(-1)).toBe(false);
-    runtime.openedReaderProps = null;
+  const onRelocated = runtime.openedReaderProps?.onRelocated as (loc: ReaderLocation) => void;
+  onRelocated({
+    cfi: 'epubcfi(/6/4!/4/8:0)',
+    xpath: '/body/p[8]',
+    percentage: 0.6,
+    href: 'chapter.xhtml',
+    spineIndex: 0,
+    pageIndex: 5,
+    pageCount: 10,
+  });
+  await vi.advanceTimersByTimeAsync(2_600);
+  expect(events).toEqual(['save:25:start']);
 
-    const secondContinueButton = [...container.querySelectorAll('button')].find(
-      (button) =>
-        button.textContent?.includes('Continue reading') &&
-        button.textContent.includes('Saved Offline Book'),
-    );
-    expect(secondContinueButton).toBeDefined();
-    secondContinueButton?.click();
-    flushSync();
-
-    await vi.advanceTimersByTimeAsync(50);
-    flushSync();
-    expect(progressCalls).toBe(1);
-
-    const openOfflineButton = [...container.querySelectorAll('button')].find((button) =>
-      button.textContent?.includes('Open offline'),
-    );
-    expect(openOfflineButton).toBeDefined();
-    openOfflineButton?.click();
-    await vi.advanceTimersByTimeAsync(0);
-    flushSync();
-
-    expect(progressCalls).toBe(1);
-    expect(runtime.openedReaderProps).toMatchObject({ initialCfi: 'epubcfi(/6/4!/4/8:0)' });
-    expect(runtime.overlayStates.at(-1)).toBe(true);
-
-    rejectProgressOrphan(new Error('SocketTimeoutException'));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(getDiagnosticCount()).toBe(0);
-  } finally {
-    vi.useRealTimers();
-  }
+  releaseFirstSave();
+  await vi.waitFor(() =>
+    expect(events).toEqual([
+      'save:25:start',
+      'save:25:settled',
+      'save:60:start',
+      'save:60:settled',
+    ]),
+  );
 });
