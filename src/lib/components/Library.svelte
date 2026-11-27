@@ -1325,7 +1325,10 @@
     }
   }
 
-  async function open(book: BookRecord, options: { preferFurthest?: boolean } = {}): Promise<void> {
+  async function open(
+    book: BookRecord,
+    options: { preferFurthest?: boolean; replaceReading?: boolean } = {},
+  ): Promise<void> {
     cancelCoverLoading();
     sharedCoverLoader.cancel();
     if (!book.downloadPath) {
@@ -1333,7 +1336,20 @@
       if (refreshed) await open(refreshed, options);
       return;
     }
-    if (destroyed || reading || conflict || resolvingOpenProgress) return;
+    if (destroyed || (reading && !options.replaceReading) || conflict || resolvingOpenProgress) {
+      return;
+    }
+    const failOpen = (errorMessage: string): void => {
+      message = errorMessage;
+      if (options.replaceReading) throw new Error(errorMessage);
+    };
+    const prepareReaderTransition = async (): Promise<boolean> => {
+      if (options.replaceReading && reading) {
+        reading = null;
+        await tick();
+      }
+      return !destroyed;
+    };
     resolvingOpenProgress = true;
     let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
     let local: StoredReadingState | null = null;
@@ -1348,18 +1364,22 @@
         checkOpenProgress(book, options.preferFurthest),
       ]);
       if (!verification.ok) {
-        message =
-          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
+        failOpen(
+          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.',
+        );
         return;
       }
       file = verification.verified;
       if (file && !progress.ok) {
-        message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
+        failOpen('Turnleaf could not load the saved reading position. Try opening the book again.');
         return;
       }
       if (file && progress.ok) [local, remote] = [progress.local, progress.remote];
-    } catch {
-      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
+    } catch (cause) {
+      if (options.replaceReading && cause instanceof Error && message === cause.message) {
+        throw cause;
+      }
+      failOpen('Turnleaf could not load the saved reading position. Try opening the book again.');
       return;
     } finally {
       resolvingOpenProgress = false;
@@ -1370,7 +1390,11 @@
       message = 'The downloaded file is missing. Download it again.';
       books = await getBooks(server.id, { includeDescription: false });
       const refreshed = books.find((item) => item.id === book.id) ?? null;
-      if (refreshed) await open(refreshed, options);
+      if (refreshed) {
+        await open(refreshed, options);
+      } else if (options.replaceReading) {
+        throw new Error(message);
+      }
       return;
     }
     const preferFurthest = shouldPreferFurthest(pendingAutoSync, options.preferFurthest);
@@ -1379,17 +1403,20 @@
       resolvingOpenProgress = true;
       try {
         if (!(await saveRemoteProgress(book, remote, local))) {
-          message = 'The saved reading position changed. Open the book again.';
+          failOpen('The saved reading position changed. Open the book again.');
           return;
         }
         updateRemoteBookProgress(book, remote);
-      } catch {
-        message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
+      } catch (cause) {
+        if (options.replaceReading && cause instanceof Error && message === cause.message) {
+          throw cause;
+        }
+        failOpen('Turnleaf could not save the Kavita reading position. Open the book again.');
         return;
       } finally {
         resolvingOpenProgress = false;
       }
-      if (destroyed) return;
+      if (!(await prepareReaderTransition())) return;
       reading = {
         book,
         url: file.webViewUrl,
@@ -1400,6 +1427,7 @@
       return;
     }
     if (openProgress === 'local') {
+      if (!(await prepareReaderTransition())) return;
       reading = {
         book,
         url: file.webViewUrl,
@@ -1411,9 +1439,11 @@
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
+      if (!(await prepareReaderTransition())) return;
       openConflict({ book, url: file.webViewUrl, local, remote });
       return;
     }
+    if (!(await prepareReaderTransition())) return;
     reading = {
       book,
       url: file.webViewUrl,
@@ -1530,6 +1560,16 @@
 
   async function markReaderBookCompleted(book: BookRecord): Promise<void> {
     if (book.pages <= 0) return;
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    const existingBook = books.find((item) => item.id === book.id);
+    const existingState = await getReadingState(book.id);
+    if (isBookCompleted(existingBook ?? book) && existingState?.percentage === 1) {
+      if (existingState.pendingSync) void syncProgress(false);
+      return;
+    }
     await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     const completedAt = new Date().toISOString();
@@ -1555,9 +1595,7 @@
       }
       target = downloaded;
     }
-    reading = null;
-    await tick();
-    await open(target);
+    await open(target, { replaceReading: true });
   }
 
   async function restoreLibraryBookFocus(

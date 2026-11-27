@@ -105,19 +105,10 @@ export function sameBookSeries(
   a: Pick<BookRecord, 'id' | 'serverId' | 'seriesId' | 'series'>,
   b: Pick<BookRecord, 'id' | 'serverId' | 'seriesId' | 'series'>,
 ): boolean {
-  if (a.serverId !== b.serverId) return false;
-  if (a.series && b.series) {
-    return a.seriesId === b.seriesId || naturalCollator.compare(a.series, b.series) === 0;
-  }
-  if (!a.series && !b.series) {
-    const expectedPrefix = `${a.serverId}:${a.seriesId}:`;
-    return (
-      a.seriesId === b.seriesId &&
-      a.id.startsWith(expectedPrefix) &&
-      b.id.startsWith(expectedPrefix)
-    );
-  }
-  return a.seriesId === b.seriesId;
+  if (a.serverId !== b.serverId || a.seriesId !== b.seriesId) return false;
+  if (a.series?.trim() && b.series?.trim()) return true;
+  const expectedPrefix = `${a.serverId}:${a.seriesId}:`;
+  return a.id.startsWith(expectedPrefix) && b.id.startsWith(expectedPrefix);
 }
 
 /**
@@ -389,8 +380,13 @@ export function selectContinueBook(
     if (isBookCompleted(book) && book.lastReadAt) {
       const nextUnread = findNextSeriesBook(books, book, { offline, unreadOnly: true });
       if (!nextUnread) continue;
+      const nextInProgress =
+        nextUnread.pages > 0 && nextUnread.pagesRead > 0 && nextUnread.pagesRead < nextUnread.pages;
       const candidate = {
-        selection: { book: nextUnread, reason: 'next-in-series' as const },
+        selection: {
+          book: nextUnread,
+          reason: nextInProgress ? ('in-progress' as const) : ('next-in-series' as const),
+        },
         timestamp: book.lastReadAt,
         downloaded: Boolean(nextUnread.downloadPath),
       };
@@ -398,7 +394,7 @@ export function selectContinueBook(
         !latestCandidate ||
         candidate.timestamp.localeCompare(latestCandidate.timestamp) > 0 ||
         (candidate.timestamp === latestCandidate.timestamp &&
-          latestCandidate.selection.reason !== 'in-progress' &&
+          (latestCandidate.selection.reason !== 'in-progress' || nextInProgress) &&
           candidate.downloaded &&
           !latestCandidate.downloaded)
       ) {

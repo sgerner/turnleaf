@@ -1258,3 +1258,39 @@ it('saves normalized browser remote progress and guards against concurrent local
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
 });
+
+it('normalizes omitted sequence fields to null during browser reconcileBooks to match SQLite', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  await saveServer({
+    id: 'server',
+    displayName: 'Test server',
+    baseUrl: 'https://books.example.com',
+    credentialRef: 'credential',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  });
+  await reconcileBooks('server', [
+    {
+      ...existingBook,
+      sortOrder: 2,
+      minNumber: 2,
+      volumeNumber: 2,
+    },
+  ]);
+  expect((await getBooks('server'))[0]).toMatchObject({
+    sortOrder: 2,
+    minNumber: 2,
+    volumeNumber: 2,
+  });
+
+  await reconcileBooks('server', [existingBook]);
+  expect((await getBooks('server'))[0]).toMatchObject({
+    sortOrder: null,
+    minNumber: null,
+    volumeNumber: null,
+  });
+});

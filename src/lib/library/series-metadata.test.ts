@@ -320,4 +320,53 @@ describe('findNextSeriesBook and selectContinueBook', () => {
       reason: 'next-in-series',
     });
   });
+
+  it('keeps distinct Kavita series with identical names isolated in continuation and sorting', () => {
+    const authorAVol1 = makeBook({
+      id: 'server:10:101',
+      seriesId: 10,
+      chapterId: 101,
+      author: 'Ursula K. Le Guin',
+      series: 'Collected Stories',
+      title: 'Volume One',
+      volumeNumber: 1,
+      pages: 100,
+      pagesRead: 100,
+      lastReadAt: '2026-09-12T10:00:00.000Z',
+      downloadPath: 'books/a-vol-1.epub',
+    });
+    const authorBVol2 = makeBook({
+      id: 'server:20:202',
+      seriesId: 20,
+      chapterId: 202,
+      author: 'Ted Chiang',
+      series: 'Collected Stories',
+      title: 'Volume Two',
+      volumeNumber: 2,
+      pages: 150,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: 'books/b-vol-2.epub',
+    });
+
+    expect(
+      findNextSeriesBook([authorAVol1, authorBVol2], authorAVol1, { offline: false }),
+    ).toBeNull();
+    expect(selectContinueBook([authorAVol1, authorBVol2], false)).toBeNull();
+  });
+
+  it('reports in-progress reason when the next unread volume after a completed book already has partial progress', () => {
+    const reMarkedVol1 = { ...vol1, lastReadAt: '2026-09-15T10:00:00.000Z' };
+    const startedVol2 = {
+      ...vol2,
+      pagesRead: 30,
+      lastReadAt: '2026-09-14T10:00:00.000Z',
+      downloadPath: 'books/vol-2.epub',
+    };
+
+    expect(selectContinueBook([reMarkedVol1, startedVol2, vol3], false)).toEqual({
+      book: startedVol2,
+      reason: 'in-progress',
+    });
+  });
 });

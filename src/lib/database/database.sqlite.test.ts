@@ -305,12 +305,13 @@ describe('native metadata transactions against SQLite', () => {
     expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
   });
 
-  it('migrates a populated v7 database to v8 without losing downloads, reading state, or sync queue and persists sequence metadata', async () => {
+  it('migrates a populated v7 database through v8 and v9 without losing downloads, reading state, or sync queue and persists sequence metadata', async () => {
     db = new DatabaseSync(':memory:');
     db.exec('PRAGMA foreign_keys = ON;');
     for (const migration of migrations.filter((item) => item.version <= 7)) {
       db.exec(migration.statements);
     }
+    db.exec('PRAGMA user_version = 7;');
     db.prepare(
       `INSERT INTO server_config
         (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
@@ -361,13 +362,20 @@ describe('native metadata transactions against SQLite', () => {
         VALUES (?, ?, 0, NULL, NULL, ?, ?, 1)`,
     ).run(baseBook.id, '{"pageNum":40}', baseBook.createdAt, baseBook.createdAt);
 
-    const v8 = migrations.find((item) => item.version === 8)!;
-    db.exec(v8.statements);
+    for (const migration of migrations.filter((item) => item.version > 7)) {
+      db.exec(migration.statements);
+      db.exec(`PRAGMA user_version = ${migration.version};`);
+    }
 
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
     expect(readBook(db, baseBook.id)).toMatchObject({
       download_path: baseBook.downloadPath,
       download_status: 'available',
       file_size: baseBook.fileSize,
+      remote_file_size: null,
+      downloaded_bytes: null,
+      downloaded_pages: null,
+      chapter_key: null,
       sort_order: null,
       min_number: null,
       volume_number: null,
@@ -394,6 +402,156 @@ describe('native metadata transactions against SQLite', () => {
       sort_order: 2.5,
       min_number: 2,
       volume_number: 2,
+    });
+  });
+
+  it('upgrades a v7 database with all accepted lineage and sequence columns regardless of merge order', async () => {
+    const pr330Migrations = [
+      ...migrations.filter((item) => item.version <= 7),
+      {
+        version: 8,
+        statements: `
+          ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+          ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+          ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+          ALTER TABLE books ADD COLUMN chapter_key TEXT;
+        `,
+      },
+    ];
+    const expectedColumns = [
+      'remote_file_size',
+      'downloaded_bytes',
+      'downloaded_pages',
+      'chapter_key',
+      'sort_order',
+      'min_number',
+      'volume_number',
+    ];
+
+    function applyPendingMigrations(
+      target: DatabaseSync,
+      catalog: ReadonlyArray<{ version: number; statements: string }>,
+    ): void {
+      const current = Number(
+        (target.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)
+          ?.user_version ?? 0,
+      );
+      for (const migration of catalog) {
+        if (migration.version <= current) continue;
+        target.exec('BEGIN');
+        target.exec(migration.statements);
+        target.exec(`PRAGMA user_version = ${migration.version};`);
+        target.exec('COMMIT');
+      }
+    }
+
+    function seedV7Database(): DatabaseSync {
+      const seeded = new DatabaseSync(':memory:');
+      seeded.exec('PRAGMA foreign_keys = ON;');
+      applyPendingMigrations(
+        seeded,
+        migrations.filter((item) => item.version <= 7),
+      );
+      seeded
+        .prepare(
+          `INSERT INTO server_config
+            (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          'server',
+          'Test server',
+          'https://books.example.com',
+          'credential',
+          null,
+          baseBook.createdAt,
+        );
+      seeded
+        .prepare(
+          `INSERT INTO books
+            (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+             description_html, format, download_path, download_status, file_size, pages, pages_read,
+             created_at, last_read_at, metadata_refreshed_at, remote_available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+        )
+        .run(
+          baseBook.id,
+          baseBook.serverId,
+          baseBook.libraryId,
+          baseBook.seriesId,
+          baseBook.volumeId,
+          baseBook.chapterId,
+          baseBook.title,
+          baseBook.author,
+          baseBook.series,
+          baseBook.descriptionHtml,
+          baseBook.format,
+          baseBook.downloadPath,
+          baseBook.downloadStatus,
+          baseBook.fileSize,
+          baseBook.pages,
+          baseBook.pagesRead,
+          baseBook.createdAt,
+          baseBook.lastReadAt,
+          baseBook.createdAt,
+        );
+      seeded
+        .prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('librarySort', 'title', baseBook.createdAt);
+      return seeded;
+    }
+
+    // Order 1: PR #330 lands first (v7 -> v8), then PR #339 lands second (v8 -> v9).
+    const lineageFirstDb = seedV7Database();
+    try {
+      applyPendingMigrations(lineageFirstDb, pr330Migrations);
+      expect(lineageFirstDb.prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
+      applyPendingMigrations(lineageFirstDb, migrations);
+      expect(lineageFirstDb.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+
+      const columns = (
+        lineageFirstDb.prepare('PRAGMA table_info(books)').all() as Array<{ name: string }>
+      ).map((row) => row.name);
+      expect(columns).toEqual(expect.arrayContaining(expectedColumns));
+
+      const adapter = createAdapter(lineageFirstDb);
+      await replaceBooksInTransaction(adapter, 'server', [
+        { ...baseBook, sortOrder: 1, minNumber: 1, volumeNumber: 1 },
+      ]);
+      lineageFirstDb
+        .prepare(
+          `UPDATE books SET remote_file_size = ?, downloaded_bytes = ?, downloaded_pages = ?, chapter_key = ?
+           WHERE id = ?`,
+        )
+        .run(2048, 1234, 100, 'vol-1.epub', baseBook.id);
+
+      expect(readBook(lineageFirstDb, baseBook.id)).toMatchObject({
+        download_path: baseBook.downloadPath,
+        remote_file_size: 2048,
+        downloaded_bytes: 1234,
+        downloaded_pages: 100,
+        chapter_key: 'vol-1.epub',
+        sort_order: 1,
+        min_number: 1,
+        volume_number: 1,
+      });
+    } finally {
+      lineageFirstDb.close();
+    }
+
+    // Order 2: PR #339 lands first (v7 -> v8 -> v9), then PR #330 rebases/lands second.
+    db = seedV7Database();
+    applyPendingMigrations(db, migrations);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+    applyPendingMigrations(db, pr330Migrations);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+
+    const columns = (db.prepare('PRAGMA table_info(books)').all() as Array<{ name: string }>).map(
+      (row) => row.name,
+    );
+    expect(columns).toEqual(expect.arrayContaining(expectedColumns));
+    expect(db.prepare('SELECT value FROM preferences WHERE key = ?').get('librarySort')).toEqual({
+      value: 'title',
     });
   });
 });

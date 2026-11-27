@@ -108,6 +108,15 @@ export const migrations = [
   {
     version: 8,
     statements: `
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+    `,
+  },
+  {
+    version: 9,
+    statements: `
       ALTER TABLE books ADD COLUMN sort_order REAL;
       ALTER TABLE books ADD COLUMN min_number REAL;
       ALTER TABLE books ADD COLUMN volume_number REAL;

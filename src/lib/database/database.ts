@@ -380,7 +380,15 @@ export async function reconcileBooks(
       const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
       const merged = [...incoming.values()].map((book) => {
         const previous = existingById.get(book.id);
-        if (!previous) return { ...book, remoteAvailable: true };
+        if (!previous) {
+          return {
+            ...book,
+            remoteAvailable: true,
+            sortOrder: book.sortOrder ?? null,
+            minNumber: book.minNumber ?? null,
+            volumeNumber: book.volumeNumber ?? null,
+          };
+        }
         const reading = state.readingState[book.id];
         const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
         const changedDuringRefresh =
@@ -403,6 +411,9 @@ export async function reconcileBooks(
               : previous.fileSize,
           pagesRead: preserveProgress ? previous.pagesRead : book.pagesRead,
           lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
+          sortOrder: book.sortOrder ?? null,
+          minNumber: book.minNumber ?? null,
+          volumeNumber: book.volumeNumber ?? null,
         };
       });
       state.books = [

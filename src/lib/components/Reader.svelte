@@ -728,7 +728,9 @@
     endOfBookOpener = opener;
     endOfBookError = '';
     endOfBookAnnouncement = nextBook
-      ? `Finished ${title}. Next volume ready: ${nextBook.title}.`
+      ? nextBook.available
+        ? `Finished ${title}. Next volume ready: ${nextBook.title}.`
+        : `Finished ${title}. Next volume ${nextBook.title} is unavailable offline.`
       : `Finished ${title}. You have reached the end of this book.`;
     endOfBookVisible = true;
     focusModal(() => endOfBookPanel);
