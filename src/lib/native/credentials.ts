@@ -3,10 +3,22 @@ import { Capacitor } from '@capacitor/core';
 
 const PREFIX = 'turnleaf_';
 const BROWSER_PREFIX = 'turnleaf_browser_';
+let prepared: Promise<void> | null = null;
 
-async function prepare(): Promise<void> {
-  await SecureStorage.setKeyPrefix(PREFIX);
-  await SecureStorage.setSynchronize(false);
+export function prepare(): Promise<void> {
+  if (!Capacitor.isNativePlatform()) {
+    return Promise.resolve();
+  }
+  prepared ??= (async () => {
+    try {
+      await SecureStorage.setKeyPrefix(PREFIX);
+      await SecureStorage.setSynchronize(false);
+    } catch (error) {
+      prepared = null;
+      throw error;
+    }
+  })();
+  return prepared;
 }
 
 function browserStorage(): Storage {

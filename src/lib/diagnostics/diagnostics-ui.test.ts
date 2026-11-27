@@ -70,6 +70,7 @@ vi.mock('../database/database', () => ({
     return env.savedServer;
   }),
   getPreferences: vi.fn(async () => new Map<string, string>()),
+  getBooks: vi.fn(async () => []),
   saveServer: vi.fn(async (server) => {
     if (env.failSaveServer) throw new Error('SQLite write error');
     env.savedServer = server;
@@ -81,6 +82,7 @@ vi.mock('../database/database', () => ({
 }));
 
 vi.mock('../native/credentials', () => ({
+  prepare: vi.fn(async () => undefined),
   getApiKey: vi.fn(async () => {
     if (env.failGetApiKey) throw new Error('Keystore locked');
     return env.savedApiKey;

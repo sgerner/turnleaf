@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="288"
+    android:viewportHeight="288">
+    <!-- Sage right leaf blade (within [72, 216] safe zone for 192dp circular SplashScreen mask) -->
+    <path
+        android:fillColor="#687358"
+        android:pathData="M198.7,77.8 C203.8,105.4 198.4,142.1 175.6,178.2 C170.2,186.8 164.5,193.8 159.8,198.0 C150.4,191.2 141.6,181.2 140.2,167.8 C154.8,150.6 177.2,118.4 198.7,77.8 Z" />
+    <!-- Dark forest inner leaf curl -->
+    <path
+        android:fillColor="#3B4734"
+        android:pathData="M198.7,77.8 C172.4,84.2 148.6,96.8 133.4,114.2 C121.6,127.8 118.8,146.4 126.4,162.8 C131.0,172.4 139.2,179.4 148.8,184.2 C158.6,162.4 178.4,122.6 198.7,77.8 Z" />
+    <!-- Turned cream book page curling over left edge and lower page stack -->
+    <path
+        android:fillColor="#F6EFE4"
+        android:pathData="M150.2,93.6 C122.6,110.8 98.8,139.2 88.2,176.4 C85.8,184.8 84.9,192.2 85.4,198.6 C113.6,199.4 143.2,197.8 170.4,193.0 C155.2,188.6 138.8,178.2 130.6,161.4 C122.2,144.2 126.8,117.4 150.2,93.6 Z" />
+    <!-- Subtle inner page fold highlight -->
+    <path
+        android:fillColor="#E9DEC9"
+        android:pathData="M85.8,194.2 C114.4,194.8 142.8,193.2 170.4,193.0 C168.8,196.4 166.2,198.8 162.6,199.8 C136.4,202.2 110.2,202.6 85.4,198.6 Z" />
+    <!-- Diagonal leaf vein / stem and bottom book cover spine -->
+    <path
+        android:fillColor="#303D29"
+        android:pathData="M198.7,77.8 C166.2,115.6 126.8,159.4 84.6,211.6 L89.8,214.2 C100.2,203.4 106.4,203.2 164.8,202.2 L166.4,197.8 C138.6,198.8 112.4,199.2 95.8,198.6 C133.4,154.6 168.8,116.2 198.7,77.8 Z" />
+</vector>

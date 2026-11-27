@@ -313,6 +313,10 @@ async function run() {
     throwIfInterrupted();
     web = await connectWebView();
     await waitFor('onboarding', () => web.evaluate("!!document.querySelector('input[type=url]')"));
+    const launchMode = await web.evaluate('document.documentElement.dataset.mode');
+    if (launchMode !== 'dark') {
+      throw new Error(`Expected dark launch mode, received ${String(launchMode)}.`);
+    }
     await web.evaluate(`(() => {
       const fill = (selector, value) => {
         const input = document.querySelector(selector);

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
-  import { onMount, untrack } from 'svelte';
+  import { Network } from '@capacitor/network';
+  import { onMount, tick, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
@@ -9,12 +10,14 @@
   import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
   import {
+    getBooks,
     getPreferences,
     getServer,
     resetLocalDatabase,
+    type BookRecord,
     type ServerConfig,
   } from './lib/database/database';
-  import { getApiKey } from './lib/native/credentials';
+  import { getApiKey, prepare as prepareCredentials } from './lib/native/credentials';
   import {
     DEFAULT_MODE,
     DEFAULT_THEME,
@@ -30,6 +33,17 @@
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
+  const startupPreferenceKeys = [
+    themePreferenceKey,
+    modePreferenceKey,
+    'syncFurthest',
+    'librarySort',
+    'libraryAuthor',
+    'librarySeries',
+    'libraryView',
+    'libraryDownloadedOnly',
+    'libraryHideCompleted',
+  ] as const;
 
   let {
     initialTheme,
@@ -53,7 +67,18 @@
     return { theme: DEFAULT_THEME, mode: DEFAULT_MODE };
   }
 
+  function isBrowserOffline(): boolean {
+    return typeof navigator !== 'undefined' && navigator.onLine === false;
+  }
+
   const bootAppearance = resolveInitialAppearance();
+
+  type StartupLibraryHydration = {
+    serverId: string;
+    books: BookRecord[];
+    preferences: ReadonlyMap<string, string>;
+    offline: boolean;
+  };
 
   let server = $state<ServerConfig | null>(null);
   let booting = $state(Capacitor.isNativePlatform());
@@ -66,36 +91,75 @@
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
+  let startupLibrary = $state.raw<StartupLibraryHydration | null>(null);
+  let destroyed = false;
+  let loadGeneration = 0;
 
   async function loadLocalData(): Promise<void> {
+    const generation = ++loadGeneration;
     booting = true;
     startupError = '';
     server = null;
     apiKey = null;
     readerOpen = false;
-    void checkForRelease();
+    startupLibrary = null;
+
+    const credentialsReady = prepareCredentials();
+    void credentialsReady.catch(() => {});
+    let latestNetworkConnected: boolean | undefined;
+    const startupNetworkListener = Promise.resolve(
+      Network.addListener('networkStatusChange', ({ connected }) => {
+        latestNetworkConnected = connected;
+      }),
+    ).catch(() => null);
+    const networkStatusPromise = Network.getStatus().catch(() => null);
+
     try {
       const [saved, preferences] = await Promise.all([
         getServer(),
-        getPreferences([themePreferenceKey, modePreferenceKey]),
+        getPreferences(startupPreferenceKeys),
       ]);
+      if (destroyed || generation !== loadGeneration) return;
+
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
       const requestedTheme = savedTheme && isSkeletonTheme(savedTheme) ? savedTheme : DEFAULT_THEME;
-      const resolvedTheme: SkeletonTheme = (await loadTheme(requestedTheme).catch(() => false))
-        ? requestedTheme
-        : DEFAULT_THEME;
       const resolvedMode = normalizeUiMode(savedMode);
+
+      let credentialFailed = false;
+      const [themeLoaded, loadedKey, savedBooks, networkStatus] = await Promise.all([
+        loadTheme(requestedTheme).catch(() => false),
+        saved
+          ? credentialsReady
+              .then(() => getApiKey(saved.credentialRef))
+              .catch(() => {
+                credentialFailed = true;
+                return null;
+              })
+          : Promise.resolve(null),
+        saved ? getBooks(saved.id, { includeDescription: false }) : Promise.resolve([]),
+        saved ? networkStatusPromise : Promise.resolve(null),
+      ]);
+      if (destroyed || generation !== loadGeneration) return;
+
+      const resolvedTheme: SkeletonTheme = themeLoaded ? requestedTheme : DEFAULT_THEME;
       uiTheme = resolvedTheme;
       uiMode = resolvedMode;
       if (savedTheme !== undefined || savedMode !== undefined) {
         writeBootThemeCache(resolvedTheme, resolvedMode);
       }
+
       if (saved) {
+        const effectiveConnected = latestNetworkConnected ?? networkStatus?.connected === true;
         server = saved;
-        try {
-          apiKey = await getApiKey(saved.credentialRef);
-        } catch {
+        apiKey = loadedKey;
+        startupLibrary = {
+          serverId: saved.id,
+          books: savedBooks,
+          preferences,
+          offline: !effectiveConnected || isBrowserOffline(),
+        };
+        if (credentialFailed) {
           recordDiagnostic({
             category: 'startup',
             endpoint: 'local/credentials',
@@ -106,6 +170,7 @@
         }
       }
     } catch {
+      if (destroyed || generation !== loadGeneration) return;
       recordDiagnostic({
         category: 'startup',
         endpoint: 'local/database',
@@ -114,13 +179,27 @@
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
-      booting = false;
+      void startupNetworkListener.then((handle) => handle?.remove()).catch(() => {});
+      if (!destroyed && generation === loadGeneration) {
+        booting = false;
+      }
+    }
+
+    if (!destroyed && generation === loadGeneration && !releaseBanner) {
+      void tick().then(() => {
+        if (!destroyed && generation === loadGeneration && !releaseBanner) {
+          void checkForRelease();
+        }
+      });
     }
   }
 
   onMount(() => {
     void hydrateDiagnostics();
     void loadLocalData();
+    return () => {
+      destroyed = true;
+    };
   });
 
   async function repairLocalData(): Promise<void> {
@@ -225,21 +304,27 @@
         </div>
       </main>
     {:else if server && apiKey && !changingServerAddress}
+      {@const preloaded = startupLibrary?.serverId === server.id ? startupLibrary : undefined}
       <Library
         {server}
         {apiKey}
         theme={uiTheme}
         mode={uiMode}
+        initialBooks={preloaded?.books}
+        initialPreferences={preloaded?.preferences}
+        initialOffline={preloaded?.offline}
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
         onReaderOpenChange={(open) => (readerOpen = open)}
         onChangeServerAddress={() => {
           readerOpen = false;
+          startupLibrary = null;
           changingServerAddress = true;
         }}
         onServerDeleted={() => {
           readerOpen = false;
+          startupLibrary = null;
           server = null;
           apiKey = null;
         }}
@@ -292,6 +377,7 @@
         editAddress={changingServerAddress}
         onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
         onConnected={(connected, key) => {
+          startupLibrary = null;
           apiKey = key;
           server = connected;
           changingServerAddress = false;

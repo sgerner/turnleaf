@@ -59,37 +59,6 @@
     </issue>
 
     <issue
-        id="IconDipSize"
-        message="The image `splash.png` varies significantly in its density-independent (dip) size across the various density versions: drawable-land-hdpi/splash.png: 533x320 dp (800x480 px), drawable-land-mdpi/splash.png: 480x320 dp (480x320 px), drawable-land-xhdpi/splash.png: 640x360 dp (1280x720 px), drawable-land-xxhdpi/splash.png: 533x320 dp (1600x960 px), drawable-land-xxxhdpi/splash.png: 480x320 dp (1920x1280 px)">
-        <location
-            file="src/main/res/drawable-land-xxxhdpi/splash.png"/>
-        <location
-            file="src/main/res/drawable-land-mdpi/splash.png"/>
-        <location
-            file="src/main/res/drawable-land-xxhdpi/splash.png"/>
-        <location
-            file="src/main/res/drawable-land-hdpi/splash.png"/>
-        <location
-            file="src/main/res/drawable-land-xhdpi/splash.png"/>
-    </issue>
-
-    <issue
-        id="IconDuplicatesConfig"
-        message="The `splash.png` icon has identical contents in the following configuration folders: drawable-land-mdpi, drawable">
-        <location
-            file="src/main/res/drawable/splash.png"/>
-        <location
-            file="src/main/res/drawable-land-mdpi/splash.png"/>
-    </issue>
-
-    <issue
-        id="IconLocation"
-        message="Found bitmap drawable `res/drawable/splash.png` in densityless folder">
-        <location
-            file="src/main/res/drawable/splash.png"/>
-    </issue>
-
-    <issue
         id="IconDuplicates"
         message="The following unrelated icon files have identical contents: ic_launcher.png, ic_launcher_round.png">
         <location
