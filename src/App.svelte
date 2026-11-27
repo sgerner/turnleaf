@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
@@ -18,7 +18,18 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey, prepare as prepareCredentials } from './lib/native/credentials';
-  import { loadTheme } from './lib/themes/themes';
+  import {
+    DEFAULT_MODE,
+    DEFAULT_THEME,
+    isSkeletonTheme,
+    loadTheme,
+    normalizeUiMode,
+    readBootThemeCache,
+    syncShellAppearanceChrome,
+    writeBootThemeCache,
+    type SkeletonTheme,
+    type UiMode,
+  } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
@@ -33,8 +44,30 @@
     'libraryDownloadedOnly',
     'libraryHideCompleted',
   ] as const;
-  const defaultTheme = 'fennec';
-  const defaultMode = 'dark';
+
+  let {
+    initialTheme,
+    initialMode,
+  }: {
+    initialTheme?: SkeletonTheme | undefined;
+    initialMode?: UiMode | undefined;
+  } = $props();
+
+  function resolveInitialAppearance(): { theme: SkeletonTheme; mode: UiMode } {
+    const cached = readBootThemeCache();
+    if (cached) return { theme: cached.theme, mode: cached.mode };
+    if (typeof document !== 'undefined') {
+      const domTheme = document.documentElement.dataset.theme;
+      const domMode = document.documentElement.dataset.mode;
+      return {
+        theme: domTheme && isSkeletonTheme(domTheme) ? domTheme : DEFAULT_THEME,
+        mode: normalizeUiMode(domMode),
+      };
+    }
+    return { theme: DEFAULT_THEME, mode: DEFAULT_MODE };
+  }
+
+  const bootAppearance = resolveInitialAppearance();
 
   type StartupLibraryHydration = {
     serverId: string;
@@ -49,8 +82,8 @@
   let repairing = $state(false);
   let changingServerAddress = $state(false);
   let apiKey = $state<string | null>(null);
-  let uiTheme = $state(defaultTheme);
-  let uiMode = $state<'light' | 'dark'>(defaultMode);
+  let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
+  let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
@@ -80,13 +113,13 @@
 
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
-      const theme = savedTheme ?? defaultTheme;
-      uiMode = savedMode === 'light' ? 'light' : 'dark';
+      const requestedTheme = savedTheme && isSkeletonTheme(savedTheme) ? savedTheme : DEFAULT_THEME;
+      const resolvedMode = normalizeUiMode(savedMode);
 
       if (saved) {
         let credentialFailed = false;
         const [themeLoaded, loadedKey, savedBooks, networkStatus] = await Promise.all([
-          loadTheme(theme).catch(() => false),
+          loadTheme(requestedTheme).catch(() => false),
           credentialsReady
             .then(() => getApiKey(saved.credentialRef))
             .catch(() => {
@@ -98,7 +131,12 @@
         ]);
         if (destroyed || generation !== loadGeneration) return;
 
-        uiTheme = themeLoaded ? theme : defaultTheme;
+        const resolvedTheme: SkeletonTheme = themeLoaded ? requestedTheme : DEFAULT_THEME;
+        uiTheme = resolvedTheme;
+        uiMode = resolvedMode;
+        if (savedTheme !== undefined || savedMode !== undefined) {
+          writeBootThemeCache(resolvedTheme, resolvedMode);
+        }
         server = saved;
         apiKey = loadedKey;
         startupLibrary = {
@@ -118,11 +156,17 @@
         }
       } else {
         const [themeLoaded] = await Promise.all([
-          loadTheme(theme).catch(() => false),
+          loadTheme(requestedTheme).catch(() => false),
           networkStatusPromise,
         ]);
         if (destroyed || generation !== loadGeneration) return;
-        uiTheme = themeLoaded ? theme : defaultTheme;
+
+        const resolvedTheme: SkeletonTheme = themeLoaded ? requestedTheme : DEFAULT_THEME;
+        uiTheme = resolvedTheme;
+        uiMode = resolvedMode;
+        if (savedTheme !== undefined || savedMode !== undefined) {
+          writeBootThemeCache(resolvedTheme, resolvedMode);
+        }
       }
     } catch {
       if (destroyed || generation !== loadGeneration) return;
@@ -188,6 +232,7 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
+    syncShellAppearanceChrome(uiTheme, uiMode, { readerActive: readerOpen });
   });
 </script>
 
