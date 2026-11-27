@@ -2,11 +2,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import { Capacitor } from '@capacitor/core';
 import type * as ThemesModule from '../themes/themes';
+import { KavitaError } from '../kavita/client';
 import {
   getBooks,
   getPendingSync,
   reconcileBooks,
+  removeDownload,
   saveLocalProgress,
   saveServer,
   type BookRecord,
@@ -55,6 +58,7 @@ vi.mock('@capacitor/app', () => ({
   },
 }));
 
+const downloadEpubMock = vi.fn(async () => ({ relativePath: 'books/book-1.epub', size: 1024 }));
 const verifyDownloadedEpubMock = vi.fn(async (path: string) => ({
   relativePath: path,
   webViewUrl: `blob:${path}`,
@@ -67,7 +71,7 @@ vi.mock('../downloads/native-download', () => ({
   clearCoverCache: vi.fn(async () => {}),
   cleanupInterruptedEpubDownloads: vi.fn(async () => {}),
   deleteDownloadedEpub: vi.fn(async () => {}),
-  downloadEpub: vi.fn(async () => ({ relativePath: 'books/book-1.epub', size: 1024 })),
+  downloadEpub: () => downloadEpubMock(),
   verifyDownloadedEpub: (path: string) => verifyDownloadedEpubMock(path),
 }));
 
@@ -193,7 +197,7 @@ function seriesDetailPayload(pagesRead = 0) {
   };
 }
 
-async function waitForCondition(check: () => boolean | Promise<boolean>, timeoutMs = 2_000) {
+async function waitForCondition(check: () => boolean | Promise<boolean>, timeoutMs = 4_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await check()) return;
@@ -238,6 +242,8 @@ beforeEach(async () => {
   networkConnected = true;
   networkListeners.clear();
   appStateListeners.clear();
+  downloadEpubMock.mockReset();
+  downloadEpubMock.mockResolvedValue({ relativePath: 'books/book-1.epub', size: 1024 });
   verifyDownloadedEpubMock.mockClear();
   Object.defineProperty(window, 'localStorage', {
     configurable: true,
@@ -533,7 +539,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     });
 
     const { target } = await mountLibrary({ apiKey: 'revoked-key' });
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    await waitForCondition(() => networkListeners.size > 0 && appStateListeners.size > 0);
 
     // Connect, then disconnect while first catalog refresh is still unwinding
     networkConnected = true;
@@ -604,7 +610,12 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     });
 
     const { target } = await mountLibrary();
-    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+    await waitForCondition(
+      () =>
+        Boolean(target.querySelector('[data-book-open]')) &&
+        networkListeners.size > 0 &&
+        appStateListeners.size > 0,
+    );
 
     // Queue a new local relocation while online right before opening the book
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
@@ -631,5 +642,132 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('ignores redundant online networkStatusChange events and preserves Retry download notices across reconnects', async () => {
+    await removeDownload(seededBook.id);
+    downloadEpubMock.mockRejectedValueOnce(
+      new KavitaError('Cross-origin redirect blocked.', 'network'),
+    );
+
+    let seriesCalls = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Series/v2') {
+        seriesCalls += 1;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => seriesCalls === 1 && networkListeners.size > 0);
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+
+    const openButton = target.querySelector<HTMLButtonElement>('[data-book-open]');
+    expect(openButton).not.toBeNull();
+    openButton!.click();
+
+    const retryReady = () =>
+      Array.from(target.querySelectorAll('button')).some(
+        (button) => !button.disabled && button.textContent?.trim() === 'Retry download',
+      );
+    await waitForCondition(retryReady);
+    expect(target.textContent).toContain(
+      'Cross-origin redirect blocked. Open Settings to copy diagnostics.',
+    );
+
+    // Android ConnectivityCallback.onCapabilitiesChanged fires while already online on Wi-Fi
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(seriesCalls).toBe(1);
+    expect(retryReady()).toBe(true);
+
+    // Real offline -> online transition refreshes the catalog without wiping the Retry download notice
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await waitForCondition(() => seriesCalls === 2);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(retryReady()).toBe(true);
+    expect(target.textContent).toContain(
+      'Cross-origin redirect blocked. Open Settings to copy diagnostics.',
+    );
+  });
+
+  it('settles native reconnects so transient cellular handoffs before going offline dispatch no requests', async () => {
+    networkConnected = false;
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/8)', '//body/p[8]', 0.5, 1);
+
+    const observedPaths: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      observedPaths.push(url.pathname);
+      if (url.pathname === '/api/Reader/progress') {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(50)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(50));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    await mountLibrary();
+    await waitForCondition(() => networkListeners.size > 0 && appStateListeners.size > 0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    vi.useFakeTimers();
+    const nativeSpy = vi.spyOn(Capacitor, 'isNativePlatform');
+
+    // Transient cellular promotion between disabling Wi-Fi and disabling mobile data
+    nativeSpy.mockReturnValueOnce(true);
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await vi.advanceTimersByTimeAsync(600);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Mobile data finishes disabling before the native reconnect settle window elapses
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Sustained reconnect uploads queued progress and refreshes catalog once settled
+    nativeSpy.mockReturnValueOnce(true);
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(100);
+    vi.useRealTimers();
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    await waitForCondition(() => observedPaths.includes('/api/Series/series-detail'));
+    expect(observedPaths).toContain('/api/Reader/progress');
   });
 });
