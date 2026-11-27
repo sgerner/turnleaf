@@ -779,7 +779,7 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected) {
+          if (connected && wasOffline) {
             if (reading || downloadingBookId || resolvingOpenProgress || conflict) {
               refreshAfterReading = true;
               void syncProgress(false);

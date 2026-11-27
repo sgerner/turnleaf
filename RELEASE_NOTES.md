@@ -4,6 +4,10 @@
 
 - Move series metadata migration to SQLite v10 with idempotent column checks
 - Persist series metadata, chapter covers, book details, and continuation
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
