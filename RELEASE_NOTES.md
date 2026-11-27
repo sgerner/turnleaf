@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: settle native WebView connectivity before uploading queued progress on reconnect
 - Move series metadata migration to SQLite v10 with idempotent column checks
 - Persist series metadata, chapter covers, book details, and continuation
 - fix: refresh only after reconnecting from offline

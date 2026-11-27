@@ -544,6 +544,26 @@ describe('native metadata transactions against SQLite', () => {
     },
   );
 
+  it.each([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as const)(
+    'upgrades a v%i schema to v10 with the exact final books column set',
+    async (startVersion) => {
+      db = new DatabaseSync(':memory:');
+      db.exec('PRAGMA foreign_keys = ON;');
+      for (const migration of migrations.filter((item) => item.version <= startVersion)) {
+        db.exec(migration.statements);
+        db.exec(`PRAGMA user_version = ${migration.version};`);
+      }
+
+      await migrateDatabase(createAdapter(db));
+
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+      const columns = (
+        db.prepare("PRAGMA table_info('books')").all() as Array<{ name: string }>
+      ).map((row) => row.name);
+      expect(columns).toEqual(expectedFinalBookColumns);
+    },
+  );
+
   it('skips already-existing columns via PRAGMA table_info when migrations re-run from earlier user_version states', async () => {
     db = seedDatabaseAtVersion(7);
     db.exec(`

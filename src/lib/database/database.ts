@@ -316,6 +316,7 @@ export async function migrateDatabase(
     const filteredStatements: string[] = [];
     const pendingAdditions: Array<{ columns: Set<string>; column: string }> = [];
     const addedInMigration = new Set<string>();
+    let skippedColumn = false;
 
     for (const statement of rawStatements) {
       const match = ALTER_ADD_COLUMN_PATTERN.exec(statement);
@@ -328,16 +329,21 @@ export async function migrateDatabase(
       const normalizedColumn = column.toLowerCase();
       const migrationKey = `${table.toLowerCase()}.${normalizedColumn}`;
       const existingColumns = await getExistingColumns(table);
-      if (existingColumns.has(normalizedColumn) || addedInMigration.has(migrationKey)) continue;
+      if (existingColumns.has(normalizedColumn) || addedInMigration.has(migrationKey)) {
+        skippedColumn = true;
+        continue;
+      }
       filteredStatements.push(statement);
       addedInMigration.add(migrationKey);
       pendingAdditions.push({ columns: existingColumns, column: normalizedColumn });
     }
 
     await executeNativeTransaction(db, [
-      ...(filteredStatements.length > 0
-        ? [{ statement: `${filteredStatements.join('\n')}\n` }]
-        : []),
+      ...(!skippedColumn
+        ? [{ statement: migration.statements }]
+        : filteredStatements.length > 0
+          ? [{ statement: `${filteredStatements.join('\n')}\n` }]
+          : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
 

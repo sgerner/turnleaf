@@ -319,7 +319,10 @@
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   let reconnectTimer: number | null = null;
+  let reconnectRetryCount = 0;
+  let pendingReconnect = false;
   let refreshAfterReading = false;
+  const MAX_RECONNECT_SETTLE_RETRIES = 20;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -716,6 +719,7 @@
     scrollTarget = container ?? window;
     scrollTarget.addEventListener('scroll', scheduleVirtualWindow, { passive: true });
     window.addEventListener('resize', handleWindowResize);
+    window.addEventListener('online', handleWindowOnline);
     scheduleVirtualWindow();
 
     const [preferences, savedBooks] = await Promise.all([
@@ -757,10 +761,9 @@
           const wasOffline = offline;
           offline = !connected;
           if (!connected) {
-            if (reconnectTimer !== null) {
-              window.clearTimeout(reconnectTimer);
-              reconnectTimer = null;
-            }
+            pendingReconnect = false;
+            reconnectRetryCount = 0;
+            clearReconnectTimer();
             if (syncTimer !== null) {
               window.clearTimeout(syncTimer);
               syncTimer = null;
@@ -782,30 +785,30 @@
           if (connected && wasOffline) {
             if (reading || downloadingBookId || resolvingOpenProgress || conflict) {
               refreshAfterReading = true;
+            }
+            if (Capacitor.isNativePlatform()) {
+              pendingReconnect = true;
+              reconnectRetryCount = 0;
+              scheduleReconnectSettle(150);
+            } else if (reading || downloadingBookId || resolvingOpenProgress || conflict) {
               void syncProgress(false);
-            } else if (Capacitor.isNativePlatform()) {
-              if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-              reconnectTimer = window.setTimeout(() => {
-                reconnectTimer = null;
-                void (async () => {
-                  if (destroyed || !(await networkAvailable())) return;
-                  if (reading || downloadingBookId || resolvingOpenProgress || conflict) {
-                    refreshAfterReading = true;
-                    void syncProgress(false);
-                    return;
-                  }
-                  const baselineRevision = activeSyncStartRevision ?? messageRevision;
-                  const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-                  void syncProgress(false);
-                  void startRefresh(false, baselineRevision, baselineMessage);
-                })().catch(() => {});
-              }, 150);
             } else {
               const baselineRevision = activeSyncStartRevision ?? messageRevision;
               const baselineMessage = activeSyncStartRevision !== null ? '' : message;
               void syncProgress(false);
               void startRefresh(false, baselineRevision, baselineMessage);
             }
+          } else if (
+            connected &&
+            Capacitor.isNativePlatform() &&
+            !pendingReconnect &&
+            syncStatus.pendingCount > 0 &&
+            syncTimer === null
+          ) {
+            syncTimer = window.setTimeout(() => {
+              syncTimer = null;
+              if (!destroyed && !offline) void syncProgress(false);
+            }, 150);
           }
         }),
       ),
@@ -833,10 +836,20 @@
       ),
     );
     if (!destroyed && !offline) {
-      const baselineRevision = activeSyncStartRevision ?? messageRevision;
-      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-      void syncProgress(false);
-      await startRefresh(false, baselineRevision, baselineMessage);
+      if (
+        Capacitor.isNativePlatform() &&
+        typeof navigator !== 'undefined' &&
+        navigator.onLine === false
+      ) {
+        pendingReconnect = true;
+        reconnectRetryCount = 0;
+        scheduleReconnectSettle(150);
+      } else {
+        const baselineRevision = activeSyncStartRevision ?? messageRevision;
+        const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+        void syncProgress(false);
+        await startRefresh(false, baselineRevision, baselineMessage);
+      }
     }
   });
 
@@ -850,11 +863,82 @@
     return handle.remove;
   }
 
+  function clearReconnectTimer(): void {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnectSettle(delayMs = 150): void {
+    clearReconnectTimer();
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      void runPendingReconnect();
+    }, delayMs);
+  }
+
+  async function runPendingReconnect(): Promise<void> {
+    if (!pendingReconnect || destroyed || offline) return;
+    if (!(await networkAvailable())) {
+      if (
+        !destroyed &&
+        !offline &&
+        Capacitor.isNativePlatform() &&
+        reconnectRetryCount < MAX_RECONNECT_SETTLE_RETRIES
+      ) {
+        reconnectRetryCount += 1;
+        scheduleReconnectSettle(150);
+      }
+      return;
+    }
+    pendingReconnect = false;
+    reconnectRetryCount = 0;
+    coverReloadRequest += 1;
+    if (reading || downloadingBookId || resolvingOpenProgress || conflict) {
+      refreshAfterReading = true;
+      await syncProgress(false);
+      if (
+        !destroyed &&
+        !offline &&
+        Capacitor.isNativePlatform() &&
+        syncStatus.pendingCount > 0 &&
+        !message.includes('rejected the saved auth key') &&
+        reconnectRetryCount < 3
+      ) {
+        pendingReconnect = true;
+        reconnectRetryCount += 1;
+        scheduleReconnectSettle(500);
+      }
+      return;
+    }
+    const baselineRevision = activeSyncStartRevision ?? messageRevision;
+    const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+    void syncProgress(false);
+    void startRefresh(false, baselineRevision, baselineMessage);
+  }
+
+  function handleWindowOnline(): void {
+    if (destroyed || offline) return;
+    if (pendingReconnect) {
+      clearReconnectTimer();
+      void runPendingReconnect();
+    } else if (syncStatus.pendingCount > 0) {
+      void syncProgress(false);
+    }
+  }
+
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    return (
+      !offline &&
+      !destroyed &&
+      (typeof navigator === 'undefined' || navigator.onLine !== false) &&
+      status?.connected === true
+    );
   }
 
   function canSyncProgress(): boolean | Promise<boolean> {
@@ -925,10 +1009,11 @@
     destroyed = true;
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    clearReconnectTimer();
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
+    window.removeEventListener('online', handleWindowOnline);
     openProgressProbe?.abort();
     refreshController?.abort();
     cancelCoverLoading();
