@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Guard native sync and catalog requests against mid-read offline transitions
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache

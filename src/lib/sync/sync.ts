@@ -23,7 +23,10 @@ export {
   UNCONFIRMED_SYNC_STORAGE_KEY,
 };
 
+export type CanSendProgress = () => boolean | Promise<boolean>;
+
 interface ActiveFlush {
+  canSend: CanSendProgress | undefined;
   client: KavitaClient;
   controller: AbortController;
   outcome: Promise<void>;
@@ -113,10 +116,14 @@ export function flushProgress(
   client: KavitaClient,
   serverId: string,
   signal?: AbortSignal,
+  canSend?: CanSendProgress,
 ): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
   const existing = flushing.get(serverId);
   if (existing && existing.client === client && !existing.controller.signal.aborted) {
+    if (canSend && !existing.canSend) {
+      existing.canSend = canSend;
+    }
     return attachCaller(existing, signal);
   }
   existing?.controller.abort();
@@ -124,6 +131,7 @@ export function flushProgress(
   const subscribers = new Set<symbol>();
 
   const entry: ActiveFlush = {
+    canSend,
     client,
     controller,
     outcome: Promise.resolve(),
@@ -135,7 +143,7 @@ export function flushProgress(
       await existing.settlement;
     }
     if (controller.signal.aborted) return;
-    await run(client, serverId, controller.signal);
+    await run(client, serverId, controller.signal, () => entry.canSend);
   })();
   const settlement = outcome.then(
     () => undefined,
@@ -150,10 +158,16 @@ export function flushProgress(
   return attachCaller(entry, signal);
 }
 
-async function run(client: KavitaClient, serverId: string, signal: AbortSignal): Promise<void> {
+async function run(
+  client: KavitaClient,
+  serverId: string,
+  signal: AbortSignal,
+  getCanSend: () => CanSendProgress | undefined,
+): Promise<void> {
   const failures = new Map<string, unknown>();
   const attempted = new Map<string, PendingSyncItem>();
-  while (!signal.aborted) {
+  let paused = false;
+  while (!signal.aborted && !paused) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
@@ -161,7 +175,6 @@ async function run(client: KavitaClient, serverId: string, signal: AbortSignal):
     if (signal.aborted || pending.length === 0) break;
     for (const item of pending) {
       if (signal.aborted) break;
-      attempted.set(item.bookId, item);
       const cachedOrPromise = getUnconfirmedUpload(serverId, item.bookId);
       const cached = cachedOrPromise instanceof Promise ? await cachedOrPromise : cachedOrPromise;
       const hasMatchingUpload =
@@ -175,6 +188,16 @@ async function run(client: KavitaClient, serverId: string, signal: AbortSignal):
 
       let serverUpdatedAt = hasMatchingUpload ? cached.serverUpdatedAt : undefined;
       if (!serverUpdatedAt) {
+        const guard = getCanSend();
+        if (guard) {
+          const allowed = guard();
+          if (!(allowed instanceof Promise ? await allowed : allowed)) {
+            paused = true;
+            break;
+          }
+        }
+        if (signal.aborted) break;
+        attempted.set(item.bookId, item);
         try {
           const payload = JSON.parse(item.payload) as KavitaProgress;
           await client.saveProgress(payload, signal);
@@ -203,6 +226,8 @@ async function run(client: KavitaClient, serverId: string, signal: AbortSignal):
           failures.set(item.bookId, uploadError);
           continue;
         }
+      } else {
+        attempted.set(item.bookId, item);
       }
 
       try {

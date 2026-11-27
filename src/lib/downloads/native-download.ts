@@ -345,7 +345,7 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
-  allowDownload = true,
+  allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
   serverOrigin?: string,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -361,11 +361,15 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!allowDownload) throw new Error('Offline');
+    const permitted = typeof allowDownload === 'function' ? await allowDownload() : allowDownload;
+    if (!permitted) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
     try {
+      const stillPermitted =
+        typeof allowDownload === 'function' ? await allowDownload() : allowDownload;
+      if (!stillPermitted) throw new Error('Offline');
       await downloadFileWithRedirects({
         initialUrl: target.url,
         normalizedInitialUrl: target.normalizedUrl,

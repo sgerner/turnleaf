@@ -119,7 +119,7 @@
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        networkAvailable,
         serverOrigin,
       );
     }
@@ -258,6 +258,7 @@
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
+  let readerSyncController: AbortController | null = null;
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
@@ -739,8 +740,13 @@
           if (destroyed) return;
           offline = !connected;
           if (!connected) {
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
             refreshController?.abort();
             openProgressProbe?.abort();
+            readerSyncController?.abort();
             if (syncWork) syncSawDisconnect = true;
           }
           coverReloadRequest += 1;
@@ -874,7 +880,10 @@
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id, controller.signal);
+      const canUpload = Capacitor.isNativePlatform()
+        ? networkAvailable
+        : () => !offline && !destroyed;
+      await flushProgress(client, server.id, controller.signal, canUpload);
       if (controller.signal.aborted || destroyed) return;
       if (showFeedback) {
         setMessage(
@@ -917,6 +926,7 @@
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
     openProgressProbe?.abort();
+    readerSyncController?.abort();
     refreshController?.abort();
     syncController?.abort();
     cancelProgressFlush(server.id);
@@ -976,7 +986,10 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        const batchAvailable = Capacitor.isNativePlatform()
+          ? await networkAvailable()
+          : !offline && !destroyed;
+        if (!batchAvailable || controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -1449,11 +1462,16 @@
       savedBook.lastReadAt = lastReadAt;
     }
     if (destroyed) return;
-    if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => {
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer);
       syncTimer = null;
-      void syncProgress(false);
-    }, 2_500);
+    }
+    if (!offline) {
+      syncTimer = window.setTimeout(() => {
+        syncTimer = null;
+        void syncProgress(false);
+      }, 2_500);
+    }
     await refreshSyncStatus();
   }
 
@@ -1472,7 +1490,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, undefined, networkAvailable);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
@@ -1484,7 +1502,19 @@
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
       return null;
     }
-    const remote = await client.getProgress(book.chapterId);
+    if (!(await networkAvailable())) {
+      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
+      return null;
+    }
+    readerSyncController?.abort();
+    const controller = new AbortController();
+    readerSyncController = controller;
+    let remote: KavitaProgress;
+    try {
+      remote = await client.getProgress(book.chapterId, controller.signal);
+    } finally {
+      if (readerSyncController === controller) readerSyncController = null;
+    }
     if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
     return {
       xpath: remote.bookScrollId ?? null,

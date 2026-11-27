@@ -370,3 +370,55 @@ it('records a server-accepted native upload even when the caller aborted before 
     pendingSync: false,
   });
 });
+
+it('stops before dispatching saveProgress when connectivity drops during native pre-upload reads', async () => {
+  const { Filesystem } = await import('@capacitor/filesystem');
+  const {
+    getPendingSync,
+    getReadingState,
+    getSyncStatus,
+    reconcileBooks,
+    saveLocalProgress,
+    saveServer,
+  } = await import('../database/database');
+  const { KavitaClient } = await import('../kavita/client');
+  const { flushProgress } = await import('./sync');
+
+  await saveServer(server);
+  await reconcileBooks(server.id, [book]);
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/12)', '//body/p[12]', 0.35);
+
+  let online = true;
+  vi.mocked(Filesystem.readFile).mockImplementationOnce(async () => {
+    online = false;
+    throw new Error('File does not exist');
+  });
+  nativeEnv.httpRequest.mockResolvedValue({ status: 200, headers: {}, url: '', data: '' });
+
+  const client = new KavitaClient(server.baseUrl, 'native-key');
+  await expect(
+    flushProgress(client, server.id, undefined, async () => online),
+  ).resolves.toBeUndefined();
+
+  expect(nativeEnv.httpRequest).not.toHaveBeenCalled();
+  const stillPending = await getPendingSync(server.id);
+  expect(stillPending).toHaveLength(1);
+  expect(stillPending[0]?.bookId).toBe(book.id);
+  await expect(getSyncStatus(server.id)).resolves.toMatchObject({
+    pendingCount: 1,
+    failedCount: 0,
+    lastError: null,
+  });
+
+  online = true;
+  await expect(
+    flushProgress(client, server.id, undefined, async () => online),
+  ).resolves.toBeUndefined();
+  expect(nativeEnv.httpRequest).toHaveBeenCalledTimes(1);
+  expect(await getPendingSync(server.id)).toEqual([]);
+  expect(await getReadingState(book.id)).toMatchObject({
+    cfi: 'epubcfi(/6/2!/4/12)',
+    xpath: '//body/p[12]',
+    pendingSync: false,
+  });
+});
