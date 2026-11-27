@@ -680,6 +680,119 @@ describe('native progress transactions against SQLite', () => {
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
   });
 
+  it('persists zero-based spine pageNum and completion payloads in SQLite reading_state', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+
+    await database.saveLocalProgress(book, 'cfi-ch0', '//body/p[3]', 0.05, 0);
+    const reopenedCh0 = await reopenDatabase(database);
+    expect(await reopenedCh0.getReadingState(book.id)).toMatchObject({
+      cfi: 'cfi-ch0',
+      pageNum: 0,
+      xpath: '//body/p[3]',
+      percentage: 0.05,
+      pendingSync: true,
+    });
+    expect(JSON.parse((await reopenedCh0.getPendingSync(server.id))[0]!.payload)).toMatchObject({
+      pageNum: 0,
+      bookScrollId: '//body/p[3]',
+    });
+
+    await reopenedCh0.markBookCompleted(book);
+    const reopenedDone = await reopenDatabase(reopenedCh0);
+    expect(await reopenedDone.getReadingState(book.id)).toMatchObject({
+      pageNum: book.pages,
+      xpath: null,
+      percentage: 1,
+      pendingSync: true,
+    });
+    expect(JSON.parse((await reopenedDone.getPendingSync(server.id))[0]!.payload)).toMatchObject({
+      pageNum: book.pages,
+      bookScrollId: null,
+    });
+  });
+
+  it('interleaves progress writes with removeServer and resetLocalDatabase so no stale row survives and nothing is lost', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+    await database.saveLocalProgress(book, 'seed-cfi', '//body/p[1]', 0.02, 0);
+    const initial = (await database.getReadingState(book.id))!;
+
+    const staleResetWrites = Promise.all([
+      database.saveLocalProgress(book, 'stale-cfi', '//body/p[2]', 0.1, 1),
+      database.markBookCompleted(book),
+      database.acceptRemoteProgress(
+        book,
+        { ...book, pageNum: 4, bookScrollId: '//body/p[4]' },
+        initial.syncRevision!,
+        initial.localUpdatedAt,
+      ),
+      database.confirmSync(
+        book.id,
+        '2026-01-02T00:00:00.000Z',
+        initial.syncRevision!,
+        initial.localUpdatedAt,
+      ),
+    ]);
+    const resetDone = database.resetLocalDatabase();
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+    await database.saveLocalProgress(book, 'fresh-cfi', '//body/p[9]', 0.35, 3);
+    await Promise.all([staleResetWrites, resetDone]);
+
+    const afterReset = await reopenDatabase(database);
+    expect(await afterReset.getReadingState(book.id)).toMatchObject({
+      cfi: 'fresh-cfi',
+      pageNum: 3,
+      xpath: '//body/p[9]',
+      percentage: 0.35,
+      pendingSync: true,
+      syncRevision: 1,
+    });
+    expect(await afterReset.getPendingSync(server.id)).toEqual([
+      expect.objectContaining({
+        bookId: book.id,
+        revision: 1,
+        payload: expect.stringContaining('"pageNum":3'),
+      }),
+    ]);
+
+    await Promise.all([
+      afterReset.removeServer(server.id),
+      afterReset.saveLocalProgress(book, 'orphan-cfi', '//body/p[5]', 0.2, 2),
+      afterReset.markBookCompleted(book),
+      afterReset.saveRemoteProgress(
+        book,
+        { ...book, pageNum: 6, bookScrollId: '//body/p[6]' },
+        null,
+      ),
+    ]);
+    expect(
+      native.database
+        ?.prepare(
+          `SELECT
+            (SELECT COUNT(*) FROM books) AS books_count,
+            (SELECT COUNT(*) FROM reading_state) AS reading_state_count,
+            (SELECT COUNT(*) FROM sync_queue) AS sync_queue_count`,
+        )
+        .get(),
+    ).toEqual({ books_count: 0, reading_state_count: 0, sync_queue_count: 0 });
+
+    await afterReset.saveServer(server);
+    await afterReset.reconcileBooks(server.id, [book]);
+    await afterReset.markBookCompleted(book);
+    const afterRemove = await reopenDatabase(afterReset);
+    expect(await afterRemove.getReadingState(book.id)).toMatchObject({
+      pageNum: book.pages,
+      xpath: null,
+      percentage: 1,
+      pendingSync: true,
+      syncRevision: 1,
+    });
+  });
+
   it('serializes reads behind reconcileBooks so mid-transaction remote_available=0 is hidden', async () => {
     const database = await importDatabase();
     await seedDatabase(database);

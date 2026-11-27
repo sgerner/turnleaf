@@ -439,6 +439,7 @@ export class ReaderSession {
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
+    serverPageNum: number | null = null,
   ): Promise<void> {
     this.viewportTarget = target;
     this.rendition = this.book.renderTo(target, {
@@ -621,10 +622,13 @@ export class ReaderSession {
         // A saved CFI can name a section removed in a newer copy of the EPUB.
       }
     }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
+    if (serverXPath && (await this.displayXPath(serverXPath, serverPageNum, restoreGeneration))) {
+      return;
+    }
     if (
-      serverPercentage &&
-      serverPercentage > 0 &&
+      serverPercentage !== null &&
+      Number.isFinite(serverPercentage) &&
+      serverPercentage >= 0 &&
       (await this.displayPercentage(serverPercentage, restoreGeneration))
     ) {
       return;
@@ -841,12 +845,35 @@ export class ReaderSession {
     }
   }
 
-  displayServerLocation(xpath: string): Promise<boolean> {
-    return this.displayXPath(xpath, this.beginLocationOperation(false));
+  displayServerLocation(xpath: string, pageNum: number | null = null): Promise<boolean> {
+    return this.displayXPath(xpath, pageNum, this.beginLocationOperation(false));
   }
 
   displayServerPercentage(percentage: number): Promise<boolean> {
     return this.displayPercentage(percentage, this.beginLocationOperation(false));
+  }
+
+  matchesServerLocation(xpath: string, pageNum: number | null = null): boolean {
+    if (!this.rendition || !this.current) return false;
+    const target = parseKavitaXPath(xpath, pageNum);
+    if (!target || target.spineIndex !== this.current.start.index) return false;
+    const currentXPath = this.cfiToXPath(this.current.start.cfi, this.current.start.index);
+    if (!currentXPath) return false;
+    const currentTarget = parseKavitaXPath(currentXPath, this.current.start.index);
+    if (
+      currentTarget &&
+      currentTarget.spineIndex === target.spineIndex &&
+      currentTarget.contentXPath === target.contentXPath
+    ) {
+      return true;
+    }
+    const contents = (this.rendition.getContents?.() as unknown as Contents[] | undefined)?.find(
+      (item) => item.sectionIndex === target.spineIndex,
+    );
+    if (!contents) return false;
+    const node = resolveContentXPath(contents.document, target.contentXPath);
+    if (!node) return false;
+    return this.elementToXPath(node, target.spineIndex) === currentXPath;
   }
 
   applyAppearance(value: Appearance): void {
@@ -1333,30 +1360,35 @@ export class ReaderSession {
     this.resizeObserver.observe(target);
   }
 
+  private elementToXPath(startElement: Element, spineIndex: number): string | null {
+    let element: Element | null = startElement;
+    const parts: string[] = [];
+    while (element && element.localName !== 'body' && element.localName !== 'html') {
+      const tag = element.localName;
+      let index = 1;
+      for (
+        let sibling = element.previousElementSibling;
+        sibling;
+        sibling = sibling.previousElementSibling
+      ) {
+        if (sibling.localName === tag) index += 1;
+      }
+      parts.push(`${tag}[${index}]`);
+      element = element.parentElement;
+    }
+    return toKavitaXPath(`/${parts.reverse().join('/')}`, spineIndex);
+  }
+
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
     try {
       if (!this.rendition) return null;
       const range = this.rendition.getRange(cfi);
-      let element =
+      const element =
         range.startContainer.nodeType === Node.ELEMENT_NODE
           ? (range.startContainer as Element)
           : range.startContainer.parentElement;
       if (!element) return null;
-      const parts: string[] = [];
-      while (element && element.localName !== 'body' && element.localName !== 'html') {
-        const tag = element.localName;
-        let index = 1;
-        for (
-          let sibling = element.previousElementSibling;
-          sibling;
-          sibling = sibling.previousElementSibling
-        ) {
-          if (sibling.localName === tag) index += 1;
-        }
-        parts.push(`${tag}[${index}]`);
-        element = element.parentElement;
-      }
-      return toKavitaXPath(`/${parts.reverse().join('/')}`, spineIndex);
+      return this.elementToXPath(element, spineIndex);
     } catch {
       return null;
     }
@@ -1375,10 +1407,14 @@ export class ReaderSession {
     return this.isCurrentLocationOperation(generation);
   }
 
-  private async displayXPath(xpath: string, generation: number): Promise<boolean> {
+  private async displayXPath(
+    xpath: string,
+    pageNum: number | null,
+    generation: number,
+  ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    const target = parseKavitaXPath(xpath);
+    const target = parseKavitaXPath(xpath, pageNum);
     if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
@@ -1421,8 +1457,14 @@ export class ReaderSession {
     if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
     const { sections } = this.getSpine();
     if (!sections.length) return false;
-    const position = Math.max(0, Math.min(0.999, percentage));
-    const section = sections[Math.floor(position * sections.length)];
+    const sectionIndex =
+      percentage >= 1
+        ? sections.length - 1
+        : Math.min(
+            sections.length - 1,
+            Math.floor(Math.max(0, percentage) * sections.length + 1e-9),
+          );
+    const section = sections[sectionIndex];
     if (!section) return false;
     try {
       return await this.displayAtGeneration(section.href, generation);

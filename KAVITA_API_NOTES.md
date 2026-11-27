@@ -20,7 +20,7 @@ Kavita supports user-created auth keys through the `x-api-key` header. Turnleaf 
 
 ## Progress caveat
 
-`ProgressDto` requires `libraryId`, `seriesId`, `volumeId`, `chapterId`, and `pageNum`; it optionally returns `bookScrollId` and includes `lastModifiedUtc`. Kavita currently uses a descoped content XPath in `bookScrollId`. Turnleaf will not send a raw EPUB CFI into that field because Kavita's own reader could not interpret it.
+`ProgressDto` requires `libraryId`, `seriesId`, `volumeId`, `chapterId`, and `pageNum`; it optionally returns `bookScrollId` and includes `lastModifiedUtc`. For EPUBs, Kavita maps `pageNum` to the zero-based spine chapter index (`0 .. pages - 1`) during reading and `pages` (with `bookScrollId = null`) when completed, while `bookScrollId` carries a chapter-scoped content XPath (`//body/...` or `id("...")/...`) without a `DocFragment[N]` wrapper. When no `AppUserProgress` record exists yet, Kavita's `SaveReadingProgress` skips creating one if `pageNum === 0`, so Turnleaf bootstraps `pageNum = 1` before persisting non-zero progress inside chapter index `0`. Turnleaf never sends a raw EPUB CFI in `bookScrollId`.
 
 The exact mapping from Kavita's calculated EPUB page to EPUB.js percentage is not specified by OpenAPI. Turnleaf uses the renderer's percentage when available and otherwise derives a stable spine-and-page approximation; XPath is the semantic cross-device locator and CFI remains the authoritative local locator.
 

@@ -3,13 +3,24 @@
 import type { Contents as EpubContents } from 'epubjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
-import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
+import {
+  parseKavitaXPath,
+  resolveContentXPath,
+  resolveKavitaPageNumber,
+  toKavitaXPath,
+} from './kavita-xpath';
 
 const PAGE_WIDTH = 300;
 
 const { testState, mockBook, mockRendition } = vi.hoisted(() => {
   const state = {
-    sections: [] as Array<{ href: string; index: number; contents: EpubContents }>,
+    sections: [] as Array<{
+      href: string;
+      index: number;
+      contents?: EpubContents;
+      load?: () => void;
+      unload?: () => void;
+    }>,
     activeSectionIndex: 0,
     displayedPage: 1,
   };
@@ -23,10 +34,11 @@ const { testState, mockBook, mockRendition } = vi.hoisted(() => {
       select: (name: string) => void;
     },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
+    getRange: vi.fn(),
     location: undefined as { start: { cfi: string } } | undefined,
     getContents: vi.fn(() => {
       const active = state.sections[state.activeSectionIndex];
-      return active ? [active.contents] : [];
+      return active?.contents ? [active.contents] : [];
     }),
     display: vi.fn(async (target?: string) => {
       if (!target) {
@@ -36,7 +48,7 @@ const { testState, mockBook, mockRendition } = vi.hoisted(() => {
       }
       if (target.startsWith('epubcfi(')) {
         const active = state.sections[state.activeSectionIndex];
-        if (!active) throw new Error('No active section');
+        if (!active?.contents) throw new Error('No active section');
         const offset = await active.contents.locationOf(target);
         state.displayedPage = Math.floor(offset.left / PAGE_WIDTH) + 1;
         return;
@@ -53,11 +65,25 @@ const { testState, mockBook, mockRendition } = vi.hoisted(() => {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
     spine: {
-      each: vi.fn((visit: (section: { href: string; index: number }) => void) => {
-        for (const section of state.sections) {
-          visit({ href: section.href, index: section.index });
-        }
-      }),
+      each: vi.fn(
+        (
+          visit: (section: {
+            href: string;
+            index: number;
+            load?: (() => void) | undefined;
+            unload?: (() => void) | undefined;
+          }) => void,
+        ) => {
+          for (const section of state.sections) {
+            visit({
+              href: section.href,
+              index: section.index,
+              load: section.load,
+              unload: section.unload,
+            });
+          }
+        },
+      ),
     },
     navigation: { toc: [] },
   };
@@ -97,44 +123,62 @@ function createSectionContents(
   }
 }
 describe('Kavita EPUB locations', () => {
-  it('adds the one-based Kavita spine fragment to an EPUB content path', () => {
-    expect(toKavitaXPath('/html/body/section[1]/p[4]', 2)).toBe(
-      '//body/DocFragment[3]/body/section[1]/p[4]',
-    );
+  it('serializes active EPUB elements as chapter-scoped Kavita body paths without DocFragment', () => {
+    expect(toKavitaXPath('/html/body/section[1]/p[4]', 2)).toBe('//body/section[1]/p[4]');
+    expect(toKavitaXPath('/html/body', 0)).toBe('//body');
   });
 
   it('removes indexed HTML and body roots produced by EPUB documents', () => {
-    expect(toKavitaXPath('/html[1]/body[1]/div[2]/p[3]', 0)).toBe(
-      '//body/DocFragment[1]/body/div[2]/p[3]',
-    );
+    expect(toKavitaXPath('/html[1]/body[1]/div[2]/p[3]', 0)).toBe('//body/div[2]/p[3]');
   });
 
-  it('maps a Kavita location back to a zero-based EPUB spine and content path', () => {
-    expect(parseKavitaXPath('//body/DocFragment[3]/body/section[1]/p[4]')).toEqual({
-      spineIndex: 2,
-      contentXPath: '/html/body/section[1]/p[4]',
-    });
+  it.each([
+    ['//body/section[1]/p[4]', 0, { spineIndex: 0, contentXPath: '/html/body/section[1]/p[4]' }],
+    ['/body/div[2]/p[1]', 2, { spineIndex: 2, contentXPath: '/html/body/div[2]/p[1]' }],
+    ['/html/body/p[3]', 4, { spineIndex: 4, contentXPath: '/html/body/p[3]' }],
+    ['//body', 1, { spineIndex: 1, contentXPath: '/html/body' }],
+    ['//body/div/p[4]/text()[1].18', 0, { spineIndex: 0, contentXPath: '/html/body/div[1]/p[4]' }],
+    [
+      '/body/DocFragment[2]/body/div/section/p[3]/text().0',
+      undefined,
+      { spineIndex: 1, contentXPath: '/html/body/div[1]/section[1]/p[3]' },
+    ],
+    ['id("note-1")', 0, { spineIndex: 0, contentXPath: 'id("note-1")' }],
+    ['id("sec:1.2")/div/p[2]', 3, { spineIndex: 3, contentXPath: 'id("sec:1.2")/div[1]/p[2]' }],
+    ['//*[@id="fn-4"]/span[2]', 1, { spineIndex: 1, contentXPath: 'id("fn-4")/span[2]' }],
+    [
+      '//body/DocFragment[3]/body/section[1]/p[4]',
+      3,
+      { spineIndex: 2, contentXPath: '/html/body/section[1]/p[4]' },
+    ],
+    ['//body/DocFragment[2]/body/', undefined, { spineIndex: 1, contentXPath: '/html/body' }],
+  ] as const)('parses %s at spine %s into canonical target', (xpath, spine, expected) => {
+    expect(parseKavitaXPath(xpath, spine)).toEqual(expected);
   });
 
-  it('accepts Kavita chapter-body locations with a trailing slash', () => {
-    expect(parseKavitaXPath('//body/DocFragment[2]/body/')).toEqual({
-      spineIndex: 1,
-      contentXPath: '/html/body',
-    });
+  it('resolves legacy DocFragment page numbers without overriding explicit completion', () => {
+    expect(resolveKavitaPageNumber(0, '//body/p[2]', 10)).toBe(0);
+    expect(resolveKavitaPageNumber(3, '//body/DocFragment[3]/body/p[2]', 10)).toBe(2);
+    expect(resolveKavitaPageNumber(10, '//body/DocFragment[3]/body/p[2]', 10)).toBe(10);
   });
 
   it('rejects unscoped and invalid locations instead of opening the wrong chapter', () => {
     expect(parseKavitaXPath('/html/body/p[1]')).toBeNull();
+    expect(parseKavitaXPath('//body/p[1]')).toBeNull();
+    expect(parseKavitaXPath('id("anchor")')).toBeNull();
     expect(parseKavitaXPath('//body/DocFragment[0]/body/p[1]')).toBeNull();
   });
 
-  it('resolves Kavita paths through XHTML-style element names', () => {
+  it('resolves Kavita paths and element-ID anchors through XHTML-style element names', () => {
     const document = new DOMParser().parseFromString(
-      '<html xmlns="http://www.w3.org/1999/xhtml"><body><section><p>one</p><p>two</p></section></body></html>',
+      '<html xmlns="http://www.w3.org/1999/xhtml"><head><meta id="head-only" /></head><body><section id="sec:1.2"><p>one</p><p id="p-two">two</p></section></body></html>',
       'application/xhtml+xml',
     );
     expect(resolveContentXPath(document, '/html/body/section[1]/p[2]')?.textContent).toBe('two');
     expect(resolveContentXPath(document, '/html/body')?.localName).toBe('body');
+    expect(resolveContentXPath(document, 'id("sec:1.2")/p[2]')?.textContent).toBe('two');
+    expect(resolveContentXPath(document, 'id("p-two")')?.textContent).toBe('two');
+    expect(resolveContentXPath(document, 'id("head-only")')).toBeNull();
   });
 
   it('counts XPath indices among siblings of the requested tag', () => {
@@ -318,7 +362,7 @@ describe('ReaderSession XPath restoration', () => {
         expect(cfi).not.toContain('/1:0');
       }
 
-      const chapterOneContents = testState.sections[0]!.contents;
+      const chapterOneContents = testState.sections[0]!.contents!;
       expect(chapterOneContents.range(cfi)).not.toBeNull();
       expect(await chapterOneContents.locationOf(cfi)).toEqual({
         left: (expectedPage - 1) * PAGE_WIDTH,
@@ -397,7 +441,7 @@ describe('ReaderSession XPath restoration', () => {
   });
 
   it('returns false when contents.range(cfi) resolves to null and falls back to serverPercentage', async () => {
-    const chapterOneContents = testState.sections[0]!.contents;
+    const chapterOneContents = testState.sections[0]!.contents!;
     const rangeSpy = vi
       .spyOn(chapterOneContents, 'range')
       .mockReturnValue(null as unknown as Range);
@@ -425,6 +469,118 @@ describe('ReaderSession XPath restoration', () => {
       session.displayServerLocation('//body/DocFragment[1]/body/section[1]/p[2]'),
     ).resolves.toBe(false);
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-one.xhtml');
+
+    session.destroy();
+  });
+
+  it('restores chapter-scoped and ID-anchored Kavita locations using zero-based serverPageNum without loading extra chapters', async () => {
+    const chapterTwo = createSectionContents(
+      `<html xmlns="http://www.w3.org/1999/xhtml"><body>
+        <div id="intro">
+          <p id="first">first</p>
+          <p id="target">target</p>
+        </div>
+      </body></html>`,
+      1,
+      {
+        '#first': 1,
+        '#target': 2,
+      },
+    );
+    createdContents.push(chapterTwo);
+    const loadCh1 = vi.fn();
+    const loadCh3 = vi.fn();
+    testState.sections = [
+      { href: 'chapter-1.xhtml', index: 0, contents: createdContents[0]!, load: loadCh1 },
+      { href: 'chapter-2.xhtml', index: 1, contents: chapterTwo, load: vi.fn() },
+      { href: 'chapter-3.xhtml', index: 2, contents: createdContents[2]!, load: loadCh3 },
+    ];
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      'id("intro")/p[2]',
+      0.5,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+      undefined,
+      undefined,
+      1,
+    );
+
+    expect(mockRendition.display).toHaveBeenNthCalledWith(1, 'chapter-2.xhtml');
+    expect(mockRendition.display.mock.calls[1]?.[0]).toMatch(/^epubcfi\(/);
+    expect(testState.activeSectionIndex).toBe(1);
+    expect(testState.displayedPage).toBe(2);
+    expect(loadCh1).not.toHaveBeenCalled();
+    expect(loadCh3).not.toHaveBeenCalled();
+
+    mockRendition.display.mockClear();
+    await expect(session.displayServerLocation('//body/div[1]/p[2]', 1)).resolves.toBe(true);
+    expect(testState.activeSectionIndex).toBe(1);
+    expect(testState.displayedPage).toBe(2);
+
+    session.destroy();
+  });
+
+  it.each([
+    [49, 1 / 49, 'chapter-2.xhtml'],
+    [2000, 1999 / 2000, 'chapter-2000.xhtml'],
+  ])('maps zero-based chapter percentage for %i-spine EPUB to %s', async (count, pct, expected) => {
+    vi.clearAllMocks();
+    testState.sections = Array.from({ length: count }, (_, index) => ({
+      href: `chapter-${index + 1}.xhtml`,
+      index,
+    }));
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      pct,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(expected);
+    session.destroy();
+  });
+
+  it('matches active chapter elements against both canonical body paths and ID-anchored locators', async () => {
+    const chapterOneContents = testState.sections[0]!.contents!;
+    const secondParagraph = chapterOneContents.document.getElementById('plain-p')!;
+    const range = chapterOneContents.document.createRange();
+    range.setStart(secondParagraph.firstChild!, 0);
+    range.collapse(true);
+    const cfi = chapterOneContents.cfiFromRange(range);
+    mockRendition.getRange.mockReturnValue({ startContainer: secondParagraph });
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      cfi,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
+    relocated?.({
+      start: {
+        cfi,
+        href: 'chapter-one.xhtml',
+        index: 0,
+        displayed: { page: 2, total: 8 },
+      },
+    });
+
+    expect(session.matchesServerLocation('//body/section[1]/p[2]', 0)).toBe(true);
+    expect(session.matchesServerLocation('id("plain-p")', 0)).toBe(true);
+    expect(session.matchesServerLocation('id("main")/p[2]', 0)).toBe(true);
+    expect(session.matchesServerLocation('//body/section[1]/p[2]', 1)).toBe(false);
 
     session.destroy();
   });
