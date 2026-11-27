@@ -441,4 +441,14 @@ it('stops study sync and progress flushing without sending requests or marking f
     }),
   ).rejects.toMatchObject({ name: 'AbortError' });
   expect(client.getSeriesAnnotations).not.toHaveBeenCalled();
+
+  await expect(flushProgress(client as never, 'server', () => false)).rejects.toMatchObject({
+    kind: 'network',
+  });
+  expect(client.saveProgress).not.toHaveBeenCalled();
+
+  // Study syncs leave pending reading progress untouched while conflict resolution is active.
+  await syncLibraryAnnotations(client as never, 'server', [book], undefined, () => true);
+  await syncBookStudyData(client as never, book, undefined, () => true);
+  expect(client.saveProgress).not.toHaveBeenCalled();
 });

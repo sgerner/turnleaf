@@ -107,13 +107,14 @@
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey, networkAvailable));
+  let activeApiKey = $derived(apiKey);
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey, networkAvailable));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
         client.coverUrl(seriesId),
-        apiKey,
+        activeApiKey,
         seriesId,
         signal,
         server.id,
@@ -251,6 +252,7 @@
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
   let message = $state('');
+  let messageRevision = 0;
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
     failedCount: 0,
@@ -259,6 +261,7 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
@@ -786,10 +789,12 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          if (connected) {
+            const baselineRevision = activeSyncStartRevision ?? messageRevision;
+            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+            void syncProgress(false);
+            void startRefresh(false, baselineRevision, baselineMessage);
+          }
         }),
       ),
     );
@@ -817,8 +822,10 @@
       ),
     );
     if (!destroyed && !offline) {
-      await refresh();
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
       void syncProgress(false);
+      await startRefresh(false, baselineRevision, baselineMessage);
     }
   });
 
@@ -832,11 +839,12 @@
     return handle.remove;
   }
 
-  async function networkAvailable(): Promise<boolean> {
+  function networkAvailable(): boolean | Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
-    const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    return Network.getStatus()
+      .then((status) => !offline && !destroyed && status?.connected === true)
+      .catch(() => false);
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -876,18 +884,28 @@
     return syncWork;
   }
 
+  function setMessage(next: string): void {
+    messageRevision += 1;
+    message = next;
+  }
+
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    activeSyncStartRevision = messageRevision;
     try {
-      if (!(await networkAvailable())) {
+      const available = Capacitor.isNativePlatform()
+        ? await networkAvailable()
+        : !offline && !destroyed;
+      if (!available) {
         if (showFeedback)
-          message =
-            'Offline. Pending progress, bookmarks, and notes will retry when Kavita is available.';
+          setMessage(
+            'Offline. Pending progress, bookmarks, and notes will retry when Kavita is available.',
+          );
         return;
       }
       await flushProgress(client, server.id, networkAvailable);
       await refreshStudyCounts();
-      if (showFeedback) message = 'Reading progress, bookmarks, and notes synced.';
+      if (showFeedback) setMessage('Reading progress, bookmarks, and notes synced.');
     } catch (error) {
       if (
         error instanceof AggregateError &&
@@ -895,12 +913,15 @@
           (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
         )
       ) {
-        message = 'Kavita rejected the saved auth key. Update it in Settings to sync with Kavita.';
+        setMessage(
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+        );
       } else if (showFeedback) {
-        message = 'Some updates are waiting to sync. Retry when Kavita is available.';
+        setMessage('Some updates are waiting to sync. Retry when Kavita is available.');
       }
     } finally {
       await refreshSyncStatus();
+      activeSyncStartRevision = null;
       syncing = false;
     }
   }
@@ -923,23 +944,48 @@
   });
 
   function refresh(): Promise<void> {
+    return startRefresh(false);
+  }
+
+  function startRefresh(
+    preserveMessage: boolean,
+    requestedRevision = messageRevision,
+    requestedMessage = message,
+  ): Promise<void> {
     if (destroyed || offline) return Promise.resolve();
-    if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
+    if (refreshWork && refreshController?.signal.aborted) {
+      return refreshWork.then(() =>
+        startRefresh(preserveMessage, requestedRevision, requestedMessage),
+      );
+    }
     if (!refreshWork) {
-      refreshWork = refreshCatalog().finally(() => {
-        refreshWork = null;
-      });
+      const work = refreshCatalog(preserveMessage, requestedRevision, requestedMessage).finally(
+        () => {
+          if (refreshWork === work) {
+            refreshController = null;
+            refreshWork = null;
+            refreshing = false;
+          }
+        },
+      );
+      refreshWork = work;
     }
     return refreshWork;
   }
 
-  async function refreshCatalog(): Promise<void> {
+  async function refreshCatalog(
+    preserveMessage: boolean,
+    initialRevision: number,
+    initialMessage: string,
+  ): Promise<void> {
     refreshing = true;
     const controller = new AbortController();
     refreshController = controller;
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
-    message = '';
+    if (!preserveMessage && messageRevision === initialRevision && message === initialMessage) {
+      message = '';
+    }
     try {
       if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
@@ -1027,9 +1073,6 @@
       } else {
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
-    } finally {
-      refreshController = null;
-      refreshing = false;
     }
   }
 
@@ -1110,7 +1153,7 @@
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
-        apiKey,
+        activeApiKey,
         book.id.replaceAll(':', '-'),
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
@@ -1905,14 +1948,15 @@
       };
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
+      // An upload started with the previous key may still be finishing.
+      while (syncWork) await syncWork;
+      refreshController?.abort();
+      activeApiKey = nextKey;
       onApiKeyChange(nextKey);
       replacementApiKey = '';
-      message = 'API key updated.';
+      setMessage('API key updated.');
       closeSettings();
-      // An upload started with the previous key may still be finishing.
-      await syncWork;
-      await refresh();
-      await syncProgress(false);
+      await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';

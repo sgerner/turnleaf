@@ -27,6 +27,7 @@ import type { StoredAnnotation } from '../reader/annotations';
 import type { StoredReaderLocation } from '../reader/bookmarks';
 
 const flushing = new Map<string, Promise<void>>();
+const flushingStudy = new Map<string, Promise<void>>();
 
 export function flushProgress(
   client: KavitaClient,
@@ -35,10 +36,24 @@ export function flushProgress(
 ): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId, canSync).finally(() => {
+  const current = run(client, serverId, canSync, true).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
+  return current;
+}
+
+function flushStudyItems(
+  client: KavitaClient,
+  serverId: string,
+  canSync?: () => boolean | Promise<boolean>,
+): Promise<void> {
+  const active = flushing.get(serverId) ?? flushingStudy.get(serverId);
+  if (active) return active;
+  const current = run(client, serverId, canSync, false).finally(() => {
+    if (flushingStudy.get(serverId) === current) flushingStudy.delete(serverId);
+  });
+  flushingStudy.set(serverId, current);
   return current;
 }
 
@@ -224,6 +239,7 @@ async function run(
   client: KavitaClient,
   serverId: string,
   canSync?: () => boolean | Promise<boolean>,
+  includeProgress = true,
 ): Promise<void> {
   const failures: unknown[] = [];
   let progressFailureCount = 0;
@@ -231,19 +247,59 @@ async function run(
   const attemptedProgress = new Map<string, PendingSyncItem>();
   const attemptedAnnotations = new Map<string, string>();
   const attemptedBookmarks = new Map<string, string>();
-  const ensureOnline = async (): Promise<boolean> => (canSync ? Boolean(await canSync()) : true);
+  const checkOnline = (): boolean | Promise<boolean> => (canSync ? canSync() : true);
 
   while (true) {
-    const [pendingProgress, pendingAnnotations, pendingBookmarks] = await Promise.all([
-      getPendingSync(serverId),
+    let stoppedOffline = false;
+    let nextProgress: PendingSyncItem[] = [];
+
+    if (includeProgress) {
+      const pendingProgress = await getPendingSync(serverId);
+      nextProgress = pendingProgress.filter((item) => {
+        const previous = attemptedProgress.get(item.bookId);
+        return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
+      });
+
+      for (const item of nextProgress) {
+        const online = checkOnline();
+        if (!(typeof online === 'boolean' ? online : await online)) {
+          stoppedOffline = true;
+          break;
+        }
+        attemptedProgress.set(item.bookId, item);
+        try {
+          await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
+          await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
+        } catch (error) {
+          await markSyncFailure(
+            item.bookId,
+            error instanceof Error ? error.message : 'Sync failed',
+            item.revision,
+            item.updatedAt,
+          );
+          progressFailureCount += 1;
+          failures.push(error);
+        }
+      }
+    }
+
+    if (stoppedOffline) {
+      if (failures.length > 0) break;
+      throw new KavitaError(
+        'Kavita could not be reached. Check the address and network.',
+        'network',
+      );
+    }
+
+    if (includeProgress) {
+      await flushingStudy.get(serverId)?.catch(() => {});
+    }
+
+    const [pendingAnnotations, pendingBookmarks] = await Promise.all([
       getPendingAnnotationSync(serverId),
       getPendingBookmarkSync(serverId),
     ]);
 
-    const nextProgress = pendingProgress.filter((item) => {
-      const previous = attemptedProgress.get(item.bookId);
-      return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
-    });
     const nextAnnotations = pendingAnnotations.filter((item) => {
       const key = `${item.syncState}:${item.syncRevision}:${item.updatedAt}`;
       return attemptedAnnotations.get(item.id) !== key;
@@ -257,57 +313,31 @@ async function run(
       break;
     }
 
-    let stoppedOffline = false;
-
-    for (const item of nextProgress) {
-      if (!(await ensureOnline())) {
+    for (const item of nextAnnotations) {
+      const online = checkOnline();
+      if (!(typeof online === 'boolean' ? online : await online)) {
         stoppedOffline = true;
         break;
       }
-      attemptedProgress.set(item.bookId, item);
+      attemptedAnnotations.set(item.id, `${item.syncState}:${item.syncRevision}:${item.updatedAt}`);
       try {
-        await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
-        await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
+        await syncPendingAnnotation(client, item);
       } catch (error) {
-        await markSyncFailure(
+        await markAnnotationSyncFailure(
+          item.id,
           item.bookId,
-          error instanceof Error ? error.message : 'Sync failed',
-          item.revision,
-          item.updatedAt,
+          error instanceof Error ? error.message : 'Annotation sync failed',
+          item.syncRevision,
         );
-        progressFailureCount += 1;
+        studyFailureCount += 1;
         failures.push(error);
       }
     }
 
     if (!stoppedOffline) {
-      for (const item of nextAnnotations) {
-        if (!(await ensureOnline())) {
-          stoppedOffline = true;
-          break;
-        }
-        attemptedAnnotations.set(
-          item.id,
-          `${item.syncState}:${item.syncRevision}:${item.updatedAt}`,
-        );
-        try {
-          await syncPendingAnnotation(client, item);
-        } catch (error) {
-          await markAnnotationSyncFailure(
-            item.id,
-            item.bookId,
-            error instanceof Error ? error.message : 'Annotation sync failed',
-            item.syncRevision,
-          );
-          studyFailureCount += 1;
-          failures.push(error);
-        }
-      }
-    }
-
-    if (!stoppedOffline) {
       for (const item of nextBookmarks) {
-        if (!(await ensureOnline())) {
+        const online = checkOnline();
+        if (!(typeof online === 'boolean' ? online : await online)) {
           stoppedOffline = true;
           break;
         }
@@ -366,7 +396,7 @@ export async function syncBookStudyData(
   }
 
   try {
-    await flushProgress(client, book.serverId, canSync);
+    await flushStudyItems(client, book.serverId, canSync);
   } catch {
     // Reconcile preserves still-pending local items if a flush item failed.
   }
@@ -398,7 +428,7 @@ export async function syncLibraryAnnotations(
   }
 
   try {
-    await flushProgress(client, serverId, canSync);
+    await flushStudyItems(client, serverId, canSync);
   } catch {
     // Continue pulling remote annotations even if an unrelated queue item failed.
   }
