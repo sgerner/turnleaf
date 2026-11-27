@@ -115,9 +115,7 @@
         throw new Error('Enter a Kavita auth key.');
       }
 
-      const result = await new KavitaClient(normalized.baseUrl, key, {
-        probe: true,
-      }).testConnection();
+      const result = await new KavitaClient(normalized.baseUrl, key).testConnection();
       if (result.bookLibraries.length === 0) {
         recordDiagnostic({
           category: 'validation',

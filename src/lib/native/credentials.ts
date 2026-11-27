@@ -75,11 +75,6 @@ export function subscribeCredentialState(listener: (state: CredentialState) => v
   };
 }
 
-export function isCredentialReady(): boolean {
-  if (!managed) return currentStatus === 'ready';
-  return currentStatus === 'ready' && Boolean(activeApiKey?.trim());
-}
-
 export function resolveCredentialEpoch(apiKey: string, explicitEpoch?: number): number | undefined {
   if (explicitEpoch !== undefined) {
     if (

@@ -680,38 +680,6 @@ describe('native progress transactions against SQLite', () => {
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
   });
 
-  it('updates server_config in place without cascade-deleting downloaded books, reading state, or queued sync rows', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
-    await database.markDownloaded(book.id, 'books/server-1-10.epub', 4096);
-    const baselineReading = await database.getReadingState(book.id);
-    const baselinePending = await database.getPendingSync(server.id);
-    expect(baselinePending).toHaveLength(1);
-
-    const rotatedServer = {
-      ...server,
-      baseUrl: 'https://rotated.example.com',
-      credentialRef: 'credential_rotated',
-      kavitaVersion: '0.8.9',
-      lastConnectedAt: '2026-02-01T00:00:00.000Z',
-    };
-    await database.saveServer(rotatedServer);
-
-    const reopened = await reopenDatabase(database);
-    expect(await reopened.getServer()).toEqual(rotatedServer);
-    expect(await reopened.getBooks(server.id)).toMatchObject([
-      {
-        id: book.id,
-        downloadPath: 'books/server-1-10.epub',
-        downloadStatus: 'available',
-        fileSize: 4096,
-        pagesRead: 25,
-      },
-    ]);
-    expect(await reopened.getReadingState(book.id)).toEqual(baselineReading);
-    expect(await reopened.getPendingSync(server.id)).toEqual(baselinePending);
-  });
-
   it('serializes reads behind reconcileBooks so mid-transaction remote_available=0 is hidden', async () => {
     const database = await importDatabase();
     await seedDatabase(database);

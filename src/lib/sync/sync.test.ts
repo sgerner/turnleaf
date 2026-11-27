@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
-import { KavitaError, KavitaOfflineError } from '../kavita/client';
+import { KavitaError } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -229,102 +229,52 @@ it('allows a manual retry after an authorization failure', async () => {
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
 
-it('stops immediately on a KavitaError authentication failure without trying remaining queued books', async () => {
+it('stops immediately on authentication or in-flight network KavitaErrors without trying remaining queued books', async () => {
   type PendingFixture = ReturnType<typeof pendingState>;
   type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
     readingState: Record<string, PendingFixture['readingState']['book-1']>;
     syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
   };
-  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
-  state.books.push({ ...book, id: 'book-2', chapterId: 2 });
-  state.readingState['book-2'] = {
-    ...state.readingState['book-1']!,
-    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  const buildTwoBookQueue = (): ExpandableFixture => {
+    const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+    state.books.push({ ...book, id: 'book-2', chapterId: 2 });
+    state.readingState['book-2'] = {
+      ...state.readingState['book-1']!,
+      localUpdatedAt: '2026-09-07T00:00:01.000Z',
+    };
+    state.syncQueue['book-2'] = {
+      ...state.syncQueue['book-1']!,
+      bookId: 'book-2',
+      serverId: 'server',
+      payloadJson: '{"pageNum":2}',
+      createdAt: '2026-09-07T00:00:01.000Z',
+      updatedAt: '2026-09-07T00:00:01.000Z',
+      revision: 1,
+    };
+    return state;
   };
-  state.syncQueue['book-2'] = {
-    ...state.syncQueue['book-1']!,
-    bookId: 'book-2',
-    serverId: 'server',
-    payloadJson: '{"pageNum":2}',
-    createdAt: '2026-09-07T00:00:01.000Z',
-    updatedAt: '2026-09-07T00:00:01.000Z',
-    revision: 1,
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
-  const saveProgress = vi
-    .fn()
-    .mockRejectedValueOnce(new KavitaError('Kavita rejected this auth key.', 'authentication', 401))
-    .mockResolvedValueOnce(undefined);
+  for (const error of [
+    new KavitaError('Kavita rejected this auth key.', 'authentication', 401),
+    new KavitaError('Kavita could not be reached. Check the address and network.', 'network'),
+  ]) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(buildTwoBookQueue()));
+    const saveProgress = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(undefined);
 
-  await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
-    '1 reading progress item failed to sync.',
-  );
-  expect(saveProgress).toHaveBeenCalledTimes(1);
+    await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
+      '1 reading progress item failed to sync.',
+    );
+    expect(saveProgress).toHaveBeenCalledTimes(1);
 
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
-  expect(saved.syncQueue['book-1']?.attemptCount).toBe(1);
-  expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
-  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
-  expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ExpandableFixture;
+    expect(saved.syncQueue['book-1']?.attemptCount).toBe(1);
+    expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
+    expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+    expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+  }
 });
 
-it('stops cleanly without attempting queued books or recording sync failures when credentials become unavailable or signal aborts', async () => {
-  type PendingFixture = ReturnType<typeof pendingState>;
-  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
-    readingState: Record<string, PendingFixture['readingState']['book-1']>;
-    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
-  };
-  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
-  state.books.push({ ...book, id: 'book-2', chapterId: 2 });
-  state.readingState['book-2'] = {
-    ...state.readingState['book-1']!,
-    localUpdatedAt: '2026-09-07T00:00:01.000Z',
-  };
-  state.syncQueue['book-2'] = {
-    ...state.syncQueue['book-1']!,
-    bookId: 'book-2',
-    serverId: 'server',
-    payloadJson: '{"pageNum":2}',
-    createdAt: '2026-09-07T00:00:01.000Z',
-    updatedAt: '2026-09-07T00:00:01.000Z',
-    revision: 1,
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-
-  const blockedSave = vi.fn();
-  await expect(
-    flushProgress({ saveProgress: blockedSave, canSendRequests: () => false } as never, 'server'),
-  ).resolves.toBeUndefined();
-  expect(blockedSave).not.toHaveBeenCalled();
-
-  const controller = new AbortController();
-  let canSend = true;
-  const abortingSave = vi.fn(async (_payload: unknown, signal?: AbortSignal) => {
-    expect(signal).toBe(controller.signal);
-    canSend = false;
-    controller.abort();
-    throw new DOMException('Aborted', 'AbortError');
-  });
-
-  await expect(
-    flushProgress(
-      { saveProgress: abortingSave, canSendRequests: () => canSend } as never,
-      'server',
-      controller.signal,
-    ),
-  ).resolves.toBeUndefined();
-  expect(abortingSave).toHaveBeenCalledTimes(1);
-
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
-  expect(saved.syncQueue['book-1']?.attemptCount).toBe(0);
-  expect(saved.syncQueue['book-1']?.lastError).toBeNull();
-  expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
-  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
-  expect(saved.readingState['book-2']?.pendingSync).toBe(true);
-});
-
-it('stops between queued uploads without dispatching or penalizing remaining items when transport drops', async () => {
+it('stops between requests without penalizing unattempted items when AbortSignal aborts, credentials lock, or beforeNativeRequest reports disconnected', async () => {
   type PendingFixture = ReturnType<typeof pendingState>;
   type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
     readingState: Record<string, PendingFixture['readingState']['book-1']>;
@@ -355,48 +305,55 @@ it('stops between queued uploads without dispatching or penalizing remaining ite
     return state;
   };
 
-  // Case A: queueSignal aborts when connectivity drops right after book-1 finishes uploading
+  // 1) Credentials already unavailable before starting
   localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
-  const queueController = new AbortController();
-  let transportOnline = true;
-  const saveProgressOnQueueAbort = vi.fn(async () => {
-    transportOnline = false;
-    queueController.abort();
+  const blockedSave = vi.fn();
+  await expect(
+    flushProgress({ saveProgress: blockedSave, canSendRequests: () => false } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(blockedSave).not.toHaveBeenCalled();
+
+  // 2) AbortSignal aborts right after book-1 finishes uploading -> book-1 confirmed, book-2 & book-3 untouched
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
+  const controller = new AbortController();
+  const saveProgressOnAbort = vi.fn(async (_payload: unknown, signal?: AbortSignal) => {
+    expect(signal).toBe(controller.signal);
+    controller.abort();
   });
 
   await expect(
-    flushProgress({ saveProgress: saveProgressOnQueueAbort } as never, 'server', {
-      queueSignal: queueController.signal,
-      canContinue: () => transportOnline,
-    }),
+    flushProgress({ saveProgress: saveProgressOnAbort } as never, 'server', controller.signal),
   ).resolves.toBeUndefined();
-  expect(saveProgressOnQueueAbort).toHaveBeenCalledTimes(1);
+  expect(saveProgressOnAbort).toHaveBeenCalledTimes(1);
 
-  const afterQueueAbort = JSON.parse(
-    localStorage.getItem(STORAGE_KEY) ?? '{}',
-  ) as ExpandableFixture;
-  expect(afterQueueAbort.syncQueue['book-1']).toBeUndefined();
-  expect(afterQueueAbort.readingState['book-1']?.pendingSync).toBe(false);
-  expect(afterQueueAbort.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
-  expect(afterQueueAbort.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
+  const afterAbort = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ExpandableFixture;
+  expect(afterAbort.syncQueue['book-1']).toBeUndefined();
+  expect(afterAbort.readingState['book-1']?.pendingSync).toBe(false);
+  expect(afterAbort.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
+  expect(afterAbort.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
 
-  // Case B: live pre-dispatch gate in client.saveProgress throws KavitaOfflineError on book-2
-  // before any HTTP request is transmitted -> stops immediately without touching book-3 or marking failure
+  // 3) beforeNativeRequest throws pre-dispatch 'No network connection.' on book-2 -> stops without penalizing book-2 or book-3
   localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
-  const saveProgressOfflineGate = vi
+  const saveProgressTransportDrop = vi
     .fn()
     .mockResolvedValueOnce(undefined)
-    .mockRejectedValueOnce(new KavitaOfflineError());
+    .mockRejectedValueOnce(new KavitaError('No network connection.', 'network'));
 
   await expect(
-    flushProgress({ saveProgress: saveProgressOfflineGate } as never, 'server'),
+    flushProgress({ saveProgress: saveProgressTransportDrop } as never, 'server'),
   ).resolves.toBeUndefined();
-  expect(saveProgressOfflineGate).toHaveBeenCalledTimes(2);
+  expect(saveProgressTransportDrop).toHaveBeenCalledTimes(2);
 
-  const afterOfflineGate = JSON.parse(
+  const afterTransportDrop = JSON.parse(
     localStorage.getItem(STORAGE_KEY) ?? '{}',
   ) as ExpandableFixture;
-  expect(afterOfflineGate.syncQueue['book-1']).toBeUndefined();
-  expect(afterOfflineGate.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
-  expect(afterOfflineGate.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
+  expect(afterTransportDrop.syncQueue['book-1']).toBeUndefined();
+  expect(afterTransportDrop.syncQueue['book-2']).toMatchObject({
+    attemptCount: 0,
+    lastError: null,
+  });
+  expect(afterTransportDrop.syncQueue['book-3']).toMatchObject({
+    attemptCount: 0,
+    lastError: null,
+  });
 });

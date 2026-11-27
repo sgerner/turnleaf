@@ -390,10 +390,8 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
-  private pendingViewportSize: { width: number; height: number } | null = null;
   private viewportTarget: HTMLElement | null = null;
   private epubContainer: HTMLElement | null = null;
-  private opening = false;
   private lockedScrollLeft = 0;
   private displayOperationCount = 0;
   private aligningFocusTarget: Element | null = null;
@@ -442,22 +440,14 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
-    const initialRect = target.getBoundingClientRect();
-    const initialWidth = Math.floor(initialRect.width);
-    const initialHeight = Math.floor(initialRect.height);
-    const hasResizeObserver = typeof ResizeObserver !== 'undefined';
-
     this.viewportTarget = target;
-    this.viewportSize = { width: initialWidth, height: initialHeight };
-    this.opening = true;
-    this.pendingViewportSize = null;
     this.rendition = this.book.renderTo(target, {
-      width: hasResizeObserver && initialWidth > 0 ? initialWidth : '100%',
-      height: hasResizeObserver && initialHeight > 0 ? initialHeight : '100%',
+      width: '100%',
+      height: '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: !hasResizeObserver,
+      resizeOnOrientationChange: true,
       allowScriptedContent: false,
     });
     this.observeViewport(target);
@@ -574,11 +564,7 @@ export class ReaderSession {
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
-        if (!this.flushPendingViewportResize()) {
-          this.preserveCfi(location.start.cfi, this.locationGeneration);
-        }
-      } else {
-        this.flushPendingViewportResize();
+        this.preserveCfi(location.start.cfi, this.locationGeneration);
       }
     };
     this.rendition.on('relocated', this.relocated);
@@ -625,16 +611,25 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    try {
-      await this.rendition.started;
-      this.bindEpubContainer();
-      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-      await this.displayInitialLocation(cfi, serverXPath, serverPercentage, restoreGeneration);
-    } finally {
-      this.opening = false;
-    }
+    await this.rendition.started;
+    this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    this.flushPendingViewportResize();
+    if (cfi) {
+      try {
+        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
+      } catch {
+        // A saved CFI can name a section removed in a newer copy of the EPUB.
+      }
+    }
+    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
+    if (
+      serverPercentage &&
+      serverPercentage > 0 &&
+      (await this.displayPercentage(serverPercentage, restoreGeneration))
+    ) {
+      return;
+    }
+    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -955,9 +950,7 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
-    this.pendingViewportSize = null;
     this.viewportTarget = null;
-    this.opening = false;
     this.lockedScrollLeft = 0;
     this.displayOperationCount = 0;
     this.aligningFocusTarget = null;
@@ -1135,14 +1128,7 @@ export class ReaderSession {
   }
 
   private isProgrammaticScrollAllowed(): boolean {
-    const rendition = this.rendition as
-      (Rendition & { displaying?: unknown; manager?: { ignore?: boolean } }) | null;
-    return (
-      this.displayOperationCount > 0 ||
-      this.userNavigationPending ||
-      Boolean(rendition?.displaying) ||
-      Boolean(rendition?.manager?.ignore)
-    );
+    return this.displayOperationCount > 0 || this.userNavigationPending;
   }
 
   private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1321,77 +1307,9 @@ export class ReaderSession {
     return cfi && text ? [{ cfi, text }] : [];
   }
 
-  private canResizeRendition(): boolean {
-    const rendition = this.rendition as
-      (Rendition & { manager?: { stage?: unknown } | undefined }) | null;
-    if (!rendition || this.opening || this.userNavigationPending) return false;
-    if ('manager' in rendition) {
-      return Boolean(
-        rendition.manager &&
-        rendition.manager.stage &&
-        (rendition.location?.start || this.current?.start),
-      );
-    }
-    return true;
-  }
-
-  private applyViewportResize(width: number, height: number): void {
-    const rendition = this.rendition;
-    if (!rendition) return;
-    this.viewportSize = { width, height };
-    const queue = (
-      rendition as Rendition & { q?: { enqueue?: (task: () => void) => Promise<unknown> } }
-    ).q;
-    this.displayOperationCount += 1;
-    let settledAsync = false;
-    try {
-      rendition.resize(width, height);
-      if (typeof queue?.enqueue === 'function') {
-        settledAsync = true;
-        void queue
-          .enqueue(() => {})
-          .finally(() => {
-            if (this.rendition !== rendition) return;
-            const container = this.bindEpubContainer();
-            if (container) this.lockedScrollLeft = container.scrollLeft;
-            this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-            this.syncVisibleColumnLinks();
-          });
-      }
-    } finally {
-      if (!settledAsync) {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-        this.syncVisibleColumnLinks();
-      }
-    }
-  }
-
-  private flushPendingViewportResize(): boolean {
-    if (!this.canResizeRendition()) return false;
-    let nextSize = this.pendingViewportSize;
-    if (!nextSize && this.viewportTarget) {
-      const rect = this.viewportTarget.getBoundingClientRect();
-      const width = Math.floor(rect.width);
-      const height = Math.floor(rect.height);
-      if (width > 0 && height > 0) {
-        nextSize = { width, height };
-      }
-    }
-    if (!nextSize || !nextSize.width || !nextSize.height) return false;
-    this.pendingViewportSize = null;
-    if (
-      this.viewportSize?.width === nextSize.width &&
-      this.viewportSize.height === nextSize.height
-    ) {
-      return false;
-    }
-    this.applyViewportResize(nextSize.width, nextSize.height);
-    return true;
-  }
-
   private observeViewport(target: HTMLElement): void {
+    const initial = target.getBoundingClientRect();
+    this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -1400,42 +1318,19 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
-      if (this.viewportSize?.width === width && this.viewportSize.height === height) {
-        this.pendingViewportSize = null;
-        return;
+      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+      this.viewportSize = { width, height };
+      this.displayOperationCount += 1;
+      try {
+        this.rendition.resize(width, height);
+      } finally {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+        this.syncVisibleColumnLinks();
       }
-      if (!this.canResizeRendition()) {
-        this.pendingViewportSize = { width, height };
-        return;
-      }
-      this.pendingViewportSize = null;
-      this.applyViewportResize(width, height);
     });
     this.resizeObserver.observe(target);
-  }
-
-  private async displayInitialLocation(
-    cfi: string | null,
-    serverXPath: string | null,
-    serverPercentage: number | null,
-    restoreGeneration: number,
-  ): Promise<void> {
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
-      }
-    }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {

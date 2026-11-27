@@ -2,8 +2,7 @@
 
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
-import { Network } from '@capacitor/network';
-import { KavitaClient, KavitaError, KavitaOfflineError } from './client';
+import { KavitaClient, KavitaError } from './client';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import {
   getCredentialState,
@@ -14,7 +13,7 @@ import {
   syncLoadedCredential,
 } from '../native/credentials';
 
-const capacitorRuntime = vi.hoisted(() => ({ native: false, connected: true }));
+const capacitorRuntime = vi.hoisted(() => ({ native: false }));
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
@@ -27,26 +26,10 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
-vi.mock('@capacitor/network', () => ({
-  Network: {
-    getStatus: vi.fn(async () => ({
-      connected: capacitorRuntime.connected,
-      connectionType: capacitorRuntime.connected ? 'wifi' : 'none',
-    })),
-  },
-}));
-
 beforeEach(() => {
   clearDiagnostics();
   resetCredentialState();
   capacitorRuntime.native = false;
-  capacitorRuntime.connected = true;
-  vi.mocked(Network.getStatus)
-    .mockReset()
-    .mockImplementation(async () => ({
-      connected: capacitorRuntime.connected,
-      connectionType: capacitorRuntime.connected ? 'wifi' : 'none',
-    }));
   vi.mocked(CapacitorHttp.get).mockReset();
   vi.mocked(CapacitorHttp.request).mockReset();
   const fetchMock = vi.fn(async () => ({
@@ -1110,37 +1093,27 @@ it('rejects tampered baseUrl values before sending x-api-key over browser or nat
   expect(CapacitorHttp.request).not.toHaveBeenCalled();
 });
 
-it('gates initial, retry, and redirect dispatches against live native Network.getStatus() and beforeDispatch hooks', async () => {
+it('gates initial, retry, and redirect native requests via beforeNativeRequest and credentials', async () => {
   capacitorRuntime.native = true;
   const loaded = syncLoadedCredential('live-key', 'server_primary_api_key');
-  const onOffline = vi.fn();
-
-  // 1) Initial dispatch blocked when live native Network.getStatus() reports disconnected
-  capacitorRuntime.connected = false;
+  let allowTransport = false;
+  const beforeNativeRequest = vi.fn(
+    async (signal?: AbortSignal) => !signal?.aborted && allowTransport,
+  );
   const client = new KavitaClient('https://books.example.com', 'live-key', {
     credentialEpoch: loaded.epoch,
-    onOffline,
+    beforeNativeRequest,
   });
 
-  await expect(client.getBookSeries()).rejects.toBeInstanceOf(KavitaOfflineError);
-  await expect(
-    client.saveProgress({
-      volumeId: 1,
-      chapterId: 1,
-      pageNum: 10,
-      seriesId: 1,
-      libraryId: 1,
-      bookScrollId: null,
-    }),
-  ).rejects.toBeInstanceOf(KavitaOfflineError);
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'No network connection.',
+  });
   expect(CapacitorHttp.request).not.toHaveBeenCalled();
-  expect(onOffline).toHaveBeenCalledTimes(2);
 
-  // 2) getProgress retry blocked when live native connectivity drops after attempt 1
-  capacitorRuntime.connected = true;
-  onOffline.mockClear();
+  allowTransport = true;
   vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
-    capacitorRuntime.connected = false;
+    allowTransport = false;
     return {
       status: 503,
       headers: {},
@@ -1148,17 +1121,16 @@ it('gates initial, retry, and redirect dispatches against live native Network.ge
       data: '',
     };
   });
-
-  await expect(client.getProgress(7)).rejects.toBeInstanceOf(KavitaOfflineError);
+  await expect(client.getProgress(7)).rejects.toMatchObject({
+    kind: 'network',
+    message: 'No network connection.',
+  });
   expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
-  expect(onOffline).toHaveBeenCalledTimes(1);
 
-  // 3) Native 307 redirect hop blocked when live native connectivity drops after hop 1
-  capacitorRuntime.connected = true;
-  onOffline.mockClear();
+  allowTransport = true;
   vi.mocked(CapacitorHttp.request).mockReset();
   vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
-    capacitorRuntime.connected = false;
+    allowTransport = false;
     return {
       status: 307,
       headers: { location: '/next/api/Series/v2?PageNumber=1&PageSize=500' },
@@ -1166,70 +1138,9 @@ it('gates initial, retry, and redirect dispatches against live native Network.ge
       data: '',
     };
   });
-
-  await expect(client.getBookSeries()).rejects.toBeInstanceOf(KavitaOfflineError);
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'No network connection.',
+  });
   expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
-  expect(onOffline).toHaveBeenCalledTimes(1);
-
-  // 4) beforeDispatch hook blocks a second redirect hop in browser mode without leaking x-api-key
-  capacitorRuntime.native = false;
-  let hopAllowed = true;
-  const gatedBrowserClient = new KavitaClient('https://books.example.com', 'live-key', {
-    credentialEpoch: loaded.epoch,
-    beforeDispatch: () => {
-      if (!hopAllowed) throw new KavitaOfflineError();
-    },
-  });
-  const redirectFetch = vi.fn().mockImplementationOnce(async () => {
-    hopAllowed = false;
-    return {
-      ok: false,
-      status: 307,
-      type: 'basic',
-      headers: { get: (name: string) => (name === 'location' ? '/redirected/series' : null) },
-    };
-  });
-  vi.stubGlobal('fetch', redirectFetch as unknown as typeof fetch);
-
-  await expect(gatedBrowserClient.getBookSeries()).rejects.toBeInstanceOf(KavitaOfflineError);
-  expect(redirectFetch).toHaveBeenCalledTimes(1);
-
-  // 5) Microtask offline transition right after Network.getStatus() resolves (without aborting
-  //    init.signal, matching saveProgress during handleOfflineTransition) still blocks dispatch
-  capacitorRuntime.native = true;
-  capacitorRuntime.connected = true;
-  vi.mocked(CapacitorHttp.request).mockReset();
-  let libraryOffline = false;
-  vi.mocked(Network.getStatus).mockImplementationOnce(
-    () =>
-      new Promise((resolve) => {
-        queueMicrotask(() => {
-          resolve({ connected: true, connectionType: 'cellular' });
-          queueMicrotask(() => {
-            libraryOffline = true;
-          });
-        });
-      }),
-  );
-  const microtaskGatedClient = new KavitaClient('https://books.example.com', 'live-key', {
-    credentialEpoch: loaded.epoch,
-    beforeDispatch: () => {
-      if (libraryOffline) throw new KavitaOfflineError();
-    },
-  });
-  const unAbortedSyncController = new AbortController();
-  await expect(
-    microtaskGatedClient.saveProgress(
-      {
-        volumeId: 1,
-        chapterId: 1,
-        pageNum: 12,
-        seriesId: 1,
-        libraryId: 1,
-        bookScrollId: null,
-      },
-      unAbortedSyncController.signal,
-    ),
-  ).rejects.toBeInstanceOf(KavitaOfflineError);
-  expect(CapacitorHttp.request).not.toHaveBeenCalled();
 });

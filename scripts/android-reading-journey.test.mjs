@@ -15,6 +15,10 @@ describe('Android reading journey fixture', () => {
     fixtures.push(fixture);
     fixture.setOffline(true);
 
+    const connectivity = await fetch(`http://127.0.0.1:${fixture.port}/connectivity-check`);
+    expect(connectivity.status).toBe(503);
+    expect(fixture.offlineRequests).toEqual([]);
+
     const response = await fetch(`http://127.0.0.1:${fixture.port}/api/Series/v2`, {
       method: 'POST',
     });

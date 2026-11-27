@@ -508,7 +508,6 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
 
   it('preserves authentication failure notices from runProgressSync when refreshCatalog runs concurrently or after abort', async () => {
     networkConnected = false;
-    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
 
     let seriesAttempt = 0;
     const releaseAbortedCleanup = deferred<void>();
@@ -558,6 +557,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) {
       listener({ connected: false, connectionType: 'none' });
     }
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
 
     // Reconnect immediately: syncProgress fails with 401, tripping the credential circuit breaker
     networkConnected = true;

@@ -4,14 +4,8 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import { KavitaError, KavitaOfflineError, type KavitaClient } from '../kavita/client';
+import { KavitaError, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
-
-export interface FlushProgressOptions {
-  signal?: AbortSignal | undefined;
-  queueSignal?: AbortSignal | undefined;
-  canContinue?: (() => boolean | Promise<boolean>) | undefined;
-}
 
 const flushing = new Map<string, Promise<void>>();
 
@@ -19,74 +13,33 @@ function canClientSend(client: KavitaClient): boolean {
   return typeof client.canSendRequests !== 'function' || client.canSendRequests();
 }
 
-function normalizeOptions(
-  signalOrOptions?: AbortSignal | FlushProgressOptions,
-): FlushProgressOptions {
-  if (!signalOrOptions) return {};
-  if ('aborted' in signalOrOptions) return { signal: signalOrOptions };
-  return signalOrOptions;
-}
-
 export function flushProgress(
   client: KavitaClient,
   serverId: string,
-  signalOrOptions?: AbortSignal | FlushProgressOptions,
+  signal?: AbortSignal,
 ): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const options = normalizeOptions(signalOrOptions);
-  const current = run(client, serverId, options).finally(() => {
+  const current = run(client, serverId, signal).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
   return current;
 }
 
-function shouldStopQueue(
-  client: KavitaClient,
-  options: FlushProgressOptions,
-): boolean | Promise<boolean> {
-  if (options.signal?.aborted || options.queueSignal?.aborted || !canClientSend(client)) {
-    return true;
-  }
-  if (!options.canContinue) return false;
-  const allowed = options.canContinue();
-  if (typeof allowed === 'boolean') {
-    if (!allowed) return true;
-    return Boolean(
-      options.signal?.aborted || options.queueSignal?.aborted || !canClientSend(client),
-    );
-  }
-  return allowed.then((ok) => {
-    if (!ok) return true;
-    return Boolean(
-      options.signal?.aborted || options.queueSignal?.aborted || !canClientSend(client),
-    );
-  });
-}
-
-async function run(
-  client: KavitaClient,
-  serverId: string,
-  options: FlushProgressOptions,
-): Promise<void> {
-  const { signal } = options;
+async function run(client: KavitaClient, serverId: string, signal?: AbortSignal): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
   while (true) {
-    const initialStop = shouldStopQueue(client, options);
-    if (typeof initialStop === 'boolean' ? initialStop : await initialStop) break;
+    if (signal?.aborted || !canClientSend(client)) break;
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
-    if (pending.length === 0) break;
-    const postReadStop = shouldStopQueue(client, options);
-    if (typeof postReadStop === 'boolean' ? postReadStop : await postReadStop) break;
+    if (pending.length === 0 || signal?.aborted || !canClientSend(client)) break;
     let stopFlush = false;
     for (const item of pending) {
-      const itemStop = shouldStopQueue(client, options);
-      if (typeof itemStop === 'boolean' ? itemStop : await itemStop) {
+      if (signal?.aborted || !canClientSend(client)) {
         stopFlush = true;
         break;
       }
@@ -96,15 +49,17 @@ async function run(
         await (signal ? client.saveProgress(payload, signal) : client.saveProgress(payload));
         await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
       } catch (error) {
-        const abortedBeforeDispatch =
+        const stoppedBeforeDispatch =
           signal?.aborted === true ||
-          error instanceof KavitaOfflineError ||
           (error instanceof DOMException && error.name === 'AbortError') ||
+          (error instanceof KavitaError &&
+            error.kind === 'network' &&
+            error.message === 'No network connection.') ||
           (error instanceof KavitaError &&
             error.kind === 'authentication' &&
             error.status === undefined &&
             !canClientSend(client));
-        if (abortedBeforeDispatch) {
+        if (stoppedBeforeDispatch) {
           stopFlush = true;
           break;
         }
@@ -115,7 +70,10 @@ async function run(
           item.updatedAt,
         );
         failures.push(error);
-        if (error instanceof KavitaError && error.kind === 'authentication') {
+        if (
+          error instanceof KavitaError &&
+          (error.kind === 'authentication' || error.kind === 'network')
+        ) {
           stopFlush = true;
           break;
         }

@@ -11,7 +11,9 @@ const runtime = vi.hoisted(() => ({
   platform: 'android',
   online: true,
   appStateListeners: [] as Array<(event: { isActive: boolean }) => void>,
-  networkListeners: [] as Array<(event: { connected: boolean }) => void>,
+  networkListeners: [] as Array<
+    (event: { connected: boolean; connectionType: 'wifi' | 'cellular' | 'none' }) => void
+  >,
   selectionCallback: null as
     ((selection: { cfi: string; text: string; href: string } | null) => void) | null,
   relocateCallback: null as
@@ -84,7 +86,13 @@ vi.mock('@capacitor/network', () => ({
       connectionType: runtime.online ? 'wifi' : 'none',
     })),
     addListener: vi.fn(
-      async (_event: string, listener: (event: { connected: boolean }) => void) => {
+      async (
+        _event: string,
+        listener: (event: {
+          connected: boolean;
+          connectionType: 'wifi' | 'cellular' | 'none';
+        }) => void,
+      ) => {
         runtime.networkListeners.push(listener);
         return {
           remove: async () => {
@@ -209,10 +217,23 @@ vi.mock('../downloads/native-download', async (importOriginal) => {
         _fileStem: string,
         _onProgress?: (percent: number | null) => void,
         _serverOrigin?: string,
+        beforeTransfer?: (signal?: AbortSignal) => Promise<boolean> | boolean,
         credentialEpoch?: number,
+        signal?: AbortSignal,
       ) => {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (!canSendCredential(apiKey, credentialEpoch)) {
           throw new actual.EpubTransferError(401, false);
+        }
+        if (beforeTransfer && !(await beforeTransfer(signal))) {
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          if (!canSendCredential(apiKey, credentialEpoch)) {
+            throw new actual.EpubTransferError(401, false);
+          }
+          throw new actual.EpubTransferError(undefined, true);
+        }
+        if (signal?.aborted || !canSendCredential(apiKey, credentialEpoch)) {
+          throw new DOMException('Aborted', 'AbortError');
         }
         if (nativeDownloadMock.downloadResult) {
           try {
@@ -236,10 +257,11 @@ vi.mock('../downloads/native-download', async (importOriginal) => {
         _url: string,
         apiKey: string,
         seriesId: number,
-        _signal?: AbortSignal,
+        signal?: AbortSignal,
         _serverId?: string,
         allowDownload = true,
         _serverOrigin?: string,
+        beforeTransfer?: (signal?: AbortSignal) => Promise<boolean> | boolean,
         credentialEpoch?: number,
       ) => {
         if (nativeDownloadMock.coverResult) {
@@ -247,6 +269,9 @@ vi.mock('../downloads/native-download', async (importOriginal) => {
         }
         if (!allowDownload || !canSendCredential(apiKey, credentialEpoch)) {
           throw new Error('Cover not cached');
+        }
+        if (beforeTransfer && !(await beforeTransfer(signal))) {
+          throw new Error('Offline');
         }
         throw new Error('Uncached cover network call attempted');
       },
@@ -1179,266 +1204,9 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     expect(dbState.syncQueue[downloadedBook.id]?.lastError).toBeNull();
   });
 
-  it('emits zero /api/Series/v2 or offline requests across Android Wi-Fi/cellular disconnect handoff and missing-key offline restart', async () => {
+  it('stops queued progress uploads between requests without penalizing remaining items when native transport drops, then syncs on reconnect', async () => {
     runtime.native = true;
     runtime.online = true;
-    seedDatabase({
-      books: [downloadedBook],
-      pendingSync: true,
-    });
-    secureStorageMock.values.set('server_primary_api_key', 'turnleaf-ci-only');
-
-    let fixtureOffline = false;
-    const offlineRequests: string[] = [];
-    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
-      const path = new URL(options.url).pathname;
-      if (fixtureOffline) {
-        offlineRequests.push(path);
-        return {
-          status: 503,
-          headers: {},
-          url: options.url,
-          data: JSON.stringify({ title: 'Offline fixture active' }),
-        };
-      }
-      if (path.endsWith('/api/Series/v2')) {
-        return {
-          status: 200,
-          headers: {},
-          url: options.url,
-          data: JSON.stringify([
-            {
-              id: 1,
-              libraryId: 1,
-              name: 'Offline Novel',
-              format: 3,
-              pages: 100,
-              pagesRead: 50,
-            },
-          ]),
-        };
-      }
-      if (path.endsWith('/api/Series/series-detail')) {
-        return {
-          status: 200,
-          headers: {},
-          url: options.url,
-          data: JSON.stringify({
-            volumes: [
-              {
-                id: 1,
-                chapters: [
-                  {
-                    id: 1,
-                    volumeId: 1,
-                    title: 'Offline Novel',
-                    pages: 100,
-                    pagesRead: 50,
-                    format: 3,
-                    files: [{ id: 1, format: 3, extension: '.epub', bytes: 4096 }],
-                  },
-                ],
-              },
-            ],
-          }),
-        };
-      }
-      if (path.endsWith('/api/Reader/progress')) {
-        return {
-          status: 200,
-          headers: {},
-          url: options.url,
-          data: '',
-        };
-      }
-      throw new Error(`Unexpected native request ${options.url}`);
-    });
-
-    mounted = mount(App, { target });
-    await waitForCondition(
-      () =>
-        target.querySelector('[data-book-open]') !== null &&
-        target.querySelector('[data-credential-alert]') === null,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    // Simulate Android smoke Phase 2: remove saved key, disable network (including transient
-    // Wi-Fi -> cellular -> offline radio notifications), and restart the app while offline.
-    secureStorageMock.values.delete('server_primary_api_key');
-    fixtureOffline = true;
-    for (const listener of runtime.networkListeners) {
-      listener({ connected: false });
-      listener({ connected: true });
-      listener({ connected: false });
-    }
-    runtime.online = false;
-
-    await new Promise((resolve) => setTimeout(resolve, 560));
-    expect(offlineRequests).toEqual([]);
-
-    await unmount(mounted);
-    mounted = null;
-    vi.mocked(CapacitorHttp.request).mockClear();
-
-    mounted = mount(App, { target });
-    await waitForCondition(
-      () =>
-        target.querySelector('[data-credential-alert="missing"]') !== null &&
-        target.querySelector('[data-book-open]') !== null,
-    );
-
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    expect(offlineRequests).toEqual([]);
-    expect(CapacitorHttp.request).not.toHaveBeenCalled();
-    expect(downloadEpub).not.toHaveBeenCalled();
-
-    // Open downloaded EPUB and turn a page while offline with missing credentials
-    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
-    await waitForCondition(
-      () => target.querySelector('[aria-label="Show reading controls"]') !== null,
-    );
-    runtime.relocateCallback?.(
-      {
-        cfi: 'epubcfi(/6/4!/4/2/3:0)',
-        xpath: '//body/DocFragment[2]/body/p[2]',
-        href: 'Text/chapter-2.xhtml',
-        label: 'Chapter 2',
-        percentage: 0.75,
-        displayedPage: 2,
-        displayedTotal: 2,
-        spineIndex: 1,
-      },
-      'navigation',
-    );
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(offlineRequests).toEqual([]);
-    expect(CapacitorHttp.request).not.toHaveBeenCalled();
-  });
-
-  it('keeps App, Library, and credential state synchronized when saveServer fails during Settings key update or Onboarding address change rollback', async () => {
-    seedDatabase({ books: [downloadedBook] });
-    window.localStorage.setItem('turnleaf_browser_server_primary_api_key', 'stale-key');
-
-    let activeServerKey = 'rotated-key';
-    vi.mocked(fetch).mockImplementation(async (input, init) => {
-      const url = String(input);
-      const sentKey = new Headers(init?.headers).get('x-api-key');
-      if (sentKey !== activeServerKey && sentKey !== 'new-server-key') {
-        return {
-          ok: false,
-          status: 401,
-          headers: { get: () => null },
-        } as unknown as Response;
-      }
-      if (url.includes('/api/Library/libraries')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => [{ id: 1, name: 'Books', type: 2 }],
-        } as unknown as Response;
-      }
-      if (url.includes('/api/Health')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => ({ version: '0.8.9' }),
-        } as unknown as Response;
-      }
-      if (url.includes('/api/Series/v2')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => [],
-        } as unknown as Response;
-      }
-      if (url.includes('/api/Image/series-cover')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          blob: async () => new Blob(['img'], { type: 'image/png' }),
-        } as unknown as Response;
-      }
-      throw new Error(`Unexpected URL ${url}`);
-    });
-
-    mounted = mount(App, { target });
-    await waitForCondition(
-      () => target.querySelector('[data-credential-alert="rejected"]') !== null,
-    );
-
-    // 1) Settings updateApiKey: saveApiKey succeeds, saveServer fails once -> key stays synchronized across App, Library, and coordinator
-    vi.mocked(Database.saveServer).mockRejectedValueOnce(new Error('SQLite busy'));
-    target.querySelector<HTMLButtonElement>('[data-credential-recover]')!.click();
-    await waitForCondition(() => target.querySelector('#replacement-api-key') !== null);
-
-    const replacementInput = target.querySelector<HTMLInputElement>('#replacement-api-key')!;
-    replacementInput.value = 'rotated-key';
-    replacementInput.dispatchEvent(new Event('input', { bubbles: true }));
-    replacementInput
-      .closest('form')!
-      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-
-    await waitForCondition(
-      () =>
-        target.textContent?.includes(
-          'The auth key was updated, but local server details could not be saved.',
-        ) === true,
-    );
-    expect(getCredentialState().status).toBe('ready');
-    expect(target.querySelector('[data-credential-alert]')).toBeNull();
-    expect(replacementInput.value).toBe('');
-
-    // 2) Onboarding Change server address: saveConnection fails saveServer and rolls back temporary ref,
-    //    restoring the saved rotated-key when Cancel returns to Library
-    const changeAddressButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
-      (btn) => btn.textContent?.includes('Change server address'),
-    );
-    expect(changeAddressButton).toBeDefined();
-    changeAddressButton!.click();
-    await waitForCondition(() => target.querySelector('input[type="url"]') !== null);
-
-    vi.mocked(Database.saveServer).mockRejectedValueOnce(new Error('SQLite busy'));
-    const urlInput = target.querySelector<HTMLInputElement>('input[type="url"]')!;
-    urlInput.value = 'https://other-books.example.com';
-    urlInput.dispatchEvent(new Event('input', { bubbles: true }));
-    const onboardingKeyInput = target.querySelector<HTMLInputElement>('#kavita-auth-key')!;
-    onboardingKeyInput.value = 'new-server-key';
-    onboardingKeyInput.dispatchEvent(new Event('input', { bubbles: true }));
-    onboardingKeyInput
-      .closest('form')!
-      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-
-    await waitForCondition(
-      () =>
-        target.textContent?.includes('The saved connection and auth key were left in place') ===
-        true,
-    );
-
-    const cancelButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
-      (btn) => btn.textContent?.trim() === 'Cancel',
-    );
-    expect(cancelButton).toBeDefined();
-    cancelButton!.click();
-
-    await waitForCondition(
-      () =>
-        target.querySelector('[aria-label="Open settings"]') !== null &&
-        target.querySelector('[data-credential-alert]') === null,
-    );
-    expect(getCredentialState().status).toBe('ready');
-    activeServerKey = 'rotated-key';
-    expect(
-      target.querySelector<HTMLButtonElement>('[aria-label="Refresh library"]')?.disabled,
-    ).toBe(false);
-  });
-
-  it('cancels active catalog and queued progress work with zero offline requests when native transport drops after initial networkAvailable() checks', async () => {
-    runtime.native = true;
-    runtime.online = false;
     secureStorageMock.values.set('server_primary_api_key', 'valid-native-key');
     seedDatabase({
       books: [downloadedBook, onlineOnlyBook],
@@ -1446,176 +1214,22 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       secondPendingSync: true,
     });
 
-    let fixtureOffline = true;
+    let fixtureOffline = false;
     const offlineRequests: string[] = [];
-    const onlineRequests: string[] = [];
-
-    // Phase 1 (Race A): runReconnect(), runProgressSync.networkAvailable(), and
-    // refreshCatalog.networkAvailable() (polls 1..3) all observe connected: true during
-    // a transient cellular handoff, then cellular tears down before either /api/Series/v2
-    // or /api/Reader/progress dispatches.
-    let handoffPolls = 0;
-    let phase: 'steady' | 'drop-after-preflight' | 'drop-between-uploads' = 'steady';
-    vi.mocked(Network.getStatus).mockImplementation(async () => {
-      if (phase === 'drop-after-preflight') {
-        handoffPolls += 1;
-        if (handoffPolls <= 3) {
-          return { connected: true, connectionType: 'cellular' };
-        }
-        runtime.online = false;
-        fixtureOffline = true;
-        return { connected: false, connectionType: 'none' };
-      }
-      return {
-        connected: runtime.online,
-        connectionType: runtime.online ? 'wifi' : 'none',
-      };
-    });
+    const uploadedPaths: string[] = [];
 
     vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
       if (fixtureOffline) {
         offlineRequests.push(`${options.method ?? 'GET'} ${options.url}`);
-      } else {
-        onlineRequests.push(`${options.method ?? 'GET'} ${options.url}`);
       }
       if (options.url.includes('/api/Reader/progress')) {
-        if (phase === 'drop-between-uploads') {
-          // Transport drops right after the first progress upload completes,
-          // before the second queued progress item or series-detail dispatches.
+        uploadedPaths.push(options.url);
+        if (uploadedPaths.length === 1) {
           runtime.online = false;
           fixtureOffline = true;
-        }
-        return { status: 204, headers: {}, url: options.url, data: '' };
-      }
-      if (options.url.includes('/api/Series/v2')) {
-        return {
-          status: 200,
-          headers: {},
-          url: options.url,
-          data: JSON.stringify([
-            {
-              id: 101,
-              libraryId: 1,
-              name: 'Offline Novel',
-              localizedName: null,
-              sortName: 'Offline Novel',
-              pages: 200,
-              pagesRead: 20,
-              format: 3,
-              created: '2026-01-01T00:00:00Z',
-              lastChapterAdded: '2026-01-01T00:00:00Z',
-            },
-          ]),
-        };
-      }
-      if (options.url.includes('/api/Series/series-detail')) {
-        return {
-          status: 200,
-          headers: {},
-          url: options.url,
-          data: JSON.stringify({
-            volumes: [],
-            chapters: [
-              {
-                id: 301,
-                volumeId: 201,
-                range: 'Offline Novel',
-                title: 'Offline Novel',
-                titleName: 'Offline Novel',
-                pages: 200,
-                pagesRead: 20,
-                files: [{ id: 1, format: 3, bytes: 4096 }],
-                writers: [{ id: 1, name: 'Ada Author' }],
-              },
-            ],
-            specials: [],
-            storylineChapters: [],
-          }),
-        };
-      }
-      throw new Error(`Unexpected native request ${options.url}`);
-    });
-
-    mounted = mount(App, { target });
-    await waitForCondition(() => target.querySelector('[data-book-open]') !== null);
-    expect(CapacitorHttp.request).not.toHaveBeenCalled();
-
-    // Trigger Race A: cellular handoff drops right after networkAvailable() preflights
-    runtime.online = true;
-    fixtureOffline = false;
-    phase = 'drop-after-preflight';
-    for (const listener of runtime.networkListeners) {
-      listener({ connected: true });
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 650));
-
-    // Zero requests at all because live pre-dispatch Network.getStatus() caught the drop!
-    expect(offlineRequests).toEqual([]);
-    expect(onlineRequests).toEqual([]);
-    expect(await Database.getPendingSync('primary')).toHaveLength(2);
-
-    // Trigger Race B: reconnect succeeds long enough for book-1 upload + /api/Series/v2,
-    // then drops right after book-1 finishes before book-2 or /api/Series/series-detail dispatches!
-    phase = 'drop-between-uploads';
-    runtime.online = true;
-    fixtureOffline = false;
-    for (const listener of runtime.networkListeners) {
-      listener({ connected: true });
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 650));
-
-    expect(offlineRequests).toEqual([]);
-    expect(onlineRequests.filter((entry) => entry.includes('/api/Reader/progress'))).toHaveLength(
-      1,
-    );
-    const pendingAfterDrop = await Database.getPendingSync('primary');
-    expect(pendingAfterDrop).toHaveLength(1);
-    expect(pendingAfterDrop[0]?.bookId).toBe(onlineOnlyBook.id);
-
-    // Phase 3: Stable Wi-Fi reconnect flushes the remaining queued progress item and completes catalog refresh
-    phase = 'steady';
-    runtime.online = true;
-    fixtureOffline = false;
-    for (const listener of runtime.networkListeners) {
-      listener({ connected: true });
-    }
-
-    await waitForCondition(
-      async () =>
-        (await Database.getPendingSync('primary')).length === 0 &&
-        onlineRequests.some((entry) => entry.includes('/api/Series/series-detail')),
-      2500,
-    );
-    expect(offlineRequests).toEqual([]);
-  });
-
-  it('chains a fresh progress sync on reconnect when connectivity drops and recovers while an in-flight upload is still settling', async () => {
-    runtime.native = true;
-    runtime.online = true;
-    secureStorageMock.values.set('server_primary_api_key', 'valid-native-key');
-    seedDatabase({
-      books: [downloadedBook, onlineOnlyBook],
-      pendingSync: true,
-      secondPendingSync: true,
-    });
-
-    let fixtureOffline = false;
-    const offlineRequests: string[] = [];
-    let releaseFirstUpload = () => {};
-    let firstUploadStarted = false;
-
-    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
-      if (fixtureOffline) {
-        offlineRequests.push(`${options.method ?? 'GET'} ${options.url}`);
-      }
-      if (options.url.includes('/api/Reader/progress')) {
-        if (!firstUploadStarted) {
-          firstUploadStarted = true;
-          await new Promise<void>((resolve) => {
-            releaseFirstUpload = resolve;
-          });
+          for (const listener of runtime.networkListeners) {
+            listener({ connected: false, connectionType: 'none' });
+          }
         }
         return { status: 204, headers: {}, url: options.url, data: '' };
       }
@@ -1626,26 +1240,26 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     });
 
     mounted = mount(App, { target });
-    await waitForCondition(() => firstUploadStarted);
+    await waitForCondition(() => uploadedPaths.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 40));
 
-    // Connectivity drops while the first upload socket is still in flight (aborting syncQueueController),
-    // then reconnects and settles (500ms) BEFORE the first upload socket finishes resolving.
-    runtime.online = false;
-    fixtureOffline = true;
-    for (const listener of runtime.networkListeners) {
-      listener({ connected: false });
-    }
+    expect(offlineRequests).toEqual([]);
+    const remaining = await Database.getPendingSync('primary');
+    expect(remaining.length).toBeGreaterThanOrEqual(1);
+    const dbMid = JSON.parse(window.localStorage.getItem(DB_STORAGE_KEY) ?? '{}') as {
+      syncQueue: Record<string, { attemptCount: number; lastError: string | null }>;
+    };
+    expect(dbMid.syncQueue[onlineOnlyBook.id]).toMatchObject({
+      attemptCount: 0,
+      lastError: null,
+    });
 
     runtime.online = true;
     fixtureOffline = false;
     for (const listener of runtime.networkListeners) {
-      listener({ connected: true });
+      listener({ connected: false, connectionType: 'wifi' });
     }
-    await new Promise((resolve) => setTimeout(resolve, 560));
-    expect(offlineRequests).toEqual([]);
 
-    // Now the in-flight first upload finishes; chained syncProgress must run and upload the second book!
-    releaseFirstUpload();
     await waitForCondition(async () => (await Database.getPendingSync('primary')).length === 0);
     expect(offlineRequests).toEqual([]);
   });

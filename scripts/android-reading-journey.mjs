@@ -109,6 +109,10 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   const server = createServer(async (request, response) => {
     const requestUrl = new URL(request.url, 'http://localhost');
     const path = requestUrl.pathname;
+    if (path === '/connectivity-check') {
+      response.writeHead(503).end();
+      return;
+    }
     if (offline) {
       offlineRequests.push(path);
       response.writeHead(503).end();
@@ -302,6 +306,7 @@ async function run() {
   let foreignTunnel;
   let web;
   let disabledNetwork = false;
+  let previousCaptivePortalSettings;
   let journeyError;
   let cleanupError;
   let journeyPassed = false;
@@ -390,13 +395,11 @@ async function run() {
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'data', 'disable');
     await adb('shell', 'svc', 'wifi', 'disable');
-    await waitFor('offline state', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
-      );
-      return connected === false;
+    await adb('shell', 'svc', 'data', 'disable');
+    await waitFor('disconnected state', async () => {
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return status?.connected === false && status?.connectionType === 'none';
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
@@ -441,24 +444,66 @@ async function run() {
       );
     }
 
-    // Phase 3: online startup with stale key verifies 401 circuit breaker & consolidated alert.
+    // Phase 3: unvalidated Wi-Fi reconnect with stale key verifies 401 circuit breaker & consolidated alert.
     await web.evaluate(
       `Capacitor.Plugins.SecureStorage.internalSetItem({ prefixedKey: ${JSON.stringify(secureStorageKey)}, data: ${JSON.stringify(JSON.stringify(key))}, sync: false, access: 0 }).then(() => true)`,
     );
     fixture.setApiKey(rotatedKey, '0.0.1-rotated');
+    const captivePortalSettingKeys = [
+      'captive_portal_mode',
+      'captive_portal_use_https',
+      'captive_portal_http_url',
+      'captive_portal_https_url',
+      'test_url_expiration_time',
+      'test_captive_portal_http_url',
+      'test_captive_portal_https_url',
+    ];
+    previousCaptivePortalSettings = await Promise.all(
+      captivePortalSettingKeys.map(async (settingKey) => [
+        settingKey,
+        await adb('shell', 'settings', 'get', 'global', settingKey),
+      ]),
+    );
+    const deviceEpochSeconds = Number.parseInt(await adb('shell', 'date', '+%s'), 10);
+    const expirationMs = String(
+      (Number.isFinite(deviceEpochSeconds) ? deviceEpochSeconds : Math.floor(Date.now() / 1000)) *
+        1000 +
+        300_000,
+    );
+    const portalHttpUrl = `http://localhost:${fixture.port}/connectivity-check`;
+    const portalHttpsUrl = `https://localhost:${fixture.port}/connectivity-check`;
+    for (const [settingKey, value] of [
+      ['captive_portal_mode', '1'],
+      ['captive_portal_use_https', '0'],
+      ['test_url_expiration_time', expirationMs],
+      ['test_captive_portal_http_url', portalHttpUrl],
+      ['test_captive_portal_https_url', portalHttpsUrl],
+      ['captive_portal_http_url', portalHttpUrl],
+      ['captive_portal_https_url', portalHttpsUrl],
+    ]) {
+      await adb('shell', 'settings', 'put', 'global', settingKey, value);
+    }
+
+    await restartApp();
+    await waitFor('offline library with restored stale key', () =>
+      web.evaluate(
+        `document.querySelector('[data-credential-alert]') === null && Boolean(document.querySelector('[data-book-open]')) && document.querySelectorAll('.alert').length === 1`,
+      ),
+    );
+    if (fixture.offlineRequests.length > 0) {
+      throw new Error(
+        `Turnleaf sent requests during offline restart: ${fixture.offlineRequests.join(', ')}.`,
+      );
+    }
+
+    fixture.unauthorizedRequests.length = 0;
     fixture.setOffline(false);
     await adb('shell', 'svc', 'wifi', 'enable');
-    await adb('shell', 'svc', 'data', 'enable');
-    disabledNetwork = false;
-    await waitFor('online state before stale-key restart', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
-      );
-      return connected === true;
+    await waitFor('unvalidated Wi-Fi state', async () => {
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return status?.connectionType === 'wifi' && status?.connected === false;
     });
-    fixture.unauthorizedRequests.length = 0;
-    await restartApp();
-    await waitFor('consolidated rejected-key alert', () =>
+    await waitFor('consolidated rejected-key alert on unvalidated Wi-Fi', () =>
       web.evaluate(
         `document.querySelector('[data-credential-alert="rejected"]') !== null && document.querySelectorAll('.alert').length === 1`,
       ),
@@ -494,7 +539,7 @@ async function run() {
       throw new Error('Queued progress uploaded before key rotation.');
     }
 
-    // Phase 4: key rotation in Settings clears circuit breaker and flushes queued progress.
+    // Phase 4: key rotation in Settings on unvalidated Wi-Fi clears circuit breaker and flushes queued progress.
     await waitFor('recover key in Settings control', () =>
       web.evaluate(click('[data-credential-recover]')),
     );
@@ -513,7 +558,7 @@ async function run() {
         return true;
       })()`),
     );
-    await waitFor('queued passage uploaded after key rotation', () =>
+    await waitFor('queued passage uploaded after key rotation on unvalidated Wi-Fi', () =>
       fixture.uploads
         .slice(uploadCount)
         .some(
@@ -521,7 +566,13 @@ async function run() {
             progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
         ),
     );
-    await waitFor('credential alert cleared after key rotation', () =>
+    const syncNetworkStatus = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+    if (syncNetworkStatus?.connectionType !== 'wifi' || syncNetworkStatus?.connected !== false) {
+      throw new Error(
+        `Expected unvalidated Wi-Fi during reconnect sync, got ${JSON.stringify(syncNetworkStatus)}.`,
+      );
+    }
+    await waitFor('credential alert cleared and saved passage preserved after key rotation', () =>
       web.evaluate(
         `!document.querySelector('[data-credential-alert]') && Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
       ),
@@ -543,6 +594,20 @@ async function run() {
     }
   } finally {
     const cleanup = [];
+    if (previousCaptivePortalSettings) {
+      cleanup.push([
+        'restore captive portal settings',
+        async () => {
+          for (const [settingKey, previousValue] of previousCaptivePortalSettings) {
+            if (!previousValue || previousValue === 'null') {
+              await adb('shell', 'settings', 'delete', 'global', settingKey);
+            } else {
+              await adb('shell', 'settings', 'put', 'global', settingKey, previousValue);
+            }
+          }
+        },
+      ]);
+    }
     if (disabledNetwork) {
       cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);
       cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);
@@ -574,7 +639,7 @@ async function run() {
   }
   if (cleanupError) throw cleanupError;
   console.log(
-    'Android reading journey passed: connect, download, missing-key offline startup, 401 gating, rotate key, sync.',
+    'Android reading journey passed: connect, download, missing-key offline startup, unvalidated Wi-Fi 401 gating, rotate key, sync.',
   );
 }
 
