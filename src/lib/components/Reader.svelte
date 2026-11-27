@@ -237,6 +237,7 @@
   async function openReaderSession(): Promise<void> {
     const nextSession = new ReaderSession(bookUrl);
     session = nextSession;
+    nextSession.updateHighlights(annotations);
     await nextSession.open(
       viewport,
       initialCfi,
@@ -285,7 +286,6 @@
     if (!destroyed) {
       sessionReady = true;
       toc = nextSession.tableOfContents();
-      nextSession.updateHighlights(annotations);
       updateDocumentTitle();
     }
   }
