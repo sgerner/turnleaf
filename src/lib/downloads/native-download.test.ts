@@ -230,7 +230,8 @@ describe('native EPUB download boundary', () => {
       'secret-api-key',
       'Secret-Book',
       undefined,
-      controller.signal,
+      undefined,
+      { signal: controller.signal },
     );
 
     await vi.waitFor(() => expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1));
@@ -296,7 +297,8 @@ describe('native EPUB download boundary', () => {
       'secret',
       'race-fail-book',
       undefined,
-      controller.signal,
+      undefined,
+      { signal: controller.signal },
     );
     await vi.waitFor(() => expect(Filesystem.rename).toHaveBeenCalledTimes(1));
     const firstPartial = vi.mocked(Filesystem.rename).mock.calls[0]?.[0].from as string;
@@ -356,7 +358,8 @@ describe('native EPUB download boundary', () => {
       'secret',
       'race-replace-book',
       undefined,
-      controller.signal,
+      undefined,
+      { signal: controller.signal },
     );
     await vi.waitFor(() => expect(Filesystem.rename).toHaveBeenCalledTimes(1));
     controller.abort();
@@ -413,9 +416,8 @@ describe('native EPUB download boundary', () => {
       'secret',
       'race-delete-book',
       undefined,
-      controller.signal,
       undefined,
-      { preserveExistingOnAbort: true },
+      { signal: controller.signal, preserveExistingOnAbort: true },
     );
     await vi.waitFor(() => expect(Filesystem.rename).toHaveBeenCalledTimes(1));
     controller.abort();
@@ -438,6 +440,50 @@ describe('native EPUB download boundary', () => {
     );
     await deleteDownloadedEpub('books/race-delete-book.epub', (fresh.ownerToken ?? 1) - 1);
     expect(disk.has('books/race-delete-book.epub')).toBe(true);
+  });
+
+  it('cleans up an aborted post-rename file by ownerToken even when a replacement transfer is in flight and later fails', async () => {
+    native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+    const disk = new Set<string>();
+    vi.mocked(Filesystem.rename).mockImplementation(async ({ from, to }) => {
+      disk.delete(from);
+      disk.add(to);
+      native.renamed = true;
+    });
+    vi.mocked(Filesystem.deleteFile).mockImplementation(async ({ path }) => {
+      disk.delete(path);
+      native.deleted.push(path);
+    });
+
+    const first = await downloadEpub(
+      'https://books.example.com/download',
+      'secret',
+      'committed-owner-race',
+    );
+    expect(disk.has('books/committed-owner-race.epub')).toBe(true);
+
+    let rejectSecondTransfer: ((reason: unknown) => void) | undefined;
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectSecondTransfer = reject;
+        }) as never,
+    );
+    const second = downloadEpub(
+      'https://books.example.com/download',
+      'secret',
+      'committed-owner-race',
+    );
+    await vi.waitFor(() => expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2));
+
+    // While the replacement transfer is in flight (not yet committed), rolling back first.ownerToken
+    // must still delete first's committed file so a failing replacement leaves zero orphans.
+    await deleteDownloadedEpub('books/committed-owner-race.epub', first.ownerToken);
+    expect(disk.has('books/committed-owner-race.epub')).toBe(false);
+
+    rejectSecondTransfer?.({ code: 'OS-PLUG-FLTR-0010', data: { httpStatus: 404 } });
+    await expect(second).rejects.toMatchObject({ status: 404 });
+    expect(disk.has('books/committed-owner-race.epub')).toBe(false);
   });
 
   it('defers partial file deletion until repaired-archive writeFile settles on abort', async () => {
@@ -552,7 +598,8 @@ describe('native EPUB download boundary', () => {
         'secret',
         'repaired-abort-book',
         undefined,
-        controller.signal,
+        undefined,
+        { signal: controller.signal },
       );
       await vi.waitFor(() => expect(Filesystem.writeFile).toHaveBeenCalledTimes(1));
 
@@ -577,7 +624,8 @@ describe('native EPUB download boundary', () => {
       'secret',
       'server-book',
       undefined,
-      controller.signal,
+      undefined,
+      { signal: controller.signal },
     );
     await vi.waitFor(() => expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1));
     controller.abort();
@@ -685,7 +733,6 @@ describe('native EPUB download boundary', () => {
         'secret',
         'server-book',
         (percent) => progressUpdates.push(percent),
-        undefined,
         'https://books.example.com',
       ),
     ).resolves.toMatchObject({ relativePath: 'books/server-book.epub' });
@@ -717,7 +764,6 @@ describe('native EPUB download boundary', () => {
         'https://books.example.com/download',
         'secret',
         'server-book',
-        undefined,
         undefined,
         'https://books.example.com',
       ),
@@ -777,7 +823,7 @@ describe('native EPUB download boundary', () => {
       }
 
       await expect(
-        downloadEpub(initialUrl, 'secret', 'server-book', undefined, undefined, serverOrigin),
+        downloadEpub(initialUrl, 'secret', 'server-book', undefined, serverOrigin),
       ).rejects.toThrow(expectedMessage);
 
       expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
@@ -799,7 +845,6 @@ describe('native EPUB download boundary', () => {
         'secret',
         'server-book',
         undefined,
-        undefined,
         'https://books.example.com',
       ),
     ).rejects.toThrow('redirected to a different server');
@@ -819,21 +864,6 @@ describe('native cover cache', () => {
       directory: 'DATA',
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
-  });
-
-  it('re-evaluates a dynamic allowDownload check after filesystem setup so offline transitions skip FileTransfer', async () => {
-    let online = true;
-    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
-    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
-      online = false;
-      return { uri: `file://${path}` };
-    });
-
-    await expect(
-      cacheCover('https://books.example.com/cover', 'secret', 7, undefined, 'srv-1', () => online),
-    ).rejects.toThrow('Offline');
-
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
 

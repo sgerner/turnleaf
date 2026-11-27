@@ -119,7 +119,7 @@
         seriesId,
         signal,
         server.id,
-        () => networkAvailable(),
+        await networkAvailable(),
         serverOrigin,
       );
     }
@@ -240,6 +240,7 @@
   let downloadController: AbortController | null = null;
   let activeDownloadBook: BookRecord | null = null;
   let activeDownloadToken = 0;
+  const lastMarkedTokenByBook: Record<string, number> = {};
   let cleanupInProgress = $state(false);
   let downloadFailureMessage = $state('');
   let downloadFailureBook = $state<BookRecord | null>(null);
@@ -802,12 +803,26 @@
           if (destroyed) return;
           const seq = ++networkEventSeq;
           if (!connected && Capacitor.getPlatform() === 'android') {
+            const wasRefreshing = Boolean(refreshWork && !refreshController?.signal.aborted);
+            refreshController?.abort();
+            openProgressProbe?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
             void Network.getStatus()
               .catch(() => null)
               .then((live) => {
                 if (destroyed || seq !== networkEventSeq) return;
                 if (live?.connected === true) {
-                  if (offline) applyConnectivityChange(true);
+                  if (offline) {
+                    applyConnectivityChange(true);
+                    return;
+                  }
+                  coverReloadRequest += 1;
+                  if (wasRefreshing) {
+                    const baselineRevision = activeSyncStartRevision ?? messageRevision;
+                    const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+                    void startRefresh(false, baselineRevision, baselineMessage);
+                  }
                   return;
                 }
                 applyConnectivityChange(false);
@@ -1179,17 +1194,6 @@
       setDownloadFailure('This book is no longer available from Kavita.', null);
       return null;
     }
-    if (!(await networkAvailable())) {
-      if (!destroyed) {
-        setDownloadFailure('No network connection. Connect to Kavita to download this book.', book);
-      }
-      return null;
-    }
-    if (destroyed) return null;
-    if (downloadingBookId || cleanupInProgress) {
-      setMessage('A book is already downloading or being cleaned up. Try again when it finishes.');
-      return null;
-    }
 
     const controller = new AbortController();
     activeDownloadToken += 1;
@@ -1199,9 +1203,6 @@
     downloadingBookId = book.id;
     downloadingBookTitle = book.title;
     downloadPercent = null;
-    if (downloadFailureBook?.id === book.id) {
-      clearDownloadFailure();
-    }
     const hadDownloadBefore = Boolean(book.downloadPath);
     const deleteAttemptFile = (path: string, ownerToken?: number) =>
       ownerToken !== undefined
@@ -1211,6 +1212,17 @@
     let downloadedOwnerToken: number | undefined;
     let markedInDatabase = false;
     try {
+      const available = await networkAvailable();
+      if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
+        return null;
+      }
+      if (!available) {
+        setDownloadFailure('No network connection. Connect to Kavita to download this book.', book);
+        return null;
+      }
+      if (downloadFailureBook?.id === book.id) {
+        clearDownloadFailure();
+      }
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
         activeApiKey,
@@ -1220,15 +1232,21 @@
             downloadPercent = percent;
           }
         },
-        controller.signal,
         serverOrigin,
-        ...(hadDownloadBefore ? [{ preserveExistingOnAbort: true }] : []),
+        {
+          signal: controller.signal,
+          preserveExistingOnAbort: hadDownloadBefore,
+        },
       );
-      const rollbackAbortedDownload = async () => {
-        if (markedInDatabase && !hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+      const rollbackMarkedDatabase = async () => {
+        if (markedInDatabase && lastMarkedTokenByBook[book.id] === token) {
+          delete lastMarkedTokenByBook[book.id];
           await removeDownload(book.id).catch(() => {});
         }
-        if (!hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+      };
+      const rollbackAbortedDownload = async () => {
+        if (!hadDownloadBefore) {
+          await rollbackMarkedDatabase();
           await deleteAttemptFile(file.relativePath, file.ownerToken).catch(() => {});
         }
       };
@@ -1238,8 +1256,9 @@
       }
       downloadedPath = file.relativePath;
       downloadedOwnerToken = file.ownerToken;
-      await markDownloaded(book.id, file.relativePath, file.size);
+      lastMarkedTokenByBook[book.id] = token;
       markedInDatabase = true;
+      await markDownloaded(book.id, file.relativePath, file.size);
       downloadedPath = null;
       if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
         await rollbackAbortedDownload();
@@ -1264,8 +1283,14 @@
         activeDownloadToken !== token ||
         destroyed
       ) {
-        if (downloadedPath && !hadDownloadBefore && activeDownloadBook?.id !== book.id) {
-          await deleteAttemptFile(downloadedPath, downloadedOwnerToken).catch(() => {});
+        if (!hadDownloadBefore) {
+          if (markedInDatabase && lastMarkedTokenByBook[book.id] === token) {
+            delete lastMarkedTokenByBook[book.id];
+            await removeDownload(book.id).catch(() => {});
+          }
+          if (downloadedPath) {
+            await deleteAttemptFile(downloadedPath, downloadedOwnerToken).catch(() => {});
+          }
         }
         return null;
       }
@@ -1280,6 +1305,16 @@
         const savedBooks = await getBooks(server.id, { includeDescription: false }).catch(
           () => null,
         );
+        if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
+          if (!hadDownloadBefore) {
+            if (markedInDatabase && lastMarkedTokenByBook[book.id] === token) {
+              delete lastMarkedTokenByBook[book.id];
+              await removeDownload(book.id).catch(() => {});
+            }
+            await deleteAttemptFile(downloadedPath, downloadedOwnerToken).catch(() => {});
+          }
+          return null;
+        }
         const persistedBook =
           savedBooks?.find((item) => item.id === book.id && item.downloadPath === downloadedPath) ??
           null;
@@ -1293,13 +1328,16 @@
         }
         if (savedBooks) {
           try {
-            if (!hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+            if (!hadDownloadBefore) {
               await deleteAttemptFile(downloadedPath, downloadedOwnerToken);
             }
             downloadedPath = null;
           } catch {
             cleanupFailed = true;
             cleanupPath = downloadedPath;
+          }
+          if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
+            return null;
           }
         } else {
           needsRefresh = true;
@@ -1506,7 +1544,7 @@
     if (!file) {
       await removeDownload(book.id);
       books = await getBooks(server.id, { includeDescription: false });
-      if (destroyed) return;
+      if (destroyed || reading || conflict || resolvingOpenProgress) return;
       const refreshed = books.find((item) => item.id === book.id) ?? null;
       if (!refreshed || refreshed.remoteAvailable === false) {
         setDownloadFailure(
@@ -1516,7 +1554,7 @@
         return;
       }
       if (!(await networkAvailable())) {
-        if (!destroyed) {
+        if (!destroyed && !reading && !conflict && !resolvingOpenProgress) {
           setDownloadFailure(
             'The downloaded file is missing. Connect to Kavita to download it again.',
             refreshed,
@@ -1524,7 +1562,7 @@
         }
         return;
       }
-      if (destroyed) return;
+      if (destroyed || reading || conflict || resolvingOpenProgress) return;
       setMessage('The downloaded file is missing. Downloading it again…');
       await open(refreshed, options);
       return;
@@ -1822,6 +1860,7 @@
     if (
       !candidates.length ||
       downloadingBookId ||
+      cleanupInProgress ||
       !window.confirm(
         `Remove ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'} from this device?`,
       )
@@ -3257,7 +3296,7 @@
           class="btn preset-tonal-error"
           type="button"
           onclick={() => (confirmDeleteServer = true)}
-          disabled={deletingServer}
+          disabled={deletingServer || cleanupInProgress}
         >
           Delete server
         </button>
@@ -3279,7 +3318,9 @@
         <button
           class="btn preset-tonal-error"
           type="button"
-          disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+          disabled={Boolean(downloadingBookId) ||
+            cleanupInProgress ||
+            !books.some((book) => book.downloadPath)}
           onclick={removeAllDownloads}
         >
           Remove all downloaded books
@@ -3310,7 +3351,7 @@
             class="btn preset-outlined-error-500"
             type="button"
             onclick={() => void deleteServer()}
-            disabled={deletingServer}
+            disabled={deletingServer || cleanupInProgress}
           >
             {deletingServer ? 'Deleting...' : 'Delete now'}
           </button>

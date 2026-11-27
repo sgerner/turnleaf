@@ -359,10 +359,17 @@ describe('Library download banners, cancellation, and offline guards', () => {
 
     let capturedSignal: AbortSignal | undefined;
     mocks.downloadEpub.mockImplementationOnce(
-      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+      (
+        _url: string,
+        _key: string,
+        _bookId: string,
+        _onProgress?: unknown,
+        _serverOrigin?: string,
+        options?: { signal?: AbortSignal },
+      ) =>
         new Promise((_resolve, reject) => {
-          capturedSignal = signal;
-          signal?.addEventListener(
+          capturedSignal = options?.signal;
+          options?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
             { once: true },
@@ -459,10 +466,17 @@ describe('Library download banners, cancellation, and offline guards', () => {
 
     let capturedSignal: AbortSignal | undefined;
     mocks.downloadEpub.mockImplementationOnce(
-      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+      (
+        _url: string,
+        _key: string,
+        _bookId: string,
+        _onProgress?: unknown,
+        _serverOrigin?: string,
+        options?: { signal?: AbortSignal },
+      ) =>
         new Promise((_resolve, reject) => {
-          capturedSignal = signal;
-          signal?.addEventListener(
+          capturedSignal = options?.signal;
+          options?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
             { once: true },
@@ -647,10 +661,17 @@ describe('Library download banners, cancellation, and offline guards', () => {
 
     let capturedSignal: AbortSignal | undefined;
     mocks.downloadEpub.mockImplementationOnce(
-      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+      (
+        _url: string,
+        _key: string,
+        _bookId: string,
+        _onProgress?: unknown,
+        _serverOrigin?: string,
+        options?: { signal?: AbortSignal },
+      ) =>
         new Promise((_resolve, reject) => {
-          capturedSignal = signal;
-          signal?.addEventListener(
+          capturedSignal = options?.signal;
+          options?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
             { once: true },
@@ -691,10 +712,17 @@ describe('Library download banners, cancellation, and offline guards', () => {
 
     let capturedSignal: AbortSignal | undefined;
     mocks.downloadEpub.mockImplementationOnce(
-      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+      (
+        _url: string,
+        _key: string,
+        _bookId: string,
+        _onProgress?: unknown,
+        _serverOrigin?: string,
+        options?: { signal?: AbortSignal },
+      ) =>
         new Promise((_resolve, reject) => {
-          capturedSignal = signal;
-          signal?.addEventListener(
+          capturedSignal = options?.signal;
+          options?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
             { once: true },
@@ -722,11 +750,18 @@ describe('Library download banners, cancellation, and offline guards', () => {
     let capturedSignal: AbortSignal | undefined;
     let resolveDownload: ((value: unknown) => void) | undefined;
     mocks.downloadEpub.mockImplementationOnce(
-      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+      (
+        _url: string,
+        _key: string,
+        _bookId: string,
+        _onProgress?: unknown,
+        _serverOrigin?: string,
+        options?: { signal?: AbortSignal },
+      ) =>
         new Promise((resolve, reject) => {
-          capturedSignal = signal;
+          capturedSignal = options?.signal;
           resolveDownload = resolve;
-          signal?.addEventListener(
+          options?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
             { once: true },
@@ -773,9 +808,16 @@ describe('Library download banners, cancellation, and offline guards', () => {
     setupCatalogFromBooks([book]);
 
     mocks.downloadEpub.mockImplementationOnce(
-      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+      (
+        _url: string,
+        _key: string,
+        _bookId: string,
+        _onProgress?: unknown,
+        _serverOrigin?: string,
+        options?: { signal?: AbortSignal },
+      ) =>
         new Promise((_resolve, reject) => {
-          signal?.addEventListener(
+          options?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
             { once: true },
@@ -887,7 +929,8 @@ describe('Library download banners, cancellation, and offline guards', () => {
       .click();
     await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(2));
 
-    // Late resolution of the cancelled first attempt must not delete the active book or emit ready offline.
+    // Late resolution of the cancelled first attempt passes its ownerToken to deleteDownloadedEpub
+    // (which only deletes uncommitted predecessors) and never emits ready offline.
     resolveFirstDownload?.({
       relativePath: 'books/srv-1-1-1.epub',
       nativeUri: 'file://books/srv-1-1-1.epub',
@@ -896,7 +939,7 @@ describe('Library download banners, cancellation, and offline guards', () => {
       ownerToken: 1,
     });
     await flushUi();
-    expect(mocks.deleteDownloadedEpub).not.toHaveBeenCalled();
+    expect(mocks.deleteDownloadedEpub).toHaveBeenCalledExactlyOnceWith('books/srv-1-1-1.epub', 1);
     expect(document.body.textContent).not.toContain('Late Settlement Book is ready offline.');
 
     mocks.verifyDownloadedEpub.mockResolvedValue({
@@ -935,11 +978,120 @@ describe('Library download banners, cancellation, and offline guards', () => {
     await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(1));
     await flushUi();
 
-    expect(mocks.downloadEpub.mock.calls[0]?.[4]).toBeInstanceOf(AbortSignal);
-    expect(mocks.downloadEpub.mock.calls[0]?.[5]).toBe('https://kavita.example');
+    expect(mocks.downloadEpub.mock.calls[0]?.[4]).toBe('https://kavita.example');
+    expect(mocks.downloadEpub.mock.calls[0]?.[5]).toMatchObject({
+      signal: expect.any(AbortSignal),
+      preserveExistingOnAbort: false,
+    });
     const failureBanner = document.querySelector('[data-banner="download-failure"]');
     expect(failureBanner?.getAttribute('role')).toBe('alert');
     expect(failureBanner?.textContent).toContain('Kavita redirected to a different server.');
     expect(document.querySelector('[data-banner="status-message"]')).toBeNull();
+  });
+
+  it('claims download ownership synchronously before async network checks settle to prevent concurrent transfers', async () => {
+    const firstBook = makeBook({ chapterId: 1, title: 'First Tap Book' });
+    const secondBook = makeBook({ chapterId: 2, title: 'Second Tap Book' });
+    await reconcileBooks(server.id, [firstBook, secondBook]);
+    setupCatalogFromBooks([firstBook, secondBook]);
+
+    await mountLibrary();
+
+    let resolveTransfer: ((value: unknown) => void) | undefined;
+    mocks.downloadEpub.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveTransfer = resolve;
+        }),
+    );
+    mocks.verifyDownloadedEpub.mockResolvedValue({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+    });
+
+    // Tap both books synchronously in the same tick before await networkAvailable() settles.
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${firstBook.id}"] [data-book-open]`)!
+      .click();
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${secondBook.id}"] [data-book-open]`)!
+      .click();
+    await flushUi();
+
+    expect(mocks.downloadEpub).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[data-banner="active-download"]')?.textContent).toContain(
+      'Downloading First Tap Book...',
+    );
+    expect(document.querySelector('[data-banner="status-message"]')?.textContent).toContain(
+      'A book is already downloading or being cleaned up.',
+    );
+
+    resolveTransfer?.({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+      ownerToken: 1,
+    });
+    await vi.waitFor(() => expect(buttonByText('Back to library')).not.toBeNull());
+    expect(mocks.downloadEpub).toHaveBeenCalledTimes(1);
+  });
+
+  it('rolls back file and database state when cancelled after downloadEpub even if a replacement download fails', async () => {
+    const book = makeBook({ chapterId: 1, title: 'Rollback Race Book' });
+    await reconcileBooks(server.id, [book]);
+    setupCatalogFromBooks([book]);
+
+    let resolveFirstDownload: ((value: unknown) => void) | undefined;
+    let rejectSecondDownload: ((reason: unknown) => void) | undefined;
+    mocks.downloadEpub
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstDownload = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectSecondDownload = reject;
+          }),
+      );
+
+    await mountLibrary();
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(1));
+    await flushUi();
+
+    // Cancel first download, then immediately start a second download that later fails.
+    buttonByText('Cancel', document.querySelector('[data-banner="active-download"]')!)!.click();
+    await flushUi();
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(2));
+
+    resolveFirstDownload?.({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+      ownerToken: 1,
+    });
+    await flushUi();
+    expect(mocks.deleteDownloadedEpub).toHaveBeenCalledExactlyOnceWith('books/srv-1-1-1.epub', 1);
+
+    rejectSecondDownload?.(new EpubTransferError(503, false, false));
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-banner="download-failure"]')?.textContent).toContain(
+        'HTTP 503',
+      ),
+    );
+    const savedBooks = await getBooks(server.id);
+    expect(savedBooks.find((item) => item.id === book.id)?.downloadPath).toBeNull();
   });
 });
