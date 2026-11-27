@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Fix TalkBack containment, edge overlaps, and EPUB progress
+- chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests
