@@ -7,6 +7,7 @@
 - Stop in-flight Kavita study sync, cover, and download requests when connectivity drops
 - Replace regex HTML tag stripping in annotation comment normalization
 - Sync annotations and bookmarks with Kavita and isolate study data per server
+- chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests
