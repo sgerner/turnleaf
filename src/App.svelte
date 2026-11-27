@@ -170,8 +170,8 @@
   {/if}
 
   {#if releaseBanner}
-    <div class="release-banner" inert={stageOverlayActive} transition:fade>
-      <div class="mx-auto w-full max-w-4xl px-4 pb-2 pt-[max(1rem,env(safe-area-inset-top))]">
+    <div class="release-banner" inert={readerOpen || stageOverlayActive} transition:fade>
+      <div class="release-banner-inner mx-auto w-full max-w-4xl pb-2">
         <div
           class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
         >
@@ -440,6 +440,11 @@
     -webkit-overflow-scrolling: touch;
     scroll-padding-block: 8px;
     z-index: 1;
+  }
+
+  .release-banner-inner {
+    padding-top: max(1rem, calc(var(--safe-top, 0px) + 0.5rem));
+    padding-inline: max(1rem, var(--safe-left, 0px)) max(1rem, var(--safe-right, 0px));
   }
 
   .app-stage {

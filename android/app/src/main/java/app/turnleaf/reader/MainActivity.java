@@ -1,9 +1,13 @@
 package app.turnleaf.reader;
 
 import com.getcapacitor.BridgeActivity;
+import android.graphics.Color;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.Window;
+import android.view.WindowManager;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -15,6 +19,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(VolumeButtonsPlugin.class);
         registerPlugin(KeepAwakePlugin.class);
         super.onCreate(savedInstanceState);
+        configureEdgeToEdgeWindow(getWindow());
     }
 
     @Override
@@ -31,24 +36,57 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
+    private void configureEdgeToEdgeWindow(Window window) {
+        if (window == null) {
+            return;
+        }
+        WindowCompat.setDecorFitsSystemWindows(window, false);
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            // Light navigation bar icons require API 26+, so retain a dark scrim on API 24-25.
+            window.setNavigationBarColor(Color.argb(0x80, 0x1b, 0x1b, 0x1b));
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            int cutoutMode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            if (attributes.layoutInDisplayCutoutMode != cutoutMode) {
+                attributes.layoutInDisplayCutoutMode = cutoutMode;
+                window.setAttributes(attributes);
+            }
+        }
+    }
+
     void applyReaderChrome(boolean enabled) {
+        applyReaderChrome(enabled, null);
+    }
+
+    void applyReaderChrome(boolean enabled, Runnable onComplete) {
         runOnUiThread(
             () -> {
                 Window window = getWindow();
-                WindowCompat.setDecorFitsSystemWindows(window, !enabled);
+                configureEdgeToEdgeWindow(window);
+                View decorView = window != null ? window.getDecorView() : null;
                 WindowInsetsControllerCompat controller =
-                    WindowCompat.getInsetsController(window, window.getDecorView());
-                if (controller == null) {
-                    return;
-                }
-
-                if (enabled) {
-                    controller.hide(WindowInsetsCompat.Type.systemBars());
+                    window != null && decorView != null
+                        ? WindowCompat.getInsetsController(window, decorView)
+                        : null;
+                if (controller != null) {
                     controller.setSystemBarsBehavior(
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                     );
-                } else {
-                    controller.show(WindowInsetsCompat.Type.systemBars());
+                    if (enabled) {
+                        controller.hide(WindowInsetsCompat.Type.systemBars());
+                    } else {
+                        controller.show(WindowInsetsCompat.Type.systemBars());
+                    }
+                }
+                if (onComplete != null) {
+                    if (decorView != null && decorView.isAttachedToWindow()) {
+                        decorView.post(onComplete);
+                    } else {
+                        onComplete.run();
+                    }
                 }
             }
         );

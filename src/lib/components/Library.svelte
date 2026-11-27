@@ -1771,12 +1771,12 @@
 {:else}
   <main
     bind:this={libraryMain}
-    class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
+    class="library-main mx-auto min-h-full w-full max-w-6xl"
     inert={Boolean(actionMenuBook || conflict || settingsVisible)}
   >
     <a
       href="#library-results"
-      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:p-3 preset-filled-surface-50-950"
+      class="library-skip-link sr-only focus:not-sr-only focus:fixed focus:z-50 focus:rounded-md focus:p-3 preset-filled-surface-50-950"
     >
       Skip to library books
     </a>
@@ -2529,14 +2529,14 @@
 
 {#if actionMenuBook}
   <div
-    class="fixed inset-0 z-40 grid place-items-center bg-black/45 p-4"
+    class="library-modal-backdrop fixed inset-0 z-40 grid place-items-center bg-black/45"
     role="presentation"
     transition:fade
     onclick={(event) => event.target === event.currentTarget && closeMenu()}
   >
     <div
       bind:this={actionMenuDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
+      class="card preset-filled-surface-50-950 max-h-full w-full max-w-md overflow-auto p-4 shadow-2xl"
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
@@ -2689,14 +2689,14 @@
 
 {#if conflict}
   <div
-    class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-5"
+    class="library-modal-backdrop library-conflict-backdrop fixed inset-0 z-40 grid place-items-center bg-black/55"
     role="presentation"
     transition:fade
     onclick={(event) => event.target === event.currentTarget && closeConflict()}
   >
     <div
       bind:this={conflictDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-sm p-6"
+      class="card preset-filled-surface-50-950 max-h-full w-full max-w-sm overflow-auto p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="sync-conflict-title"
@@ -3054,6 +3054,33 @@
 {/if}
 
 <style>
+  .library-main {
+    padding-top: max(1.5rem, calc(var(--safe-top, 0px) + 0.5rem));
+    padding-inline: max(1rem, var(--safe-left, 0px)) max(1rem, var(--safe-right, 0px));
+    padding-bottom: max(4rem, calc(var(--safe-bottom, 0px) + 2rem));
+  }
+
+  @media (min-width: 40rem) {
+    .library-main {
+      padding-inline: max(1.5rem, var(--safe-left, 0px)) max(1.5rem, var(--safe-right, 0px));
+    }
+  }
+
+  .library-skip-link:focus {
+    top: max(1rem, var(--safe-top, 0px));
+    left: max(1rem, var(--safe-left, 0px));
+  }
+
+  .library-modal-backdrop {
+    padding: max(1rem, var(--safe-top, 0px)) max(1rem, var(--safe-right, 0px))
+      max(1rem, var(--safe-bottom, 0px)) max(1rem, var(--safe-left, 0px));
+  }
+
+  .library-conflict-backdrop {
+    padding: max(1.25rem, var(--safe-top, 0px)) max(1.25rem, var(--safe-right, 0px))
+      max(1.25rem, var(--safe-bottom, 0px)) max(1.25rem, var(--safe-left, 0px));
+  }
+
   .switch-track {
     position: relative;
     display: inline-flex;

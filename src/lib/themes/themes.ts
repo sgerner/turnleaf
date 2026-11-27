@@ -1,6 +1,10 @@
-import { Capacitor } from '@capacitor/core';
-import { StatusBar, Style } from '@capacitor/status-bar';
+import { Capacitor, type SystemBarsStyle } from '@capacitor/core';
 import { enqueueNativeWindowAction } from '../native/reader-native-features';
+import {
+  applySystemBarsStyle,
+  applyThemeColorMeta,
+  systemBarsStyleForHex,
+} from '../native/system-bars';
 
 const themeStyles = {
   catppuccin: () => import('@skeletonlabs/skeleton/themes/catppuccin'),
@@ -597,6 +601,55 @@ function isUsableCssColor(value: string): boolean {
   );
 }
 
+function hasNativeSystemBarsBridge(): boolean {
+  if (Capacitor.isNativePlatform()) return true;
+  const cap = (globalThis as { Capacitor?: { PluginHeaders?: ReadonlyArray<{ name?: string }> } })
+    .Capacitor;
+  return Boolean(cap?.PluginHeaders?.some((header) => header.name === 'SystemBars'));
+}
+
+export function resolveShellAppearanceChrome(
+  theme: string,
+  mode: UiMode,
+): { metaColor: string; hexColor: string; style: SystemBarsStyle; luminance: number } {
+  const fallbackColor = getThemeRootBackground(theme, mode);
+  let resolvedColor = fallbackColor;
+
+  if (typeof document !== 'undefined') {
+    const bodyColor = document.body ? getComputedStyle(document.body).backgroundColor : '';
+    if (isUsableCssColor(bodyColor)) {
+      resolvedColor = bodyColor;
+    }
+  }
+
+  const fallbackHex = cssColorToHex(fallbackColor) ?? (mode === 'light' ? '#ffffff' : '#212227');
+  const hexColor = cssColorToHex(resolvedColor) ?? fallbackHex;
+  const { style, luminance } = systemBarsStyleForHex(hexColor, mode);
+
+  return {
+    metaColor: resolvedColor,
+    hexColor,
+    style,
+    luminance,
+  };
+}
+
+export function resolveReaderAppearanceChrome(
+  theme: string,
+  mode: UiMode,
+  readerElement?: Element | null,
+): { hexColor: string; style: SystemBarsStyle; luminance: number } {
+  const tokens = isSkeletonTheme(theme) ? themeTokens[theme] : themeTokens[DEFAULT_THEME];
+  const fallbackColor = mode === 'dark' ? tokens.surfaceDark : tokens.surfaceLight;
+  const fallbackHex = cssColorToHex(fallbackColor) ?? (mode === 'light' ? '#ffffff' : '#212227');
+  const elementColor = readerElement ? getComputedStyle(readerElement).backgroundColor : '';
+  const hexColor =
+    (isUsableCssColor(elementColor) ? cssColorToHex(elementColor) : null) ?? fallbackHex;
+  const { style, luminance } = systemBarsStyleForHex(hexColor, mode);
+
+  return { hexColor, style, luminance };
+}
+
 let shellChromeGeneration = 0;
 
 export function syncShellAppearanceChrome(
@@ -607,30 +660,16 @@ export function syncShellAppearanceChrome(
   const generation = ++shellChromeGeneration;
   if (options?.readerActive) return;
 
-  const fallbackColor = getThemeRootBackground(theme, mode);
-  let resolvedColor = fallbackColor;
+  const { metaColor, style } = resolveShellAppearanceChrome(theme, mode);
 
   if (typeof document !== 'undefined') {
-    const bodyColor = document.body ? getComputedStyle(document.body).backgroundColor : '';
-    if (isUsableCssColor(bodyColor)) {
-      resolvedColor = bodyColor;
-    }
-    const themeColorMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-    if (themeColorMeta) {
-      themeColorMeta.content = resolvedColor;
-    }
+    applyThemeColorMeta(metaColor, document);
   }
 
-  if (!Capacitor.isNativePlatform()) return;
-
-  const hexColor = cssColorToHex(resolvedColor) ?? cssColorToHex(fallbackColor);
-  const style = mode === 'dark' ? Style.Dark : Style.Light;
+  if (!hasNativeSystemBarsBridge()) return;
 
   void enqueueNativeWindowAction(async () => {
     if (generation !== shellChromeGeneration) return;
-    await StatusBar.setStyle({ style }).catch(() => undefined);
-    if (hexColor && generation === shellChromeGeneration) {
-      await StatusBar.setBackgroundColor({ color: hexColor }).catch(() => undefined);
-    }
+    await applySystemBarsStyle(style);
   });
 }

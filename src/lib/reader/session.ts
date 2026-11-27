@@ -441,15 +441,17 @@ export class ReaderSession {
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.viewportTarget = target;
+    const gap = appearance.margin * 2;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
+      gap,
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
       resizeOnOrientationChange: true,
       allowScriptedContent: false,
-    });
+    } as Rendition['settings'] & { gap: number });
     this.observeViewport(target);
     this.bindEpubContainer();
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
@@ -867,6 +869,14 @@ export class ReaderSession {
         previous.hyphenation !== value.hyphenation);
     const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
+    const gap = value.margin * 2;
+    const renditionWithLayout = rendition as Rendition & {
+      settings?: Rendition['settings'] & { gap?: number };
+      manager?: { settings?: { gap?: number }; updateLayout?: () => void };
+    };
+    if (renditionWithLayout.settings) {
+      renditionWithLayout.settings.gap = gap;
+    }
     const loadedContents =
       typeof (rendition as Partial<Rendition>).getContents === 'function'
         ? (rendition.getContents() as unknown as Contents | Contents[])
@@ -894,7 +904,8 @@ export class ReaderSession {
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
         'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
+        'padding-top': '0.5rem !important',
+        'padding-bottom': `${value.bottomMargin}px !important`,
         'box-sizing': 'border-box',
       },
       p: value.publisherStyles
@@ -917,6 +928,10 @@ export class ReaderSession {
       '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
     });
     rendition.themes.select('turnleaf');
+    if (previous && previous.margin !== value.margin && renditionWithLayout.manager?.settings) {
+      renditionWithLayout.manager.settings.gap = gap;
+      renditionWithLayout.manager.updateLayout?.();
+    }
     if (!layoutChanged) return;
     this.syncVisibleColumnLinks();
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;

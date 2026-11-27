@@ -19,11 +19,15 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
     }
 
     override var prefersStatusBarHidden: Bool {
-        TurnleafReaderChromeController.shared.enabled
+        super.prefersStatusBarHidden || TurnleafReaderChromeController.shared.enabled
     }
 
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
-        TurnleafReaderChromeController.shared.enabled ? [.bottom] : []
+        var edges = super.preferredScreenEdgesDeferringSystemGestures
+        if TurnleafReaderChromeController.shared.enabled {
+            edges.insert(.bottom)
+        }
+        return edges
     }
 }
 

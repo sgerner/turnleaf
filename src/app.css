@@ -5,6 +5,10 @@
 @custom-variant dark (&:where([data-mode='dark'], [data-mode='dark'] *));
 
 :root {
+  --safe-top: max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+  --safe-right: max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+  --safe-left: max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
   --turnleaf-font-sans: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
   --typo-base--font-family: var(--turnleaf-font-sans);
   --typo-base--font-size: inherit;

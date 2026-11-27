@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => ({
   getPreferences: vi.fn(async () => new Map<string, string>()),
   resetLocalDatabase: vi.fn(async () => undefined),
   setStyle: vi.fn(async () => undefined),
-  setBackgroundColor: vi.fn(async () => undefined),
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -20,17 +19,13 @@ vi.mock('@capacitor/core', () => ({
     isNativePlatform: () => mocks.isNative,
     getPlatform: () => (mocks.isNative ? 'android' : 'web'),
   },
-}));
-
-vi.mock('@capacitor/status-bar', () => ({
-  Style: {
+  SystemBars: {
+    setStyle: mocks.setStyle,
+  },
+  SystemBarsStyle: {
     Dark: 'DARK',
     Light: 'LIGHT',
     Default: 'DEFAULT',
-  },
-  StatusBar: {
-    setStyle: mocks.setStyle,
-    setBackgroundColor: mocks.setBackgroundColor,
   },
 }));
 
@@ -79,7 +74,6 @@ beforeEach(() => {
   mocks.getPreferences.mockReset();
   mocks.getPreferences.mockResolvedValue(new Map());
   mocks.setStyle.mockClear();
-  mocks.setBackgroundColor.mockClear();
   window.localStorage.clear();
   document.documentElement.dataset.theme = 'fennec';
   document.documentElement.dataset.mode = 'dark';
@@ -118,7 +112,6 @@ describe('App cold boot appearance and reconciliation', () => {
     );
     await vi.waitFor(() => {
       expect(mocks.setStyle).toHaveBeenCalledWith({ style: 'LIGHT' });
-      expect(mocks.setBackgroundColor).toHaveBeenCalledWith({ color: '#ffffff' });
     });
 
     resolvePreferences(

@@ -2,15 +2,28 @@
   import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
-  import { tick, onDestroy, onMount } from 'svelte';
+  import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
-  import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
+  import {
+    applySystemBarsStyle,
+    applyThemeColorMeta,
+    hideSystemBars,
+    showSystemBars,
+  } from '../native/system-bars';
+  import {
+    DEFAULT_THEME,
+    resolveReaderAppearanceChrome,
+    resolveShellAppearanceChrome,
+  } from '../themes/themes';
   import { VolumeButtons } from '../native/volume-buttons';
-  import { createReaderNativeFeatures } from '../native/reader-native-features';
+  import {
+    createReaderNativeFeatures,
+    enqueueNativeWindowAction,
+  } from '../native/reader-native-features';
   import {
     defaultAppearance,
     parseAppearance,
@@ -102,6 +115,7 @@
     registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
+  let readerShell = $state<HTMLElement | null>(null);
   let viewport: HTMLDivElement;
   let readerToolbar = $state<HTMLElement | null>(null);
   let topRevealButton = $state<HTMLButtonElement | null>(null);
@@ -171,7 +185,7 @@
   let readerSyncMessage = $state('');
   let searchError = $state('');
   let searchController: AbortController | null = null;
-  let appearance = $state<Appearance>({ ...defaultAppearance });
+  let appearance = $state<Appearance>(untrack(() => ({ ...defaultAppearance, mode: defaultMode })));
   let location = $state<ReaderLocation | null>(null);
   let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
   let pendingSyncLocation = $state<SyncedLocation | null>(null);
@@ -187,13 +201,24 @@
   let syncingLatest = $state(false);
   let destroyed = false;
   let localNavigationDuringSession = false;
+
+  async function restoreShellSystemBars(): Promise<void> {
+    const shellTheme = document.documentElement.dataset.theme || DEFAULT_THEME;
+    const shellMode = document.documentElement.dataset.mode === 'light' ? 'light' : 'dark';
+    const { metaColor, style } = resolveShellAppearanceChrome(shellTheme, shellMode);
+    applyThemeColorMeta(metaColor);
+    await applySystemBarsStyle(style);
+  }
+
   const nativeFeatures = Capacitor.isNativePlatform()
     ? createReaderNativeFeatures({
-        hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
-        showStatusBar: () => StatusBar.show({ animation: Animation.None }),
+        hideStatusBar: () => hideSystemBars({ animation: 'NONE' }),
+        showStatusBar: () => showSystemBars({ animation: 'NONE' }),
         setReaderChrome: (enabled) => ReaderChrome.setEnabled({ enabled }),
         setVolumeButtons: (enabled) => VolumeButtons.setEnabled({ enabled }),
         setKeepAwake: (enabled) => KeepAwake.setEnabled({ enabled }),
+        setBarStyle: (style) => applySystemBarsStyle(style),
+        restoreBarStyle: () => restoreShellSystemBars(),
       })
     : null;
 
@@ -323,6 +348,20 @@
   }
 
   $effect(() => {
+    const mode = appearance.mode;
+    const shell = readerShell;
+    if (destroyed) return;
+    const shellTheme = document.documentElement.dataset.theme || DEFAULT_THEME;
+    const { hexColor, style } = resolveReaderAppearanceChrome(shellTheme, mode, shell);
+    applyThemeColorMeta(hexColor);
+    if (nativeFeatures) {
+      void nativeFeatures.setBarStyle(style);
+    } else {
+      void enqueueNativeWindowAction(() => applySystemBarsStyle(style));
+    }
+  });
+
+  $effect(() => {
     if (!nativeFeatures || !androidReader) return;
     void nativeFeatures.setVolumeButtons(appearance.volumeButtons && !hasOpenReaderPanel());
   });
@@ -387,7 +426,11 @@
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
-    void nativeFeatures?.disable();
+    if (nativeFeatures) {
+      void nativeFeatures.disable();
+    } else {
+      void enqueueNativeWindowAction(restoreShellSystemBars);
+    }
     session?.destroy();
   });
 
@@ -1443,7 +1486,12 @@
   });
 </script>
 
-<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+<main
+  bind:this={readerShell}
+  class="reader-shell"
+  data-mode={appearance.mode}
+  aria-describedby="reader-keyboard-help"
+>
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
@@ -1451,7 +1499,7 @@
   {#if selectedText && !hasOpenReaderPanel()}
     <div
       bind:this={selectedTextGroup}
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      class="reader-selection-toolbar mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
       role="group"
       aria-label="Selected text"
     >
@@ -1518,7 +1566,7 @@
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
       bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
+      class="reader-link-return btn min-h-11 preset-filled-primary-700-300 shadow"
       type="button"
       aria-label="Return to the location before this link"
       onclick={() => void returnToLink()}
@@ -1529,7 +1577,7 @@
 
   {#if readerSyncMessage && controlsVisible}
     <p
-      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
+      class="reader-sync-toast mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
       role="status"
     >
       {readerSyncMessage}
@@ -2505,7 +2553,7 @@
 
   {#if pendingSyncLocation}
     <div
-      class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-4"
+      class="reader-alert-backdrop fixed inset-0 z-40 grid place-items-center bg-black/55"
       role="presentation"
       transition:fade={{ duration: 120 }}
       onclick={(event) => event.target === event.currentTarget && closeSyncConfirmation()}
@@ -2550,7 +2598,7 @@
 
   {#if error}
     <div
-      class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-4"
+      class="reader-alert-backdrop fixed inset-0 z-40 grid place-items-center bg-black/55"
       role="presentation"
       transition:fade={{ duration: 120 }}
       onclick={(event) => {
@@ -2607,9 +2655,11 @@
   .reader-shell {
     position: fixed;
     inset: 0;
+    z-index: 30;
     overflow: hidden;
     background: var(--reader-background);
     color: var(--reader-text);
+    color-scheme: light;
     touch-action: pan-y;
     user-select: none;
     --reader-background: var(--color-surface-50);
@@ -2617,23 +2667,21 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
-    --reader-safe-bottom: max(
-      1rem,
-      env(safe-area-inset-bottom, 0px),
-      var(--safe-area-inset-bottom, 0px)
-    );
+    --reader-safe-top: max(0.5rem, var(--safe-top, 0px));
+    --reader-safe-right: var(--safe-right, 0px);
+    --reader-safe-bottom: max(1rem, var(--safe-bottom, 0px));
+    --reader-safe-left: var(--safe-left, 0px);
     --reader-progress-height: 0.25rem;
   }
 
   .reader-viewport {
     position: absolute;
-    inset: var(--reader-safe-top) 0 var(--reader-safe-bottom) 0;
+    inset: var(--reader-safe-top) var(--reader-safe-right) var(--reader-safe-bottom)
+      var(--reader-safe-left);
     overflow: hidden;
-    width: 100%;
+    width: auto;
     height: auto;
     min-width: 0;
-    max-width: 100%;
     contain: layout paint;
   }
 
@@ -2652,11 +2700,44 @@
   }
 
   .reader-shell[data-mode='dark'] {
+    color-scheme: dark;
     --reader-background: var(--color-surface-950);
     --reader-text: var(--color-surface-50);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 38%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 32%, transparent);
     --reader-bar-text: var(--color-surface-50);
+  }
+
+  .reader-link-return {
+    position: absolute;
+    right: max(1rem, var(--reader-safe-right));
+    bottom: calc(var(--reader-safe-bottom) + 0.75rem);
+    z-index: 30;
+  }
+
+  .reader-sync-toast {
+    position: absolute;
+    left: max(1rem, var(--reader-safe-left));
+    right: max(1rem, var(--reader-safe-right));
+    bottom: max(3rem, var(--safe-bottom, 0px));
+    z-index: 30;
+  }
+
+  .reader-selection-toolbar {
+    position: absolute;
+    left: max(0.5rem, var(--reader-safe-left));
+    right: max(0.5rem, var(--reader-safe-right));
+    bottom: max(2rem, var(--safe-bottom, 0px));
+    z-index: 30;
+  }
+
+  .reader-alert-backdrop {
+    padding: max(1rem, var(--reader-safe-top)) max(1rem, var(--reader-safe-right))
+      max(1rem, var(--reader-safe-bottom)) max(1rem, var(--reader-safe-left));
+  }
+
+  .reader-alert-backdrop > .card {
+    max-height: min(calc(100dvh - 2rem), 100%);
   }
 
   .reader-overlay {
@@ -2685,9 +2766,9 @@
     position: absolute;
     z-index: 11;
     top: 0;
-    left: 0;
-    right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    left: var(--reader-safe-left);
+    right: var(--reader-safe-right);
+    height: max(4rem, calc(var(--safe-top, 0px) + 3rem));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2696,10 +2777,10 @@
   .reader-bottom-reveal {
     position: absolute;
     z-index: 11;
-    left: 0;
-    right: 0;
+    left: var(--reader-safe-left);
+    right: var(--reader-safe-right);
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: max(2.5rem, calc(var(--safe-bottom, 0px) + 1.5rem));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2738,13 +2819,14 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding-inline: max(1rem, env(safe-area-inset-left));
+    padding-inline-start: max(1rem, var(--reader-safe-left));
+    padding-inline-end: max(1rem, var(--reader-safe-right));
     color: var(--reader-bar-text);
   }
 
   .reader-top {
     top: 0;
-    padding-top: env(safe-area-inset-top);
+    padding-top: var(--reader-safe-top);
   }
 
   .reader-toolbar {
@@ -2831,15 +2913,15 @@
   }
 
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    bottom: calc(var(--reader-progress-height) + max(1.5rem, var(--safe-bottom, 0px) + 1rem));
     justify-content: space-between;
     padding-bottom: 0;
   }
 
   .reader-progress {
     position: absolute;
-    left: 0;
-    right: 0;
+    left: var(--reader-safe-left);
+    right: var(--reader-safe-right);
     bottom: 0;
     z-index: 18;
     pointer-events: none;
@@ -2861,8 +2943,8 @@
 
   .reader-progress-reveal {
     position: absolute;
-    right: max(1rem, env(safe-area-inset-right));
-    bottom: max(0.25rem, env(safe-area-inset-bottom));
+    right: max(1rem, var(--reader-safe-right));
+    bottom: max(0.25rem, var(--safe-bottom, 0px));
     z-index: 19;
     min-width: 3rem;
     min-height: 2.75rem;
@@ -2871,12 +2953,15 @@
 
   .reader-settings {
     position: absolute;
-    left: 1rem;
-    right: 1rem;
-    bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    left: max(1rem, var(--reader-safe-left));
+    right: max(1rem, var(--reader-safe-right));
+    bottom: max(4rem, calc(var(--safe-bottom, 0px) + 3rem));
     margin-inline: auto;
     max-width: 30rem;
-    max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    max-height: min(
+      75dvh,
+      calc(100dvh - max(4rem, var(--safe-bottom, 0px) + 3rem) - max(1rem, var(--safe-top, 0px)))
+    );
     overflow: auto;
     padding: 1.25rem;
     z-index: 1;

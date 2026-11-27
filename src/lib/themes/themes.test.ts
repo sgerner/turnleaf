@@ -7,24 +7,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const nativeMocks = vi.hoisted(() => ({
   isNative: false,
   setStyle: vi.fn<(options: { style: string }) => Promise<void>>(async () => undefined),
-  setBackgroundColor: vi.fn<(options: { color: string }) => Promise<void>>(async () => undefined),
 }));
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
     isNativePlatform: () => nativeMocks.isNative,
   },
-}));
-
-vi.mock('@capacitor/status-bar', () => ({
-  Style: {
+  SystemBars: {
+    setStyle: nativeMocks.setStyle,
+  },
+  SystemBarsStyle: {
     Dark: 'DARK',
     Light: 'LIGHT',
     Default: 'DEFAULT',
-  },
-  StatusBar: {
-    setStyle: nativeMocks.setStyle,
-    setBackgroundColor: nativeMocks.setBackgroundColor,
   },
 }));
 
@@ -65,7 +60,6 @@ function resolveCssVar(
 beforeEach(() => {
   nativeMocks.isNative = false;
   nativeMocks.setStyle.mockClear();
-  nativeMocks.setBackgroundColor.mockClear();
   window.localStorage.clear();
   document.documentElement.className = '';
   document.documentElement.removeAttribute('style');
@@ -213,8 +207,8 @@ describe('boot theme cache and pre-paint script', () => {
   });
 });
 
-describe('reactive browser theme-color and native StatusBar synchronization', () => {
-  it('updates meta[name="theme-color"] from document.body and syncs native StatusBar outside reader mode', async () => {
+describe('reactive browser theme-color and native SystemBars synchronization', () => {
+  it('updates meta[name="theme-color"] from document.body and syncs native SystemBars outside reader mode', async () => {
     nativeMocks.isNative = true;
     document.body.style.backgroundColor = 'rgb(255, 255, 255)';
 
@@ -224,11 +218,9 @@ describe('reactive browser theme-color and native StatusBar synchronization', ()
     expect(meta?.content).toBe('rgb(255, 255, 255)');
     await vi.waitFor(() => {
       expect(nativeMocks.setStyle).toHaveBeenCalledWith({ style: 'LIGHT' });
-      expect(nativeMocks.setBackgroundColor).toHaveBeenCalledWith({ color: '#ffffff' });
     });
 
     nativeMocks.setStyle.mockClear();
-    nativeMocks.setBackgroundColor.mockClear();
     document.body.style.backgroundColor = 'rgb(18, 20, 28)';
 
     syncShellAppearanceChrome('fennec', 'dark');
@@ -236,18 +228,14 @@ describe('reactive browser theme-color and native StatusBar synchronization', ()
     expect(meta?.content).toBe('rgb(18, 20, 28)');
     await vi.waitFor(() => {
       expect(nativeMocks.setStyle).toHaveBeenCalledWith({ style: 'DARK' });
-      expect(nativeMocks.setBackgroundColor).toHaveBeenCalledWith({ color: '#12141c' });
     });
   });
 
-  it('skips status bar mutations during reader mode and serializes after reader teardown', async () => {
+  it('skips system bar mutations during reader mode and serializes after reader teardown', async () => {
     nativeMocks.isNative = true;
     const order: string[] = [];
     nativeMocks.setStyle.mockImplementation(async ({ style }: { style: string }) => {
       order.push(`style:${style}`);
-    });
-    nativeMocks.setBackgroundColor.mockImplementation(async ({ color }: { color: string }) => {
-      order.push(`bg:${color}`);
     });
 
     let releaseShow!: () => void;
@@ -281,7 +269,7 @@ describe('reactive browser theme-color and native StatusBar synchronization', ()
     releaseShow();
     await disabling;
     await vi.waitFor(() => {
-      expect(order).toEqual(['reader:show', 'reader:chrome:false', 'style:LIGHT', 'bg:#ffffff']);
+      expect(order).toEqual(['reader:show', 'reader:chrome:false', 'style:LIGHT']);
     });
   });
 });

@@ -19,7 +19,7 @@
 </script>
 
 <div
-  class="dialog-backdrop fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
+  class="dialog-backdrop fixed inset-0 z-50 grid place-items-center bg-black/55"
   role="presentation"
   transition:fade
   onclick={(event) => event.target === event.currentTarget && onClose()}
@@ -44,9 +44,14 @@
 </div>
 
 <style>
+  .dialog-backdrop {
+    padding: max(1rem, var(--safe-top, 0px)) max(1rem, var(--safe-right, 0px))
+      max(1rem, var(--safe-bottom, 0px)) max(1rem, var(--safe-left, 0px));
+  }
+
   .dialog-card {
-    max-height: 88vh;
-    max-height: 88dvh;
+    max-height: min(88vh, 100%);
+    max-height: min(88dvh, 100%);
   }
 
   .dialog-body {
@@ -57,7 +62,8 @@
 
   @media (max-height: 24rem) {
     .dialog-backdrop {
-      padding: 0.25rem 0.5rem;
+      padding: max(0.25rem, var(--safe-top, 0px)) max(0.5rem, var(--safe-right, 0px))
+        max(0.25rem, var(--safe-bottom, 0px)) max(0.5rem, var(--safe-left, 0px));
     }
 
     .dialog-card {

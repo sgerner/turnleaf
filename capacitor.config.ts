@@ -14,6 +14,12 @@ const config: CapacitorConfig = {
     // Kavita may be hosted on a local HTTP address; onboarding requires explicit confirmation.
     allowMixedContent: true,
   },
+  plugins: {
+    SystemBars: {
+      insetsHandling: 'css',
+      initialViewportFitValueHint: 'cover',
+    },
+  },
 };
 
 export default config;
