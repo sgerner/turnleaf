@@ -190,6 +190,7 @@ vi.mock('../downloads/native-download', async (importOriginal) => {
         apiKey: string,
         _fileStem: string,
         _onProgress?: (percent: number | null) => void,
+        _serverOrigin?: string,
         credentialEpoch?: number,
       ) => {
         if (!canSendCredential(apiKey, credentialEpoch)) {
@@ -220,6 +221,7 @@ vi.mock('../downloads/native-download', async (importOriginal) => {
         _signal?: AbortSignal,
         _serverId?: string,
         allowDownload = true,
+        _serverOrigin?: string,
         credentialEpoch?: number,
       ) => {
         if (nativeDownloadMock.coverResult) {
@@ -396,50 +398,92 @@ function seedDatabase({
   server = savedServer,
   books = [downloadedBook],
   pendingSync = false,
+  secondPendingSync = false,
 }: {
   server?: ServerConfig | null;
   books?: BookRecord[];
   pendingSync?: boolean;
+  secondPendingSync?: boolean;
 } = {}) {
   const updatedAt = '2026-01-02T00:00:00.000Z';
+  const secondUpdatedAt = '2026-01-02T00:01:00.000Z';
   const db = {
     serverConfig: server,
     books,
-    readingState: pendingSync
-      ? {
-          [downloadedBook.id]: {
-            cfi: 'epubcfi(/6/4!/4/2/1:0)',
-            xpath: '//body/DocFragment[2]/body/p[1]',
-            percentage: 0.5,
-            localUpdatedAt: updatedAt,
-            syncedLocalUpdatedAt: null,
-            serverUpdatedAt: null,
-            pendingSync: true,
-          },
-        }
-      : {},
-    syncQueue: pendingSync
-      ? {
-          [downloadedBook.id]: {
-            bookId: downloadedBook.id,
-            serverId: 'primary',
-            payloadJson: JSON.stringify({
-              libraryId: 1,
-              seriesId: 1,
-              volumeId: 1,
-              chapterId: 1,
-              pageNum: 50,
-              bookScrollId: '//body/DocFragment[2]/body/p[1]',
-            }),
-            attemptCount: 0,
-            lastAttemptAt: null,
-            lastError: null,
-            createdAt: updatedAt,
-            updatedAt,
-            revision: 1,
-          },
-        }
-      : {},
+    readingState: {
+      ...(pendingSync
+        ? {
+            [downloadedBook.id]: {
+              cfi: 'epubcfi(/6/4!/4/2/1:0)',
+              xpath: '//body/DocFragment[2]/body/p[1]',
+              percentage: 0.5,
+              localUpdatedAt: updatedAt,
+              syncedLocalUpdatedAt: null,
+              serverUpdatedAt: null,
+              pendingSync: true,
+            },
+          }
+        : {}),
+      ...(secondPendingSync
+        ? {
+            [onlineOnlyBook.id]: {
+              cfi: 'epubcfi(/6/4!/4/4/1:0)',
+              xpath: '//body/DocFragment[2]/body/p[2]',
+              percentage: 0.25,
+              localUpdatedAt: secondUpdatedAt,
+              syncedLocalUpdatedAt: null,
+              serverUpdatedAt: null,
+              pendingSync: true,
+            },
+          }
+        : {}),
+    },
+    syncQueue: {
+      ...(pendingSync
+        ? {
+            [downloadedBook.id]: {
+              bookId: downloadedBook.id,
+              serverId: 'primary',
+              payloadJson: JSON.stringify({
+                libraryId: 1,
+                seriesId: 1,
+                volumeId: 1,
+                chapterId: 1,
+                pageNum: 50,
+                bookScrollId: '//body/DocFragment[2]/body/p[1]',
+              }),
+              attemptCount: 0,
+              lastAttemptAt: null,
+              lastError: null,
+              createdAt: updatedAt,
+              updatedAt,
+              revision: 1,
+            },
+          }
+        : {}),
+      ...(secondPendingSync
+        ? {
+            [onlineOnlyBook.id]: {
+              bookId: onlineOnlyBook.id,
+              serverId: 'primary',
+              payloadJson: JSON.stringify({
+                libraryId: 1,
+                seriesId: 2,
+                volumeId: 2,
+                chapterId: 2,
+                pageNum: 25,
+                bookScrollId: '//body/DocFragment[2]/body/p[2]',
+              }),
+              attemptCount: 0,
+              lastAttemptAt: null,
+              lastError: null,
+              createdAt: secondUpdatedAt,
+              updatedAt: secondUpdatedAt,
+              revision: 1,
+            },
+          }
+        : {}),
+    },
     preferences: {
       hideCompleted: 'false',
     },
@@ -622,8 +666,12 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     ).toBe(true);
   });
 
-  it('stops all follow-up requests after catalog 401, renders one consolidated alert, and keeps offline reader features working', async () => {
-    seedDatabase({ books: [downloadedBook, onlineOnlyBook], pendingSync: true });
+  it('stops all follow-up requests after startup 401, renders one consolidated alert, and keeps offline reader features working', async () => {
+    seedDatabase({
+      books: [downloadedBook, onlineOnlyBook],
+      pendingSync: true,
+      secondPendingSync: true,
+    });
     window.localStorage.setItem('turnleaf_browser_server_primary_api_key', 'stale-key');
 
     const requestedUrls: string[] = [];
@@ -644,9 +692,22 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
         target.querySelector('[data-book-open]') !== null,
     );
 
-    // Exactly 1 request (/api/Series/v2): syncProgress, uncached covers, and checkOpenProgress are skipped.
-    expect(requestedUrls).toHaveLength(1);
-    expect(requestedUrls[0]).toContain('/api/Series/v2');
+    // Concurrent startup sync + refresh send at most 1 initial /api/Reader/progress and/or /api/Series/v2;
+    // the 2nd queued progress item, series-detail, uncached covers, and checkOpenProgress are all gated.
+    const initialRequestCount = requestedUrls.length;
+    expect(initialRequestCount).toBeGreaterThanOrEqual(1);
+    expect(initialRequestCount).toBeLessThanOrEqual(2);
+    expect(
+      requestedUrls.filter((url) => url.includes('/api/Reader/progress')).length,
+    ).toBeLessThanOrEqual(1);
+    expect(
+      requestedUrls.filter((url) => url.includes('/api/Series/v2')).length,
+    ).toBeLessThanOrEqual(1);
+    expect(
+      requestedUrls.every(
+        (url) => url.includes('/api/Reader/progress') || url.includes('/api/Series/v2'),
+      ),
+    ).toBe(true);
 
     // Consolidated single credential alert instead of 3 stacked error banners.
     expect(target.querySelectorAll('.alert')).toHaveLength(1);
@@ -669,7 +730,7 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     );
     target.querySelector<HTMLButtonElement>('[aria-label="Show reading controls"]')!.click();
     await waitForCondition(() => target.querySelector('[aria-label="Back to library"]') !== null);
-    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls).toHaveLength(initialRequestCount);
     expect(CapacitorHttp.request).not.toHaveBeenCalled();
 
     // Switch back to browser storage mode for local preference writes while testing reader features,
@@ -679,7 +740,7 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       listener({ isActive: true });
     }
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls).toHaveLength(initialRequestCount);
     expect(CapacitorHttp.request).not.toHaveBeenCalled();
 
     // Verify local in-book search works during lockout.
@@ -747,11 +808,15 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     );
 
     // Zero network requests occurred across search, bookmarks, annotations, Markdown export, or resume.
-    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls).toHaveLength(initialRequestCount);
   });
 
-  it('also gates follow-up requests when catalog refresh receives HTTP 403', async () => {
-    seedDatabase({ books: [downloadedBook, onlineOnlyBook], pendingSync: true });
+  it('also gates follow-up requests when startup receives HTTP 403', async () => {
+    seedDatabase({
+      books: [downloadedBook, onlineOnlyBook],
+      pendingSync: true,
+      secondPendingSync: true,
+    });
     window.localStorage.setItem('turnleaf_browser_server_primary_api_key', 'forbidden-key');
 
     const requestedUrls: string[] = [];
@@ -769,7 +834,14 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       () => target.querySelector('[data-credential-alert="rejected"]') !== null,
     );
 
-    expect(requestedUrls).toHaveLength(1);
+    expect(requestedUrls.length).toBeGreaterThanOrEqual(1);
+    expect(requestedUrls.length).toBeLessThanOrEqual(2);
+    expect(
+      requestedUrls.filter((url) => url.includes('/api/Reader/progress')).length,
+    ).toBeLessThanOrEqual(1);
+    expect(
+      requestedUrls.filter((url) => url.includes('/api/Series/v2')).length,
+    ).toBeLessThanOrEqual(1);
     expect(target.querySelectorAll('.alert')).toHaveLength(1);
   });
 

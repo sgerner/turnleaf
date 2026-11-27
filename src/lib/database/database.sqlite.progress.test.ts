@@ -13,6 +13,7 @@ const native = vi.hoisted(() => ({
   database: null as DatabaseSync | null,
   isOpen: false,
   failTransactionAt: null as number | null,
+  onTransactionTask: null as ((index: number) => void | Promise<void>) | null,
   createAdapter: null as (() => unknown) | null,
 }));
 
@@ -121,6 +122,7 @@ function createAdapter() {
       const failAt = native.failTransactionAt;
       native.failTransactionAt = null;
       database.exec('BEGIN');
+      await Promise.resolve();
       try {
         for (const [index, task] of tasks.entries()) {
           if (index === failAt) throw new Error(`injected transaction failure at ${index}`);
@@ -129,10 +131,14 @@ function createAdapter() {
           } else {
             database.exec(task.statement);
           }
+          await Promise.resolve();
+          await native.onTransactionTask?.(index);
         }
+        await Promise.resolve();
         database.exec('COMMIT');
         return { changes: { changes: tasks.length } };
       } catch (error) {
+        await Promise.resolve();
         database.exec('ROLLBACK');
         throw error;
       }
@@ -168,6 +174,7 @@ describe('native progress transactions against SQLite', () => {
     native.database = null;
     native.isOpen = false;
     native.failTransactionAt = null;
+    native.onTransactionTask = null;
   });
 
   afterEach(() => {
@@ -175,6 +182,7 @@ describe('native progress transactions against SQLite', () => {
     native.database = null;
     native.isOpen = false;
     native.failTransactionAt = null;
+    native.onTransactionTask = null;
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -514,6 +522,88 @@ describe('native progress transactions against SQLite', () => {
     expect(await database.getPendingSync(server.id)).toMatchObject([{ bookId: book.id }]);
   });
 
+  it('marks and clears SQLite download metadata across reopen without touching other books', async () => {
+    const database = await importDatabase();
+    const sibling = { ...book, id: 'server:1:11', chapterId: 11, title: 'Sibling' };
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book, sibling]);
+
+    await database.markDownloaded(book.id, 'books/server-1-10.epub', 4096);
+    const afterMark = await reopenDatabase(database);
+    expect(await afterMark.getBooks(server.id)).toEqual([
+      expect.objectContaining({
+        id: book.id,
+        downloadPath: 'books/server-1-10.epub',
+        downloadStatus: 'available',
+        fileSize: 4096,
+      }),
+      expect.objectContaining({
+        id: sibling.id,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+      }),
+    ]);
+
+    await afterMark.removeDownload(book.id);
+    const afterRemove = await reopenDatabase(afterMark);
+    expect(await afterRemove.getBooks(server.id)).toEqual([
+      expect.objectContaining({
+        id: book.id,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+      }),
+      expect.objectContaining({
+        id: sibling.id,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+      }),
+    ]);
+    const rawRow = native.database
+      ?.prepare('SELECT download_path, download_status, file_size FROM books WHERE id=?')
+      .get(book.id);
+    expect(rawRow).toEqual({
+      download_path: null,
+      download_status: 'none',
+      file_size: null,
+    });
+  });
+
+  it('normalizes zero-page remote progress to zero percent while storing raw server_page_num', async () => {
+    const database = await importDatabase();
+    const zeroPageBook = { ...book, pages: 0 };
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [zeroPageBook]);
+    const remote = {
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 10,
+      chapterId: 10,
+      pageNum: 17,
+      bookScrollId: '/zero',
+      lastModifiedUtc: '2026-01-03T00:00:00.000Z',
+    };
+
+    expect(await database.saveRemoteProgress(zeroPageBook, remote, null)).toBe(true);
+    expect(await database.getReadingState(zeroPageBook.id)).toMatchObject({
+      cfi: '',
+      xpath: '/zero',
+      percentage: 0,
+      pendingSync: false,
+    });
+    expect((await database.getBooks(server.id))[0]?.pagesRead).toBe(0);
+    expect(
+      native.database
+        ?.prepare('SELECT percentage, server_page_num FROM reading_state WHERE book_id=?')
+        .get(zeroPageBook.id),
+    ).toEqual({
+      percentage: 0,
+      server_page_num: 17,
+    });
+  });
+
   it('seeds the persistent progress revision when upgrading a pending version-6 queue', async () => {
     const updatedAt = '2026-01-01T00:00:00.000Z';
     native.database = new DatabaseSync(native.databasePath);
@@ -620,5 +710,178 @@ describe('native progress transactions against SQLite', () => {
     ]);
     expect(await reopened.getReadingState(book.id)).toEqual(baselineReading);
     expect(await reopened.getPendingSync(server.id)).toEqual(baselinePending);
+  });
+
+  it('serializes reads behind reconcileBooks so mid-transaction remote_available=0 is hidden', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+
+    const captured: {
+      pending?: ReturnType<typeof database.getPendingSync>;
+      status?: ReturnType<typeof database.getSyncStatus>;
+      books?: ReturnType<typeof database.getBooks>;
+    } = {};
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      captured.pending = database.getPendingSync(server.id);
+      captured.status = database.getSyncStatus(server.id);
+      captured.books = database.getBooks(server.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    await database.reconcileBooks(server.id, [{ ...book, title: 'Refreshed during sync' }]);
+
+    expect(captured.pending).toBeDefined();
+    expect(await captured.pending).toMatchObject([{ bookId: book.id, revision: 1 }]);
+    expect(await captured.status).toMatchObject({ pendingCount: 1, failedCount: 0 });
+    expect(await captured.books).toMatchObject([
+      { id: book.id, title: 'Refreshed during sync', remoteAvailable: true },
+    ]);
+  });
+
+  it('hides uncommitted progress rows when saveLocalProgress rolls back mid-transaction', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    const baselineReading = await database.getReadingState(book.id);
+    const baselineQueue = await database.getPendingSync(server.id);
+
+    const captured: {
+      reading?: ReturnType<typeof database.getReadingState>;
+      queue?: ReturnType<typeof database.getPendingSync>;
+    } = {};
+    native.failTransactionAt = 2;
+    native.onTransactionTask = async (index) => {
+      if (index !== 1) return;
+      native.onTransactionTask = null;
+      captured.reading = database.getReadingState(book.id);
+      captured.queue = database.getPendingSync(server.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    await expect(
+      database.saveLocalProgress(book, 'rolled-back-cfi', '/rolled-back', 0.8),
+    ).rejects.toThrow('injected transaction failure at 2');
+
+    expect(await captured.reading).toEqual(baselineReading);
+    expect(await captured.queue).toEqual(baselineQueue);
+    expect(await database.getServer()).toEqual(server);
+  });
+
+  it('prevents torn reads across reading_state and sync_queue during confirmSync', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    const pending = (await database.getPendingSync(server.id))[0]!;
+
+    const captured: {
+      reading?: ReturnType<typeof database.getReadingState>;
+      queue?: ReturnType<typeof database.getPendingSync>;
+    } = {};
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      captured.reading = database.getReadingState(book.id);
+      captured.queue = database.getPendingSync(server.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    await database.confirmSync(
+      book.id,
+      '2026-01-02T00:00:00.000Z',
+      pending.revision,
+      pending.updatedAt,
+    );
+
+    expect(await captured.reading).toMatchObject({
+      pendingSync: false,
+      syncedLocalUpdatedAt: pending.updatedAt,
+      serverUpdatedAt: '2026-01-02T00:00:00.000Z',
+    });
+    expect(await captured.queue).toEqual([]);
+  });
+
+  it('keeps internal reads unqueued in saveRemoteProgress while serializing concurrent reads', async () => {
+    const database = await importDatabase();
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book]);
+    const remote = { ...book, pageNum: 41, bookScrollId: '/remote' };
+
+    const captured: {
+      reading?: ReturnType<typeof database.getReadingState>;
+      books?: ReturnType<typeof database.getBooks>;
+    } = {};
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      captured.reading = database.getReadingState(book.id);
+      captured.books = database.getBooks(server.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    expect(await database.saveRemoteProgress(book, remote, null)).toBe(true);
+    expect(await captured.reading).toMatchObject({
+      xpath: '/remote',
+      percentage: 0.41,
+      pendingSync: false,
+    });
+    expect((await captured.books)?.[0]?.pagesRead).toBe(41);
+  });
+
+  it('keeps acceptRemoteProgress transaction and verification atomic ahead of queued reads and writes', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    const initial = (await database.getReadingState(book.id))!;
+    const remote = {
+      libraryId: 1,
+      seriesId: 1,
+      volumeId: 10,
+      chapterId: 10,
+      pageNum: 80,
+      bookScrollId: '/remote',
+      lastModifiedUtc: '2026-01-02T00:00:00.000Z',
+    };
+
+    const captured: {
+      reading?: ReturnType<typeof database.getReadingState>;
+      queue?: ReturnType<typeof database.getPendingSync>;
+      books?: ReturnType<typeof database.getBooks>;
+      queuedLocalSave?: Promise<void>;
+    } = {};
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      captured.reading = database.getReadingState(book.id);
+      captured.queue = database.getPendingSync(server.id);
+      captured.books = database.getBooks(server.id);
+      captured.queuedLocalSave = database.saveLocalProgress(book, 'newer-cfi', '/newer', 0.9);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    expect(
+      await database.acceptRemoteProgress(
+        book,
+        remote,
+        initial.syncRevision!,
+        initial.localUpdatedAt,
+      ),
+    ).toBe(true);
+
+    expect(await captured.reading).toMatchObject({
+      cfi: '',
+      xpath: '/remote',
+      percentage: 0.8,
+      pendingSync: false,
+    });
+    expect(await captured.queue).toEqual([]);
+    expect((await captured.books)?.[0]).toMatchObject({
+      pagesRead: 80,
+      lastReadAt: remote.lastModifiedUtc,
+    });
+
+    await captured.queuedLocalSave;
+    expect(await database.getReadingState(book.id)).toMatchObject({
+      cfi: 'newer-cfi',
+      pendingSync: true,
+    });
   });
 });
