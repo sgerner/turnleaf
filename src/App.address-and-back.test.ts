@@ -198,14 +198,23 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
     mocks.loadTheme.mockReset().mockResolvedValue(true);
     mocks.networkConnected = true;
 
-    if (typeof Element.prototype.animate !== 'function') {
-      Element.prototype.animate = () =>
-        ({
-          finished: Promise.resolve(),
-          cancel: () => {},
-          onfinish: null,
-        }) as unknown as Animation;
-    }
+    Element.prototype.animate = () => {
+      let canceled = false;
+      const animation = {
+        currentTime: 0,
+        playState: 'finished',
+        effect: null,
+        finished: Promise.resolve(),
+        onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+        cancel: () => {
+          canceled = true;
+        },
+      };
+      queueMicrotask(() => {
+        if (!canceled) animation.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+      });
+      return animation as unknown as Animation;
+    };
 
     vi.stubGlobal(
       'fetch',
@@ -459,13 +468,43 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
     expect(document.activeElement?.textContent?.trim()).toBe('Change server address');
     expect(mocks.exitApp).not.toHaveBeenCalled();
 
-    // 2nd Back: closes Settings and restores focus to Open settings button
+    // Open Delete server confirmation, then press Back -> cancels confirmation before closing Settings
+    const deleteServerBtn = Array.from(target.querySelectorAll('button')).find(
+      (btn) => btn.textContent?.trim() === 'Delete server',
+    )!;
+    const cancelOtherFocusBtn = Array.from(target.querySelectorAll('button')).find(
+      (btn) => btn.textContent?.trim() === 'Clear cover cache',
+    )!;
+    deleteServerBtn.click();
+    await settle();
+    cancelOtherFocusBtn.focus();
+    const confirmHeading = Array.from(target.querySelectorAll('p')).find(
+      (node) => node.textContent?.trim() === 'Delete this server?',
+    )!;
+    expect(confirmHeading).toBeTruthy();
+    expect(confirmHeading.parentElement?.hasAttribute('inert')).toBe(false);
+
+    pressAndroidBack();
+    await settle();
+    expect(!confirmHeading.isConnected || confirmHeading.parentElement?.hasAttribute('inert')).toBe(
+      true,
+    );
+    expect(
+      target
+        .querySelector('#library-settings-title')
+        ?.closest('[role="dialog"]')
+        ?.hasAttribute('inert'),
+    ).toBe(false);
+    expect(document.activeElement).toBe(deleteServerBtn);
+    expect(mocks.exitApp).not.toHaveBeenCalled();
+
+    // Next Back: closes Settings and restores focus to Open settings button
     pressAndroidBack();
     await settle();
     expect(document.activeElement).toBe(openSettingsBtn);
     expect(mocks.exitApp).not.toHaveBeenCalled();
 
-    // 3rd Back: exits Turnleaf cleanly via App.svelte
+    // Final Back: exits Turnleaf cleanly via App.svelte
     pressAndroidBack();
     await settle();
     expect(mocks.exitApp).toHaveBeenCalledTimes(1);

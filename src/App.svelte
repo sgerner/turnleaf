@@ -132,7 +132,8 @@
     let destroyed = false;
     let removeBackListener: (() => Promise<void>) | null = null;
     void App.addListener('backButton', () => {
-      if (!destroyed) backStack.dispatch();
+      if (destroyed || booting || repairing) return;
+      backStack.dispatch();
     })
       .then((handle) => {
         if (destroyed) void handle.remove();

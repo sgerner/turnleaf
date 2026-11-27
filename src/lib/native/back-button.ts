@@ -2,28 +2,31 @@ export type BackButtonHandler = () => boolean;
 export type RegisterBackHandler = (handler: BackButtonHandler) => () => void;
 
 export function createBackButtonStack(options: { exitApp: () => void }) {
-  const handlers: BackButtonHandler[] = [];
+  const entries: Array<{ handler: BackButtonHandler; active: boolean }> = [];
 
   return {
     register(handler: BackButtonHandler): () => void {
-      handlers.push(handler);
-      let active = true;
+      const entry = { handler, active: true };
+      entries.push(entry);
       return () => {
-        if (!active) return;
-        active = false;
-        const index = handlers.lastIndexOf(handler);
-        if (index >= 0) handlers.splice(index, 1);
+        if (!entry.active) return;
+        entry.active = false;
+        const index = entries.indexOf(entry);
+        if (index >= 0) entries.splice(index, 1);
       };
     },
     dispatch(): boolean {
-      for (let index = handlers.length - 1; index >= 0; index -= 1) {
-        if (handlers[index]?.()) return true;
+      const snapshot = [...entries];
+      for (let index = snapshot.length - 1; index >= 0; index -= 1) {
+        const entry = snapshot[index];
+        if (entry?.active && entry.handler()) return true;
       }
       options.exitApp();
       return false;
     },
     clear(): void {
-      handlers.length = 0;
+      for (const entry of entries) entry.active = false;
+      entries.length = 0;
     },
   };
 }
@@ -45,6 +48,7 @@ export function handleLibraryBack(options: {
   hasOpenReader: boolean;
   editingServerAddress?: boolean;
   savingServerAddress?: boolean;
+  confirmDeleteServer?: boolean;
   settingsBusy?: boolean;
   settingsVisible: boolean;
   filtersVisible: boolean;
@@ -52,6 +56,7 @@ export function handleLibraryBack(options: {
   closeActionMenu: () => void;
   closeReader: () => void;
   cancelServerAddressEdit?: () => void;
+  cancelDeleteServer?: () => void;
   closeSettings: () => void;
   closeFilters: () => void;
 }): boolean {
@@ -69,6 +74,10 @@ export function handleLibraryBack(options: {
   }
   if (options.settingsVisible && options.editingServerAddress) {
     if (!options.savingServerAddress) options.cancelServerAddressEdit?.();
+    return true;
+  }
+  if (options.settingsVisible && options.confirmDeleteServer) {
+    if (!options.settingsBusy) options.cancelDeleteServer?.();
     return true;
   }
   if (options.settingsVisible) {

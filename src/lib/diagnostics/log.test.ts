@@ -145,9 +145,14 @@ describe('diagnostic log', () => {
       category: 'request',
       endpoint: 'https://host.invalid/kavita/api/opds/secret-opds-token/libraries#clients',
     });
+    recordDiagnostic({
+      category: 'request',
+      endpoint: 'https://İ.host.invalid/api-proxy/api/opds/secret-opds-token/api/v1?key=secret',
+    });
     const exported = exportDiagnostics({ appVersion: 'test', platform: 'android' });
     expect(exported).toContain('endpoint=/api/Series/:id/cover');
     expect(exported).toContain('endpoint=/api/opds');
+    expect(exported).not.toContain('endpoint=/api/v1');
     expect(exported).not.toContain('secret-opds-token');
     expect(exported).not.toContain('host.invalid');
   });

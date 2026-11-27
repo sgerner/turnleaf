@@ -119,9 +119,10 @@
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
+  let activeServer = $derived(server);
   let activeApiKey = $derived(apiKey);
-  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
-  const serverOrigin = $derived(new URL(server.baseUrl).origin);
+  const client = $derived(new KavitaClient(activeServer.baseUrl, activeApiKey));
+  const serverOrigin = $derived(new URL(activeServer.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
@@ -292,6 +293,7 @@
   let settingsDialog = $state<HTMLElement | null>(null);
   let serverAddressEditor = $state<HTMLElement | null>(null);
   let changeServerAddressButton = $state<HTMLButtonElement | null>(null);
+  let deleteServerButton = $state<HTMLButtonElement | null>(null);
   let settingsTriggerButton = $state<HTMLButtonElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
@@ -418,7 +420,7 @@
   }
 
   function insecureServer(): boolean {
-    return server.baseUrl.toLowerCase().startsWith('http://');
+    return activeServer.baseUrl.toLowerCase().startsWith('http://');
   }
 
   function isMissingNativeFile(error: unknown): boolean {
@@ -659,6 +661,7 @@
       hasOpenReader: Boolean(reading),
       editingServerAddress,
       savingServerAddress,
+      confirmDeleteServer,
       settingsBusy: replacingApiKey || deletingServer,
       settingsVisible,
       filtersVisible,
@@ -666,6 +669,7 @@
       closeActionMenu: closeMenu,
       closeReader: () => void closeReader(),
       cancelServerAddressEdit,
+      cancelDeleteServer,
       closeSettings,
       closeFilters: () => {
         filtersVisible = false;
@@ -1646,6 +1650,7 @@
   function closeSettings(): void {
     settingsVisible = false;
     editingServerAddress = false;
+    confirmDeleteServer = false;
     nextServerUrl = '';
     allowInsecureServerUrl = false;
     addressError = '';
@@ -1663,7 +1668,7 @@
     addressInvalidField = null;
     addressStatusMessage = '';
     settingsError = '';
-    nextServerUrl = server.baseUrl;
+    nextServerUrl = activeServer.baseUrl;
     allowInsecureServerUrl = false;
     editingServerAddress = true;
     void tick().then(() => focusFirstElement(serverAddressEditor));
@@ -1672,11 +1677,17 @@
   function cancelServerAddressEdit(): void {
     if (savingServerAddress) return;
     editingServerAddress = false;
-    nextServerUrl = server.baseUrl;
+    nextServerUrl = activeServer.baseUrl;
     allowInsecureServerUrl = false;
     addressError = '';
     addressInvalidField = null;
     void tick().then(() => restoreFocus(changeServerAddressButton));
+  }
+
+  function cancelDeleteServer(): void {
+    if (deletingServer) return;
+    confirmDeleteServer = false;
+    void tick().then(() => restoreFocus(deleteServerButton));
   }
 
   function handleSettingsServerUrlPaste(event: ClipboardEvent): void {
@@ -1726,7 +1737,7 @@
 
       const result = await verifyKavitaConnection(normalized.baseUrl, candidateKey);
       const updatedServer = await rotateServerConnection(
-        server,
+        activeServer,
         normalized.baseUrl,
         candidateKey,
         result.version,
@@ -1740,6 +1751,7 @@
       coverReloadRequest += 1;
 
       const keyChanged = candidateKey !== activeApiKey;
+      activeServer = updatedServer;
       activeApiKey = candidateKey;
       onServerChange(updatedServer, candidateKey);
       if (keyChanged) onApiKeyChange(candidateKey);
@@ -1869,24 +1881,25 @@
       const nextKey = replacementApiKey.trim();
       if (!nextKey) throw new Error('Enter a new Kavita auth key.');
 
-      const result = await verifyKavitaConnection(server.baseUrl, nextKey);
+      const result = await verifyKavitaConnection(activeServer.baseUrl, nextKey);
 
       const previousKey = activeApiKey;
       const updatedServer: ServerConfig = {
-        ...server,
+        ...activeServer,
         kavitaVersion: result.version,
         lastConnectedAt: new Date().toISOString(),
       };
-      await saveApiKey(server.credentialRef, nextKey);
+      await saveApiKey(activeServer.credentialRef, nextKey);
       try {
         await saveServer(updatedServer);
       } catch (storageError) {
-        await saveApiKey(server.credentialRef, previousKey).catch(() => {});
+        await saveApiKey(activeServer.credentialRef, previousKey).catch(() => {});
         throw storageError;
       }
       // An upload started with the previous key may still be finishing.
       while (syncWork) await syncWork;
       refreshController?.abort();
+      activeServer = updatedServer;
       activeApiKey = nextKey;
       onServerChange(updatedServer, nextKey);
       onApiKeyChange(nextKey);
@@ -1913,10 +1926,10 @@
       await clearCoverCache().catch(() => {});
       clearCovers();
       if (!credentialCleanupComplete) {
-        await removeApiKey(server.credentialRef);
+        await removeApiKey(activeServer.credentialRef);
         credentialCleanupComplete = true;
       }
-      await removeServer(server.id);
+      await removeServer(activeServer.id);
       await clearDiagnostics();
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
@@ -2973,6 +2986,8 @@
     onClose={() => {
       if (editingServerAddress) {
         cancelServerAddressEdit();
+      } else if (confirmDeleteServer) {
+        cancelDeleteServer();
       } else if (!savingServerAddress && !replacingApiKey && !deletingServer) {
         closeSettings();
       }
@@ -3112,11 +3127,11 @@
       <dl class="mt-3 space-y-2 text-sm">
         <div class="flex items-center justify-between gap-3">
           <dt class="text-surface-700-300">Server</dt>
-          <dd class="truncate text-right">{server.displayName}</dd>
+          <dd class="truncate text-right">{activeServer.displayName}</dd>
         </div>
         <div class="flex items-center justify-between gap-3">
           <dt class="text-surface-700-300">Address</dt>
-          <dd class="truncate text-right">{server.baseUrl}</dd>
+          <dd class="truncate text-right">{activeServer.baseUrl}</dd>
         </div>
       </dl>
       {#if editingServerAddress}
@@ -3268,9 +3283,15 @@
           {settingsError}
         </div>
         <button
+          bind:this={deleteServerButton}
           class="btn preset-tonal-error min-h-11"
           type="button"
-          onclick={() => (confirmDeleteServer = true)}
+          onclick={() => {
+            editingServerAddress = false;
+            addressError = '';
+            addressInvalidField = null;
+            confirmDeleteServer = true;
+          }}
           disabled={deletingServer || savingServerAddress}
         >
           Delete server
@@ -3311,7 +3332,7 @@
         </div>
       </dl>
     </section>
-    <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
+    <DiagnosticsPanel kavitaVersion={activeServer.kavitaVersion} />
     {#if confirmDeleteServer}
       <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
         <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
@@ -3331,7 +3352,7 @@
           <button
             class="btn preset-tonal-surface"
             type="button"
-            onclick={() => (confirmDeleteServer = false)}
+            onclick={cancelDeleteServer}
             disabled={deletingServer}
           >
             Cancel
