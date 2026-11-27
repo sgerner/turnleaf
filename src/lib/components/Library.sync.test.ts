@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as ThemesModule from '../themes/themes';
 import {
   confirmSync,
   getBooks,
@@ -14,7 +15,6 @@ import {
   type BookRecord,
   type ServerConfig,
 } from '../database/database';
-import type * as ThemesModule from '../themes/themes';
 
 const networkListeners = new Set<
   (status: { connected: boolean; connectionType: string }) => void
@@ -79,11 +79,14 @@ vi.mock('../native/credentials', () => ({
   removeApiKey: vi.fn(async () => {}),
 }));
 
-vi.mock('../themes/themes', async (importOriginal) => ({
-  ...(await importOriginal<typeof ThemesModule>()),
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 vi.mock('../reader/session', () => ({
   resolveReaderKeyboardAction: vi.fn(() => null),
