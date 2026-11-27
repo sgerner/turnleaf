@@ -7,6 +7,11 @@
 - A local git hook amends each commit with a `RELEASE_NOTES.md` update from the commit subject when hooks are installed.
 - Use `npm run release:notes` to extract the release body for GitHub releases.
 - For Android Java or CodeQL build changes, run `npm run build`, `npx cap sync android`, and `(cd android && ./gradlew :app:compileDebugJavaWithJavac --no-daemon)` locally.
+- Use `npm run android:verify-release` to verify a signed release APK's signature and SHA-256 digest locally.
 - Pin external GitHub Actions in `.github/workflows/` to full 40-character lowercase commit SHAs with `# vX.Y.Z` version comments; run `npm run workflow:check` (included in `npm run verify`) to verify workflow pins and quality gates locally.
 - `scripts/github-release.mjs` handles paginated GitHub release preflight deduplication (`preflight`) and staged draft verification/promotion (`publish`), with unit coverage included in `npm run verify` (`scripts/github-release.test.mjs`).
+- Run `npm run ios:sync` after Capacitor, dependency, or version changes to update `ios/App/CapApp-SPM/Package.swift` and `MARKETING_VERSION`, and run `npm run ios:check` to verify zero iOS manifest or git drift.
+- On macOS with Xcode installed, run `npm run ios:simulator` to compile the unsigned iPhone Simulator `App.app` bundle and verify `PrivacyInfo.xcprivacy` and `CFBundleShortVersionString`.
+- Android release signing prefers `TURNLEAF_STORE_FILE`, `TURNLEAF_STORE_PASSWORD`, `TURNLEAF_KEY_ALIAS`, and `TURNLEAF_KEY_PASSWORD` environment variables over UTF-8 `android/keystore.properties` (which follows Java `Properties` escaping such as `\\` and leading `\ `); use `npm run android:release -- --no-daemon` for single-use signed builds and never write signing secrets into workspace files in CI.
+- Run `npm run verify` for web quality gates, and run `npm run android:lint` (plus `npm run android:debug`) when touching Capacitor or Android files so local runs match CI.
 - Keep changes small and explicit; do not add abstractions unless they solve a real problem.

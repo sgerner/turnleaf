@@ -12,13 +12,53 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-function getFocusableElements(container: HTMLElement): HTMLElement[] {
-  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) =>
-      element.tabIndex >= 0 &&
-      !element.matches(':disabled') &&
-      !element.closest('[hidden], [inert], [aria-hidden="true"]'),
+function isHiddenOrInert(element: HTMLElement): boolean {
+  if (element.closest('[hidden], [inert], [aria-hidden="true"]')) return true;
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    if (current.inert) return true;
+  }
+  return false;
+}
+
+export function isFocusableElement(element: HTMLElement): boolean {
+  return element.tabIndex >= 0 && !element.matches(':disabled') && !isHiddenOrInert(element);
+}
+
+function canRestoreFocusTarget(element: HTMLElement | null | undefined): element is HTMLElement {
+  return Boolean(
+    element &&
+    element.isConnected &&
+    element !== document.body &&
+    element !== document.documentElement &&
+    !element.hasAttribute('disabled') &&
+    !element.matches(':disabled') &&
+    !isHiddenOrInert(element),
   );
+}
+
+function findFirstFocusableElement(
+  candidates: ArrayLike<HTMLElement>,
+): { element: HTMLElement; index: number } | null {
+  for (let index = 0; index < candidates.length; index += 1) {
+    const element = candidates[index];
+    if (element && isFocusableElement(element)) {
+      return { element, index };
+    }
+  }
+  return null;
+}
+
+function findLastFocusableElement(
+  candidates: ArrayLike<HTMLElement>,
+  minIndex = 0,
+): HTMLElement | null {
+  for (let index = candidates.length - 1; index >= minIndex; index -= 1) {
+    const element = candidates[index];
+    if (element && isFocusableElement(element)) {
+      return element;
+    }
+  }
+  return null;
 }
 
 export function activeElement(): HTMLElement | null {
@@ -29,7 +69,8 @@ export function activeElement(): HTMLElement | null {
 
 export function focusFirstElement(container: HTMLElement | null): void {
   if (!container) return;
-  const first = getFocusableElements(container)[0];
+  const candidates = container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
+  const first = findFirstFocusableElement(candidates)?.element;
   (first ?? container).focus();
 }
 
@@ -37,12 +78,26 @@ export function focusModal(getContainer: () => HTMLElement | null): void {
   void tick().then(() => focusFirstElement(getContainer()));
 }
 
-export function restoreFocus(element: HTMLElement | null): void {
-  if (element?.isConnected && !element.hasAttribute('disabled')) element.focus();
+export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement | null): void {
+  if (canRestoreFocusTarget(element)) {
+    element.focus();
+    return;
+  }
+  if (!canRestoreFocusTarget(fallback)) return;
+  if (fallback.matches(FOCUSABLE_SELECTOR) && fallback.tabIndex >= 0) {
+    fallback.focus();
+    return;
+  }
+  focusFirstElement(fallback);
 }
 
-export function restoreModalFocus(element: HTMLElement | null): void {
-  void tick().then(() => restoreFocus(element));
+export function restoreModalFocus(
+  element: HTMLElement | null,
+  fallback?: HTMLElement | null | (() => HTMLElement | null),
+): void {
+  void tick().then(() =>
+    restoreFocus(element, typeof fallback === 'function' ? fallback() : fallback),
+  );
 }
 
 export function trapModalKeydown(
@@ -50,6 +105,7 @@ export function trapModalKeydown(
   container: HTMLElement,
   close: () => void,
 ): void {
+  if (event.defaultPrevented) return;
   if (event.key === 'Escape') {
     event.preventDefault();
     close();
@@ -57,15 +113,16 @@ export function trapModalKeydown(
   }
   if (event.key !== 'Tab') return;
 
-  const focusable = getFocusableElements(container);
-  if (focusable.length === 0) {
+  const candidates = container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
+  const firstMatch = findFirstFocusableElement(candidates);
+  if (!firstMatch) {
     event.preventDefault();
     container.focus();
     return;
   }
 
-  const first = focusable[0]!;
-  const last = focusable[focusable.length - 1]!;
+  const first = firstMatch.element;
+  const last = findLastFocusableElement(candidates, firstMatch.index + 1) ?? first;
   const active = document.activeElement;
   if (event.shiftKey && (active === first || !container.contains(active))) {
     event.preventDefault();

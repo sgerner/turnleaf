@@ -29,6 +29,8 @@ jobs:
     timeout-minutes: 35
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     env:
       TESTED_REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
     outputs:
@@ -36,6 +38,9 @@ jobs:
       release_tag: ${{ steps.release_version.outputs.release_tag }}
       version_base: ${{ steps.release_version.outputs.version_base }}
       tested_revision: ${{ steps.release_version.outputs.tested_revision }}
+      apk_sha256: ${{ steps.stage_release.outputs.apk_sha256 }}
+      notes_sha256: ${{ steps.stage_release.outputs.notes_sha256 }}
+      min_sdk_version: ${{ steps.stage_release.outputs.min_sdk_version }}
 
     steps:
       - name: Check out source
@@ -114,6 +119,12 @@ jobs:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
+      - name: Run Android lint for manual release
+        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
+        run: npm run android:lint
+
       - name: Enable emulator hardware acceleration
         if: steps.release_preflight.outputs.already_released != 'true'
         run: |
@@ -177,40 +188,42 @@ jobs:
         if: steps.release_preflight.outputs.already_released != 'true'
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -eu
+          umask 077
           if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ]; then
             echo "Missing ANDROID_KEYSTORE_BASE64 secret" >&2
             exit 1
           fi
-          if [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
-            echo "Missing ANDROID_KEYSTORE_PASSWORD secret" >&2
+          KEYSTORE_PATH="$RUNNER_TEMP/turnleaf-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode --ignore-garbage > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          if [ ! -s "$KEYSTORE_PATH" ]; then
+            echo "Decoded keystore at $KEYSTORE_PATH is empty" >&2
             exit 1
           fi
-          if [ -z "${ANDROID_KEY_ALIAS:-}" ]; then
-            echo "Missing ANDROID_KEY_ALIAS secret" >&2
-            exit 1
-          fi
-          if [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
-            echo "Missing ANDROID_KEY_PASSWORD secret" >&2
-            exit 1
-          fi
-          base64 --decode <<<"$ANDROID_KEYSTORE_BASE64" > android/turnleaf-release.jks
-          cat > android/keystore.properties <<EOF
-          TURNLEAF_STORE_FILE=turnleaf-release.jks
-          TURNLEAF_STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD
-          TURNLEAF_KEY_ALIAS=$ANDROID_KEY_ALIAS
-          TURNLEAF_KEY_PASSWORD=$ANDROID_KEY_PASSWORD
-          EOF
 
       - name: Build signed release APK
         if: steps.release_preflight.outputs.already_released != 'true'
         env:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
-        run: npm run android:release
+          TURNLEAF_STORE_FILE: ${{ runner.temp }}/turnleaf-release.jks
+          TURNLEAF_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          TURNLEAF_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          TURNLEAF_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: npm run android:release -- --no-daemon
+
+      - name: Clean up signing files
+        if: always()
+        run: |
+          set -eu
+          for signing_file in "$RUNNER_TEMP/turnleaf-release.jks" "android/turnleaf-release.jks" "android/keystore.properties"; do
+            if [ -f "$signing_file" ]; then
+              shred -u "$signing_file" || rm -f "$signing_file"
+            else
+              rm -f "$signing_file"
+            fi
+          done
 
       - name: Smoke-test signed release APK
         if: steps.release_preflight.outputs.already_released != 'true'
@@ -231,13 +244,14 @@ jobs:
 
       - name: Stage release artifacts and notes
         if: steps.release_preflight.outputs.already_released != 'true'
+        id: stage_release
         env:
           TESTED_REVISION: ${{ steps.release_version.outputs.tested_revision }}
         run: |
           set -eu
           mkdir -p release-payload
           APK="android/app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK"
+          test -s "$APK"
           npm run --silent release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
           {
             cat "$RUNNER_TEMP/turnleaf-release-notes.md"
@@ -246,6 +260,22 @@ jobs:
           cp "$APK" release-payload/app-release.apk
           (cd release-payload && sha256sum app-release.apk > app-release.apk.sha256)
           printf '%s\n' "$TESTED_REVISION" > release-payload/tested-revision.txt
+          npm run android:verify-release -- release-payload/app-release.apk
+          MIN_SDK_VERSION="$(sed -n 's/^[[:space:]]*minSdkVersion[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' android/variables.gradle)"
+          APK_SHA256="$(sha256sum release-payload/app-release.apk | awk '{print $1}')"
+          NOTES_SHA256="$(sha256sum release-payload/turnleaf-release-notes.md | awk '{print $1}')"
+          test -n "$MIN_SDK_VERSION"
+          test "${#APK_SHA256}" -eq 64
+          test "${#NOTES_SHA256}" -eq 64
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "notes_sha256=${NOTES_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "min_sdk_version=${MIN_SDK_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest release APK build provenance
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-payload/app-release.apk
 
       - name: Upload release artifacts
         if: steps.release_preflight.outputs.already_released != 'true'
@@ -254,6 +284,7 @@ jobs:
           name: turnleaf-release
           path: release-payload
           if-no-files-found: error
+          retention-days: 1
 
   publish-github-release:
     needs: build-release-apk
@@ -262,6 +293,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      attestations: read
 
     steps:
       - name: Check out release helper
@@ -282,13 +314,81 @@ jobs:
       - name: Verify release provenance
         env:
           TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
+          EXPECTED_APK_SHA256: ${{ needs.build-release-apk.outputs.apk_sha256 }}
+          EXPECTED_NOTES_SHA256: ${{ needs.build-release-apk.outputs.notes_sha256 }}
+          MIN_SDK_VERSION: ${{ needs.build-release-apk.outputs.min_sdk_version }}
         run: |
           set -eu
+          if [ -z "${TESTED_REVISION:-}" ] || [ -z "${EXPECTED_APK_SHA256:-}" ] || [ -z "${EXPECTED_NOTES_SHA256:-}" ] || [ -z "${MIN_SDK_VERSION:-}" ]; then
+            echo "Missing required provenance outputs from build-release-apk." >&2
+            exit 1
+          fi
+          case "$EXPECTED_APK_SHA256" in
+            *[!0-9a-f]*) echo "Invalid apk_sha256 output." >&2; exit 1 ;;
+          esac
+          test "${#EXPECTED_APK_SHA256}" -eq 64
+          case "$EXPECTED_NOTES_SHA256" in
+            *[!0-9a-f]*) echo "Invalid notes_sha256 output." >&2; exit 1 ;;
+          esac
+          test "${#EXPECTED_NOTES_SHA256}" -eq 64
+          case "$MIN_SDK_VERSION" in
+            *[!0-9]*) echo "Invalid min_sdk_version output." >&2; exit 1 ;;
+          esac
           test "$(cat release-payload/tested-revision.txt)" = "$TESTED_REVISION"
           grep -Fq "Tested revision: \`$TESTED_REVISION\`" release-payload/turnleaf-release-notes.md
           test -s release-payload/app-release.apk
           test -s release-payload/turnleaf-release-notes.md
           (cd release-payload && sha256sum --check app-release.apk.sha256)
+          test "$(cat release-payload/app-release.apk.sha256)" = "${EXPECTED_APK_SHA256}  app-release.apk"
+          ACTUAL_APK_SHA256="$(sha256sum release-payload/app-release.apk | awk '{print $1}')"
+          ACTUAL_NOTES_SHA256="$(sha256sum release-payload/turnleaf-release-notes.md | awk '{print $1}')"
+          if [ "$ACTUAL_APK_SHA256" != "$EXPECTED_APK_SHA256" ]; then
+            echo "APK SHA-256 digest mismatch: expected $EXPECTED_APK_SHA256, got $ACTUAL_APK_SHA256" >&2
+            exit 1
+          fi
+          if [ "$ACTUAL_NOTES_SHA256" != "$EXPECTED_NOTES_SHA256" ]; then
+            echo "Release notes SHA-256 digest mismatch: expected $EXPECTED_NOTES_SHA256, got $ACTUAL_NOTES_SHA256" >&2
+            exit 1
+          fi
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          BUILD_TOOLS_DIR="${SDK_ROOT}/build-tools"
+          if [ ! -d "$BUILD_TOOLS_DIR" ]; then
+            echo "Android SDK build-tools directory not found at $BUILD_TOOLS_DIR" >&2
+            exit 1
+          fi
+          CANDIDATES="$(find "$BUILD_TOOLS_DIR" -mindepth 2 -maxdepth 2 -name apksigner -print | sort -Vr)"
+          APKSIGNER=""
+          while IFS= read -r candidate; do
+            if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
+              APKSIGNER="$candidate"
+              break
+            fi
+          done <<<"$CANDIDATES"
+          if [ -z "$APKSIGNER" ]; then
+            echo "No executable apksigner binary found under $BUILD_TOOLS_DIR" >&2
+            exit 1
+          fi
+          "$APKSIGNER" verify --min-sdk-version "$MIN_SDK_VERSION" --print-certs release-payload/app-release.apk
+
+      - name: Verify APK provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ATTEMPT=1
+          MAX_ATTEMPTS=3
+          until gh attestation verify "release-payload/app-release.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/android-release.yml" \
+            --deny-self-hosted-runners; do
+            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+              echo "APK provenance attestation verification failed after ${MAX_ATTEMPTS} attempts." >&2
+              exit 1
+            fi
+            echo "Attestation verification attempt ${ATTEMPT} failed; retrying in 5 seconds..." >&2
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+          done
 
       - name: Confirm release revision is still current master
         env:
