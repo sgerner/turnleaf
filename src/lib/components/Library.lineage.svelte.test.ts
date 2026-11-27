@@ -3,6 +3,7 @@
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BookRecord, ServerConfig } from '../database/database';
+import type * as ThemesModule from '../themes/themes';
 
 const events = vi.hoisted(() => [] as string[]);
 const networkListeners = vi.hoisted(() => [] as Array<(status: { connected: boolean }) => void>);
@@ -80,10 +81,14 @@ vi.mock('../native/credentials', () => ({
   removeApiKey: vi.fn(async () => undefined),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['vintage'],
-  loadTheme: vi.fn(async () => undefined),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 vi.mock('../downloads/native-download', () => ({
   EPUB_DOWNLOAD_ENDPOINT: '/api/Download/download-chapter',
