@@ -1,3 +1,12 @@
+export const STUDY_STORAGE_MIGRATION_VERSION = 10;
+
+export const DELETE_LEGACY_STUDY_PREFERENCES_SQL = `
+  DELETE FROM preferences
+    WHERE key LIKE 'readerAnnotations:%'
+       OR key LIKE 'readerBookmarks:%'
+       OR key LIKE 'readerHistory:%';
+`;
+
 export const migrations = [
   {
     version: 1,
@@ -108,6 +117,23 @@ export const migrations = [
   {
     version: 8,
     statements: `
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+    `,
+  },
+  {
+    version: 9,
+    statements: `
+      ALTER TABLE books ADD COLUMN sort_order REAL;
+      ALTER TABLE books ADD COLUMN min_number REAL;
+      ALTER TABLE books ADD COLUMN volume_number REAL;
+    `,
+  },
+  {
+    version: STUDY_STORAGE_MIGRATION_VERSION,
+    statements: `
       CREATE TABLE IF NOT EXISTS annotations (
         id TEXT PRIMARY KEY NOT NULL,
         book_id TEXT NOT NULL,
@@ -186,11 +212,6 @@ export const migrations = [
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-
-      DELETE FROM preferences
-        WHERE key LIKE 'readerAnnotations:%'
-           OR key LIKE 'readerBookmarks:%'
-           OR key LIKE 'readerHistory:%';
     `,
   },
 ] as const;

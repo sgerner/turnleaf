@@ -1167,6 +1167,15 @@ it('migrates legacy reader preference rows for the active server and purges orph
     }),
   );
 
+  const rawBefore = storage.getItem(BROWSER_STORAGE_KEY);
+  expect(rawBefore).not.toBeNull();
+
+  // If browser storage fails while persisting migrated study records, source preferences stay intact.
+  storage.failWrites = true;
+  await getBookAnnotations(activeBook.id);
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBe(rawBefore);
+  storage.failWrites = false;
+
   const annotations = await getBookAnnotations(activeBook.id);
   const bookmarks = await getBookBookmarks(activeBook.id);
   const history = await getBookHistory(activeBook.id);

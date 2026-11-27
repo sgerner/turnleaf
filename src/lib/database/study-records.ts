@@ -88,6 +88,17 @@ export function migrateLegacyPreferenceEntries(
   const bookmarks: StoredBookmarkRecord[] = [];
   const history: Array<{ bookId: string; entry: StoredReaderLocation }> = [];
   const keysToRemove: string[] = [];
+  const seenAnnotationIds = new Set<string>();
+  const seenBookmarkIds = new Set<string>();
+  const seenHistoryKeys = new Set<string>();
+
+  const normalizeSyncState = (value: unknown): StudySyncState =>
+    value === 'synced' ||
+    value === 'pending_create' ||
+    value === 'pending_update' ||
+    value === 'pending_delete'
+      ? value
+      : 'pending_create';
 
   for (const [key, raw] of entries) {
     if (!isLegacyStudyPreferenceKey(key)) continue;
@@ -100,26 +111,48 @@ export function migrateLegacyPreferenceEntries(
 
     if (prefix === 'readerAnnotations') {
       for (const item of parseAnnotations(raw)) {
+        const id = `${bookId}:${item.id}`;
+        if (seenAnnotationIds.has(id)) continue;
+        seenAnnotationIds.add(id);
         const fallback = cfiFallbackLocator(item.cfi);
-        const xpath = item.xpath?.trim() || fallback.xpath;
+        const xpath =
+          typeof item.xpath === 'string' && item.xpath.trim() ? item.xpath.trim() : fallback.xpath;
+        const endingXPath =
+          typeof item.endingXPath === 'string' && item.endingXPath.trim()
+            ? item.endingXPath.trim()
+            : xpath;
+        const pageNumber =
+          typeof item.pageNumber === 'number' &&
+          Number.isFinite(item.pageNumber) &&
+          item.pageNumber >= 0
+            ? Math.floor(item.pageNumber)
+            : fallback.pageNumber;
+        const slotIndex =
+          typeof item.slotIndex === 'number' && Number.isFinite(item.slotIndex)
+            ? Math.max(0, Math.floor(item.slotIndex))
+            : 0;
         annotations.push({
-          id: `${bookId}:${item.id}`,
+          id,
           bookId,
-          remoteId: item.remoteId ?? null,
+          remoteId:
+            typeof item.remoteId === 'number' && Number.isFinite(item.remoteId)
+              ? Math.trunc(item.remoteId)
+              : null,
           cfi: item.cfi,
           xpath,
-          endingXPath: item.endingXPath ?? xpath,
-          pageNumber: item.pageNumber ?? fallback.pageNumber,
-          slotIndex: item.slotIndex ?? 0,
-          containsSpoiler: item.containsSpoiler ?? false,
-          context: item.context ?? item.excerpt,
-          chapterTitle: item.chapterTitle ?? null,
+          endingXPath,
+          pageNumber,
+          slotIndex,
+          containsSpoiler: Boolean(item.containsSpoiler),
+          context: typeof item.context === 'string' ? item.context : item.excerpt,
+          chapterTitle: typeof item.chapterTitle === 'string' ? item.chapterTitle : null,
           excerpt: item.excerpt,
           note: item.note,
           createdAt: item.createdAt,
-          updatedAt: item.updatedAt ?? item.createdAt,
+          updatedAt:
+            typeof item.updatedAt === 'string' && item.updatedAt ? item.updatedAt : item.createdAt,
           remoteUpdatedAt: null,
-          syncState: item.syncState ?? 'pending_create',
+          syncState: normalizeSyncState(item.syncState),
           syncRevision: 1,
           attemptCount: 0,
           lastAttemptAt: null,
@@ -129,25 +162,43 @@ export function migrateLegacyPreferenceEntries(
     } else if (prefix === 'readerBookmarks') {
       const bookBookmarks: StoredBookmarkRecord[] = [];
       for (const item of parseBookmarks(raw)) {
+        const id = `${bookId}:${item.id}`;
+        if (seenBookmarkIds.has(id)) continue;
+        seenBookmarkIds.add(id);
         const fallback = cfiFallbackLocator(item.cfi);
-        const pageNumber = item.pageNumber ?? fallback.pageNumber;
+        const pageNumber =
+          typeof item.pageNumber === 'number' &&
+          Number.isFinite(item.pageNumber) &&
+          item.pageNumber >= 0
+            ? Math.floor(item.pageNumber)
+            : fallback.pageNumber;
         const label = disambiguateBookmarkLabel(bookBookmarks, pageNumber, item.label);
         const record: StoredBookmarkRecord = {
-          id: `${bookId}:${item.id}`,
+          id,
           bookId,
-          remoteId: item.remoteId ?? null,
+          remoteId:
+            typeof item.remoteId === 'number' && Number.isFinite(item.remoteId)
+              ? Math.trunc(item.remoteId)
+              : null,
           cfi: item.cfi,
-          xpath: item.xpath ?? fallback.xpath,
+          xpath:
+            typeof item.xpath === 'string' && item.xpath.trim()
+              ? item.xpath.trim()
+              : fallback.xpath,
           href: item.href,
           percentage: item.percentage,
           pageNumber,
           label,
-          excerpt: item.excerpt ?? '',
-          remoteTitle: item.remoteTitle ?? null,
-          remotePageNumber: item.remotePageNumber ?? null,
+          excerpt: typeof item.excerpt === 'string' ? item.excerpt : '',
+          remoteTitle: typeof item.remoteTitle === 'string' ? item.remoteTitle : null,
+          remotePageNumber:
+            typeof item.remotePageNumber === 'number' && Number.isFinite(item.remotePageNumber)
+              ? Math.floor(item.remotePageNumber)
+              : null,
           savedAt: item.savedAt,
-          updatedAt: item.updatedAt ?? item.savedAt,
-          syncState: item.syncState ?? 'pending_create',
+          updatedAt:
+            typeof item.updatedAt === 'string' && item.updatedAt ? item.updatedAt : item.savedAt,
+          syncState: normalizeSyncState(item.syncState),
           syncRevision: 1,
           attemptCount: 0,
           lastAttemptAt: null,
@@ -158,6 +209,9 @@ export function migrateLegacyPreferenceEntries(
       }
     } else if (prefix === 'readerHistory') {
       for (const entry of parseLocationHistory(raw)) {
+        const historyKey = `${bookId}\0${entry.id}`;
+        if (seenHistoryKeys.has(historyKey)) continue;
+        seenHistoryKeys.add(historyKey);
         history.push({ bookId, entry });
       }
     }

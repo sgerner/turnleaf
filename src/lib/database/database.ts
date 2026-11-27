@@ -11,7 +11,11 @@ import type { KavitaAnnotation, KavitaPersonalTocItem, KavitaProgress } from '..
 import { MAX_BOOKMARKS, recordLocation, type StoredReaderLocation } from '../reader/bookmarks';
 import { MAX_ANNOTATIONS, type StoredAnnotation, type StudySyncState } from '../reader/annotations';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import {
+  DELETE_LEGACY_STUDY_PREFERENCES_SQL,
+  migrations,
+  STUDY_STORAGE_MIGRATION_VERSION,
+} from './schema';
 import {
   cfiFallbackLocator,
   disambiguateBookmarkLabel,
@@ -316,7 +320,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -344,6 +348,24 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
+const COORDINATED_BOOK_COLUMNS: ReadonlyArray<{
+  name: string;
+  definition: string;
+  version: 8 | 9;
+}> = [
+  { name: 'remote_file_size', definition: 'INTEGER', version: 8 },
+  { name: 'downloaded_bytes', definition: 'INTEGER', version: 8 },
+  { name: 'downloaded_pages', definition: 'INTEGER', version: 8 },
+  { name: 'chapter_key', definition: 'TEXT', version: 8 },
+  { name: 'sort_order', definition: 'REAL', version: 9 },
+  { name: 'min_number', definition: 'REAL', version: 9 },
+  { name: 'volume_number', definition: 'REAL', version: 9 },
+];
+
+function isMissingTableError(error: unknown, tableName: string): boolean {
+  return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
+}
+
 async function buildLegacyStudyMigrationTasks(
   db: Pick<SQLiteDBConnection, 'query'>,
 ): Promise<capTask[]> {
@@ -351,15 +373,17 @@ async function buildLegacyStudyMigrationTasks(
   try {
     preferencesRows =
       (
-        await db.query(
+        await executeNativeQuery(
+          db,
           `SELECT key, value FROM preferences
            WHERE key LIKE 'readerAnnotations:%'
               OR key LIKE 'readerBookmarks:%'
               OR key LIKE 'readerHistory:%'`,
         )
       ).values ?? [];
-  } catch {
-    return [];
+  } catch (error) {
+    if (isMissingTableError(error, 'preferences')) return [];
+    throw error;
   }
   if (preferencesRows.length === 0) return [];
 
@@ -367,34 +391,33 @@ async function buildLegacyStudyMigrationTasks(
   try {
     bookRows =
       (
-        await db.query(
+        await executeNativeQuery(
+          db,
           `SELECT books.id FROM books
            WHERE EXISTS (SELECT 1 FROM server_config WHERE server_config.id = books.server_id)`,
         )
       ).values ?? [];
-  } catch {
-    try {
-      bookRows = (await db.query('SELECT id FROM books')).values ?? [];
-    } catch {
-      return [];
-    }
+  } catch (error) {
+    if (!isMissingTableError(error, 'server_config')) throw error;
+    bookRows = (await executeNativeQuery(db, 'SELECT id FROM books')).values ?? [];
   }
   const activeBookIds = new Set(bookRows.map((row) => String(row.id)));
+  if (activeBookIds.size === 0) return [];
+
   const entries = preferencesRows.map(
     (row) => [String(row.key), String(row.value)] as [string, string],
   );
-  if (entries.length === 0 || activeBookIds.size === 0) return [];
   const migrated = migrateLegacyPreferenceEntries(entries, activeBookIds);
   const tasks: capTask[] = [];
   for (const record of migrated.annotations) {
-    tasks.push(insertAnnotationRecordTask(record, true));
+    tasks.push(insertAnnotationRecordTask(record, 'abort'));
   }
   for (const record of migrated.bookmarks) {
-    tasks.push(insertBookmarkRecordTask(record, true));
+    tasks.push(insertBookmarkRecordTask(record, 'abort'));
   }
   for (const { bookId, entry } of migrated.history) {
     tasks.push({
-      statement: `INSERT OR IGNORE INTO reading_history
+      statement: `INSERT INTO reading_history
         (book_id, id, cfi, href, percentage, label, saved_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       values: [
@@ -411,18 +434,72 @@ async function buildLegacyStudyMigrationTasks(
   return tasks;
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+export async function migrateDatabase(
+  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion' | 'query'>,
+): Promise<void> {
   const current = await db.getVersion();
   const currentVersion = current.version ?? 0;
+  let existingBookColumns: Set<string> | null = null;
+  if (currentVersion >= 8 && currentVersion < STUDY_STORAGE_MIGRATION_VERSION) {
+    const tableInfoRows = (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
+    if (tableInfoRows.length > 0) {
+      existingBookColumns = new Set(tableInfoRows.map((row) => String(row.name)));
+    }
+  }
+
   for (const migration of migrations) {
     if (migration.version <= currentVersion) continue;
-    const legacyTasks =
-      currentVersion >= 3 && migration.version === 8
-        ? await buildLegacyStudyMigrationTasks(db)
+
+    if ((migration.version === 8 || migration.version === 9) && existingBookColumns) {
+      const missingColumns = COORDINATED_BOOK_COLUMNS.filter(
+        (column) => column.version <= migration.version && !existingBookColumns.has(column.name),
+      );
+      await executeNativeTransaction(db, [
+        ...(missingColumns.length > 0
+          ? [
+              {
+                statement: missingColumns
+                  .map(
+                    (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+                  )
+                  .join('\n'),
+              },
+            ]
+          : []),
+        { statement: `PRAGMA user_version = ${migration.version};` },
+      ]);
+      for (const column of missingColumns) existingBookColumns.add(column.name);
+      continue;
+    }
+
+    if (migration.version === STUDY_STORAGE_MIGRATION_VERSION) {
+      const missingBookColumns = existingBookColumns
+        ? COORDINATED_BOOK_COLUMNS.filter((column) => !existingBookColumns.has(column.name))
         : [];
+      const legacyTasks = currentVersion >= 3 ? await buildLegacyStudyMigrationTasks(db) : [];
+      await executeNativeTransaction(db, [
+        ...(missingBookColumns.length > 0
+          ? [
+              {
+                statement: missingBookColumns
+                  .map(
+                    (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+                  )
+                  .join('\n'),
+              },
+            ]
+          : []),
+        { statement: migration.statements },
+        ...legacyTasks,
+        ...(currentVersion >= 3 ? [{ statement: DELETE_LEGACY_STUDY_PREFERENCES_SQL }] : []),
+        { statement: `PRAGMA user_version = ${migration.version};` },
+      ]);
+      for (const column of missingBookColumns) existingBookColumns?.add(column.name);
+      continue;
+    }
+
     await executeNativeTransaction(db, [
       { statement: migration.statements },
-      ...legacyTasks,
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
   }
@@ -1589,9 +1666,12 @@ function mapBookmarkRow(row: Record<string, unknown>): StoredBookmarkRecord {
   };
 }
 
-function insertAnnotationRecordTask(record: StoredAnnotationRecord, orIgnore = false): capTask {
+function insertAnnotationRecordTask(
+  record: StoredAnnotationRecord,
+  conflictMode: 'replace' | 'abort' = 'replace',
+): capTask {
   return {
-    statement: `INSERT ${orIgnore ? 'OR IGNORE' : 'OR REPLACE'} INTO annotations
+    statement: `INSERT ${conflictMode === 'replace' ? 'OR REPLACE ' : ''}INTO annotations
       (id, book_id, remote_id, cfi, xpath, ending_xpath, page_number, slot_index,
        contains_spoiler, context, chapter_title, excerpt, note, created_at, updated_at,
        remote_updated_at, sync_state, sync_revision, attempt_count, last_attempt_at, last_error)
@@ -1622,9 +1702,12 @@ function insertAnnotationRecordTask(record: StoredAnnotationRecord, orIgnore = f
   };
 }
 
-function insertBookmarkRecordTask(record: StoredBookmarkRecord, orIgnore = false): capTask {
+function insertBookmarkRecordTask(
+  record: StoredBookmarkRecord,
+  conflictMode: 'replace' | 'abort' = 'replace',
+): capTask {
   return {
-    statement: `INSERT ${orIgnore ? 'OR IGNORE' : 'OR REPLACE'} INTO bookmarks
+    statement: `INSERT ${conflictMode === 'replace' ? 'OR REPLACE ' : ''}INTO bookmarks
       (id, book_id, remote_id, cfi, xpath, href, percentage, page_number, label, excerpt,
        remote_title, remote_page_number, saved_at, updated_at, sync_state, sync_revision,
        attempt_count, last_attempt_at, last_error)

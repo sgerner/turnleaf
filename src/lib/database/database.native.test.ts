@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 8;
+  let databaseVersion = 10;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 8;
+      databaseVersion = 10;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -381,7 +381,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(8);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(10);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -391,6 +391,8 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN sort_order'),
     expect.stringContaining('CREATE TABLE IF NOT EXISTS annotations'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
@@ -402,10 +404,12 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
     'PRAGMA user_version = 8;',
+    'PRAGMA user_version = 9;',
+    'PRAGMA user_version = 10;',
   ]);
 });
 
-it('migrates active-server legacy study preferences during v8 upgrade and ignores deleted-server orphans', async () => {
+it('migrates active-server legacy study preferences during v10 upgrade before deleting legacy keys and ignores deleted-server orphans', async () => {
   const { openDatabase, resetLocalDatabase } = await import('./database');
   await resetLocalDatabase();
   mocks.setDatabaseVersion(7);
@@ -469,18 +473,27 @@ it('migrates active-server legacy study preferences during v8 upgrade and ignore
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
-  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(3);
+  const [v8Tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  const [v9Tasks] = mocks.executeTransaction.mock.calls[1] ?? [];
+  const [tasks] = mocks.executeTransaction.mock.calls[2] ?? [];
+  expect(v8Tasks?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
+    'PRAGMA user_version = 8;',
+  ]);
+  expect(v9Tasks?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('ALTER TABLE books ADD COLUMN sort_order'),
+    'PRAGMA user_version = 9;',
+  ]);
   const statements = tasks?.map((task) => task.statement) ?? [];
-  expect(statements[0]).toContain('CREATE TABLE IF NOT EXISTS annotations');
-  expect(statements).toEqual(
-    expect.arrayContaining([
-      expect.stringContaining('INSERT OR IGNORE INTO annotations'),
-      expect.stringContaining('INSERT OR IGNORE INTO bookmarks'),
-      expect.stringContaining('INSERT OR IGNORE INTO reading_history'),
-      'PRAGMA user_version = 8;',
-    ]),
-  );
+  expect(statements).toEqual([
+    expect.stringContaining('CREATE TABLE IF NOT EXISTS annotations'),
+    expect.stringContaining('INSERT INTO annotations'),
+    expect.stringContaining('INSERT INTO bookmarks'),
+    expect.stringContaining('INSERT INTO reading_history'),
+    expect.stringContaining('DELETE FROM preferences'),
+    'PRAGMA user_version = 10;',
+  ]);
   const annotationInsert = tasks?.find((task) => task.statement.includes('INTO annotations'));
   expect(annotationInsert?.values).toContain('active:1:10:a1');
   expect(JSON.stringify(tasks)).not.toContain('deleted:1:10');
@@ -489,7 +502,7 @@ it('migrates active-server legacy study preferences during v8 upgrade and ignore
 it('removes books, server config, and any legacy study preferences atomically on native removeServer', async () => {
   const { openDatabase, removeServer, resetLocalDatabase } = await import('./database');
   await resetLocalDatabase();
-  mocks.setDatabaseVersion(8);
+  mocks.setDatabaseVersion(10);
   await openDatabase();
   mocks.executeTransaction.mockClear();
 
