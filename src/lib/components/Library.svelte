@@ -718,7 +718,6 @@
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     const initialNetworkStatus = await Network.getStatus().catch(() => null);
-    networkValidated = Boolean(initialNetworkStatus?.connected);
     offline = !isNetworkConnected(initialNetworkStatus);
     if (destroyed) return;
     books = savedBooks;
@@ -797,7 +796,6 @@
   }
 
   let networkStatusGeneration = 0;
-  let networkValidated = false;
   let syncPendingRetry = false;
   let syncPendingShowFeedback = false;
   let transientSyncRetries = 0;
@@ -806,12 +804,8 @@
   function isNetworkConnected(
     status: { connected: boolean; connectionType?: string } | null | undefined,
   ): boolean {
-    if (!status) return false;
-    if (status.connected) return true;
-    return (
-      Capacitor.isNativePlatform() &&
-      (status.connectionType === 'wifi' || status.connectionType === 'cellular')
-    );
+    if (!status?.connected) return false;
+    return !Capacitor.isNativePlatform() || navigator.onLine !== false;
   }
 
   function handleWindowNetworkChange(): void {
@@ -824,20 +818,7 @@
   ): void {
     if (destroyed) return;
     const connected = isNetworkConnected(status);
-    const validated = Boolean(status?.connected);
-    const newlyValidated = connected && validated && !networkValidated;
-    networkValidated = validated;
-    if (offline === !connected) {
-      if (newlyValidated) {
-        const baselineRevision = activeSyncStartRevision ?? messageRevision;
-        const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-        void syncProgress(false);
-        if (kavitaUnreachable || offlineMessage) {
-          void startRefresh(false, baselineRevision, baselineMessage);
-        }
-      }
-      return;
-    }
+    if (offline === !connected) return;
     offline = !connected;
     if (!connected) {
       if (syncTimer !== null) {
@@ -1494,6 +1475,7 @@
       location.percentage,
       location.spineIndex,
     );
+    if (destroyed || deletingServer) return;
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
     const savedBook = books.find((item) => item.id === book.id);
@@ -1854,6 +1836,16 @@
     settingsError = '';
     deletingServer = true;
     try {
+      if (syncTimer !== null) {
+        window.clearTimeout(syncTimer);
+        syncTimer = null;
+      }
+      syncPendingRetry = false;
+      syncPendingShowFeedback = false;
+      transientSyncRetries = 0;
+      openProgressProbe?.abort();
+      refreshController?.abort();
+      while (syncWork) await syncWork;
       for (const book of books.filter((item) => item.downloadPath)) await remove(book);
       cancelCoverLoading();
       await clearCoverCache().catch(() => {});

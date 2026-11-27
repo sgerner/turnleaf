@@ -650,7 +650,7 @@ export class ReaderSession {
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
-        this.preserveCfi(location.start.cfi, this.locationGeneration);
+        this.preserveCfi(location.start.cfi, this.locationGeneration, true);
       }
     };
     this.rendition.on('relocated', this.relocated);
@@ -699,8 +699,6 @@ export class ReaderSession {
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) {
-          this.restoreTarget = { cfi };
-          await this.alignCfiAfterRender(cfi, restoreGeneration);
           await this.finishOpen(target, restoreGeneration, { cfi });
           return;
         }
@@ -709,15 +707,13 @@ export class ReaderSession {
       }
     }
     if (serverXPath) {
-      const restoredTarget = await this.displayXPath(serverXPath, restoreGeneration);
-      if (restoredTarget) {
-        if (restoredTarget.startsWith('epubcfi(')) {
-          this.restoreTarget = { cfi: restoredTarget };
-          await this.alignCfiAfterRender(restoredTarget, restoreGeneration);
-          await this.finishOpen(target, restoreGeneration, { cfi: restoredTarget });
-        } else {
-          await this.finishOpen(target, restoreGeneration, { href: restoredTarget });
-        }
+      const restored = await this.displayXPath(serverXPath, restoreGeneration);
+      if (restored) {
+        await this.finishOpen(
+          target,
+          restoreGeneration,
+          restored.startsWith('epubcfi(') ? { cfi: restored } : { href: restored },
+        );
         return;
       }
     }
@@ -943,11 +939,22 @@ export class ReaderSession {
   }
 
   async displayServerLocation(xpath: string): Promise<boolean> {
-    return (await this.displayXPath(xpath, this.beginLocationOperation(false))) !== null;
+    const generation = this.beginLocationOperation(false);
+    const restored = await this.displayXPath(xpath, generation);
+    if (!restored) return false;
+    await this.settleRestoredTarget(
+      restored.startsWith('epubcfi(') ? { cfi: restored } : { href: restored },
+      generation,
+    );
+    return this.isCurrentLocationOperation(generation);
   }
 
   async displayServerPercentage(percentage: number): Promise<boolean> {
-    return (await this.displayPercentage(percentage, this.beginLocationOperation(false))) !== null;
+    const generation = this.beginLocationOperation(false);
+    const restoredHref = await this.displayPercentage(percentage, generation);
+    if (!restoredHref) return false;
+    await this.settleRestoredTarget({ href: restoredHref }, generation);
+    return this.isCurrentLocationOperation(generation);
   }
 
   applyAppearance(value: Appearance): void {
@@ -1020,13 +1027,14 @@ export class ReaderSession {
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
     this.syncVisibleColumnLinks();
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    const cfi =
+      this.restoreTarget?.cfi ?? this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
       this.reflowPending = true;
       return;
     }
-    this.preserveCfi(cfi, this.locationGeneration);
+    this.preserveCfi(cfi, this.locationGeneration, true);
   }
 
   destroy(): void {
@@ -1122,7 +1130,7 @@ export class ReaderSession {
 
   private harden(contents: Contents): Promise<void> {
     const runtimeContents = contents as unknown as { resizeCheck?: () => void };
-    const work = sanitizeEpubDocument(contents.document, this.stylesheetCache).then(() => {
+    return sanitizeEpubDocument(contents.document, this.stylesheetCache).then(() => {
       if (!this.rendition) return;
       const triggerResizeCheck = () => {
         if (!this.rendition) return;
@@ -1145,9 +1153,6 @@ export class ReaderSession {
         this.contentObservers.set(contents.document, observer);
       }
     });
-    this.pendingContentWork.add(work);
-    void work.finally(() => this.pendingContentWork.delete(work));
-    return work;
   }
 
   private detachStageWindowListeners(): void {
@@ -1166,23 +1171,27 @@ export class ReaderSession {
     if (!manager || patchedManagers.has(manager)) return;
     patchedManagers.add(manager);
 
+    const canSnapHorizontalLtr = (requireMultipleViews = false) => {
+      const dir = manager.settings?.direction;
+      return Boolean(
+        manager.isPaginated &&
+        manager.settings?.axis === 'horizontal' &&
+        (!dir || dir === 'ltr') &&
+        manager.container &&
+        (!requireMultipleViews ||
+          (!manager.settings?.fullsize &&
+            (manager.layout?.delta ?? 0) > 0 &&
+            (manager.views?.length ?? 0) > 0)),
+      );
+    };
+
     if (typeof manager.next === 'function') {
       const origNext = manager.next.bind(manager);
       manager.next = () => {
-        const dir = manager.settings?.direction;
-        const delta = manager.layout?.delta ?? 0;
-        const container = manager.container;
-        if (
-          manager.isPaginated &&
-          manager.settings?.axis === 'horizontal' &&
-          (!dir || dir === 'ltr') &&
-          !manager.settings?.fullsize &&
-          container &&
-          delta > 0 &&
-          (manager.views?.length ?? 0) > 0
-        ) {
-          const currentPage = Math.round(container.scrollLeft / delta);
-          const nextScrollLeft = (currentPage + 1) * delta;
+        if (canSnapHorizontalLtr(true)) {
+          const delta = manager.layout!.delta!;
+          const container = manager.container!;
+          const nextScrollLeft = (Math.round(container.scrollLeft / delta) + 1) * delta;
           if (nextScrollLeft + delta <= container.scrollWidth + 2) {
             manager.scrollTo?.(nextScrollLeft, 0, true);
             return undefined;
@@ -1198,26 +1207,15 @@ export class ReaderSession {
     if (typeof manager.prev === 'function') {
       const origPrev = manager.prev.bind(manager);
       manager.prev = () => {
-        const dir = manager.settings?.direction;
-        const delta = manager.layout?.delta ?? 0;
-        const container = manager.container;
-        if (
-          manager.isPaginated &&
-          manager.settings?.axis === 'horizontal' &&
-          (!dir || dir === 'ltr') &&
-          !manager.settings?.fullsize &&
-          container &&
-          delta > 0 &&
-          (manager.views?.length ?? 0) > 0
-        ) {
+        if (canSnapHorizontalLtr(true)) {
+          const delta = manager.layout!.delta!;
+          const container = manager.container!;
           const currentPage = Math.round(container.scrollLeft / delta);
           if (currentPage > 0) {
             manager.scrollTo?.((currentPage - 1) * delta, 0, true);
             return undefined;
           }
-          if (container.scrollLeft > 0) {
-            container.scrollLeft = 0;
-          }
+          if (container.scrollLeft > 0) container.scrollLeft = 0;
         }
         return origPrev();
       };
@@ -1226,27 +1224,24 @@ export class ReaderSession {
     if (typeof manager.moveTo === 'function') {
       const origMoveTo = manager.moveTo.bind(manager);
       manager.moveTo = (offset, width) => {
-        const dir = manager.settings?.direction;
         const delta = manager.layout?.delta ?? 0;
         const container = manager.container;
         if (
-          manager.isPaginated &&
-          manager.settings?.axis === 'horizontal' &&
-          (!dir || dir === 'ltr') &&
+          canSnapHorizontalLtr() &&
           container &&
           delta > 0 &&
           offset &&
           Number.isFinite(offset.left)
         ) {
-          let distX = Math.floor((offset.left + 0.5) / delta) * delta;
-          if (distX + delta > container.scrollWidth) {
-            distX = Math.max(0, container.scrollWidth - delta);
-          }
-          let distY = Math.floor((offset.top + 0.5) / delta) * delta;
-          if (distY + delta > container.scrollHeight) {
-            distY = Math.max(0, container.scrollHeight - delta);
-          }
-          manager.scrollTo?.(distX, distY, true);
+          const clampStep = (pos: number, max: number) => {
+            const stepped = Math.floor((pos + 0.5) / delta) * delta;
+            return stepped + delta > max ? Math.max(0, max - delta) : stepped;
+          };
+          manager.scrollTo?.(
+            clampStep(offset.left, container.scrollWidth),
+            clampStep(offset.top, container.scrollHeight),
+            true,
+          );
           return;
         }
         origMoveTo(offset, width);
@@ -1256,13 +1251,10 @@ export class ReaderSession {
     if (typeof manager.paginatedLocation === 'function') {
       const origPaginatedLocation = manager.paginatedLocation.bind(manager);
       manager.paginatedLocation = () => {
-        const dir = manager.settings?.direction;
         const layout = manager.layout;
         const containerEl = manager.container;
         if (
-          !manager.isPaginated ||
-          manager.settings?.axis !== 'horizontal' ||
-          (dir && dir !== 'ltr') ||
+          !canSnapHorizontalLtr() ||
           !containerEl ||
           !layout?.pageWidth ||
           !layout.width ||
@@ -1335,6 +1327,7 @@ export class ReaderSession {
     manager.on('added', this.viewAdded);
     this.viewResized = () => {
       if (
+        this.displayOperationCount > 0 ||
         this.pendingViewRenders.size > 0 ||
         this.pendingContentWork.size > 0 ||
         this.activeNavigation !== null ||
@@ -1416,18 +1409,27 @@ export class ReaderSession {
     }
   }
 
+  private async settleRestoredTarget(
+    restoreTarget: { cfi?: string; href?: string },
+    generation: number,
+  ): Promise<void> {
+    if (!this.isCurrentLocationOperation(generation)) return;
+    this.restoreTarget = restoreTarget;
+    if (restoreTarget.cfi) {
+      await this.alignCfiAfterRender(restoreTarget.cfi, generation);
+    } else {
+      await this.settlePendingSectionRenders(generation);
+    }
+  }
+
   private async finishOpen(
     target: HTMLElement,
     generation: number,
     restoreTarget: { cfi?: string; href?: string },
   ): Promise<void> {
+    await this.settleRestoredTarget(restoreTarget, generation);
     if (!this.isCurrentLocationOperation(generation)) return;
-    if (!restoreTarget.cfi) {
-      await this.settlePendingSectionRenders(generation);
-      if (!this.isCurrentLocationOperation(generation)) return;
-    }
     this.detachStageWindowListeners();
-    this.restoreTarget = restoreTarget;
     this.observeViewport(target);
     const current = target.getBoundingClientRect();
     await this.resizeViewport(Math.floor(current.width), Math.floor(current.height));
@@ -1779,16 +1781,9 @@ export class ReaderSession {
       resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
     };
     if (!runtimeRendition.q?.enqueue) {
-      this.displayOperationCount += 1;
-      try {
+      return this.runDisplayOperation(async () => {
         this.applyViewportResize(runtimeRendition, width, height);
-      } finally {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-        this.syncVisibleColumnLinks();
-      }
-      return Promise.resolve();
+      });
     }
     this.pendingViewportSize = { width, height };
     if (!this.resizeDrain) {
@@ -1918,16 +1913,9 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    this.displayOperationCount += 1;
-    try {
-      if (target === undefined) await rendition.display();
-      else await rendition.display(target);
-    } finally {
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-      this.syncVisibleColumnLinks();
-    }
+    await this.runDisplayOperation(() =>
+      target === undefined ? rendition.display() : rendition.display(target),
+    );
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -1998,22 +1986,18 @@ export class ReaderSession {
       if (previousNavigation) await previousNavigation;
       while (this.resizeDrain) await this.resizeDrain;
       const generation = this.beginLocationOperation(true);
-      this.displayOperationCount += 1;
-      try {
-        await display();
-        await this.settlePendingSectionRenders(generation, true);
-      } catch (error) {
-        if (this.isCurrentLocationOperation(generation)) {
-          this.userNavigationPending = false;
-          this.userNavigationStartCfi = null;
+      await this.runDisplayOperation(async () => {
+        try {
+          await display();
+          await this.settlePendingSectionRenders(generation, true);
+        } catch (error) {
+          if (this.isCurrentLocationOperation(generation)) {
+            this.userNavigationPending = false;
+            this.userNavigationStartCfi = null;
+          }
+          throw error;
         }
-        throw error;
-      } finally {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-        this.syncVisibleColumnLinks();
-      }
+      });
     } finally {
       if (this.activeNavigation === gate) this.activeNavigation = null;
       releaseNavigation();
@@ -2113,12 +2097,25 @@ export class ReaderSession {
     return generation === this.locationGeneration && this.rendition !== null;
   }
 
-  private preserveCfi(cfi: string, generation: number): void {
-    const rendition = this.rendition;
+  private preserveCfi(cfi: string, generation: number, expandViews = false): void {
+    const rendition = this.rendition as
+      | (Rendition & {
+          manager?: {
+            container?: HTMLElement;
+            views?: { all?: () => Array<{ expand?: () => void }> };
+          };
+        })
+      | null;
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
+    void this.runDisplayOperation(() => {
+      if (expandViews && rendition.manager) {
+        rendition.manager.views?.all?.().forEach((view) => view.expand?.());
+        void rendition.manager.container?.scrollWidth;
+      }
+      return rendition.display(cfi);
+    }).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
   }

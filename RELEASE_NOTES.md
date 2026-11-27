@@ -2,8 +2,13 @@
 
 ## Unreleased
 
-- test(android): decouple post-restart book card and sync banner journey checks
+- fix: fence SQLite/browser progress across clear/reset, align reader restore, and merge master
+- Verify real `@capacitor-community/sqlite` wrappers, fence native and browser progress writes across storage clear/reset, and harden mid-chapter EPUB journey recovery
 - Fix Android reading journey DPR pagination, ReaderChrome inset sync, post-reflow progress persistence, and reconnect sync races
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

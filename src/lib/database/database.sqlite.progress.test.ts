@@ -679,8 +679,9 @@ describe('native progress transactions against SQLite', () => {
       insertV1Queue.run(book.id, '{"pageNum":25}', updatedAt, updatedAt);
       insertV1Queue.run(otherBookId, '{"pageNum":10}', updatedAt, updatedAt);
 
+      const latestVersion = migrations.at(-1)!.version;
       for (const migration of migrations) {
-        if (migration.version <= 1 || migration.version >= 7) continue;
+        if (migration.version <= 1 || migration.version >= latestVersion) continue;
         raw.exec(migration.statements);
         raw.exec(`PRAGMA user_version = ${migration.version};`);
         if (migration.version === 2) {
@@ -704,11 +705,12 @@ describe('native progress transactions against SQLite', () => {
       raw.close();
     }
 
+    const latestVersion = migrations.at(-1)!.version;
     const conn = await database.openDatabase();
-    expect((await conn.getVersion()).version).toBe(7);
+    expect((await conn.getVersion()).version).toBe(latestVersion);
 
     const migratedBooks = await database.getBooks(server.id);
-    expect(migratedBooks).toEqual([
+    expect(migratedBooks).toMatchObject([
       {
         id: book.id,
         serverId: server.id,
@@ -828,7 +830,7 @@ describe('native progress transactions against SQLite', () => {
     }
 
     const conn = await database.openDatabase();
-    expect((await conn.getVersion()).version).toBe(7);
+    expect((await conn.getVersion()).version).toBe(migrations.at(-1)!.version);
     expect(await database.getBooks(server.id)).toMatchObject([
       {
         id: book.id,
@@ -1036,6 +1038,7 @@ describe('native progress transactions against SQLite', () => {
       getItem: (key: string) => store.get(key) ?? null,
       setItem: (key: string, value: string) => void store.set(key, value),
       removeItem: (key: string) => void store.delete(key),
+      clear: () => void store.clear(),
     };
     vi.stubGlobal('window', { localStorage: mockStorage });
     try {
@@ -1058,6 +1061,230 @@ describe('native progress transactions against SQLite', () => {
       expect(getBridge().isNativeHandleOpen('turnleaf')).toBe(true);
       expect(await database.getServer()).toBeNull();
       expect(await database.getPreferences(['uiTheme', 'uiMode'])).toEqual(new Map());
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('interleaves native progress writes with localStorage.clear(), removeServer, and resetLocalDatabase so no stale row survives and nothing is lost', async () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+      clear: () => void store.clear(),
+    };
+    vi.stubGlobal('window', { localStorage: mockStorage });
+
+    const staleCompletedBook = {
+      ...book,
+      id: 'server:1:11',
+      volumeId: 11,
+      chapterId: 11,
+      title: 'Completed Stale Book',
+    };
+    const keptServer = { ...server, id: 'kept-server', displayName: 'Kept server' };
+    const keptBook = {
+      ...book,
+      id: 'kept-server:1:20',
+      serverId: keptServer.id,
+      volumeId: 20,
+      chapterId: 20,
+      title: 'Kept Book',
+    };
+    const freshServer = {
+      ...server,
+      id: 'fresh-server',
+      displayName: 'Fresh server',
+      lastConnectedAt: '2026-01-03T00:00:00.000Z',
+    };
+    const freshBook = {
+      ...book,
+      id: 'fresh-server:2:30',
+      serverId: freshServer.id,
+      libraryId: 2,
+      seriesId: 3,
+      volumeId: 30,
+      chapterId: 30,
+      title: 'Fresh Post-Reset Book',
+    };
+
+    try {
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+      await database.saveServer(server);
+      await database.saveServer(keptServer);
+      await database.reconcileBooks(server.id, [book, staleCompletedBook]);
+      await database.reconcileBooks(keptServer.id, [keptBook]);
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'light'],
+        ]),
+      );
+
+      // Interleave localStorage.clear() with a single-key native preference update.
+      mockStorage.clear();
+      expect(store.size).toBe(0);
+      await database.setPreference('uiTheme', 'cerberus');
+      expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+        theme: 'cerberus',
+        mode: 'light',
+      });
+
+      // Interleave server removal with progress writes across servers.
+      await Promise.all([
+        database.saveLocalProgress(book, 'stale-cfi', '/stale', 0.35, 1),
+        database.removeServer(server.id),
+        database.saveLocalProgress(keptBook, 'kept-cfi', '/kept', 0.45, 1),
+      ]);
+      expect(await database.getBooks(server.id)).toEqual([]);
+      expect(await database.getReadingState(book.id)).toBeNull();
+      expect(await database.getPendingSync(server.id)).toEqual([]);
+      expect(await database.getReadingState(keptBook.id)).toMatchObject({
+        cfi: 'kept-cfi',
+        pendingSync: true,
+      });
+
+      // Capture a pre-reset SQLiteDBConnection handle, then fire unawaited writes before and after reset.
+      const staleConn = await database.openDatabase();
+      const preResetWrites = [
+        database.saveServer(server),
+        database.reconcileBooks(server.id, [book, staleCompletedBook]),
+        database.saveLocalProgress(book, 'pre-reset-cfi', '/pre-reset', 0.42, 1),
+        database.markBookCompleted(staleCompletedBook),
+        database.setPreference('uiTheme', 'eink'),
+      ];
+      mockStorage.clear();
+      const resetOp = database.resetLocalDatabase();
+      const postResetWrites = [
+        database.saveServer(freshServer),
+        database.reconcileBooks(freshServer.id, [freshBook]),
+        database.saveLocalProgress(freshBook, 'post-reset-cfi', '/post-reset', 0.64, 2),
+        database.setPreferences(
+          new Map([
+            ['uiTheme', 'pine'],
+            ['uiMode', 'light'],
+          ]),
+        ),
+      ];
+      await Promise.all([...preResetWrites, resetOp, ...postResetWrites]);
+
+      // Stale pre-reset SQLiteDBConnection handles must not mutate or close the post-reset database.
+      await expect(staleConn.close()).resolves.toBeUndefined();
+      expect(getBridge().isNativeHandleOpen('turnleaf')).toBe(true);
+      await expect(staleConn.run('DELETE FROM books WHERE id = ?', [freshBook.id])).rejects.toThrow(
+        'resetLocalDatabase',
+      );
+      await expect(
+        database.replaceBooksInTransaction(staleConn, server.id, [book]),
+      ).rejects.toThrow('resetLocalDatabase');
+      await expect(
+        database.reconcileBooksInTransaction(staleConn, server.id, [book]),
+      ).rejects.toThrow('resetLocalDatabase');
+
+      const reopened = await reopenDatabase();
+      expect(await reopened.getServer()).toEqual(freshServer);
+      expect(await reopened.getBooks(server.id)).toEqual([]);
+      expect(await reopened.getBooks(keptServer.id)).toEqual([]);
+      expect(await reopened.getReadingState(book.id)).toBeNull();
+      expect(await reopened.getReadingState(staleCompletedBook.id)).toBeNull();
+      expect(await reopened.getReadingState(keptBook.id)).toBeNull();
+      expect(await reopened.getPendingSync(server.id)).toEqual([]);
+      expect(await reopened.getPendingSync(keptServer.id)).toEqual([]);
+
+      expect(await reopened.getBooks(freshServer.id)).toMatchObject([
+        { id: freshBook.id, pagesRead: 3, remoteAvailable: true },
+      ]);
+      expect(await reopened.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'post-reset-cfi',
+        xpath: '/post-reset',
+        percentage: 0.64,
+        pendingSync: true,
+        syncRevision: 1,
+      });
+      const pending = await reopened.getPendingSync(freshServer.id);
+      expect(pending).toHaveLength(1);
+      expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+        chapterId: freshBook.chapterId,
+        pageNum: 3,
+        bookScrollId: '/post-reset',
+      });
+      expect(await reopened.getPreferences(['uiTheme', 'uiMode'])).toEqual(
+        new Map([
+          ['uiTheme', 'pine'],
+          ['uiMode', 'light'],
+        ]),
+      );
+      expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+        theme: 'pine',
+        mode: 'light',
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('fences mid-transaction saveLocalProgress interleaved with localStorage.clear() and resetLocalDatabase', async () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+      clear: () => void store.clear(),
+    };
+    vi.stubGlobal('window', { localStorage: mockStorage });
+
+    const freshServer = { ...server, id: 'after-mid-tx', displayName: 'After Mid-Tx Reset' };
+    const freshBook = {
+      ...book,
+      id: 'after-mid-tx:1:99',
+      serverId: freshServer.id,
+      chapterId: 99,
+      title: 'Saved After Mid-Transaction Reset',
+    };
+
+    try {
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+      await seedDatabase();
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'dark'],
+        ]),
+      );
+
+      let queuedDuringTx: Promise<unknown> | null = null;
+      getBridge().onTransactionTask(async (index) => {
+        if (index !== 1) return;
+        getBridge().onTransactionTask(null);
+        mockStorage.clear();
+        const resetPromise = database.resetLocalDatabase();
+        const afterReset = Promise.all([
+          database.saveServer(freshServer),
+          database.reconcileBooks(freshServer.id, [freshBook]),
+          database.saveLocalProgress(freshBook, 'after-cfi', '/after', 0.52, 1),
+        ]);
+        queuedDuringTx = Promise.all([resetPromise, afterReset]);
+      });
+
+      await database.saveLocalProgress(book, 'in-flight-cfi', '/in-flight', 0.88, 2);
+      expect(queuedDuringTx).not.toBeNull();
+      await queuedDuringTx;
+
+      const reopened = await reopenDatabase();
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+      expect(await reopened.getServer()).toEqual(freshServer);
+      expect(await reopened.getBooks(server.id)).toEqual([]);
+      expect(await reopened.getReadingState(book.id)).toBeNull();
+      expect(await reopened.getPendingSync(server.id)).toEqual([]);
+      expect(await reopened.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'after-cfi',
+        xpath: '/after',
+        percentage: 0.52,
+        pendingSync: true,
+        syncRevision: 1,
+      });
+      expect(await reopened.getPendingSync(freshServer.id)).toHaveLength(1);
     } finally {
       vi.unstubAllGlobals();
     }

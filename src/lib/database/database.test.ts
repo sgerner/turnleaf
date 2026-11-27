@@ -1212,3 +1212,123 @@ it('saves normalized browser remote progress and guards against concurrent local
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
 });
+
+it('interleaves browser progress writes with localStorage.clear(), removeServer, and resetLocalDatabase so no stale row survives and nothing is lost', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  const staleServer = {
+    id: 'server',
+    displayName: 'Stale server',
+    baseUrl: 'https://stale.example.com',
+    credentialRef: 'stale-credential',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  };
+  const completedStaleBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:11',
+    chapterId: 11,
+    title: 'Completed Stale Book',
+  };
+  const freshServer = {
+    id: 'fresh-server',
+    displayName: 'Fresh server',
+    baseUrl: 'https://fresh.example.com',
+    credentialRef: 'fresh-credential',
+    kavitaVersion: '0.8.5',
+    lastConnectedAt: '2026-09-08T00:00:00.000Z',
+  };
+  const freshBook: BookRecord = {
+    ...existingBook,
+    id: 'fresh-server:2:20',
+    serverId: freshServer.id,
+    libraryId: 2,
+    seriesId: 3,
+    volumeId: 20,
+    chapterId: 20,
+    title: 'Fresh Browser Book',
+    pagesRead: 0,
+  };
+
+  await saveServer(staleServer);
+  await reconcileBooks(staleServer.id, [existingBook, completedStaleBook]);
+  await saveLocalProgress(existingBook, 'stale-cfi', '/stale', 0.35, 1);
+  await markBookCompleted(completedStaleBook);
+  await setPreferences(
+    new Map([
+      ['uiTheme', 'eink'],
+      ['uiMode', 'light'],
+    ]),
+  );
+
+  // Clear localStorage mid-flow; late writes for cleared books must not plant orphan state.
+  storage.clear();
+  await saveLocalProgress(existingBook, 'orphan-after-clear', '/orphan', 0.5, 1);
+  await markBookCompleted(completedStaleBook);
+  await markDownloaded(existingBook.id, 'books/orphan.epub', 1024);
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBeNull();
+  expect(storage.getItem(BOOT_THEME_STORAGE_KEY)).toBeNull();
+
+  // Re-seed, removeServer, and verify late writes for the removed server leave zero stale rows.
+  await saveServer(staleServer);
+  await reconcileBooks(staleServer.id, [existingBook, completedStaleBook]);
+  await saveLocalProgress(existingBook, 'before-remove', '/before-remove', 0.4, 1);
+  await removeServer(staleServer.id);
+  await saveLocalProgress(existingBook, 'orphan-after-remove', '/orphan-remove', 0.7, 1);
+  await markBookCompleted(completedStaleBook);
+
+  expect(await getServer()).toBeNull();
+  expect(await getBooks(staleServer.id)).toEqual([]);
+  expect(await getReadingState(existingBook.id)).toBeNull();
+  expect(await getReadingState(completedStaleBook.id)).toBeNull();
+  expect(await getPendingSync(staleServer.id)).toEqual([]);
+
+  // Interleave pre-reset writes, resetLocalDatabase(), stale late writes, and post-reset writes.
+  await Promise.all([
+    saveServer(staleServer),
+    reconcileBooks(staleServer.id, [existingBook, completedStaleBook]),
+    saveLocalProgress(existingBook, 'pre-reset-cfi', '/pre-reset', 0.45, 1),
+    setPreference('uiTheme', 'eink'),
+    resetLocalDatabase(),
+    saveLocalProgress(existingBook, 'late-stale-cfi', '/late-stale', 0.8, 1),
+    saveServer(freshServer),
+    reconcileBooks(freshServer.id, [freshBook]),
+    saveLocalProgress(freshBook, 'fresh-cfi', '/fresh', 0.62, 2),
+    setPreferences(
+      new Map([
+        ['uiTheme', 'pine'],
+        ['uiMode', 'light'],
+      ]),
+    ),
+  ]);
+
+  expect(await getServer()).toEqual(freshServer);
+  expect(await getBooks(staleServer.id)).toEqual([]);
+  expect(await getReadingState(existingBook.id)).toBeNull();
+  expect(await getReadingState(completedStaleBook.id)).toBeNull();
+  expect(await getPendingSync(staleServer.id)).toEqual([]);
+
+  expect(await getBooks(freshServer.id)).toMatchObject([{ id: freshBook.id, pagesRead: 3 }]);
+  expect(await getReadingState(freshBook.id)).toMatchObject({
+    cfi: 'fresh-cfi',
+    xpath: '/fresh',
+    percentage: 0.62,
+    pendingSync: true,
+    syncRevision: 1,
+  });
+  expect(await getPendingSync(freshServer.id)).toHaveLength(1);
+  expect(await getPreferences(['uiTheme', 'uiMode'])).toEqual(
+    new Map([
+      ['uiTheme', 'pine'],
+      ['uiMode', 'light'],
+    ]),
+  );
+  expect(JSON.parse(storage.getItem(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+    theme: 'pine',
+    mode: 'light',
+  });
+});

@@ -1556,4 +1556,75 @@ describe('ReaderSession', () => {
       delete runtimeRendition.manager;
     }
   });
+
+  it('expands multi-column views on displayServerLocation and preserves restoreTarget across post-open appearance hydration', async () => {
+    const view = { expand: vi.fn() };
+    const runtimeRendition = mockRendition as typeof mockRendition & {
+      manager?: {
+        stage: object;
+        container: HTMLElement;
+        on: () => void;
+        off: () => void;
+        views: { all: () => Array<typeof view> };
+      };
+    };
+    runtimeRendition.manager = {
+      stage: {},
+      container: document.createElement('div'),
+      on: vi.fn(),
+      off: vi.fn(),
+      views: { all: () => [view] },
+    };
+
+    const doc = document.implementation.createHTMLDocument('chapter');
+    doc.body.innerHTML = '<p>Opening</p><p>Mid-chapter restored passage</p>';
+    mockRendition.getContents.mockReturnValue([
+      {
+        document: doc,
+        window,
+        sectionIndex: 1,
+        cfiFromRange: () => 'epubcfi(/6/4!/4/4/1:0)',
+        cfiFromNode: () => 'epubcfi(/6/4!/4/4)',
+        range: () => doc.createRange(),
+      } as unknown as Contents,
+    ]);
+
+    try {
+      const session = new ReaderSession('book.epub');
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 640));
+      await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+      view.expand.mockClear();
+      mockRendition.display.mockClear();
+
+      expect(await session.displayServerLocation('//body/DocFragment[2]/body/p[2]')).toBe(true);
+      expect(view.expand).toHaveBeenCalledOnce();
+      expect(mockRendition.display.mock.calls).toEqual([
+        ['second.xhtml'],
+        ['epubcfi(/6/4!/4/4/1:0)'],
+        ['epubcfi(/6/4!/4/4/1:0)'],
+      ]);
+
+      // Simulate relocated briefly reporting section start before appearance hydration applies.
+      const relocated = getRenditionListener('relocated');
+      relocated({
+        start: {
+          href: 'second.xhtml',
+          index: 1,
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          displayed: { page: 1, total: 5 },
+        },
+      });
+      view.expand.mockClear();
+      mockRendition.display.mockClear();
+
+      session.applyAppearance({ ...defaultAppearance, fontSize: 22 });
+      expect(view.expand).toHaveBeenCalledOnce();
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/4/1:0)');
+
+      session.destroy();
+    } finally {
+      delete runtimeRendition.manager;
+    }
+  });
 });
