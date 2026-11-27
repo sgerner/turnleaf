@@ -70,14 +70,10 @@ function kavitaDevProxy(): Plugin {
 
 export default defineConfig(() => ({
   plugins: [tailwindcss(), svelte(), kavitaDevProxy()],
+  ...(process.env.VITEST ? { resolve: { conditions: ['browser'] } } : {}),
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
   },
-  resolve: process.env.VITEST
-    ? {
-        conditions: ['browser'],
-      }
-    : undefined,
   build: {
     target: 'es2022',
     sourcemap: false,
