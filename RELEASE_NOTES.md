@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test(android): decouple post-restart book card and sync banner journey checks
 - Fix Android reading journey DPR pagination, ReaderChrome inset sync, post-reflow progress persistence, and reconnect sync races
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache

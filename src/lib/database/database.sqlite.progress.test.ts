@@ -1029,4 +1029,37 @@ describe('native progress transactions against SQLite', () => {
       pendingSync: true,
     });
   });
+
+  it('clears the boot theme cache and serializes concurrent openDatabase calls across resetLocalDatabase', async () => {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+    };
+    vi.stubGlobal('window', { localStorage: mockStorage });
+    try {
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+      await seedDatabase();
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'light'],
+        ]),
+      );
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(true);
+
+      const resetPromise = database.resetLocalDatabase();
+      const reopenedPromise = database.openDatabase();
+      const [, reopenedConn] = await Promise.all([resetPromise, reopenedPromise]);
+
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+      expect(reopenedConn).toBeInstanceOf(SQLiteDBConnection);
+      expect(getBridge().isNativeHandleOpen('turnleaf')).toBe(true);
+      expect(await database.getServer()).toBeNull();
+      expect(await database.getPreferences(['uiTheme', 'uiMode'])).toEqual(new Map());
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

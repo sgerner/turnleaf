@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { startFixture } from './android-reading-journey.mjs';
+import {
+  expectedBookCardPercent,
+  hasQueuedSyncBanner,
+  inspectLibraryBookCard,
+  startFixture,
+} from './android-reading-journey.mjs';
 
 const fixtures = [];
 
@@ -7,6 +12,87 @@ afterEach(() => {
   while (fixtures.length > 0) {
     fixtures.pop()?.close();
   }
+});
+
+describe('Android reading journey helpers', () => {
+  it('derives expected card percentage from persisted SQLite book progress without hard-coding 50%', () => {
+    expect(expectedBookCardPercent({ pages: 2, pagesRead: 1 })).toBe(50);
+    expect(expectedBookCardPercent({ pages: 8, pagesRead: 5 })).toBe(63);
+    expect(expectedBookCardPercent({ pages: 0, pagesRead: 1 })).toBe(0);
+    expect(expectedBookCardPercent({ pages: 10, pagesRead: 14 })).toBe(100);
+  });
+
+  it('matches book cards by stable identifier and title across grid and list accessibility modes', () => {
+    const bookId = 'server:1:1';
+    const title = 'Turnleaf CI EPUB';
+    const expectedPercent = expectedBookCardPercent({ pages: 8, pagesRead: 5 });
+
+    expect(
+      inspectLibraryBookCard(
+        {
+          bookId,
+          heading: title,
+          openDisabled: false,
+          openLabel: `Open ${title}, by Turnleaf, downloaded for offline reading, 63% complete`,
+          progressNow: '63',
+          progressText: '63% complete',
+        },
+        { bookId, title, expectedPercent },
+      ),
+    ).toBe(true);
+
+    expect(
+      inspectLibraryBookCard(
+        {
+          bookId,
+          heading: title,
+          openDisabled: false,
+          openLabel: `Open ${title}, downloaded for offline reading`,
+          progressNow: '63',
+          progressText: '63% complete',
+        },
+        { bookId, title, expectedPercent },
+      ),
+    ).toBe(true);
+
+    expect(
+      inspectLibraryBookCard(
+        {
+          bookId: 'server:1:999',
+          heading: title,
+          openDisabled: false,
+          openLabel: `Open ${title}, downloaded for offline reading, 63% complete`,
+          progressNow: '63',
+          progressText: '63% complete',
+        },
+        { bookId, title, expectedPercent },
+      ),
+    ).toBe(false);
+
+    expect(
+      inspectLibraryBookCard(
+        {
+          bookId,
+          heading: title,
+          openDisabled: false,
+          openLabel: `Open ${title}, downloaded for offline reading, 50% complete`,
+          progressNow: '50',
+          progressText: '50% complete',
+        },
+        { bookId, title, expectedPercent },
+      ),
+    ).toBe(false);
+  });
+
+  it('checks the queued reading progress banner independently from card selectors', () => {
+    expect(
+      hasQueuedSyncBanner([
+        'No network connection. Showing your saved library.',
+        '1 reading progress update waiting to sync. Retry sync',
+      ]),
+    ).toBe(true);
+    expect(hasQueuedSyncBanner(['No network connection. Showing your saved library.'])).toBe(false);
+  });
 });
 
 describe('Android reading journey fixture', () => {

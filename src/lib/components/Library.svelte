@@ -1501,8 +1501,17 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    await refreshSyncStatus();
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    if (!offline) {
+      syncTimer = window.setTimeout(() => {
+        syncTimer = null;
+        void syncProgress(false);
+      }, 2_500);
+    }
   }
 
   async function syncLatestForReader(
@@ -1569,6 +1578,7 @@
       savedBook.pagesRead = book.pages;
       savedBook.lastReadAt = new Date().toISOString();
     }
+    await refreshSyncStatus();
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
@@ -1585,10 +1595,18 @@
     if (!offline) {
       const baselineRevision = activeSyncStartRevision ?? messageRevision;
       const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-      if (syncStatus.pendingCount > 0) void syncProgress(false);
+      if (syncStatus.pendingCount > 0 || syncTimer !== null) {
+        if (syncTimer !== null) {
+          window.clearTimeout(syncTimer);
+          syncTimer = null;
+        }
+        void syncProgress(false);
+      }
       if (kavitaUnreachable || offlineMessage) {
         void startRefresh(false, baselineRevision, baselineMessage);
       }
+    } else {
+      void refreshSyncStatus();
     }
     await tick();
     if (reading || !libraryMain) return;

@@ -75,10 +75,16 @@ vi.mock('../native/credentials', () => ({
   removeApiKey: vi.fn(async () => {}),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+import type * as ThemesModule from '../themes/themes';
+
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -626,5 +632,29 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('surfaces the queued sync banner immediately when progress is saved while offline', async () => {
+    networkConnected = false;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-actions]')));
+    expect(target.textContent).not.toContain('1 reading progress update waiting to sync.');
+
+    target.querySelector<HTMLButtonElement>('[data-book-actions]')!.click();
+    flushSync();
+
+    const markReadButton = Array.from(target.ownerDocument.querySelectorAll('button')).find(
+      (button) => button.textContent?.includes('Mark as read'),
+    );
+    expect(markReadButton).toBeDefined();
+    markReadButton!.click();
+    flushSync();
+
+    await waitForCondition(() =>
+      Boolean(target.textContent?.includes('1 reading progress update waiting to sync.')),
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

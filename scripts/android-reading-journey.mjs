@@ -26,7 +26,7 @@ const adb = async (...args) =>
     })
   ).stdout.trim();
 
-async function waitFor(label, check) {
+async function waitFor(label, check, describeTimeout) {
   const end = Date.now() + 30_000;
   let lastError;
   do {
@@ -42,7 +42,16 @@ async function waitFor(label, check) {
     }
     await delay(250);
   } while (Date.now() < end);
-  throw new Error(`Timed out waiting for ${label}.`, { cause: lastError });
+  let detail = '';
+  if (describeTimeout) {
+    try {
+      const info = await describeTimeout();
+      if (info !== undefined) detail = ` (${JSON.stringify(info)})`;
+    } catch (diagnosticError) {
+      detail = ` (diagnostic failed: ${String(diagnosticError)})`;
+    }
+  }
+  throw new Error(`Timed out waiting for ${label}${detail}.`, { cause: lastError });
 }
 
 async function connectWebView() {
@@ -259,6 +268,105 @@ const renderedCover = `(() => {
   const image = document.querySelector('[data-book-open]')?.parentElement?.querySelector('img');
   return Boolean(image && image.complete && image.naturalWidth > 0);
 })()`;
+
+const renderedBookCover = (bookId) => `(() => {
+  const card = document.querySelector(${JSON.stringify(`article[data-book-id="${bookId}"]`)});
+  const image = card?.querySelector('img');
+  return Boolean(image && image.complete && image.naturalWidth > 0);
+})()`;
+
+const libraryBookCardSnapshot = (bookId, fallbackTitle = title) => `(() => {
+  const byId = ${bookId ? `document.querySelector(${JSON.stringify(`article[data-book-id="${bookId}"]`)})` : 'null'};
+  const card =
+    byId ??
+    Array.from(document.querySelectorAll('article[data-book-id]')).find(
+      (el) => el.querySelector('h2')?.textContent?.trim() === ${JSON.stringify(fallbackTitle)},
+    );
+  if (!card) return null;
+  const openButton = card.querySelector('[data-book-open]');
+  const progressBar = card.querySelector('[role="progressbar"]');
+  return {
+    bookId: card.getAttribute('data-book-id'),
+    heading: card.querySelector('h2')?.textContent?.trim() ?? null,
+    openDisabled: Boolean(openButton?.disabled),
+    openLabel: openButton?.getAttribute('aria-label') ?? null,
+    progressNow: progressBar?.getAttribute('aria-valuenow') ?? null,
+    progressText: progressBar?.getAttribute('aria-valuetext') ?? null,
+  };
+})()`;
+
+export function expectedBookCardPercent({ pages, pagesRead }) {
+  const totalPages = Number(pages);
+  const readPages = Number(pagesRead);
+  if (!Number.isFinite(totalPages) || totalPages <= 0 || !Number.isFinite(readPages)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, Math.round((readPages / totalPages) * 100)));
+}
+
+export function inspectLibraryBookCard(
+  snapshot,
+  { bookId, title: expectedTitle, expectedPercent },
+) {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  if (bookId && snapshot.bookId !== bookId) return false;
+  if (snapshot.heading !== expectedTitle || snapshot.openDisabled) return false;
+  if (typeof snapshot.openLabel !== 'string') return false;
+  if (
+    !snapshot.openLabel.startsWith(`Open ${expectedTitle},`) ||
+    !snapshot.openLabel.includes('downloaded for offline reading')
+  ) {
+    return false;
+  }
+  if (expectedPercent > 0) {
+    if (Number(snapshot.progressNow) !== expectedPercent) return false;
+    if (snapshot.progressText !== `${expectedPercent}% complete`) return false;
+    if (
+      snapshot.openLabel.includes('% complete') &&
+      !snapshot.openLabel.includes(`${expectedPercent}% complete`)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return snapshot.progressNow === null && !snapshot.openLabel.includes('% complete');
+}
+
+export function hasQueuedSyncBanner(warningTexts) {
+  return (
+    Array.isArray(warningTexts) &&
+    warningTexts.some(
+      (text) =>
+        typeof text === 'string' && text.includes('1 reading progress update waiting to sync.'),
+    )
+  );
+}
+
+async function captureLibraryDiagnostics(web) {
+  const dom = await web.evaluate(`(() => ({
+    booting: Boolean(document.querySelector('[aria-label="Opening Turnleaf"]')),
+    alerts: Array.from(document.querySelectorAll('[role="alert"], [role="status"], .alert')).map(
+      (el) => el.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+    ),
+    cards: Array.from(document.querySelectorAll('article[data-book-id]')).map((el) => ({
+      bookId: el.getAttribute('data-book-id'),
+      heading: el.querySelector('h2')?.textContent?.trim() ?? null,
+      openLabel: el.querySelector('[data-book-open]')?.getAttribute('aria-label') ?? null,
+      progressNow: el.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') ?? null,
+    })),
+  }))()`);
+  const books = await web
+    .evaluate(
+      querySqliteRows(
+        'SELECT id, title, pages, pages_read, download_path, remote_available FROM books',
+      ),
+    )
+    .catch((error) => ({ error: String(error) }));
+  const queue = await web
+    .evaluate(querySqliteRows('SELECT book_id, revision, last_error, updated_at FROM sync_queue'))
+    .catch((error) => ({ error: String(error) }));
+  return { dom, books, queue };
+}
 
 const retryDownloadReady = `Array.from(document.querySelectorAll('button')).some(
   button => !button.disabled && button.textContent?.trim() === 'Retry download'
@@ -497,9 +605,11 @@ async function run() {
         }
         const rows = await web.evaluate(
           querySqliteRows(
-            `SELECT r.cfi, r.kavita_xpath, r.percentage, r.pending_sync, q.revision
+            `SELECT b.id AS book_id, b.pages, b.pages_read,
+                    r.cfi, r.kavita_xpath, r.percentage, r.pending_sync, q.revision
              FROM reading_state r
-             JOIN sync_queue q ON q.book_id = r.book_id`,
+             JOIN sync_queue q ON q.book_id = r.book_id
+             JOIN books b ON b.id = r.book_id`,
           ),
         );
         if (!Array.isArray(rows) || rows.length !== 1) return null;
@@ -510,17 +620,25 @@ async function run() {
             : null;
         const paragraphNumber = xpathMatch ? Number(xpathMatch[1]) : 0;
         if (
+          typeof row.book_id === 'string' &&
+          row.book_id.length > 0 &&
           Number(row.pending_sync) === 1 &&
           typeof row.cfi === 'string' &&
           row.cfi.startsWith('epubcfi(') &&
           paragraphNumber > 1 &&
           Math.round(Number(row.percentage) * 100) === midChapterTarget.progressNow
         ) {
+          const pages = Number(row.pages);
+          const pagesRead = Number(row.pages_read);
           return {
+            bookId: row.book_id,
             cfi: row.cfi,
-            xpath: row.kavita_xpath,
+            expectedCardPercent: expectedBookCardPercent({ pages, pagesRead }),
+            pages,
+            pagesRead,
             percentage: Number(row.percentage),
             revision: Number(row.revision),
+            xpath: row.kavita_xpath,
           };
         }
         return null;
@@ -547,18 +665,36 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
-    await waitFor('offline library with pending sync banner', () =>
-      web.evaluate(`(() => {
-        const card = document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]');
-        const warnings = Array.from(document.querySelectorAll('.alert.preset-tonal-warning'));
-        return Boolean(
-          card &&
-          warnings.some((el) => el.textContent?.includes('1 reading progress update waiting to sync.'))
-        );
-      })()`),
+    const bookOpenSelector = `article[data-book-id="${committedProgress.bookId}"] [data-book-open]`;
+    await waitFor(
+      'offline library book card after restart',
+      async () => {
+        const snapshot = await web.evaluate(libraryBookCardSnapshot(committedProgress.bookId));
+        return inspectLibraryBookCard(snapshot, {
+          bookId: committedProgress.bookId,
+          title,
+          expectedPercent: committedProgress.expectedCardPercent,
+        });
+      },
+      () => captureLibraryDiagnostics(web),
     );
-    await waitFor('rendered offline cover after restart', () => web.evaluate(renderedCover));
-    await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
+    await waitFor(
+      'queued reading progress banner after restart',
+      async () => {
+        const warningTexts = await web.evaluate(`Array.from(
+          document.querySelectorAll('.alert.preset-tonal-warning'),
+          (el) => el.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+        )`);
+        return hasQueuedSyncBanner(warningTexts);
+      },
+      () => captureLibraryDiagnostics(web),
+    );
+    await waitFor(
+      'rendered offline cover after restart',
+      () => web.evaluate(renderedBookCover(committedProgress.bookId)),
+      () => captureLibraryDiagnostics(web),
+    );
+    await waitFor('offline catalog book', () => web.evaluate(click(bookOpenSelector)));
     await waitFor('exact mid-chapter offline passage restored after force-stop', async () => {
       const restored = await web.evaluate(readerSnapshotExpression);
       if (!isMidChapterTwoSnapshot(restored)) return false;
@@ -592,26 +728,43 @@ async function run() {
       await web.evaluate(click('[aria-label="Show reading controls"]'));
       return false;
     });
-    await waitFor('synced passage in library with zero pending sync warning banners', async () => {
-      const domReady = await web.evaluate(`(() => {
-        const card = document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]');
-        const warning = document.querySelector('.alert.preset-tonal-warning');
-        return Boolean(card && !warning);
-      })()`);
-      if (!domReady) return false;
-      const queueRows = await web.evaluate(
-        querySqliteRows('SELECT COUNT(*) AS count FROM sync_queue'),
-      );
-      const readingRows = await web.evaluate(
-        querySqliteRows('SELECT pending_sync FROM reading_state'),
-      );
-      return (
-        Number(queueRows?.[0]?.count ?? -1) === 0 &&
-        readingRows?.length === 1 &&
-        Number(readingRows[0]?.pending_sync) === 0
-      );
-    });
-    await waitFor('rendered cover after reconnect', () => web.evaluate(renderedCover));
+    await waitFor(
+      'synced passage in library with zero pending sync warning banners',
+      async () => {
+        const domState = await web.evaluate(`(() => ({
+          card: ${libraryBookCardSnapshot(committedProgress.bookId)},
+          hasWarning: Boolean(document.querySelector('.alert.preset-tonal-warning')),
+        }))()`);
+        if (
+          !domState ||
+          domState.hasWarning ||
+          !inspectLibraryBookCard(domState.card, {
+            bookId: committedProgress.bookId,
+            title,
+            expectedPercent: committedProgress.expectedCardPercent,
+          })
+        ) {
+          return false;
+        }
+        const queueRows = await web.evaluate(
+          querySqliteRows('SELECT COUNT(*) AS count FROM sync_queue'),
+        );
+        const readingRows = await web.evaluate(
+          querySqliteRows('SELECT pending_sync FROM reading_state'),
+        );
+        return (
+          Number(queueRows?.[0]?.count ?? -1) === 0 &&
+          readingRows?.length === 1 &&
+          Number(readingRows[0]?.pending_sync) === 0
+        );
+      },
+      () => captureLibraryDiagnostics(web),
+    );
+    await waitFor(
+      'rendered cover after reconnect',
+      () => web.evaluate(renderedBookCover(committedProgress.bookId)),
+      () => captureLibraryDiagnostics(web),
+    );
     assertRedirectIsolation(fixture);
     if (fixture.notFoundPaths.length > 0) {
       throw new Error(
