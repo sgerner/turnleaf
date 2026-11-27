@@ -24,12 +24,12 @@ export function hasActiveTransport(
   status: ConnectionStatus | null | undefined,
   options: TransportCheckOptions = {},
 ): boolean {
+  if (options.browserOnline === false) {
+    return false;
+  }
   const native = options.native ?? true;
   if (native) {
     return status != null && status.connectionType !== 'none';
-  }
-  if (options.browserOnline === false) {
-    return false;
   }
   if (status == null) {
     return true;
@@ -71,17 +71,16 @@ export function applyNetworkStatusChange(
 
   const nextType = status?.connectionType ?? 'unknown';
   const nextValidated = status?.connected === true;
-  const shouldReconnect =
-    previous.offline ||
-    previous.connectionType !== nextType ||
-    (!previous.validated && nextValidated);
+  const transportChanged =
+    previous.connectionType !== nextType || (!previous.validated && nextValidated);
+  const shouldReconnect = previous.offline || (previous.kavitaUnreachable && transportChanged);
 
   return {
     state: {
       offline: false,
       connectionType: nextType,
       validated: nextValidated,
-      kavitaUnreachable: shouldReconnect ? false : previous.kavitaUnreachable,
+      kavitaUnreachable: transportChanged ? false : previous.kavitaUnreachable,
     },
     disconnected: false,
     shouldReconnect,
@@ -90,10 +89,10 @@ export function applyNetworkStatusChange(
 
 export function isKavitaNetworkFailure(error: unknown): boolean {
   if (error instanceof KavitaError) {
-    return error.kind === 'network';
+    return error.kind === 'network' && !error.transportDenied;
   }
   if (error instanceof EpubTransferError) {
-    return error.connectionFailed;
+    return error.connectionFailed && !error.transportDenied;
   }
   if (error instanceof AggregateError) {
     return error.errors.some((cause) => isKavitaNetworkFailure(cause));

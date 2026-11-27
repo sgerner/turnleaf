@@ -122,7 +122,10 @@
   const client = $derived(new KavitaClient(server.baseUrl, activeApiKey, ensureClientTransport));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
-    const allowDownload = !initialRefreshPending && (await networkAvailable({ manual: false }));
+    const allowDownload =
+      !initialRefreshPending &&
+      (await networkAvailable({ manual: false })) &&
+      !initialRefreshPending;
     if (Capacitor.isNativePlatform()) {
       try {
         return await cacheCover(
@@ -133,10 +136,7 @@
           server.id,
           allowDownload,
           serverOrigin,
-          (transferSignal) =>
-            !initialRefreshPending &&
-            !transferSignal?.aborted &&
-            networkAvailable({ manual: false }),
+          (transferSignal) => !transferSignal?.aborted && networkAvailable({ manual: false }),
         );
       } catch (error) {
         if (!signal.aborted && isKavitaNetworkFailure(error)) {
@@ -287,6 +287,7 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let pendingReconnectSync = false;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -769,14 +770,12 @@
         await Network.addListener('networkStatusChange', (nextStatus) => {
           if (destroyed) return;
           const revision = ++networkStatusRevision;
-          if (!hasActiveTransport(nextStatus, transportOptions())) {
-            handleNetworkStatus(nextStatus);
-            return;
-          }
-          if (!Capacitor.isNativePlatform()) {
-            if (handleNetworkStatus(nextStatus)) {
-              launchReconnectSyncAndRefresh();
-            }
+          if (
+            !hasActiveTransport(nextStatus, transportOptions()) ||
+            !Capacitor.isNativePlatform()
+          ) {
+            latestAppliedProbeId = ++statusProbeSequence;
+            applyAcceptedNetworkStatus(nextStatus);
             return;
           }
           void confirmNativeNetworkStatus(revision);
@@ -847,9 +846,12 @@
 
   let networkStatusRevision = 0;
   let disconnectRevision = 0;
+  let statusProbeSequence = 0;
+  let latestAppliedProbeId = 0;
 
   function applyDisconnectedState(state: ReachabilityState): void {
     disconnectRevision += 1;
+    pendingReconnectSync = false;
     reachability = state;
     initialRefreshPending = false;
     abortActiveNetworkProbes();
@@ -859,30 +861,43 @@
   function launchReconnectSyncAndRefresh(): void {
     const baselineRevision = activeSyncStartRevision ?? messageRevision;
     const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-    void syncProgress(false);
+    if (syncWork) {
+      pendingReconnectSync = true;
+    } else {
+      void syncProgress(false);
+    }
     void startRefresh(false, baselineRevision, baselineMessage);
   }
 
-  async function confirmNativeNetworkStatus(revision: number): Promise<void> {
-    const liveStatus = await Network.getStatus().catch(() => null);
-    if (destroyed || revision !== networkStatusRevision) return;
-    if (handleNetworkStatus(liveStatus)) {
-      launchReconnectSyncAndRefresh();
-    }
-  }
-
-  function handleNetworkStatus(status: ConnectionStatus | null): boolean {
+  function applyAcceptedNetworkStatus(status: ConnectionStatus | null): void {
     const transition = applyNetworkStatusChange(reachability, status, transportOptions());
     if (transition.disconnected) {
       applyDisconnectedState(transition.state);
-      return false;
+      return;
     }
     reachability = transition.state;
     if (transition.shouldReconnect) {
       initialRefreshPending = true;
       offlineMessage = '';
+      launchReconnectSyncAndRefresh();
     }
-    return transition.shouldReconnect;
+  }
+
+  async function confirmNativeNetworkStatus(revision: number): Promise<void> {
+    const disconnectAtStart = disconnectRevision;
+    const probeId = ++statusProbeSequence;
+    const liveStatus = await Network.getStatus().catch(() => null);
+    if (
+      destroyed ||
+      revision !== networkStatusRevision ||
+      disconnectRevision !== disconnectAtStart
+    ) {
+      return;
+    }
+    if (probeId > latestAppliedProbeId) {
+      latestAppliedProbeId = probeId;
+      applyAcceptedNetworkStatus(liveStatus);
+    }
   }
 
   function markKavitaUnreachable(): void {
@@ -906,21 +921,15 @@
   async function networkAvailable(options: { manual?: boolean } = {}): Promise<boolean> {
     if (destroyed || !canAttemptKavitaRequest(reachability, options)) return false;
     const disconnectAtStart = disconnectRevision;
-    const statusRevisionAtStart = networkStatusRevision;
+    const probeId = ++statusProbeSequence;
     const status = await Network.getStatus().catch(() => null);
-    if (destroyed) return false;
-    const transition = applyNetworkStatusChange(reachability, status, transportOptions());
-    if (transition.disconnected) {
-      // A newer network event superseded this probe; skip this request without
-      // reverting the newer state to offline.
-      if (networkStatusRevision === statusRevisionAtStart) applyDisconnectedState(transition.state);
-      return false;
+    if (destroyed || disconnectRevision !== disconnectAtStart) return false;
+    if (probeId > latestAppliedProbeId) {
+      latestAppliedProbeId = probeId;
+      applyAcceptedNetworkStatus(status);
     }
-    if (disconnectRevision !== disconnectAtStart && reachability.offline) {
+    if (!hasActiveTransport(status, transportOptions())) {
       return false;
-    }
-    if (networkStatusRevision === statusRevisionAtStart) {
-      reachability = transition.state;
     }
     return !destroyed && canAttemptKavitaRequest(reachability, options);
   }
@@ -950,6 +959,10 @@
     }
     syncWork = runProgressSync(showFeedback).finally(() => {
       syncWork = null;
+      if (pendingReconnectSync && !destroyed) {
+        pendingReconnectSync = false;
+        void syncProgress(false);
+      }
     });
     return syncWork;
   }
@@ -962,6 +975,7 @@
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     activeSyncStartRevision = messageRevision;
+    let disconnectAtFlushStart = disconnectRevision;
     try {
       const available = Capacitor.isNativePlatform()
         ? await networkAvailable({ manual: showFeedback })
@@ -973,11 +987,34 @@
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id);
-      markKavitaReachable();
-      if (showFeedback) setMessage('Reading progress synced.');
+      disconnectAtFlushStart = disconnectRevision;
+      const flushClient = Capacitor.isNativePlatform()
+        ? new KavitaClient(
+            server.baseUrl,
+            activeApiKey,
+            async (signal) =>
+              disconnectRevision === disconnectAtFlushStart &&
+              (await ensureClientTransport(signal)),
+          )
+        : client;
+      pendingReconnectSync = false;
+      await flushProgress(flushClient, server.id);
+      const remaining = await getSyncStatus(server.id).catch(() => null);
+      if (!destroyed && remaining) syncStatus = remaining;
+      if (disconnectRevision === disconnectAtFlushStart && !reachability.offline) {
+        markKavitaReachable();
+        if (showFeedback && (remaining?.pendingCount ?? 0) === 0) {
+          setMessage('Reading progress synced.');
+        }
+      } else if (showFeedback && (remaining?.pendingCount ?? 0) > 0) {
+        setMessage('Offline. Reading progress will retry when Kavita is available.');
+      }
     } catch (error) {
-      if (isKavitaNetworkFailure(error)) {
+      if (
+        disconnectRevision === disconnectAtFlushStart &&
+        !pendingReconnectSync &&
+        isKavitaNetworkFailure(error)
+      ) {
         markKavitaUnreachable();
       }
       if (
@@ -1107,7 +1144,9 @@
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || (cause instanceof KavitaError && cause.transportDenied)) {
+        return;
+      }
       initialRefreshPending = false;
       recordDiagnostic({
         category:
@@ -1216,7 +1255,13 @@
       message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
-    if (!(await networkAvailable({ manual: true }))) {
+    const available = await networkAvailable({ manual: true });
+    if (destroyed) return null;
+    if (downloadingBookId || cleanupInProgress) {
+      message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
+      return null;
+    }
+    if (!available) {
       message = 'No network connection. Connect to Kavita to download this book.';
       return null;
     }
@@ -1284,7 +1329,7 @@
       if (error instanceof EpubTransferError) {
         status = error.status;
         detail = error.connectionFailed ? 'download-connection' : 'download-transfer';
-        if (error.connectionFailed) {
+        if (isKavitaNetworkFailure(error)) {
           markKavitaUnreachable();
         }
         if (status === 401) {
@@ -1321,8 +1366,10 @@
       downloadFailureBook = book;
       return null;
     } finally {
-      downloadingBookId = null;
-      downloadPercent = null;
+      if (downloadingBookId === book.id) {
+        downloadingBookId = null;
+        downloadPercent = null;
+      }
     }
   }
 
@@ -1884,7 +1931,11 @@
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
       // An upload started with the previous key may still be finishing.
-      while (syncWork) await syncWork;
+      while (syncWork) {
+        pendingReconnectSync = false;
+        await syncWork;
+      }
+      pendingReconnectSync = false;
       refreshController?.abort();
       activeApiKey = nextKey;
       onApiKeyChange(nextKey);

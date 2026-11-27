@@ -21,6 +21,7 @@ export class EpubTransferError extends Error {
   constructor(
     readonly status: number | undefined,
     readonly connectionFailed: boolean,
+    readonly transportDenied = false,
   ) {
     super('The EPUB transfer failed.');
   }
@@ -168,7 +169,7 @@ async function downloadFileWithRedirects(options: {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     if (options.beforeTransfer && !(await options.beforeTransfer(options.signal))) {
       if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      throw new EpubTransferError(undefined, true);
+      throw new EpubTransferError(undefined, true, true);
     }
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.onHop?.(redirects.currentUrl);

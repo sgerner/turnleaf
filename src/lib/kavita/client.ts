@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -154,6 +155,7 @@ export class KavitaClient {
     } catch (error) {
       const retryable =
         error instanceof KavitaError &&
+        !error.transportDenied &&
         (error.kind === 'network' ||
           (error.kind === 'server' &&
             error.status !== undefined &&
@@ -232,14 +234,44 @@ export class KavitaClient {
       let response: HttpResponse;
       while (true) {
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        if (
-          this.beforeNativeRequest &&
-          !(await this.beforeNativeRequest(init.signal ?? undefined))
-        ) {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          throw new KavitaError(
+            'Kavita could not be reached while offline.',
+            'network',
+            undefined,
+            true,
+          );
+        }
+        if (this.beforeNativeRequest) {
+          if (!(await this.beforeNativeRequest(init.signal ?? undefined))) {
+            if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            throw new KavitaError('No network connection.', 'network', undefined, true);
+          }
+        } else {
+          const networkStatus = await Network.getStatus().catch(() => null);
           if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-          throw new KavitaError('No network connection.', 'network');
+          if (
+            networkStatus == null ||
+            networkStatus.connectionType === 'none' ||
+            (typeof navigator !== 'undefined' && navigator.onLine === false)
+          ) {
+            throw new KavitaError(
+              'Kavita could not be reached while offline.',
+              'network',
+              undefined,
+              true,
+            );
+          }
         }
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          throw new KavitaError(
+            'Kavita could not be reached while offline.',
+            'network',
+            undefined,
+            true,
+          );
+        }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (

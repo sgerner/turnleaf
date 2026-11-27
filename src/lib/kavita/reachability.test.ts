@@ -63,6 +63,12 @@ describe('active transport detection and reachability transitions', () => {
     expect(canAttemptKavitaRequest(disconnected, { manual: true })).toBe(false);
 
     expect(hasActiveTransport(null, { native: true })).toBe(false);
+    expect(
+      hasActiveTransport(
+        { connected: true, connectionType: 'wifi' },
+        { native: true, browserOnline: false },
+      ),
+    ).toBe(false);
   });
 
   it('marks the browser offline only when navigator.onLine is false or connectionType is none', () => {
@@ -134,6 +140,10 @@ describe('active transport detection and reachability transitions', () => {
 
   it('detects network failures wrapped in EpubTransferError, FileTransfer codes, and AggregateError', () => {
     expect(isKavitaNetworkFailure(new EpubTransferError(undefined, true))).toBe(true);
+    expect(isKavitaNetworkFailure(new EpubTransferError(undefined, true, true))).toBe(false);
+    expect(
+      isKavitaNetworkFailure(new KavitaError('No network connection.', 'network', undefined, true)),
+    ).toBe(false);
     expect(isKavitaNetworkFailure({ code: 'OS-PLUG-FLTR-0008' })).toBe(true);
     expect(
       isKavitaNetworkFailure(
@@ -148,6 +158,14 @@ describe('active transport detection and reachability transitions', () => {
     ).toBe(true);
     expect(
       isKavitaNetworkFailure(
+        new AggregateError(
+          [new KavitaError('No network connection.', 'network', undefined, true)],
+          'Sync skipped',
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      isKavitaNetworkFailure(
         new AggregateError([new KavitaError('Auth error', 'authentication', 401)], 'Sync failed'),
       ),
     ).toBe(false);
@@ -158,6 +176,22 @@ describe('active transport detection and reachability transitions', () => {
       { connected: true, connectionType: 'cellular' },
       { native: true },
     );
+    const healthyWifiHandoff = applyNetworkStatusChange(
+      cellular,
+      { connected: true, connectionType: 'wifi' },
+      { native: true },
+    );
+    expect(healthyWifiHandoff).toEqual({
+      state: {
+        offline: false,
+        connectionType: 'wifi',
+        validated: true,
+        kavitaUnreachable: false,
+      },
+      disconnected: false,
+      shouldReconnect: false,
+    });
+
     const unreachableOnCellular = applyKavitaFailure(
       cellular,
       new KavitaError('Kavita could not be reached.', 'network'),

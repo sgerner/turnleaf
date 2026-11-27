@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: serialize download ownership, handover probes, and offline sync retries
 - fix: ignore superseded offline probe results in networkAvailable
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
