@@ -370,6 +370,7 @@ export async function sanitizeEpubDocument(
 
 interface RenditionScrollManager {
   _onScroll?: (() => void) | undefined;
+  afterScrolled?: ReturnType<typeof setTimeout> | undefined;
   container?: HTMLElement | undefined;
   ignore?: boolean | undefined;
   isPaginated?: boolean | undefined;
@@ -1002,6 +1003,7 @@ export class ReaderSession {
   destroy(): void {
     this.locationGeneration += 1;
     this.clearFocusScrollSuppression();
+    this.clearManagerScrollTimer();
     const manager = this.getScrollManager();
     if (manager?.off && this.managerScroll) manager.off('scroll', this.managerScroll);
     if (this.viewportTarget && this.targetScroll) {
@@ -1232,8 +1234,6 @@ export class ReaderSession {
       frameContainer ?? this.viewportTarget?.querySelector<HTMLElement>('.epub-container') ?? null;
     if (queriedContainer && queriedContainer !== this.epubContainer) {
       this.epubContainer = queriedContainer;
-      this.lastDomScrollLeft = queriedContainer.scrollLeft;
-      this.lastDomScrollTop = queriedContainer.scrollTop ?? 0;
       this.syncContainerScroll(queriedContainer);
     }
     return this.epubContainer;
@@ -1456,6 +1456,7 @@ export class ReaderSession {
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
       this.scrollNavigationPending = false;
       this.scrollNavigationStartCfi = null;
+      this.clearManagerScrollTimer();
       this.viewportSize = { width, height };
       this.displayOperationCount += 1;
       try {
@@ -1478,6 +1479,14 @@ export class ReaderSession {
     return (
       (this.rendition as (Rendition & { manager?: RenditionScrollManager }) | null)?.manager ?? null
     );
+  }
+
+  private clearManagerScrollTimer(): void {
+    const manager = this.getScrollManager();
+    if (manager?.afterScrolled !== undefined) {
+      clearTimeout(manager.afterScrolled);
+      manager.afterScrolled = undefined;
+    }
   }
 
   private attachManagerScroll(): void {
@@ -1578,6 +1587,7 @@ export class ReaderSession {
       columnLeft = Math.min(columnLeft, scroller.scrollWidth - delta);
     }
     if (columnLeft === scroller.scrollLeft) return;
+    this.clearManagerScrollTimer();
     this.beginScrollNavigation();
     this.scrollContainerTo(scroller, columnLeft);
     this.syncVisibleColumnLinks();
@@ -1701,6 +1711,7 @@ export class ReaderSession {
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.scrollNavigationPending = false;
     this.scrollNavigationStartCfi = null;
+    this.clearManagerScrollTimer();
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
@@ -1715,6 +1726,9 @@ export class ReaderSession {
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
     this.userNavigationOrigin = 'link';
+    this.scrollNavigationPending = false;
+    this.scrollNavigationStartCfi = null;
+    this.clearManagerScrollTimer();
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }
 
@@ -1729,6 +1743,7 @@ export class ReaderSession {
     }
     this.scrollNavigationPending = false;
     this.scrollNavigationStartCfi = null;
+    this.clearManagerScrollTimer();
     void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });

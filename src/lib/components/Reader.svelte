@@ -436,10 +436,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     focusModal(() => settingsPanel);
   }
 
@@ -459,10 +461,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     focusedTocIndex = -1;
     void initializeTocDialog();
   }
@@ -488,10 +492,12 @@
     tocVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     focusModal(() => bookmarksPanel);
   }
 
@@ -530,10 +536,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     searchController?.abort();
     searchController = null;
     searching = false;
@@ -570,10 +578,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     annotationsVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
+    syncConfirmationOpener = null;
     searchError = '';
     focusModal(() => searchPanel);
   }
@@ -1268,11 +1278,12 @@
     else if (annotationsVisible) closeAnnotations();
     else if (searchVisible) closeSearch();
     else if (linkReturnTarget) void returnToLink();
-    else if (controlsVisible) {
+    else if (controlsVisible || footerVisible) {
       controlsVisible = false;
       footerVisible = false;
       pauseChromeHide();
       void tick().then(() => topRevealButton?.focus());
+      return true;
     } else {
       onBack();
       return true;

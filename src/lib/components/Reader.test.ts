@@ -7,8 +7,11 @@ import type {
   ReaderLinkReturnTarget,
   ReaderLocation,
   ReaderLocationOrigin,
+  ReaderSelection,
   TocItem,
 } from '../reader/session';
+import { MAX_ANNOTATIONS } from '../reader/annotations';
+import { MAX_BOOKMARKS } from '../reader/bookmarks';
 
 vi.mock('svelte/transition', () => ({
   fade: () => ({ duration: 0 }),
@@ -34,6 +37,10 @@ const {
         ) => void)
       | null;
     onTap: ((zone: 'previous' | 'center' | 'next') => void) | null;
+    onSelection: ((selection: ReaderSelection | null) => void) | null;
+    onKeyboardNavigation: ((event: KeyboardEvent) => void) | null;
+    displayCfi: ReturnType<typeof vi.fn>;
+    display: ReturnType<typeof vi.fn>;
     displayServerLocation: ReturnType<typeof vi.fn>;
     displayServerPercentage: ReturnType<typeof vi.fn>;
     applyAppearance: ReturnType<typeof vi.fn>;
@@ -67,6 +74,10 @@ vi.mock('../reader/session', async (importOriginal) => {
         ) => void)
       | null = null;
     onTap: ((zone: 'previous' | 'center' | 'next') => void) | null = null;
+    onSelection: ((selection: ReaderSelection | null) => void) | null = null;
+    onKeyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+    displayCfi = vi.fn(async () => true);
+    display = vi.fn(async () => {});
     displayServerLocation = vi.fn(async () => true);
     displayServerPercentage = vi.fn(async () => true);
     applyAppearance = vi.fn();
@@ -94,9 +105,13 @@ vi.mock('../reader/session', async (importOriginal) => {
         returnTarget?: ReaderLinkReturnTarget,
       ) => void,
       onTap: (zone: 'previous' | 'center' | 'next') => void,
+      onSelection?: (selection: ReaderSelection | null) => void,
+      onKeyboardNavigation?: (event: KeyboardEvent) => void,
     ): Promise<void> {
       this.onLocation = onLocation;
       this.onTap = onTap;
+      this.onSelection = onSelection ?? null;
+      this.onKeyboardNavigation = onKeyboardNavigation ?? null;
       await openSessionMock(
         target,
         cfi,
@@ -559,5 +574,282 @@ describe('Reader accessibility, sync confirmation, and edge insets', () => {
     expect(readerSource).toMatch(
       /\.reader-bottom-reveal\s*\{[^}]*height:\s*var\(--reader-safe-bottom\);/s,
     );
+  });
+
+  it('retains MAX_BOOKMARKS and MAX_ANNOTATIONS limits and preserves annotation drafts across panel close and relocation', async () => {
+    preferencesStore.set(
+      'readerBookmarks:book-limits',
+      JSON.stringify(
+        Array.from({ length: MAX_BOOKMARKS }, (_, index) => ({
+          id: `epubcfi(/6/2!/4/${index + 10}/1:0)|chapter-1.xhtml`,
+          cfi: `epubcfi(/6/2!/4/${index + 10}/1:0)`,
+          href: 'chapter-1.xhtml',
+          percentage: 0.1,
+          label: `Bookmark ${index + 1}`,
+          savedAt: `2026-01-01T00:00:${String(index % 60).padStart(2, '0')}Z`,
+        })),
+      ),
+    );
+    preferencesStore.set(
+      'readerAnnotations:book-limits',
+      JSON.stringify(
+        Array.from({ length: MAX_ANNOTATIONS }, (_, index) => ({
+          id: `ann-${index + 1}`,
+          cfi: `epubcfi(/6/2!/4/${index + 10}/1:0)`,
+          excerpt: `Excerpt ${index + 1}`,
+          note: '',
+          createdAt: `2026-01-01T00:00:${String(index % 60).padStart(2, '0')}Z`,
+        })),
+      ),
+    );
+
+    component = mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-limits',
+        title: 'Dawn',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await settle();
+
+    host
+      .querySelector<HTMLButtonElement>('.tap-zones [aria-label="Show reading controls"]')!
+      .click();
+    flushSync();
+
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-bookmarks"]')!.click();
+    flushSync();
+    await tick();
+
+    host.querySelector<HTMLButtonElement>('[data-reader-focus="bookmark-current"]')!.click();
+    flushSync();
+    expect(host.querySelector('#reader-bookmarks [role="alert"]')?.textContent).toContain(
+      `You can save up to ${MAX_BOOKMARKS} bookmarks per book.`,
+    );
+    expect((host.querySelector('.reader-viewport') as HTMLElement).inert).toBe(true);
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Close bookmarks and history"]')!.click();
+    flushSync();
+    await tick();
+
+    sessionInstances[0]?.onSelection?.({
+      cfi: 'epubcfi(/6/2!/4/9999/1:0)',
+      text: 'Passage beyond highlight cap',
+    });
+    flushSync();
+
+    const highlightButton = Array.from(
+      host.querySelectorAll<HTMLButtonElement>('[aria-label="Selected text"] button'),
+    ).find((btn) => btn.textContent?.trim() === 'Highlight')!;
+    highlightButton.click();
+    flushSync();
+    await tick();
+
+    expect(host.querySelector('#reader-annotations [role="alert"]')?.textContent).toContain(
+      `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
+    );
+
+    await unmount(component);
+    component = null;
+
+    // Verify selection-note draft and per-annotation edit draft survive panel close and relocation.
+    preferencesStore.set(
+      'readerAnnotations:book-drafts',
+      JSON.stringify([
+        {
+          id: 'saved-ann-1',
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          excerpt: 'Saved excerpt',
+          note: 'Saved note',
+          createdAt: '2026-01-01T00:00:00Z',
+        },
+      ]),
+    );
+
+    component = mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-drafts',
+        title: 'Adulthood Rites',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await settle();
+
+    const draftSession = sessionInstances.at(-1)!;
+    draftSession.onSelection?.({
+      cfi: 'epubcfi(/6/2!/4/6/1:0)',
+      text: 'Selected passage with draft',
+    });
+    flushSync();
+
+    host
+      .querySelector<HTMLButtonElement>('.tap-zones [aria-label="Show reading controls"]')!
+      .click();
+    flushSync();
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-annotations"]')!.click();
+    flushSync();
+    await tick();
+
+    const selectionNoteArea = host.querySelector<HTMLTextAreaElement>(
+      '#reader-annotations form textarea',
+    )!;
+    selectionNoteArea.value = 'Work-in-progress selection note';
+    selectionNoteArea.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSync();
+
+    host.querySelector<HTMLButtonElement>('[data-reader-focus="annotation-edit"]')!.click();
+    flushSync();
+    await tick();
+
+    const editNoteArea = host.querySelector<HTMLTextAreaElement>(
+      '[data-reader-focus="annotation-editor"]',
+    )!;
+    editNoteArea.value = 'Updated saved note draft';
+    editNoteArea.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSync();
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Close highlights and notes"]')!.click();
+    flushSync();
+    await tick();
+    expect((host.querySelector('.reader-viewport') as HTMLElement).inert).toBe(false);
+
+    // Relocating and collapsing selection must not discard an active selection note draft.
+    draftSession.onLocation?.(
+      {
+        cfi: 'epubcfi(/6/2!/4/8/1:0)',
+        xpath: '//body/DocFragment[1]/body/p[4]',
+        href: 'chapter-1.xhtml',
+        percentage: 0.5,
+        spineIndex: 0,
+        pageIndex: 1,
+        pageCount: 4,
+      },
+      'navigation',
+    );
+    draftSession.onSelection?.(null);
+    flushSync();
+
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-annotations"]')!.click();
+    flushSync();
+    await tick();
+
+    expect(host.querySelector('#reader-annotations')?.textContent).toContain(
+      'Selected passage with draft',
+    );
+    expect(
+      host.querySelector<HTMLTextAreaElement>('#reader-annotations form textarea')?.value,
+    ).toBe('Work-in-progress selection note');
+    expect(
+      host.querySelector<HTMLTextAreaElement>('[data-reader-focus="annotation-editor"]')?.value,
+    ).toBe('Updated saved note draft');
+  });
+
+  it('keeps one ordered Back handler chain so panels, link returns, and controls close before exiting', async () => {
+    const onBack = vi.fn();
+    let backHandler: (() => boolean) | null = null;
+    const unregisterBack = vi.fn(() => {
+      backHandler = null;
+    });
+    const registerBackHandler = vi.fn((handler: () => boolean) => {
+      backHandler = handler;
+      return unregisterBack;
+    });
+
+    component = mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-back',
+        title: 'Imago',
+        onBack,
+        onRelocated: vi.fn(),
+        onSyncLatest: vi.fn(async () => ({
+          xpath: '//body/DocFragment[2]/body/p[3]',
+          percentage: 0.8,
+        })),
+        registerBackHandler,
+      },
+    });
+    await settle();
+
+    expect(registerBackHandler).toHaveBeenCalledOnce();
+    expect(backHandler).toBeTypeOf('function');
+
+    host
+      .querySelector<HTMLButtonElement>('.tap-zones [aria-label="Show reading controls"]')!
+      .click();
+    flushSync();
+
+    // 1. Sync confirmation dialog closes on Back without exiting reader.
+    host.querySelector<HTMLButtonElement>('[aria-label="Sync latest reading position"]')!.click();
+    await settle();
+    flushSync();
+    await tick();
+    expect(host.querySelector('[role="alertdialog"]')).not.toBeNull();
+
+    expect(backHandler!()).toBe(true);
+    flushSync();
+    await tick();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect((host.querySelector('.reader-viewport') as HTMLElement).inert).toBe(false);
+    expect(onBack).not.toHaveBeenCalled();
+
+    // 2. Reader modal panel closes on Back before controls or reader exit.
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-appearance"]')!.click();
+    flushSync();
+    await tick();
+    expect(host.querySelector('#reader-appearance')).not.toBeNull();
+
+    expect(backHandler!()).toBe(true);
+    flushSync();
+    await tick();
+    expect(host.querySelector('#reader-appearance')).toBeNull();
+    expect((host.querySelector('.reader-viewport') as HTMLElement).inert).toBe(false);
+    expect(host.querySelector('[data-controls]')).not.toBeNull();
+    expect(onBack).not.toHaveBeenCalled();
+
+    // 3. Link return target returns to origin location before hiding controls or exiting.
+    const session = sessionInstances[0]!;
+    session.onLocation?.(
+      {
+        cfi: 'epubcfi(/6/4!/4/2/1:0)',
+        xpath: '//body/DocFragment[2]/body/p[1]',
+        href: 'chapter-2.xhtml',
+        percentage: 0.75,
+        spineIndex: 1,
+        pageIndex: 0,
+        pageCount: 2,
+      },
+      'link',
+      { cfi: 'epubcfi(/6/2!/4/2/1:0)', href: 'chapter-1.xhtml' },
+    );
+    flushSync();
+
+    expect(backHandler!()).toBe(true);
+    await settle();
+    flushSync();
+    expect(session.displayCfi).toHaveBeenCalledWith('epubcfi(/6/2!/4/2/1:0)');
+    expect(onBack).not.toHaveBeenCalled();
+
+    // 4. Visible controls hide on Back before reader exits.
+    expect(host.querySelector('[data-controls]')).not.toBeNull();
+    expect(backHandler!()).toBe(true);
+    flushSync();
+    expect(host.querySelector('[data-controls]')).toBeNull();
+    expect(onBack).not.toHaveBeenCalled();
+
+    // 5. With panels closed, no link return target, and controls hidden, Back exits reader.
+    expect(backHandler!()).toBe(true);
+    expect(onBack).toHaveBeenCalledOnce();
+
+    await unmount(component);
+    component = null;
+    expect(unregisterBack).toHaveBeenCalledOnce();
   });
 });
