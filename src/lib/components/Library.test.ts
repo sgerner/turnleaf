@@ -760,31 +760,154 @@ describe('Library download banners, cancellation, and offline guards', () => {
     await vi.waitFor(() => expect(buttonByText('Back to library')).not.toBeNull());
   });
 
-  it('flushes queued reading progress before refreshing the catalog on reconnect', async () => {
+  it('flushes queued reading progress concurrently with catalog refresh on reconnect while keeping a disconnect failure banner actionable', async () => {
     mocks.setPlatform('android');
-    mocks.setConnected(false, false);
     const book = makeBook({ chapterId: 1, title: 'Queued Sync Book' });
     await reconcileBooks(server.id, [book]);
     await saveLocalProgress(book, 'epubcfi(/6/4!/4/2)', '//body/h1[1]', 0.5, 1);
     setupCatalogFromBooks([book]);
 
-    const callOrder: string[] = [];
-    mocks.flushProgress.mockImplementation(async () => {
-      callOrder.push('flushProgress');
-    });
-    mocks.getBookSeries.mockImplementation(async () => {
-      callOrder.push('getBookSeries');
-      return [];
-    });
+    mocks.downloadEpub.mockImplementationOnce(
+      (_url: string, _key: string, _bookId: string, _onProgress?: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        }),
+    );
 
     await mountLibrary();
-    expect(callOrder).toEqual([]);
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(1));
 
-    // Simulate cellular -> Wi-Fi reconnect with trailing false onLost(cellular) event while Wi-Fi stays up.
-    mocks.setConnected(true, true);
+    // Confirm real disconnect -> download cancels into failure alert while device goes offline.
+    mocks.setConnected(false, true);
+    await vi.waitFor(() =>
+      expect(document.querySelector('[data-banner="download-failure"]')?.textContent).toContain(
+        'Connection lost while downloading Queued Sync Book.',
+      ),
+    );
+    expect(buttonByText('Retry download')?.disabled).toBe(true);
+
+    const callOrder: string[] = [];
+    let resolveCatalog: ((value: unknown[]) => void) | undefined;
+    mocks.flushProgress.mockClear().mockImplementation(async () => {
+      callOrder.push('flushProgress');
+    });
+    mocks.getBookSeries.mockClear().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          callOrder.push('getBookSeries:start');
+          resolveCatalog = resolve;
+        }),
+    );
+
+    // Reconnect with a trailing false cellular onLost event while Wi-Fi is connected.
+    mocks.setConnected(true, false);
     mocks.emitNetworkEvent(false);
 
-    await vi.waitFor(() => expect(callOrder).toEqual(['flushProgress', 'getBookSeries']));
+    // flushProgress must start and finish without waiting for getBookSeries to resolve.
+    await vi.waitFor(() => {
+      expect(mocks.flushProgress).toHaveBeenCalledTimes(1);
+      expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
+    });
+    expect(callOrder).toContain('flushProgress');
+    expect(callOrder).toContain('getBookSeries:start');
+    expect(document.querySelector('[data-banner="download-failure"]')?.textContent).toContain(
+      'Connection lost while downloading Queued Sync Book.',
+    );
+    expect(buttonByText('Retry download')?.disabled).toBe(false);
+
+    resolveCatalog?.([
+      {
+        id: book.seriesId,
+        libraryId: book.libraryId,
+        name: book.title,
+        format: 3,
+        pages: book.pages,
+        pagesRead: book.pagesRead,
+        created: book.createdAt,
+        latestReadDate: book.lastReadAt ?? '',
+        coverImage: null,
+      },
+    ]);
+    await flushUi();
+    expect(document.querySelector('[data-banner="download-failure"]')?.textContent).toContain(
+      'Connection lost while downloading Queued Sync Book.',
+    );
+  });
+
+  it('does not delete a replacement download or show ready-offline when cancelled as downloadEpub settles', async () => {
+    const book = makeBook({ chapterId: 1, title: 'Late Settlement Book' });
+    await reconcileBooks(server.id, [book]);
+    setupCatalogFromBooks([book]);
+
+    let resolveFirstDownload: ((value: unknown) => void) | undefined;
+    let resolveSecondDownload: ((value: unknown) => void) | undefined;
+    mocks.downloadEpub
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstDownload = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSecondDownload = resolve;
+          }),
+      );
+
+    await mountLibrary();
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(1));
+    await flushUi();
+
+    const activeBanner = document.querySelector('[data-banner="active-download"]');
+    buttonByText('Cancel', activeBanner!)!.click();
+    await flushUi();
+    expect(document.querySelector('[data-banner="status-message"]')?.textContent).toContain(
+      'Cancelled download for Late Settlement Book.',
+    );
+
+    // Immediately start a replacement download for the same book before the first promise settles.
+    document
+      .querySelector<HTMLButtonElement>(`[data-book-id="${book.id}"] [data-book-open]`)!
+      .click();
+    await vi.waitFor(() => expect(mocks.downloadEpub).toHaveBeenCalledTimes(2));
+
+    // Late resolution of the cancelled first attempt must not delete the active book or emit ready offline.
+    resolveFirstDownload?.({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+      ownerToken: 1,
+    });
+    await flushUi();
+    expect(mocks.deleteDownloadedEpub).not.toHaveBeenCalled();
+    expect(document.body.textContent).not.toContain('Late Settlement Book is ready offline.');
+
+    mocks.verifyDownloadedEpub.mockResolvedValue({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+    });
+    resolveSecondDownload?.({
+      relativePath: 'books/srv-1-1-1.epub',
+      nativeUri: 'file://books/srv-1-1-1.epub',
+      webViewUrl: 'web://books/srv-1-1-1.epub',
+      size: 4096,
+      ownerToken: 2,
+    });
+    await vi.waitFor(() => expect(buttonByText('Back to library')).not.toBeNull());
   });
 
   it('passes serverOrigin to downloadEpub and surfaces redirect KavitaError on the decoupled failure alert', async () => {

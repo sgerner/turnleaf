@@ -1195,7 +1195,14 @@
     if (downloadFailureBook?.id === book.id) {
       clearDownloadFailure();
     }
+    const hadDownloadBefore = Boolean(book.downloadPath);
+    const deleteAttemptFile = (path: string, ownerToken?: number) =>
+      ownerToken !== undefined
+        ? deleteDownloadedEpub(path, ownerToken)
+        : deleteDownloadedEpub(path);
     let downloadedPath: string | null = null;
+    let downloadedOwnerToken: number | undefined;
+    let markedInDatabase = false;
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
@@ -1208,14 +1215,29 @@
         },
         controller.signal,
         serverOrigin,
+        ...(hadDownloadBefore ? [{ preserveExistingOnAbort: true }] : []),
       );
+      const rollbackAbortedDownload = async () => {
+        if (markedInDatabase && !hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+          await removeDownload(book.id).catch(() => {});
+        }
+        if (!hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+          await deleteAttemptFile(file.relativePath, file.ownerToken).catch(() => {});
+        }
+      };
       if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
-        await deleteDownloadedEpub(file.relativePath).catch(() => {});
+        await rollbackAbortedDownload();
         return null;
       }
       downloadedPath = file.relativePath;
+      downloadedOwnerToken = file.ownerToken;
       await markDownloaded(book.id, file.relativePath, file.size);
+      markedInDatabase = true;
       downloadedPath = null;
+      if (controller.signal.aborted || activeDownloadToken !== token || destroyed) {
+        await rollbackAbortedDownload();
+        return null;
+      }
       const refreshed = {
         ...book,
         downloadPath: file.relativePath,
@@ -1229,9 +1251,14 @@
       setMessage(`${book.title} is ready offline.`);
       return refreshed;
     } catch (error) {
-      if (isAbortError(error) || controller.signal.aborted || activeDownloadToken !== token) {
-        if (downloadedPath) {
-          await deleteDownloadedEpub(downloadedPath).catch(() => {});
+      if (
+        isAbortError(error) ||
+        controller.signal.aborted ||
+        activeDownloadToken !== token ||
+        destroyed
+      ) {
+        if (downloadedPath && !hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+          await deleteAttemptFile(downloadedPath, downloadedOwnerToken).catch(() => {});
         }
         return null;
       }
@@ -1259,7 +1286,9 @@
         }
         if (savedBooks) {
           try {
-            await deleteDownloadedEpub(downloadedPath);
+            if (!hadDownloadBefore && activeDownloadBook?.id !== book.id) {
+              await deleteAttemptFile(downloadedPath, downloadedOwnerToken);
+            }
             downloadedPath = null;
           } catch {
             cleanupFailed = true;
@@ -1354,7 +1383,7 @@
 
   async function remove(book: BookRecord): Promise<boolean> {
     if (downloadingBookId || cleanupInProgress) {
-      message = 'Wait for the current download or cleanup to finish before removing a book.';
+      setMessage('Wait for the current download or cleanup to finish before removing a book.');
       return false;
     }
     let fileCleared = false;
@@ -1370,9 +1399,11 @@
       await removeDownload(book.id);
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'storage error';
-      message = fileCleared
-        ? `${book.title}'s file was removed, but Turnleaf could not update its saved status. Try removing it again.`
-        : `Could not remove ${book.title}: ${detail}`;
+      setMessage(
+        fileCleared
+          ? `${book.title}'s file was removed, but Turnleaf could not update its saved status. Try removing it again.`
+          : `Could not remove ${book.title}: ${detail}`,
+      );
       return false;
     }
     books = books.map((item) =>
@@ -1445,18 +1476,21 @@
         checkOpenProgress(book, options.preferFurthest),
       ]);
       if (!verification.ok) {
-        message =
-          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.';
+        setMessage(
+          'Turnleaf could not read the downloaded book. The file was kept. Try opening it again.',
+        );
         return;
       }
       file = verification.verified;
       if (file && !progress.ok) {
-        message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
+        setMessage(
+          'Turnleaf could not load the saved reading position. Try opening the book again.',
+        );
         return;
       }
       if (file && progress.ok) [local, remote] = [progress.local, progress.remote];
     } catch {
-      message = 'Turnleaf could not load the saved reading position. Try opening the book again.';
+      setMessage('Turnleaf could not load the saved reading position. Try opening the book again.');
       return;
     } finally {
       resolvingOpenProgress = false;
@@ -1484,7 +1518,7 @@
         return;
       }
       if (destroyed) return;
-      message = 'The downloaded file is missing. Downloading it again…';
+      setMessage('The downloaded file is missing. Downloading it again…');
       await open(refreshed, options);
       return;
     }
@@ -1494,12 +1528,12 @@
       resolvingOpenProgress = true;
       try {
         if (!(await saveRemoteProgress(book, remote, local))) {
-          message = 'The saved reading position changed. Open the book again.';
+          setMessage('The saved reading position changed. Open the book again.');
           return;
         }
         updateRemoteBookProgress(book, remote);
       } catch {
-        message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
+        setMessage('Turnleaf could not save the Kavita reading position. Open the book again.');
         return;
       } finally {
         resolvingOpenProgress = false;
@@ -1792,13 +1826,17 @@
       if (!(await remove(book))) failed.push(book.title);
     }
     if (failed.length === 0) {
-      message = candidates.length
-        ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
-        : 'No downloaded books to remove.';
+      setMessage(
+        candidates.length
+          ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
+          : 'No downloaded books to remove.',
+      );
     } else {
       const succeeded = candidates.length - failed.length;
       const names = failed.slice(0, 2).join(', ');
-      message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
+      setMessage(
+        `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`,
+      );
     }
     closeSettings();
   }
@@ -1812,7 +1850,7 @@
     if (destroyed) return;
     clearCovers();
     coverReloadRequest += 1;
-    message = 'Cover cache cleared.';
+    setMessage('Cover cache cleared.');
     closeSettings();
   }
 
@@ -1894,6 +1932,7 @@
     settingsError = '';
     deletingServer = true;
     try {
+      if (downloadingBookId) cancelActiveDownload('exit');
       for (const book of books.filter((item) => item.downloadPath)) await remove(book);
       cancelCoverLoading();
       await clearCoverCache().catch(() => {});
@@ -1905,7 +1944,7 @@
       await removeServer(server.id);
       await clearDiagnostics();
       onServerDeleted();
-      message = 'Server removed. Add it again to browse the library.';
+      setMessage('Server removed. Add it again to browse the library.');
       closeSettings();
     } catch (cause) {
       settingsError = credentialCleanupComplete

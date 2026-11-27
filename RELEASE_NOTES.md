@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Fix Android dual-radio network status and reader resize races
+- Bound EPUB transfer timeouts, serialize final renames, and decouple download banners
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache
