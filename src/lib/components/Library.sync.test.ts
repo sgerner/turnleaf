@@ -80,6 +80,7 @@ vi.mock('../themes/themes', async (importOriginal) => {
   const actual = await importOriginal<typeof ThemesModule>();
   return {
     ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
     loadTheme: vi.fn(async () => true),
   };
 });
