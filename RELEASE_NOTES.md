@@ -4,6 +4,10 @@
 
 - Harden Kavita progress sync across clear/reset and cross-device edge cases
 - Align EPUB reading progress sync with Kavita's zero-based ProgressDto contract and guard queued progress across storage resets
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
