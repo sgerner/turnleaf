@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- chore: verify consecutive android-emulator-smoke run (2/3)
 - test: handle empty SharedPreferences XML in Android journey flush check
 - fix: stabilize native connectivity handover and SecureStorage journey restarts
 - Centralize Kavita credential state, gate 401/403 requests, and stop queued syncs on disconnect.
