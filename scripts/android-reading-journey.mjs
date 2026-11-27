@@ -352,8 +352,8 @@ async function run() {
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
+    await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
       const connected = await web.evaluate(
         'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
@@ -380,6 +380,11 @@ async function run() {
       ),
     );
     await waitFor('rendered offline cover before restart', () => web.evaluate(renderedCover));
+    await waitFor('settled SQLite writes', () =>
+      web.evaluate(
+        `Capacitor.Plugins.CapacitorSQLite.isTransactionActive({ database: 'turnleaf' }).then(res => res?.result === false)`,
+      ),
+    );
 
     const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
     await web.close();

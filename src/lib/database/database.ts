@@ -56,7 +56,24 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
+let resetting: Promise<void> | null = null;
+let databaseEpoch = 0;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
+
+const backfillSyncedReadingBaselinesStatement = `
+  UPDATE reading_state
+  SET
+    server_page_num = COALESCE(
+      (SELECT pages_read FROM books WHERE books.id = reading_state.book_id),
+      0
+    ),
+    server_xpath = COALESCE(server_xpath, kavita_xpath)
+  WHERE pending_sync = 0
+    AND NOT EXISTS (
+      SELECT 1 FROM sync_queue WHERE sync_queue.book_id = reading_state.book_id
+    )
+    AND server_page_num IS NULL;
+`;
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -92,16 +109,24 @@ function enqueueNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
 async function executeNativeTransaction(
   db: Pick<SQLiteDBConnection, 'executeTransaction'>,
   tasks: capTask[],
+  expectedEpoch?: number,
 ): Promise<void> {
-  await enqueueNativeWrite(() => db.executeTransaction(tasks).then(() => undefined));
+  await enqueueNativeWrite(async () => {
+    if (expectedEpoch !== undefined && expectedEpoch !== databaseEpoch) return;
+    await db.executeTransaction(tasks);
+  });
 }
 
 async function executeNativeRun(
   db: Pick<SQLiteDBConnection, 'run'>,
   statement: string,
   values: unknown[] = [],
+  expectedEpoch?: number,
 ): Promise<void> {
-  await enqueueNativeWrite(() => db.run(statement, values).then(() => undefined));
+  await enqueueNativeWrite(async () => {
+    if (expectedEpoch !== undefined && expectedEpoch !== databaseEpoch) return;
+    await db.run(statement, values);
+  });
 }
 
 async function executeNativeStatement(
@@ -129,6 +154,8 @@ function parseReadingStateRow(row: Record<string, unknown> | undefined): StoredR
     percentage: Number(row.percentage),
     localUpdatedAt: String(row.local_updated_at),
     syncedLocalUpdatedAt: row.synced_local_updated_at ? String(row.synced_local_updated_at) : null,
+    serverPageNum: row.server_page_num == null ? null : Number(row.server_page_num),
+    serverXPath: row.server_xpath ? String(row.server_xpath) : null,
     serverUpdatedAt: row.server_updated_at ? String(row.server_updated_at) : null,
     pendingSync: Number(row.pending_sync) === 1,
     syncRevision: Number(row.sync_revision ?? 0),
@@ -166,20 +193,36 @@ function readBrowserState(): BrowserDatabaseState {
         }))
       : [];
     const booksById = new Map(books.map((book) => [book.id, book]));
+    const syncQueue = Object.fromEntries(
+      Object.entries(parsed.syncQueue ?? {}).map(([bookId, row]) => [
+        bookId,
+        {
+          ...row,
+          serverId: row.serverId ?? booksById.get(bookId)?.serverId ?? '',
+          revision: Number(row.revision ?? 0),
+        },
+      ]),
+    );
+    const readingState = Object.fromEntries(
+      Object.entries(parsed.readingState ?? {}).map(([bookId, entry]) => {
+        if (!entry.pendingSync && !syncQueue[bookId] && entry.serverPageNum == null) {
+          return [
+            bookId,
+            {
+              ...entry,
+              serverPageNum: booksById.get(bookId)?.pagesRead ?? 0,
+              serverXPath: entry.serverXPath ?? entry.xpath ?? null,
+            },
+          ];
+        }
+        return [bookId, entry];
+      }),
+    );
     return {
       serverConfig: parsed.serverConfig ?? null,
       books,
-      readingState: parsed.readingState ?? {},
-      syncQueue: Object.fromEntries(
-        Object.entries(parsed.syncQueue ?? {}).map(([bookId, row]) => [
-          bookId,
-          {
-            ...row,
-            serverId: row.serverId ?? booksById.get(bookId)?.serverId ?? '',
-            revision: Number(row.revision ?? 0),
-          },
-        ]),
-      ),
+      readingState,
+      syncQueue,
       preferences: parsed.preferences ?? {},
     };
   } catch {
@@ -205,20 +248,49 @@ function updateBrowserState(mutate: (state: BrowserDatabaseState) => boolean | v
   return true;
 }
 
-export async function openDatabase(): Promise<SQLiteDBConnection> {
+async function openDatabaseForEpoch(requiredEpoch?: number): Promise<SQLiteDBConnection | null> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
+  while (resetting) {
+    await resetting;
+  }
+  if (requiredEpoch !== undefined && requiredEpoch !== databaseEpoch) {
+    return null;
+  }
   if (connection) return connection;
 
-  if (opening) return opening;
-  opening = openNativeDatabase();
-  try {
-    connection = await opening;
-    return connection;
-  } finally {
-    opening = null;
+  const openEpoch = databaseEpoch;
+  if (!opening) {
+    const pending = openNativeDatabase();
+    opening = pending;
+    try {
+      const db = await pending;
+      if (openEpoch === databaseEpoch && !resetting) {
+        connection = db;
+        return db;
+      }
+    } finally {
+      if (opening === pending) {
+        opening = null;
+      }
+    }
+    return openDatabaseForEpoch(requiredEpoch);
   }
+
+  const db = await opening;
+  if (openEpoch !== databaseEpoch || resetting) {
+    return openDatabaseForEpoch(requiredEpoch);
+  }
+  return db;
+}
+
+export function getDatabaseEpoch(): number {
+  return databaseEpoch;
+}
+
+export function openDatabase(): Promise<SQLiteDBConnection> {
+  return openDatabaseForEpoch() as Promise<SQLiteDBConnection>;
 }
 
 async function openNativeDatabase(): Promise<SQLiteDBConnection> {
@@ -232,30 +304,52 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
   await migrate(db);
+  await executeNativeStatement(db, backfillSyncedReadingBaselinesStatement);
   return db;
 }
 
 export async function resetLocalDatabase(): Promise<void> {
+  databaseEpoch += 1;
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
     clearBootThemeCache();
     return;
   }
 
-  try {
-    if (connection) {
-      try {
-        await connection.close();
-      } catch {
-        // Best effort only; a broken connection can still be removed.
+  const previousReset = resetting ?? Promise.resolve();
+  const currentReset = previousReset
+    .catch(() => undefined)
+    .then(async () => {
+      const pendingOpen = opening;
+      opening = null;
+      const openedDb = pendingOpen ? await pendingOpen.catch(() => null) : null;
+      await nativeTransactionQueue;
+      const dbToClose = connection ?? openedDb;
+      connection = null;
+      if (dbToClose) {
+        try {
+          await dbToClose.close();
+        } catch {
+          // Best effort only; a broken connection can still be removed.
+        }
       }
-    }
-    connection = null;
-    opening = null;
-    await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
-    clearBootThemeCache();
+      await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+      clearBootThemeCache();
+    });
+  const trackedReset = currentReset.then(
+    () => undefined,
+    () => undefined,
+  );
+  resetting = trackedReset;
+
+  try {
+    await currentReset;
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
+  } finally {
+    if (resetting === trackedReset) {
+      resetting = null;
+    }
   }
 }
 
@@ -277,7 +371,9 @@ export async function saveServer(config: ServerConfig): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   await executeNativeRun(
     db,
     `INSERT INTO server_config
@@ -297,6 +393,7 @@ export async function saveServer(config: ServerConfig): Promise<void> {
       config.kavitaVersion,
       config.lastConnectedAt,
     ],
+    callerEpoch,
   );
 }
 
@@ -311,8 +408,10 @@ export async function removeServer(serverId: string): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
+  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId], callerEpoch);
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
@@ -375,16 +474,20 @@ export async function reconcileBooks(
             )
             .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
       const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
+      const nextReadingState = { ...state.readingState };
       const merged = [...incoming.values()].map((book) => {
         const previous = existingById.get(book.id);
-        if (!previous) return { ...book, remoteAvailable: true };
-        const reading = state.readingState[book.id];
+        const reading = nextReadingState[book.id];
         const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
         const changedDuringRefresh =
-          reading &&
-          (Date.parse(reading.localUpdatedAt) >= began ||
-            Date.parse(reading.serverUpdatedAt ?? '') >= began);
+          Boolean(reading) &&
+          (Date.parse(reading!.localUpdatedAt) >= began ||
+            Date.parse(reading!.serverUpdatedAt ?? '') >= began);
         const preserveProgress = pending || changedDuringRefresh || unknownProgress.has(book.id);
+        if (!preserveProgress && book.pagesRead <= 0) {
+          delete nextReadingState[book.id];
+        }
+        if (!previous) return { ...book, remoteAvailable: true };
         const preserveReadDate = preserveProgress || unknownReadDate.has(book.id);
         return {
           ...withoutRemoteProgressMarkers(previous),
@@ -398,6 +501,7 @@ export async function reconcileBooks(
           lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
         };
       });
+      state.readingState = nextReadingState;
       state.books = [
         ...state.books.filter((book) => book.serverId !== serverId),
         ...merged,
@@ -406,13 +510,17 @@ export async function reconcileBooks(
     });
     return;
   }
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   await reconcileBooksInTransaction(
-    await openDatabase(),
+    db,
     serverId,
     books,
     undefined,
     preserveMissing,
     snapshotStartedAt,
+    callerEpoch,
   );
 }
 
@@ -502,6 +610,21 @@ const retainedBookCondition = `(download_path IS NOT NULL OR download_status='av
   OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id)
   OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
 
+function clearUnreadReadingStateTask(
+  bookId: string,
+  snapshotStartedAt: string | null = null,
+): capTask {
+  return {
+    statement: `DELETE FROM reading_state WHERE book_id=? AND pending_sync=0
+      AND (? IS NULL OR (
+        julianday(local_updated_at)<julianday(?) AND
+        (server_updated_at IS NULL OR julianday(server_updated_at)<julianday(?))
+      ))
+      AND NOT EXISTS (SELECT 1 FROM sync_queue WHERE book_id=?)`,
+    values: [bookId, snapshotStartedAt, snapshotStartedAt, snapshotStartedAt, bookId],
+  };
+}
+
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
 export async function reconcileBooksInTransaction(
   db: Pick<SQLiteDBConnection, 'executeTransaction'>,
@@ -510,6 +633,7 @@ export async function reconcileBooksInTransaction(
   refreshedAt = new Date().toISOString(),
   preserveMissing = false,
   snapshotStartedAt: string | null = null,
+  expectedEpoch?: number,
 ): Promise<void> {
   const tasks: capTask[] = [];
   if (!preserveMissing) {
@@ -522,6 +646,9 @@ export async function reconcileBooksInTransaction(
     tasks.push(
       replaceBookTask(serverId, { ...book, remoteAvailable: true }, refreshedAt, snapshotStartedAt),
     );
+    if (book.pagesRead <= 0 && book.remoteProgressKnown !== false) {
+      tasks.push(clearUnreadReadingStateTask(book.id, snapshotStartedAt));
+    }
   }
   if (!preserveMissing) {
     tasks.push({
@@ -531,7 +658,7 @@ export async function reconcileBooksInTransaction(
     });
   }
   if (!tasks.length) return;
-  await executeNativeTransaction(db, tasks);
+  await executeNativeTransaction(db, tasks, expectedEpoch);
 }
 
 export async function getBooks(
@@ -588,11 +715,14 @@ async function updateBookDownloadState(
     });
     return;
   }
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   await executeNativeRun(
     db,
     'UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?',
     [downloadPath, downloadStatus, fileSize, bookId],
+    callerEpoch,
   );
 }
 
@@ -606,6 +736,8 @@ export interface StoredReadingState {
   percentage: number;
   localUpdatedAt: string;
   syncedLocalUpdatedAt: string | null;
+  serverPageNum?: number | null;
+  serverXPath?: string | null;
   serverUpdatedAt: string | null;
   pendingSync: boolean;
   /** Monotonic reading revision, retained after the queue row is acknowledged. */
@@ -623,14 +755,16 @@ export interface PendingProgressPayload {
 
 const readingStateUpsertStatement = `INSERT INTO reading_state
   (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync,sync_revision)
-  VALUES (?,?,?,?,?,1,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
+  SELECT ?,?,?,?,?,1,1 WHERE EXISTS (SELECT 1 FROM books WHERE id=?)
+  ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
   kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
   local_updated_at=excluded.local_updated_at,pending_sync=1,
   sync_revision=reading_state.sync_revision+1`;
 
 const syncQueueUpsertStatement = `INSERT INTO sync_queue
   (book_id,payload_json,created_at,updated_at,revision)
-  VALUES (?,?,?,?,COALESCE((SELECT sync_revision FROM reading_state WHERE book_id=?),1))
+  SELECT ?,?,?,?,COALESCE((SELECT sync_revision FROM reading_state WHERE book_id=?),1)
+  WHERE EXISTS (SELECT 1 FROM books WHERE id=?)
   ON CONFLICT(book_id) DO UPDATE SET payload_json=excluded.payload_json,
   attempt_count=0,last_attempt_at=NULL,last_error=NULL,
   updated_at=excluded.updated_at,revision=excluded.revision`;
@@ -644,7 +778,7 @@ function createReadingStateTask(
 ): capTask {
   return {
     statement: readingStateUpsertStatement,
-    values: [bookId, cfi, xpath, percentage, updatedAt],
+    values: [bookId, cfi, xpath, percentage, updatedAt, bookId],
   };
 }
 
@@ -655,7 +789,7 @@ function createSyncQueueTask(
 ): capTask {
   return {
     statement: syncQueueUpsertStatement,
-    values: [bookId, JSON.stringify(payload), updatedAt, updatedAt, bookId],
+    values: [bookId, JSON.stringify(payload), updatedAt, updatedAt, bookId, bookId],
   };
 }
 
@@ -666,6 +800,8 @@ export async function getReadingState(bookId: string): Promise<StoredReadingStat
     if (!readingState) return null;
     return {
       ...readingState,
+      serverPageNum: readingState.serverPageNum ?? null,
+      serverXPath: readingState.serverXPath ?? null,
       syncRevision: Math.max(
         Number(readingState.syncRevision ?? 0),
         Number(state.syncQueue[bookId]?.revision ?? 0),
@@ -701,18 +837,22 @@ export async function saveLocalProgress(
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
           Number(state.syncQueue[book.id]?.revision ?? 0),
         ) + 1;
+      const previous = state.readingState[book.id];
       state.readingState[book.id] = {
         cfi,
         xpath,
         percentage,
         localUpdatedAt: now,
-        syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
-        serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
+        syncedLocalUpdatedAt: previous?.syncedLocalUpdatedAt ?? null,
+        serverPageNum: previous?.serverPageNum ?? null,
+        serverXPath: previous?.serverXPath ?? null,
+        serverUpdatedAt: previous?.serverUpdatedAt ?? null,
         pendingSync: true,
         syncRevision,
       };
@@ -738,7 +878,9 @@ export async function saveLocalProgress(
     });
     return;
   }
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -747,14 +889,18 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await executeNativeTransaction(db, [
-    createReadingStateTask(book.id, cfi, xpath, percentage, now),
-    createSyncQueueTask(book.id, payload, now),
-    {
-      statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
-      values: [pagesRead, now, book.id],
-    },
-  ]);
+  await executeNativeTransaction(
+    db,
+    [
+      createReadingStateTask(book.id, cfi, xpath, percentage, now),
+      createSyncQueueTask(book.id, payload, now),
+      {
+        statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+        values: [pagesRead, now, book.id],
+      },
+    ],
+    callerEpoch,
+  );
 }
 
 export async function markBookCompleted(book: BookRecord): Promise<void> {
@@ -769,19 +915,23 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
   };
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
           Number(state.syncQueue[book.id]?.revision ?? 0),
         ) + 1;
       updateBrowserBookProgress(state, book.id, book.pages, now);
+      const previous = state.readingState[book.id];
       state.readingState[book.id] = {
         cfi: '',
         xpath: null,
         percentage: 1,
         localUpdatedAt: now,
-        syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
-        serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
+        syncedLocalUpdatedAt: previous?.syncedLocalUpdatedAt ?? null,
+        serverPageNum: previous?.serverPageNum ?? null,
+        serverXPath: previous?.serverXPath ?? null,
+        serverUpdatedAt: previous?.serverUpdatedAt ?? null,
         pendingSync: true,
         syncRevision,
       };
@@ -799,7 +949,9 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   const tasks: capTask[] = [
     {
       statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
@@ -808,7 +960,7 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
   ];
   tasks.push(createReadingStateTask(book.id, '', null, 1, now));
   tasks.push(createSyncQueueTask(book.id, payload, now));
-  await executeNativeTransaction(db, tasks);
+  await executeNativeTransaction(db, tasks, callerEpoch);
 }
 
 export interface PendingSyncItem {
@@ -948,6 +1100,12 @@ interface NormalizedRemoteProgress {
   readingState: StoredReadingState;
 }
 
+function remoteProgressPercentage(pageNum: number, totalPages: number): number {
+  if (totalPages <= 0 || pageNum <= 0) return 0;
+  if (pageNum >= totalPages) return 1;
+  return Math.min(0.999, pageNum / totalPages);
+}
+
 function normalizeRemoteProgress(
   book: BookRecord,
   remote: KavitaProgress,
@@ -956,7 +1114,7 @@ function normalizeRemoteProgress(
   const now = new Date().toISOString();
   const serverUpdatedAt = remote.lastModifiedUtc ?? now;
   const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-  const percentage = book.pages > 0 ? Math.min(0.999, pagesRead / book.pages) : 0;
+  const percentage = remoteProgressPercentage(remote.pageNum, book.pages);
   const xpath = remote.bookScrollId ?? null;
   return {
     now,
@@ -970,6 +1128,8 @@ function normalizeRemoteProgress(
       percentage,
       localUpdatedAt: now,
       syncedLocalUpdatedAt: now,
+      serverPageNum: remote.pageNum,
+      serverXPath: xpath,
       serverUpdatedAt,
       pendingSync: false,
       syncRevision,
@@ -1010,17 +1170,21 @@ export async function saveRemoteProgress(
     });
   }
 
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return false;
   return enqueueNativeWrite(async () => {
+    if (callerEpoch !== databaseEpoch) return false;
     if (!matches(await queryNativeReadingState(db, book.id))) return false;
     const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
     if (queue.values?.length) return false;
-    await db.executeTransaction([
+    const result = await db.executeTransaction([
       {
         statement: `INSERT INTO reading_state
           (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
           server_page_num,server_xpath,server_updated_at,pending_sync,sync_revision)
-          VALUES (?,'',?,?,?,?,?,?,?,0,?) ON CONFLICT(book_id) DO UPDATE SET cfi='',
+          SELECT ?,'',?,?,?,?,?,?,?,0,? WHERE EXISTS (SELECT 1 FROM books WHERE id=?)
+          ON CONFLICT(book_id) DO UPDATE SET cfi='',
           kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
           local_updated_at=excluded.local_updated_at,synced_local_updated_at=excluded.synced_local_updated_at,
           server_page_num=excluded.server_page_num,server_xpath=excluded.server_xpath,
@@ -1035,6 +1199,7 @@ export async function saveRemoteProgress(
           normalized.xpath,
           normalized.serverUpdatedAt,
           normalized.readingState.syncRevision,
+          book.id,
         ],
       },
       {
@@ -1042,7 +1207,7 @@ export async function saveRemoteProgress(
         values: [normalized.pagesRead, normalized.serverUpdatedAt, book.id],
       },
     ]);
-    return true;
+    return (result.changes?.changes ?? 1) > 0;
   });
 }
 
@@ -1065,6 +1230,7 @@ export async function acceptRemoteProgress(
       if (
         !queue ||
         !reading ||
+        !state.books.some((item) => item.id === book.id) ||
         !reading.pendingSync ||
         Math.max(Number(reading.syncRevision ?? 0), queue.revision) !== expectedRevision ||
         queue.revision !== expectedRevision ||
@@ -1078,8 +1244,11 @@ export async function acceptRemoteProgress(
     });
   }
 
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return false;
   return enqueueNativeWrite(async () => {
+    if (callerEpoch !== databaseEpoch) return false;
     await db.executeTransaction([
       {
         statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
@@ -1140,26 +1309,86 @@ export async function acceptRemoteProgress(
   });
 }
 
+export interface AcknowledgedSyncBaseline {
+  pageNum: number;
+  bookScrollId?: string | null;
+}
+
+function parseBaselineFromPayload(
+  payloadJson: string | undefined,
+  fallbackPageNum: number | null,
+  fallbackXPath: string | null,
+): { serverPageNum: number | null; serverXPath: string | null } {
+  if (payloadJson) {
+    try {
+      const parsed = JSON.parse(payloadJson) as Record<string, unknown>;
+      const pageNum =
+        typeof parsed.pageNum === 'number' && Number.isFinite(parsed.pageNum)
+          ? parsed.pageNum
+          : fallbackPageNum;
+      const bookScrollId =
+        typeof parsed.bookScrollId === 'string'
+          ? parsed.bookScrollId
+          : parsed.bookScrollId === null
+            ? null
+            : fallbackXPath;
+      return { serverPageNum: pageNum, serverXPath: bookScrollId };
+    } catch {
+      // Fall back to saved reading state if payload JSON cannot be parsed.
+    }
+  }
+  return { serverPageNum: fallbackPageNum, serverXPath: fallbackXPath };
+}
+
 export async function confirmSync(
   bookId: string,
   serverUpdatedAt: string,
   expectedRevision: number,
   expectedUpdatedAt: string,
+  baseline?: AcknowledgedSyncBaseline,
 ): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
-      if (
-        state.syncQueue[bookId]?.revision !== expectedRevision ||
-        state.syncQueue[bookId]?.updatedAt !== expectedUpdatedAt
-      ) {
+      const queued = state.syncQueue[bookId];
+      const current = state.readingState[bookId];
+      if (queued?.revision !== expectedRevision || queued?.updatedAt !== expectedUpdatedAt) {
+        if (
+          baseline &&
+          current?.pendingSync &&
+          queued &&
+          state.books.some((item) => item.id === bookId) &&
+          queued.revision > expectedRevision &&
+          Date.parse(queued.createdAt) <= Date.parse(expectedUpdatedAt) &&
+          (!current.syncedLocalUpdatedAt ||
+            Date.parse(current.syncedLocalUpdatedAt) <= Date.parse(expectedUpdatedAt))
+        ) {
+          state.readingState[bookId] = {
+            ...current,
+            syncedLocalUpdatedAt: expectedUpdatedAt,
+            serverPageNum: baseline.pageNum,
+            serverXPath: baseline.bookScrollId ?? null,
+            serverUpdatedAt,
+          };
+          return;
+        }
         return false;
       }
       delete state.syncQueue[bookId];
-      if (state.readingState[bookId]) {
+      if (current && current.localUpdatedAt === expectedUpdatedAt) {
+        const fallbackBook = state.books.find((item) => item.id === bookId);
+        const resolved = baseline
+          ? { serverPageNum: baseline.pageNum, serverXPath: baseline.bookScrollId ?? null }
+          : parseBaselineFromPayload(
+              queued.payloadJson,
+              fallbackBook?.pagesRead ?? current.serverPageNum ?? null,
+              current.xpath,
+            );
         state.readingState[bookId] = {
-          ...state.readingState[bookId],
+          ...current,
           pendingSync: false,
           syncedLocalUpdatedAt: expectedUpdatedAt,
+          serverPageNum: resolved.serverPageNum,
+          serverXPath: resolved.serverXPath,
           serverUpdatedAt,
           syncRevision: expectedRevision,
         };
@@ -1167,14 +1396,23 @@ export async function confirmSync(
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeTransaction(db, [
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
+  const hasBaseline = baseline !== undefined ? 1 : 0;
+  const tasks: capTask[] = [
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=?,
+        server_page_num=CASE WHEN ? THEN ? ELSE COALESCE((SELECT pages_read FROM books WHERE id=reading_state.book_id), 0) END,
+        server_xpath=CASE WHEN ? THEN ? ELSE reading_state.kavita_xpath END,
         server_updated_at=? WHERE book_id=? AND local_updated_at=?
         AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?)`,
       values: [
         expectedUpdatedAt,
+        hasBaseline,
+        baseline?.pageNum ?? null,
+        hasBaseline,
+        baseline?.bookScrollId ?? null,
         serverUpdatedAt,
         bookId,
         expectedUpdatedAt,
@@ -1187,7 +1425,30 @@ export async function confirmSync(
       statement: 'DELETE FROM sync_queue WHERE book_id=? AND updated_at=? AND revision=?',
       values: [bookId, expectedUpdatedAt, expectedRevision],
     },
-  ]);
+  ];
+  if (baseline) {
+    tasks.push({
+      statement: `UPDATE reading_state SET synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?
+        WHERE book_id=? AND pending_sync=1
+        AND (synced_local_updated_at IS NULL OR julianday(synced_local_updated_at)<=julianday(?))
+        AND EXISTS (
+          SELECT 1 FROM sync_queue
+          WHERE book_id=? AND revision>? AND julianday(created_at)<=julianday(?)
+        )`,
+      values: [
+        expectedUpdatedAt,
+        baseline.pageNum,
+        baseline.bookScrollId ?? null,
+        serverUpdatedAt,
+        bookId,
+        expectedUpdatedAt,
+        bookId,
+        expectedRevision,
+        expectedUpdatedAt,
+      ],
+    });
+  }
+  await executeNativeTransaction(db, tasks, callerEpoch);
 }
 
 export async function markSyncFailure(
@@ -1206,12 +1467,15 @@ export async function markSyncFailure(
     });
     return;
   }
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   await executeNativeRun(
     db,
     `UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=?
     WHERE book_id=? AND updated_at=? AND revision=?`,
     [new Date().toISOString(), error.slice(0, 240), bookId, expectedUpdatedAt, expectedRevision],
+    callerEpoch,
   );
 }
 
@@ -1259,7 +1523,9 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     });
     return;
   }
-  const db = await openDatabase();
+  const callerEpoch = databaseEpoch;
+  const db = await openDatabaseForEpoch(callerEpoch);
+  if (!db) return;
   const now = new Date().toISOString();
   await executeNativeRun(
     db,
@@ -1267,6 +1533,8 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
+    callerEpoch,
   );
+  if (callerEpoch !== databaseEpoch) return;
   mirrorBootThemePreferences(preferences);
 }

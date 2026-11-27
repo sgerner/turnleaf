@@ -252,6 +252,7 @@
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
   let activeSyncStartRevision: number | null = null;
+  let networkStatusGeneration = 0;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
@@ -731,27 +732,19 @@
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', ({ connected }) => {
+        await Network.addListener('networkStatusChange', (eventStatus) => {
           if (destroyed) return;
-          const wasOffline = offline;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
+          const generation = ++networkStatusGeneration;
+          if (!Capacitor.isNativePlatform()) {
+            applyNetworkStatus(eventStatus.connected);
+            return;
           }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected && wasOffline) {
-            const baselineRevision = activeSyncStartRevision ?? messageRevision;
-            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-            void syncProgress(false);
-            void startRefresh(false, baselineRevision, baselineMessage);
-          }
+          void Network.getStatus()
+            .catch(() => eventStatus)
+            .then((actualStatus) => {
+              if (destroyed || generation !== networkStatusGeneration) return;
+              applyNetworkStatus(actualStatus.connected === true);
+            });
         }),
       ),
     );
@@ -793,6 +786,34 @@
       return async () => {};
     }
     return handle.remove;
+  }
+
+  function applyNetworkStatus(connected: boolean): void {
+    if (destroyed) return;
+    const wasOffline = offline;
+    offline = !connected;
+    if (!connected) {
+      if (syncTimer !== null) {
+        window.clearTimeout(syncTimer);
+        syncTimer = null;
+      }
+      refreshController?.abort();
+      openProgressProbe?.abort();
+    }
+    if (wasOffline === offline) return;
+    coverReloadRequest += 1;
+    kavitaUnreachable = false;
+    offlineMessage = connected
+      ? ''
+      : displayableBooks.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.';
+    if (connected && wasOffline) {
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+      void syncProgress(false);
+      void startRefresh(false, baselineRevision, baselineMessage);
+    }
   }
 
   async function networkAvailable(): Promise<boolean> {
@@ -926,7 +947,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (!(await networkAvailable()) || controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -1337,7 +1358,7 @@
         xpath: local?.xpath ?? null,
         percentage: local?.percentage ?? null,
       };
-      if (preferFurthest) void syncProgress(false);
+      if (local?.pendingSync || preferFurthest) void syncProgress(false);
       return;
     }
     if (openProgress === 'conflict' && local && remote) {
@@ -1370,6 +1391,7 @@
 
   function remotePercentage(remote: KavitaProgress, book: BookRecord): number | null {
     if (!book.pages || remote.pageNum <= 0) return null;
+    if (remote.pageNum >= book.pages) return 1;
     return Math.max(0, Math.min(0.999, remote.pageNum / book.pages));
   }
 
@@ -1542,6 +1564,8 @@
 
     acceptingRemoteProgress = true;
     try {
+      // An upload cannot race with deletion of the exact revision it is sending.
+      await syncWork;
       const accepted = await acceptRemoteProgress(
         current.book,
         current.remote,

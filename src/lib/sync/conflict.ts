@@ -51,6 +51,8 @@ export interface OpenLocalProgress {
   percentage: number;
   pendingSync: boolean;
   xpath: string | null;
+  serverPageNum?: number | null;
+  serverXPath?: string | null;
 }
 
 export interface OpenRemoteProgress {
@@ -60,31 +62,66 @@ export interface OpenRemoteProgress {
 
 export type OpenProgressDecision = 'local' | 'remote' | 'conflict' | 'none';
 
+function normalizeXPath(xpath?: string | null): string | null {
+  return xpath?.trim() || null;
+}
+
+function remoteMatchesBaseline(local: OpenLocalProgress, remote: OpenRemoteProgress): boolean {
+  return (
+    local.serverPageNum != null &&
+    remote.pageNum === local.serverPageNum &&
+    normalizeXPath(local.serverXPath) === normalizeXPath(remote.bookScrollId)
+  );
+}
+
 export function chooseOpenProgress(
   local: OpenLocalProgress | null,
   remote: OpenRemoteProgress | null,
   bookPages: number,
   preferFurthest: boolean,
 ): OpenProgressDecision {
-  const hasRemoteLocation = Boolean(remote?.bookScrollId || (remote && remote.pageNum > 0));
+  const hasRemoteLocation = Boolean(
+    normalizeXPath(remote?.bookScrollId) || (remote && remote.pageNum > 0),
+  );
   if (!local && hasRemoteLocation) return 'remote';
   if (!local) return 'none';
-  if (!hasRemoteLocation) return 'local';
+  if (!remote) return 'local';
+
+  const hasBaseline = local.serverPageNum != null || Boolean(normalizeXPath(local.serverXPath));
+  const remoteUnchanged = hasBaseline ? remoteMatchesBaseline(local, remote) : !hasRemoteLocation;
 
   if (local.pendingSync) {
-    return !local.xpath || remote?.bookScrollId !== local.xpath ? 'conflict' : 'local';
+    if (remoteUnchanged) return 'local';
+    if (
+      !normalizeXPath(local.xpath) &&
+      local.percentage >= 1 &&
+      !normalizeXPath(remote.bookScrollId) &&
+      bookPages > 0 &&
+      remote.pageNum >= bookPages
+    ) {
+      return 'local';
+    }
+    return 'conflict';
   }
 
-  if (preferFurthest && remote && bookPages > 0 && remote.pageNum >= bookPages) {
+  if (hasBaseline) {
+    return remoteUnchanged ? 'local' : 'remote';
+  }
+
+  if (!hasRemoteLocation) return 'local';
+
+  if (preferFurthest && bookPages > 0 && remote.pageNum >= bookPages) {
     return local.percentage < 1 ? 'remote' : 'local';
   }
 
   // Kavita's XPath does not retain EPUB.js's exact CFI. When both snapshots
   // point at the same element, keep the finer local locator even with
   // automatic furthest selection turned off.
-  if (local.xpath && remote?.bookScrollId === local.xpath) return 'local';
+  if (local.xpath && normalizeXPath(remote.bookScrollId) === normalizeXPath(local.xpath)) {
+    return 'local';
+  }
 
-  if (preferFurthest && remote) {
+  if (preferFurthest) {
     if (local.percentage >= 1) return 'local';
     if (local.xpath && remote.bookScrollId) {
       const location = compareKavitaLocations(local.xpath, remote.bookScrollId);
