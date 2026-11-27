@@ -68,7 +68,7 @@ function kavitaDevProxy(): Plugin {
   };
 }
 
-export default defineConfig(() => ({
+export default defineConfig({
   plugins: [tailwindcss(), svelte(), kavitaDevProxy()],
   ...(process.env.VITEST ? { resolve: { conditions: ['browser'] } } : {}),
   define: {
@@ -78,4 +78,4 @@ export default defineConfig(() => ({
     target: 'es2022',
     sourcemap: false,
   },
-}));
+});
