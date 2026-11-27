@@ -884,16 +884,14 @@
       sharedCoverLoader.cancel();
       cancelActiveDownload('disconnect');
     }
-    if (wasOffline !== offline || connected) {
-      coverReloadRequest += 1;
-    }
+    coverReloadRequest += 1;
     kavitaUnreachable = false;
     offlineMessage = connected
       ? ''
       : displayableBooks.length
         ? 'No network connection. Showing your saved library.'
         : 'No network connection. Connect to Kavita to load your library.';
-    if (connected) {
+    if (connected && wasOffline) {
       const baselineRevision = activeSyncStartRevision ?? messageRevision;
       const baselineMessage = activeSyncStartRevision !== null ? '' : message;
       void syncProgress(false);
