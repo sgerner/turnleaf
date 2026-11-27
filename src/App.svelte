@@ -63,6 +63,7 @@
   let repairing = $state(false);
   let autoFocusOnboarding = $state(false);
   let apiKey = $state<string | null>(null);
+  let staleCredentialRefs = $state<string[]>([]);
   let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
@@ -82,6 +83,7 @@
     startupError = '';
     server = null;
     apiKey = null;
+    staleCredentialRefs = [];
     readerOpen = false;
     void checkForRelease();
     try {
@@ -269,9 +271,12 @@
         onServerDeleted={() => {
           readerOpen = false;
           autoFocusOnboarding = true;
+          staleCredentialRefs = [];
           server = null;
           apiKey = null;
         }}
+        initialStaleCredentialRefs={staleCredentialRefs}
+        onStaleCredentialRefsChange={(refs) => (staleCredentialRefs = refs)}
         {registerBackHandler}
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
@@ -324,8 +329,9 @@
         savedServer={server}
         autoFocus={autoFocusOnboarding}
         {registerBackHandler}
-        onConnected={(connected, key) => {
+        onConnected={(connected, key, nextStaleRefs = []) => {
           autoFocusOnboarding = false;
+          staleCredentialRefs = [...nextStaleRefs];
           apiKey = key;
           server = connected;
         }}

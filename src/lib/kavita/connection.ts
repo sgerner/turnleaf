@@ -26,6 +26,18 @@ export const INITIAL_SETUP_MESSAGES: SaveConnectionMessages = {
     'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
 };
 
+export const STALE_CREDENTIAL_CLEANUP_WARNING =
+  'Server address updated, but the previous auth key could not be removed from this device. Retry cleanup to remove it.';
+
+export const STALE_CREDENTIAL_RETRY_FAILED_WARNING =
+  'Turnleaf still could not remove the previous auth key from this device. Retry cleanup again later.';
+
+export interface RotateServerConnectionResult {
+  server: ServerConfig;
+  staleCredentialRefs: string[];
+  cleanupWarning: string | null;
+}
+
 export async function saveConnection(
   server: ServerConfig,
   key: string,
@@ -95,15 +107,46 @@ export async function verifyKavitaConnection(
   return result;
 }
 
+export async function cleanupStaleCredentials(
+  references: readonly string[],
+  activeCredentialRef?: string,
+): Promise<string[]> {
+  const uniqueRefs = [...new Set(references)].filter(
+    (ref) => Boolean(ref) && ref !== activeCredentialRef,
+  );
+  const remaining: string[] = [];
+  let failed = false;
+  for (const ref of uniqueRefs) {
+    try {
+      await removeApiKey(ref);
+    } catch {
+      failed = true;
+      remaining.push(ref);
+    }
+  }
+  if (failed) {
+    recordDiagnostic({
+      category: 'startup',
+      endpoint: 'local/credentials',
+      detail: 'credential-cleanup-failed',
+    });
+  }
+  return remaining;
+}
+
 export async function rotateServerConnection(
   savedServer: ServerConfig,
   baseUrl: string,
   key: string,
   version: string | null,
   messages: SaveConnectionMessages = ADDRESS_ROTATION_MESSAGES,
-): Promise<ServerConfig> {
+  previousStaleCredentialRefs: readonly string[] = [],
+): Promise<RotateServerConnectionResult> {
   let credentialRef = `server_${savedServer.id}_api_key_${Date.now().toString(36)}`;
-  if (credentialRef === savedServer.credentialRef) {
+  if (
+    credentialRef === savedServer.credentialRef ||
+    previousStaleCredentialRefs.includes(credentialRef)
+  ) {
     credentialRef = `${credentialRef}_next`;
   }
   const connectedServer: ServerConfig = {
@@ -114,10 +157,16 @@ export async function rotateServerConnection(
     lastConnectedAt: new Date().toISOString(),
   };
   await saveConnection(connectedServer, key, messages);
-  if (savedServer.credentialRef !== credentialRef) {
-    await removeApiKey(savedServer.credentialRef).catch(() => {});
-  }
-  return connectedServer;
+  const candidates =
+    savedServer.credentialRef !== credentialRef
+      ? [...previousStaleCredentialRefs, savedServer.credentialRef]
+      : [...previousStaleCredentialRefs];
+  const staleCredentialRefs = await cleanupStaleCredentials(candidates, credentialRef);
+  return {
+    server: connectedServer,
+    staleCredentialRefs,
+    cleanupWarning: staleCredentialRefs.length > 0 ? STALE_CREDENTIAL_CLEANUP_WARNING : null,
+  };
 }
 
 export function classifyConnectionError(

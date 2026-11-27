@@ -689,4 +689,147 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
 
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it('keeps the new connection active, records diagnostics, and surfaces a retryable cleanup warning when old-key removal fails', async () => {
+    mocks.getServer.mockResolvedValue({
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: 'https://old.example.com',
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    });
+    mocks.getApiKey.mockResolvedValue('saved-active-key');
+
+    instance = mount(App, { target });
+    await settle();
+
+    target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await settle();
+
+    const changeBtn = Array.from(target.querySelectorAll('button')).find(
+      (btn) => btn.textContent?.trim() === 'Change server address',
+    )!;
+    changeBtn.click();
+    await settle();
+
+    const inlineUrlInput = target.querySelector<HTMLInputElement>('#settings-server-url')!;
+    const replacementKeyInput = target.querySelector<HTMLInputElement>('#replacement-api-key')!;
+    setInputValue(inlineUrlInput, 'https://new.example.com/kavita');
+    setInputValue(replacementKeyInput, 'rotated-active-key');
+
+    // Old credential removal rejects after new credential + server are saved
+    mocks.removeApiKey.mockRejectedValueOnce(new Error('SecureStorage remove failed'));
+    vi.mocked(fetch).mockClear();
+
+    inlineUrlInput
+      .closest('form')!
+      .querySelector<HTMLButtonElement>('button[type="submit"]')!
+      .click();
+    await settle();
+
+    // New connection is saved and active (catalog refresh hits the new server with the new key)
+    const savedServer = mocks.saveServer.mock.calls.at(-1)?.[0] as {
+      baseUrl: string;
+      credentialRef: string;
+    };
+    expect(savedServer.baseUrl).toBe('https://new.example.com/kavita');
+    expect(savedServer.credentialRef).not.toBe('server_primary_api_key');
+    expect(fetch).toHaveBeenCalledWith(
+      'https://new.example.com/kavita/api/Series/v2?PageNumber=1&PageSize=500',
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'x-api-key': 'rotated-active-key' }),
+      }),
+    );
+    expect(target.textContent).toContain('https://new.example.com/kavita');
+
+    // Cleanup failure is recorded in diagnostics and surfaced with a retry warning in Settings
+    const exported = exportDiagnostics({ appVersion: '0.3.5', platform: 'android' });
+    expect(exported).toContain(
+      'startup endpoint=local/credentials detail=credential-cleanup-failed',
+    );
+    const settingsWarning = target.querySelector('#settings-credential-cleanup-warning');
+    expect(settingsWarning?.textContent).toContain(
+      'previous auth key could not be removed from this device',
+    );
+    expect(mocks.setPreference).toHaveBeenCalledWith(
+      'staleCredentialRefs',
+      JSON.stringify(['server_primary_api_key']),
+    );
+
+    // Closing Settings keeps the warning visible and retryable in the Library view
+    pressAndroidBack();
+    await settle();
+    expect(target.querySelector('#library-settings-title')).toBeNull();
+    expect(target.textContent).toContain('previous auth key could not be removed from this device');
+
+    const retryBtn = Array.from(target.querySelectorAll('button')).find(
+      (btn) => btn.textContent?.trim() === 'Retry cleanup',
+    )!;
+    expect(retryBtn).toBeTruthy();
+
+    // Retry cleanup removes the stale credentialRef without touching the new credentialRef
+    retryBtn.focus();
+    retryBtn.click();
+    await settle();
+
+    expect(mocks.removeApiKey).toHaveBeenCalledTimes(2);
+    expect(mocks.removeApiKey).toHaveBeenLastCalledWith('server_primary_api_key');
+    expect(mocks.removeApiKey).not.toHaveBeenCalledWith(savedServer.credentialRef);
+    expect(mocks.setPreference).toHaveBeenLastCalledWith('staleCredentialRefs', '[]');
+    expect(target.textContent).not.toContain(
+      'previous auth key could not be removed from this device',
+    );
+    expect(target.textContent).toContain('Previous auth key removed from this device.');
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('keeps the reconnected library active and surfaces retryable cleanup warning if old-key deletion fails during Onboarding address change', async () => {
+    mocks.getServer.mockResolvedValue({
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: 'https://old.example.com',
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    });
+    mocks.getApiKey.mockResolvedValue(null);
+    mocks.removeApiKey.mockRejectedValueOnce(new Error('SecureStorage remove failed'));
+
+    instance = mount(App, { target });
+    await settle();
+
+    const changeAddressToggle = Array.from(target.querySelectorAll('button')).find(
+      (btn) => btn.textContent?.trim() === 'Change server address',
+    )!;
+    changeAddressToggle.click();
+    await settle();
+
+    const urlInput = target.querySelector<HTMLInputElement>('input[type="url"]')!;
+    const keyInput = target.querySelector<HTMLInputElement>('#kavita-auth-key')!;
+    setInputValue(urlInput, 'https://reconnected.example.com');
+    setInputValue(keyInput, 'reconnected-key');
+
+    target.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
+    await settle();
+
+    // Library mounts with the new connection active while surfacing the retry warning
+    expect(target.querySelector('[aria-label="Open settings"]')).not.toBeNull();
+    expect(fetch).toHaveBeenCalledWith(
+      'https://reconnected.example.com/api/Series/v2?PageNumber=1&PageSize=500',
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'x-api-key': 'reconnected-key' }),
+      }),
+    );
+    expect(target.textContent).toContain('previous auth key could not be removed from this device');
+
+    const retryBtn = Array.from(target.querySelectorAll('button')).find(
+      (btn) => btn.textContent?.trim() === 'Retry cleanup',
+    )!;
+    retryBtn.click();
+    await settle();
+
+    expect(mocks.removeApiKey).toHaveBeenLastCalledWith('server_primary_api_key');
+    expect(target.textContent).toContain('Previous auth key removed from this device.');
+  });
 });

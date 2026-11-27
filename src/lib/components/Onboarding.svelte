@@ -28,7 +28,7 @@
     savedServer?: ServerConfig | null;
     autoFocus?: boolean;
     registerBackHandler?: RegisterBackHandler | undefined;
-    onConnected: (server: ServerConfig, key: string) => void;
+    onConnected: (server: ServerConfig, key: string, staleCredentialRefs?: string[]) => void;
   } = $props();
 
   let formElement = $state<HTMLFormElement | null>(null);
@@ -130,13 +130,16 @@
 
       if (savedServer) {
         let connectedServer = savedServer;
+        let staleCredentialRefs: string[] = [];
         if (changingServerAddress) {
-          connectedServer = await rotateServerConnection(
+          const rotation = await rotateServerConnection(
             savedServer,
             normalized.baseUrl,
             key,
             result.version,
           );
+          connectedServer = rotation.server;
+          staleCredentialRefs = rotation.staleCredentialRefs;
           serverUrl = normalized.baseUrl;
         } else {
           try {
@@ -151,7 +154,7 @@
           }
         }
         apiKey = '';
-        onConnected(connectedServer, key);
+        onConnected(connectedServer, key, staleCredentialRefs);
         return;
       }
 

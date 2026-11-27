@@ -1,11 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from '../database/database';
+import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import { KavitaError } from './client';
 import {
   classifyConnectionError,
+  cleanupStaleCredentials,
   INITIAL_SETUP_MESSAGES,
   rotateServerConnection,
   saveConnection,
+  STALE_CREDENTIAL_CLEANUP_WARNING,
   verifyKavitaConnection,
 } from './connection';
 import { ServerUrlError } from './url';
@@ -60,7 +63,8 @@ const existingServer: ServerConfig = {
 };
 
 describe('connection helpers', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await clearDiagnostics();
     mocks.saveServer.mockReset().mockResolvedValue(undefined);
     mocks.saveApiKey.mockReset().mockResolvedValue(undefined);
     mocks.removeApiKey.mockReset().mockResolvedValue(undefined);
@@ -113,18 +117,49 @@ describe('connection helpers', () => {
   });
 
   it('rotates credentials and cleans up the old credentialRef after saving', async () => {
-    const updated = await rotateServerConnection(
+    const rotation = await rotateServerConnection(
       existingServer,
       'https://books.example.com/kavita',
       'active-key',
       '0.8.5',
     );
 
-    expect(updated.baseUrl).toBe('https://books.example.com/kavita');
-    expect(updated.credentialRef).not.toBe(existingServer.credentialRef);
-    expect(mocks.saveApiKey).toHaveBeenCalledWith(updated.credentialRef, 'active-key');
-    expect(mocks.saveServer).toHaveBeenCalledWith(updated);
+    expect(rotation.server.baseUrl).toBe('https://books.example.com/kavita');
+    expect(rotation.server.credentialRef).not.toBe(existingServer.credentialRef);
+    expect(rotation.staleCredentialRefs).toEqual([]);
+    expect(rotation.cleanupWarning).toBeNull();
+    expect(mocks.saveApiKey).toHaveBeenCalledWith(rotation.server.credentialRef, 'active-key');
+    expect(mocks.saveServer).toHaveBeenCalledWith(rotation.server);
     expect(mocks.removeApiKey).toHaveBeenCalledWith(existingServer.credentialRef);
+  });
+
+  it('keeps the new connection active while recording and returning retryable cleanup status when old-key deletion fails', async () => {
+    mocks.removeApiKey.mockRejectedValueOnce(new Error('Keystore locked'));
+
+    const rotation = await rotateServerConnection(
+      existingServer,
+      'https://books.example.com/kavita',
+      'active-key',
+      '0.8.5',
+    );
+
+    expect(rotation.server.baseUrl).toBe('https://books.example.com/kavita');
+    expect(rotation.server.credentialRef).not.toBe(existingServer.credentialRef);
+    expect(rotation.staleCredentialRefs).toEqual([existingServer.credentialRef]);
+    expect(rotation.cleanupWarning).toBe(STALE_CREDENTIAL_CLEANUP_WARNING);
+
+    const diagnostics = exportDiagnostics({ appVersion: '0.3.5', platform: 'android' });
+    expect(diagnostics).toContain(
+      'startup endpoint=local/credentials detail=credential-cleanup-failed',
+    );
+
+    const remaining = await cleanupStaleCredentials(
+      [...rotation.staleCredentialRefs, rotation.server.credentialRef],
+      rotation.server.credentialRef,
+    );
+    expect(remaining).toEqual([]);
+    expect(mocks.removeApiKey).toHaveBeenCalledTimes(2);
+    expect(mocks.removeApiKey).toHaveBeenLastCalledWith(existingServer.credentialRef);
   });
 
   it('rolls back the newly stored key and keeps old credentials untouched when saveServer fails', async () => {

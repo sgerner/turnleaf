@@ -43,8 +43,12 @@
   } from '../downloads/cover-loader';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import {
+    ADDRESS_ROTATION_MESSAGES,
     classifyConnectionError,
+    cleanupStaleCredentials,
     rotateServerConnection,
+    STALE_CREDENTIAL_CLEANUP_WARNING,
+    STALE_CREDENTIAL_RETRY_FAILED_WARNING,
     verifyKavitaConnection,
     type InvalidConnectionField,
   } from '../kavita/connection';
@@ -102,6 +106,8 @@
     onServerChange,
     onServerDeleted,
     onReaderOpenChange,
+    initialStaleCredentialRefs,
+    onStaleCredentialRefsChange,
     registerBackHandler,
     onOverlayActiveChange,
   }: {
@@ -115,6 +121,8 @@
     onServerChange: (server: ServerConfig, apiKey: string) => void;
     onServerDeleted: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
+    initialStaleCredentialRefs?: readonly string[] | undefined;
+    onStaleCredentialRefsChange?: ((refs: string[]) => void) | undefined;
     registerBackHandler?: RegisterBackHandler | undefined;
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
@@ -280,6 +288,7 @@
   let appearanceError = $state('');
   let settingsError = $state('');
   let themeSwitchSequence = 0;
+  const staleCredentialRefsPreferenceKey = 'staleCredentialRefs';
   let editingServerAddress = $state(false);
   let nextServerUrl = $state('');
   let allowInsecureServerUrl = $state(false);
@@ -287,6 +296,17 @@
   let addressError = $state('');
   let addressInvalidField = $state<InvalidConnectionField>(null);
   let addressStatusMessage = $state('');
+  let staleCredentialRefs = $state<string[]>(
+    untrack(() =>
+      [...new Set(initialStaleCredentialRefs ?? [])].filter(
+        (ref) => Boolean(ref) && ref !== server.credentialRef,
+      ),
+    ),
+  );
+  let credentialCleanupWarning = $state(
+    untrack(() => (staleCredentialRefs.length > 0 ? STALE_CREDENTIAL_CLEANUP_WARNING : '')),
+  );
+  let retryingCredentialCleanup = $state(false);
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
@@ -658,32 +678,34 @@
 
   function handleBackButton(): boolean {
     if (destroyed) return false;
-    return handleLibraryBack(
-      {
-        hasConflict: Boolean(conflict),
-        acceptingRemoteProgress,
-        hasActionMenu: Boolean(actionMenuBook),
-        hasOpenReader: Boolean(reading),
-        resolvingOpenProgress,
-        editingServerAddress,
-        savingServerAddress,
-        confirmDeleteServer,
-        settingsBusy: replacingApiKey || deletingServer,
-        settingsVisible,
-        filtersVisible,
-      },
-      {
-        closeConflict,
-        closeMenu,
-        closeReader: () => void closeReader(),
-        cancelOpenProgress: () => openProgressProbe?.abort(),
-        cancelServerAddressEdit,
-        cancelDeleteServer,
-        closeSettings,
-        hideFilters: () => {
-          filtersVisible = false;
+    return (
+      handleLibraryBack(
+        {
+          hasConflict: Boolean(conflict),
+          acceptingRemoteProgress,
+          hasActionMenu: Boolean(actionMenuBook),
+          hasOpenReader: Boolean(reading),
+          resolvingOpenProgress,
+          editingServerAddress,
+          savingServerAddress,
+          confirmDeleteServer,
+          settingsBusy: replacingApiKey || deletingServer || retryingCredentialCleanup,
+          settingsVisible,
+          filtersVisible,
         },
-      },
+        {
+          closeConflict,
+          closeMenu,
+          closeReader: () => void closeReader(),
+          cancelOpenProgress: () => openProgressProbe?.abort(),
+          cancelServerAddressEdit,
+          cancelDeleteServer,
+          closeSettings,
+          hideFilters: () => {
+            filtersVisible = false;
+          },
+        },
+      ) || retryingCredentialCleanup
     );
   }
 
@@ -765,10 +787,28 @@
         'libraryView',
         'libraryDownloadedOnly',
         'libraryHideCompleted',
+        staleCredentialRefsPreferenceKey,
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
+    const savedStaleRefs = parseStaleCredentialRefs(
+      preferences.get(staleCredentialRefsPreferenceKey),
+      activeServer.credentialRef,
+    );
+    const mergedStaleRefs = [...new Set([...savedStaleRefs, ...staleCredentialRefs])].filter(
+      (ref) => Boolean(ref) && ref !== activeServer.credentialRef,
+    );
+    if (mergedStaleRefs.length > 0) {
+      staleCredentialRefs = mergedStaleRefs;
+      credentialCleanupWarning = credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING;
+      onStaleCredentialRefsChange?.([...mergedStaleRefs]);
+      if (mergedStaleRefs.length !== savedStaleRefs.length) {
+        void setPreference(staleCredentialRefsPreferenceKey, JSON.stringify(mergedStaleRefs)).catch(
+          () => {},
+        );
+      }
+    }
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
     downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
     hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
@@ -1817,13 +1857,17 @@
         throw new Error('Enter a Kavita auth key.');
       }
 
+      const hadStaleCredentialRefs = staleCredentialRefs.length > 0;
       const result = await verifyKavitaConnection(normalized.baseUrl, candidateKey);
-      const updatedServer = await rotateServerConnection(
+      const rotation = await rotateServerConnection(
         activeServer,
         normalized.baseUrl,
         candidateKey,
         result.version,
+        ADDRESS_ROTATION_MESSAGES,
+        staleCredentialRefs,
       );
+      const updatedServer = rotation.server;
 
       // An upload started with the previous connection may still be finishing.
       while (syncWork) await syncWork;
@@ -1835,6 +1879,7 @@
       const keyChanged = candidateKey !== activeApiKey;
       activeServer = updatedServer;
       activeApiKey = candidateKey;
+      await persistStaleCredentialRefs(rotation.staleCredentialRefs, hadStaleCredentialRefs);
       onServerChange(updatedServer, candidateKey);
       if (keyChanged) onApiKeyChange(candidateKey);
       nextServerUrl = normalized.baseUrl;
@@ -1842,8 +1887,15 @@
       editingServerAddress = false;
       allowInsecureServerUrl = false;
       savingServerAddress = false;
-      addressStatusMessage = 'Server address updated.';
-      setMessage('Server address updated.');
+      if (rotation.cleanupWarning) {
+        credentialCleanupWarning = rotation.cleanupWarning;
+        addressStatusMessage = '';
+        setMessage('');
+      } else {
+        credentialCleanupWarning = '';
+        addressStatusMessage = 'Server address updated.';
+        setMessage('Server address updated.');
+      }
       await tick();
       restoreFocus(changeServerAddressButton);
 
@@ -1882,6 +1934,71 @@
     } finally {
       unsubscribe();
       savingServerAddress = false;
+    }
+  }
+
+  function parseStaleCredentialRefs(
+    raw: string | undefined,
+    activeCredentialRef: string,
+  ): string[] {
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return [
+        ...new Set(
+          parsed.filter((item): item is string => typeof item === 'string' && item.length > 0),
+        ),
+      ].filter((ref) => ref !== activeCredentialRef);
+    } catch {
+      return [];
+    }
+  }
+
+  async function persistStaleCredentialRefs(
+    nextRefs: readonly string[],
+    hadPreviousRefs: boolean,
+  ): Promise<void> {
+    const normalizedRefs = [...new Set(nextRefs)].filter(
+      (ref) => Boolean(ref) && ref !== activeServer.credentialRef,
+    );
+    staleCredentialRefs = normalizedRefs;
+    onStaleCredentialRefsChange?.([...normalizedRefs]);
+    if (normalizedRefs.length > 0 || hadPreviousRefs) {
+      await setPreference(staleCredentialRefsPreferenceKey, JSON.stringify(normalizedRefs)).catch(
+        () => {},
+      );
+    }
+  }
+
+  async function retryCredentialCleanup(): Promise<void> {
+    if (staleCredentialRefs.length === 0 || retryingCredentialCleanup) return;
+    retryingCredentialCleanup = true;
+    try {
+      const remaining = await cleanupStaleCredentials(
+        staleCredentialRefs,
+        activeServer.credentialRef,
+      );
+      await persistStaleCredentialRefs(remaining, true);
+      if (remaining.length === 0) {
+        credentialCleanupWarning = '';
+        if (settingsVisible) {
+          addressStatusMessage = 'Previous auth key removed from this device.';
+        }
+        setMessage('Previous auth key removed from this device.');
+        await tick();
+        if (settingsVisible) {
+          if (!settingsDialog?.contains(document.activeElement)) {
+            restoreFocus(changeServerAddressButton);
+          }
+        } else if (libraryMain && !libraryMain.contains(document.activeElement)) {
+          restoreFocus(settingsTriggerButton);
+        }
+      } else {
+        credentialCleanupWarning = STALE_CREDENTIAL_RETRY_FAILED_WARNING;
+      }
+    } finally {
+      retryingCredentialCleanup = false;
     }
   }
   async function removeAllDownloads(): Promise<void> {
@@ -2012,6 +2129,14 @@
       await clearCoverCache().catch(() => {});
       clearCovers();
       if (!credentialCleanupComplete) {
+        for (const ref of [...staleCredentialRefs]) {
+          if (ref !== activeServer.credentialRef) {
+            await removeApiKey(ref);
+            staleCredentialRefs = staleCredentialRefs.filter((item) => item !== ref);
+          }
+        }
+        credentialCleanupWarning = '';
+        onStaleCredentialRefsChange?.([]);
         await removeApiKey(activeServer.credentialRef);
         credentialCleanupComplete = true;
       }
@@ -2454,6 +2579,24 @@
             </button>
           {/if}
         {/if}
+      </div>
+    {/if}
+    {#if staleCredentialRefs.length > 0 && !settingsVisible}
+      <div
+        class="alert preset-tonal-warning mt-4 flex flex-wrap items-center justify-between gap-3"
+        role="status"
+      >
+        <p class="min-w-0 flex-1">
+          {credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING}
+        </p>
+        <button
+          class="btn btn-sm preset-tonal-warning min-h-11 shrink-0"
+          type="button"
+          onclick={() => void retryCredentialCleanup()}
+          disabled={retryingCredentialCleanup}
+        >
+          {retryingCredentialCleanup ? 'Cleaning up…' : 'Retry cleanup'}
+        </button>
       </div>
     {/if}
     {#if syncStatus.pendingCount > 0}
@@ -3301,6 +3444,7 @@
           type="button"
           disabled={Boolean(downloadingBookId) ||
             cleanupInProgress ||
+            retryingCredentialCleanup ||
             savingServerAddress ||
             replacingApiKey ||
             deletingServer}
@@ -3308,6 +3452,25 @@
         >
           Change server address
         </button>
+      {/if}
+      {#if staleCredentialRefs.length > 0}
+        <div
+          id="settings-credential-cleanup-warning"
+          class="alert preset-tonal-warning mt-3 flex flex-wrap items-center justify-between gap-3"
+          role="alert"
+        >
+          <p class="min-w-0 flex-1 text-sm">
+            {credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING}
+          </p>
+          <button
+            class="btn btn-sm preset-tonal-warning min-h-11 shrink-0"
+            type="button"
+            onclick={() => void retryCredentialCleanup()}
+            disabled={retryingCredentialCleanup || savingServerAddress || deletingServer}
+          >
+            {retryingCredentialCleanup ? 'Cleaning up…' : 'Retry cleanup'}
+          </button>
+        </div>
       {/if}
       {#if addressStatusMessage}
         <p class="mt-2 text-sm text-surface-700-300" role="status">{addressStatusMessage}</p>
@@ -3378,7 +3541,7 @@
             addressInvalidField = null;
             confirmDeleteServer = true;
           }}
-          disabled={deletingServer || savingServerAddress}
+          disabled={deletingServer || savingServerAddress || retryingCredentialCleanup}
         >
           Delete server
         </button>
