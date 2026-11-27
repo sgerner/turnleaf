@@ -287,10 +287,15 @@
       (resolution) => {
         if (destroyed || session !== nextSession) return;
         if (resolution.repaired.length > 0) {
-          const repairedSet = new Set(resolution.repaired.map((entry) => entry.id));
-          annotations = repairAnnotations(annotations, resolution.repaired);
-          unanchoredAnnotationIds = unanchoredAnnotationIds.filter((id) => !repairedSet.has(id));
-          queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+          const next = repairAnnotations(annotations, resolution.repaired);
+          if (next !== annotations) {
+            const appliedIds = new Set(
+              next.filter((entry, index) => entry !== annotations[index]).map((entry) => entry.id),
+            );
+            annotations = next;
+            unanchoredAnnotationIds = unanchoredAnnotationIds.filter((id) => !appliedIds.has(id));
+            queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+          }
         }
         if (resolution.missingIds.length > 0) {
           unanchoredAnnotationIds = [
@@ -1090,31 +1095,44 @@
   }
 
   async function selectAnnotation(annotation: StoredAnnotation): Promise<void> {
-    if (!session) return;
+    const reader = session;
+    if (!reader) return;
     annotationMessage = '';
     highlightNotice = '';
-    const result = await session.displayAnnotation(annotation);
+    const result = await reader.displayAnnotation(annotation);
+    if (destroyed || session !== reader) return;
     if (result.status === 'displayed' || result.status === 'repaired') {
       if (result.status === 'repaired') {
-        annotations = repairAnnotations(annotations, [
+        const next = repairAnnotations(annotations, [
           { id: annotation.id, cfi: result.cfi, href: result.href },
         ]);
-        queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+        if (next !== annotations) {
+          annotations = next;
+          queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+        }
       }
       unanchoredAnnotationIds = unanchoredAnnotationIds.filter((id) => id !== annotation.id);
       closeAnnotations();
       showControls();
       return;
     }
-    if (!unanchoredAnnotationIds.includes(annotation.id)) {
+    if (
+      annotations.some((entry) => entry.id === annotation.id) &&
+      !unanchoredAnnotationIds.includes(annotation.id)
+    ) {
       unanchoredAnnotationIds = [...unanchoredAnnotationIds, annotation.id];
     }
     if (annotation.href) {
-      if (typeof session.displayHref === 'function') {
-        await session.displayHref(annotation.href);
-      } else {
-        await session.display(annotation.href);
+      try {
+        if (typeof reader.displayHref === 'function') {
+          await reader.displayHref(annotation.href);
+        } else {
+          await reader.display(annotation.href);
+        }
+      } catch {
+        // Keep the saved note accessible in the panel even if the chapter href also disappeared.
       }
+      if (destroyed || session !== reader) return;
     }
     annotationMessage =
       'This highlighted text is no longer available in the current EPUB. Your note is still saved.';
@@ -1637,7 +1655,7 @@
     >
       <span>{highlightNotice}</span>
       <button
-        class="btn btn-sm preset-tonal-surface"
+        class="btn btn-sm min-h-11 preset-tonal-surface"
         type="button"
         onclick={() => {
           highlightNotice = '';

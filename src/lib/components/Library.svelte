@@ -145,6 +145,14 @@
         server.id,
         allowDownload,
         serverOrigin,
+        async () => {
+          if (destroyed || offline || signal.aborted || !(await networkAvailable(true))) {
+            throw new DOMException('Aborted', 'AbortError');
+          }
+          if (destroyed || offline || signal.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
+          }
+        },
       );
     }
     if (!(await networkAvailable(true))) throw new Error('Offline');
@@ -1166,6 +1174,13 @@
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
         serverOrigin,
+        {
+          beforeDispatch: async () => {
+            if (destroyed || offline || !(await networkAvailable(true)) || destroyed || offline) {
+              throw new EpubTransferError(undefined, true);
+            }
+          },
+        },
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);

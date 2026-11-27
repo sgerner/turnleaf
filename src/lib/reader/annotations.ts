@@ -112,14 +112,49 @@ export function repairAnnotations(
 ): StoredAnnotation[] {
   if (!repairs.length) return annotations;
   const byId = new Map(repairs.map((repair) => [repair.id, repair]));
+  const occupiedAnchors: Array<{ id: string; cfi: string; href: string | undefined }> = [];
+  for (const annotation of annotations) {
+    if (!byId.has(annotation.id)) {
+      occupiedAnchors.push({
+        id: annotation.id,
+        cfi: annotation.cfi.trim(),
+        href: annotation.href,
+      });
+    }
+  }
+  const hasAnchorCollision = (id: string, cfi: string, href: string | undefined): boolean =>
+    occupiedAnchors.some(
+      (anchor) =>
+        anchor.id !== id && anchor.cfi === cfi && (!href || !anchor.href || href === anchor.href),
+    );
+
   let changed = false;
   const next = annotations.map((annotation) => {
     const repair = byId.get(annotation.id);
     if (!repair) return annotation;
     const trimmedCfi = repair.cfi.trim();
-    if (!trimmedCfi) return annotation;
+    if (!trimmedCfi) {
+      occupiedAnchors.push({
+        id: annotation.id,
+        cfi: annotation.cfi.trim(),
+        href: annotation.href,
+      });
+      return annotation;
+    }
     const href = optionalText(repair.href?.split('#', 1)[0]) ?? annotation.href;
-    if (trimmedCfi === annotation.cfi && href === annotation.href) return annotation;
+    if (trimmedCfi === annotation.cfi && href === annotation.href) {
+      occupiedAnchors.push({ id: annotation.id, cfi: trimmedCfi, href });
+      return annotation;
+    }
+    if (hasAnchorCollision(annotation.id, trimmedCfi, href)) {
+      occupiedAnchors.push({
+        id: annotation.id,
+        cfi: annotation.cfi.trim(),
+        href: annotation.href,
+      });
+      return annotation;
+    }
+    occupiedAnchors.push({ id: annotation.id, cfi: trimmedCfi, href });
     changed = true;
     return {
       ...annotation,

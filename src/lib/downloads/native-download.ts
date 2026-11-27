@@ -155,6 +155,7 @@ async function downloadFileWithRedirects(options: {
   connectTimeout?: number;
   readTimeout?: number;
   signal?: AbortSignal | undefined;
+  beforeDispatch?: (() => Promise<void> | void) | undefined;
   onHop?: ((url: string) => void) | undefined;
 }): Promise<void> {
   const redirects = createRedirectState(
@@ -164,6 +165,8 @@ async function downloadFileWithRedirects(options: {
     options.normalizedInitialUrl,
   );
   while (true) {
+    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    await options.beforeDispatch?.();
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.onHop?.(redirects.currentUrl);
     try {
@@ -196,6 +199,7 @@ export async function downloadEpub(
   bookId: string,
   onProgress?: (percent: number) => void,
   serverOrigin?: string,
+  options?: { beforeDispatch?: (() => Promise<void> | void) | undefined },
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   const target = assertSafeTransferTarget(
@@ -237,13 +241,14 @@ export async function downloadEpub(
           path: destination.uri,
           apiKey,
           progress: Boolean(listener),
+          beforeDispatch: options?.beforeDispatch,
           onHop: (url) => {
             activeHopUrl = url;
           },
         });
         break;
       } catch (error) {
-        if (error instanceof KavitaError) throw error;
+        if (error instanceof KavitaError || error instanceof EpubTransferError) throw error;
         const { code, status } = readTransferFailure(error);
         const connectionFailed = code === 'OS-PLUG-FLTR-0008';
         const retryable =
@@ -347,6 +352,7 @@ export async function cacheCover(
   cacheNamespace = 'default',
   allowDownload = true,
   serverOrigin?: string,
+  beforeDispatch?: () => Promise<void> | void,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const target = assertSafeTransferTarget(
@@ -375,6 +381,7 @@ export async function cacheCover(
         connectTimeout: 5_000,
         readTimeout: 5_000,
         signal,
+        beforeDispatch,
       });
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)

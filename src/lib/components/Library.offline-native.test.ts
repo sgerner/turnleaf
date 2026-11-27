@@ -413,4 +413,65 @@ describe('Library native Android offline transitions (CapacitorHttp + Network pl
     expect(offlineAuthenticatedRequests).toEqual([]);
     expect(target.textContent).toContain('No network connection. Showing your saved library.');
   });
+
+  it('passes pre-dispatch Network.getStatus guards into native cacheCover so mid-preparation offline drops never dispatch FileTransfer', async () => {
+    const { cacheCover } = await import('../downloads/native-download');
+    let initialRefreshDone = false;
+    const offlineCoverTransfers: number[] = [];
+
+    vi.mocked(cacheCover).mockImplementation(
+      async (
+        _downloadUrl,
+        apiKey,
+        seriesId,
+        _signal,
+        _namespace,
+        allowDownload,
+        _serverOrigin,
+        beforeDispatch,
+      ) => {
+        if (!allowDownload) throw new Error('Offline');
+        // Simulate connectivity dropping while Filesystem directories/URIs are being prepared before FileTransfer
+        networkConnected = false;
+        await beforeDispatch?.();
+        if (!networkConnected && apiKey) {
+          offlineCoverTransfers.push(seriesId);
+        }
+        return `cover-${seriesId}`;
+      },
+    );
+
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      const url = new URL(options.url);
+      if (url.pathname === '/api/Series/v2') {
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          data: [seriesListItem()],
+          url: options.url,
+        };
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        initialRefreshDone = true;
+        return {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+          data: seriesDetailPayload(),
+          url: options.url,
+        };
+      }
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        data: {},
+        url: options.url,
+      };
+    });
+
+    await mountLibrary();
+    await waitForCondition(() => initialRefreshDone || !networkConnected);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(offlineCoverTransfers).toEqual([]);
+  });
 });

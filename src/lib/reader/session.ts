@@ -565,6 +565,23 @@ interface ResolvedCfiEndpoint {
   offset: number;
   clamped: boolean;
   elementOnly: boolean;
+  relocatedById: boolean;
+}
+
+function canEpubCfiResolveInDocument(
+  doc: Document,
+  cfi: string,
+  CfiClass: EpubCfiConstructor,
+): boolean {
+  try {
+    const instance = new CfiClass(cfi) as unknown as {
+      toRange?: (targetDoc: Document) => Range | null;
+    };
+    if (typeof instance.toRange !== 'function') return true;
+    return Boolean(instance.toRange(doc));
+  } catch {
+    return false;
+  }
 }
 
 function resolveCfiStepsInDocument(
@@ -575,6 +592,7 @@ function resolveCfiStepsInDocument(
   const root = doc.documentElement;
   if (!root || steps.length === 0) return null;
   let current: Node | null = root;
+  let relocatedById = false;
 
   for (let index = 0; index < steps.length; index += 1) {
     const step = steps[index];
@@ -591,6 +609,7 @@ function resolveCfiStepsInDocument(
           const byId = doc.getElementById(step.id);
           if (!byId || !root.contains(byId)) return null;
           current = byId;
+          relocatedById = true;
         }
       } else {
         current = element.children[step.index] ?? null;
@@ -612,11 +631,12 @@ function resolveCfiStepsInDocument(
       offset: clampedOffset,
       clamped: clampedOffset !== rawOffset,
       elementOnly: false,
+      relocatedById,
     };
   }
 
   if (terminalOffset === null) {
-    return { node: current, offset: 0, clamped: false, elementOnly: true };
+    return { node: current, offset: 0, clamped: false, elementOnly: true, relocatedById };
   }
   const maxOffset = current.childNodes.length;
   const clampedOffset = Math.max(0, Math.min(terminalOffset, maxOffset));
@@ -625,6 +645,7 @@ function resolveCfiStepsInDocument(
     offset: clampedOffset,
     clamped: clampedOffset !== terminalOffset,
     elementOnly: false,
+    relocatedById,
   };
 }
 
@@ -664,8 +685,10 @@ function validateAndClampReadingCfi(
   parsed: RuntimeParsedCfi,
   originalCfi: string,
   cfiBase: string | undefined,
+  sectionIndex: number,
   CfiClass: EpubCfiConstructor,
 ): string | null {
+  const spineShifted = parsed.spinePos !== sectionIndex;
   if (!parsed.range) {
     const endpoint = resolveCfiStepsInDocument(
       doc,
@@ -673,7 +696,17 @@ function validateAndClampReadingCfi(
       parsed.path.terminal?.offset ?? null,
     );
     if (!endpoint) return null;
-    if (!cfiBase) return endpoint.clamped ? null : originalCfi;
+    if (!cfiBase) {
+      return endpoint.clamped || endpoint.relocatedById || spineShifted ? null : originalCfi;
+    }
+    if (
+      !endpoint.clamped &&
+      !endpoint.relocatedById &&
+      !spineShifted &&
+      canEpubCfiResolveInDocument(doc, originalCfi, CfiClass)
+    ) {
+      return originalCfi;
+    }
     return cfiFromEndpoint(doc, endpoint, cfiBase, CfiClass);
   }
 
@@ -682,7 +715,27 @@ function validateAndClampReadingCfi(
   const start = resolveCfiStepsInDocument(doc, startSteps, parsed.start?.terminal?.offset ?? null);
   if (!start) return null;
   const end = resolveCfiStepsInDocument(doc, endSteps, parsed.end?.terminal?.offset ?? null);
-  if (!cfiBase) return start.clamped || end?.clamped ? null : originalCfi;
+  if (!cfiBase) {
+    return start.clamped ||
+      start.relocatedById ||
+      end?.clamped ||
+      end?.relocatedById ||
+      spineShifted
+      ? null
+      : originalCfi;
+  }
+
+  if (
+    end &&
+    !start.clamped &&
+    !start.relocatedById &&
+    !end.clamped &&
+    !end.relocatedById &&
+    !spineShifted &&
+    canEpubCfiResolveInDocument(doc, originalCfi, CfiClass)
+  ) {
+    return originalCfi;
+  }
 
   if (end && start.node.nodeType === Node.TEXT_NODE && end.node.nodeType === Node.TEXT_NODE) {
     try {
@@ -801,6 +854,30 @@ function recordRangeInTextMap(
   range: Range,
   claimedSpans: ClaimedTextSpan[],
 ): void {
+  if (map.starts.length === 0 || range.collapsed) return;
+  if (typeof range.comparePoint === 'function') {
+    let first = -1;
+    let last = -1;
+    for (let index = 0; index < map.starts.length; index += 1) {
+      const startPos = map.starts[index]!;
+      const endPos = map.ends[index]!;
+      try {
+        const startCmp = range.comparePoint(startPos.node, startPos.offset);
+        if (startCmp > 0) break;
+        if (startCmp === 0 && range.comparePoint(endPos.node, endPos.offset) === 0) {
+          if (first < 0) first = index;
+          last = index;
+        }
+      } catch {
+        return;
+      }
+    }
+    if (first >= 0 && last >= first) {
+      claimedSpans.push({ start: first, end: last + 1 });
+    }
+    return;
+  }
+
   const startIndex = map.starts.findIndex(
     (entry) => entry.node === range.startContainer && entry.offset >= range.startOffset,
   );
@@ -821,6 +898,10 @@ interface ExcerptMatchResult {
   unambiguous: boolean;
 }
 
+function isWordCharacter(char: string | undefined): boolean {
+  return Boolean(char && /[\p{L}\p{N}]/u.test(char));
+}
+
 function findExcerptMatchInDocument(
   doc: Document,
   excerpt: string,
@@ -829,6 +910,7 @@ function findExcerptMatchInDocument(
     suffix?: string | undefined;
     textMap?: DocumentTextMap | undefined;
     claimedSpans?: ClaimedTextSpan[] | undefined;
+    competingBrokenCount?: number | undefined;
     requireUnambiguous?: boolean | undefined;
   },
 ): ExcerptMatchResult | null {
@@ -862,57 +944,59 @@ function findExcerptMatchInDocument(
   const prefix = options?.prefix ? normalizeWhitespace(options.prefix) : '';
   const suffix = options?.suffix ? normalizeWhitespace(options.suffix) : '';
   const claimed = options?.claimedSpans ?? [];
+  const overlapsClaimed = (candidate: ClaimedTextSpan): boolean =>
+    claimed.some((span) => candidate.start < span.end && candidate.end > span.start);
 
-  let chosen = candidates[0]!;
-  let bestScore: number;
-  let tiedBestCount = 1;
+  let bestScore = -1;
+  let tiedBestCount = 0;
+  let chosen: ClaimedTextSpan | null = null;
+  let chosenScore = -1;
 
-  if (candidates.length === 1) {
+  for (const candidate of candidates) {
     const before = prefix
-      ? map.text.slice(Math.max(0, chosen.start - prefix.length - 8), chosen.start).trimEnd()
+      ? map.text.slice(Math.max(0, candidate.start - prefix.length - 8), candidate.start).trimEnd()
       : '';
     const after = suffix
       ? map.text
-          .slice(chosen.end, Math.min(map.text.length, chosen.end + suffix.length + 8))
+          .slice(candidate.end, Math.min(map.text.length, candidate.end + suffix.length + 8))
           .trimStart()
       : '';
-    bestScore = scoreContextAffix(before, prefix, true) + scoreContextAffix(after, suffix, false);
-  } else {
-    bestScore = -1;
-    tiedBestCount = 0;
-    let bestUnclaimed = false;
-    for (const candidate of candidates) {
-      const before = prefix
-        ? map.text
-            .slice(Math.max(0, candidate.start - prefix.length - 8), candidate.start)
-            .trimEnd()
-        : '';
-      const after = suffix
-        ? map.text
-            .slice(candidate.end, Math.min(map.text.length, candidate.end + suffix.length + 8))
-            .trimStart()
-        : '';
-      const score =
-        scoreContextAffix(before, prefix, true) + scoreContextAffix(after, suffix, false);
-      const isUnclaimed = !claimed.some(
-        (span) => candidate.start < span.end && candidate.end > span.start,
-      );
-      if (score > bestScore) {
-        bestScore = score;
-        tiedBestCount = 1;
-        bestUnclaimed = isUnclaimed;
-        chosen = candidate;
-      } else if (score === bestScore) {
-        tiedBestCount += 1;
-        if (isUnclaimed && !bestUnclaimed) {
-          bestUnclaimed = isUnclaimed;
-          chosen = candidate;
-        }
-      }
+    const score = scoreContextAffix(before, prefix, true) + scoreContextAffix(after, suffix, false);
+    if (score > bestScore) {
+      bestScore = score;
+      tiedBestCount = 1;
+    } else if (score === bestScore) {
+      tiedBestCount += 1;
+    }
+
+    if (!overlapsClaimed(candidate) && score > chosenScore) {
+      chosen = candidate;
+      chosenScore = score;
     }
   }
 
-  const unambiguous = candidates.length === 1 || (bestScore > 0 && tiedBestCount === 1);
+  if (!chosen) return null;
+
+  const minContextScore = Math.min(4, prefix.length + suffix.length);
+  const contextContradicted =
+    minContextScore > 0 && query.length < 32 && chosenScore < minContextScore;
+  const embeddedMidWord =
+    query.length < 24 &&
+    chosenScore === 0 &&
+    ((isWordCharacter(query[0]) && isWordCharacter(map.text[chosen.start - 1])) ||
+      (isWordCharacter(query[query.length - 1]) && isWordCharacter(map.text[chosen.end])));
+  const competingBrokenAmbiguous =
+    (options?.competingBrokenCount ?? 1) > candidates.length &&
+    chosenScore < Math.max(1, minContextScore);
+  const unambiguous =
+    !contextContradicted &&
+    !embeddedMidWord &&
+    !competingBrokenAmbiguous &&
+    ((candidates.length === 1 && chosenScore === bestScore) ||
+      (bestScore >= Math.max(1, minContextScore) &&
+        tiedBestCount === 1 &&
+        chosenScore === bestScore));
+
   if (options?.requireUnambiguous && !unambiguous) {
     return null;
   }
@@ -926,7 +1010,12 @@ function findExcerptMatchInDocument(
     range.setEnd(endPos.node, endPos.offset);
     if (range.collapsed) return null;
     options?.claimedSpans?.push(chosen);
-    return { range, score: Math.max(0, bestScore), candidateCount: candidates.length, unambiguous };
+    return {
+      range,
+      score: Math.max(0, chosenScore),
+      candidateCount: candidates.length,
+      unambiguous,
+    };
   } catch {
     return null;
   }
@@ -1402,17 +1491,40 @@ export class ReaderSession {
         if (primarySection && section.index === primarySection.index) continue;
         const loaded = await this.loadSectionDocument(section);
         if (!loaded) continue;
+        const textMap = buildDocumentTextMap(loaded.document);
+        const { claimedSpans, ownedCfis, competingBrokenCount } =
+          this.collectClaimedSpansForSection(
+            loaded.document,
+            textMap,
+            section,
+            loaded.cfiBase,
+            CfiClass,
+            annotation,
+          );
         const matched = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
           prefix: annotation.prefix,
           suffix: annotation.suffix,
+          textMap,
+          claimedSpans,
+          competingBrokenCount,
         });
         if (!matched || !loaded.cfiBase) {
+          if (claimedSpans.length > 0) {
+            const anyOccurrence = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
+              textMap,
+            });
+            if (anyOccurrence) totalOccurrences += anyOccurrence.candidateCount;
+          }
           loaded.unloadAfterFailure();
           continue;
         }
         totalOccurrences += matched.candidateCount;
         try {
           const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
+          if (ownedCfis.has(freshCfi.trim())) {
+            loaded.unloadAfterFailure();
+            continue;
+          }
           crossChapterCandidates.push({
             section,
             cfi: freshCfi,
@@ -1441,9 +1553,13 @@ export class ReaderSession {
           }
         }
 
+        const expectedContextLength =
+          (annotation.prefix ? normalizeWhitespace(annotation.prefix).length : 0) +
+          (annotation.suffix ? normalizeWhitespace(annotation.suffix).length : 0);
+        const minContextScore = Math.max(1, Math.min(4, expectedContextLength));
         const globallyUnambiguous =
-          totalOccurrences === 1 ||
-          (bestScore > 0 && tiedBestCount === 1 && winner.unambiguousInSection);
+          (totalOccurrences === 1 && winner.unambiguousInSection) ||
+          (bestScore >= minContextScore && tiedBestCount === 1 && winner.unambiguousInSection);
 
         for (const candidate of crossChapterCandidates) {
           if (candidate !== winner || !globallyUnambiguous) {
@@ -2658,17 +2774,27 @@ export class ReaderSession {
         if (!wasLoaded && typeof targetSection.unload === 'function') targetSection.unload();
         return null;
       }
+      const missingHead =
+        rawDoc.documentElement.localName.toLowerCase() === 'html' && !rawDoc.querySelector('head');
       const hasBodyUnsafeNodes = Boolean(
         rawDoc.querySelector(
           'body script, body iframe, body object, body embed, body form, body meta[http-equiv]',
         ),
       );
       let document = rawDoc;
-      if (hasBodyUnsafeNodes) {
+      if (missingHead || hasBodyUnsafeNodes) {
         document = rawDoc.cloneNode(true) as Document;
-        document
-          .querySelectorAll('script, iframe, object, embed, form, meta[http-equiv]')
-          .forEach((node) => node.remove());
+        if (missingHead) {
+          const headNode = document.documentElement.namespaceURI
+            ? document.createElementNS(document.documentElement.namespaceURI, 'head')
+            : document.createElement('head');
+          document.documentElement.insertBefore(headNode, document.documentElement.firstChild);
+        }
+        if (hasBodyUnsafeNodes) {
+          document
+            .querySelectorAll('script, iframe, object, embed, form, meta[http-equiv]')
+            .forEach((node) => node.remove());
+        }
       }
       return {
         document,
@@ -2697,6 +2823,7 @@ export class ReaderSession {
       parsed,
       cfi,
       loaded.cfiBase,
+      section.index,
       CfiClass,
     );
     if (!validated) {
@@ -2704,6 +2831,63 @@ export class ReaderSession {
       return null;
     }
     return validated;
+  }
+
+  private collectClaimedSpansForSection(
+    doc: Document,
+    textMap: DocumentTextMap,
+    section: SpineSection,
+    cfiBase: string | undefined,
+    CfiClass: EpubCfiConstructor,
+    excludeAnnotation: ReaderHighlightInput,
+  ): { claimedSpans: ClaimedTextSpan[]; ownedCfis: Set<string>; competingBrokenCount: number } {
+    const claimedSpans: ClaimedTextSpan[] = [];
+    const ownedCfis = new Set<string>();
+    const targetExcerpt = excludeAnnotation.excerpt
+      ? normalizeWhitespace(excludeAnnotation.excerpt)
+      : '';
+    let competingBrokenCount = 1;
+    for (const other of this.storedHighlights) {
+      const sameAnnotation =
+        excludeAnnotation.id !== undefined && other.id !== undefined
+          ? other.id === excludeAnnotation.id
+          : other.cfi === excludeAnnotation.cfi;
+      if (sameAnnotation) continue;
+      const otherParsed = parseRuntimeCfi(other.cfi, CfiClass);
+      const candidate = this.isHighlightCandidateForView(
+        other,
+        otherParsed,
+        section.index,
+        section.href,
+      );
+      if (!candidate.matches) continue;
+      ownedCfis.add(other.cfi.trim());
+      const otherTargetSection = otherParsed
+        ? this.resolveSpineSectionForCfi(otherParsed, other.href)
+        : null;
+      const validated =
+        otherParsed && otherTargetSection?.index === section.index
+          ? this.validateHighlightRangeInDocument(
+              doc,
+              otherParsed,
+              other,
+              cfiBase,
+              section.index,
+              CfiClass,
+            )
+          : null;
+      if (validated) {
+        ownedCfis.add(validated.cfi.trim());
+        recordRangeInTextMap(textMap, validated.range, claimedSpans);
+      } else if (
+        targetExcerpt &&
+        other.excerpt &&
+        normalizeWhitespace(other.excerpt) === targetExcerpt
+      ) {
+        competingBrokenCount += 1;
+      }
+    }
+    return { claimedSpans, ownedCfis, competingBrokenCount };
   }
 
   private async resolveAnnotationInSection(
@@ -2714,13 +2898,17 @@ export class ReaderSession {
   ): Promise<{ cfi: string; repaired: boolean } | null> {
     const loaded = await this.loadSectionDocument(section);
     if (!loaded) return null;
+    const cfiMatchesSection =
+      parsed !== null &&
+      this.resolveSpineSectionForCfi(parsed, annotation.href)?.index === section.index;
     const direct =
-      parsed && parsed.spinePos === section.index
+      parsed && cfiMatchesSection
         ? this.validateHighlightRangeInDocument(
             loaded.document,
             parsed,
             annotation,
             loaded.cfiBase,
+            section.index,
             CfiClass,
           )
         : null;
@@ -2728,17 +2916,31 @@ export class ReaderSession {
       return { cfi: direct.cfi, repaired: direct.repaired };
     }
     if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
+      const textMap = buildDocumentTextMap(loaded.document);
+      const { claimedSpans, ownedCfis, competingBrokenCount } = this.collectClaimedSpansForSection(
+        loaded.document,
+        textMap,
+        section,
+        loaded.cfiBase,
+        CfiClass,
+        annotation,
+      );
       const matched = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
         prefix: annotation.prefix,
         suffix: annotation.suffix,
+        textMap,
+        claimedSpans,
+        competingBrokenCount,
         requireUnambiguous: true,
       });
       if (matched && loaded.cfiBase) {
         try {
           const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
-          const canPersistRepair =
-            freshCfi !== annotation.cfi && annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
-          return { cfi: freshCfi, repaired: canPersistRepair };
+          if (!ownedCfis.has(freshCfi.trim())) {
+            const canPersistRepair =
+              freshCfi !== annotation.cfi && annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
+            return { cfi: freshCfi, repaired: canPersistRepair };
+          }
         } catch {
           // Fall through and unload temporary section.
         }
@@ -2753,10 +2955,12 @@ export class ReaderSession {
     parsed: RuntimeParsedCfi,
     annotation: ReaderHighlightInput,
     cfiBase: string | undefined,
+    sectionIndex: number,
     CfiClass: EpubCfiConstructor,
   ): { cfi: string; range: Range; repaired: boolean } | null {
     const range = doc.createRange();
     let clamped: boolean;
+    let relocatedById: boolean;
     if (parsed.range) {
       const startSteps = [...parsed.path.steps, ...(parsed.start?.steps ?? [])];
       const endSteps = [...parsed.path.steps, ...(parsed.end?.steps ?? [])];
@@ -2774,6 +2978,7 @@ export class ReaderSession {
         return null;
       }
       clamped = start.clamped || end.clamped;
+      relocatedById = start.relocatedById || end.relocatedById;
     } else {
       const endpoint = resolveCfiStepsInDocument(
         doc,
@@ -2781,31 +2986,46 @@ export class ReaderSession {
         parsed.path.terminal?.offset ?? null,
       );
       if (!endpoint) return null;
+      if (endpoint.elementOnly && annotation.excerpt === undefined) return null;
       try {
         range.selectNodeContents(endpoint.node);
       } catch {
         return null;
       }
       clamped = endpoint.clamped;
+      relocatedById = endpoint.relocatedById;
     }
 
     if (range.collapsed) return null;
     const rangeText = range.toString();
     if (!normalizeWhitespace(rangeText)) return null;
-    if (
-      annotation.excerpt !== undefined &&
-      !rangeMatchesExcerpt(rangeText, annotation.excerpt, annotation.excerpt.length >= 500)
-    ) {
+    const hasExcerpt = Boolean(annotation.excerpt && normalizeWhitespace(annotation.excerpt));
+    const excerptWasTruncated = Boolean(
+      annotation.excerpt && annotation.excerpt.length >= MAX_STORED_EXCERPT_LENGTH,
+    );
+    if (hasExcerpt) {
+      if (!rangeMatchesExcerpt(rangeText, annotation.excerpt!, excerptWasTruncated)) {
+        return null;
+      }
+    } else if (clamped || relocatedById || parsed.spinePos !== sectionIndex) {
       return null;
     }
 
-    if (!clamped) {
+    const needsFreshCfi =
+      clamped ||
+      relocatedById ||
+      parsed.spinePos !== sectionIndex ||
+      !canEpubCfiResolveInDocument(doc, annotation.cfi, CfiClass);
+
+    if (!needsFreshCfi) {
       return { cfi: annotation.cfi, range, repaired: false };
     }
     if (!cfiBase) return null;
     try {
       const freshCfi = new CfiClass(range, cfiBase).toString();
-      return { cfi: freshCfi, range, repaired: freshCfi !== annotation.cfi };
+      const canPersistRepair =
+        hasExcerpt && (!clamped || !excerptWasTruncated) && freshCfi !== annotation.cfi;
+      return { cfi: freshCfi, range, repaired: canPersistRepair };
     } catch {
       return null;
     }
@@ -2905,6 +3125,11 @@ export class ReaderSession {
         return cachedMap;
       };
 
+      const viewCandidates: Array<{
+        annotation: ReaderHighlightInput;
+        parsed: RuntimeParsedCfi | null;
+        authoritative: boolean;
+      }> = [];
       for (const annotation of this.storedHighlights) {
         const parsed = CfiClass ? parseRuntimeCfi(annotation.cfi, CfiClass) : null;
         const candidate = this.isHighlightCandidateForView(
@@ -2913,55 +3138,83 @@ export class ReaderSession {
           view.index,
           viewHref,
         );
-        if (!candidate.matches) continue;
+        if (candidate.matches) {
+          viewCandidates.push({ annotation, parsed, authoritative: candidate.authoritative });
+        }
+      }
 
+      const directResolved = new Map<ReaderHighlightInput, { cfi: string; repaired: boolean }>();
+
+      // Pass 1: Validate all intact, clamped, or spine-shifted DOM CFIs first and reserve their
+      // text spans so stale annotations in Pass 2 can never steal a surviving highlight's anchor.
+      for (const { annotation, parsed } of viewCandidates) {
+        if (!parsed || !CfiClass) continue;
+        const targetSection = this.resolveSpineSectionForCfi(parsed, annotation.href);
+        if (!targetSection || targetSection.index !== view.index) continue;
+
+        const validated = this.validateHighlightRangeInDocument(
+          contents.document,
+          parsed,
+          annotation,
+          cfiBase,
+          view.index,
+          CfiClass,
+        );
+        if (!validated) continue;
+
+        if (this.isRangeUsableOnView(view, validated.cfi)) {
+          directResolved.set(annotation, { cfi: validated.cfi, repaired: validated.repaired });
+          recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
+        } else if (typeof contents.cfiFromRange === 'function') {
+          try {
+            const regenerated = contents.cfiFromRange(validated.range);
+            if (this.isRangeUsableOnView(view, regenerated)) {
+              directResolved.set(annotation, {
+                cfi: regenerated,
+                repaired: validated.repaired && regenerated !== annotation.cfi,
+              });
+              recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
+            }
+          } catch {
+            // Fall back to Pass 2 excerpt search below.
+          }
+        }
+      }
+
+      const brokenExcerptCounts = new Map<string, number>();
+      for (const { annotation } of viewCandidates) {
+        if (directResolved.has(annotation) || !annotation.excerpt) continue;
+        const normalizedExcerpt = normalizeWhitespace(annotation.excerpt);
+        if (!normalizedExcerpt) continue;
+        brokenExcerptCounts.set(
+          normalizedExcerpt,
+          (brokenExcerptCounts.get(normalizedExcerpt) ?? 0) + 1,
+        );
+      }
+
+      // Pass 2: Attempt unambiguous excerpt recovery only against unclaimed spans.
+      for (const { annotation, authoritative } of viewCandidates) {
         let resolvedCfi: string | null = null;
         let wasRepaired = false;
 
-        if (parsed && CfiClass && parsed.spinePos === view.index) {
-          const validated = this.validateHighlightRangeInDocument(
-            contents.document,
-            parsed,
-            annotation,
-            cfiBase,
-            CfiClass,
-          );
-          if (validated) {
-            if (this.isRangeUsableOnView(view, validated.cfi)) {
-              resolvedCfi = validated.cfi;
-              wasRepaired = validated.repaired;
-              if (annotation.excerpt) {
-                recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
-              }
-            } else if (typeof contents.cfiFromRange === 'function') {
-              try {
-                const regenerated = contents.cfiFromRange(validated.range);
-                if (this.isRangeUsableOnView(view, regenerated)) {
-                  resolvedCfi = regenerated;
-                  wasRepaired = regenerated !== annotation.cfi;
-                  if (annotation.excerpt) {
-                    recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
-                  }
-                }
-              } catch {
-                // Fall back to excerpt search below.
-              }
-            }
-          }
-        }
-
-        if (!resolvedCfi && annotation.excerpt && typeof contents.cfiFromRange === 'function') {
+        const direct = directResolved.get(annotation);
+        if (direct) {
+          resolvedCfi = direct.cfi;
+          wasRepaired = direct.repaired;
+        } else if (annotation.excerpt && typeof contents.cfiFromRange === 'function') {
+          const normalizedExcerpt = normalizeWhitespace(annotation.excerpt);
           const matched = findExcerptMatchInDocument(contents.document, annotation.excerpt, {
             prefix: annotation.prefix,
             suffix: annotation.suffix,
             textMap: getTextMap(),
             claimedSpans,
+            competingBrokenCount: brokenExcerptCounts.get(normalizedExcerpt) ?? 1,
             requireUnambiguous: true,
           });
           if (matched) {
             try {
               const freshCfi = contents.cfiFromRange(matched.range);
-              if (this.isRangeUsableOnView(view, freshCfi)) {
+              if (!desired.has(freshCfi) && this.isRangeUsableOnView(view, freshCfi)) {
                 resolvedCfi = freshCfi;
                 wasRepaired =
                   annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH &&
@@ -2980,7 +3233,7 @@ export class ReaderSession {
             repaired.push({ id: annotation.id, cfi: resolvedCfi, href: viewHref });
           }
         } else if (
-          candidate.authoritative &&
+          authoritative &&
           annotation.id &&
           !this.reportedMissingHighlightIds.has(annotation.id)
         ) {

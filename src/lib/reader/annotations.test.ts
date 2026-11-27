@@ -216,6 +216,67 @@ describe('reader annotations', () => {
     expect(markdown).toContain('Shifted note');
   });
 
+  it('prevents repairAnnotations from overwriting a stale highlight onto another annotation CFI in the same chapter while allowing cross-chapter spine shifts', () => {
+    const first = addAnnotation(
+      [],
+      'epubcfi(/6/2!/4/2,/1:0,/1:19)',
+      'Remember the signal',
+      'First note on deleted paragraph',
+      '2026-01-01T00:00:00.000Z',
+      { href: 'chapter-1.xhtml', prefix: 'Opening scene: ' },
+    )[0]!;
+    const second = addAnnotation(
+      [],
+      'epubcfi(/6/2!/4/6,/1:0,/1:19)',
+      'Remember the signal',
+      'Second note on surviving paragraph',
+      '2026-01-02T00:00:00.000Z',
+      { href: 'chapter-1.xhtml', prefix: 'Closing scene: ' },
+    )[0]!;
+    const chapterTwo = addAnnotation(
+      [],
+      'epubcfi(/6/4!/4/2,/1:0,/1:14)',
+      'Chapter 2 line',
+      'Chapter 2 note',
+      '2026-01-03T00:00:00.000Z',
+      { href: 'chapter-2.xhtml' },
+    )[0]!;
+
+    // Colliding onto `second.cfi` in the same chapter must be rejected without touching notes or metadata
+    const inputList = [first, second];
+    const rejectedCollision = repairAnnotations(inputList, [
+      { id: first.id, cfi: second.cfi, href: 'chapter-1.xhtml' },
+    ]);
+    expect(rejectedCollision).toBe(inputList);
+    expect(rejectedCollision).toEqual([first, second]);
+    expect(rejectedCollision[0]?.note).toBe('First note on deleted paragraph');
+    expect(rejectedCollision[1]?.note).toBe('Second note on surviving paragraph');
+
+    // Frontmatter spine shift: chapter-1 moves from /6/2 to /6/4 while chapter-2 (href: chapter-2.xhtml)
+    // has not been visited yet and still holds stale `/6/4!/4/2...` with a different href.
+    const chapterOneShifted = addAnnotation(
+      [],
+      'epubcfi(/6/2!/4/2,/1:0,/1:14)',
+      'Chapter 1 line',
+      'Chapter 1 note',
+      '2026-01-01T00:00:00.000Z',
+      { href: 'chapter-1.xhtml' },
+    )[0]!;
+    const allowedSpineShift = repairAnnotations(
+      [chapterOneShifted, chapterTwo],
+      [
+        {
+          id: chapterOneShifted.id,
+          cfi: 'epubcfi(/6/4!/4/2,/1:0,/1:14)',
+          href: 'chapter-1.xhtml',
+        },
+      ],
+    );
+    expect(allowedSpineShift[0]?.cfi).toBe('epubcfi(/6/4!/4/2,/1:0,/1:14)');
+    expect(allowedSpineShift[0]?.note).toBe('Chapter 1 note');
+    expect(allowedSpineShift[1]).toEqual(chapterTwo);
+  });
+
   it('exports notes without exposing HTML markup', () => {
     const annotations = addAnnotation([], 'epubcfi(/6/2)', 'A quote', 'A note', '2026');
     expect(annotationsMarkdown('Book', annotations)).toContain('# Notes for Book');

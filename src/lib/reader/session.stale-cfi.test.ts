@@ -589,4 +589,307 @@ describe('ReaderSession stale CFI and highlight recovery (real epubjs + marks-pa
     });
     expect(jumpResult.status).toBe('displayed');
   });
+
+  it('repairs moved ID-bearing elements instead of letting epubjs XPath position mismatch reset to page 1', async () => {
+    books.set(
+      'moved-id-v2.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: [
+            '<p data-page="0">Inserted intro paragraph on page one.</p>',
+            '<p data-page="0">Second inserted paragraph on page one.</p>',
+            '<p id="target-para" data-page="1">Moved ID paragraph with a saved highlight on page two.</p>',
+          ].join('\n'),
+        },
+      ]),
+    );
+
+    // Originally #target-para was the 1st <p> (/4/2[target-para]), now it is the 3rd <p> (/4/6[target-para]).
+    // epubjs's stepsToXpath builds `*[position()=2 and @id='target-para']`, which fails without CFI regeneration!
+    const staleMovedIdReadingCfi = 'epubcfi(/6/2!/4/2[target-para]/1:0)';
+    const staleMovedIdHighlightCfi = 'epubcfi(/6/2!/4/2[target-para],/1:0,/1:54)';
+
+    const readingLocations: ReaderLocation[] = [];
+    const readingSession = trackSession(`${baseUrl}/moved-id-v2.epub`);
+    await readingSession.open(
+      createViewport(),
+      staleMovedIdReadingCfi,
+      null,
+      null,
+      defaultAppearance,
+      (loc) => readingLocations.push(loc),
+      () => {},
+    );
+    await flushEpubLocationReport();
+    expect(readingLocations.at(-1)?.pageIndex).toBe(1);
+
+    const resolutions: ReaderHighlightResolution[] = [];
+    const navLocations: ReaderLocation[] = [];
+    const highlightViewport = createViewport();
+    const highlightSession = trackSession(`${baseUrl}/moved-id-v2.epub`);
+    await highlightSession.open(
+      highlightViewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      (loc) => navLocations.push(loc),
+      () => {},
+      undefined,
+      undefined,
+      (res) => resolutions.push(res),
+    );
+    await flushEpubLocationReport();
+
+    const movedHighlight: ReaderHighlightInput = {
+      id: 'moved-id-hl',
+      cfi: staleMovedIdHighlightCfi,
+      excerpt: 'Moved ID paragraph with a saved highlight on page two.',
+      href: 'chapter-1.xhtml',
+    };
+    highlightSession.updateHighlights([movedHighlight]);
+
+    const repaired = resolutions.flatMap((entry) => entry.repaired);
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]?.id).toBe('moved-id-hl');
+    expect(repaired[0]?.cfi).toContain('/4/6[target-para]');
+
+    const jump = await highlightSession.displayAnnotation(movedHighlight);
+    await flushEpubLocationReport();
+    expect(jump.status).toBe('repaired');
+    expect(navLocations.at(-1)?.pageIndex).toBe(1);
+  });
+
+  it('never steals an intact highlight anchor when an earlier duplicate-excerpt highlight was deleted, and rejects contradicted short-phrase context', async () => {
+    books.set(
+      'duplicate-steal-guard.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: [
+            '<p data-page="0">Rewritten opening paragraph where the refrain was removed.</p>',
+            '<p data-page="1">Harbor watchtower scene: Remember the signal before dawn.</p>',
+            '<p data-page="1">Bob shouted Yes loudly across the courtyard.</p>',
+          ].join('\n'),
+        },
+      ]),
+    );
+
+    const resolutions: ReaderHighlightResolution[] = [];
+    const viewport = createViewport();
+    const session = trackSession(`${baseUrl}/duplicate-steal-guard.epub`);
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      () => {},
+      () => {},
+      undefined,
+      undefined,
+      (res) => resolutions.push(res),
+    );
+    await flushEpubLocationReport();
+
+    // `deleted-dup-1` comes BEFORE `intact-dup-2` in the array!
+    // Its paragraph (/4/2) was rewritten, while `intact-dup-2` at /4/4 still resolves directly.
+    const deletedFirstDup: ReaderHighlightInput = {
+      id: 'deleted-dup-1',
+      cfi: 'epubcfi(/6/2!/4/2,/1:14,/1:33)',
+      excerpt: 'Remember the signal',
+      href: 'chapter-1.xhtml',
+      prefix: 'Courtyard whisper: ',
+      suffix: ' at midnight.',
+    };
+    const intactSecondDup: ReaderHighlightInput = {
+      id: 'intact-dup-2',
+      cfi: 'epubcfi(/6/2!/4/4,/1:25,/1:44)',
+      excerpt: 'Remember the signal',
+      href: 'chapter-1.xhtml',
+      prefix: 'Harbor watchtower scene: ',
+      suffix: ' before dawn.',
+    };
+    const contradictedShortPhrase: ReaderHighlightInput = {
+      id: 'contradicted-short',
+      cfi: 'epubcfi(/6/2!/4/99,/1:0,/1:3)',
+      excerpt: 'Yes',
+      href: 'chapter-1.xhtml',
+      prefix: 'Alice whispered ',
+      suffix: ' softly to him.',
+    };
+
+    session.updateHighlights([deletedFirstDup, intactSecondDup, contradictedShortPhrase]);
+
+    expect(resolutions.flatMap((entry) => entry.repaired)).toEqual([]);
+    expect(resolutions.flatMap((entry) => entry.missingIds)).toEqual([
+      'deleted-dup-1',
+      'contradicted-short',
+    ]);
+
+    // Explicit jump on the deleted duplicate or contradicted short phrase must also return 'missing' rather than stealing
+    expect(await session.displayAnnotation(deletedFirstDup)).toEqual({ status: 'missing' });
+    expect(await session.displayAnnotation(contradictedShortPhrase)).toEqual({ status: 'missing' });
+
+    // Meanwhile the intact second duplicate still jumps cleanly to page 2 (pageIndex 1)
+    const intactJump = await session.displayAnnotation(intactSecondDup);
+    expect(intactJump.status).toBe('displayed');
+  });
+
+  it('repairs spine-shifted >500-character highlights directly via DOM CFI without truncating to 500 characters', async () => {
+    const longHighlight = Array.from(
+      { length: 10 },
+      (_, index) =>
+        `Clause ${index + 1} of an unchanged chapter passage after a cover page was prepended.`,
+    ).join(' ');
+    expect(longHighlight.length).toBeGreaterThan(600);
+
+    books.set(
+      'frontmatter-shifted.epub',
+      buildTestEpub([
+        {
+          id: 'cover',
+          href: 'cover.xhtml',
+          title: 'Cover',
+          body: '<p data-page="0">New frontmatter cover page.</p>',
+        },
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: `<p data-page="0">${longHighlight}</p>`,
+        },
+      ]),
+    );
+
+    const resolutions: ReaderHighlightResolution[] = [];
+    const viewport = createViewport();
+    const session = trackSession(`${baseUrl}/frontmatter-shifted.epub`);
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      () => {},
+      () => {},
+      undefined,
+      undefined,
+      (res) => resolutions.push(res),
+    );
+    await session.display('chapter-1.xhtml');
+    await flushEpubLocationReport();
+
+    // Originally chapter-1 was spine index 0 (/6/2[ch1]), now it is spine index 1 (/6/4[ch1])
+    const preCoverFullCfi = `epubcfi(/6/2[ch1]!/4/2,/1:0,/1:${longHighlight.length})`;
+    session.updateHighlights([
+      {
+        id: 'frontmatter-long-hl',
+        cfi: preCoverFullCfi,
+        excerpt: longHighlight.slice(0, 500),
+        href: 'chapter-1.xhtml',
+      },
+    ]);
+
+    const repaired = resolutions.flatMap((entry) => entry.repaired);
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]?.cfi).toContain('/6/4');
+    // Full end offset is preserved rather than shrinking to :500!
+    expect(repaired[0]?.cfi).toContain(`:${longHighlight.length})`);
+  });
+
+  it('refuses to shrink clamped >500-char highlights, match short words inside longer words, or let two broken refrains guess a lone survivor', async () => {
+    const originalLongQuote = Array.from(
+      { length: 12 },
+      (_, index) => `Segment ${index + 1} of an extended highlighted passage in chapter one.`,
+    ).join(' ');
+    expect(originalLongQuote.length).toBeGreaterThan(620);
+    // Shorten the tail past 500 chars so the node clamps from ~660 to 540 chars
+    const shortenedTailQuote = originalLongQuote.slice(0, 540);
+
+    books.set(
+      'clamped-and-refrain-guards.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: [
+            '<p data-page="0">Inserted preface paragraph shifting refrains.</p>',
+            `<p data-page="0">${shortenedTailQuote}</p>`,
+            '<p data-page="1">Yesterday the harbor bell rang once.</p>',
+            '<p data-page="1">Echoing refrain without context</p>',
+          ].join('\n'),
+        },
+      ]),
+    );
+
+    const resolutions: ReaderHighlightResolution[] = [];
+    const viewport = createViewport();
+    const session = trackSession(`${baseUrl}/clamped-and-refrain-guards.epub`);
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      () => {},
+      () => {},
+      undefined,
+      undefined,
+      (res) => resolutions.push(res),
+    );
+    await flushEpubLocationReport();
+
+    const clampedLongHighlight: ReaderHighlightInput = {
+      id: 'clamped-long-hl',
+      cfi: `epubcfi(/6/2!/4/4,/1:0,/1:${originalLongQuote.length})`,
+      excerpt: originalLongQuote.slice(0, 500),
+      href: 'chapter-1.xhtml',
+    };
+    const midWordShortHighlight: ReaderHighlightInput = {
+      id: 'mid-word-yes',
+      cfi: 'epubcfi(/6/2!/4/90,/1:0,/1:3)',
+      excerpt: 'Yes',
+      href: 'chapter-1.xhtml',
+    };
+    const brokenRefrainOne: ReaderHighlightInput = {
+      id: 'broken-refrain-1',
+      cfi: 'epubcfi(/6/2!/4/92,/1:0,/1:31)',
+      excerpt: 'Echoing refrain without context',
+      href: 'chapter-1.xhtml',
+    };
+    const brokenRefrainTwo: ReaderHighlightInput = {
+      id: 'broken-refrain-2',
+      cfi: 'epubcfi(/6/2!/4/94,/1:0,/1:31)',
+      excerpt: 'Echoing refrain without context',
+      href: 'chapter-1.xhtml',
+    };
+
+    session.updateHighlights([
+      clampedLongHighlight,
+      midWordShortHighlight,
+      brokenRefrainOne,
+      brokenRefrainTwo,
+    ]);
+
+    // Clamped >500-char highlight renders without shrinking its persisted CFI; the other three refuse false matches
+    expect(viewport.querySelectorAll('svg g.turnleaf-highlight rect').length).toBeGreaterThan(0);
+    expect(resolutions.flatMap((entry) => entry.repaired)).toEqual([]);
+    expect(resolutions.flatMap((entry) => entry.missingIds)).toEqual([
+      'mid-word-yes',
+      'broken-refrain-1',
+      'broken-refrain-2',
+    ]);
+
+    expect((await session.displayAnnotation(clampedLongHighlight)).status).toBe('displayed');
+    expect(await session.displayAnnotation(midWordShortHighlight)).toEqual({ status: 'missing' });
+    expect(await session.displayAnnotation(brokenRefrainOne)).toEqual({ status: 'missing' });
+    expect(await session.displayAnnotation(brokenRefrainTwo)).toEqual({ status: 'missing' });
+  });
 });

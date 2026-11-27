@@ -38,7 +38,12 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
-import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
+import {
+  cacheCover,
+  downloadEpub,
+  EpubTransferError,
+  verifyDownloadedEpub,
+} from './native-download';
 
 function encoded(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
@@ -489,4 +494,50 @@ describe('native cover cache', () => {
       expect(native.deleted).toContain('covers/server-1/7.img.partial');
     },
   );
+
+  it('invokes beforeDispatch immediately before FileTransfer in cacheCover and downloadEpub retries so offline transitions dispatch zero requests', async () => {
+    vi.useFakeTimers();
+    let online = true;
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      // Simulate connection failing and device going offline before the 750ms retry fires
+      online = false;
+      throw { code: 'OS-PLUG-FLTR-0008' };
+    });
+
+    const epubAttempt = expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'secret',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        {
+          beforeDispatch: async () => {
+            if (!online) throw new EpubTransferError(undefined, true);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ connectionFailed: true });
+    await Promise.all([epubAttempt, vi.runAllTimersAsync()]);
+    // Only the initial online attempt ran; the 750ms retry was blocked before FileTransfer.downloadFile!
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+
+    vi.mocked(FileTransfer.downloadFile).mockReset();
+    vi.mocked(Filesystem.stat).mockRejectedValue(new Error('uncached'));
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        9,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+        async () => {
+          if (!online) throw new DOMException('Aborted', 'AbortError');
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
 });
