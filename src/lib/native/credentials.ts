@@ -81,7 +81,18 @@ export function isCredentialReady(): boolean {
 }
 
 export function resolveCredentialEpoch(apiKey: string, explicitEpoch?: number): number | undefined {
-  if (explicitEpoch !== undefined) return explicitEpoch;
+  if (explicitEpoch !== undefined) {
+    if (
+      managed &&
+      explicitEpoch === currentEpoch &&
+      activeApiKey !== null &&
+      apiKey.trim().length > 0 &&
+      apiKey !== activeApiKey
+    ) {
+      return undefined;
+    }
+    return explicitEpoch;
+  }
   if (!managed) return undefined;
   if (!apiKey.trim() || activeApiKey === null || apiKey === activeApiKey) {
     return currentEpoch;

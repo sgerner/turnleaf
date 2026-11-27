@@ -318,6 +318,20 @@
               reconnectingServer = false;
             }
           : undefined}
+        onApiKeySaved={server
+          ? (savedKey) => {
+              if (server) {
+                syncLoadedCredential(savedKey, server.credentialRef);
+                apiKey = savedKey;
+              }
+            }
+          : undefined}
+        onRestoreCredentials={server
+          ? async () => {
+              if (!server) return false;
+              return loadServerCredential(server);
+            }
+          : undefined}
         onConnected={(connected, key) => {
           syncLoadedCredential(key, connected.credentialRef);
           apiKey = key;

@@ -1073,3 +1073,22 @@ it('blocks non-probe requests and getProgress retries when credentials become mi
   });
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });
+
+it('rejects tampered baseUrl values before sending x-api-key over browser or native requests', async () => {
+  for (const unsafeBaseUrl of [
+    'ftp://books.example.com',
+    'file:///etc/passwd',
+    'https://user:pass@books.example.com',
+    'https://books.example.com?api_key=leak',
+    'https://books.example.com#fragment',
+  ]) {
+    await expect(new KavitaClient(unsafeBaseUrl, 'secret-key').getBookSeries()).rejects.toThrow(
+      'Invalid Kavita server address.',
+    );
+    await expect(new KavitaClient(unsafeBaseUrl, 'secret-key').testConnection()).rejects.toThrow(
+      'Invalid Kavita server address.',
+    );
+  }
+  expect(fetch).not.toHaveBeenCalled();
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+});

@@ -14,7 +14,13 @@ import {
   markCredentialRejected,
   resolveCredentialEpoch,
 } from '../native/credentials';
-import { advanceRedirect, createRedirectState, KavitaError, nativeHeader } from './redirects';
+import {
+  advanceRedirect,
+  assertSafeTransferTarget,
+  createRedirectState,
+  KavitaError,
+  nativeHeader,
+} from './redirects';
 
 export { KavitaError };
 
@@ -242,8 +248,8 @@ export class KavitaClient {
             headers: {
               Accept: 'application/json',
               'Content-Type': 'application/json',
-              'x-api-key': this.apiKey,
               ...init.headers,
+              'x-api-key': this.apiKey,
             },
           },
           probe,
@@ -328,6 +334,10 @@ export class KavitaClient {
     while (true) {
       this.assertCredentialReady(probe);
       const response = await fetch(redirects.currentUrl, { ...init, redirect: 'manual' });
+      if (!probe && init.signal?.aborted && (response.status === 401 || response.status === 403)) {
+        this.localRejectedStatus = response.status;
+        markCredentialRejected(this.credentialEpoch, response.status);
+      }
       if (
         !advanceRedirect(
           redirects,
@@ -380,9 +390,30 @@ export class KavitaClient {
     }
   }
 
+  private parseBaseOrigin(): URL {
+    let parsed: URL;
+    try {
+      parsed = new URL(this.baseUrl);
+    } catch {
+      throw new KavitaError('Invalid Kavita server address.', 'server');
+    }
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      throw new KavitaError('Invalid Kavita server address.', 'server');
+    }
+    return parsed;
+  }
+
   private resolveUrl(path: string): string {
+    const parsedBase = this.parseBaseOrigin();
     const baseUrl = this.baseUrl.replace(/\/+$/, '') + '/';
     const absolute = new URL(path.replace(/^\/+/, ''), baseUrl).toString();
+    assertSafeTransferTarget(absolute, parsedBase.origin, 'Invalid Kavita server address.');
     if (
       !Capacitor.isNativePlatform() &&
       import.meta.env.DEV &&

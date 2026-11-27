@@ -173,7 +173,7 @@ vi.mock('../database/database', async (importOriginal) => {
   return {
     ...actual,
     getServer: wrap(actual.getServer),
-    saveServer: wrap(actual.saveServer),
+    saveServer: vi.fn(wrap(actual.saveServer)),
     removeServer: wrap(actual.removeServer),
     getBooks: wrap(actual.getBooks),
     reconcileBooks: wrap(actual.reconcileBooks),
@@ -341,6 +341,7 @@ import { CapacitorHttp } from '@capacitor/core';
 import { Network } from '@capacitor/network';
 import App from '../../App.svelte';
 import { clearDiagnostics } from '../diagnostics/log';
+import * as Database from '../database/database';
 import { EpubTransferError, cacheCover, downloadEpub } from '../downloads/native-download';
 import {
   getCredentialState,
@@ -1309,5 +1310,126 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(offlineRequests).toEqual([]);
     expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  });
+
+  it('keeps App, Library, and credential state synchronized when saveServer fails during Settings key update or Onboarding address change rollback', async () => {
+    seedDatabase({ books: [downloadedBook] });
+    window.localStorage.setItem('turnleaf_browser_server_primary_api_key', 'stale-key');
+
+    let activeServerKey = 'rotated-key';
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      const sentKey = new Headers(init?.headers).get('x-api-key');
+      if (sentKey !== activeServerKey && sentKey !== 'new-server-key') {
+        return {
+          ok: false,
+          status: 401,
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      if (url.includes('/api/Library/libraries')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => [{ id: 1, name: 'Books', type: 2 }],
+        } as unknown as Response;
+      }
+      if (url.includes('/api/Health')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => ({ version: '0.8.9' }),
+        } as unknown as Response;
+      }
+      if (url.includes('/api/Series/v2')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => [],
+        } as unknown as Response;
+      }
+      if (url.includes('/api/Image/series-cover')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          blob: async () => new Blob(['img'], { type: 'image/png' }),
+        } as unknown as Response;
+      }
+      throw new Error(`Unexpected URL ${url}`);
+    });
+
+    mounted = mount(App, { target });
+    await waitForCondition(
+      () => target.querySelector('[data-credential-alert="rejected"]') !== null,
+    );
+
+    // 1) Settings updateApiKey: saveApiKey succeeds, saveServer fails once -> key stays synchronized across App, Library, and coordinator
+    vi.mocked(Database.saveServer).mockRejectedValueOnce(new Error('SQLite busy'));
+    target.querySelector<HTMLButtonElement>('[data-credential-recover]')!.click();
+    await waitForCondition(() => target.querySelector('#replacement-api-key') !== null);
+
+    const replacementInput = target.querySelector<HTMLInputElement>('#replacement-api-key')!;
+    replacementInput.value = 'rotated-key';
+    replacementInput.dispatchEvent(new Event('input', { bubbles: true }));
+    replacementInput
+      .closest('form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await waitForCondition(
+      () =>
+        target.textContent?.includes(
+          'The auth key was updated, but local server details could not be saved.',
+        ) === true,
+    );
+    expect(getCredentialState().status).toBe('ready');
+    expect(target.querySelector('[data-credential-alert]')).toBeNull();
+    expect(replacementInput.value).toBe('');
+
+    // 2) Onboarding Change server address: saveConnection fails saveServer and rolls back temporary ref,
+    //    restoring the saved rotated-key when Cancel returns to Library
+    const changeAddressButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.includes('Change server address'),
+    );
+    expect(changeAddressButton).toBeDefined();
+    changeAddressButton!.click();
+    await waitForCondition(() => target.querySelector('input[type="url"]') !== null);
+
+    vi.mocked(Database.saveServer).mockRejectedValueOnce(new Error('SQLite busy'));
+    const urlInput = target.querySelector<HTMLInputElement>('input[type="url"]')!;
+    urlInput.value = 'https://other-books.example.com';
+    urlInput.dispatchEvent(new Event('input', { bubbles: true }));
+    const onboardingKeyInput = target.querySelector<HTMLInputElement>('#kavita-auth-key')!;
+    onboardingKeyInput.value = 'new-server-key';
+    onboardingKeyInput.dispatchEvent(new Event('input', { bubbles: true }));
+    onboardingKeyInput
+      .closest('form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await waitForCondition(
+      () =>
+        target.textContent?.includes('The saved connection and auth key were left in place') ===
+        true,
+    );
+
+    const cancelButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Cancel',
+    );
+    expect(cancelButton).toBeDefined();
+    cancelButton!.click();
+
+    await waitForCondition(
+      () =>
+        target.querySelector('[aria-label="Open settings"]') !== null &&
+        target.querySelector('[data-credential-alert]') === null,
+    );
+    expect(getCredentialState().status).toBe('ready');
+    activeServerKey = 'rotated-key';
+    expect(
+      target.querySelector<HTMLButtonElement>('[aria-label="Refresh library"]')?.disabled,
+    ).toBe(false);
   });
 });

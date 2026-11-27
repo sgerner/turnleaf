@@ -13,11 +13,15 @@
     savedServer = null,
     editAddress = false,
     onCancel,
+    onApiKeySaved,
+    onRestoreCredentials,
     onConnected,
   }: {
     savedServer?: ServerConfig | null;
     editAddress?: boolean;
     onCancel?: (() => void) | undefined;
+    onApiKeySaved?: ((key: string) => void) | undefined;
+    onRestoreCredentials?: (() => Promise<boolean>) | undefined;
     onConnected: (server: ServerConfig, key: string) => void;
   } = $props();
 
@@ -59,6 +63,7 @@
       try {
         await removeApiKey(server.credentialRef);
       } catch (cleanupError) {
+        await onRestoreCredentials?.().catch(() => false);
         recordDiagnostic({
           category: 'startup',
           endpoint: 'local/credentials',
@@ -66,6 +71,7 @@
         });
         throw new Error(messages.cleanupFailed, { cause: cleanupError });
       }
+      await onRestoreCredentials?.().catch(() => false);
       recordDiagnostic({
         category: 'startup',
         endpoint: 'local/database',
@@ -155,6 +161,8 @@
             });
             throw credentialError;
           }
+          syncLoadedCredential(key, savedServer.credentialRef);
+          onApiKeySaved?.(key);
           try {
             await saveServer(connectedServer);
           } catch (storageError) {

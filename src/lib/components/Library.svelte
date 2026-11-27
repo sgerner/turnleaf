@@ -48,6 +48,7 @@
   import {
     getCredentialState,
     removeApiKey,
+    resolveCredentialEpoch,
     saveApiKey,
     subscribeCredentialState,
     syncLoadedCredential,
@@ -127,18 +128,21 @@
   let credentialState = $state<CredentialState>(getCredentialState());
   let retryingCredentials = $state(false);
   let catalogCheckPending = $state(false);
+  const clientEpoch = $derived(resolveCredentialEpoch(activeApiKey, credentialState.epoch));
+  const client = $derived(
+    new KavitaClient(server.baseUrl, activeApiKey, { credentialEpoch: clientEpoch }),
+  );
   const credentialStatus = $derived<CredentialStatus>(
-    credentialState.status === 'ready' && !activeApiKey.trim() ? 'missing' : credentialState.status,
+    credentialState.status === 'ready' && (!activeApiKey.trim() || !client.canSendRequests())
+      ? 'missing'
+      : credentialState.status,
   );
   const credentialReady = $derived(credentialStatus === 'ready');
-  const client = $derived(
-    new KavitaClient(server.baseUrl, activeApiKey, { credentialEpoch: credentialState.epoch }),
-  );
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     const coverClient = client;
     const coverKey = activeApiKey;
-    const coverEpoch = credentialState.epoch;
+    const coverEpoch = clientEpoch;
     const coverServerId = server.id;
     const coverOrigin = serverOrigin;
     if (Capacitor.isNativePlatform()) {
@@ -310,6 +314,8 @@
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
   let syncController: AbortController | null = null;
+  let readerSyncController: AbortController | null = null;
+  let downloadController: AbortController | null = null;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -403,6 +409,8 @@
     clearReconnectTimer();
     refreshController?.abort();
     openProgressProbe?.abort();
+    readerSyncController?.abort();
+    downloadController?.abort();
     if (status === 'missing' || status === 'unreadable') {
       syncController?.abort();
     }
@@ -1033,6 +1041,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    replacementApiKey = '';
     unsubscribeCredentials();
     onReaderOpenChange?.(false);
     clearSyncTimer();
@@ -1043,6 +1052,8 @@
     openProgressProbe?.abort();
     refreshController?.abort();
     syncController?.abort();
+    readerSyncController?.abort();
+    downloadController?.abort();
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -1291,7 +1302,7 @@
   async function download(book: BookRecord): Promise<BookRecord | null> {
     const downloadClient = client;
     const downloadKey = activeApiKey;
-    const downloadEpoch = credentialState.epoch;
+    const downloadEpoch = clientEpoch;
     if (!credentialReady || !downloadClient.canSendRequests()) {
       libraryMain?.querySelector<HTMLElement>('[data-credential-recover]')?.focus();
       return null;
@@ -1307,6 +1318,8 @@
     if (destroyed || offline || !credentialReady || !downloadClient.canSendRequests()) {
       return null;
     }
+    const controller = new AbortController();
+    downloadController = controller;
     downloadingBookId = book.id;
     downloadPercent = null;
     downloadFailureBook = null;
@@ -1324,10 +1337,12 @@
         },
         serverOrigin,
         downloadEpoch,
+        controller.signal,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
       downloadedPath = null;
+      if (destroyed) return null;
       const refreshed = {
         ...book,
         downloadPath: file.relativePath,
@@ -1338,6 +1353,16 @@
       message = `${book.title} is ready offline.`;
       return refreshed;
     } catch (error) {
+      if (
+        controller.signal.aborted ||
+        (error instanceof DOMException && error.name === 'AbortError')
+      ) {
+        if (!destroyed) {
+          message = '';
+          downloadFailureBook = null;
+        }
+        return null;
+      }
       let detail = 'download-storage';
       let status: number | undefined;
       let cleanupFailed = false;
@@ -1411,6 +1436,7 @@
       downloadFailureBook = book;
       return null;
     } finally {
+      if (downloadController === controller) downloadController = null;
       downloadingBookId = null;
       downloadPercent = null;
     }
@@ -1701,48 +1727,92 @@
       }
       return null;
     }
-    if (manual) {
-      try {
-        await flushProgress(readerClient, server.id);
-      } catch {
-        throw new Error('Reading progress is saved here and still waiting to upload.');
-      } finally {
-        void refreshSyncStatus();
-      }
-    }
-    const local = await getReadingState(book.id);
-    if (local?.pendingSync) {
-      if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
-      return null;
-    }
-    if (destroyed || offline || !credentialReady || !readerClient.canSendRequests()) {
+    const controller = new AbortController();
+    readerSyncController = controller;
+    try {
       if (manual) {
-        throw new Error(
-          'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
-        );
-      }
-      return null;
-    }
-    const remote = await readerClient.getProgress(book.chapterId);
-    if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
-    return {
-      xpath: remote.bookScrollId ?? null,
-      percentage: remotePercentage(remote, book),
-      accept: async () => {
-        acceptingRemoteProgress = true;
         try {
-          // An upload cannot race with deletion of the exact revision it is sending.
-          await syncWork;
-          const accepted = await saveRemoteProgress(book, remote, local);
-          if (!accepted)
-            throw new Error('The saved reading position changed. Sync again to retry.');
-          updateRemoteBookProgress(book, remote);
-          void refreshSyncStatus();
+          await flushProgress(readerClient, server.id, controller.signal);
+        } catch (error) {
+          const authError =
+            (error instanceof KavitaError && error.kind === 'authentication') ||
+            (error instanceof AggregateError &&
+              error.errors.some(
+                (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
+              ));
+          if (authError || !credentialReady || !readerClient.canSendRequests()) {
+            throw new Error(
+              'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
+              { cause: error },
+            );
+          }
+          throw new Error('Reading progress is saved here and still waiting to upload.', {
+            cause: error,
+          });
         } finally {
-          acceptingRemoteProgress = false;
+          void refreshSyncStatus();
         }
-      },
-    };
+      }
+      const local = await getReadingState(book.id);
+      if (local?.pendingSync) {
+        if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
+        return null;
+      }
+      if (
+        destroyed ||
+        offline ||
+        controller.signal.aborted ||
+        !credentialReady ||
+        !readerClient.canSendRequests()
+      ) {
+        if (manual) {
+          throw new Error(
+            'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
+          );
+        }
+        return null;
+      }
+      let remote: KavitaProgress;
+      try {
+        remote = await readerClient.getProgress(book.chapterId, controller.signal);
+      } catch (error) {
+        if (
+          (error instanceof KavitaError && error.kind === 'authentication') ||
+          !credentialReady ||
+          !readerClient.canSendRequests()
+        ) {
+          if (manual) {
+            throw new Error(
+              'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
+              { cause: error },
+            );
+          }
+          return null;
+        }
+        throw error;
+      }
+      if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
+      return {
+        xpath: remote.bookScrollId ?? null,
+        percentage: remotePercentage(remote, book),
+        accept: async () => {
+          acceptingRemoteProgress = true;
+          try {
+            // An upload cannot race with deletion of the exact revision it is sending.
+            await syncWork;
+            const accepted = await saveRemoteProgress(book, remote, local);
+            if (!accepted)
+              throw new Error('The saved reading position changed. Sync again to retry.');
+            updateRemoteBookProgress(book, remote);
+            void refreshSyncStatus();
+          } finally {
+            acceptingRemoteProgress = false;
+          }
+        },
+      };
+    } finally {
+      if (readerSyncController === controller) readerSyncController = null;
+    }
   }
 
   function updateRemoteBookProgress(book: BookRecord, remote: KavitaProgress): void {
@@ -1913,6 +1983,10 @@
   function closeSettings(): void {
     settingsVisible = false;
     showReplacementKey = false;
+    if (!replacingApiKey) {
+      replacementApiKey = '';
+      settingsError = '';
+    }
     const opener = settingsOpener;
     settingsOpener = null;
     restoreModalFocus(opener);
@@ -2019,7 +2093,20 @@
         lastConnectedAt: new Date().toISOString(),
       };
       await saveApiKey(server.credentialRef, nextKey);
-      await saveServer(updatedServer);
+      try {
+        await saveServer(updatedServer);
+      } catch (storageError) {
+        while (syncWork) await syncWork;
+        refreshController?.abort();
+        syncLoadedCredential(nextKey, server.credentialRef);
+        activeApiKey = nextKey;
+        onApiKeyChange(nextKey);
+        replacementApiKey = '';
+        throw new Error(
+          'The auth key was updated, but local server details could not be saved. Retry in Settings.',
+          { cause: storageError },
+        );
+      }
       // An upload started with the previous key may still be finishing.
       while (syncWork) await syncWork;
       refreshController?.abort();

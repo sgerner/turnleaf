@@ -688,4 +688,52 @@ describe('native EPUB credential gating', () => {
     ).rejects.toThrow('Offline');
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
+
+  it('trips the credential breaker when an aborted cover transfer returns HTTP 401 and discards partial files if credentials become missing mid-transfer', async () => {
+    const firstState = syncLoadedCredential('stale-cover-key', 'server_primary_api_key');
+    const abortController = new AbortController();
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      abortController.abort();
+      throw { code: 'OS-PLUG-FLTR-0010', data: { httpStatus: 401 } };
+    });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'stale-cover-key',
+        42,
+        abortController.signal,
+        'primary',
+        true,
+        'https://books.example.com',
+        firstState.epoch,
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(getCredentialState()).toEqual({
+      status: 'rejected',
+      epoch: firstState.epoch,
+      statusCode: 401,
+    });
+
+    const secondState = syncLoadedCredential('active-key', 'server_primary_api_key');
+    vi.mocked(Filesystem.rename).mockClear();
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      markCredentialMissing('server_primary_api_key');
+      return { path: 'file://books/server-book.epub.partial' };
+    });
+
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'active-key',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        secondState.epoch,
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(Filesystem.rename).not.toHaveBeenCalled();
+    expect(native.deleted).toContain('books/server-book.epub.partial');
+  });
 });

@@ -142,3 +142,18 @@ it('fails closed for any non-probe credential when coordinator status is missing
   expect(canSendCredential('active-key')).toBe(false);
   expect(canSendCredential('other-key')).toBe(false);
 });
+
+it('refuses to bind a stale mismatched key to the active managed epoch', async () => {
+  const { getCredentialState, markCredentialRejected, resolveCredentialEpoch, saveApiKey } =
+    await import('./credentials');
+
+  await saveApiKey('server_primary_api_key', 'fresh-key');
+  const freshEpoch = getCredentialState().epoch;
+
+  expect(resolveCredentialEpoch('fresh-key', freshEpoch)).toBe(freshEpoch);
+  expect(resolveCredentialEpoch('stale-prop-key', freshEpoch)).toBeUndefined();
+  expect(markCredentialRejected(resolveCredentialEpoch('stale-prop-key', freshEpoch), 401)).toBe(
+    false,
+  );
+  expect(getCredentialState()).toEqual({ status: 'ready', epoch: freshEpoch });
+});

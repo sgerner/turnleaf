@@ -162,6 +162,7 @@ async function downloadFileWithRedirects(options: {
   signal?: AbortSignal | undefined;
   onHop?: ((url: string) => void) | undefined;
   beforeHop?: (() => void) | undefined;
+  onHttpError?: ((status: number) => void) | undefined;
 }): Promise<void> {
   const redirects = createRedirectState(
     options.initialUrl,
@@ -186,8 +187,9 @@ async function downloadFileWithRedirects(options: {
       if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       return;
     } catch (error) {
-      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const { code, status, headers } = readTransferFailure(error);
+      if (status !== undefined) options.onHttpError?.(status);
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (code === 'OS-PLUG-FLTR-0010' && status !== undefined && status >= 300 && status < 400) {
         const nextUrl = advanceRedirect(redirects, status, nativeHeader(headers, 'location'));
         if (nextUrl) continue;
@@ -204,8 +206,10 @@ export async function downloadEpub(
   onProgress?: (percent: number) => void,
   serverOrigin?: string,
   credentialEpoch?: number,
+  signal?: AbortSignal,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const target = assertSafeTransferTarget(
     downloadUrl,
     serverOrigin,
@@ -241,6 +245,7 @@ export async function downloadEpub(
 
   try {
     for (let attempt = 0; ; attempt += 1) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (!canSendCredential(apiKey, epoch)) {
         throw new EpubTransferError(401, false);
       }
@@ -252,6 +257,7 @@ export async function downloadEpub(
           path: destination.uri,
           apiKey,
           progress: Boolean(listener),
+          signal,
           beforeHop: () => {
             if (!canSendCredential(apiKey, epoch)) {
               throw new EpubTransferError(401, false);
@@ -260,10 +266,21 @@ export async function downloadEpub(
           onHop: (url) => {
             activeHopUrl = url;
           },
+          onHttpError: (httpStatus) => {
+            if (httpStatus === 401) {
+              markCredentialRejected(epoch, 401);
+            }
+          },
         });
         break;
       } catch (error) {
-        if (error instanceof KavitaError || error instanceof EpubTransferError) throw error;
+        if (
+          error instanceof KavitaError ||
+          error instanceof EpubTransferError ||
+          (error instanceof DOMException && error.name === 'AbortError')
+        ) {
+          throw error;
+        }
         const { code, status } = readTransferFailure(error);
         if (status === 401) {
           markCredentialRejected(epoch, 401);
@@ -271,7 +288,7 @@ export async function downloadEpub(
         const connectionFailed = code === 'OS-PLUG-FLTR-0008';
         const retryable =
           status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
-        if (attempt > 0 || !retryable || !canSendCredential(apiKey, epoch)) {
+        if (attempt > 0 || !retryable || signal?.aborted || !canSendCredential(apiKey, epoch)) {
           throw new EpubTransferError(status, connectionFailed);
         }
 
@@ -286,6 +303,9 @@ export async function downloadEpub(
         });
         await new Promise((resolve) => setTimeout(resolve, 750));
       }
+    }
+    if (signal?.aborted || !canSendCredential(apiKey, epoch)) {
+      throw new DOMException('Aborted', 'AbortError');
     }
     const stat = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
     if (stat.type !== 'file') throw new EpubValidationError('Kavita did not return an EPUB file.');
@@ -395,6 +415,7 @@ export async function cacheCover(
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     if (!allowDownload || !canSendCredential(apiKey, epoch)) throw new Error('Offline');
     try {
+      let recordedAuthRejection = false;
       await downloadFileWithRedirects({
         initialUrl: target.url,
         normalizedInitialUrl: target.normalizedUrl,
@@ -407,7 +428,22 @@ export async function cacheCover(
         beforeHop: () => {
           if (!canSendCredential(apiKey, epoch)) throw new Error('Offline');
         },
+        onHttpError: (httpStatus) => {
+          if (!recordedAuthRejection && (httpStatus === 401 || httpStatus === 403)) {
+            recordedAuthRejection = true;
+            markCredentialRejected(epoch, httpStatus);
+            recordDiagnostic({
+              category: 'response',
+              endpoint: '/api/Image/series-cover',
+              status: httpStatus,
+              detail: 'authentication',
+            });
+          }
+        },
       });
+      if (signal?.aborted || !canSendCredential(apiKey, epoch)) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)
         throw new Error('Kavita returned an empty cover.');
@@ -420,12 +456,6 @@ export async function cacheCover(
       const { status: httpStatus } = readTransferFailure(error);
       if (httpStatus === 401 || httpStatus === 403) {
         markCredentialRejected(epoch, httpStatus);
-        recordDiagnostic({
-          category: 'response',
-          endpoint: '/api/Image/series-cover',
-          status: httpStatus,
-          detail: 'authentication',
-        });
       }
       await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
         () => {},
