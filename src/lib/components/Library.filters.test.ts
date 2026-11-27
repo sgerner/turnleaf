@@ -206,7 +206,7 @@ describe('Library filter preference persistence', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
     await vi.waitFor(() => {

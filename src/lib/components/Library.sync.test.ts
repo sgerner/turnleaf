@@ -227,7 +227,7 @@ async function mountLibrary(
       onModeChange: vi.fn(),
       onApiKeyChange: options.onApiKeyChange ?? vi.fn(),
       onServerDeleted: vi.fn(),
-      onChangeServerAddress: vi.fn(),
+      onServerChange: vi.fn(),
     },
   });
   mountedInstances.push(instance);

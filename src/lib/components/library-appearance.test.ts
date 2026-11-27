@@ -123,7 +123,7 @@ describe('Library Settings appearance and palette switching', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
     flushSync();
@@ -187,7 +187,7 @@ describe('Library Settings appearance and palette switching', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
     flushSync();
@@ -241,7 +241,7 @@ describe('Library Settings appearance and palette switching', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
     flushSync();
@@ -300,7 +300,7 @@ describe('Library Settings appearance and palette switching', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
     flushSync();

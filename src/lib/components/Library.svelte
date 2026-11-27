@@ -42,11 +42,29 @@
     type CoverLoadItem,
   } from '../downloads/cover-loader';
   import { KavitaClient, KavitaError } from '../kavita/client';
+  import {
+    ADDRESS_ROTATION_MESSAGES,
+    classifyConnectionError,
+    cleanupStaleCredentials,
+    parseStaleCredentialRefs,
+    rotateServerConnection,
+    saveStaleCredentialRefs,
+    STALE_CREDENTIAL_CLEANUP_WARNING,
+    STALE_CREDENTIAL_PERSIST_FAILED_WARNING,
+    STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+    STALE_CREDENTIAL_RETRY_FAILED_WARNING,
+    STALE_CREDENTIAL_RETRY_PERSIST_FAILED_WARNING,
+    STALE_CREDENTIAL_STATUS_PERSIST_FAILED_WARNING,
+    verifyKavitaConnection,
+    type InvalidConnectionField,
+  } from '../kavita/connection';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
+  import { extractPastedOpdsUrl, normalizeServerUrl, ServerUrlError } from '../kavita/url';
   import type { ReaderLocation } from '../reader/session';
+  import { handleLibraryBack, type RegisterBackHandler } from '../native/back-button';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { clearDiagnostics, recordDiagnostic } from '../diagnostics/log';
+  import { clearDiagnostics, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
@@ -76,6 +94,7 @@
   } from '../a11y/book-labels';
   import {
     activeElement,
+    focusFirstElement,
     focusModal,
     restoreFocus,
     restoreModalFocus,
@@ -90,9 +109,13 @@
     onThemeChange,
     onModeChange,
     onApiKeyChange,
+    onServerChange,
     onServerDeleted,
-    onChangeServerAddress,
     onReaderOpenChange,
+    initialStaleCredentialRefs,
+    initialCleanupWarning,
+    onStaleCredentialRefsChange,
+    registerBackHandler,
     onOverlayActiveChange,
   }: {
     server: ServerConfig;
@@ -102,15 +125,20 @@
     onThemeChange: (theme: SkeletonTheme) => void;
     onModeChange: (mode: 'light' | 'dark') => void;
     onApiKeyChange: (apiKey: string) => void;
+    onServerChange: (server: ServerConfig, apiKey: string) => void;
     onServerDeleted: () => void;
-    onChangeServerAddress: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
+    initialStaleCredentialRefs?: readonly string[] | undefined;
+    initialCleanupWarning?: string | null | undefined;
+    onStaleCredentialRefsChange?: ((refs: string[]) => void) | undefined;
+    registerBackHandler?: RegisterBackHandler | undefined;
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
+  let activeServer = $derived(server);
   let activeApiKey = $derived(apiKey);
-  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
-  const serverOrigin = $derived(new URL(server.baseUrl).origin);
+  const client = $derived(new KavitaClient(activeServer.baseUrl, activeApiKey));
+  const serverOrigin = $derived(new URL(activeServer.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
@@ -220,7 +248,6 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
-  let readerBackHandler: (() => boolean) | null = null;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -265,6 +292,28 @@
   let appearanceError = $state('');
   let settingsError = $state('');
   let themeSwitchSequence = 0;
+  let editingServerAddress = $state(false);
+  let nextServerUrl = $state('');
+  let allowInsecureServerUrl = $state(false);
+  let savingServerAddress = $state(false);
+  let addressError = $state('');
+  let addressInvalidField = $state<InvalidConnectionField>(null);
+  let addressStatusMessage = $state('');
+  let staleCredentialRefs = $state<string[]>(
+    untrack(() =>
+      [...new Set(initialStaleCredentialRefs ?? [])].filter(
+        (ref) => Boolean(ref) && ref !== server.credentialRef,
+      ),
+    ),
+  );
+  let credentialCleanupWarning = $state(
+    untrack(
+      () =>
+        initialCleanupWarning ||
+        (staleCredentialRefs.length > 0 ? STALE_CREDENTIAL_CLEANUP_WARNING : ''),
+    ),
+  );
+  let retryingCredentialCleanup = $state(false);
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
@@ -273,6 +322,10 @@
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
+  let serverAddressEditor = $state<HTMLElement | null>(null);
+  let changeServerAddressButton = $state<HTMLButtonElement | null>(null);
+  let deleteServerButton = $state<HTMLButtonElement | null>(null);
+  let settingsTriggerButton = $state<HTMLButtonElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
@@ -313,6 +366,7 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  let removeBackHandler: (() => void) | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -397,7 +451,7 @@
   }
 
   function insecureServer(): boolean {
-    return server.baseUrl.toLowerCase().startsWith('http://');
+    return activeServer.baseUrl.toLowerCase().startsWith('http://');
   }
 
   function isMissingNativeFile(error: unknown): boolean {
@@ -688,7 +742,40 @@
     });
   });
 
+  function handleBackButton(): boolean {
+    if (destroyed) return false;
+    return handleLibraryBack(
+      {
+        hasConflict: Boolean(conflict),
+        acceptingRemoteProgress,
+        hasActionMenu: Boolean(actionMenuBook),
+        hasOpenReader: Boolean(reading),
+        resolvingOpenProgress,
+        editingServerAddress,
+        savingServerAddress,
+        confirmDeleteServer,
+        settingsBusy: replacingApiKey || deletingServer,
+        retryingCredentialCleanup,
+        settingsVisible,
+        filtersVisible,
+      },
+      {
+        closeConflict,
+        closeMenu,
+        closeReader: () => void closeReader(),
+        cancelOpenProgress: () => openProgressProbe?.abort(),
+        cancelServerAddressEdit,
+        cancelDeleteServer,
+        closeSettings,
+        hideFilters: () => {
+          filtersVisible = false;
+        },
+      },
+    );
+  }
+
   onMount(async () => {
+    if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     void cleanupInterruptedEpubDownloads();
     const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
     scrollContainer = container;
@@ -706,10 +793,32 @@
         'libraryView',
         'libraryDownloadedOnly',
         'libraryHideCompleted',
+        STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
+    const savedStaleRefs = parseStaleCredentialRefs(
+      preferences.get(STALE_CREDENTIAL_REFS_PREFERENCE_KEY),
+      activeServer.credentialRef,
+    );
+    const mergedStaleRefs = [...new Set([...savedStaleRefs, ...staleCredentialRefs])].filter(
+      (ref) => Boolean(ref) && ref !== activeServer.credentialRef,
+    );
+    if (mergedStaleRefs.length > 0) {
+      staleCredentialRefs = mergedStaleRefs;
+      credentialCleanupWarning = credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING;
+      onStaleCredentialRefsChange?.([...mergedStaleRefs]);
+      if (mergedStaleRefs.length !== savedStaleRefs.length) {
+        const persistedState = await saveStaleCredentialRefs(mergedStaleRefs, {
+          previousRefs: savedStaleRefs,
+          activeCredentialRef: activeServer.credentialRef,
+        });
+        if (!persistedState.persisted) {
+          credentialCleanupWarning = STALE_CREDENTIAL_PERSIST_FAILED_WARNING;
+        }
+      }
+    }
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
     downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
     hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
@@ -759,21 +868,6 @@
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
           if (!destroyed && !isActive) void syncProgress(false);
-        }),
-      ),
-    );
-    cleanups.push(
-      await registerListener(
-        await App.addListener('backButton', () => {
-          if (destroyed) return;
-          if (conflict) closeConflict();
-          else if (actionMenuBook) closeMenu();
-          else if (reading) {
-            if (readerBackHandler?.()) return;
-            void closeReader();
-          } else if (settingsVisible) closeSettings();
-          else if (filtersVisible) filtersVisible = false;
-          else void App.exitApp();
         }),
       ),
     );
@@ -863,6 +957,8 @@
 
   onDestroy(() => {
     destroyed = true;
+    removeBackHandler?.();
+    removeBackHandler = null;
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
@@ -1577,17 +1673,229 @@
   }
 
   function openSettings(): void {
-    settingsOpener = activeElement();
+    const active = activeElement();
+    settingsOpener = active && active !== document.body ? active : settingsTriggerButton;
     settingsVisible = true;
     focusModal(() => settingsDialog);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
+    editingServerAddress = false;
+    confirmDeleteServer = false;
+    nextServerUrl = '';
+    allowInsecureServerUrl = false;
+    addressError = '';
+    addressInvalidField = null;
+    addressStatusMessage = '';
     showReplacementKey = false;
-    const opener = settingsOpener;
+    const opener = settingsOpener ?? settingsTriggerButton;
     settingsOpener = null;
     restoreModalFocus(opener);
+  }
+
+  function openServerAddressEdit(): void {
+    confirmDeleteServer = false;
+    addressError = '';
+    addressInvalidField = null;
+    addressStatusMessage = '';
+    settingsError = '';
+    nextServerUrl = activeServer.baseUrl;
+    allowInsecureServerUrl = false;
+    editingServerAddress = true;
+    void tick().then(() => focusFirstElement(serverAddressEditor));
+  }
+
+  function cancelServerAddressEdit(): void {
+    if (savingServerAddress) return;
+    editingServerAddress = false;
+    nextServerUrl = activeServer.baseUrl;
+    allowInsecureServerUrl = false;
+    addressError = '';
+    addressInvalidField = null;
+    void tick().then(() => restoreFocus(changeServerAddressButton));
+  }
+
+  function cancelDeleteServer(): void {
+    if (deletingServer) return;
+    confirmDeleteServer = false;
+    void tick().then(() => restoreFocus(deleteServerButton));
+  }
+
+  function handleSettingsServerUrlPaste(event: ClipboardEvent): void {
+    const pasted =
+      event.clipboardData?.getData('text/plain') || event.clipboardData?.getData('text') || '';
+    const extracted = extractPastedOpdsUrl(pasted);
+    if (!extracted) return;
+    event.preventDefault();
+    nextServerUrl = extracted.baseUrl;
+    if (!replacementApiKey.trim()) replacementApiKey = extracted.apiKey;
+    addressError = '';
+    addressInvalidField = null;
+  }
+
+  async function updateServerAddress(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (savingServerAddress || replacingApiKey || deletingServer || retryingCredentialCleanup) {
+      return;
+    }
+    addressError = '';
+    addressInvalidField = null;
+    addressStatusMessage = '';
+    settingsError = '';
+    savingServerAddress = true;
+    let eventsRecorded = -1;
+    const unsubscribe = subscribeDiagnostics(() => {
+      eventsRecorded += 1;
+    });
+    let rotated = false;
+    try {
+      const normalized = normalizeServerUrl(nextServerUrl);
+      if (normalized.apiKey) {
+        nextServerUrl = normalized.baseUrl;
+        if (!replacementApiKey.trim()) replacementApiKey = normalized.apiKey;
+      }
+      if (normalized.insecure && !allowInsecureServerUrl) {
+        addressInvalidField = 'address';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'insecure-http-blocked',
+        });
+        throw new Error('Confirm that you accept an unencrypted HTTP connection.');
+      }
+      const candidateKey = replacementApiKey.trim() || normalized.apiKey || activeApiKey;
+      if (!candidateKey) {
+        addressInvalidField = 'key';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'missing-auth-key',
+        });
+        throw new Error('Enter a Kavita auth key.');
+      }
+
+      const result = await verifyKavitaConnection(normalized.baseUrl, candidateKey);
+      const rotation = await rotateServerConnection(
+        activeServer,
+        normalized.baseUrl,
+        candidateKey,
+        result.version,
+        ADDRESS_ROTATION_MESSAGES,
+        staleCredentialRefs,
+      );
+      const updatedServer = rotation.server;
+
+      // Persist and surface failed cleanup references before waiting on an upload
+      // that may outlive this screen or the app process.
+      staleCredentialRefs = rotation.staleCredentialRefs;
+      credentialCleanupWarning = rotation.cleanupWarning ?? '';
+      onStaleCredentialRefsChange?.([...rotation.staleCredentialRefs]);
+
+      // An upload started with the previous connection may still be finishing.
+      while (syncWork) await syncWork;
+      refreshController?.abort();
+      cancelCoverLoading();
+      clearCovers();
+      coverReloadRequest += 1;
+
+      const keyChanged = candidateKey !== activeApiKey;
+      activeServer = updatedServer;
+      activeApiKey = candidateKey;
+      onServerChange(updatedServer, candidateKey);
+      if (keyChanged) onApiKeyChange(candidateKey);
+      nextServerUrl = normalized.baseUrl;
+      replacementApiKey = '';
+      editingServerAddress = false;
+      allowInsecureServerUrl = false;
+      if (rotation.cleanupWarning) {
+        credentialCleanupWarning = rotation.cleanupWarning;
+        addressStatusMessage = '';
+        setMessage('');
+      } else {
+        credentialCleanupWarning = '';
+        addressStatusMessage = 'Server address updated.';
+        setMessage('Server address updated.');
+      }
+      rotated = true;
+    } catch (cause) {
+      if (cause instanceof ServerUrlError) {
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'invalid-server-url',
+        });
+      } else if (eventsRecorded === 0) {
+        if (cause instanceof KavitaError) {
+          recordDiagnostic({
+            category: cause.kind === 'invalid-response' ? 'response' : 'request',
+            endpoint: '/api/Library/libraries',
+            ...(cause.status !== undefined ? { status: cause.status } : {}),
+            detail: cause.kind,
+          });
+        } else {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/setup',
+            detail: 'setup-failed',
+          });
+        }
+      }
+      const classified = classifyConnectionError(
+        cause,
+        'Turnleaf could not update the server address.',
+      );
+      if (!addressInvalidField) addressInvalidField = classified.invalidField;
+      addressError = classified.message;
+    } finally {
+      unsubscribe();
+      savingServerAddress = false;
+    }
+    if (rotated) {
+      await tick();
+      restoreFocus(changeServerAddressButton);
+      if (!offline) {
+        await Promise.all([syncProgress(false), startRefresh(true)]);
+      }
+    }
+  }
+
+  async function retryCredentialCleanup(): Promise<void> {
+    if (staleCredentialRefs.length === 0 || retryingCredentialCleanup) return;
+    retryingCredentialCleanup = true;
+    try {
+      const previousRefs = [...staleCredentialRefs];
+      const remaining = await cleanupStaleCredentials(previousRefs, activeServer.credentialRef);
+      const persistedState = await saveStaleCredentialRefs(remaining, {
+        previousRefs,
+        activeCredentialRef: activeServer.credentialRef,
+      });
+      staleCredentialRefs = persistedState.refs;
+      onStaleCredentialRefsChange?.([...persistedState.refs]);
+      if (remaining.length > 0) {
+        credentialCleanupWarning = persistedState.persisted
+          ? STALE_CREDENTIAL_RETRY_FAILED_WARNING
+          : STALE_CREDENTIAL_RETRY_PERSIST_FAILED_WARNING;
+      } else if (!persistedState.persisted) {
+        credentialCleanupWarning = STALE_CREDENTIAL_STATUS_PERSIST_FAILED_WARNING;
+      } else {
+        credentialCleanupWarning = '';
+        if (settingsVisible) {
+          addressStatusMessage = 'Previous auth key removed from this device.';
+        }
+        setMessage('Previous auth key removed from this device.');
+        await tick();
+        if (settingsVisible) {
+          if (!settingsDialog?.contains(document.activeElement)) {
+            restoreFocus(changeServerAddressButton);
+          }
+        } else if (libraryMain && !libraryMain.contains(document.activeElement)) {
+          restoreFocus(settingsTriggerButton);
+        }
+      }
+    } finally {
+      retryingCredentialCleanup = false;
+    }
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -1663,53 +1971,57 @@
     void relocated(reading.book, location);
   }
 
-  function registerReaderBackHandler(handler: () => boolean): () => void {
-    readerBackHandler = handler;
-    return () => {
-      if (readerBackHandler === handler) readerBackHandler = null;
-    };
-  }
-
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
+    if (replacingApiKey || savingServerAddress || deletingServer || retryingCredentialCleanup) {
+      return;
+    }
     settingsError = '';
     replacingApiKey = true;
     try {
       const nextKey = replacementApiKey.trim();
       if (!nextKey) throw new Error('Enter a new Kavita auth key.');
 
-      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
-      if (result.bookLibraries.length === 0) {
-        throw new Error(
-          'This account has no book or light novel libraries. Only EPUB books are supported.',
-        );
-      }
+      const result = await verifyKavitaConnection(activeServer.baseUrl, nextKey);
 
+      const previousKey = activeApiKey;
       const updatedServer: ServerConfig = {
-        ...server,
+        ...activeServer,
         kavitaVersion: result.version,
         lastConnectedAt: new Date().toISOString(),
       };
-      await saveApiKey(server.credentialRef, nextKey);
-      await saveServer(updatedServer);
+      await saveApiKey(activeServer.credentialRef, nextKey);
+      try {
+        await saveServer(updatedServer);
+      } catch (storageError) {
+        await saveApiKey(activeServer.credentialRef, previousKey).catch(() => {});
+        throw storageError;
+      }
       // An upload started with the previous key may still be finishing.
       while (syncWork) await syncWork;
       refreshController?.abort();
+      activeServer = updatedServer;
       activeApiKey = nextKey;
+      onServerChange(updatedServer, nextKey);
       onApiKeyChange(nextKey);
       replacementApiKey = '';
       setMessage('API key updated.');
       closeSettings();
       await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
-      settingsError =
-        cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
+      settingsError = classifyConnectionError(
+        cause,
+        'Turnleaf could not update the API key.',
+      ).message;
     } finally {
       replacingApiKey = false;
     }
   }
 
   async function deleteServer(): Promise<void> {
+    if (deletingServer || savingServerAddress || replacingApiKey || retryingCredentialCleanup) {
+      return;
+    }
     settingsError = '';
     deletingServer = true;
     try {
@@ -1718,10 +2030,22 @@
       await clearCoverCache().catch(() => {});
       clearCovers();
       if (!credentialCleanupComplete) {
-        await removeApiKey(server.credentialRef);
+        const hadStaleRefs = staleCredentialRefs.length > 0;
+        for (const ref of [...staleCredentialRefs]) {
+          if (ref !== activeServer.credentialRef) {
+            await removeApiKey(ref);
+            staleCredentialRefs = staleCredentialRefs.filter((item) => item !== ref);
+          }
+        }
+        if (hadStaleRefs) {
+          await setPreference(STALE_CREDENTIAL_REFS_PREFERENCE_KEY, '[]');
+        }
+        credentialCleanupWarning = '';
+        onStaleCredentialRefsChange?.([]);
+        await removeApiKey(activeServer.credentialRef);
         credentialCleanupComplete = true;
       }
-      await removeServer(server.id);
+      await removeServer(activeServer.id);
       await clearDiagnostics();
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
@@ -1758,7 +2082,7 @@
         ? undefined
         : retryReaderDownload}
       onMountChange={onReaderOpenChange}
-      registerBackHandler={registerReaderBackHandler}
+      {...registerBackHandler ? { registerBackHandler } : {}}
     />
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
@@ -1795,6 +2119,7 @@
       </div>
       <div class="card preset-tonal-surface flex shrink-0 gap-1 p-1">
         <button
+          bind:this={settingsTriggerButton}
           class="btn btn-sm preset-tonal-surface h-11 w-11 !p-0"
           type="button"
           onclick={openSettings}
@@ -2159,6 +2484,24 @@
             </button>
           {/if}
         {/if}
+      </div>
+    {/if}
+    {#if staleCredentialRefs.length > 0 && !settingsVisible}
+      <div
+        class="alert preset-tonal-warning mt-4 flex flex-wrap items-center justify-between gap-3"
+        role="status"
+      >
+        <p class="min-w-0 flex-1">
+          {credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING}
+        </p>
+        <button
+          class="btn btn-sm preset-tonal-warning min-h-11 shrink-0"
+          type="button"
+          onclick={() => void retryCredentialCleanup()}
+          disabled={retryingCredentialCleanup || savingServerAddress}
+        >
+          {retryingCredentialCleanup ? 'Cleaning up…' : 'Retry cleanup'}
+        </button>
       </div>
     {/if}
     {#if syncStatus.pendingCount > 0}
@@ -2774,7 +3117,20 @@
   <DialogShell
     bind:dialogElement={settingsDialog}
     labelledBy="library-settings-title"
-    onClose={closeSettings}
+    onClose={() => {
+      if (editingServerAddress) {
+        cancelServerAddressEdit();
+      } else if (confirmDeleteServer) {
+        cancelDeleteServer();
+      } else if (
+        !savingServerAddress &&
+        !replacingApiKey &&
+        !deletingServer &&
+        !retryingCredentialCleanup
+      ) {
+        closeSettings();
+      }
+    }}
   >
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
@@ -2783,6 +3139,10 @@
           class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
           type="button"
           onclick={closeSettings}
+          disabled={savingServerAddress ||
+            replacingApiKey ||
+            deletingServer ||
+            retryingCredentialCleanup}
           aria-label="Close settings"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -2910,24 +3270,125 @@
       <dl class="mt-3 space-y-2 text-sm">
         <div class="flex items-center justify-between gap-3">
           <dt class="text-surface-700-300">Server</dt>
-          <dd class="truncate text-right">{server.displayName}</dd>
+          <dd class="truncate text-right">{activeServer.displayName}</dd>
         </div>
         <div class="flex items-center justify-between gap-3">
           <dt class="text-surface-700-300">Address</dt>
-          <dd class="truncate text-right">{server.baseUrl}</dd>
+          <dd class="truncate text-right">{activeServer.baseUrl}</dd>
         </div>
       </dl>
-      <button
-        class="btn preset-tonal-surface mt-3"
-        type="button"
-        disabled={Boolean(downloadingBookId) ||
-          cleanupInProgress ||
-          replacingApiKey ||
-          deletingServer}
-        onclick={onChangeServerAddress}
-      >
-        Change server address
-      </button>
+      {#if editingServerAddress}
+        <form
+          bind:this={serverAddressEditor}
+          class="mt-3 grid gap-3 rounded-xl preset-tonal-surface p-4"
+          novalidate
+          onsubmit={updateServerAddress}
+        >
+          <label class="label">
+            <span class="label-text">New Kavita server address</span>
+            <input
+              id="settings-server-url"
+              class="input min-h-11"
+              type="url"
+              inputmode="url"
+              autocomplete="url"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              placeholder="https://books.example.com"
+              bind:value={nextServerUrl}
+              onpaste={handleSettingsServerUrlPaste}
+              aria-invalid={addressInvalidField === 'address' || undefined}
+              aria-describedby={addressError ? 'settings-address-error' : undefined}
+              disabled={savingServerAddress}
+              required
+            />
+          </label>
+          <p class="text-xs text-surface-700-300">
+            Use this only when the new address reaches the same Kavita server and libraries. Leave
+            Replace API key blank to keep your current key, or paste a Kavita OPDS URL.
+          </p>
+          {#if nextServerUrl.trim().toLowerCase().startsWith('http://')}
+            <label
+              class="card preset-tonal-warning flex min-h-12 items-start gap-3 p-3 text-sm"
+              transition:fade
+            >
+              <input
+                class="checkbox mt-0.5"
+                type="checkbox"
+                bind:checked={allowInsecureServerUrl}
+                disabled={savingServerAddress}
+              />
+              <span>
+                Allow plain HTTP. Anyone on this network may be able to observe your reading traffic
+                and auth key.
+              </span>
+            </label>
+          {/if}
+          <div
+            id="settings-address-error"
+            role="alert"
+            class:alert={addressError}
+            class:preset-tonal-error={addressError}
+          >
+            {addressError}
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn preset-filled-primary-700-300 min-h-11"
+              type="submit"
+              disabled={savingServerAddress}
+            >
+              {savingServerAddress ? 'Testing…' : 'Save address'}
+            </button>
+            <button
+              class="btn preset-tonal-surface min-h-11"
+              type="button"
+              onclick={cancelServerAddressEdit}
+              disabled={savingServerAddress}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      {:else}
+        <button
+          bind:this={changeServerAddressButton}
+          class="btn preset-tonal-surface mt-3 min-h-11"
+          type="button"
+          disabled={Boolean(downloadingBookId) ||
+            cleanupInProgress ||
+            retryingCredentialCleanup ||
+            savingServerAddress ||
+            replacingApiKey ||
+            deletingServer}
+          onclick={openServerAddressEdit}
+        >
+          Change server address
+        </button>
+      {/if}
+      {#if staleCredentialRefs.length > 0}
+        <div
+          id="settings-credential-cleanup-warning"
+          class="alert preset-tonal-warning mt-3 flex flex-wrap items-center justify-between gap-3"
+          role="alert"
+        >
+          <p class="min-w-0 flex-1 text-sm">
+            {credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING}
+          </p>
+          <button
+            class="btn btn-sm preset-tonal-warning min-h-11 shrink-0"
+            type="button"
+            onclick={() => void retryCredentialCleanup()}
+            disabled={retryingCredentialCleanup || savingServerAddress || deletingServer}
+          >
+            {retryingCredentialCleanup ? 'Cleaning up…' : 'Retry cleanup'}
+          </button>
+        </div>
+      {/if}
+      {#if addressStatusMessage}
+        <p class="mt-2 text-sm text-surface-700-300" role="status">{addressStatusMessage}</p>
+      {/if}
       {#if insecureServer()}
         <div class="alert preset-tonal-warning mt-4" role="alert">
           Plain HTTP is enabled. Anyone on this network may be able to observe your reading traffic
@@ -2935,33 +3396,41 @@
         </div>
       {/if}
 
-      <form class="mt-4 grid gap-3" onsubmit={updateApiKey}>
+      <form class="mt-4 grid gap-3" novalidate onsubmit={updateApiKey}>
         <div class="label">
           <label for="replacement-api-key" class="label-text">Replace API key</label>
           <div class="flex flex-wrap gap-2">
             <input
               id="replacement-api-key"
-              class="input min-w-0 flex-1 max-w-96"
+              class="input min-h-11 min-w-0 max-w-96 flex-1"
               type={showReplacementKey ? 'text' : 'password'}
+              autocapitalize="none"
+              autocorrect="off"
               spellcheck="false"
               autocomplete="off"
               bind:value={replacementApiKey}
               placeholder="Enter a new Kavita key"
-              aria-invalid={settingsError ? true : undefined}
-              aria-describedby={settingsError ? 'settings-key-error' : undefined}
+              disabled={replacingApiKey || savingServerAddress || deletingServer}
+              aria-invalid={Boolean(settingsError) || addressInvalidField === 'key' || undefined}
+              aria-describedby={settingsError
+                ? 'settings-key-error'
+                : addressInvalidField === 'key' && addressError
+                  ? 'settings-address-error'
+                  : undefined}
               required
             />
             <button
-              class="btn preset-tonal-surface"
+              class="btn preset-tonal-surface min-h-11"
               type="button"
+              disabled={replacingApiKey || savingServerAddress || deletingServer}
               onclick={() => (showReplacementKey = !showReplacementKey)}
             >
               {showReplacementKey ? 'Hide key' : 'Show key'}
             </button>
             <button
-              class="btn preset-filled-primary-700-300 shrink-0"
+              class="btn preset-filled-primary-700-300 min-h-11 shrink-0"
               type="submit"
-              disabled={replacingApiKey}
+              disabled={replacingApiKey || savingServerAddress || deletingServer}
             >
               {replacingApiKey ? 'Testing...' : 'Save'}
             </button>
@@ -2979,10 +3448,16 @@
           {settingsError}
         </div>
         <button
-          class="btn preset-tonal-error"
+          bind:this={deleteServerButton}
+          class="btn preset-tonal-error min-h-11"
           type="button"
-          onclick={() => (confirmDeleteServer = true)}
-          disabled={deletingServer}
+          onclick={() => {
+            editingServerAddress = false;
+            addressError = '';
+            addressInvalidField = null;
+            confirmDeleteServer = true;
+          }}
+          disabled={deletingServer || savingServerAddress || retryingCredentialCleanup}
         >
           Delete server
         </button>
@@ -3022,7 +3497,7 @@
         </div>
       </dl>
     </section>
-    <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
+    <DiagnosticsPanel kavitaVersion={activeServer.kavitaVersion} />
     {#if confirmDeleteServer}
       <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
         <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
@@ -3042,7 +3517,7 @@
           <button
             class="btn preset-tonal-surface"
             type="button"
-            onclick={() => (confirmDeleteServer = false)}
+            onclick={cancelDeleteServer}
             disabled={deletingServer}
           >
             Cancel

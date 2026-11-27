@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
-  import { onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
@@ -14,6 +15,11 @@
     resetLocalDatabase,
     type ServerConfig,
   } from './lib/database/database';
+  import {
+    parseStaleCredentialRefs,
+    STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+  } from './lib/kavita/connection';
+  import { createBackButtonStack } from './lib/native/back-button';
   import { getApiKey } from './lib/native/credentials';
   import {
     DEFAULT_MODE,
@@ -59,25 +65,41 @@
   let booting = $state(Capacitor.isNativePlatform());
   let startupError = $state('');
   let repairing = $state(false);
-  let changingServerAddress = $state(false);
+  let autoFocusOnboarding = $state(false);
   let apiKey = $state<string | null>(null);
+  let staleCredentialRefs = $state<string[]>([]);
+  let credentialCleanupWarning = $state<string | null>(null);
   let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
+  const backStack = createBackButtonStack({
+    exitApp: () => {
+      void Promise.resolve()
+        .then(() => App.exitApp())
+        .catch(() => {});
+    },
+  });
+  const registerBackHandler = backStack.register;
 
   async function loadLocalData(): Promise<void> {
     booting = true;
     startupError = '';
     server = null;
     apiKey = null;
+    staleCredentialRefs = [];
+    credentialCleanupWarning = null;
     readerOpen = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
         getServer(),
-        getPreferences([themePreferenceKey, modePreferenceKey]),
+        getPreferences([
+          themePreferenceKey,
+          modePreferenceKey,
+          STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+        ]),
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
@@ -91,6 +113,10 @@
       if (savedTheme !== undefined || savedMode !== undefined) {
         writeBootThemeCache(resolvedTheme, resolvedMode);
       }
+      staleCredentialRefs = parseStaleCredentialRefs(
+        preferences.get(STALE_CREDENTIAL_REFS_PREFERENCE_KEY),
+        saved?.credentialRef,
+      );
       if (saved) {
         server = saved;
         try {
@@ -118,9 +144,28 @@
     }
   }
 
+  let destroyed = false;
+  let backListenerHandle: { remove: () => Promise<void> } | null = null;
+
   onMount(() => {
+    void App.addListener('backButton', () => {
+      if (destroyed || booting || repairing) return;
+      backStack.dispatch();
+    })
+      .then((handle) => {
+        if (destroyed) void handle.remove();
+        else backListenerHandle = handle;
+      })
+      .catch(() => {});
+
     void hydrateDiagnostics();
     void loadLocalData();
+  });
+
+  onDestroy(() => {
+    destroyed = true;
+    void backListenerHandle?.remove();
+    backListenerHandle = null;
   });
 
   async function repairLocalData(): Promise<void> {
@@ -224,7 +269,7 @@
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
         </div>
       </main>
-    {:else if server && apiKey && !changingServerAddress}
+    {:else if server && apiKey}
       <Library
         {server}
         {apiKey}
@@ -233,16 +278,23 @@
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
-        onReaderOpenChange={(open) => (readerOpen = open)}
-        onChangeServerAddress={() => {
-          readerOpen = false;
-          changingServerAddress = true;
+        onServerChange={(updatedServer, nextKey) => {
+          server = updatedServer;
+          apiKey = nextKey;
         }}
+        onReaderOpenChange={(open) => (readerOpen = open)}
         onServerDeleted={() => {
           readerOpen = false;
+          autoFocusOnboarding = true;
+          staleCredentialRefs = [];
+          credentialCleanupWarning = null;
           server = null;
           apiKey = null;
         }}
+        initialStaleCredentialRefs={staleCredentialRefs}
+        initialCleanupWarning={credentialCleanupWarning}
+        onStaleCredentialRefsChange={(refs) => (staleCredentialRefs = refs)}
+        {registerBackHandler}
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
     {:else if startupError}
@@ -250,7 +302,7 @@
         <p>{startupError}</p>
         <div class="flex flex-wrap gap-2">
           <button
-            class="btn btn-sm preset-filled-error-500 !text-sm"
+            class="btn btn-sm preset-filled-error-500 min-h-11 !text-sm"
             type="button"
             onclick={() => void loadLocalData()}
             disabled={repairing}
@@ -259,15 +311,18 @@
           </button>
           {#if server}
             <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
+              class="btn btn-sm preset-tonal-surface min-h-11 !text-sm"
               type="button"
-              onclick={() => (startupError = '')}
+              onclick={() => {
+                autoFocusOnboarding = true;
+                startupError = '';
+              }}
             >
               Enter auth key
             </button>
           {:else}
             <button
-              class="btn btn-sm preset-tonal-error !text-sm"
+              class="btn btn-sm preset-tonal-error min-h-11 !text-sm"
               type="button"
               disabled={repairing}
               onclick={() => {
@@ -289,12 +344,15 @@
     {:else}
       <Onboarding
         savedServer={server}
-        editAddress={changingServerAddress}
-        onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
-        onConnected={(connected, key) => {
+        autoFocus={autoFocusOnboarding}
+        previousStaleCredentialRefs={staleCredentialRefs}
+        {registerBackHandler}
+        onConnected={(connected, key, nextStaleRefs = [], nextCleanupWarning = null) => {
+          autoFocusOnboarding = false;
+          staleCredentialRefs = [...nextStaleRefs];
+          credentialCleanupWarning = nextCleanupWarning;
           apiKey = key;
           server = connected;
-          changingServerAddress = false;
         }}
       />
     {/if}

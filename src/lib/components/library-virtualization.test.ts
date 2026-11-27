@@ -366,7 +366,7 @@ describe('Library virtual DOM caching and containment', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
 
@@ -532,7 +532,7 @@ describe('Library virtual DOM caching and containment', () => {
         onModeChange: vi.fn(),
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
+        onServerChange: vi.fn(),
       },
     });
 
