@@ -6,6 +6,7 @@ import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
   getPendingSync,
+  getSyncStatus,
   reconcileBooks,
   saveLocalProgress,
   saveServer,
@@ -268,6 +269,36 @@ afterEach(async () => {
 });
 
 describe('Library concurrent progress uploads and catalog refreshes', () => {
+  it('does not start another refresh for a connected event while already online', async () => {
+    let seriesRequests = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Series/v2') {
+        seriesRequests += 1;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Android can report a new connected network during a Wi-Fi-to-cellular handoff.
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(seriesRequests).toBe(1);
+  });
+
   it('starts saveProgress on online mount without awaiting catalog pagination and retains local progress', async () => {
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[4]', 0.4);
 
@@ -631,5 +662,175 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('replays deferred sync attempts after resolvingOpenProgress or dismissing a conflict dialog', async () => {
+    let progressSaveCount = 0;
+    const verifyGate = deferred<{ relativePath: string; webViewUrl: string }>();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        progressSaveCount += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Reader/get-progress') {
+        return jsonResponse({
+          libraryId: 1,
+          seriesId: 1,
+          volumeId: 1,
+          chapterId: 10,
+          pageNum: 75,
+          bookScrollId: '//body/p[75]',
+          lastModifiedUtc: '2026-09-08T00:00:00.000Z',
+        });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
+    verifyDownloadedEpubMock.mockImplementationOnce(() => verifyGate.promise);
+
+    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
+    flushSync();
+
+    for (const listener of appStateListeners) listener({ isActive: false });
+    expect(progressSaveCount).toBe(0);
+
+    verifyGate.resolve({ relativePath: 'books/book-1.epub', webViewUrl: 'blob:book-1' });
+    await waitForCondition(() => Boolean(target.textContent?.includes('Continue from Kavita')));
+    expect(progressSaveCount).toBe(0);
+
+    const cancelButton = Array.from(target.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Cancel',
+    );
+    expect(cancelButton).toBeDefined();
+    cancelButton!.click();
+    flushSync();
+
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    expect(progressSaveCount).toBe(1);
+  });
+
+  it('replaces a stalled pre-disconnect upload on reconnect without recording a failure and aborts on unmount', async () => {
+    const secondBook: BookRecord = {
+      ...seededBook,
+      id: 'server-1:1:11',
+      chapterId: 11,
+      title: 'The Dispossessed',
+    };
+    await reconcileBooks(server.id, [seededBook, secondBook]);
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/6)', '//body/p[6]', 0.45, 1);
+    await saveLocalProgress(secondBook, 'epubcfi(/6/6!/4/4)', '//body/p[4]', 0.3, 1);
+
+    const progressSignals: Array<AbortSignal | undefined> = [];
+    const firstUploadStarted = deferred<void>();
+    const releaseFirstUploadAfterReconnect = deferred<Response>();
+    const unmountUploadStarted = deferred<void>();
+    let uploadAttempt = 0;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        uploadAttempt += 1;
+        progressSignals.push(init?.signal ?? undefined);
+        if (uploadAttempt === 1) {
+          // Simulate a held request that only settles after disconnect + reconnect.
+          firstUploadStarted.resolve();
+          return releaseFirstUploadAfterReconnect.promise;
+        }
+        if (uploadAttempt <= 3) {
+          return new Response(null, { status: 204 });
+        }
+        unmountUploadStarted.resolve();
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          );
+        });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { instance } = await mountLibrary();
+    await firstUploadStarted.promise;
+
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    expect(progressSignals[0]?.aborted).toBe(false);
+
+    // Reconnect before the held upload settles: schedules one retry behind its settlement.
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    expect(progressSignals[0]?.aborted).toBe(true);
+    expect(uploadAttempt).toBe(1);
+
+    // Let the aborted pre-disconnect request finally reject after reconnect; queued retry flushes both books.
+    releaseFirstUploadAfterReconnect.reject(new DOMException('Aborted', 'AbortError'));
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    expect(uploadAttempt).toBe(3);
+
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/10)', '//body/p[10]', 0.6, 1);
+    for (const listener of appStateListeners) listener({ isActive: false });
+    await unmountUploadStarted.promise;
+
+    const index = mountedInstances.indexOf(instance);
+    if (index >= 0) mountedInstances.splice(index, 1);
+    await unmount(instance);
+
+    expect(progressSignals[3]?.aborted).toBe(true);
+    await expect(getSyncStatus(server.id)).resolves.toMatchObject({
+      pendingCount: 1,
+      failedCount: 0,
+      lastError: null,
+    });
+  });
+
+  it('refreshes syncStatus immediately when local progress is saved offline', async () => {
+    networkConnected = false;
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({}));
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-actions]')));
+
+    target.querySelector<HTMLButtonElement>('[data-book-actions]')!.click();
+    flushSync();
+
+    const markReadButton = Array.from(target.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Mark as read',
+    );
+    expect(markReadButton).toBeDefined();
+    markReadButton!.click();
+
+    await waitForCondition(() =>
+      Boolean(target.textContent?.includes('1 reading progress update waiting to sync.')),
+    );
   });
 });

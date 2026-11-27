@@ -4,7 +4,7 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import type { KavitaClient } from '../kavita/client';
+import { KavitaError, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 import {
   clearUnconfirmedUploads,
@@ -23,10 +23,7 @@ export {
   UNCONFIRMED_SYNC_STORAGE_KEY,
 };
 
-export type CanSendProgress = () => boolean | Promise<boolean>;
-
 interface ActiveFlush {
-  canSend: CanSendProgress | undefined;
   client: KavitaClient;
   controller: AbortController;
   outcome: Promise<void>;
@@ -116,14 +113,10 @@ export function flushProgress(
   client: KavitaClient,
   serverId: string,
   signal?: AbortSignal,
-  canSend?: CanSendProgress,
 ): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
   const existing = flushing.get(serverId);
   if (existing && existing.client === client && !existing.controller.signal.aborted) {
-    if (canSend && !existing.canSend) {
-      existing.canSend = canSend;
-    }
     return attachCaller(existing, signal);
   }
   existing?.controller.abort();
@@ -131,7 +124,6 @@ export function flushProgress(
   const subscribers = new Set<symbol>();
 
   const entry: ActiveFlush = {
-    canSend,
     client,
     controller,
     outcome: Promise.resolve(),
@@ -143,7 +135,7 @@ export function flushProgress(
       await existing.settlement;
     }
     if (controller.signal.aborted) return;
-    await run(client, serverId, controller.signal, () => entry.canSend);
+    await run(client, serverId, controller.signal);
   })();
   const settlement = outcome.then(
     () => undefined,
@@ -158,16 +150,11 @@ export function flushProgress(
   return attachCaller(entry, signal);
 }
 
-async function run(
-  client: KavitaClient,
-  serverId: string,
-  signal: AbortSignal,
-  getCanSend: () => CanSendProgress | undefined,
-): Promise<void> {
+async function run(client: KavitaClient, serverId: string, signal: AbortSignal): Promise<void> {
   const failures = new Map<string, unknown>();
   const attempted = new Map<string, PendingSyncItem>();
-  let paused = false;
-  while (!signal.aborted && !paused) {
+  let stoppedByTransport = false;
+  while (!signal.aborted && !stoppedByTransport) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
@@ -188,14 +175,6 @@ async function run(
 
       let serverUpdatedAt = hasMatchingUpload ? cached.serverUpdatedAt : undefined;
       if (!serverUpdatedAt) {
-        const guard = getCanSend();
-        if (guard) {
-          const allowed = guard();
-          if (!(allowed instanceof Promise ? await allowed : allowed)) {
-            paused = true;
-            break;
-          }
-        }
         if (signal.aborted) break;
         attempted.set(item.bookId, item);
         try {
@@ -213,6 +192,10 @@ async function run(
           });
         } catch (uploadError) {
           if (signal.aborted) break;
+          if (uploadError instanceof KavitaError && uploadError.transportDenied) {
+            stoppedByTransport = true;
+            break;
+          }
           try {
             await markSyncFailure(
               item.bookId,

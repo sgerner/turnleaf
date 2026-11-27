@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -50,6 +51,8 @@ export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
+    private readonly beforeNativeRequest?:
+      ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -158,6 +161,7 @@ export class KavitaClient {
     } catch (error) {
       const retryable =
         error instanceof KavitaError &&
+        !error.transportDenied &&
         (error.kind === 'network' ||
           (error.kind === 'server' &&
             error.status !== undefined &&
@@ -193,6 +197,14 @@ export class KavitaClient {
       return this.nativeRequest<T>(path, init, commitOnSuccessWhenAborted);
     }
     if (init.signal?.aborted) throw abortError();
+    if (this.beforeNativeRequest) {
+      const allowed = this.beforeNativeRequest(init.signal ?? undefined);
+      const ok = typeof allowed === 'boolean' ? allowed : await allowed;
+      if (init.signal?.aborted) throw abortError();
+      if (!ok) {
+        throw new KavitaError('No network connection.', 'network', undefined, true);
+      }
+    }
     return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
       try {
         const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
@@ -253,6 +265,43 @@ export class KavitaClient {
       let response: HttpResponse;
       while (true) {
         if (init.signal?.aborted) throw abortError();
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          throw new KavitaError(
+            'Kavita could not be reached while offline.',
+            'network',
+            undefined,
+            true,
+          );
+        }
+        if (this.beforeNativeRequest) {
+          if (!(await this.beforeNativeRequest(init.signal ?? undefined))) {
+            if (init.signal?.aborted) throw abortError();
+            throw new KavitaError('No network connection.', 'network', undefined, true);
+          }
+        } else {
+          const networkStatus = await Network.getStatus().catch(() => null);
+          if (init.signal?.aborted) throw abortError();
+          if (
+            networkStatus?.connected !== true ||
+            (typeof navigator !== 'undefined' && navigator.onLine === false)
+          ) {
+            throw new KavitaError(
+              'Kavita could not be reached while offline.',
+              'network',
+              undefined,
+              true,
+            );
+          }
+        }
+        if (init.signal?.aborted) throw abortError();
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          throw new KavitaError(
+            'Kavita could not be reached while offline.',
+            'network',
+            undefined,
+            true,
+          );
+        }
         // CapacitorHttp has no native request cancellation API. Always await the real
         // native settlement rather than racing AbortSignal so callers can serialize
         // replacement writes and observe server-committed responses accurately.

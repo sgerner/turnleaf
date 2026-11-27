@@ -8,6 +8,7 @@ export class KavitaError extends Error {
     message: string,
     readonly kind: 'network' | 'authentication' | 'server' | 'invalid-response',
     readonly status?: number | undefined,
+    readonly transportDenied = false,
   ) {
     super(message);
   }

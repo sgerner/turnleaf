@@ -21,6 +21,7 @@ export class EpubTransferError extends Error {
   constructor(
     readonly status: number | undefined,
     readonly connectionFailed: boolean,
+    readonly transportDenied = false,
   ) {
     super('The EPUB transfer failed.');
   }
@@ -156,6 +157,7 @@ async function downloadFileWithRedirects(options: {
   readTimeout?: number;
   signal?: AbortSignal | undefined;
   onHop?: ((url: string) => void) | undefined;
+  beforeTransfer?: ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined;
 }): Promise<void> {
   const redirects = createRedirectState(
     options.initialUrl,
@@ -164,6 +166,11 @@ async function downloadFileWithRedirects(options: {
     options.normalizedInitialUrl,
   );
   while (true) {
+    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (options.beforeTransfer && !(await options.beforeTransfer(options.signal))) {
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      throw new EpubTransferError(undefined, true, true);
+    }
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.onHop?.(redirects.currentUrl);
     try {
@@ -196,6 +203,7 @@ export async function downloadEpub(
   bookId: string,
   onProgress?: (percent: number) => void,
   serverOrigin?: string,
+  beforeTransfer?: ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
   const target = assertSafeTransferTarget(
@@ -240,10 +248,11 @@ export async function downloadEpub(
           onHop: (url) => {
             activeHopUrl = url;
           },
+          beforeTransfer,
         });
         break;
       } catch (error) {
-        if (error instanceof KavitaError) throw error;
+        if (error instanceof KavitaError || error instanceof EpubTransferError) throw error;
         const { code, status } = readTransferFailure(error);
         const connectionFailed = code === 'OS-PLUG-FLTR-0008';
         const retryable =
@@ -345,8 +354,9 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
-  allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
+  allowDownload = true,
   serverOrigin?: string,
+  beforeTransfer?: ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const target = assertSafeTransferTarget(
@@ -361,15 +371,11 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const permitted = typeof allowDownload === 'function' ? await allowDownload() : allowDownload;
-    if (!permitted) throw new Error('Offline');
+    if (!allowDownload) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
     try {
-      const stillPermitted =
-        typeof allowDownload === 'function' ? await allowDownload() : allowDownload;
-      if (!stillPermitted) throw new Error('Offline');
       await downloadFileWithRedirects({
         initialUrl: target.url,
         normalizedInitialUrl: target.normalizedUrl,
@@ -379,6 +385,7 @@ export async function cacheCover(
         connectTimeout: 5_000,
         readTimeout: 5_000,
         signal,
+        beforeTransfer,
       });
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)

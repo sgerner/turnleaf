@@ -14,6 +14,7 @@ const nativeEnv = vi.hoisted(() => ({
   dataDir: '',
   database: null as DatabaseSync | null,
   isOpen: false,
+  connected: true,
   failConfirmSyncOnce: false,
   httpRequest: vi.fn(),
   createAdapter: null as (() => unknown) | null,
@@ -26,6 +27,15 @@ vi.mock('@capacitor/core', () => ({
   CapacitorHttp: {
     request: (...args: unknown[]) => nativeEnv.httpRequest(...args),
     get: vi.fn(),
+  },
+}));
+
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: nativeEnv.connected,
+      connectionType: nativeEnv.connected ? 'wifi' : 'none',
+    })),
   },
 }));
 
@@ -193,6 +203,7 @@ beforeEach(() => {
   mkdirSync(nativeEnv.dataDir, { recursive: true });
   nativeEnv.database = null;
   nativeEnv.isOpen = false;
+  nativeEnv.connected = true;
   nativeEnv.failConfirmSyncOnce = false;
   nativeEnv.httpRequest.mockReset();
   nativeEnv.createAdapter = createSqliteAdapter;
@@ -371,8 +382,7 @@ it('records a server-accepted native upload even when the caller aborted before 
   });
 });
 
-it('stops before dispatching saveProgress when connectivity drops during native pre-upload reads', async () => {
-  const { Filesystem } = await import('@capacitor/filesystem');
+it('stops between queued books via beforeNativeRequest when connectivity drops without failing skipped items', async () => {
   const {
     getPendingSync,
     getReadingState,
@@ -384,41 +394,58 @@ it('stops before dispatching saveProgress when connectivity drops during native 
   const { KavitaClient } = await import('../kavita/client');
   const { flushProgress } = await import('./sync');
 
+  const secondBook = {
+    ...book,
+    id: 'primary:1:30',
+    chapterId: 30,
+    title: 'Native Book Two',
+  };
+  const thirdBook = {
+    ...book,
+    id: 'primary:1:31',
+    chapterId: 31,
+    title: 'Native Book Three',
+  };
+
   await saveServer(server);
-  await reconcileBooks(server.id, [book]);
+  await reconcileBooks(server.id, [book, secondBook, thirdBook]);
   await saveLocalProgress(book, 'epubcfi(/6/2!/4/12)', '//body/p[12]', 0.35);
+  await saveLocalProgress(secondBook, 'epubcfi(/6/4!/4/4)', '//body/p[4]', 0.2);
+  await saveLocalProgress(thirdBook, 'epubcfi(/6/6!/4/8)', '//body/p[8]', 0.5);
 
   let online = true;
-  vi.mocked(Filesystem.readFile).mockImplementationOnce(async () => {
-    online = false;
-    throw new Error('File does not exist');
+  let gateCalls = 0;
+  nativeEnv.httpRequest.mockImplementation(async () => {
+    if (nativeEnv.httpRequest.mock.calls.length === 1) {
+      online = false;
+    }
+    return { status: 200, headers: {}, url: '', data: '' };
   });
-  nativeEnv.httpRequest.mockResolvedValue({ status: 200, headers: {}, url: '', data: '' });
 
-  const client = new KavitaClient(server.baseUrl, 'native-key');
-  await expect(
-    flushProgress(client, server.id, undefined, async () => online),
-  ).resolves.toBeUndefined();
+  const client = new KavitaClient(server.baseUrl, 'native-key', async () => {
+    gateCalls += 1;
+    return online;
+  });
+  await expect(flushProgress(client, server.id)).resolves.toBeUndefined();
 
-  expect(nativeEnv.httpRequest).not.toHaveBeenCalled();
+  // First book uploaded and confirmed; second book denied by beforeNativeRequest; third book never visited.
+  expect(nativeEnv.httpRequest).toHaveBeenCalledTimes(1);
+  expect(gateCalls).toBe(2);
   const stillPending = await getPendingSync(server.id);
-  expect(stillPending).toHaveLength(1);
-  expect(stillPending[0]?.bookId).toBe(book.id);
+  expect(stillPending.map((item) => item.bookId)).toEqual([secondBook.id, thirdBook.id]);
   await expect(getSyncStatus(server.id)).resolves.toMatchObject({
-    pendingCount: 1,
+    pendingCount: 2,
     failedCount: 0,
     lastError: null,
   });
 
   online = true;
-  await expect(
-    flushProgress(client, server.id, undefined, async () => online),
-  ).resolves.toBeUndefined();
-  expect(nativeEnv.httpRequest).toHaveBeenCalledTimes(1);
+  await expect(flushProgress(client, server.id)).resolves.toBeUndefined();
+  expect(nativeEnv.httpRequest).toHaveBeenCalledTimes(3);
   expect(await getPendingSync(server.id)).toEqual([]);
-  expect(await getReadingState(book.id)).toMatchObject({
-    cfi: 'epubcfi(/6/2!/4/12)',
-    xpath: '//body/p[12]',
+  expect(await getReadingState(thirdBook.id)).toMatchObject({
+    cfi: 'epubcfi(/6/6!/4/8)',
+    xpath: '//body/p[8]',
     pendingSync: false,
   });
 });

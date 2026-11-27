@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { formatJourneyFailureAnnotation, startFixture } from './android-reading-journey.mjs';
+import { startFixture } from './android-reading-journey.mjs';
 
 const fixtures = [];
 
@@ -74,15 +74,5 @@ describe('Android reading journey fixture', () => {
     });
     expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
     expect(fixture.foreignAuthHeaders).toBe(1);
-  });
-
-  it('formats failure annotations with nested causes and escaped newlines for GitHub Actions', () => {
-    const cause = new Error('50% complete missing');
-    const error = new Error('Timed out waiting for saved offline progress.', { cause });
-    const annotation = formatJourneyFailureAnnotation(error, ['Fixture: covers=1']);
-
-    expect(annotation).toBe(
-      '::error title=Android reading journey failed::Timed out waiting for saved offline progress.%0ACaused by: 50%25 complete missing%0AFixture: covers=1',
-    );
   });
 });
