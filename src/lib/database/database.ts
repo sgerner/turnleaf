@@ -7,6 +7,7 @@ import {
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
+import { clearUnconfirmedUploads, deleteUnconfirmedUpload } from '../sync/unconfirmed-uploads';
 import type { KavitaProgress } from '../kavita/types';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 import { migrations } from './schema';
@@ -237,6 +238,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 
 export async function resetLocalDatabase(): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
+    await clearUnconfirmedUploads();
     writeBrowserState(createBrowserState());
     clearBootThemeCache();
     return;
@@ -253,6 +255,7 @@ export async function resetLocalDatabase(): Promise<void> {
     connection = null;
     opening = null;
     await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+    await clearUnconfirmedUploads();
     clearBootThemeCache();
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
@@ -302,17 +305,19 @@ export async function saveServer(config: ServerConfig): Promise<void> {
 
 export async function removeServer(serverId: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
-    updateBrowserState((state) => {
+    const removed = updateBrowserState((state) => {
       if (state.serverConfig?.id !== serverId) return false;
       state.serverConfig = null;
       state.books = [];
       state.readingState = {};
       state.syncQueue = {};
     });
+    if (removed) await clearUnconfirmedUploads(serverId);
     return;
   }
   const db = await openDatabase();
   await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
+  await clearUnconfirmedUploads(serverId);
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
@@ -1059,7 +1064,7 @@ export async function acceptRemoteProgress(
   const normalized = normalizeRemoteProgress(book, remote, expectedRevision);
 
   if (!Capacitor.isNativePlatform()) {
-    return updateBrowserState((state) => {
+    const adopted = updateBrowserState((state) => {
       const queue = state.syncQueue[book.id];
       const reading = state.readingState[book.id];
       if (
@@ -1076,10 +1081,12 @@ export async function acceptRemoteProgress(
       delete state.syncQueue[book.id];
       applyBrowserRemoteProgress(state, book.id, normalized);
     });
+    if (adopted) await deleteUnconfirmedUpload(book.serverId, book.id);
+    return adopted;
   }
 
   const db = await openDatabase();
-  return enqueueNativeWrite(async () => {
+  const adoptedNative = await enqueueNativeWrite(async () => {
     await db.executeTransaction([
       {
         statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
@@ -1138,6 +1145,8 @@ export async function acceptRemoteProgress(
       String(adopted.server_updated_at) === normalized.serverUpdatedAt,
     );
   });
+  if (adoptedNative) await deleteUnconfirmedUpload(book.serverId, book.id);
+  return adoptedNative;
 }
 
 export async function confirmSync(

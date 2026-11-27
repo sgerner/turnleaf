@@ -687,8 +687,7 @@ it('distinguishes browser request timeouts from caller aborts and clears timers'
 
     const caller = new AbortController();
     const abortedByCaller = expect(client.getSeriesDetail(4, caller.signal)).rejects.toMatchObject({
-      kind: 'network',
-      message: 'Kavita could not be reached. Check the address and network.',
+      name: 'AbortError',
     });
     caller.abort();
     await abortedByCaller;
@@ -894,4 +893,173 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
   await expect(new KavitaClient('http://books.example', 'key').getBookSeries()).rejects.toThrow(
     'repeated series page',
   );
+});
+
+it('propagates caller cancellation in saveProgress without recording a network error', async () => {
+  const controller = new AbortController();
+  vi.mocked(fetch).mockImplementationOnce(
+    (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('Aborted', 'AbortError')),
+          { once: true },
+        );
+      }),
+  );
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  const pending = client.saveProgress(
+    { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 10 },
+    controller.signal,
+  );
+  controller.abort();
+
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  const log = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+  expect(log).toContain('Events: 0');
+});
+
+it('preserves REQUEST_TIMEOUT_MS timeout errors for active saveProgress requests', async () => {
+  vi.useFakeTimers();
+  try {
+    const controller = new AbortController();
+    vi.mocked(fetch).mockImplementationOnce(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Timed out', 'AbortError')),
+            { once: true },
+          );
+        }),
+    );
+
+    const client = new KavitaClient('https://books.example.com', 'abc123');
+    const pending = expect(
+      client.saveProgress(
+        { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 10 },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita did not respond in time.',
+    });
+
+    await vi.advanceTimersByTimeAsync(12_000);
+    await pending;
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('waits for native saveProgress settlement on abort, resolves 2xx commits, and aborts pending redirects or errors quietly', async () => {
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  let resolvePost!: (response: {
+    status: number;
+    headers: Record<string, string>;
+    url: string;
+    data: string;
+  }) => void;
+  let markDispatched!: () => void;
+  const postDispatched = new Promise<void>((resolve) => {
+    markDispatched = resolve;
+  });
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(() => {
+    markDispatched();
+    return new Promise((resolve) => {
+      resolvePost = resolve;
+    });
+  });
+
+  const firstAbort = new AbortController();
+  let firstSettled = false;
+  const firstUpload = client
+    .saveProgress(
+      { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 10 },
+      firstAbort.signal,
+    )
+    .then(() => {
+      firstSettled = true;
+    });
+
+  await postDispatched;
+  firstAbort.abort();
+  await Promise.resolve();
+  await Promise.resolve();
+  // Must not settle early while the native HTTP request is still in flight.
+  expect(firstSettled).toBe(false);
+
+  resolvePost({ status: 200, headers: {}, url: '', data: '' });
+  await expect(firstUpload).resolves.toBeUndefined();
+  expect(firstSettled).toBe(true);
+
+  const redirectAbort = new AbortController();
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    redirectAbort.abort();
+    return {
+      status: 307,
+      headers: { Location: '/api/Reader/progress/' },
+      url: '',
+      data: '',
+    };
+  });
+  await expect(
+    client.saveProgress(
+      { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 11 },
+      redirectAbort.signal,
+    ),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(2);
+
+  const errorAbort = new AbortController();
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    errorAbort.abort();
+    throw new Error('socket closed');
+  });
+  await expect(
+    client.saveProgress(
+      { libraryId: 1, seriesId: 2, volumeId: 3, chapterId: 4, pageNum: 12 },
+      errorAbort.signal,
+    ),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+});
+
+it('gates native dispatches and redirect hops via beforeNativeRequest without diagnostics or retries', async () => {
+  capacitorRuntime.native = true;
+  let online = false;
+  let checks = 0;
+  const client = new KavitaClient('https://books.example.com', 'abc123', async () => {
+    checks += 1;
+    return online;
+  });
+
+  await expect(client.getProgress(10)).rejects.toMatchObject({
+    kind: 'network',
+    transportDenied: true,
+  });
+  // getProgress must not retry immediately when beforeNativeRequest denied transport.
+  expect(checks).toBe(1);
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  online = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    online = false;
+    return {
+      status: 307,
+      headers: { Location: '/moved/api/Series/v2?PageNumber=1&PageSize=500' },
+      url: '',
+      data: '',
+    };
+  });
+
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    transportDenied: true,
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
 });

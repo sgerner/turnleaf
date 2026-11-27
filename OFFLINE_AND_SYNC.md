@@ -7,6 +7,7 @@
 - Incomplete files: the same path with `.partial`; deleted on failure.
 - Credentials: Android Keystore-backed encrypted SharedPreferences or iOS Keychain, under the `turnleaf_` prefix.
 - Covers: server-scoped app-private cache under `Directory.Data/covers`; browser previews use revocable object URLs.
+- Unconfirmed progress uploads: app-private journal at `Directory.Data/sync/unconfirmed-uploads.json` (or `turnleaf_unconfirmed_sync_v1` in browser preview `localStorage`), deleted once SQLite confirms the queued revision.
 
 ## Download rule
 
@@ -17,6 +18,8 @@ A native file transfer writes directly to `.partial`, the app verifies a nonempt
 Every meaningful relocation is saved locally first using EPUB CFI, percentage, spine location, XPath, and timestamp. The queue has one row per book; a newer payload replaces the older payload without resetting retry history.
 
 Flush triggers are connectivity restoration, app backgrounding, chapter change, and one rescheduled idle deadline. There is no interval, poll, WebSocket, or background service.
+
+When Kavita accepts a progress upload, Turnleaf journals `{ revision, updatedAt, payload, serverUpdatedAt }` before running SQLite confirmation. If SQLite confirmation fails (for example `SQLITE_BUSY`) or the app restarts before confirmation completes, the next flush matches that journaled revision, skips sending a duplicate `POST /api/Reader/progress`, and finishes local confirmation; any newer local revision invalidates the journal entry and uploads normally. Caller `AbortSignal`s cancel only the awaiting caller unless no callers remain, and replacement flushes wait for any in-flight native HTTP upload to settle before sending a newer payload.
 
 Reconciliation compares local and server locations with the last shared state. If both changed, reading pauses for an explicit choice. The optional **Auto-sync furthest read** setting (and the explicit reader action) may choose the furthest compatible location by Kavita XPath or percentage; with that setting off, a non-conflicting server position is preferred.
 

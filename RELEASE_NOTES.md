@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Abort stalled progress flushes, recover unconfirmed uploads, and replay deferred sync retries
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline
