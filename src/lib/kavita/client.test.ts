@@ -895,3 +895,58 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+it('gates each native request hop with beforeNativeRequest without recording network diagnostics', async () => {
+  capacitorRuntime.native = true;
+  clearDiagnostics();
+  let transportOnline = false;
+  const client = new KavitaClient(
+    'https://books.example.com',
+    'abc123',
+    async (signal) => !signal?.aborted && transportOnline,
+  );
+
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'Kavita could not be reached while offline.',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+
+  const page = Array.from({ length: 500 }, (_, id) => ({
+    id,
+    name: `Book ${id}`,
+    libraryId: 1,
+    format: 3,
+    pages: 1,
+    pagesRead: 0,
+    created: '2026-01-01',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: '',
+  }));
+  transportOnline = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    transportOnline = false;
+    return {
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify(page),
+    };
+  });
+
+  const controller = new AbortController();
+  const gatedClient = new KavitaClient('https://books.example.com', 'abc123', async () => {
+    if (!transportOnline) {
+      controller.abort();
+      return false;
+    }
+    return true;
+  });
+
+  await expect(gatedClient.getBookSeries(controller.signal)).rejects.toMatchObject({
+    name: 'AbortError',
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+});

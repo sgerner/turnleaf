@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Centralize Android Back handling across screens and scope native reader plugin state to MainActivity.
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

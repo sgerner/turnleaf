@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as CapacitorCoreModule from '@capacitor/core';
 import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
@@ -18,6 +20,20 @@ const networkListeners = new Set<
 >();
 const appStateListeners = new Set<(state: { isActive: boolean }) => void>();
 let networkConnected = true;
+
+vi.mock('@capacitor/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof CapacitorCoreModule>();
+  return {
+    ...actual,
+    Capacitor: {
+      ...actual.Capacitor,
+      isNativePlatform: vi.fn(() => false),
+    },
+    CapacitorHttp: {
+      request: vi.fn(),
+    },
+  };
+});
 
 vi.mock('@capacitor/network', () => ({
   Network: {
@@ -661,5 +677,134 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('blocks follow-up native catalog and progress dispatches after disconnect and chains retry once confirmed reconnect settles', async () => {
+    const secondBook: BookRecord = {
+      ...seededBook,
+      id: 'server-1:1:11',
+      chapterId: 11,
+      title: 'The Dispossessed',
+    };
+    await reconcileBooks(server.id, [seededBook, secondBook]);
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/10)', '//body/p[10]', 0.5, 2);
+    await saveLocalProgress(secondBook, 'epubcfi(/6/6!/4/4)', '//body/p[4]', 0.3, 1);
+
+    const nativePlatformSpy = vi
+      .spyOn(Capacitor, 'isNativePlatform')
+      .mockImplementation(() => !new Error().stack?.includes('database.ts'));
+    const catalogStarted = deferred<void>();
+    const progressStarted = deferred<void>();
+    const releaseHeldCatalog = deferred<{
+      status: number;
+      headers: Record<string, string>;
+      url: string;
+      data: unknown;
+    }>();
+    const releaseHeldProgress = deferred<void>();
+    const nativePaths: string[] = [];
+    let holdInitialWave = true;
+
+    const nativeRequestSpy = vi
+      .spyOn(CapacitorHttp, 'request')
+      .mockImplementation(async (options) => {
+        const pathname = new URL(options.url).pathname;
+        nativePaths.push(pathname);
+        if (pathname === '/api/Series/v2') {
+          if (holdInitialWave) {
+            catalogStarted.resolve();
+            return releaseHeldCatalog.promise;
+          }
+          return {
+            status: 200,
+            headers: {},
+            url: options.url,
+            data: [seriesListItem(50)],
+          };
+        }
+        if (pathname === '/api/Series/series-detail') {
+          const base = seriesDetailPayload(50);
+          return {
+            status: 200,
+            headers: {},
+            url: options.url,
+            data: {
+              volumes: [
+                {
+                  ...base.volumes[0]!,
+                  chapters: [
+                    ...base.volumes[0]!.chapters,
+                    {
+                      ...base.volumes[0]!.chapters[0]!,
+                      id: 11,
+                      title: secondBook.title,
+                      titleName: secondBook.title,
+                    },
+                  ],
+                },
+              ],
+            },
+          };
+        }
+        if (pathname === '/api/Reader/progress') {
+          if (holdInitialWave) {
+            holdInitialWave = false;
+            progressStarted.resolve();
+            await releaseHeldProgress.promise;
+            throw new Error('Socket closed on radio teardown');
+          }
+          return { status: 204, headers: {}, url: options.url, data: '' };
+        }
+        return { status: 200, headers: {}, url: options.url, data: {} };
+      });
+
+    try {
+      const { target } = await mountLibrary();
+      await Promise.all([catalogStarted.promise, progressStarted.promise]);
+
+      // Disconnect while native /api/Series/v2 and first /api/Reader/progress are in flight
+      networkConnected = false;
+      for (const listener of networkListeners) {
+        listener({ connected: false, connectionType: 'none' });
+      }
+
+      // Release held /api/Series/v2 response while offline: must NOT dispatch /api/Series/series-detail
+      releaseHeldCatalog.resolve({
+        status: 200,
+        headers: {},
+        url: `${server.baseUrl}/api/Series/v2`,
+        data: [seriesListItem(50)],
+      });
+      // Spurious native reconnect event while Network.getStatus() is still offline must be ignored
+      for (const listener of networkListeners) {
+        listener({ connected: true, connectionType: 'cellular' });
+      }
+      for (const listener of appStateListeners) {
+        listener({ isActive: false });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(nativePaths).toEqual(['/api/Series/v2', '/api/Reader/progress']);
+      expect(target.textContent).toContain('No network connection. Showing your saved library.');
+
+      // Confirmed reconnect arrives BEFORE the old held native progress request finishes unwinding
+      networkConnected = true;
+      for (const listener of networkListeners) {
+        listener({ connected: true, connectionType: 'wifi' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 15));
+
+      // Now let the pre-disconnect socket reject: neither item is marked failed, and the queued
+      // post-reconnect sync automatically chains to upload both preserved items cleanly
+      releaseHeldProgress.resolve();
+
+      await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+      await waitForCondition(() => nativePaths.includes('/api/Series/series-detail'));
+      expect(target.textContent).not.toContain('failed and remain queued');
+      expect(nativePaths.filter((path) => path === '/api/Reader/progress')).toHaveLength(3);
+    } finally {
+      nativeRequestSpy.mockRestore();
+      nativePlatformSpy.mockRestore();
+    }
   });
 });

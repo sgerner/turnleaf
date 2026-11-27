@@ -8,23 +8,46 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 @CapacitorPlugin(name = "ReaderChrome")
 public class ReaderChromePlugin extends Plugin {
-    static volatile boolean enabled = false;
+    private final ReaderWindowController testController;
+
+    public ReaderChromePlugin() {
+        this.testController = null;
+    }
+
+    ReaderChromePlugin(ReaderWindowController testController) {
+        this.testController = testController;
+    }
 
     @PluginMethod
     public void setEnabled(PluginCall call) {
         Boolean value = call.getBoolean("enabled", false);
-        enabled = value != null && value;
-        apply();
+        setEnabled(value != null && value);
         call.resolve();
     }
 
-    static void applyTo(Activity activity, boolean enabled) {
-        if (activity instanceof MainActivity) {
-            ((MainActivity) activity).applyReaderChrome(enabled);
-        }
+    @Override
+    protected void handleOnDestroy() {
+        super.handleOnDestroy();
+        setEnabled(false);
     }
 
-    private void apply() {
-        applyTo(getActivity(), enabled);
+    void setEnabled(boolean enabled) {
+        ReaderWindowController controller = resolveController();
+        if (controller == null) {
+            return;
+        }
+        controller.getReaderWindowState().setReaderChromeEnabled(enabled);
+        controller.applyReaderChrome(enabled);
+    }
+
+    private ReaderWindowController resolveController() {
+        if (testController != null) {
+            return testController;
+        }
+        if (getBridge() == null) {
+            return null;
+        }
+        Activity activity = getActivity();
+        return activity instanceof ReaderWindowController ? (ReaderWindowController) activity : null;
     }
 }

@@ -14,6 +14,7 @@ import {
   childEnvironment,
   gradleArgs,
   gradleTask,
+  gradleTasks,
   main as runAndroidBuild,
 } from './android-build.mjs';
 
@@ -164,7 +165,9 @@ describe('Android SDK preflight', () => {
 
     expect(gradleTask('debug')).toBe('assembleDebug');
     expect(gradleTask('release')).toBe('assembleRelease');
-    expect(gradleArgs('debug')).toEqual(['assembleDebug']);
+    expect(gradleTasks('debug')).toEqual(['testDebugUnitTest', 'assembleDebug']);
+    expect(gradleTasks('release')).toEqual(['assembleRelease']);
+    expect(gradleArgs('debug')).toEqual(['testDebugUnitTest', 'assembleDebug']);
     expect(gradleArgs('release', ['--no-daemon'])).toEqual(['assembleRelease', '--no-daemon']);
     expect(gradleArgs('release', ['--', '--no-daemon', '--stacktrace'])).toEqual([
       'assembleRelease',

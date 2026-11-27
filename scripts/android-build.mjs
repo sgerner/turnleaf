@@ -45,9 +45,14 @@ export function gradleTask(mode) {
   throw new Error(`Unsupported Android build mode: ${mode}`);
 }
 
+export function gradleTasks(mode) {
+  const task = gradleTask(mode);
+  return mode === 'debug' ? ['testDebugUnitTest', task] : [task];
+}
+
 export function gradleArgs(mode, extraArgs = []) {
   const forwarded = extraArgs[0] === '--' ? extraArgs.slice(1) : extraArgs;
-  return [gradleTask(mode), ...forwarded];
+  return [...gradleTasks(mode), ...forwarded];
 }
 
 export function canReuseWebBuild(environment = process.env) {

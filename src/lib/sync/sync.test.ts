@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { KavitaError, OFFLINE_KAVITA_MESSAGE } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -226,4 +227,87 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('stops between queued items without marking failure when signal aborts', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const controller = new AbortController();
+  const saveProgress = vi.fn().mockImplementationOnce(async () => {
+    controller.abort();
+  });
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', controller.signal),
+  ).resolves.toBeUndefined();
+
+  expect(saveProgress).toHaveBeenCalledOnce();
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']).toBeUndefined();
+  expect(saved.syncQueue['book-2']).toMatchObject({
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    revision: 1,
+  });
+  expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+});
+
+it('preserves queued progress without marking failure when transport drops or beforeNativeRequest blocks', async () => {
+  const initial = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":12}');
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
+
+  const controller = new AbortController();
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      controller.abort();
+      throw new KavitaError(
+        'Kavita could not be reached. Check the address and network.',
+        'network',
+      );
+    })
+    .mockRejectedValueOnce(new KavitaError(OFFLINE_KAVITA_MESSAGE, 'network'))
+    .mockResolvedValueOnce(undefined);
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', controller.signal),
+  ).resolves.toBeUndefined();
+  await expect(flushProgress({ saveProgress } as never, 'server')).resolves.toBeUndefined();
+
+  const afterDisconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
+  expect(afterDisconnect.syncQueue['book-1']).toMatchObject({
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    revision: 1,
+  });
+  expect(afterDisconnect.readingState['book-1']?.pendingSync).toBe(true);
+
+  await expect(flushProgress({ saveProgress } as never, 'server')).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(3);
+
+  const afterReconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
+  expect(afterReconnect.syncQueue['book-1']).toBeUndefined();
+  expect(afterReconnect.readingState['book-1']?.pendingSync).toBe(false);
 });

@@ -12,6 +12,7 @@ import { recordDiagnostic } from '../diagnostics/log';
 import { advanceRedirect, createRedirectState, KavitaError, nativeHeader } from './redirects';
 
 export { KavitaError };
+export const OFFLINE_KAVITA_MESSAGE = 'Kavita could not be reached while offline.';
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
@@ -45,6 +46,8 @@ export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
+    private readonly beforeNativeRequest?:
+      ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -68,6 +71,7 @@ export class KavitaClient {
     const series: KavitaSeries[] = [];
     const seenSeriesIds = new Set<number>();
     for (let pageNumber = 1; pageNumber <= MAX_SERIES_PAGES; pageNumber += 1) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const options: RequestInit = {
         method: 'POST',
         body: JSON.stringify({
@@ -153,6 +157,7 @@ export class KavitaClient {
     } catch (error) {
       const retryable =
         error instanceof KavitaError &&
+        error.message !== OFFLINE_KAVITA_MESSAGE &&
         (error.kind === 'network' ||
           (error.kind === 'server' &&
             error.status !== undefined &&
@@ -201,7 +206,9 @@ export class KavitaClient {
         return await this.parseJsonPayload<T>(path, () => response.json() as Promise<T>);
       } catch (error) {
         if (error instanceof KavitaError) throw error;
-        recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+        if (!init.signal?.aborted) {
+          recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+        }
         const message = timeoutSignal.aborted
           ? 'Kavita did not respond in time.'
           : 'Kavita could not be reached. Check the address and network.';
@@ -230,10 +237,13 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
-        const networkStatus = await Network.getStatus().catch(() => null);
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        if (networkStatus?.connected !== true || navigator.onLine === false) {
-          throw new KavitaError('Kavita could not be reached while offline.', 'network');
+        const allowed = this.beforeNativeRequest
+          ? await this.beforeNativeRequest(init.signal ?? undefined)
+          : (await Network.getStatus().catch(() => null))?.connected === true;
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (!allowed || navigator.onLine === false) {
+          throw new KavitaError(OFFLINE_KAVITA_MESSAGE, 'network');
         }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -252,7 +262,9 @@ export class KavitaClient {
       return response.data as T;
     } catch (error) {
       if (error instanceof KavitaError || error instanceof DOMException) throw error;
-      recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+      if (!init.signal?.aborted) {
+        recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+      }
       throw new KavitaError(
         'Kavita could not be reached. Check the address and network.',
         'network',
