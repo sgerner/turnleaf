@@ -1506,6 +1506,17 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       webViewOnline = true;
       window.dispatchEvent(new Event('online'));
 
+      // Android cellular-to-Wi-Fi handover emits onLost(cellular) -> connected: false AND briefly
+      // pulses WebView navigator.onLine during the reconnect settle window while Wi-Fi remains up
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      webViewOnline = false;
+      window.dispatchEvent(new Event('offline'));
+      for (const listener of runtime.networkListeners) {
+        listener({ connected: false, connectionType: 'none' });
+      }
+      webViewOnline = true;
+      window.dispatchEvent(new Event('online'));
+
       await waitForCondition(
         () =>
           target.querySelector('[data-credential-alert="rejected"]') !== null &&
@@ -1513,13 +1524,6 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       );
       expect(nativeCalls.length).toBeGreaterThanOrEqual(1);
       expect(nativeCalls.length).toBeLessThanOrEqual(2);
-
-      // Android cellular-to-Wi-Fi default network handover emits onLost(cellular) -> connected: false
-      // even though Network.getStatus() remains connected: true on Wi-Fi
-      for (const listener of runtime.networkListeners) {
-        listener({ connected: false, connectionType: 'none' });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
 
       // Rotate API key in Settings and verify queued progress flushes cleanly without transient missing alerts
       const recoverBtn = target.querySelector<HTMLButtonElement>('[data-credential-recover]');
@@ -1543,6 +1547,25 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
           target.querySelector('[data-credential-alert]') === null,
       );
       expect(target.textContent).toContain('API key updated.');
+
+      // Transient Wi-Fi -> Cellular -> Offline disconnect (<250ms cellular blip) sends zero requests
+      nativeCalls.length = 0;
+      pluginOnline = false;
+      for (const listener of runtime.networkListeners) {
+        listener({ connected: false, connectionType: 'none' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      pluginOnline = true;
+      for (const listener of runtime.networkListeners) {
+        listener({ connected: true, connectionType: 'cellular' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      pluginOnline = false;
+      for (const listener of runtime.networkListeners) {
+        listener({ connected: false, connectionType: 'none' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(nativeCalls).toEqual([]);
     } finally {
       onLineSpy.mockRestore();
     }

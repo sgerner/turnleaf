@@ -306,13 +306,37 @@ async function run() {
   let cleanupError;
   let journeyPassed = false;
 
+  async function waitForSecureStorageFlush(expectPresent) {
+    await waitFor(
+      expectPresent ? 'persisted SecureStorage key' : 'removed SecureStorage key',
+      async () => {
+        try {
+          const xml = await adb(
+            'shell',
+            'run-as',
+            packageName,
+            'cat',
+            'shared_prefs/WSSecureStorageSharedPreferences.xml',
+          );
+          return (
+            xml.includes('</map>') && xml.includes(`name="${secureStorageKey}"`) === expectPresent
+          );
+        } catch (error) {
+          if (String(error?.stderr || error).includes('not debuggable')) {
+            await delay(500);
+            return true;
+          }
+          return false;
+        }
+      },
+    );
+  }
+
   async function restartApp() {
     if (web) {
       await web.close();
       web = undefined;
     }
-    await adb('shell', 'input', 'keyevent', 'KEYCODE_HOME');
-    await delay(300);
     await adb('shell', 'am', 'force-stop', packageName);
     await adb(
       'shell',
@@ -420,6 +444,7 @@ async function run() {
     await web.evaluate(
       `Capacitor.Plugins.SecureStorage.internalRemoveItem({ prefixedKey: ${JSON.stringify(secureStorageKey)}, sync: false }).then(() => true)`,
     );
+    await waitForSecureStorageFlush(false);
     const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
     await restartApp();
     await waitFor('missing-key alert in degraded offline library', () =>
@@ -446,6 +471,7 @@ async function run() {
     await web.evaluate(
       `Capacitor.Plugins.SecureStorage.internalSetItem({ prefixedKey: ${JSON.stringify(secureStorageKey)}, data: ${JSON.stringify(JSON.stringify(key))}, sync: false, access: 0 }).then(() => true)`,
     );
+    await waitForSecureStorageFlush(true);
     fixture.setApiKey(rotatedKey, '0.0.1-rotated');
     await restartApp();
     await waitFor('offline library with restored stale key', () =>

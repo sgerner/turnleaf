@@ -237,11 +237,13 @@ export class KavitaClient {
     }
   }
 
-  saveProgress(progress: KavitaProgress): Promise<void> {
-    return this.request('/api/Reader/progress', {
+  saveProgress(progress: KavitaProgress, signal?: AbortSignal): Promise<void> {
+    const options: RequestInit = {
       method: 'POST',
       body: JSON.stringify(progress),
-    });
+    };
+    if (signal) options.signal = signal;
+    return this.request('/api/Reader/progress', options);
   }
 
   private async request<T>(path: string, init: RequestInit = {}, probe = this.probe): Promise<T> {

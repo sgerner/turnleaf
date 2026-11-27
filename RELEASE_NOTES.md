@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- fix: deduplicate transport gates and serialize download/sync state
-- fix: centralize credential state and gate 401/403 requests
+- fix: stabilize native connectivity handover and SecureStorage journey restarts
+- Centralize Kavita credential state, gate 401/403 requests, and stop queued syncs on disconnect.
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

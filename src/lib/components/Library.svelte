@@ -364,7 +364,9 @@
   let pluginConnected = true;
   let connectivitySequence = 0;
   let webViewOnlineTimer: number | null = null;
+  let reconnectTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
+  const NATIVE_RECONNECT_SETTLE_MS = 250;
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const COVER_LOAD_CONCURRENCY = 6;
@@ -384,6 +386,13 @@
     }
   }
 
+  function clearReconnectTimer(): void {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
   function scheduleWebViewOnlineCheck(): void {
     if (webViewOnlineTimer !== null || destroyed) return;
     webViewOnlineTimer = window.setTimeout(() => {
@@ -392,19 +401,45 @@
     }, 50);
   }
 
+  function scheduleReconnect(baselineRevision: number, baselineMessage: string): void {
+    clearReconnectTimer();
+    if (!Capacitor.isNativePlatform()) {
+      void syncProgress(false);
+      void startRefresh(false, baselineRevision, baselineMessage);
+      return;
+    }
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      if (destroyed || offline || !credentialReady || !client.canSendRequests()) {
+        initialRefreshPending = false;
+        return;
+      }
+      if (!isWebViewOnline()) {
+        scheduleReconnect(baselineRevision, baselineMessage);
+        return;
+      }
+      void syncProgress(false);
+      void startRefresh(false, baselineRevision, baselineMessage);
+    }, NATIVE_RECONNECT_SETTLE_MS);
+  }
+
   function applyConnectivity(nextPluginConnected = pluginConnected): void {
     if (destroyed) return;
     pluginConnected = nextPluginConnected;
+    const native = Capacitor.isNativePlatform();
+    const wasOffline = offline;
     const webOnline = isWebViewOnline();
-    if (pluginConnected && !webOnline) {
+    const connected = native
+      ? pluginConnected && (!wasOffline || webOnline)
+      : pluginConnected && webOnline;
+    if (pluginConnected && wasOffline && !webOnline) {
       scheduleWebViewOnlineCheck();
     } else {
       clearWebViewOnlineTimer();
     }
-    const connected = pluginConnected && webOnline;
-    const wasOffline = offline;
     offline = !connected;
     if (!connected) {
+      clearReconnectTimer();
       if (!wasOffline) {
         stopActiveNetworkWork(true);
         coverReloadRequest += 1;
@@ -417,50 +452,54 @@
           : 'No network connection. Connect to Kavita to load your library.';
       return;
     }
-    coverReloadRequest += 1;
-    kavitaUnreachable = false;
-    offlineMessage = '';
+    if (wasOffline || kavitaUnreachable) {
+      coverReloadRequest += 1;
+      kavitaUnreachable = false;
+      offlineMessage = '';
+    }
     if (wasOffline && credentialReady && client.canSendRequests()) {
       initialRefreshPending = true;
       const baselineRevision = activeSyncStartRevision ?? messageRevision;
       const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-      void syncProgress(false);
-      void startRefresh(false, baselineRevision, baselineMessage);
+      scheduleReconnect(baselineRevision, baselineMessage);
     }
+  }
+
+  function syncNativeConnectivity(): void {
+    const sequence = ++connectivitySequence;
+    void Network.getStatus()
+      .then((status) => {
+        if (destroyed || sequence !== connectivitySequence) return;
+        applyConnectivity(status.connected);
+      })
+      .catch(() => {});
   }
 
   function handleWindowOnline(): void {
     if (destroyed) return;
-    applyConnectivity();
-    if (!pluginConnected && Capacitor.isNativePlatform()) {
-      void Network.getStatus()
-        .then((status) => {
-          if (status && !destroyed) applyConnectivity(status.connected);
-        })
-        .catch(() => {});
+    if (Capacitor.isNativePlatform()) {
+      syncNativeConnectivity();
+      return;
     }
+    applyConnectivity();
   }
 
   function handleWindowOffline(): void {
+    if (destroyed) return;
+    if (Capacitor.isNativePlatform()) {
+      syncNativeConnectivity();
+      return;
+    }
     applyConnectivity();
   }
 
   function handleNativeNetworkChange(connected: boolean): void {
-    const sequence = ++connectivitySequence;
-    if (connected) {
-      applyConnectivity(true);
+    if (destroyed) return;
+    if (Capacitor.isNativePlatform()) {
+      syncNativeConnectivity();
       return;
     }
-    applyConnectivity(false);
-    if (!Capacitor.isNativePlatform()) return;
-    void Network.getStatus()
-      .then((status) => {
-        if (destroyed || sequence !== connectivitySequence) return;
-        if (status.connected) {
-          applyConnectivity(true);
-        }
-      })
-      .catch(() => {});
+    applyConnectivity(connected);
   }
 
   function clearSyncTimer(): void {
@@ -472,6 +511,7 @@
 
   function stopActiveNetworkWork(abortSync: boolean): void {
     initialRefreshPending = false;
+    clearReconnectTimer();
     clearSyncTimer();
     refreshController?.abort();
     if (abortSync) syncController?.abort();
@@ -1096,6 +1136,7 @@
     destroyed = true;
     replacementApiKey = '';
     clearWebViewOnlineTimer();
+    clearReconnectTimer();
     unsubscribeCredentials();
     onReaderOpenChange?.(false);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
@@ -1952,6 +1993,7 @@
   async function retryCredentials(): Promise<void> {
     if (!onRetryCredentials || retryingCredentials) return;
     retryingCredentials = true;
+    clearReconnectTimer();
     initialRefreshPending = !offline;
     let refreshed = false;
     try {
@@ -2098,6 +2140,7 @@
       // An upload started with the previous key may still be finishing.
       while (syncWork) await syncWork;
       if (destroyed) return;
+      clearReconnectTimer();
       refreshController?.abort();
       await saveApiKey(server.credentialRef, nextKey);
       if (destroyed) return;
