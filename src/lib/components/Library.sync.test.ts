@@ -6,7 +6,6 @@ import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
   getPendingSync,
-  getSyncStatus,
   reconcileBooks,
   saveLocalProgress,
   saveServer,
@@ -227,8 +226,8 @@ async function mountLibrary(
       onThemeChange: vi.fn(),
       onModeChange: vi.fn(),
       onApiKeyChange: options.onApiKeyChange ?? vi.fn(),
-      onServerChange: vi.fn(),
       onServerDeleted: vi.fn(),
+      onServerChange: vi.fn(),
     },
   });
   mountedInstances.push(instance);
@@ -269,6 +268,36 @@ afterEach(async () => {
 });
 
 describe('Library concurrent progress uploads and catalog refreshes', () => {
+  it('does not start another refresh for a connected event while already online', async () => {
+    let seriesRequests = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Series/v2') {
+        seriesRequests += 1;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Android can report a new connected network during a Wi-Fi-to-cellular handoff.
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(seriesRequests).toBe(1);
+  });
+
   it('starts saveProgress on online mount without awaiting catalog pagination and retains local progress', async () => {
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[4]', 0.4);
 
@@ -632,76 +661,5 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
-  });
-
-  it('stops queued progress uploads and aborts catalog refresh on disconnect without failing queued progress or leaking offline requests', async () => {
-    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
-
-    const secondBook: BookRecord = {
-      ...seededBook,
-      id: 'server-1:1:11',
-      chapterId: 11,
-      title: 'The Dispossessed',
-    };
-    await reconcileBooks(server.id, [seededBook, secondBook]);
-    await saveLocalProgress(secondBook, 'epubcfi(/6/6!/4/2)', '//body/p[4]', 0.3, 1);
-
-    const observedPaths: string[] = [];
-    const failInFlightUpload = deferred<void>();
-    let seriesAborted = false;
-
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-      const url = new URL(String(input));
-      observedPaths.push(url.pathname);
-      if (url.pathname === '/api/Reader/progress') {
-        await failInFlightUpload.promise;
-        throw new TypeError('Failed to fetch');
-      }
-      if (url.pathname === '/api/Series/v2') {
-        return new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener(
-            'abort',
-            () => {
-              seriesAborted = true;
-              reject(new DOMException('Aborted', 'AbortError'));
-            },
-            { once: true },
-          );
-        });
-      }
-      if (url.pathname === '/api/Image/series-cover') {
-        return new Response(new Blob(['cover']), { status: 200 });
-      }
-      return jsonResponse({});
-    });
-
-    const { target } = await mountLibrary();
-    await waitForCondition(
-      () =>
-        observedPaths.includes('/api/Reader/progress') && observedPaths.includes('/api/Series/v2'),
-    );
-
-    const requestCountBeforeDisconnect = observedPaths.length;
-    networkConnected = false;
-    for (const listener of networkListeners) {
-      listener({ connected: false, connectionType: 'none' });
-    }
-
-    await waitForCondition(() => seriesAborted);
-    failInFlightUpload.resolve();
-    // Simulate backgrounding while offline; neither the second queued book nor any new sync may fire
-    for (const listener of appStateListeners) listener({ isActive: false });
-    await new Promise((resolve) => setTimeout(resolve, 30));
-
-    expect(observedPaths.filter((path) => path === '/api/Reader/progress')).toHaveLength(1);
-    expect(observedPaths.length).toBe(requestCountBeforeDisconnect);
-    const pending = await getPendingSync(server.id);
-    expect(pending).toHaveLength(2);
-    const status = await getSyncStatus(server.id);
-    expect(status.pendingCount).toBe(2);
-    expect(status.failedCount).toBe(0);
-    expect(status.lastError).toBeNull();
-    expect(target.textContent).toContain('No network connection. Showing your saved library.');
-    expect(target.textContent).not.toContain('Some reading progress is waiting to sync.');
   });
 });

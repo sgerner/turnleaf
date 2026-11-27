@@ -7,7 +7,6 @@
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreferences, setPreferences } from '../database/database';
-  import type { RegisterBackHandler } from '../native/back-button';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -100,7 +99,7 @@
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
     onMountChange?: ((mounted: boolean) => void) | undefined;
-    registerBackHandler?: RegisterBackHandler | undefined;
+    registerBackHandler?: (handler: () => boolean) => () => void;
   } = $props();
 
   let viewport: HTMLDivElement;

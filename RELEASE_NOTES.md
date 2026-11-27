@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- fix: persist stale credentials before sync barrier
-- Surface and retry stale credential cleanup after server address rotation
-- Edit Kavita server addresses inline from Settings and accept pasted OPDS URLs without exposing tokens in diagnostics.
+- Edit Kavita server addresses inline from Settings with retryable credential cleanup and OPDS URL paste support without exposing tokens in diagnostics.
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

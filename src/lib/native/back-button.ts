@@ -5,7 +5,6 @@ export type RegisterBackHandler = (handler: BackButtonHandler) => () => void;
 export interface BackButtonStack {
   register: RegisterBackHandler;
   dispatch: () => boolean;
-  clear: () => void;
 }
 
 export function createBackButtonStack(
@@ -35,10 +34,6 @@ export function createBackButtonStack(
       options.exitApp?.();
       return false;
     },
-    clear(): void {
-      for (const entry of entries) entry.active = false;
-      entries.length = 0;
-    },
   };
 }
 
@@ -62,6 +57,7 @@ export interface LibraryBackState {
   savingServerAddress?: boolean;
   confirmDeleteServer?: boolean;
   settingsBusy?: boolean;
+  retryingCredentialCleanup?: boolean;
   settingsVisible: boolean;
   filtersVisible: boolean;
 }
@@ -99,11 +95,16 @@ export function handleLibraryBack(state: LibraryBackState, actions: LibraryBackA
     return true;
   }
   if (state.settingsVisible && state.confirmDeleteServer) {
-    if (!state.settingsBusy) actions.cancelDeleteServer?.();
+    if (!state.settingsBusy && !state.retryingCredentialCleanup) actions.cancelDeleteServer?.();
     return true;
   }
   if (state.settingsVisible) {
-    if (!state.savingServerAddress && !state.settingsBusy) actions.closeSettings();
+    if (!state.savingServerAddress && !state.settingsBusy && !state.retryingCredentialCleanup) {
+      actions.closeSettings();
+    }
+    return true;
+  }
+  if (state.retryingCredentialCleanup) {
     return true;
   }
   if (state.filtersVisible) {

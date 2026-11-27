@@ -6,15 +6,20 @@ import {
   classifyConnectionError,
   cleanupStaleCredentials,
   INITIAL_SETUP_MESSAGES,
+  parseStaleCredentialRefs,
   rotateServerConnection,
   saveConnection,
   STALE_CREDENTIAL_CLEANUP_WARNING,
+  STALE_CREDENTIAL_PERSIST_FAILED_WARNING,
+  STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+  STALE_CREDENTIAL_STATUS_PERSIST_FAILED_WARNING,
   verifyKavitaConnection,
 } from './connection';
 import { ServerUrlError } from './url';
 
 const mocks = vi.hoisted(() => ({
   saveServer: vi.fn(),
+  setPreference: vi.fn(),
   saveApiKey: vi.fn(),
   removeApiKey: vi.fn(),
   testConnection: vi.fn(),
@@ -22,6 +27,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../database/database', () => ({
   saveServer: mocks.saveServer,
+  setPreference: mocks.setPreference,
 }));
 
 vi.mock('../native/credentials', () => ({
@@ -66,6 +72,7 @@ describe('connection helpers', () => {
   beforeEach(async () => {
     await clearDiagnostics();
     mocks.saveServer.mockReset().mockResolvedValue(undefined);
+    mocks.setPreference.mockReset().mockResolvedValue(undefined);
     mocks.saveApiKey.mockReset().mockResolvedValue(undefined);
     mocks.removeApiKey.mockReset().mockResolvedValue(undefined);
     mocks.testConnection.mockReset().mockResolvedValue({
@@ -147,6 +154,11 @@ describe('connection helpers', () => {
     expect(rotation.server.credentialRef).not.toBe(existingServer.credentialRef);
     expect(rotation.staleCredentialRefs).toEqual([existingServer.credentialRef]);
     expect(rotation.cleanupWarning).toBe(STALE_CREDENTIAL_CLEANUP_WARNING);
+    expect(rotation.cleanupPersisted).toBe(true);
+    expect(mocks.setPreference).toHaveBeenCalledWith(
+      STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+      JSON.stringify([existingServer.credentialRef]),
+    );
 
     const diagnostics = exportDiagnostics({ appVersion: '0.3.5', platform: 'android' });
     expect(diagnostics).toContain(
@@ -160,6 +172,53 @@ describe('connection helpers', () => {
     expect(remaining).toEqual([]);
     expect(mocks.removeApiKey).toHaveBeenCalledTimes(2);
     expect(mocks.removeApiKey).toHaveBeenLastCalledWith(existingServer.credentialRef);
+  });
+
+  it('records diagnostics and surfaces an explicit warning when persisting failed cleanup references rejects', async () => {
+    mocks.removeApiKey.mockRejectedValueOnce(new Error('Keystore locked'));
+    mocks.setPreference.mockRejectedValueOnce(new Error('SQLite disk full'));
+
+    const rotation = await rotateServerConnection(
+      existingServer,
+      'https://books.example.com/kavita',
+      'active-key',
+      '0.8.5',
+    );
+
+    expect(rotation.staleCredentialRefs).toEqual([existingServer.credentialRef]);
+    expect(rotation.cleanupPersisted).toBe(false);
+    expect(rotation.cleanupWarning).toBe(STALE_CREDENTIAL_PERSIST_FAILED_WARNING);
+
+    const diagnostics = exportDiagnostics({ appVersion: '0.3.5', platform: 'android' });
+    expect(diagnostics).toContain(
+      'startup endpoint=local/credentials detail=credential-cleanup-failed',
+    );
+    expect(diagnostics).toContain(
+      'startup endpoint=local/database detail=stale-credential-persist-failed',
+    );
+  });
+
+  it('retains retryable references and surfaces status persistence failure when clearing previous stale refs fails', async () => {
+    mocks.setPreference.mockRejectedValueOnce(new Error('SQLite busy'));
+
+    const rotation = await rotateServerConnection(
+      existingServer,
+      'https://books.example.com/kavita',
+      'active-key',
+      '0.8.5',
+      undefined,
+      ['server_older_api_key'],
+    );
+
+    expect(rotation.cleanupPersisted).toBe(false);
+    expect(rotation.staleCredentialRefs).toEqual(['server_older_api_key']);
+    expect(rotation.cleanupWarning).toBe(STALE_CREDENTIAL_STATUS_PERSIST_FAILED_WARNING);
+    expect(
+      parseStaleCredentialRefs(
+        JSON.stringify(['server_older_api_key', rotation.server.credentialRef]),
+        rotation.server.credentialRef,
+      ),
+    ).toEqual(['server_older_api_key']);
   });
 
   it('rolls back the newly stored key and keeps old credentials untouched when saveServer fails', async () => {

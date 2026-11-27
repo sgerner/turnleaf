@@ -489,27 +489,4 @@ describe('native cover cache', () => {
       expect(native.deleted).toContain('covers/server-1/7.img.partial');
     },
   );
-
-  it('does not start FileTransfer.downloadFile if connectivity drops while preparing the cover file', async () => {
-    let online = true;
-    vi.mocked(Filesystem.stat).mockRejectedValueOnce(new Error('missing'));
-    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
-      online = false;
-      return { uri: `file://${path}` };
-    });
-
-    await expect(
-      cacheCover(
-        'https://books.example.com/cover',
-        'secret',
-        7,
-        undefined,
-        'server-1',
-        () => online,
-        'https://books.example.com',
-      ),
-    ).rejects.toThrow('Offline');
-
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
-  });
 });

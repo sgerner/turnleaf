@@ -899,4 +899,69 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
     expect(mocks.removeApiKey).toHaveBeenLastCalledWith('server_primary_api_key');
     expect(target.textContent).toContain('Previous auth key removed from this device.');
   });
+
+  it('surfaces setPreference failures when persisting or clearing stale credential references and clears them on Delete server', async () => {
+    mocks.getServer.mockResolvedValue({
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: 'https://old.example.com',
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    });
+    mocks.getApiKey.mockResolvedValue('saved-active-key');
+
+    instance = mount(App, { target });
+    await settle();
+
+    target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await settle();
+    Array.from(target.querySelectorAll('button'))
+      .find((btn) => btn.textContent?.trim() === 'Change server address')!
+      .click();
+    await settle();
+
+    setInputValue(
+      target.querySelector<HTMLInputElement>('#settings-server-url')!,
+      'https://new.example.com',
+    );
+    mocks.removeApiKey.mockRejectedValueOnce(new Error('Keystore locked'));
+    mocks.setPreference.mockRejectedValueOnce(new Error('SQLite write failed'));
+
+    target
+      .querySelector<HTMLInputElement>('#settings-server-url')!
+      .closest('form')!
+      .querySelector<HTMLButtonElement>('button[type="submit"]')!
+      .click();
+    await settle();
+
+    expect(target.querySelector('#settings-credential-cleanup-warning')?.textContent).toContain(
+      'could not be removed or recorded for later cleanup',
+    );
+    expect(exportDiagnostics({ appVersion: '0.3.5', platform: 'android' })).toContain(
+      'startup endpoint=local/database detail=stale-credential-persist-failed',
+    );
+
+    // Next retry removes the key, but clearing local status in preferences rejects once
+    mocks.setPreference.mockRejectedValueOnce(new Error('SQLite busy'));
+    target.querySelector<HTMLButtonElement>('#settings-credential-cleanup-warning button')!.click();
+    await settle();
+
+    expect(target.querySelector('#settings-credential-cleanup-warning')?.textContent).toContain(
+      'local cleanup status could not be saved',
+    );
+
+    // Delete server removes any remaining stale refs and clears staleCredentialRefs preference
+    Array.from(target.querySelectorAll('button'))
+      .find((btn) => btn.textContent?.trim() === 'Delete server')!
+      .click();
+    await settle();
+    Array.from(target.querySelectorAll('button'))
+      .find((btn) => btn.textContent?.trim() === 'Delete now')!
+      .click();
+    await settle();
+
+    expect(mocks.setPreference).toHaveBeenCalledWith('staleCredentialRefs', '[]');
+    expect(mocks.removeServer).toHaveBeenCalledWith('primary');
+  });
 });

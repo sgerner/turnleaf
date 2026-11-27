@@ -1,7 +1,7 @@
 <script lang="ts">
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
-  import { onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
@@ -15,6 +15,10 @@
     resetLocalDatabase,
     type ServerConfig,
   } from './lib/database/database';
+  import {
+    parseStaleCredentialRefs,
+    STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+  } from './lib/kavita/connection';
   import { createBackButtonStack } from './lib/native/back-button';
   import { getApiKey } from './lib/native/credentials';
   import {
@@ -64,6 +68,7 @@
   let autoFocusOnboarding = $state(false);
   let apiKey = $state<string | null>(null);
   let staleCredentialRefs = $state<string[]>([]);
+  let credentialCleanupWarning = $state<string | null>(null);
   let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
@@ -84,12 +89,17 @@
     server = null;
     apiKey = null;
     staleCredentialRefs = [];
+    credentialCleanupWarning = null;
     readerOpen = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
         getServer(),
-        getPreferences([themePreferenceKey, modePreferenceKey]),
+        getPreferences([
+          themePreferenceKey,
+          modePreferenceKey,
+          STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
+        ]),
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
@@ -103,6 +113,10 @@
       if (savedTheme !== undefined || savedMode !== undefined) {
         writeBootThemeCache(resolvedTheme, resolvedMode);
       }
+      staleCredentialRefs = parseStaleCredentialRefs(
+        preferences.get(STALE_CREDENTIAL_REFS_PREFERENCE_KEY),
+        saved?.credentialRef,
+      );
       if (saved) {
         server = saved;
         try {
@@ -130,27 +144,28 @@
     }
   }
 
+  let destroyed = false;
+  let backListenerHandle: { remove: () => Promise<void> } | null = null;
+
   onMount(() => {
-    let destroyed = false;
-    let removeBackListener: (() => Promise<void>) | null = null;
     void App.addListener('backButton', () => {
       if (destroyed || booting || repairing) return;
       backStack.dispatch();
     })
       .then((handle) => {
         if (destroyed) void handle.remove();
-        else removeBackListener = () => handle.remove();
+        else backListenerHandle = handle;
       })
       .catch(() => {});
 
     void hydrateDiagnostics();
     void loadLocalData();
+  });
 
-    return () => {
-      destroyed = true;
-      backStack.clear();
-      if (removeBackListener) void removeBackListener();
-    };
+  onDestroy(() => {
+    destroyed = true;
+    void backListenerHandle?.remove();
+    backListenerHandle = null;
   });
 
   async function repairLocalData(): Promise<void> {
@@ -272,10 +287,12 @@
           readerOpen = false;
           autoFocusOnboarding = true;
           staleCredentialRefs = [];
+          credentialCleanupWarning = null;
           server = null;
           apiKey = null;
         }}
         initialStaleCredentialRefs={staleCredentialRefs}
+        initialCleanupWarning={credentialCleanupWarning}
         onStaleCredentialRefsChange={(refs) => (staleCredentialRefs = refs)}
         {registerBackHandler}
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
@@ -328,10 +345,12 @@
       <Onboarding
         savedServer={server}
         autoFocus={autoFocusOnboarding}
+        previousStaleCredentialRefs={staleCredentialRefs}
         {registerBackHandler}
-        onConnected={(connected, key, nextStaleRefs = []) => {
+        onConnected={(connected, key, nextStaleRefs = [], nextCleanupWarning = null) => {
           autoFocusOnboarding = false;
           staleCredentialRefs = [...nextStaleRefs];
+          credentialCleanupWarning = nextCleanupWarning;
           apiKey = key;
           server = connected;
         }}

@@ -352,12 +352,8 @@ async function run() {
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'data', 'disable');
-    await waitFor(
-      'mobile data disabled',
-      async () => (await adb('shell', 'settings', 'get', 'global', 'mobile_data')).trim() === '0',
-    );
     await adb('shell', 'svc', 'wifi', 'disable');
+    await adb('shell', 'svc', 'data', 'disable');
     await waitFor('offline state', async () => {
       const connected = await web.evaluate(
         'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',

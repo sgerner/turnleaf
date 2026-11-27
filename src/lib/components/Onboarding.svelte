@@ -6,6 +6,7 @@
   import { getDiagnosticCount, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
   import { KavitaError } from '../kavita/client';
   import {
+    ADDRESS_ROTATION_MESSAGES,
     classifyConnectionError,
     INITIAL_SETUP_MESSAGES,
     rotateServerConnection,
@@ -22,13 +23,20 @@
   let {
     savedServer = null,
     autoFocus = false,
+    previousStaleCredentialRefs = [],
     registerBackHandler,
     onConnected,
   }: {
     savedServer?: ServerConfig | null;
     autoFocus?: boolean;
+    previousStaleCredentialRefs?: readonly string[];
     registerBackHandler?: RegisterBackHandler | undefined;
-    onConnected: (server: ServerConfig, key: string, staleCredentialRefs?: string[]) => void;
+    onConnected: (
+      server: ServerConfig,
+      key: string,
+      staleCredentialRefs?: string[],
+      cleanupWarning?: string | null,
+    ) => void;
   } = $props();
 
   let formElement = $state<HTMLFormElement | null>(null);
@@ -106,6 +114,10 @@
       const normalized = normalizeServerUrl(
         savedServer && !changingServerAddress ? savedServer.baseUrl : serverUrl,
       );
+      if ((!savedServer || changingServerAddress) && normalized.apiKey) {
+        serverUrl = normalized.baseUrl;
+        if (!apiKey.trim()) apiKey = normalized.apiKey;
+      }
       if ((!savedServer || changingServerAddress) && normalized.insecure && !allowHttp) {
         invalidField = 'address';
         recordDiagnostic({
@@ -130,16 +142,20 @@
 
       if (savedServer) {
         let connectedServer = savedServer;
-        let staleCredentialRefs: string[] = [];
+        let staleCredentialRefs = [...previousStaleCredentialRefs];
+        let cleanupWarning: string | null = null;
         if (changingServerAddress) {
           const rotation = await rotateServerConnection(
             savedServer,
             normalized.baseUrl,
             key,
             result.version,
+            ADDRESS_ROTATION_MESSAGES,
+            previousStaleCredentialRefs,
           );
           connectedServer = rotation.server;
           staleCredentialRefs = rotation.staleCredentialRefs;
+          cleanupWarning = rotation.cleanupWarning;
           serverUrl = normalized.baseUrl;
         } else {
           try {
@@ -154,7 +170,7 @@
           }
         }
         apiKey = '';
-        onConnected(connectedServer, key, staleCredentialRefs);
+        onConnected(connectedServer, key, staleCredentialRefs, cleanupWarning);
         return;
       }
 

@@ -345,7 +345,7 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
-  allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
+  allowDownload = true,
   serverOrigin?: string,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -354,7 +354,6 @@ export async function cacheCover(
     serverOrigin,
     'Invalid Kavita cover address.',
   );
-  const canDownload = typeof allowDownload === 'function' ? allowDownload : () => allowDownload;
   const namespace = safeCoverNamespace(cacheNamespace);
   const directory = `covers/${namespace}`;
   const path = `${directory}/${seriesId}.img`;
@@ -362,12 +361,10 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!(await canDownload())) throw new Error('Offline');
+    if (!allowDownload) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!(await canDownload())) throw new Error('Offline');
     try {
       await downloadFileWithRedirects({
         initialUrl: target.url,

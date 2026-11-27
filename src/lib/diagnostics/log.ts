@@ -151,6 +151,7 @@ const ALLOWED = new Set([
   'server',
   'server-save-failed',
   'setup-failed',
+  'stale-credential-persist-failed',
 ]);
 
 function sanitizeDetail(value: string | undefined): string | undefined {

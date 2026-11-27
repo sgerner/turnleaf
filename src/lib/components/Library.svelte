@@ -46,9 +46,15 @@
     ADDRESS_ROTATION_MESSAGES,
     classifyConnectionError,
     cleanupStaleCredentials,
+    parseStaleCredentialRefs,
     rotateServerConnection,
+    saveStaleCredentialRefs,
     STALE_CREDENTIAL_CLEANUP_WARNING,
+    STALE_CREDENTIAL_PERSIST_FAILED_WARNING,
+    STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
     STALE_CREDENTIAL_RETRY_FAILED_WARNING,
+    STALE_CREDENTIAL_RETRY_PERSIST_FAILED_WARNING,
+    STALE_CREDENTIAL_STATUS_PERSIST_FAILED_WARNING,
     verifyKavitaConnection,
     type InvalidConnectionField,
   } from '../kavita/connection';
@@ -107,6 +113,7 @@
     onServerDeleted,
     onReaderOpenChange,
     initialStaleCredentialRefs,
+    initialCleanupWarning,
     onStaleCredentialRefsChange,
     registerBackHandler,
     onOverlayActiveChange,
@@ -122,6 +129,7 @@
     onServerDeleted: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
     initialStaleCredentialRefs?: readonly string[] | undefined;
+    initialCleanupWarning?: string | null | undefined;
     onStaleCredentialRefsChange?: ((refs: string[]) => void) | undefined;
     registerBackHandler?: RegisterBackHandler | undefined;
     onOverlayActiveChange?: (active: boolean) => void;
@@ -139,11 +147,11 @@
         seriesId,
         signal,
         server.id,
-        () => networkAvailable(),
+        await networkAvailable(),
         serverOrigin,
       );
     }
-    if (!(await networkAvailable())) throw new Error('Offline');
+    if (offline) throw new Error('Offline');
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
@@ -270,10 +278,6 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
-  let syncController: AbortController | null = null;
-  let syncEpoch: number | null = null;
-  let readerSyncController: AbortController | null = null;
-  let networkEpoch = 0;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -288,7 +292,6 @@
   let appearanceError = $state('');
   let settingsError = $state('');
   let themeSwitchSequence = 0;
-  const staleCredentialRefsPreferenceKey = 'staleCredentialRefs';
   let editingServerAddress = $state(false);
   let nextServerUrl = $state('');
   let allowInsecureServerUrl = $state(false);
@@ -304,7 +307,11 @@
     ),
   );
   let credentialCleanupWarning = $state(
-    untrack(() => (staleCredentialRefs.length > 0 ? STALE_CREDENTIAL_CLEANUP_WARNING : '')),
+    untrack(
+      () =>
+        initialCleanupWarning ||
+        (staleCredentialRefs.length > 0 ? STALE_CREDENTIAL_CLEANUP_WARNING : ''),
+    ),
   );
   let retryingCredentialCleanup = $state(false);
   let replacingApiKey = $state(false);
@@ -676,39 +683,6 @@
     }
   });
 
-  function handleBackButton(): boolean {
-    if (destroyed) return false;
-    return (
-      handleLibraryBack(
-        {
-          hasConflict: Boolean(conflict),
-          acceptingRemoteProgress,
-          hasActionMenu: Boolean(actionMenuBook),
-          hasOpenReader: Boolean(reading),
-          resolvingOpenProgress,
-          editingServerAddress,
-          savingServerAddress,
-          confirmDeleteServer,
-          settingsBusy: replacingApiKey || deletingServer || retryingCredentialCleanup,
-          settingsVisible,
-          filtersVisible,
-        },
-        {
-          closeConflict,
-          closeMenu,
-          closeReader: () => void closeReader(),
-          cancelOpenProgress: () => openProgressProbe?.abort(),
-          cancelServerAddressEdit,
-          cancelDeleteServer,
-          closeSettings,
-          hideFilters: () => {
-            filtersVisible = false;
-          },
-        },
-      ) || retryingCredentialCleanup
-    );
-  }
-
   $effect(() => {
     if (theme === observedTheme) return;
     observedTheme = theme;
@@ -768,6 +742,38 @@
     });
   });
 
+  function handleBackButton(): boolean {
+    if (destroyed) return false;
+    return handleLibraryBack(
+      {
+        hasConflict: Boolean(conflict),
+        acceptingRemoteProgress,
+        hasActionMenu: Boolean(actionMenuBook),
+        hasOpenReader: Boolean(reading),
+        resolvingOpenProgress,
+        editingServerAddress,
+        savingServerAddress,
+        confirmDeleteServer,
+        settingsBusy: replacingApiKey || deletingServer,
+        retryingCredentialCleanup,
+        settingsVisible,
+        filtersVisible,
+      },
+      {
+        closeConflict,
+        closeMenu,
+        closeReader: () => void closeReader(),
+        cancelOpenProgress: () => openProgressProbe?.abort(),
+        cancelServerAddressEdit,
+        cancelDeleteServer,
+        closeSettings,
+        hideFilters: () => {
+          filtersVisible = false;
+        },
+      },
+    );
+  }
+
   onMount(async () => {
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     void cleanupInterruptedEpubDownloads();
@@ -787,13 +793,13 @@
         'libraryView',
         'libraryDownloadedOnly',
         'libraryHideCompleted',
-        staleCredentialRefsPreferenceKey,
+        STALE_CREDENTIAL_REFS_PREFERENCE_KEY,
       ]),
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
     const savedStaleRefs = parseStaleCredentialRefs(
-      preferences.get(staleCredentialRefsPreferenceKey),
+      preferences.get(STALE_CREDENTIAL_REFS_PREFERENCE_KEY),
       activeServer.credentialRef,
     );
     const mergedStaleRefs = [...new Set([...savedStaleRefs, ...staleCredentialRefs])].filter(
@@ -804,9 +810,13 @@
       credentialCleanupWarning = credentialCleanupWarning || STALE_CREDENTIAL_CLEANUP_WARNING;
       onStaleCredentialRefsChange?.([...mergedStaleRefs]);
       if (mergedStaleRefs.length !== savedStaleRefs.length) {
-        void setPreference(staleCredentialRefsPreferenceKey, JSON.stringify(mergedStaleRefs)).catch(
-          () => {},
-        );
+        const persistedState = await saveStaleCredentialRefs(mergedStaleRefs, {
+          previousRefs: savedStaleRefs,
+          activeCredentialRef: activeServer.credentialRef,
+        });
+        if (!persistedState.persisted) {
+          credentialCleanupWarning = STALE_CREDENTIAL_PERSIST_FAILED_WARNING;
+        }
       }
     }
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
@@ -833,25 +843,23 @@
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
           const wasOffline = offline;
-          const wasUnreachable = kavitaUnreachable;
           offline = !connected;
-          kavitaUnreachable = false;
           if (!connected) {
-            cancelNetworkRequests();
+            refreshController?.abort();
+            openProgressProbe?.abort();
           }
+          coverReloadRequest += 1;
+          kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected && (wasOffline || wasUnreachable)) {
-            coverReloadRequest += 1;
+          if (connected && wasOffline) {
             const baselineRevision = activeSyncStartRevision ?? messageRevision;
             const baselineMessage = activeSyncStartRevision !== null ? '' : message;
             void syncProgress(false);
             void startRefresh(false, baselineRevision, baselineMessage);
-          } else if (connected && !wasOffline && syncTimer === null) {
-            void syncProgress(false);
           }
         }),
       ),
@@ -859,7 +867,7 @@
     cleanups.push(
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
-          if (!destroyed && !isActive && !offline) void syncProgress(false);
+          if (!destroyed && !isActive) void syncProgress(false);
         }),
       ),
     );
@@ -881,34 +889,11 @@
     return handle.remove;
   }
 
-  function cancelNetworkRequests(options: { abortActiveSync?: boolean } = {}): void {
-    networkEpoch += 1;
-    if (syncTimer !== null) {
-      window.clearTimeout(syncTimer);
-      syncTimer = null;
-    }
-    refreshController?.abort();
-    if (options.abortActiveSync) syncController?.abort();
-    openProgressProbe?.abort();
-    readerSyncController?.abort();
-    cancelCoverLoading();
-    sharedCoverLoader.cancel();
-  }
-
-  function networkAvailable(expectedEpoch = networkEpoch): boolean | Promise<boolean> {
-    if (offline || destroyed || networkEpoch !== expectedEpoch) return false;
+  async function networkAvailable(): Promise<boolean> {
+    if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
-    return Network.getStatus()
-      .catch(() => null)
-      .then((status) => {
-        if (status && !status.connected && !destroyed && !offline) {
-          offline = true;
-          cancelNetworkRequests();
-        }
-        return (
-          !offline && !destroyed && networkEpoch === expectedEpoch && status?.connected === true
-        );
-      });
+    const status = await Network.getStatus().catch(() => null);
+    return !offline && !destroyed && status?.connected === true;
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -921,26 +906,14 @@
   }
 
   function syncProgress(showFeedback = true): Promise<void> {
+    if (syncWork) return syncWork;
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
-    if (offline && !showFeedback) return Promise.resolve();
-    if (syncWork && (syncController?.signal.aborted || syncEpoch !== networkEpoch)) {
-      return syncWork.then(() => {
-        if (destroyed || (offline && !showFeedback)) return;
-        return syncProgress(showFeedback);
-      });
-    }
-    if (syncWork) return syncWork;
-    const work = runProgressSync(showFeedback).finally(() => {
-      if (syncWork === work) {
-        syncController = null;
-        syncEpoch = null;
-        syncWork = null;
-      }
+    syncWork = runProgressSync(showFeedback).finally(() => {
+      syncWork = null;
     });
-    syncWork = work;
-    return work;
+    return syncWork;
   }
 
   function setMessage(next: string): void {
@@ -951,32 +924,18 @@
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     activeSyncStartRevision = messageRevision;
-    const controller = new AbortController();
-    syncController = controller;
-    const epoch = networkEpoch;
-    syncEpoch = epoch;
-    const isStale = () =>
-      destroyed || offline || controller.signal.aborted || networkEpoch !== epoch;
     try {
-      const available = Capacitor.isNativePlatform() ? await networkAvailable(epoch) : !isStale();
-      if (!available || isStale()) {
-        if (showFeedback && !destroyed)
+      const available = Capacitor.isNativePlatform()
+        ? await networkAvailable()
+        : !offline && !destroyed;
+      if (!available) {
+        if (showFeedback)
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(
-        client,
-        server.id,
-        () => !isStale() && networkAvailable(epoch),
-        controller.signal,
-      );
-      if (showFeedback && !isStale()) setMessage('Reading progress synced.');
+      await flushProgress(client, server.id);
+      if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
-      if (isStale()) {
-        if (showFeedback && !destroyed)
-          setMessage('Offline. Reading progress will retry when Kavita is available.');
-        return;
-      }
       if (
         error instanceof AggregateError &&
         error.errors.some(
@@ -1001,11 +960,15 @@
     removeBackHandler?.();
     removeBackHandler = null;
     onReaderOpenChange?.(false);
-    cancelNetworkRequests({ abortActiveSync: true });
+    if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
+    openProgressProbe?.abort();
+    refreshController?.abort();
+    cancelCoverLoading();
     clearCovers();
+    sharedCoverLoader.cancel();
     cleanups.forEach((remove) => void remove());
   });
 
@@ -1047,29 +1010,25 @@
     refreshing = true;
     const controller = new AbortController();
     refreshController = controller;
-    const epoch = networkEpoch;
-    const isStale = () =>
-      destroyed || offline || controller.signal.aborted || networkEpoch !== epoch;
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
     if (!preserveMessage && messageRevision === initialRevision && message === initialMessage) {
       message = '';
     }
     try {
-      if (isStale() || !(await networkAvailable(epoch)) || isStale()) return;
+      if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (isStale() || !(await networkAvailable(epoch)) || isStale()) return;
+        if (controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
           ...(
             await Promise.all(
               batch.map(async (item) => {
-                if (isStale() || !(await networkAvailable(epoch)) || isStale()) return [];
                 const detail = await client.getSeriesDetail(item.id, controller.signal);
                 if (detail.incomplete) incomplete = true;
                 return mapSeriesToBooks(server.id, item, detail);
@@ -1078,7 +1037,7 @@
           ).flat(),
         );
       }
-      if (isStale() || !(await networkAvailable(epoch)) || isStale()) return;
+      if (controller.signal.aborted) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -1104,7 +1063,7 @@
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
-      if (isStale()) return;
+      if (controller.signal.aborted) return;
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -1401,8 +1360,6 @@
       return;
     }
     if (destroyed || reading || conflict || resolvingOpenProgress) return;
-    cancelCoverLoading();
-    sharedCoverLoader.cancel();
     resolvingOpenProgress = true;
     let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
     let local: StoredReadingState | null = null;
@@ -1532,17 +1489,8 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    void refreshSyncStatus();
-    if (syncTimer !== null) {
-      window.clearTimeout(syncTimer);
-      syncTimer = null;
-    }
-    if (!offline) {
-      syncTimer = window.setTimeout(() => {
-        syncTimer = null;
-        void syncProgress(false);
-      }, 2_500);
-    }
+    if (syncTimer !== null) window.clearTimeout(syncTimer);
+    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
   }
 
   async function syncLatestForReader(
@@ -1554,81 +1502,44 @@
     accept?: () => Promise<void>;
   } | null> {
     if (!manual && !pendingAutoSync) return null;
-    readerSyncController?.abort();
-    const controller = new AbortController();
-    readerSyncController = controller;
-    const epoch = networkEpoch;
-    const isStale = () =>
-      destroyed || offline || controller.signal.aborted || networkEpoch !== epoch;
-    try {
-      if (
-        book.remoteAvailable === false ||
-        isStale() ||
-        !(await networkAvailable(epoch)) ||
-        isStale()
-      ) {
-        if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
-        return null;
-      }
-      if (manual) {
-        try {
-          await flushProgress(
-            client,
-            server.id,
-            () => !isStale() && networkAvailable(epoch),
-            controller.signal,
-          );
-        } catch {
-          if (isStale()) {
-            throw new Error('Kavita is unavailable. Your reading position is saved here.');
-          }
-          throw new Error('Reading progress is saved here and still waiting to upload.');
-        } finally {
-          void refreshSyncStatus();
-        }
-        if (isStale()) {
-          throw new Error('Kavita is unavailable. Your reading position is saved here.');
-        }
-      }
-      const local = await getReadingState(book.id);
-      if (local?.pendingSync) {
-        if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
-        return null;
-      }
-      if (isStale() || !(await networkAvailable(epoch)) || isStale()) {
-        if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
-        return null;
-      }
-      const remote = await client.getProgress(book.chapterId, controller.signal);
-      if (isStale()) {
-        if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
-        return null;
-      }
-      if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
-      return {
-        xpath: remote.bookScrollId ?? null,
-        percentage: remotePercentage(remote, book),
-        accept: async () => {
-          acceptingRemoteProgress = true;
-          try {
-            // An upload cannot race with deletion of the exact revision it is sending.
-            await syncWork;
-            const accepted = await saveRemoteProgress(book, remote, local);
-            if (!accepted)
-              throw new Error('The saved reading position changed. Sync again to retry.');
-            updateRemoteBookProgress(book, remote);
-            void refreshSyncStatus();
-          } finally {
-            acceptingRemoteProgress = false;
-          }
-        },
-      };
-    } catch (error) {
-      if (!manual && isStale()) return null;
-      throw error;
-    } finally {
-      if (readerSyncController === controller) readerSyncController = null;
+    if (book.remoteAvailable === false || !(await networkAvailable())) {
+      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
+      return null;
     }
+    if (manual) {
+      try {
+        await flushProgress(client, server.id);
+      } catch {
+        throw new Error('Reading progress is saved here and still waiting to upload.');
+      } finally {
+        void refreshSyncStatus();
+      }
+    }
+    const local = await getReadingState(book.id);
+    if (local?.pendingSync) {
+      if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
+      return null;
+    }
+    const remote = await client.getProgress(book.chapterId);
+    if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;
+    return {
+      xpath: remote.bookScrollId ?? null,
+      percentage: remotePercentage(remote, book),
+      accept: async () => {
+        acceptingRemoteProgress = true;
+        try {
+          // An upload cannot race with deletion of the exact revision it is sending.
+          await syncWork;
+          const accepted = await saveRemoteProgress(book, remote, local);
+          if (!accepted)
+            throw new Error('The saved reading position changed. Sync again to retry.');
+          updateRemoteBookProgress(book, remote);
+          void refreshSyncStatus();
+        } finally {
+          acceptingRemoteProgress = false;
+        }
+      },
+    };
   }
 
   function updateRemoteBookProgress(book: BookRecord, remote: KavitaProgress): void {
@@ -1646,7 +1557,6 @@
       savedBook.pagesRead = book.pages;
       savedBook.lastReadAt = new Date().toISOString();
     }
-    void refreshSyncStatus();
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
@@ -1826,6 +1736,9 @@
 
   async function updateServerAddress(event: SubmitEvent): Promise<void> {
     event.preventDefault();
+    if (savingServerAddress || replacingApiKey || deletingServer || retryingCredentialCleanup) {
+      return;
+    }
     addressError = '';
     addressInvalidField = null;
     addressStatusMessage = '';
@@ -1835,8 +1748,13 @@
     const unsubscribe = subscribeDiagnostics(() => {
       eventsRecorded += 1;
     });
+    let rotated = false;
     try {
       const normalized = normalizeServerUrl(nextServerUrl);
+      if (normalized.apiKey) {
+        nextServerUrl = normalized.baseUrl;
+        if (!replacementApiKey.trim()) replacementApiKey = normalized.apiKey;
+      }
       if (normalized.insecure && !allowInsecureServerUrl) {
         addressInvalidField = 'address';
         recordDiagnostic({
@@ -1857,7 +1775,6 @@
         throw new Error('Enter a Kavita auth key.');
       }
 
-      const hadStaleCredentialRefs = staleCredentialRefs.length > 0;
       const result = await verifyKavitaConnection(normalized.baseUrl, candidateKey);
       const rotation = await rotateServerConnection(
         activeServer,
@@ -1869,13 +1786,11 @@
       );
       const updatedServer = rotation.server;
 
-      // Persist failed cleanup references before waiting on an upload that may
-      // outlive this screen or the app process.
-      await persistStaleCredentialRefs(
-        rotation.staleCredentialRefs,
-        hadStaleCredentialRefs,
-        updatedServer.credentialRef,
-      );
+      // Persist and surface failed cleanup references before waiting on an upload
+      // that may outlive this screen or the app process.
+      staleCredentialRefs = rotation.staleCredentialRefs;
+      credentialCleanupWarning = rotation.cleanupWarning ?? '';
+      onStaleCredentialRefsChange?.([...rotation.staleCredentialRefs]);
 
       // An upload started with the previous connection may still be finishing.
       while (syncWork) await syncWork;
@@ -1893,7 +1808,6 @@
       replacementApiKey = '';
       editingServerAddress = false;
       allowInsecureServerUrl = false;
-      savingServerAddress = false;
       if (rotation.cleanupWarning) {
         credentialCleanupWarning = rotation.cleanupWarning;
         addressStatusMessage = '';
@@ -1903,12 +1817,7 @@
         addressStatusMessage = 'Server address updated.';
         setMessage('Server address updated.');
       }
-      await tick();
-      restoreFocus(changeServerAddressButton);
-
-      if (!offline) {
-        await Promise.all([syncProgress(false), startRefresh(true)]);
-      }
+      rotated = true;
     } catch (cause) {
       if (cause instanceof ServerUrlError) {
         recordDiagnostic({
@@ -1942,40 +1851,12 @@
       unsubscribe();
       savingServerAddress = false;
     }
-  }
-
-  function parseStaleCredentialRefs(
-    raw: string | undefined,
-    activeCredentialRef: string,
-  ): string[] {
-    if (!raw) return [];
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return [];
-      return [
-        ...new Set(
-          parsed.filter((item): item is string => typeof item === 'string' && item.length > 0),
-        ),
-      ].filter((ref) => ref !== activeCredentialRef);
-    } catch {
-      return [];
-    }
-  }
-
-  async function persistStaleCredentialRefs(
-    nextRefs: readonly string[],
-    hadPreviousRefs: boolean,
-    activeCredentialRef = activeServer.credentialRef,
-  ): Promise<void> {
-    const normalizedRefs = [...new Set(nextRefs)].filter(
-      (ref) => Boolean(ref) && ref !== activeCredentialRef,
-    );
-    staleCredentialRefs = normalizedRefs;
-    onStaleCredentialRefsChange?.([...normalizedRefs]);
-    if (normalizedRefs.length > 0 || hadPreviousRefs) {
-      await setPreference(staleCredentialRefsPreferenceKey, JSON.stringify(normalizedRefs)).catch(
-        () => {},
-      );
+    if (rotated) {
+      await tick();
+      restoreFocus(changeServerAddressButton);
+      if (!offline) {
+        await Promise.all([syncProgress(false), startRefresh(true)]);
+      }
     }
   }
 
@@ -1983,12 +1864,21 @@
     if (staleCredentialRefs.length === 0 || retryingCredentialCleanup) return;
     retryingCredentialCleanup = true;
     try {
-      const remaining = await cleanupStaleCredentials(
-        staleCredentialRefs,
-        activeServer.credentialRef,
-      );
-      await persistStaleCredentialRefs(remaining, true);
-      if (remaining.length === 0) {
+      const previousRefs = [...staleCredentialRefs];
+      const remaining = await cleanupStaleCredentials(previousRefs, activeServer.credentialRef);
+      const persistedState = await saveStaleCredentialRefs(remaining, {
+        previousRefs,
+        activeCredentialRef: activeServer.credentialRef,
+      });
+      staleCredentialRefs = persistedState.refs;
+      onStaleCredentialRefsChange?.([...persistedState.refs]);
+      if (remaining.length > 0) {
+        credentialCleanupWarning = persistedState.persisted
+          ? STALE_CREDENTIAL_RETRY_FAILED_WARNING
+          : STALE_CREDENTIAL_RETRY_PERSIST_FAILED_WARNING;
+      } else if (!persistedState.persisted) {
+        credentialCleanupWarning = STALE_CREDENTIAL_STATUS_PERSIST_FAILED_WARNING;
+      } else {
         credentialCleanupWarning = '';
         if (settingsVisible) {
           addressStatusMessage = 'Previous auth key removed from this device.';
@@ -2002,13 +1892,12 @@
         } else if (libraryMain && !libraryMain.contains(document.activeElement)) {
           restoreFocus(settingsTriggerButton);
         }
-      } else {
-        credentialCleanupWarning = STALE_CREDENTIAL_RETRY_FAILED_WARNING;
       }
     } finally {
       retryingCredentialCleanup = false;
     }
   }
+
   async function removeAllDownloads(): Promise<void> {
     const candidates = books.filter((item) => item.downloadPath);
     if (
@@ -2084,6 +1973,9 @@
 
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
+    if (replacingApiKey || savingServerAddress || deletingServer || retryingCredentialCleanup) {
+      return;
+    }
     settingsError = '';
     replacingApiKey = true;
     try {
@@ -2115,9 +2007,7 @@
       replacementApiKey = '';
       setMessage('API key updated.');
       closeSettings();
-      if (!offline) {
-        await Promise.all([syncProgress(false), startRefresh(true)]);
-      }
+      await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
       settingsError = classifyConnectionError(
         cause,
@@ -2129,6 +2019,9 @@
   }
 
   async function deleteServer(): Promise<void> {
+    if (deletingServer || savingServerAddress || replacingApiKey || retryingCredentialCleanup) {
+      return;
+    }
     settingsError = '';
     deletingServer = true;
     try {
@@ -2137,11 +2030,15 @@
       await clearCoverCache().catch(() => {});
       clearCovers();
       if (!credentialCleanupComplete) {
+        const hadStaleRefs = staleCredentialRefs.length > 0;
         for (const ref of [...staleCredentialRefs]) {
           if (ref !== activeServer.credentialRef) {
             await removeApiKey(ref);
             staleCredentialRefs = staleCredentialRefs.filter((item) => item !== ref);
           }
+        }
+        if (hadStaleRefs) {
+          await setPreference(STALE_CREDENTIAL_REFS_PREFERENCE_KEY, '[]');
         }
         credentialCleanupWarning = '';
         onStaleCredentialRefsChange?.([]);
@@ -2185,7 +2082,7 @@
         ? undefined
         : retryReaderDownload}
       onMountChange={onReaderOpenChange}
-      {registerBackHandler}
+      {...registerBackHandler ? { registerBackHandler } : {}}
     />
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
@@ -3225,7 +3122,12 @@
         cancelServerAddressEdit();
       } else if (confirmDeleteServer) {
         cancelDeleteServer();
-      } else if (!savingServerAddress && !replacingApiKey && !deletingServer) {
+      } else if (
+        !savingServerAddress &&
+        !replacingApiKey &&
+        !deletingServer &&
+        !retryingCredentialCleanup
+      ) {
         closeSettings();
       }
     }}
@@ -3237,6 +3139,10 @@
           class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
           type="button"
           onclick={closeSettings}
+          disabled={savingServerAddress ||
+            replacingApiKey ||
+            deletingServer ||
+            retryingCredentialCleanup}
           aria-label="Close settings"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -3504,6 +3410,7 @@
               autocomplete="off"
               bind:value={replacementApiKey}
               placeholder="Enter a new Kavita key"
+              disabled={replacingApiKey || savingServerAddress || deletingServer}
               aria-invalid={Boolean(settingsError) || addressInvalidField === 'key' || undefined}
               aria-describedby={settingsError
                 ? 'settings-key-error'
@@ -3515,6 +3422,7 @@
             <button
               class="btn preset-tonal-surface min-h-11"
               type="button"
+              disabled={replacingApiKey || savingServerAddress || deletingServer}
               onclick={() => (showReplacementKey = !showReplacementKey)}
             >
               {showReplacementKey ? 'Hide key' : 'Show key'}
@@ -3522,7 +3430,7 @@
             <button
               class="btn preset-filled-primary-700-300 min-h-11 shrink-0"
               type="submit"
-              disabled={replacingApiKey || savingServerAddress}
+              disabled={replacingApiKey || savingServerAddress || deletingServer}
             >
               {replacingApiKey ? 'Testing...' : 'Save'}
             </button>

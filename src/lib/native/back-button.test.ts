@@ -87,6 +87,7 @@ describe('Android Back handler stack', () => {
       savingServerAddress: false,
       confirmDeleteServer: false,
       settingsBusy: false,
+      retryingCredentialCleanup: false,
       settingsVisible: false,
       filtersVisible: false,
     };
@@ -186,9 +187,25 @@ describe('Android Back handler stack', () => {
     expect(actions.closeSettings).not.toHaveBeenCalled();
 
     expect(
+      handleLibraryBack(
+        { ...baseState, settingsVisible: true, retryingCredentialCleanup: true },
+        actions,
+      ),
+    ).toBe(true);
+    expect(actions.closeSettings).not.toHaveBeenCalled();
+
+    expect(
       handleLibraryBack({ ...baseState, settingsVisible: true, filtersVisible: true }, actions),
     ).toBe(true);
     expect(actions.closeSettings).toHaveBeenCalledOnce();
+    expect(actions.hideFilters).not.toHaveBeenCalled();
+
+    expect(
+      handleLibraryBack(
+        { ...baseState, retryingCredentialCleanup: true, filtersVisible: true },
+        actions,
+      ),
+    ).toBe(true);
     expect(actions.hideFilters).not.toHaveBeenCalled();
 
     expect(handleLibraryBack({ ...baseState, filtersVisible: true }, actions)).toBe(true);
