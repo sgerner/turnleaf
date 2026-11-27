@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline
 - Block authenticated Kavita requests at the native transport boundary when offline.
