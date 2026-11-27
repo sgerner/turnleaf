@@ -143,7 +143,8 @@
   let bookmarkDraft = $state('');
   let bookmarkLimitMessage = $state('');
   let annotations = $state<StoredAnnotation[]>([]);
-  const androidReader = Capacitor.getPlatform() === 'android';
+  const platform = Capacitor.getPlatform();
+  const nativeReader = Capacitor.isNativePlatform() || platform === 'android' || platform === 'ios';
   let exportMessage = $state('');
   let exportFallback = $state('');
   let exporting = $state(false);
@@ -187,7 +188,7 @@
   let syncingLatest = $state(false);
   let destroyed = false;
   let localNavigationDuringSession = false;
-  const nativeFeatures = Capacitor.isNativePlatform()
+  const nativeFeatures = nativeReader
     ? createReaderNativeFeatures({
         hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
         showStatusBar: () => StatusBar.show({ animation: Animation.None }),
@@ -203,6 +204,8 @@
     document.title = `${title} · Turnleaf`;
     if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     window.addEventListener('keydown', handleKeyboardNavigation);
+    window.addEventListener('turnleafVolumeButton', handleVolumeButton);
+    window.addEventListener('turnleafPageButton', handlePageButton);
     const preferences = await getPreferences([
       'appearance',
       `readerBookmarks:${bookId}`,
@@ -293,7 +296,10 @@
   async function enableNativeReaderChrome(): Promise<void> {
     if (!nativeFeatures) return;
     try {
-      await nativeFeatures.enable(appearance.keepAwake, androidReader && appearance.volumeButtons);
+      await nativeFeatures.enable(
+        appearance.keepAwake,
+        appearance.volumeButtons && !hasOpenReaderPanel(),
+      );
     } catch {
       // Native reader chrome is optional; the reader itself should keep working.
     }
@@ -323,7 +329,7 @@
   }
 
   $effect(() => {
-    if (!nativeFeatures || !androidReader) return;
+    if (!nativeFeatures) return;
     void nativeFeatures.setVolumeButtons(appearance.volumeButtons && !hasOpenReaderPanel());
   });
 
@@ -379,6 +385,8 @@
     removeBackHandler?.();
     removeBackHandler = null;
     window.removeEventListener('keydown', handleKeyboardNavigation);
+    window.removeEventListener('turnleafVolumeButton', handleVolumeButton);
+    window.removeEventListener('turnleafPageButton', handlePageButton);
     document.title = previousDocumentTitle;
     if (hideTimer !== null) window.clearTimeout(hideTimer);
     if (tocVirtualizationFrame !== null) window.cancelAnimationFrame(tocVirtualizationFrame);
@@ -1326,43 +1334,58 @@
     }
   }
 
+  function readHardwareButtonDirection(event: Event): 'next' | 'previous' | null {
+    const candidate = event as CustomEvent<{ direction?: unknown }> & { direction?: unknown };
+    const direction = candidate.detail?.direction ?? candidate.direction;
+    return direction === 'next' || direction === 'previous' ? direction : null;
+  }
+
   function handleVolumeButton(event: Event): void {
-    if (!appearance.volumeButtons || hasOpenReaderPanel()) return;
-    const detail = (event as CustomEvent<{ direction?: string }>).detail;
-    if (detail?.direction === 'next' || detail?.direction === 'previous') {
-      void turn(detail.direction);
+    if (destroyed || !appearance.volumeButtons || hasOpenReaderPanel()) return;
+    const direction = readHardwareButtonDirection(event);
+    if (direction) {
+      void turn(direction);
+    }
+  }
+
+  function handlePageButton(event: Event): void {
+    if (destroyed || hasOpenReaderPanel()) return;
+    const direction = readHardwareButtonDirection(event);
+    if (direction) {
+      void turn(direction);
     }
   }
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
-    if (destroyed || event.defaultPrevented) return;
-    if (
-      !event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey &&
-      !event.shiftKey &&
-      event.key === 'Escape' &&
-      hasOpenReaderPanel()
-    ) {
-      event.preventDefault();
-      if (error) {
-        handleErrorDialogClose();
-        return;
+    if (destroyed || event.defaultPrevented || event.isComposing) return;
+    if (hasOpenReaderPanel()) {
+      if (
+        event.key === 'Escape' &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey
+      ) {
+        event.preventDefault();
+        if (error) {
+          handleErrorDialogClose();
+          return;
+        }
+        if (pendingSyncLocation) {
+          closeSyncConfirmation();
+          return;
+        }
+        if (settingsVisible) closeSettings();
+        else if (tocVisible) closeToc();
+        else if (bookmarksVisible) closeBookmarks();
+        else if (annotationsVisible) closeAnnotations();
+        else if (searchVisible) closeSearch();
+        showControls();
       }
-      if (pendingSyncLocation) {
-        closeSyncConfirmation();
-        return;
-      }
-      if (settingsVisible) closeSettings();
-      else if (tocVisible) closeToc();
-      else if (bookmarksVisible) closeBookmarks();
-      else if (annotationsVisible) closeAnnotations();
-      else if (searchVisible) closeSearch();
-      showControls();
       return;
     }
     const action = resolveReaderKeyboardAction(event, {
-      hasOpenPanel: hasOpenReaderPanel(),
+      hasOpenPanel: false,
       hasSelection: selectedText !== null,
     });
     if (!action) return;
@@ -1431,16 +1454,6 @@
   function handleBottomSwipeEnd(event: PointerEvent): void {
     if (bottomSwipeStart?.id === event.pointerId) bottomSwipeStart = null;
   }
-
-  if (Capacitor.isNativePlatform()) {
-    window.addEventListener('turnleafVolumeButton', handleVolumeButton);
-  }
-
-  onDestroy(() => {
-    if (Capacitor.isNativePlatform()) {
-      window.removeEventListener('turnleafVolumeButton', handleVolumeButton);
-    }
-  });
 </script>
 
 <main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
@@ -1490,15 +1503,15 @@
   </p>
 
   <p id="reader-keyboard-help" class="sr-only">
-    Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
-    Press Escape to close an open reader panel or clear selected text.
+    Use Left, Up, Page Up, or Shift+Space for the previous page. Use Right, Down, Page Down, or
+    Space for the next page. Press Escape to close an open reader panel or clear selected text.
   </p>
 
   <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
     <button
       type="button"
       aria-label="Previous page"
-      aria-keyshortcuts="ArrowLeft PageUp"
+      aria-keyshortcuts="ArrowLeft ArrowUp PageUp Shift+Space"
       onclick={() => turn('previous')}
     ></button>
     <button
@@ -1510,7 +1523,7 @@
     <button
       type="button"
       aria-label="Next page"
-      aria-keyshortcuts="ArrowRight PageDown Space"
+      aria-keyshortcuts="ArrowRight ArrowDown PageDown Space"
       onclick={() => turn('next')}
     ></button>
   </nav>
@@ -1924,7 +1937,7 @@
             />
             Keep screen on while reading
           </label>
-          {#if androidReader}
+          {#if nativeReader}
             <label class="mt-4 flex min-h-12 items-center gap-3">
               <input
                 class="checkbox"

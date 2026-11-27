@@ -37,22 +37,79 @@ export interface ReaderSelection {
 
 export type ReaderKeyboardAction = 'next' | 'previous' | 'clear-selection' | null;
 
+const INTERACTIVE_READER_TARGET_SELECTOR = [
+  'a',
+  'button',
+  'input',
+  'select',
+  'textarea',
+  'summary',
+  '[contenteditable="true"]',
+  '[role="button"]',
+  '[role="link"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="combobox"]',
+  '[role="listbox"]',
+  '[role="slider"]',
+  '[role="spinbutton"]',
+  '[role="switch"]',
+  '[role="checkbox"]',
+  '[role="menuitem"]',
+].join(',');
+
+function isInteractiveReaderElement(candidate: unknown): boolean {
+  if (!candidate || typeof candidate !== 'object') return false;
+  const closest = (candidate as { closest?: unknown }).closest;
+  if (typeof closest !== 'function') return false;
+  return Boolean((candidate as Element).closest(INTERACTIVE_READER_TARGET_SELECTOR));
+}
+
+function hasInteractiveReaderFocus(event: KeyboardEvent): boolean {
+  if (isInteractiveReaderElement(event.target)) return true;
+  if (isInteractiveReaderElement(event.view?.document?.activeElement)) return true;
+
+  if (typeof document === 'undefined') return false;
+  const active = document.activeElement;
+  if (!active) return false;
+  if (isInteractiveReaderElement(active)) return true;
+  if (active.localName === 'iframe') {
+    const frameActive = (active as HTMLIFrameElement).contentDocument?.activeElement;
+    if (isInteractiveReaderElement(frameActive)) return true;
+  }
+  return false;
+}
+
 export function resolveReaderKeyboardAction(
   event: KeyboardEvent,
   options: { hasOpenPanel?: boolean; hasSelection?: boolean } = {},
 ): ReaderKeyboardAction {
-  if (event.defaultPrevented) return null;
-  if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return null;
+  if (event.defaultPrevented || event.isComposing) return null;
+  if (event.ctrlKey || event.metaKey || event.altKey) return null;
   if (options.hasOpenPanel) return null;
   if (event.key === 'Escape') {
-    return options.hasSelection ? 'clear-selection' : null;
+    return !event.shiftKey && options.hasSelection ? 'clear-selection' : null;
   }
-  const target = event.target as Element | null;
-  if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
+  if (event.shiftKey && event.key !== ' ') return null;
+  if (hasInteractiveReaderFocus(event)) {
     return null;
   }
-  if (event.key === 'ArrowLeft' || event.key === 'PageUp') return 'previous';
-  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') return 'next';
+  if (
+    event.key === 'ArrowLeft' ||
+    event.key === 'ArrowUp' ||
+    event.key === 'PageUp' ||
+    (event.key === ' ' && event.shiftKey)
+  ) {
+    return 'previous';
+  }
+  if (
+    event.key === 'ArrowRight' ||
+    event.key === 'ArrowDown' ||
+    event.key === 'PageDown' ||
+    event.key === ' '
+  ) {
+    return 'next';
+  }
   return null;
 }
 
@@ -375,6 +432,7 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+  private readonly keydownDocuments = new Set<Document>();
   private current: Location | null = null;
   private spine: {
     sections: SpineSection[];
@@ -607,7 +665,23 @@ export class ReaderSession {
     this.rendition.on('click', this.contentClick);
     if (onKeyboardNavigation) {
       this.keyboardNavigation = onKeyboardNavigation;
-      this.rendition.on('keydown', this.keyboardNavigation);
+      this.rendition.hooks.content.register((contents: Contents) => {
+        const listener = this.keyboardNavigation;
+        const doc = contents.document;
+        if (!doc || !listener) return;
+        for (const existing of this.keydownDocuments) {
+          if (!existing.defaultView) {
+            existing.removeEventListener('keydown', listener);
+            this.keydownDocuments.delete(existing);
+          }
+        }
+        doc.addEventListener('keydown', listener, { passive: false });
+        this.keydownDocuments.add(doc);
+        this.addContentCleanup(contents, () => {
+          doc.removeEventListener('keydown', listener);
+          this.keydownDocuments.delete(doc);
+        });
+      });
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
@@ -944,8 +1018,12 @@ export class ReaderSession {
       this.rendition.off('rendered', this.renderedListener);
     if (this.rendition && this.resizedListener) this.rendition.off('resized', this.resizedListener);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
-    if (this.rendition && this.keyboardNavigation)
-      this.rendition.off('keydown', this.keyboardNavigation);
+    if (this.keyboardNavigation) {
+      for (const doc of this.keydownDocuments) {
+        doc.removeEventListener('keydown', this.keyboardNavigation);
+      }
+    }
+    this.keydownDocuments.clear();
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;

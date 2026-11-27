@@ -15,6 +15,7 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+  import { forwardStageScrollKey } from './lib/a11y/stage-scroll';
   import {
     DEFAULT_MODE,
     DEFAULT_THEME,
@@ -65,6 +66,7 @@
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let appStage = $state<HTMLDivElement | null>(null);
   let stageOverlayActive = $state(false);
 
   async function loadLocalData(): Promise<void> {
@@ -73,6 +75,7 @@
     server = null;
     apiKey = null;
     readerOpen = false;
+    stageOverlayActive = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -159,6 +162,12 @@
   });
 </script>
 
+<svelte:window
+  onkeydown={(event) => {
+    if (!stageOverlayActive) forwardStageScrollKey(event, appStage);
+  }}
+/>
+
 <div class="app-shell">
   {#if !readerOpen && uiTheme !== 'eink'}
     <div class="app-ambient" aria-hidden="true">
@@ -216,7 +225,7 @@
     </div>
   {/if}
 
-  <div class="app-stage">
+  <div class="app-stage" bind:this={appStage}>
     {#if booting}
       <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
