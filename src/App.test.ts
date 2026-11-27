@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, tick, unmount } from 'svelte';
 import type { BookRecord, ServerConfig } from './lib/database/database';
+import type * as ThemesModule from './lib/themes/themes';
 
 const {
   fetchLatestGithubReleaseMock,
@@ -50,10 +51,14 @@ vi.mock('./lib/github/releases', () => ({
   fetchLatestGithubRelease: fetchLatestGithubReleaseMock,
 }));
 
-vi.mock('./lib/themes/themes', () => ({
-  loadTheme: loadThemeMock,
-  skeletonThemes: ['fennec', 'eink', 'catppuccin'],
-}));
+vi.mock('./lib/themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: loadThemeMock,
+    skeletonThemes: ['fennec', 'eink', 'catppuccin'],
+  };
+});
 
 vi.mock('./lib/native/credentials', () => ({
   getApiKey: getApiKeyMock,
@@ -107,9 +112,12 @@ vi.mock('@capacitor/app', () => ({
 }));
 
 vi.mock('./lib/reader/session', () => ({
+  resolveReaderKeyboardAction: vi.fn(() => null),
   ReaderSession: class MockReaderSession {
     open = openSessionMock;
     tableOfContents = () => [];
+    getVisiblePassages = () => [];
+    clearTextSelection = vi.fn();
     updateHighlights = vi.fn();
     destroy = destroySessionMock;
   },
@@ -246,6 +254,7 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     ensureElementAnimate();
+    window.localStorage.clear();
     document.documentElement.removeAttribute('data-theme');
     document.documentElement.removeAttribute('data-mode');
 

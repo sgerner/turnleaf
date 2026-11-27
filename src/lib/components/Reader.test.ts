@@ -174,7 +174,7 @@ describe('Reader mount lifecycle', () => {
     expect(onMountChange).toHaveBeenCalledWith(true);
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
         'This EPUB could not be opened.',
       );
     });
