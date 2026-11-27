@@ -38,6 +38,7 @@
   } from '../reader/annotations';
   import {
     MAX_BOOKMARKS,
+    hasCustomBookmarkLabel,
     parseBookmarks,
     parseLocationHistory,
     recordLocation,
@@ -54,6 +55,7 @@
     restoreModalFocus,
     trapModalKeydown,
   } from '../a11y/modal-focus';
+  import ConfirmDialog from './ConfirmDialog.svelte';
   import {
     TOC_FALLBACK_VIEWPORT_HEIGHT_PX,
     TOC_OVERSCAN_ROWS,
@@ -71,6 +73,19 @@
     percentage: number | null;
     accept?: () => Promise<void>;
   };
+
+  type ReaderConfirmation =
+    | {
+        kind: 'delete-annotation';
+        annotation: StoredAnnotation;
+        opener: HTMLElement | null;
+      }
+    | {
+        kind: 'delete-bookmark';
+        bookmark: StoredReaderLocation;
+        source: 'list' | 'current';
+        opener: HTMLElement | null;
+      };
 
   let {
     bookUrl,
@@ -175,6 +190,7 @@
   let location = $state<ReaderLocation | null>(null);
   let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
   let pendingSyncLocation = $state<SyncedLocation | null>(null);
+  let readerConfirm = $state<ReaderConfirmation | null>(null);
   let error = $state('');
   let startupOpenFailed = $state(false);
   let retryingReader = $state(false);
@@ -418,12 +434,13 @@
       annotationsVisible ||
       searchVisible ||
       pendingSyncLocation !== null ||
+      readerConfirm !== null ||
       Boolean(error)
     );
   }
 
   function hasTopLevelAlert(): boolean {
-    return pendingSyncLocation !== null || Boolean(error);
+    return pendingSyncLocation !== null || readerConfirm !== null || Boolean(error);
   }
 
   function canDismissError(): boolean {
@@ -446,6 +463,7 @@
     restoreReturnLink = false,
   ): void {
     pauseChromeHide();
+    readerConfirm = null;
     errorOpener = opener;
     errorRestoreReturnLink = restoreReturnLink;
     error = message;
@@ -687,6 +705,7 @@
     opener: HTMLElement | null = activeElement(),
   ): void {
     pauseChromeHide();
+    readerConfirm = null;
     syncConfirmationOpener = opener;
     closeOpenSubpanels();
     pendingSyncLocation = progress;
@@ -701,6 +720,16 @@
       restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
     }
     resumeChromeHide();
+  }
+
+  function cancelReaderConfirm(): void {
+    readerConfirm = null;
+    resumeChromeHide();
+  }
+
+  function previewText(value: string, limit: number): string {
+    const normalized = value.trim().replace(/\s+/g, ' ');
+    return normalized.length > limit ? `${normalized.slice(0, limit - 1).trimEnd()}…` : normalized;
   }
 
   function showFooter(): void {
@@ -927,8 +956,20 @@
 
   function toggleCurrentBookmark(): void {
     if (!location) return;
+    const existing = currentBookmark();
+    if (existing && hasCustomBookmarkLabel(existing)) {
+      pauseChromeHide();
+      selectionMessage = '';
+      readerConfirm = {
+        kind: 'delete-bookmark',
+        bookmark: existing,
+        source: 'current',
+        opener: activeElement(),
+      };
+      return;
+    }
     const id = `${location.cfi}|${location.href}`;
-    const wasBookmarked = bookmarks.some((bookmark) => bookmark.id === id);
+    const wasBookmarked = existing !== null;
     const next = toggleBookmark(bookmarks, readerLocation(location));
     if (!wasBookmarked && !next.some((bookmark) => bookmark.id === id)) {
       bookmarkLimitMessage = BOOKMARK_LIMIT_MESSAGE;
@@ -955,11 +996,29 @@
   }
 
   function deleteBookmark(bookmark: StoredReaderLocation): void {
+    pauseChromeHide();
+    selectionMessage = '';
+    readerConfirm = {
+      kind: 'delete-bookmark',
+      bookmark,
+      source: 'list',
+      opener: activeElement(),
+    };
+  }
+
+  function confirmDeleteBookmark(bookmark: StoredReaderLocation, source: 'list' | 'current'): void {
     const index = bookmarks.findIndex((entry) => entry.id === bookmark.id);
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
     if (bookmarks.length < MAX_BOOKMARKS) bookmarkLimitMessage = '';
+    readerConfirm = null;
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
+    selectionMessage = `Bookmark “${bookmark.label}” deleted.`;
+    resumeChromeHide();
+    if (source === 'current') {
+      focusReaderTarget(bookmarksPanel, 'bookmark-current');
+      return;
+    }
     const next = bookmarks[Math.min(Math.max(index, 0), bookmarks.length - 1)];
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
@@ -1042,13 +1101,28 @@
   }
 
   function deleteAnnotation(annotation: StoredAnnotation): void {
+    pauseChromeHide();
+    selectionMessage = '';
+    annotationMessage = '';
+    readerConfirm = {
+      kind: 'delete-annotation',
+      annotation,
+      opener: activeElement(),
+    };
+  }
+
+  function confirmDeleteAnnotation(annotation: StoredAnnotation): void {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
     annotationDrafts.delete(annotation.id);
     if (editingAnnotationId === annotation.id) editingAnnotationId = null;
     if (annotations.length < MAX_ANNOTATIONS) annotationLimitMessage = '';
+    readerConfirm = null;
     session?.updateHighlights(annotations);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    annotationMessage = '';
+    selectionMessage = annotation.note ? 'Highlight and note deleted.' : 'Highlight deleted.';
+    resumeChromeHide();
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
   }
@@ -1353,6 +1427,10 @@
         closeSyncConfirmation();
         return;
       }
+      if (readerConfirm) {
+        cancelReaderConfirm();
+        return;
+      }
       if (settingsVisible) closeSettings();
       else if (tocVisible) closeToc();
       else if (bookmarksVisible) closeBookmarks();
@@ -1388,6 +1466,10 @@
     }
     if (pendingSyncLocation) {
       closeSyncConfirmation();
+      return true;
+    }
+    if (readerConfirm) {
+      cancelReaderConfirm();
       return true;
     }
     if (settingsVisible) closeSettings();
@@ -2546,6 +2628,48 @@
         </div>
       </div>
     </div>
+  {/if}
+
+  {#if readerConfirm}
+    {#if readerConfirm.kind === 'delete-annotation'}
+      {@const targetAnnotation = readerConfirm.annotation}
+      <ConfirmDialog
+        title={targetAnnotation.note ? 'Delete highlight and note?' : 'Delete highlight?'}
+        description={targetAnnotation.note
+          ? 'This permanently deletes your saved highlight and note from this device.'
+          : 'This permanently deletes your saved highlight from this device.'}
+        confirmLabel="Delete highlight"
+        zIndexClass="z-40"
+        opener={readerConfirm.opener}
+        fallbackFocus={() => annotationsPanel ?? readerToolbar ?? topRevealButton}
+        onCancel={cancelReaderConfirm}
+        onConfirm={() => confirmDeleteAnnotation(targetAnnotation)}
+      >
+        <blockquote
+          class="rounded-md preset-tonal-surface p-2.5 text-xs italic text-surface-950-50"
+        >
+          “{previewText(targetAnnotation.excerpt, 180)}”
+        </blockquote>
+        {#if targetAnnotation.note}
+          <p class="rounded-md preset-tonal-surface p-2.5 text-xs text-surface-800-200">
+            Note: {previewText(targetAnnotation.note, 220)}
+          </p>
+        {/if}
+      </ConfirmDialog>
+    {:else}
+      {@const targetBookmark = readerConfirm.bookmark}
+      {@const targetSource = readerConfirm.source}
+      <ConfirmDialog
+        title="Delete bookmark?"
+        description={`Delete bookmark “${previewText(targetBookmark.label, 120)}” from this device? This cannot be undone.`}
+        confirmLabel="Delete bookmark"
+        zIndexClass="z-40"
+        opener={readerConfirm.opener}
+        fallbackFocus={() => bookmarksPanel ?? readerToolbar ?? topRevealButton}
+        onCancel={cancelReaderConfirm}
+        onConfirm={() => confirmDeleteBookmark(targetBookmark, targetSource)}
+      />
+    {/if}
   {/if}
 
   {#if error}

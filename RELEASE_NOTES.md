@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Guard destructive reading actions with confirmation dialogs
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

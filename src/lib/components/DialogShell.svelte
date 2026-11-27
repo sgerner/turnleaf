@@ -6,12 +6,14 @@
   let {
     labelledBy,
     onClose,
+    inert = false,
     dialogElement = $bindable<HTMLElement | null>(null),
     header,
     children,
   }: {
     labelledBy: string;
     onClose: () => void;
+    inert?: boolean;
     dialogElement?: HTMLElement | null;
     header: Snippet;
     children: Snippet;
@@ -21,6 +23,7 @@
 <div
   class="dialog-backdrop fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
   role="presentation"
+  {inert}
   transition:fade
   onclick={(event) => event.target === event.currentTarget && onClose()}
 >
