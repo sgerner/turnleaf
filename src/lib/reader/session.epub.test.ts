@@ -678,6 +678,52 @@ describe('ReaderSession', () => {
 
       expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(412, 915);
       session.destroy();
+
+      // Also flushes deferred resize onto a newer chapter when display() supersedes an in-flight open()
+      mockRendition.on.mockClear();
+      mockRendition.resize.mockClear();
+      mockRendition.display.mockClear();
+      mockRendition.started = Promise.resolve();
+      let resolveOpenDisplay!: () => void;
+      mockRendition.display
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              resolveOpenDisplay = resolve;
+            }),
+        )
+        .mockImplementation(async () => {});
+
+      const supersededSession = new ReaderSession('book.epub');
+      const supersededOpen = supersededSession.open(
+        viewport,
+        'epubcfi(/6/2!/4/2:0)',
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      await Promise.resolve();
+
+      const newerNav = supersededSession.display('second.xhtml');
+      resizeCallbacks.at(-1)?.(
+        [{ contentRect: { width: 540, height: 920 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      await newerNav;
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      const relocated = getRenditionListener('relocated');
+      relocated(location('epubcfi(/6/4!/4/2:0)'));
+      mockRendition.display.mockClear();
+
+      resolveOpenDisplay();
+      await supersededOpen;
+
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(540, 920);
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2:0)');
+      supersededSession.destroy();
     } finally {
       mockRendition.started = Promise.resolve();
     }

@@ -12,6 +12,7 @@ import {
   isolateModalBackground,
   restoreFocus,
   restoreModalFocus,
+  snapshotModalBackground,
   trapModalKeydown,
 } from './modal-focus';
 
@@ -178,6 +179,35 @@ it('redirects stray focusin outside an active modal and releases inert before re
 
   restoreFocus(opener);
   expect(document.activeElement).toBe(opener);
+});
+
+it('restores siblings cleanly via snapshotModalBackground when declarative inert reflects before tick', async () => {
+  const main = document.createElement('main');
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('tabindex', '0');
+  main.append(iframe);
+  stage.prepend(main);
+
+  const snapshot = snapshotModalBackground(main);
+  // Simulate Chromium reflected inert={modalOpen} flushing before async activateModal runs
+  main.inert = true;
+  main.setAttribute('inert', '');
+
+  await tick();
+  const cleanup = activateModal(dialog, null, '.app-stage', true, snapshot);
+  expect(main.inert).toBe(true);
+  expect(main.hasAttribute('inert')).toBe(true);
+  expect(iframe.getAttribute('tabindex')).toBe('-1');
+
+  main.inert = false;
+  main.removeAttribute('inert');
+  deactivateModal(cleanup, dialog);
+
+  expect(main.inert).toBe(false);
+  expect(main.hasAttribute('inert')).toBe(false);
+  expect(main.hasAttribute('aria-hidden')).toBe(false);
+  expect(iframe.hasAttribute('inert')).toBe(false);
+  expect(iframe.getAttribute('tabindex')).toBe('0');
 });
 
 it('retains previous inert, aria-hidden, and iframe tabindex values across nested modals and restores dynamically added siblings when the final modal closes', async () => {

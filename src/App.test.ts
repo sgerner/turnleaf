@@ -247,6 +247,7 @@ describe('App shell releaseBanner layout', () => {
       expect(banner.dataset.bannerHeight).toBe('96');
       expect(stage.dataset.stickyBannerHeight).toBe('96');
       expect(stage.style.getPropertyValue('--release-banner-height')).toBe('96px');
+      expect(banner.inert).toBe(false);
 
       const dismissButton = Array.from(banner.querySelectorAll('button')).find(
         (button) => button.textContent?.trim() === 'Dismiss',

@@ -208,9 +208,7 @@
       class="release-banner"
       data-release-banner=""
       data-banner-height={releaseBannerHeight}
-      inert={readerOpen || undefined}
-      aria-hidden={readerOpen ? 'true' : undefined}
-      data-stage-overlay={stageOverlayActive ? '' : undefined}
+      inert={stageOverlayActive}
       transition:fade
     >
       <div class="mx-auto w-full max-w-4xl px-4 pb-2 pt-[max(1rem,env(safe-area-inset-top))]">
@@ -262,7 +260,6 @@
     class="app-stage"
     data-sticky-banner-height={releaseBanner ? releaseBannerHeight : 0}
     style:--release-banner-height={`${releaseBanner ? releaseBannerHeight : 0}px`}
-    style:--sticky-banner-height={`${releaseBanner ? releaseBannerHeight : 0}px`}
   >
     {#if booting}
       <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">

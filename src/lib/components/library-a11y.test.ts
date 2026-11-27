@@ -6,55 +6,24 @@ import type { BookRecord, ServerConfig, StoredReadingState } from '../database/d
 import type { KavitaProgress } from '../kavita/types';
 import type * as ThemesModule from '../themes/themes';
 
-const mocks = vi.hoisted(() => {
-  let backListener: (() => void) | null = null;
-  let books: BookRecord[] = [];
-  let connected = false;
-  let preferences = new Map<string, string>();
-  let localReadingState: StoredReadingState | null = null;
-  let remoteProgress: KavitaProgress | null = null;
-  let releaseBannerData: {
+const mocks = vi.hoisted(() => ({
+  backListener: null as (() => void) | null,
+  books: [] as BookRecord[],
+  connected: false,
+  preferences: new Map<string, string>(),
+  localReadingState: null as StoredReadingState | null,
+  remoteProgress: null as KavitaProgress | null,
+  releaseBanner: null as {
     version: string;
     title: string;
     releaseUrl: string;
     downloadUrl: string | null;
-  } | null = null;
-
-  return {
-    getBackListener: () => backListener,
-    setBackListener: (fn: (() => void) | null) => {
-      backListener = fn;
-    },
-    getBooks: () => books,
-    setBooks: (next: BookRecord[]) => {
-      books = next;
-    },
-    getConnected: () => connected,
-    setConnected: (next: boolean) => {
-      connected = next;
-    },
-    getPreferences: () => preferences,
-    setPreferences: (next: Map<string, string>) => {
-      preferences = next;
-    },
-    getLocalReadingState: () => localReadingState,
-    setLocalReadingState: (next: StoredReadingState | null) => {
-      localReadingState = next;
-    },
-    getRemoteProgress: () => remoteProgress,
-    setRemoteProgress: (next: KavitaProgress | null) => {
-      remoteProgress = next;
-    },
-    getReleaseBanner: () => releaseBannerData,
-    setReleaseBanner: (next: typeof releaseBannerData) => {
-      releaseBannerData = next;
-    },
-  };
-});
+  } | null,
+}));
 
 vi.mock('@capacitor/network', () => ({
   Network: {
-    getStatus: vi.fn(async () => ({ connected: mocks.getConnected() })),
+    getStatus: vi.fn(async () => ({ connected: mocks.connected })),
     addListener: vi.fn(async () => ({ remove: async () => {} })),
   },
 }));
@@ -62,11 +31,11 @@ vi.mock('@capacitor/network', () => ({
 vi.mock('@capacitor/app', () => ({
   App: {
     addListener: vi.fn(async (eventName: string, callback: () => void) => {
-      if (eventName === 'backButton') mocks.setBackListener(callback);
+      if (eventName === 'backButton') mocks.backListener = callback;
       return {
         remove: async () => {
-          if (eventName === 'backButton' && mocks.getBackListener() === callback) {
-            mocks.setBackListener(null);
+          if (eventName === 'backButton' && mocks.backListener === callback) {
+            mocks.backListener = null;
           }
         },
       };
@@ -84,10 +53,10 @@ vi.mock('../database/database', () => ({
     kavitaVersion: '0.8.0',
     lastConnectedAt: '2026-01-01T00:00:00.000Z',
   })),
-  getBooks: vi.fn(async () => mocks.getBooks()),
-  getPreferences: vi.fn(async () => new Map(mocks.getPreferences())),
+  getBooks: vi.fn(async () => mocks.books),
+  getPreferences: vi.fn(async () => new Map(mocks.preferences)),
   setPreference: vi.fn(async (key: string, value: string) => {
-    mocks.getPreferences().set(key, value);
+    mocks.preferences.set(key, value);
   }),
   getSyncStatus: vi.fn(async () => ({
     pendingCount: 0,
@@ -95,7 +64,7 @@ vi.mock('../database/database', () => ({
     lastError: null,
     lastUpdatedAt: null,
   })),
-  getReadingState: vi.fn(async () => mocks.getLocalReadingState()),
+  getReadingState: vi.fn(async () => mocks.localReadingState),
   acceptRemoteProgress: vi.fn(async () => true),
   markDownloaded: vi.fn(async () => {}),
   markBookCompleted: vi.fn(async () => {}),
@@ -124,7 +93,7 @@ vi.mock('../themes/themes', async (importOriginal) => {
 });
 
 vi.mock('../github/releases', () => ({
-  fetchLatestGithubRelease: vi.fn(async () => mocks.getReleaseBanner()),
+  fetchLatestGithubRelease: vi.fn(async () => mocks.releaseBanner),
 }));
 
 vi.mock('../downloads/native-download', () => ({
@@ -154,7 +123,7 @@ vi.mock('../kavita/client', () => ({
       return [];
     }
     async getProgress(): Promise<KavitaProgress | null> {
-      return mocks.getRemoteProgress();
+      return mocks.remoteProgress;
     }
   },
 }));
@@ -166,11 +135,7 @@ if (typeof Element !== 'undefined' && !Element.prototype.animate) {
   Element.prototype.animate = () => {
     const animation = {
       onfinish: null as (() => void) | null,
-      cancel: () => {},
-      finish: () => animation.onfinish?.(),
-      play: () => {},
-      pause: () => {},
-      reverse: () => {},
+      cancel() {},
       finished: Promise.resolve(),
     };
     queueMicrotask(() => animation.onfinish?.());
@@ -214,6 +179,23 @@ const defaultServer: ServerConfig = {
   lastConnectedAt: '2026-01-01T00:00:00.000Z',
 };
 
+function mountLibrary(target: HTMLElement): Record<string, unknown> {
+  return mount(Library, {
+    target,
+    props: {
+      server: defaultServer,
+      apiKey: 'test-api-key',
+      theme: 'fennec',
+      mode: 'dark',
+      onThemeChange: vi.fn(),
+      onModeChange: vi.fn(),
+      onApiKeyChange: vi.fn(),
+      onServerDeleted: vi.fn(),
+      onChangeServerAddress: vi.fn(),
+    },
+  });
+}
+
 async function settle(): Promise<void> {
   for (let i = 0; i < 6; i += 1) {
     await Promise.resolve();
@@ -228,13 +210,13 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
 
   beforeEach(() => {
     document.body.innerHTML = '';
-    mocks.setBackListener(null);
-    mocks.setConnected(false);
-    mocks.setBooks(makeBooks(500));
-    mocks.setPreferences(new Map([['syncFurthest', 'false']]));
-    mocks.setLocalReadingState(null);
-    mocks.setRemoteProgress(null);
-    mocks.setReleaseBanner(null);
+    mocks.backListener = null;
+    mocks.connected = false;
+    mocks.books = makeBooks(500);
+    mocks.preferences = new Map([['syncFurthest', 'false']]);
+    mocks.localReadingState = null;
+    mocks.remoteProgress = null;
+    mocks.releaseBanner = null;
   });
 
   afterEach(async () => {
@@ -252,20 +234,7 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
     Object.defineProperty(stage, 'clientHeight', { value: 800, configurable: true });
     document.body.append(stage);
 
-    mountedComponent = mount(Library, {
-      target: stage,
-      props: {
-        server: defaultServer,
-        apiKey: 'test-api-key',
-        theme: 'fennec',
-        mode: 'dark',
-        onThemeChange: vi.fn(),
-        onModeChange: vi.fn(),
-        onApiKeyChange: vi.fn(),
-        onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
-      },
-    });
+    mountedComponent = mountLibrary(stage);
     await settle();
 
     const feed = stage.querySelector<HTMLElement>('#library-results');
@@ -324,26 +293,13 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
   });
 
   it('maintains 1-based aria-posinset and aria-setsize across grid, list, and filtered states and supports page-jump shortcuts', async () => {
-    mocks.setBooks(makeBooks(40));
+    mocks.books = makeBooks(40);
     const stage = document.createElement('div');
     stage.className = 'app-stage';
     Object.defineProperty(stage, 'clientHeight', { value: 800, configurable: true });
     document.body.append(stage);
 
-    mountedComponent = mount(Library, {
-      target: stage,
-      props: {
-        server: defaultServer,
-        apiKey: 'test-api-key',
-        theme: 'fennec',
-        mode: 'dark',
-        onThemeChange: vi.fn(),
-        onModeChange: vi.fn(),
-        onApiKeyChange: vi.fn(),
-        onServerDeleted: vi.fn(),
-        onChangeServerAddress: vi.fn(),
-      },
-    });
+    mountedComponent = mountLibrary(stage);
     await settle();
 
     const feed = stage.querySelector<HTMLElement>('#library-results')!;
@@ -405,16 +361,16 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
     expect(filteredArticles[0]?.getAttribute('aria-setsize')).toBe('20');
   });
 
-  it('tracks sticky releaseBanner height on .app-stage, offsets programmatic scrolling, and isolates background siblings across Library dialogs', async () => {
-    mocks.setConnected(true);
-    mocks.setBooks(makeBooks(30));
-    mocks.setReleaseBanner({
+  it('distinguishes non-overlapping flex sibling releaseBanner from overlapping banner offset and isolates background siblings across Library dialogs', async () => {
+    mocks.connected = true;
+    mocks.books = makeBooks(30);
+    mocks.releaseBanner = {
       version: '0.4.0',
       title: 'Accessibility release',
       releaseUrl: 'https://github.com/sgerner/turnleaf/releases/tag/v0.4.0',
       downloadUrl: 'https://github.com/sgerner/turnleaf/releases/download/v0.4.0/turnleaf.apk',
-    });
-    mocks.setLocalReadingState({
+    };
+    mocks.localReadingState = {
       cfi: 'epubcfi(/6/2!/4/2:0)',
       xpath: '/body/p[1]',
       percentage: 0.25,
@@ -423,8 +379,8 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
       serverUpdatedAt: null,
       pendingSync: true,
       syncRevision: 1,
-    });
-    mocks.setRemoteProgress({
+    };
+    mocks.remoteProgress = {
       libraryId: 1,
       seriesId: 1,
       volumeId: 1,
@@ -432,7 +388,7 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
       pageNum: 120,
       bookScrollId: '/body/p[9]',
       lastModifiedUtc: '2026-02-02T00:00:00.000Z',
-    });
+    };
 
     const host = document.createElement('div');
     document.body.append(host);
@@ -446,46 +402,57 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
 
     const feed = stage.querySelector<HTMLElement>('#library-results')!;
     const listTop = 320;
+    let stageTop = 112;
     Object.defineProperty(stage, 'clientHeight', { value: 700, configurable: true });
     stage.dataset.stickyBannerHeight = '112';
-    vi.spyOn(stage, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 112, 800, 700));
+    vi.spyOn(stage, 'getBoundingClientRect').mockImplementation(
+      () => new DOMRect(0, stageTop, 800, 700),
+    );
     vi.spyOn(banner, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 800, 112));
     vi.spyOn(feed, 'getBoundingClientRect').mockImplementation(
-      () => new DOMRect(0, 112 + listTop - stage.scrollTop, 800, 6000),
+      () => new DOMRect(0, stageTop + listTop - stage.scrollTop, 800, 6000),
     );
     window.dispatchEvent(new Event('resize'));
     await settle();
 
-    // Scroll so row 0 is partially obscured (listTop 320 - scrollTop 260 = 60 < 112).
+    // Non-overlapping flex sibling (banner 0..112, stage 112..812): row 0 at scrollTop 260 is at y=172 (uncovered), so scrollTop stays 260.
     stage.scrollTop = 260;
     const row0Open = feed.querySelector<HTMLButtonElement>(
       'article[data-book-index="0"] [data-book-open]',
     )!;
     row0Open.focus();
     await settle();
+    expect(stage.scrollTop).toBe(260);
 
-    // Focusing row 0 subtracts sticky banner height (320 - 112 = 208), leaving 0% banner overlap!
+    // Overlapping banner (banner 0..112 over stage 0..700): focusing row 0 subtracts 112px overlap (320 - 112 = 208).
+    stageTop = 0;
+    window.dispatchEvent(new Event('resize'));
+    await settle();
+    row0Open.blur();
+    row0Open.focus();
+    await settle();
     expect(stage.scrollTop).toBe(208);
 
     const libraryMain = stage.querySelector<HTMLElement>('main')!;
 
-    // 1. Settings dialog: isolates both releaseBanner and libraryMain; closes via Escape, backdrop, close button, and Android Back.
+    // 1. Settings DialogShell: isolates both releaseBanner (inert={stageOverlayActive} + modal isolation) and libraryMain; restores both cleanly on close.
     const settingsOpener = stage.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!;
     settingsOpener.focus();
     settingsOpener.click();
     await settle();
 
+    expect(banner.inert).toBe(true);
     expect(banner.hasAttribute('inert')).toBe(true);
     expect(banner.getAttribute('aria-hidden')).toBe('true');
+    expect(libraryMain.inert).toBe(true);
     expect(libraryMain.hasAttribute('inert')).toBe(true);
     expect(libraryMain.getAttribute('aria-hidden')).toBe('true');
 
-    const closeSettingsBtn = stage.querySelector<HTMLButtonElement>(
-      '[aria-label="Close settings"]',
-    )!;
-    closeSettingsBtn.click();
+    stage.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click();
     await settle();
+    expect(banner.inert).toBe(false);
     expect(banner.hasAttribute('inert')).toBe(false);
+    expect(libraryMain.inert).toBe(false);
     expect(libraryMain.hasAttribute('inert')).toBe(false);
     expect(document.activeElement).toBe(settingsOpener);
 
@@ -535,7 +502,7 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
     expect(banner.hasAttribute('inert')).toBe(true);
     expect(libraryMain.hasAttribute('inert')).toBe(true);
 
-    mocks.getBackListener()?.();
+    mocks.backListener?.();
     await settle();
     expect(banner.hasAttribute('inert')).toBe(false);
     expect(libraryMain.hasAttribute('inert')).toBe(false);

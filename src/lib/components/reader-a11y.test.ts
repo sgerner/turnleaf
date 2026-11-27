@@ -3,16 +3,17 @@
 import { mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+type LocationPayload = {
+  cfi: string;
+  href: string;
+  xpath: string | null;
+  percentage: number;
+  spineIndex: number;
+  pageIndex: number;
+  pageCount: number;
+};
+
 const sessionBridge = vi.hoisted(() => {
-  type LocationPayload = {
-    cfi: string;
-    href: string;
-    xpath: string | null;
-    percentage: number;
-    spineIndex: number;
-    pageIndex: number;
-    pageCount: number;
-  };
   type SelectionPayload = { cfi: string; text: string } | null;
   let onLocationHandler:
     | ((
@@ -30,43 +31,30 @@ const sessionBridge = vi.hoisted(() => {
       onSelectionHandler = null;
       nextImpl = async () => {};
     },
-    setHandlers(
-      onLocation: typeof onLocationHandler,
-      onSelection?: typeof onSelectionHandler,
-    ): void {
+    setHandlers(onLocation: typeof onLocationHandler, onSelection?: typeof onSelectionHandler) {
       onLocationHandler = onLocation;
       onSelectionHandler = onSelection ?? null;
     },
-    emitLocation(
-      loc: LocationPayload,
-      origin: 'restore' | 'navigation' | 'link' = 'navigation',
-    ): void {
+    emitLocation(loc: LocationPayload, origin: 'restore' | 'navigation' | 'link' = 'navigation') {
       onLocationHandler?.(loc, origin);
     },
-    emitSelection(selection: SelectionPayload): void {
+    emitSelection(selection: SelectionPayload) {
       onSelectionHandler?.(selection);
     },
-    setNextImpl(fn: () => Promise<void>): void {
+    setNextImpl(fn: () => Promise<void>) {
       nextImpl = fn;
     },
-    runNext(): Promise<void> {
-      return nextImpl();
-    },
+    runNext: () => nextImpl(),
   };
 });
 
 vi.mock('@capacitor/app', () => ({
-  App: {
-    addListener: vi.fn(async () => ({ remove: async () => {} })),
-  },
+  App: { addListener: vi.fn(async () => ({ remove: async () => {} })) },
 }));
 
 vi.mock('@capacitor/status-bar', () => ({
   Animation: { None: 'NONE' },
-  StatusBar: {
-    hide: vi.fn(async () => {}),
-    show: vi.fn(async () => {}),
-  },
+  StatusBar: { hide: vi.fn(async () => {}), show: vi.fn(async () => {}) },
 }));
 
 vi.mock('../database/database', () => ({
@@ -85,18 +73,7 @@ vi.mock('../reader/session', async (importOriginal) => {
         _initialXPath: string | null,
         _initialPercentage: number | null,
         _appearance: unknown,
-        onLocation: (
-          loc: {
-            cfi: string;
-            href: string;
-            xpath: string | null;
-            percentage: number;
-            spineIndex: number;
-            pageIndex: number;
-            pageCount: number;
-          },
-          origin: 'restore' | 'navigation' | 'link',
-        ) => void,
+        onLocation: (loc: LocationPayload, origin: 'restore' | 'navigation' | 'link') => void,
         _onTap: (zone: 'previous' | 'center' | 'next') => void,
         onSelection?: (selection: { cfi: string; text: string } | null) => void,
       ): Promise<void> {
@@ -120,35 +97,18 @@ vi.mock('../reader/session', async (importOriginal) => {
           'restore',
         );
       }
-
-      tableOfContents() {
-        return [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
-      }
-
-      getVisiblePassages() {
-        return [];
-      }
-
+      tableOfContents = () => [{ label: 'Chapter 1', href: 'chapter-1.xhtml', children: [] }];
+      getVisiblePassages = () => [];
       clearTextSelection(): void {}
       updateHighlights(): void {}
       applyAppearance(): void {}
-      async display(): Promise<boolean> {
-        return true;
-      }
-      async displayCfi(): Promise<boolean> {
-        return true;
-      }
-      async displayServerLocation(): Promise<boolean> {
-        return true;
-      }
-      async displayServerPercentage(): Promise<void> {}
-      async next(): Promise<void> {
-        await sessionBridge.runNext();
-      }
-      async previous(): Promise<void> {}
-      async search() {
-        return [];
-      }
+      display = async () => true;
+      displayCfi = async () => true;
+      displayServerLocation = async () => true;
+      displayServerPercentage = async () => {};
+      next = () => sessionBridge.runNext();
+      previous = async () => {};
+      search = async () => [];
       destroy(): void {}
     },
   };
@@ -160,11 +120,7 @@ if (typeof Element !== 'undefined' && !Element.prototype.animate) {
   Element.prototype.animate = () => {
     const animation = {
       onfinish: null as (() => void) | null,
-      cancel: () => {},
-      finish: () => animation.onfinish?.(),
-      play: () => {},
-      pause: () => {},
-      reverse: () => {},
+      cancel() {},
       finished: Promise.resolve(),
     };
     queueMicrotask(() => animation.onfinish?.());
@@ -256,6 +212,7 @@ describe('Reader modal isolation and focus restoration across panels and selecti
     const assertBackgroundIsolated = (expectOverlayBackdrop = true) => {
       expect(releaseBanner.hasAttribute('inert')).toBe(true);
       expect(releaseBanner.getAttribute('aria-hidden')).toBe('true');
+      expect(viewport.inert).toBe(true);
       expect(viewport.hasAttribute('inert')).toBe(true);
       expect(viewport.getAttribute('aria-hidden')).toBe('true');
       expect(epubFrame.hasAttribute('inert')).toBe(true);
@@ -263,19 +220,24 @@ describe('Reader modal isolation and focus restoration across panels and selecti
       expect(epubFrame.getAttribute('tabindex')).toBe('-1');
       expect(progress.hasAttribute('inert')).toBe(true);
       expect(progress.getAttribute('aria-hidden')).toBe('true');
+      expect(footer.inert).toBe(true);
       expect(footer.hasAttribute('inert')).toBe(true);
       expect(footer.getAttribute('aria-hidden')).toBe('true');
+      expect(progressReveal.inert).toBe(true);
       expect(progressReveal.hasAttribute('inert')).toBe(true);
       expect(progressReveal.getAttribute('aria-hidden')).toBe('true');
+      expect(tapZones.inert).toBe(true);
       expect(tapZones.hasAttribute('inert')).toBe(true);
 
       if (expectOverlayBackdrop) {
+        expect(toolbar.inert).toBe(true);
         expect(toolbar.hasAttribute('inert')).toBe(true);
         const backdrop = stage.querySelector<HTMLElement>('.reader-panel-backdrop');
         expect(backdrop).not.toBeNull();
         expect(backdrop?.getAttribute('aria-hidden')).toBe('true');
         expect(backdrop?.tagName).toBe('DIV');
       } else {
+        expect(overlay.inert).toBe(true);
         expect(overlay.hasAttribute('inert')).toBe(true);
         expect(overlay.getAttribute('aria-hidden')).toBe('true');
       }
@@ -283,55 +245,57 @@ describe('Reader modal isolation and focus restoration across panels and selecti
 
     const assertBackgroundReleased = () => {
       expect(releaseBanner.hasAttribute('inert')).toBe(false);
+      expect(viewport.inert).toBe(false);
       expect(viewport.hasAttribute('inert')).toBe(false);
       expect(epubFrame.hasAttribute('inert')).toBe(false);
       expect(epubFrame.getAttribute('tabindex')).toBe('0');
       expect(progress.hasAttribute('inert')).toBe(false);
+      expect(footer.inert).toBe(false);
       expect(footer.hasAttribute('inert')).toBe(false);
+      expect(progressReveal.inert).toBe(false);
       expect(progressReveal.hasAttribute('inert')).toBe(false);
+      expect(tapZones.inert).toBe(false);
       expect(tapZones.hasAttribute('inert')).toBe(false);
+      expect(overlay.inert).toBe(false);
       expect(overlay.hasAttribute('inert')).toBe(false);
+      expect(toolbar.inert).toBe(false);
       expect(toolbar.hasAttribute('inert')).toBe(false);
     };
 
     const panelSpecs = [
-      {
-        openerSelector: '[aria-controls="reader-contents"]',
-        panelSelector: '#reader-contents',
-        closeSelector: '[aria-label="Close table of contents"]',
-      },
-      {
-        openerSelector: '[aria-controls="reader-appearance"]',
-        panelSelector: '#reader-appearance',
-        closeSelector: '[aria-label="Close reading appearance"]',
-      },
-      {
-        openerSelector: '[aria-controls="reader-bookmarks"]',
-        panelSelector: '#reader-bookmarks',
-        closeSelector: '[aria-label="Close bookmarks and history"]',
-      },
-      {
-        openerSelector: '[aria-controls="reader-annotations"]',
-        panelSelector: '#reader-annotations',
-        closeSelector: '[aria-label="Close highlights and notes"]',
-      },
-      {
-        openerSelector: '[aria-controls="reader-search"]',
-        panelSelector: '#reader-search',
-        closeSelector: '[aria-label="Close book search"]',
-      },
-    ];
+      [
+        '[aria-controls="reader-contents"]',
+        '#reader-contents',
+        '[aria-label="Close table of contents"]',
+      ],
+      [
+        '[aria-controls="reader-appearance"]',
+        '#reader-appearance',
+        '[aria-label="Close reading appearance"]',
+      ],
+      [
+        '[aria-controls="reader-bookmarks"]',
+        '#reader-bookmarks',
+        '[aria-label="Close bookmarks and history"]',
+      ],
+      [
+        '[aria-controls="reader-annotations"]',
+        '#reader-annotations',
+        '[aria-label="Close highlights and notes"]',
+      ],
+      ['[aria-controls="reader-search"]', '#reader-search', '[aria-label="Close book search"]'],
+    ] as const;
 
-    for (const spec of panelSpecs) {
-      const opener = stage.querySelector<HTMLButtonElement>(spec.openerSelector)!;
+    for (const [openerSelector, panelSelector, closeSelector] of panelSpecs) {
+      const opener = stage.querySelector<HTMLButtonElement>(openerSelector)!;
 
       // Close button path
       opener.focus();
       opener.click();
       await settle();
-      expect(stage.querySelector(spec.panelSelector)).not.toBeNull();
+      expect(stage.querySelector(panelSelector)).not.toBeNull();
       assertBackgroundIsolated(true);
-      stage.querySelector<HTMLButtonElement>(spec.closeSelector)!.click();
+      stage.querySelector<HTMLButtonElement>(closeSelector)!.click();
       await settle();
       assertBackgroundReleased();
       expect(document.activeElement).toBe(opener);
@@ -350,7 +314,7 @@ describe('Reader modal isolation and focus restoration across panels and selecti
       await settle();
       assertBackgroundIsolated(true);
       stage
-        .querySelector<HTMLElement>(spec.panelSelector)!
+        .querySelector<HTMLElement>(panelSelector)!
         .dispatchEvent(
           new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
         );

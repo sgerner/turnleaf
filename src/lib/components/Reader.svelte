@@ -53,7 +53,9 @@
     focusFirstElement,
     restoreFocus,
     restoreModalFocus,
+    snapshotModalBackground,
     trapModalKeydown,
+    type ModalStateSnapshot,
   } from '../a11y/modal-focus';
   import {
     TOC_FALLBACK_VIEWPORT_HEIGHT_PX,
@@ -361,6 +363,7 @@
   async function retryReaderOpen(): Promise<void> {
     if (!startupOpenFailed || !onRetryDownload || retryingReader) return;
     retryingReader = true;
+    let errorSnapshot: ModalStateSnapshot | null = null;
     try {
       await onRetryDownload();
       if (destroyed) return;
@@ -380,6 +383,7 @@
       sessionReady = false;
       await restoreNativeReaderChrome();
       startupOpenFailed = true;
+      errorSnapshot = snapshotModalBackground(viewport);
       error =
         cause instanceof Error
           ? cause.message
@@ -387,7 +391,7 @@
     } finally {
       retryingReader = false;
       if (!destroyed && error) {
-        focusErrorPanel();
+        focusErrorPanel(errorSnapshot);
       }
     }
   }
@@ -419,12 +423,16 @@
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
   }
 
-  function focusPanel(getPanel: () => HTMLElement | null, autoFocus = true): void {
+  function focusPanel(
+    getPanel: () => HTMLElement | null,
+    snapshot?: ModalStateSnapshot | null,
+    autoFocus = true,
+  ): void {
     void tick().then(() => {
       if (destroyed) return;
       const panel = getPanel();
       if (!panel) return;
-      panelCleanup = activateModal(panel, panelCleanup, '.app-stage', autoFocus);
+      panelCleanup = activateModal(panel, panelCleanup, '.app-stage', autoFocus, snapshot);
     });
   }
 
@@ -434,10 +442,16 @@
     deactivateModal(cleanup, closingPanel);
   }
 
-  function focusErrorPanel(): void {
+  function focusErrorPanel(snapshot?: ModalStateSnapshot | null): void {
     void tick().then(() => {
       if (destroyed || !error || !errorPanel) return;
-      errorPanelCleanup = activateModal(errorPanel, errorPanelCleanup);
+      errorPanelCleanup = activateModal(
+        errorPanel,
+        errorPanelCleanup,
+        '.app-stage',
+        true,
+        snapshot,
+      );
     });
   }
 
@@ -478,6 +492,10 @@
     );
   }
 
+  function hasTopLevelAlert(): boolean {
+    return pendingSyncLocation !== null || Boolean(error);
+  }
+
   function canDismissError(): boolean {
     return session !== null && sessionReady && !startupOpenFailed;
   }
@@ -497,11 +515,12 @@
     opener: HTMLElement | null = null,
     restoreReturnLink = false,
   ): void {
+    const snapshot = snapshotModalBackground(viewport);
     pauseChromeHide();
     errorOpener = opener;
     errorRestoreReturnLink = restoreReturnLink;
     error = message;
-    focusErrorPanel();
+    focusErrorPanel(snapshot);
   }
 
   function dismissError(): void {
@@ -540,6 +559,7 @@
   }
 
   function openSettings(): void {
+    const snapshot = snapshotModalBackground(viewport);
     pauseChromeHide();
     settingsOpener = activeElement();
     settingsVisible = true;
@@ -547,13 +567,11 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
-    pendingSyncLocation = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    syncConfirmationOpener = null;
-    focusPanel(() => (settingsVisible ? settingsPanel : null));
+    focusPanel(() => (settingsVisible ? settingsPanel : null), snapshot);
   }
 
   function closeSettings(): void {
@@ -567,6 +585,7 @@
   }
 
   function openToc(): void {
+    const snapshot = snapshotModalBackground(viewport);
     pauseChromeHide();
     tocOpener = activeElement();
     tocVisible = true;
@@ -574,14 +593,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
-    pendingSyncLocation = null;
     settingsOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    syncConfirmationOpener = null;
     focusedTocIndex = -1;
-    void initializeTocDialog();
+    void initializeTocDialog(snapshot);
   }
 
   function closeToc(): void {
@@ -600,6 +617,7 @@
   }
 
   function openBookmarks(): void {
+    const snapshot = snapshotModalBackground(viewport);
     pauseChromeHide();
     bookmarksOpener = activeElement();
     bookmarksVisible = true;
@@ -607,13 +625,11 @@
     tocVisible = false;
     annotationsVisible = false;
     searchVisible = false;
-    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    syncConfirmationOpener = null;
-    focusPanel(() => (bookmarksVisible ? bookmarksPanel : null));
+    focusPanel(() => (bookmarksVisible ? bookmarksPanel : null), snapshot);
   }
 
   function closeBookmarks(): void {
@@ -643,6 +659,7 @@
   }
 
   function openAnnotations(focusAnnotationId?: string): void {
+    const snapshot = snapshotModalBackground(viewport);
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
@@ -653,16 +670,14 @@
     tocVisible = false;
     bookmarksVisible = false;
     searchVisible = false;
-    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     searchOpener = null;
-    syncConfirmationOpener = null;
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusPanel(() => (annotationsVisible ? annotationsPanel : null), !focusAnnotationId);
+    focusPanel(() => (annotationsVisible ? annotationsPanel : null), snapshot, !focusAnnotationId);
     if (focusAnnotationId) {
       void tick().then(() => {
         if (destroyed || !annotationsVisible || !annotationsPanel) return;
@@ -700,6 +715,7 @@
   }
 
   function openSearch(): void {
+    const snapshot = snapshotModalBackground(viewport);
     pauseChromeHide();
     searchOpener = activeElement();
     searchVisible = true;
@@ -707,14 +723,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     annotationsVisible = false;
-    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
-    syncConfirmationOpener = null;
     searchError = '';
-    focusPanel(() => (searchVisible ? searchPanel : null));
+    focusPanel(() => (searchVisible ? searchPanel : null), snapshot);
   }
 
   function closeSearch(): void {
@@ -770,11 +784,12 @@
     progress: SyncedLocation,
     opener: HTMLElement | null = activeElement(),
   ): void {
+    const snapshot = snapshotModalBackground(viewport);
     pauseChromeHide();
     syncConfirmationOpener = opener;
     closeOpenSubpanels();
     pendingSyncLocation = progress;
-    focusPanel(() => (pendingSyncLocation ? syncConfirmationPanel : null));
+    focusPanel(() => (pendingSyncLocation ? syncConfirmationPanel : null), snapshot);
   }
 
   function closeSyncConfirmation(restore = true): void {
@@ -856,7 +871,7 @@
     });
   }
 
-  async function initializeTocDialog(): Promise<void> {
+  async function initializeTocDialog(snapshot?: ModalStateSnapshot | null): Promise<void> {
     await tick();
     if (destroyed || !tocVisible) return;
     const container = tocScrollContainer;
@@ -879,7 +894,7 @@
       }
     }
     if (destroyed || !tocVisible || !tocPanel) return;
-    panelCleanup = activateModal(tocPanel, panelCleanup);
+    panelCleanup = activateModal(tocPanel, panelCleanup, '.app-stage', true, snapshot);
   }
 
   function handleTocFocusIn(event: FocusEvent): void {
@@ -1534,7 +1549,7 @@
 
 <main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
   <h1 class="sr-only">{title}</h1>
-  <div class="reader-viewport" bind:this={viewport}></div>
+  <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
   <p class="sr-only" role="status">{selectionMessage}</p>
   {#if selectedText && !hasOpenReaderPanel()}
@@ -1583,7 +1598,7 @@
     Press Escape to close an open reader panel or clear selected text.
   </p>
 
-  <nav class="tap-zones" aria-label="Page navigation">
+  <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
     <button
       type="button"
       aria-label="Previous page"
@@ -1649,16 +1664,23 @@
       type="button"
       class="reader-top-reveal"
       bind:this={topRevealButton}
+      inert={hasOpenReaderPanel()}
       aria-label="Show reading controls"
       onclick={showControls}
     ></button>
   {/if}
 
   {#if controlsVisible}
-    <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
+    <div
+      class="reader-overlay"
+      data-controls
+      inert={hasTopLevelAlert()}
+      transition:fade={{ duration: 120 }}
+    >
       <header
         bind:this={readerToolbar}
         class="reader-bar reader-top"
+        inert={hasOpenReaderPanel()}
         transition:fly={{ y: -8, duration: 140 }}
       >
         <div class="reader-toolbar">
@@ -2553,7 +2575,11 @@
   {/if}
 
   {#if footerVisible}
-    <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
+    <footer
+      class="reader-bar reader-bottom"
+      inert={hasOpenReaderPanel()}
+      transition:fly={{ y: 8, duration: 140 }}
+    >
       <span class="truncate text-xs">{activeSectionLabel}</span>
       <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
     </footer>
@@ -2562,6 +2588,7 @@
   <button
     class="reader-progress-reveal btn btn-sm preset-tonal-surface"
     type="button"
+    inert={hasOpenReaderPanel()}
     aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
     aria-pressed={footerVisible}
     title={footerVisible ? 'Hide reading details' : 'Show reading details'}
@@ -2573,6 +2600,7 @@
   <div
     class="reader-bottom-reveal"
     aria-hidden="true"
+    inert={hasOpenReaderPanel()}
     onpointerdown={handleBottomSwipeStart}
     onpointermove={handleBottomSwipeMove}
     onpointerup={handleBottomSwipeEnd}

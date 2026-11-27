@@ -14,15 +14,27 @@ const FOCUSABLE_SELECTOR = [
 
 const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'TEMPLATE']);
 
-interface SavedElementState {
-  count: number;
+interface SavedElementSnapshot {
   hadInertAttribute: boolean;
   previousInert: boolean;
   previousAriaHidden: string | null;
 }
 
-interface SavedIframeState extends SavedElementState {
+interface SavedElementState extends SavedElementSnapshot {
+  count: number;
+}
+
+interface SavedIframeSnapshot extends SavedElementSnapshot {
   previousTabIndex: string | null;
+}
+
+interface SavedIframeState extends SavedIframeSnapshot {
+  count: number;
+}
+
+export interface ModalStateSnapshot {
+  elements: WeakMap<HTMLElement, SavedElementSnapshot>;
+  iframes: WeakMap<HTMLIFrameElement, SavedIframeSnapshot>;
 }
 
 interface ActiveModalEntry {
@@ -134,20 +146,62 @@ export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement
   focusFirstElement(fallback);
 }
 
+function resolveModalBoundary(
+  element: HTMLElement,
+  boundarySelector = '.app-stage',
+): HTMLElement | null {
+  return (
+    (boundarySelector === '.app-stage' ? element.closest<HTMLElement>('.app-shell') : null) ??
+    element.closest<HTMLElement>(boundarySelector) ??
+    element.ownerDocument.body
+  );
+}
+
+export function snapshotModalBackground(
+  reference: HTMLElement | null | undefined,
+  boundarySelector = '.app-stage',
+): ModalStateSnapshot | null {
+  if (!reference?.isConnected) return null;
+  const boundary = resolveModalBoundary(reference, boundarySelector);
+  if (!boundary) return null;
+
+  const elements = new WeakMap<HTMLElement, SavedElementSnapshot>();
+  const iframes = new WeakMap<HTMLIFrameElement, SavedIframeSnapshot>();
+  const recordElement = (el: HTMLElement): void => {
+    const saved = isolatedElements.get(el);
+    elements.set(el, {
+      hadInertAttribute: saved ? saved.hadInertAttribute : el.hasAttribute('inert'),
+      previousInert: saved ? saved.previousInert : Boolean(el.inert),
+      previousAriaHidden: saved ? saved.previousAriaHidden : el.getAttribute('aria-hidden'),
+    });
+    if (el instanceof HTMLIFrameElement) {
+      const savedFrame = isolatedIframes.get(el);
+      iframes.set(el, {
+        hadInertAttribute: savedFrame ? savedFrame.hadInertAttribute : el.hasAttribute('inert'),
+        previousInert: savedFrame ? savedFrame.previousInert : Boolean(el.inert),
+        previousAriaHidden: savedFrame
+          ? savedFrame.previousAriaHidden
+          : el.getAttribute('aria-hidden'),
+        previousTabIndex: savedFrame ? savedFrame.previousTabIndex : el.getAttribute('tabindex'),
+      });
+    }
+  };
+
+  recordElement(boundary);
+  for (const el of boundary.querySelectorAll<HTMLElement>('*')) recordElement(el);
+  return { elements, iframes };
+}
+
 export function isolateModalBackground(
   container: HTMLElement | null,
   boundarySelector = '.app-stage',
+  snapshot?: ModalStateSnapshot | null,
 ): () => void {
   if (!container || !container.isConnected) return () => {};
 
   const modalContainer = container;
   const doc = modalContainer.ownerDocument;
-  const boundary =
-    (boundarySelector === '.app-stage'
-      ? modalContainer.closest<HTMLElement>('.app-shell')
-      : null) ??
-    modalContainer.closest<HTMLElement>(boundarySelector) ??
-    doc.body;
+  const boundary = resolveModalBoundary(modalContainer, boundarySelector);
   if (!boundary) return () => {};
 
   const sessionElements = new Set<HTMLElement>();
@@ -163,23 +217,19 @@ export function isolateModalBackground(
   initialStack.push(entry);
   activeModalStacks.set(doc, initialStack);
 
-  const isUpperModalBranch = (candidate: HTMLElement): boolean => {
+  const hasUpperModal = (predicate: (upper: HTMLElement) => boolean): boolean => {
     const stack = activeModalStacks.get(doc);
-    if (!stack) return false;
-    const entryIndex = stack.indexOf(entry);
-    if (entryIndex < 0) return false;
+    const entryIndex = stack ? stack.indexOf(entry) : -1;
+    if (!stack || entryIndex < 0) return false;
     for (let index = entryIndex + 1; index < stack.length; index += 1) {
-      const upper = stack[index];
-      if (
-        upper &&
-        upper.container.isConnected &&
-        (upper.container === candidate || candidate.contains(upper.container))
-      ) {
-        return true;
-      }
+      const upper = stack[index]?.container;
+      if (upper?.isConnected && predicate(upper)) return true;
     }
     return false;
   };
+
+  const isUpperModalBranch = (candidate: HTMLElement): boolean =>
+    hasUpperModal((upper) => upper === candidate || candidate.contains(upper));
 
   const isolateIframe = (iframe: HTMLIFrameElement): void => {
     if (isUpperModalBranch(iframe)) return;
@@ -189,12 +239,13 @@ export function isolateModalBackground(
       if (existing) {
         existing.count += 1;
       } else {
+        const prior = snapshot?.iframes.get(iframe);
         isolatedIframes.set(iframe, {
           count: 1,
-          hadInertAttribute: iframe.hasAttribute('inert'),
-          previousInert: Boolean(iframe.inert),
-          previousAriaHidden: iframe.getAttribute('aria-hidden'),
-          previousTabIndex: iframe.getAttribute('tabindex'),
+          hadInertAttribute: prior ? prior.hadInertAttribute : iframe.hasAttribute('inert'),
+          previousInert: prior ? prior.previousInert : Boolean(iframe.inert),
+          previousAriaHidden: prior ? prior.previousAriaHidden : iframe.getAttribute('aria-hidden'),
+          previousTabIndex: prior ? prior.previousTabIndex : iframe.getAttribute('tabindex'),
         });
       }
     }
@@ -211,11 +262,14 @@ export function isolateModalBackground(
       if (existing) {
         existing.count += 1;
       } else {
+        const prior = snapshot?.elements.get(sibling);
         isolatedElements.set(sibling, {
           count: 1,
-          hadInertAttribute: sibling.hasAttribute('inert'),
-          previousInert: Boolean(sibling.inert),
-          previousAriaHidden: sibling.getAttribute('aria-hidden'),
+          hadInertAttribute: prior ? prior.hadInertAttribute : sibling.hasAttribute('inert'),
+          previousInert: prior ? prior.previousInert : Boolean(sibling.inert),
+          previousAriaHidden: prior
+            ? prior.previousAriaHidden
+            : sibling.getAttribute('aria-hidden'),
         });
       }
     }
@@ -249,19 +303,8 @@ export function isolateModalBackground(
     observer.observe(boundary, { childList: true, subtree: true });
   }
 
-  const hasUpperModalOutside = (branchNode: HTMLElement): boolean => {
-    const stack = activeModalStacks.get(doc);
-    if (!stack) return false;
-    const entryIndex = stack.indexOf(entry);
-    if (entryIndex < 0) return false;
-    for (let index = entryIndex + 1; index < stack.length; index += 1) {
-      const upper = stack[index];
-      if (upper && upper.container.isConnected && !branchNode.contains(upper.container)) {
-        return true;
-      }
-    }
-    return false;
-  };
+  const hasUpperModalOutside = (branchNode: HTMLElement): boolean =>
+    hasUpperModal((upper) => !branchNode.contains(upper));
 
   function syncAncestors(): void {
     if (released || !modalContainer.isConnected) return;
@@ -367,12 +410,13 @@ export function activateModal(
   previousCleanup?: (() => void) | null,
   boundarySelector = '.app-stage',
   autoFocus = true,
+  snapshot?: ModalStateSnapshot | null,
 ): () => void {
   previousCleanup?.();
   if (!container || !container.isConnected) return () => {};
   setInertState(container, false);
   container.removeAttribute('aria-hidden');
-  const cleanup = isolateModalBackground(container, boundarySelector);
+  const cleanup = isolateModalBackground(container, boundarySelector, snapshot);
   if (autoFocus) focusFirstElement(container);
   return cleanup;
 }

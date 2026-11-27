@@ -79,7 +79,9 @@
     activeElement,
     deactivateModal,
     restoreFocus,
+    snapshotModalBackground,
     trapModalKeydown,
+    type ModalStateSnapshot,
   } from '../a11y/modal-focus';
 
   let {
@@ -400,12 +402,15 @@
     void setPreference('librarySeries', seriesFilter);
   }
 
-  function focusModal(getDialog: () => HTMLElement | null): void {
+  function focusModal(
+    getDialog: () => HTMLElement | null,
+    snapshot?: ModalStateSnapshot | null,
+  ): void {
     void tick().then(() => {
       if (destroyed) return;
       const dialog = getDialog();
       if (!dialog) return;
-      modalCleanup = activateModal(dialog, modalCleanup);
+      modalCleanup = activateModal(dialog, modalCleanup, '.app-stage', true, snapshot);
     });
   }
 
@@ -458,13 +463,13 @@
       container.querySelector<HTMLElement>('[data-release-banner]') ??
       container.parentElement?.querySelector<HTMLElement>('[data-release-banner]') ??
       null;
-    if (!banner || banner.hidden) return Math.max(0, Math.ceil(tracked));
+    if (!banner) return Math.max(0, Math.ceil(tracked));
+    if (banner.hidden) return 0;
     const bannerRect = banner.getBoundingClientRect();
-    const measured =
-      bannerRect.height > 0
-        ? Math.max(bannerRect.height, bannerRect.bottom - containerTop)
-        : banner.offsetHeight;
-    return Math.max(0, Math.ceil(Math.max(measured, tracked)));
+    if (container.contains(banner)) {
+      return Math.max(0, Math.ceil(bannerRect.height || banner.offsetHeight || tracked));
+    }
+    return bannerRect.height > 0 ? Math.max(0, Math.ceil(bannerRect.bottom - containerTop)) : 0;
   }
 
   function refreshLayoutMetrics(): void {
@@ -1742,9 +1747,10 @@
   }
 
   function openMenu(book: BookRecord): void {
+    const snapshot = snapshotModalBackground(libraryMain);
     actionMenuOpener = activeElement();
     actionMenuBook = book;
-    focusModal(() => (actionMenuBook ? actionMenuDialog : null));
+    focusModal(() => (actionMenuBook ? actionMenuDialog : null), snapshot);
   }
 
   function closeMenu(): void {
@@ -1767,6 +1773,7 @@
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
+    const snapshot = snapshotModalBackground(libraryMain);
     const active = activeElement();
     const activeUnavailable =
       !active ||
@@ -1776,7 +1783,7 @@
     pendingMenuOpener = null;
     conflictError = '';
     conflict = next;
-    focusModal(() => (conflict ? conflictDialog : null));
+    focusModal(() => (conflict ? conflictDialog : null), snapshot);
   }
 
   function closeConflict(): void {
@@ -1844,9 +1851,10 @@
   }
 
   function openSettings(): void {
+    const snapshot = snapshotModalBackground(libraryMain);
     settingsOpener = activeElement();
     settingsVisible = true;
-    focusModal(() => (settingsVisible ? settingsDialog : null));
+    focusModal(() => (settingsVisible ? settingsDialog : null), snapshot);
   }
 
   function closeSettings(): void {
@@ -2044,6 +2052,7 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
+    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
   >
     <a
       href="#library-results"
