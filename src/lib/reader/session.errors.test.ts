@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
-import type { Book, Location } from 'epubjs';
+import ePub, { type Book, type Location, type Rendition } from 'epubjs';
+import JSZip from 'jszip';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
 
@@ -111,12 +112,147 @@ function location(cfi: string, href = 'chapter-1.xhtml'): Location {
   } as Location;
 }
 
+async function buildTestEpub(): Promise<ArrayBuffer> {
+  const zip = new JSZip();
+  zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+  zip.file(
+    'META-INF/container.xml',
+    `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>`,
+  );
+  zip.file(
+    'OEBPS/content.opf',
+    `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">urn:uuid:test-epub-concurrency</dc:identifier>
+    <dc:title>Concurrency Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="text/chapter2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+</package>`,
+  );
+  zip.file(
+    'OEBPS/text/chapter1.xhtml',
+    `<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title></head>
+<body><p id="c1">First chapter opening paragraph.</p></body></html>`,
+  );
+  zip.file(
+    'OEBPS/text/chapter2.xhtml',
+    `<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 2</title></head>
+<body><p id="c2">Second chapter opening paragraph.</p></body></html>`,
+  );
+  return zip.generateAsync({ type: 'arraybuffer' });
+}
+
+function setupJsdomEpubEnvironment(
+  getViewportSize: () => { width: number; height: number } = () => ({ width: 360, height: 640 }),
+): { resizeCallbacks: ResizeObserverCallback[] } {
+  const resizeCallbacks: ResizeObserverCallback[] = [];
+  class TestResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      resizeCallbacks.push(callback);
+    }
+    observe(): void {}
+    disconnect(): void {}
+  }
+  vi.stubGlobal('ResizeObserver', TestResizeObserver);
+  vi.stubGlobal('innerWidth', 1024);
+  vi.stubGlobal('innerHeight', 1024);
+  vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
+
+  const patchWindowGeometry = (win: Window & typeof globalThis) => {
+    win.scrollTo = (() => {}) as typeof win.scrollTo;
+    const rangeProto = win.Range?.prototype as
+      | (Range & {
+          getBoundingClientRect?: () => DOMRect;
+          getClientRects?: () => DOMRectList;
+        })
+      | undefined;
+    if (rangeProto && typeof rangeProto.getBoundingClientRect !== 'function') {
+      rangeProto.getBoundingClientRect = () => new DOMRect(0, 0, 240, 120);
+    }
+    if (rangeProto && typeof rangeProto.getClientRects !== 'function') {
+      rangeProto.getClientRects = () => [new DOMRect(0, 0, 240, 120)] as unknown as DOMRectList;
+    }
+    const elementProto = win.HTMLElement?.prototype;
+    if (elementProto) {
+      elementProto.getBoundingClientRect = function (this: HTMLElement) {
+        const { width, height } = getViewportSize();
+        const styleWidth = Number.parseFloat(this.style?.width || '');
+        const styleHeight = Number.parseFloat(this.style?.height || '');
+        return new DOMRect(
+          0,
+          0,
+          Number.isFinite(styleWidth) && styleWidth > 0 ? styleWidth : Math.min(240, width),
+          Number.isFinite(styleHeight) && styleHeight > 0 ? styleHeight : Math.min(120, height),
+        );
+      };
+    }
+  };
+
+  patchWindowGeometry(window);
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    const { width, height } = getViewportSize();
+    const styleWidth = Number.parseFloat(this.style?.width || '');
+    const styleHeight = Number.parseFloat(this.style?.height || '');
+    return new DOMRect(
+      0,
+      0,
+      Number.isFinite(styleWidth) && styleWidth > 0 ? styleWidth : width,
+      Number.isFinite(styleHeight) && styleHeight > 0 ? styleHeight : height,
+    );
+  });
+
+  const originalAppendChild = Node.prototype.appendChild;
+  vi.spyOn(Node.prototype, 'appendChild').mockImplementation(function <T extends Node>(
+    this: Node,
+    child: T,
+  ): T {
+    const result = originalAppendChild.call(this, child) as T;
+    if (child.nodeName === 'IFRAME') {
+      const frame = child as unknown as HTMLIFrameElement;
+      if (frame.contentWindow) {
+        patchWindowGeometry(frame.contentWindow as Window & typeof globalThis);
+      }
+      frame.addEventListener(
+        'load',
+        () => {
+          if (frame.contentWindow) {
+            patchWindowGeometry(frame.contentWindow as Window & typeof globalThis);
+          }
+        },
+        { once: true },
+      );
+    }
+    return result;
+  });
+
+  return { resizeCallbacks };
+}
+
 describe('ReaderSession error events, timeouts, and retry URLs', () => {
   beforeEach(() => {
     resetMocks();
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -359,189 +495,217 @@ describe('ReaderSession error events, timeouts, and retry URLs', () => {
     parserBook.destroy();
   });
 
-  it('re-displays the restored CFI when epubjs emits resized before relocated populates rendition.location', async () => {
-    const savedCfi = 'epubcfi(/6/4!/4/2/1:0)';
-    const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      savedCfi,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-    );
+  it('aborts a display that is in flight during a resize and checks the final CFI', async () => {
+    const { default: realEpub } = await vi.importActual<{ default: typeof ePub }>('epubjs');
+    const epubBuffer = await buildTestEpub();
 
-    expect(rendition.display).toHaveBeenCalledTimes(1);
-    expect(rendition.display).toHaveBeenLastCalledWith(savedCfi);
+    let viewportWidth = 360;
+    let viewportHeight = 640;
+    const { resizeCallbacks } = setupJsdomEpubEnvironment(() => ({
+      width: viewportWidth,
+      height: viewportHeight,
+    }));
+    const viewport = document.createElement('div');
+    document.body.appendChild(viewport);
 
-    // Simulate epub.js clearing views on resize before requestAnimationFrame sets rendition.location.
-    emitRendition('resized', { width: 412, height: 915 });
-    await Promise.resolve();
+    let realBook!: Book;
+    let realRendition!: Rendition;
+    let pauseChapter2 = false;
+    let chapter2EnteredLoad: (() => void) | null = null;
+    const pausedChapter2: { reject: ((reason?: unknown) => void) | null } = { reject: null };
 
-    expect(rendition.display).toHaveBeenCalledTimes(2);
-    expect(rendition.display).toHaveBeenLastCalledWith(savedCfi);
-
-    // Once relocated populates rendition.location, epub.js handles its own resize redisplay.
-    const nextLocation = location(savedCfi, 'chapter-2.xhtml');
-    rendition.location = nextLocation;
-    emitRendition('relocated', nextLocation);
-    emitRendition('resized', { width: 412, height: 900 });
-    await Promise.resolve();
-
-    expect(rendition.display).toHaveBeenCalledTimes(2);
-    session.destroy();
-  });
-
-  it('defers ResizeObserver reflows until rendition attachment and in-flight startup display finish', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
-
-    let resolveStarted!: () => void;
-    rendition.started = new Promise<void>((resolve) => {
-      resolveStarted = resolve;
-    });
-    let resolveInitialDisplay!: () => void;
-    const savedCfi = 'epubcfi(/6/4!/4/2/1:0)';
-    rendition.display.mockImplementationOnce(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveInitialDisplay = resolve;
-        }),
-    );
-    rendition.resize.mockImplementation((width: number, height: number) => {
-      emitRendition('resized', { width, height });
+    vi.mocked(ePub).mockImplementationOnce(() => {
+      realBook = realEpub(epubBuffer);
+      const originalLoad = realBook.load.bind(realBook);
+      realBook.load = ((path: string) => {
+        if (pauseChapter2 && path.includes('chapter2.xhtml')) {
+          return new Promise<unknown>((_resolve, reject) => {
+            pausedChapter2.reject = reject;
+            chapter2EnteredLoad?.();
+          });
+        }
+        return originalLoad(path);
+      }) as typeof realBook.load;
+      const originalRenderTo = realBook.renderTo.bind(realBook);
+      realBook.renderTo = ((element: Element, options?: Parameters<Book['renderTo']>[1]) => {
+        realRendition = originalRenderTo(element, options);
+        return realRendition;
+      }) as Book['renderTo'];
+      return realBook;
     });
 
-    const session = new ReaderSession('book.epub');
-    const opening = session.open(
-      document.createElement('div'),
-      savedCfi,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-    );
-
-    // ResizeObserver firing before rendition.started / attached must not call rendition.resize yet.
-    resizeCallbacks[0]?.(
-      [{ contentRect: { width: 412, height: 900 } } as ResizeObserverEntry],
-      {} as ResizeObserver,
-    );
-    expect(rendition.resize).not.toHaveBeenCalled();
-
-    resolveStarted();
-    await vi.waitFor(() => {
-      expect(rendition.display).toHaveBeenCalledWith(savedCfi);
-    });
-    emitRendition('attached');
-
-    // ResizeObserver firing while initial display(savedCfi) is still in flight must also be deferred.
-    resizeCallbacks[0]?.(
-      [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-      {} as ResizeObserver,
-    );
-    expect(rendition.resize).not.toHaveBeenCalled();
-
-    resolveInitialDisplay();
-    await opening;
-
-    // Once initial display finishes, only the latest pending size is flushed and savedCfi is preserved.
-    expect(rendition.resize).toHaveBeenCalledTimes(1);
-    expect(rendition.resize).toHaveBeenCalledWith(412, 915);
-    expect(rendition.display).toHaveBeenCalledTimes(2);
-    expect(rendition.display).toHaveBeenNthCalledWith(2, savedCfi);
-    session.destroy();
-  });
-
-  it('defers ResizeObserver reflows after next() until relocated updates rendition.location', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
-
-    const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      null,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-    );
-
-    const chapter1 = location('epubcfi(/6/2!/4/2/1:0)', 'chapter-1.xhtml');
-    rendition.location = chapter1;
-    emitRendition('relocated', chapter1);
-
-    await session.next();
-
-    // ResizeObserver firing right after next() resolves (while rendition.location is still chapter 1)
-    // must wait until relocated updates rendition.location to chapter 2.
-    resizeCallbacks[0]?.(
-      [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-      {} as ResizeObserver,
-    );
-    expect(rendition.resize).not.toHaveBeenCalled();
-
-    const chapter2 = location('epubcfi(/6/4!/4/2/1:0)', 'chapter-2.xhtml');
-    rendition.location = chapter2;
-    emitRendition('relocated', chapter2);
-
-    expect(rendition.resize).toHaveBeenCalledTimes(1);
-    expect(rendition.resize).toHaveBeenCalledWith(412, 915);
-    session.destroy();
-  });
-
-  it('preserves navigation origin for chapter 2 when next() starts before chapter 1 relocated RAF runs', async () => {
     const onLocation = vi.fn();
-    const chapter1 = location('epubcfi(/6/2!/4/2/1:0)', 'chapter-1.xhtml');
-    const chapter2 = location('epubcfi(/6/4!/4/2/1:0)', 'chapter-2.xhtml');
-    rendition.currentLocation.mockReturnValue(chapter1);
+    const session = new ReaderSession('lorem-ipsum.epub', { displayTimeoutMs: 500 });
 
-    const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      null,
-      null,
-      null,
-      defaultAppearance,
-      onLocation,
-      vi.fn(),
-    );
+    try {
+      await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+      await vi.waitFor(() => {
+        expect(onLocation).toHaveBeenCalled();
+      });
 
-    // User turns to chapter 2 before chapter 1's requestAnimationFrame relocated fires.
-    await session.next();
+      const initialLocation = onLocation.mock.calls.at(-1)?.[0] as { cfi: string; href: string };
+      expect(initialLocation.href).toContain('chapter1.xhtml');
+      expect(initialLocation.cfi).toMatch(/^epubcfi\(/);
+      const initialCfi = initialLocation.cfi;
 
-    // Delayed chapter 1 relocated must report 'restore' without consuming userNavigationPending.
-    emitRendition('relocated', chapter1);
-    expect(onLocation).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ cfi: chapter1.start.cfi }),
-      'restore',
-    );
+      onLocation.mockClear();
+      pauseChapter2 = true;
+      const chapter2InFlight = new Promise<void>((resolveLoad) => {
+        chapter2EnteredLoad = resolveLoad;
+      });
 
-    // Subsequent chapter 2 relocated must still report 'navigation' so progress is persisted.
-    emitRendition('relocated', chapter2);
-    expect(onLocation).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ cfi: chapter2.start.cfi }),
-      'navigation',
-    );
-    session.destroy();
+      const abortedNavigation = session.display('text/chapter2.xhtml');
+      await chapter2InFlight;
+
+      // Resize while chapter 2 display is in flight: EPUB.js clears views, aborts the in-flight
+      // displaying promise, and queues a re-display of the pre-resize CFI.
+      viewportWidth = 480;
+      viewportHeight = 640;
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      pauseChapter2 = false;
+      pausedChapter2.reject?.(new DOMException('Aborted in-flight chapter load', 'AbortError'));
+
+      await expect(abortedNavigation).resolves.toBeUndefined();
+      await vi.waitFor(() => {
+        expect(onLocation).toHaveBeenCalled();
+      });
+
+      const finalAfterResize = onLocation.mock.calls.at(-1);
+      expect(finalAfterResize?.[0]).toEqual(
+        expect.objectContaining({
+          cfi: initialCfi,
+          href: initialLocation.href,
+        }),
+      );
+      expect(finalAfterResize?.[1]).toBe('restore');
+      expect(realRendition.location?.start?.cfi).toBe(initialCfi);
+
+      // Verify navigation state is clean after the resize-aborted display.
+      onLocation.mockClear();
+      await session.display('text/chapter2.xhtml');
+      await vi.waitFor(() => {
+        expect(onLocation).toHaveBeenCalledWith(
+          expect.objectContaining({ href: 'text/chapter2.xhtml' }),
+          'navigation',
+        );
+      });
+      expect(onLocation.mock.calls.at(-1)?.[0].cfi).not.toBe(initialCfi);
+    } finally {
+      session.destroy();
+      viewport.remove();
+    }
+  });
+
+  it('unblocks EPUB.js queued displays after displayerror and display timeouts without rejecting queued operations', async () => {
+    const { default: realEpub } = await vi.importActual<{ default: typeof ePub }>('epubjs');
+    const epubBuffer = await buildTestEpub();
+    setupJsdomEpubEnvironment();
+
+    const viewport = document.createElement('div');
+    document.body.appendChild(viewport);
+
+    let chapter2Mode: 'error' | 'stall' | 'ok' = 'error';
+
+    vi.mocked(ePub).mockImplementationOnce(() => {
+      const realBook = realEpub(epubBuffer);
+      const originalLoad = realBook.load.bind(realBook);
+      realBook.load = ((path: string) => {
+        if (path.includes('chapter2.xhtml')) {
+          if (chapter2Mode === 'error') {
+            return Promise.reject(new Error('Corrupt chapter 2 stream'));
+          }
+          if (chapter2Mode === 'stall') {
+            return new Promise<unknown>(() => {});
+          }
+        }
+        return originalLoad(path);
+      }) as typeof realBook.load;
+      return realBook;
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('lorem-ipsum.epub', { displayTimeoutMs: 60 });
+
+    try {
+      await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+      await vi.waitFor(() => {
+        expect(onLocation).toHaveBeenCalled();
+      });
+
+      // Queue next() behind a failing display() on real rendition.q: only display() rejects,
+      // settleRenditionDisplaying unblocks rendition.q, and next() resolves cleanly.
+      const failingDisplay = session.display('text/chapter2.xhtml');
+      const queuedNext = session.next();
+
+      await expect(failingDisplay).rejects.toThrow('Corrupt chapter 2 stream');
+      await expect(queuedNext).resolves.toBeUndefined();
+
+      // Now stall chapter 2 to trigger displayTimeoutMs and verify rendition.q still unblocks.
+      chapter2Mode = 'stall';
+      await expect(session.display('text/chapter2.xhtml')).rejects.toThrow(
+        'Timed out while displaying this section.',
+      );
+
+      chapter2Mode = 'ok';
+      onLocation.mockClear();
+      await expect(session.display('text/chapter2.xhtml')).resolves.toBeUndefined();
+      await vi.waitFor(() => {
+        expect(onLocation).toHaveBeenCalledWith(
+          expect.objectContaining({ href: 'text/chapter2.xhtml' }),
+          'navigation',
+        );
+      });
+    } finally {
+      session.destroy();
+      viewport.remove();
+    }
+  });
+
+  it('stops queued EPUB.js rendition tasks and pending location frames when destroyed', async () => {
+    const { default: realEpub } = await vi.importActual<{ default: typeof ePub }>('epubjs');
+    const epubBuffer = await buildTestEpub();
+    setupJsdomEpubEnvironment();
+
+    const unhandled: unknown[] = [];
+    const uncaught: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const onUncaught = (error: unknown) => uncaught.push(error);
+    process.on('unhandledRejection', onUnhandled);
+    process.on('uncaughtException', onUncaught);
+
+    const viewport = document.createElement('div');
+    document.body.appendChild(viewport);
+
+    vi.mocked(ePub).mockImplementationOnce(() => {
+      return realEpub(epubBuffer);
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('lorem-ipsum.epub');
+
+    try {
+      await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+      const pendingDisplay = session.display('text/chapter2.xhtml');
+      const pendingNext = session.next();
+
+      onLocation.mockClear();
+      session.destroy();
+
+      await expect(pendingDisplay).resolves.toBeUndefined();
+      await expect(pendingNext).resolves.toBeUndefined();
+      await new Promise((resolveFrame) => requestAnimationFrame(() => resolveFrame(undefined)));
+      await new Promise((resolveTick) => setTimeout(resolveTick, 30));
+
+      expect(onLocation).not.toHaveBeenCalled();
+      expect(unhandled).toEqual([]);
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      process.off('uncaughtException', onUncaught);
+      viewport.remove();
+    }
   });
 });
