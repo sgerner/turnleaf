@@ -4,6 +4,7 @@
 
 - [ ] `npm run verify`
 - [ ] `npm run android:debug` (when changing Capacitor or Android behavior)
+- [ ] `npm run android:lint` (when changing Capacitor or Android behavior)
 - [ ] `npm run android:smoke` (when an emulator or device is available)
 - [ ] Manual/device validation recorded in [DEVICE_VALIDATION.md](../DEVICE_VALIDATION.md) when applicable
 
