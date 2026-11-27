@@ -227,3 +227,51 @@ it('allows a manual retry after an authorization failure', async () => {
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
+
+it('stops between queued uploads on disconnect or abort without sending offline requests or marking remaining items failed', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  let online = true;
+  const controller = new AbortController();
+  const saveProgress = vi.fn().mockImplementationOnce(async () => {
+    online = false;
+  });
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', {
+      signal: controller.signal,
+      canUpload: async () => online,
+    }),
+  ).resolves.toBeUndefined();
+
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+  const afterDisconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(afterDisconnect.syncQueue['book-1']).toBeUndefined();
+  expect(afterDisconnect.readingState['book-1']?.pendingSync).toBe(false);
+  expect(afterDisconnect.syncQueue['book-2']).toMatchObject({
+    bookId: 'book-2',
+    attemptCount: 0,
+    lastError: null,
+  });
+  expect(afterDisconnect.readingState['book-2']?.pendingSync).toBe(true);
+});

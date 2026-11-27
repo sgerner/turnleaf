@@ -44,6 +44,8 @@ export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
+    private readonly beforeRequest?:
+      ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -229,6 +231,12 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (this.beforeRequest && !(await this.beforeRequest(init.signal ?? undefined))) {
+          if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          throw new KavitaError('No network connection.', 'network');
+        }
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (
@@ -257,6 +265,12 @@ export class KavitaClient {
   private async browserFetchWithRedirects(url: string, init: RequestInit): Promise<Response> {
     const redirects = createRedirectState(url, new URL(this.baseUrl).origin, init.method ?? 'GET');
     while (true) {
+      if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (this.beforeRequest && !(await this.beforeRequest(init.signal ?? undefined))) {
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        throw new KavitaError('No network connection.', 'network');
+      }
+      if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const response = await fetch(redirects.currentUrl, { ...init, redirect: 'manual' });
       if (
         !advanceRedirect(

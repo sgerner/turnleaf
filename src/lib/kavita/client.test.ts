@@ -845,3 +845,60 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+it('re-checks transport immediately before each native and browser request and redirect hop', async () => {
+  capacitorRuntime.native = true;
+  let online = false;
+  const nativeClient = new KavitaClient('https://books.example.com', 'abc123', async () => online);
+
+  await expect(nativeClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'No network connection.',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  online = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    online = false;
+    return {
+      status: 307,
+      headers: { Location: '/api/Series/v2/?PageNumber=1&PageSize=500' },
+      data: '',
+      url: '',
+    };
+  });
+
+  await expect(nativeClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'No network connection.',
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
+
+  capacitorRuntime.native = false;
+  online = true;
+  const page = Array.from({ length: 500 }, (_, id) => ({
+    id,
+    name: `Book ${id}`,
+    libraryId: 1,
+    format: 3,
+    pages: 1,
+    pagesRead: 0,
+  }));
+  const fetchMock = vi.fn(async () => {
+    online = false;
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => page,
+    } as unknown as Response;
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const browserClient = new KavitaClient('https://books.example.com', 'abc123', async () => online);
+  await expect(browserClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'No network connection.',
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});

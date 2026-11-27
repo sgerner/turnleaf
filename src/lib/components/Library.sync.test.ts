@@ -312,7 +312,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     expect(booksAfterReconcile[0]?.pagesRead).toBe(40);
   });
 
-  it('uploads queued progress during a brief reconnect window and cancels only catalog refresh on disconnect', async () => {
+  it('uploads queued progress during a brief reconnect window and cancels active catalog and progress work on disconnect', async () => {
     networkConnected = false;
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/8)', '//body/p[8]', 0.55, 2);
 
@@ -327,7 +327,6 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
 
     const catalogSignals: AbortSignal[] = [];
     const progressSignals: Array<AbortSignal | undefined> = [];
-    const secondUploadGate = deferred<void>();
     const secondUploadStarted = deferred<void>();
     let uploadCalls = 0;
 
@@ -338,7 +337,13 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
         progressSignals.push(init?.signal ?? undefined);
         if (uploadCalls === 2) {
           secondUploadStarted.resolve();
-          await secondUploadGate.promise;
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('Aborted', 'AbortError')),
+              { once: true },
+            );
+          });
         }
         return new Response(null, { status: 204 });
       }
@@ -372,17 +377,16 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     await waitForCondition(() => catalogSignals.length === 1);
     expect(uploadCalls).toBe(2);
 
-    // Network drops mid-refresh (within 2-second window): catalog refresh aborts, in-flight upload does not
+    // Network drops mid-sync/refresh: both catalog refresh and active progress upload abort
     networkConnected = false;
     for (const listener of networkListeners) {
       listener({ connected: false, connectionType: 'none' });
     }
 
     expect(catalogSignals[0]?.aborted).toBe(true);
-    expect(progressSignals[1]?.aborted).toBe(false);
-
-    secondUploadGate.resolve();
-    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    expect(progressSignals[1]?.aborted).toBe(true);
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 1);
+    expect((await getPendingSync(server.id)).map((item) => item.bookId)).toEqual([secondBook.id]);
   });
 
   it('awaits active syncWork in updateApiKey before switching keys, then runs syncProgress and refresh concurrently while preserving notice', async () => {
@@ -631,5 +635,84 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('stops sending queued progress and catalog follow-up requests when transport disconnects between requests', async () => {
+    const secondBook: BookRecord = {
+      ...seededBook,
+      id: 'server-1:1:11',
+      chapterId: 11,
+      title: 'The Dispossessed',
+    };
+    await reconcileBooks(server.id, [seededBook, secondBook]);
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
+    await saveLocalProgress(secondBook, 'epubcfi(/6/6!/4/4)', '//body/p[4]', 0.45, 1);
+
+    const offlineRequests: string[] = [];
+    let progressUploads = 0;
+    let seriesPages = 0;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (!networkConnected) {
+        offlineRequests.push(url.pathname);
+        return jsonResponse({}, 503);
+      }
+      if (url.pathname === '/api/Reader/progress') {
+        progressUploads += 1;
+        if (seriesPages >= 1) networkConnected = false;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        seriesPages += 1;
+        // Disconnect immediately once the initial concurrent progress upload and
+        // series page have started, before any networkStatusChange event arrives,
+        // so both the second queued progress item and /api/Series/series-detail
+        // must be blocked by per-request transport checks.
+        if (progressUploads >= 1) networkConnected = false;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => progressUploads === 1 && seriesPages === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(progressUploads).toBe(1);
+    expect(seriesPages).toBe(1);
+    expect(offlineRequests).toEqual([]);
+    expect((await getPendingSync(server.id)).map((item) => item.bookId)).toEqual([secondBook.id]);
+    expect(target.textContent).toContain('No network connection. Showing your saved library.');
+  });
+
+  it('ignores stale reconnect callbacks when live network status is already disconnected', async () => {
+    networkConnected = false;
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
+
+    const requestedPaths: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      requestedPaths.push(new URL(String(input)).pathname);
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requestedPaths).toEqual([]);
+
+    // Emit a stale cellular reconnect callback while Network.getStatus() already reports offline.
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(requestedPaths).toEqual([]);
+    expect(target.textContent).toContain('No network connection. Showing your saved library.');
   });
 });

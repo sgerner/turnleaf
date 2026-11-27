@@ -489,4 +489,33 @@ describe('native cover cache', () => {
       expect(native.deleted).toContain('covers/server-1/7.img.partial');
     },
   );
+
+  it('gates EPUB and cover transfers on live connectivity before invoking FileTransfer', async () => {
+    await expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'secret',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        async () => false,
+      ),
+    ).rejects.toMatchObject({ connectionFailed: true });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    vi.mocked(Filesystem.stat).mockRejectedValueOnce(new Error('missing'));
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+        async () => false,
+      ),
+    ).rejects.toMatchObject({ connectionFailed: true });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
 });
