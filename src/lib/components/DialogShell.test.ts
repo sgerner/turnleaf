@@ -38,7 +38,7 @@ describe('DialogShell', () => {
     host.remove();
   });
 
-  function mountShell(onClose = vi.fn()) {
+  function mountShell(onClose = vi.fn(), inert?: boolean) {
     const header = createRawSnippet(() => ({
       render: () => `
         <div class="header-row">
@@ -63,6 +63,7 @@ describe('DialogShell', () => {
       props: {
         labelledBy: 'test-dialog-title',
         onClose,
+        ...(inert !== undefined ? { inert } : {}),
         header,
         children,
       },
@@ -145,5 +146,11 @@ describe('DialogShell', () => {
 
     backdrop.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it('marks the backdrop subtree inert when inert is true', () => {
+    mountShell(vi.fn(), true);
+    const backdrop = host.querySelector<HTMLElement>('[role="presentation"]')!;
+    expect(backdrop.inert).toBe(true);
   });
 });

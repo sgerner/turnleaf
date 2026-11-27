@@ -2605,7 +2605,7 @@
   >
     <div
       bind:this={actionMenuDialog}
-      class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
+      class="card preset-filled-surface-50-950 max-h-[calc(100dvh-2rem)] w-full max-w-md overflow-x-hidden overflow-y-auto p-4 shadow-2xl"
       role="dialog"
       aria-modal="true"
       aria-labelledby="book-actions-title"
