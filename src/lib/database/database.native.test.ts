@@ -466,8 +466,8 @@ it('rolls back an active native transaction when a statement run fails', async (
   expect(mocks.plugin.commitTransaction).not.toHaveBeenCalled();
 });
 
-it('normalizes iOS ios_columns query payloads before returning rows', async () => {
-  const { getPreferences } = await import('./database');
+it('normalizes iOS ios_columns query payloads before returning rows and server/book state', async () => {
+  const { getBooks, getPreferences, getServer, openDatabase } = await import('./database');
   mocks.db.query.mockResolvedValueOnce({
     values: [
       { ios_columns: ['key', 'value'] },
@@ -476,8 +476,126 @@ it('normalizes iOS ios_columns query payloads before returning rows', async () =
   });
 
   const values = await getPreferences(['uiTheme']);
-
   expect(values.get('uiTheme')).toBe('eink');
+
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      {
+        ios_columns: [
+          'id',
+          'display_name',
+          'base_url',
+          'credential_ref',
+          'kavita_version',
+          'last_connected_at',
+        ],
+      },
+      {
+        last_connected_at: '2026-01-01T00:00:00.000Z',
+        kavita_version: '0.8.4',
+        credential_ref: 'cred-1',
+        base_url: 'https://books.example.com',
+        display_name: 'Home Kavita',
+        id: 'server',
+      },
+    ],
+  });
+  await expect(getServer()).resolves.toEqual({
+    id: 'server',
+    displayName: 'Home Kavita',
+    baseUrl: 'https://books.example.com',
+    credentialRef: 'cred-1',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-01-01T00:00:00.000Z',
+  });
+
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      {
+        ios_columns: [
+          'id',
+          'server_id',
+          'library_id',
+          'series_id',
+          'volume_id',
+          'chapter_id',
+          'title',
+          'author',
+          'series',
+          'format',
+          'pages',
+          'pages_read',
+          'created_at',
+          'last_read_at',
+          'download_path',
+          'download_status',
+          'file_size',
+          'remote_available',
+        ],
+      },
+      {
+        id: book.id,
+        server_id: book.serverId,
+        library_id: book.libraryId,
+        series_id: book.seriesId,
+        volume_id: book.volumeId,
+        chapter_id: book.chapterId,
+        title: book.title,
+        author: null,
+        series: null,
+        format: 'epub',
+        pages: 100,
+        pages_read: 25,
+        created_at: book.createdAt,
+        last_read_at: null,
+        download_path: 'books/server-1-10.epub',
+        download_status: 'available',
+        file_size: 2048,
+        remote_available: 1,
+      },
+    ],
+  });
+  await expect(getBooks(book.serverId, { includeDescription: false })).resolves.toEqual([
+    {
+      ...book,
+      pagesRead: 25,
+      downloadPath: 'books/server-1-10.epub',
+      downloadStatus: 'available',
+      fileSize: 2048,
+      remoteAvailable: true,
+    },
+  ]);
+
+  const db = await openDatabase();
+  mocks.db.run.mockResolvedValueOnce({
+    changes: {
+      changes: 1,
+      values: [{ ios_columns: ['id'] }, { id: book.id, ignored: true }],
+    },
+  });
+  const returning = await db.run('UPDATE books SET pages_read=? WHERE id=? RETURNING id', [
+    30,
+    book.id,
+  ]);
+  expect(returning.changes?.values).toEqual([{ id: book.id }]);
+});
+
+it('registers a native connection handle if deleteDatabase runs before createConnection', async () => {
+  const { resetLocalDatabase } = await import('./database');
+  mocks.plugin.deleteDatabase
+    .mockRejectedValueOnce(new Error('No available connection for database turnleaf'))
+    .mockResolvedValueOnce(undefined);
+
+  await resetLocalDatabase();
+
+  expect(mocks.plugin.createConnection).toHaveBeenCalledExactlyOnceWith({
+    database: 'turnleaf',
+    encrypted: false,
+    mode: 'no-encryption',
+    version: 1,
+    readonly: false,
+  });
+  expect(mocks.plugin.deleteDatabase).toHaveBeenCalledTimes(2);
 });
 
 it('keeps LATEST_SCHEMA_VERSION aligned with the final schema migration', async () => {

@@ -287,9 +287,9 @@ function createNativeConnection(database: string): NativeSQLiteConnection {
         values: normalizeQueryRows(result.values as Record<string, unknown>[] | undefined),
       };
     },
-    run(statement, values, transaction = true, returnMode = 'no', isSQL92 = true) {
+    async run(statement, values, transaction = true, returnMode = 'no', isSQL92 = true) {
       const runValues = values && values.length > 0 ? values : [];
-      return sqlitePlugin.run({
+      const result = await sqlitePlugin.run({
         database,
         statement,
         values: runValues,
@@ -298,6 +298,14 @@ function createNativeConnection(database: string): NativeSQLiteConnection {
         returnMode: returnMode as 'all' | 'one' | 'no',
         isSQL92: runValues.length > 0 ? true : isSQL92,
       });
+      if (!result.changes?.values) return result;
+      return {
+        ...result,
+        changes: {
+          ...result.changes,
+          values: normalizeQueryRows(result.changes.values as Record<string, unknown>[]),
+        },
+      };
     },
     async executeTransaction(tasks, isSQL92 = true): Promise<capSQLiteChanges> {
       await sqlitePlugin.beginTransaction({ database });
@@ -358,6 +366,28 @@ async function openNativeDatabase(): Promise<NativeSQLiteConnection> {
   return db;
 }
 
+async function deleteNativeDatabase(): Promise<void> {
+  try {
+    await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
+  } catch (error) {
+    const message = String(error);
+    if (
+      !message.includes(`No available connection for database ${NATIVE_DATABASE}`) &&
+      !message.includes(`Connection to ${NATIVE_DATABASE} not available`)
+    ) {
+      throw error;
+    }
+    await sqlitePlugin.createConnection({
+      database: NATIVE_DATABASE,
+      encrypted: false,
+      mode: 'no-encryption',
+      version: 1,
+      readonly: false,
+    });
+    await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
+  }
+}
+
 export async function resetLocalDatabase(): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
@@ -375,7 +405,7 @@ export async function resetLocalDatabase(): Promise<void> {
     }
     connection = null;
     opening = null;
-    await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
+    await deleteNativeDatabase();
     clearBootThemeCache();
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
