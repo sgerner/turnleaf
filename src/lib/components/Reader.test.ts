@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as SessionModule from '../reader/session';
 
 const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
   () => ({
@@ -17,14 +18,20 @@ vi.mock('../database/database', () => ({
   setPreferences: setPreferencesMock,
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    open = openSessionMock;
-    tableOfContents = () => [];
-    updateHighlights = vi.fn();
-    destroy = destroySessionMock;
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      open = openSessionMock;
+      tableOfContents = () => [];
+      getVisiblePassages = () => [];
+      clearTextSelection = vi.fn();
+      updateHighlights = vi.fn();
+      destroy = destroySessionMock;
+    },
+  };
+});
 
 import Reader from './Reader.svelte';
 
@@ -34,6 +41,29 @@ describe('Reader mount lifecycle', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    if (typeof Element.prototype.animate !== 'function') {
+      Element.prototype.animate = (() => {
+        const anim = {
+          currentTime: 0,
+          playState: 'running',
+          effect: null,
+          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+          cancel() {
+            anim.playState = 'idle';
+          },
+          finish() {
+            anim.playState = 'finished';
+          },
+        };
+        queueMicrotask(() => {
+          if (anim.playState !== 'idle') {
+            anim.playState = 'finished';
+            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+          }
+        });
+        return anim as unknown as Animation;
+      }) as typeof Element.prototype.animate;
+    }
     getPreferencesMock.mockResolvedValue(new Map());
     setPreferencesMock.mockResolvedValue(undefined);
     openSessionMock.mockResolvedValue(undefined);
@@ -100,7 +130,7 @@ describe('Reader mount lifecycle', () => {
     expect(onMountChange).toHaveBeenCalledWith(true);
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
         'This EPUB could not be opened.',
       );
     });
