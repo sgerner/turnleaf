@@ -4,14 +4,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import type * as SessionModule from '../reader/session';
 
-const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
-  () => ({
-    getPreferencesMock: vi.fn(),
-    setPreferencesMock: vi.fn(),
-    openSessionMock: vi.fn(),
-    destroySessionMock: vi.fn(),
-  }),
-);
+const {
+  getPreferencesMock,
+  setPreferencesMock,
+  openSessionMock,
+  nextSessionMock,
+  destroySessionMock,
+} = vi.hoisted(() => ({
+  getPreferencesMock: vi.fn(),
+  setPreferencesMock: vi.fn(),
+  openSessionMock: vi.fn(),
+  nextSessionMock: vi.fn(),
+  destroySessionMock: vi.fn(),
+}));
 
 vi.mock('../database/database', () => ({
   getPreferences: getPreferencesMock,
@@ -24,6 +29,7 @@ vi.mock('../reader/session', async (importOriginal) => {
     ...actual,
     ReaderSession: class MockReaderSession {
       open = openSessionMock;
+      next = nextSessionMock;
       tableOfContents = () => [];
       getVisiblePassages = () => [];
       clearTextSelection = vi.fn();
@@ -67,6 +73,7 @@ describe('Reader mount lifecycle', () => {
     getPreferencesMock.mockResolvedValue(new Map());
     setPreferencesMock.mockResolvedValue(undefined);
     openSessionMock.mockResolvedValue(undefined);
+    nextSessionMock.mockResolvedValue(true);
     target = document.createElement('div');
     document.body.append(target);
   });
@@ -163,5 +170,58 @@ describe('Reader mount lifecycle', () => {
     await unmount(mounted);
     mounted = null;
     expect(destroySessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('opens, focuses, and restores focus for the end-of-book continuation dialog', async () => {
+    nextSessionMock.mockResolvedValueOnce(false);
+    const onBookCompleted = vi.fn();
+    const onOpenNextBook = vi.fn().mockResolvedValue(undefined);
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:vol-1',
+        bookId: 'vol-1',
+        title: 'Leviathan Wakes',
+        nextBook: {
+          title: "Caliban's War",
+          seriesLabel: 'The Expanse · Vol. 2',
+          downloaded: true,
+          available: true,
+        },
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onBookCompleted,
+        onOpenNextBook,
+      },
+    });
+    flushSync();
+
+    await vi.waitFor(() => {
+      expect(openSessionMock).toHaveBeenCalledOnce();
+    });
+
+    const nextZone = target.querySelector<HTMLButtonElement>('button[aria-label="Next page"]');
+    expect(nextZone).not.toBeNull();
+    nextZone?.focus();
+    nextZone?.click();
+
+    await vi.waitFor(() => {
+      expect(onBookCompleted).toHaveBeenCalledOnce();
+      expect(target.querySelector('dialog, [role="dialog"]')).not.toBeNull();
+    });
+
+    const dialog = target.querySelector<HTMLElement>('dialog, [role="dialog"]');
+    await vi.waitFor(() => {
+      expect(dialog?.contains(document.activeElement)).toBe(true);
+    });
+
+    dialog?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    flushSync();
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('dialog, [role="dialog"]')).toBeNull();
+      expect(document.activeElement).toBe(nextZone);
+    });
   });
 });

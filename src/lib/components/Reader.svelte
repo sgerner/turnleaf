@@ -72,6 +72,13 @@
     accept?: () => Promise<void>;
   };
 
+  type NextReaderBook = {
+    title: string;
+    seriesLabel: string | null;
+    downloaded: boolean;
+    available: boolean;
+  };
+
   let {
     bookUrl,
     bookId,
@@ -80,8 +87,11 @@
     initialCfi = null,
     initialXPath = null,
     initialPercentage = null,
+    nextBook = null,
     onBack,
     onRelocated,
+    onBookCompleted,
+    onOpenNextBook,
     onSyncLatest,
     onRetryDownload,
     onMountChange,
@@ -94,8 +104,11 @@
     initialCfi?: string | null;
     initialXPath?: string | null;
     initialPercentage?: number | null;
+    nextBook?: NextReaderBook | null;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
+    onBookCompleted?: (() => void) | undefined;
+    onOpenNextBook?: (() => Promise<void>) | undefined;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
     onRetryDownload?: (() => Promise<void>) | undefined;
     onMountChange?: ((mounted: boolean) => void) | undefined;
@@ -121,6 +134,7 @@
   let annotationsPanel = $state<HTMLElement | null>(null);
   let searchPanel = $state<HTMLElement | null>(null);
   let syncConfirmationPanel = $state<HTMLElement | null>(null);
+  let endOfBookPanel = $state<HTMLElement | null>(null);
   let errorPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
@@ -128,6 +142,11 @@
   let annotationsOpener: HTMLElement | null = null;
   let searchOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
+  let endOfBookOpener: HTMLElement | null = null;
+  let endOfBookVisible = $state(false);
+  let openingNextBook = $state(false);
+  let endOfBookError = $state('');
+  let endOfBookAnnouncement = $state('');
   let errorOpener: HTMLElement | null = null;
   let errorRestoreReturnLink = false;
   let toc = $state<TocItem[]>([]);
@@ -418,12 +437,13 @@
       annotationsVisible ||
       searchVisible ||
       pendingSyncLocation !== null ||
+      endOfBookVisible ||
       Boolean(error)
     );
   }
 
   function hasTopLevelAlert(): boolean {
-    return pendingSyncLocation !== null || Boolean(error);
+    return pendingSyncLocation !== null || endOfBookVisible || Boolean(error);
   }
 
   function canDismissError(): boolean {
@@ -701,6 +721,45 @@
       restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
     }
     resumeChromeHide();
+  }
+
+  function openEndOfBook(opener: HTMLElement | null = activeElement()): void {
+    pauseChromeHide();
+    endOfBookOpener = opener;
+    endOfBookError = '';
+    endOfBookAnnouncement = nextBook
+      ? nextBook.available
+        ? `Finished ${title}. Next volume ready: ${nextBook.title}.`
+        : `Finished ${title}. Next volume ${nextBook.title} is unavailable offline.`
+      : `Finished ${title}. You have reached the end of this book.`;
+    endOfBookVisible = true;
+    focusModal(() => endOfBookPanel);
+  }
+
+  function closeEndOfBook(): void {
+    if (openingNextBook) return;
+    endOfBookVisible = false;
+    endOfBookError = '';
+    const opener = endOfBookOpener;
+    endOfBookOpener = null;
+    restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
+    resumeChromeHide();
+  }
+
+  async function confirmOpenNextBook(): Promise<void> {
+    if (!nextBook || !onOpenNextBook || openingNextBook || !nextBook.available) return;
+    openingNextBook = true;
+    endOfBookError = '';
+    try {
+      await onOpenNextBook();
+    } catch (cause) {
+      if (!destroyed) {
+        endOfBookError =
+          cause instanceof Error ? cause.message : 'Turnleaf could not open the next volume.';
+      }
+    } finally {
+      if (!destroyed) openingNextBook = false;
+    }
   }
 
   function showFooter(): void {
@@ -1188,8 +1247,16 @@
     if (!session || Boolean(error)) return;
     const opener = activeElement();
     try {
-      if (direction === 'next') await session.next();
-      else await session.previous();
+      if (direction === 'next') {
+        const advanced = await session.next();
+        if (advanced === false && !destroyed) {
+          onBookCompleted?.();
+          openEndOfBook(opener);
+        }
+      } else {
+        if (endOfBookVisible) closeEndOfBook();
+        await session.previous();
+      }
     } catch (cause) {
       openReaderError(
         cause instanceof Error
@@ -1353,6 +1420,10 @@
         closeSyncConfirmation();
         return;
       }
+      if (endOfBookVisible) {
+        closeEndOfBook();
+        return;
+      }
       if (settingsVisible) closeSettings();
       else if (tocVisible) closeToc();
       else if (bookmarksVisible) closeBookmarks();
@@ -1388,6 +1459,10 @@
     }
     if (pendingSyncLocation) {
       closeSyncConfirmation();
+      return true;
+    }
+    if (endOfBookVisible) {
+      closeEndOfBook();
       return true;
     }
     if (settingsVisible) closeSettings();
@@ -1488,6 +1563,9 @@
       {currentProgressLabel()} complete.
     {/if}
   </p>
+  <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+    {endOfBookAnnouncement}
+  </p>
 
   <p id="reader-keyboard-help" class="sr-only">
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
@@ -1564,6 +1642,86 @@
       aria-label="Show reading controls"
       onclick={showControls}
     ></button>
+  {/if}
+
+  {#if endOfBookVisible}
+    <div class="reader-end-modal" transition:fade={{ duration: 120 }}>
+      <button
+        class="reader-panel-backdrop"
+        type="button"
+        tabindex="-1"
+        aria-label="Dismiss end of book prompt"
+        onclick={closeEndOfBook}
+      ></button>
+      <dialog
+        bind:this={endOfBookPanel}
+        open
+        class="reader-end-dialog card preset-filled-surface-50-950 w-full max-w-md p-6 shadow-2xl"
+        aria-modal="true"
+        aria-labelledby="reader-end-title"
+        aria-describedby="reader-end-description"
+        tabindex="-1"
+        onkeydown={(event) => trapModalKeydown(event, endOfBookPanel!, closeEndOfBook)}
+        transition:fly={{ y: 12, duration: 150 }}
+      >
+        <p class="text-xs uppercase tracking-wider text-surface-700-300">Book completed</p>
+        <h2 id="reader-end-title" class="mt-1 font-serif text-2xl text-surface-950-50">
+          Finished {title}
+        </h2>
+        {#if nextBook}
+          <p id="reader-end-description" class="mt-2 text-sm text-surface-700-300">
+            Up next{nextBook.seriesLabel ? ` in ${nextBook.seriesLabel}` : ''}:
+            <span class="font-medium text-surface-950-50">{nextBook.title}</span>
+          </p>
+        {:else}
+          <p id="reader-end-description" class="mt-2 text-sm text-surface-700-300">
+            You have reached the final page of this book.
+          </p>
+        {/if}
+        {#if endOfBookError}
+          <p class="mt-3 text-sm text-error-600-400" role="alert">{endOfBookError}</p>
+        {/if}
+        <div class="mt-5 grid gap-2">
+          {#if nextBook && onOpenNextBook}
+            <button
+              class="btn preset-filled-primary-700-300 min-h-11 w-full justify-center"
+              type="button"
+              data-reader-next-volume
+              disabled={!nextBook.available || openingNextBook}
+              onclick={() => void confirmOpenNextBook()}
+            >
+              {#if openingNextBook}
+                Opening next volume…
+              {:else if nextBook.downloaded}
+                Continue to {nextBook.title}
+              {:else if nextBook.available}
+                Download and read {nextBook.title}
+              {:else}
+                Next volume unavailable offline
+              {/if}
+            </button>
+          {/if}
+          <div class="grid grid-cols-2 gap-2">
+            <button
+              class="btn preset-tonal-surface min-h-11 justify-center"
+              type="button"
+              disabled={openingNextBook}
+              onclick={closeEndOfBook}
+            >
+              Stay on page
+            </button>
+            <button
+              class="btn preset-tonal-tertiary min-h-11 justify-center"
+              type="button"
+              disabled={openingNextBook}
+              onclick={onBack}
+            >
+              Back to library
+            </button>
+          </div>
+        </div>
+      </dialog>
+    </div>
   {/if}
 
   {#if controlsVisible}
@@ -2889,6 +3047,24 @@
     border: 0;
     background: hsl(0 0% 0% / 0.24);
     pointer-events: auto;
+  }
+
+  .reader-end-modal {
+    position: absolute;
+    inset: 0;
+    z-index: 35;
+    display: grid;
+    place-items: center;
+    padding: 1.25rem;
+    pointer-events: auto;
+  }
+
+  .reader-end-dialog {
+    position: relative;
+    z-index: 1;
+    margin: 0;
+    border: 0;
+    color: inherit;
   }
 
   .active-mode {

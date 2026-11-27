@@ -159,6 +159,82 @@ function progress(
   return n;
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed !== '') {
+      const n = Number(trimmed);
+      return Number.isFinite(n) ? n : undefined;
+    }
+  }
+  return undefined;
+}
+
+function optionalFiniteNumber(
+  value: unknown,
+  endpoint: string,
+  base: CollectionPath,
+  index: number,
+  field: string,
+  onFallback?: () => void,
+): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const n = finiteNumber(value);
+  if (n !== undefined) return n;
+  onFallback?.();
+  fallback(endpoint, formatPath(base, index, field), value, 'number');
+  return undefined;
+}
+
+function optionalBoolean(
+  value: unknown,
+  endpoint: string,
+  base: CollectionPath,
+  index: number,
+  field: string,
+  onFallback?: () => void,
+): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'boolean') return value;
+  onFallback?.();
+  fallback(endpoint, formatPath(base, index, field), value, 'boolean');
+  return undefined;
+}
+
+function optionalString(
+  value: unknown,
+  endpoint: string,
+  base: CollectionPath,
+  index: number,
+  field: string,
+  onFallback?: () => void,
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') return value;
+  onFallback?.();
+  fallback(endpoint, formatPath(base, index, field), value, 'string');
+  return undefined;
+}
+
+function matchesOptionalNumber(raw: unknown, cached: number | null | undefined): boolean {
+  if (raw === undefined || raw === null) return cached === undefined;
+  const n = finiteNumber(raw);
+  return n !== undefined && n === cached;
+}
+
+function matchesOptionalBoolean(raw: unknown, cached: boolean | null | undefined): boolean {
+  if (raw === undefined || raw === null) return cached === undefined;
+  return typeof raw === 'boolean' && raw === cached;
+}
+
+function matchesOptionalString(raw: unknown, cached: string | null | undefined): boolean {
+  if (raw === undefined || raw === null) return cached === undefined;
+  return typeof raw === 'string' && raw === cached;
+}
+
 export function normalizeLibraries(payload: unknown): KavitaLibrary[] {
   if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
   return payload.map((value, index) => {
@@ -242,15 +318,27 @@ function isEpubFile(value: unknown): boolean {
   );
 }
 
-function matchesCachedChapter(row: Row, cached: KavitaChapter, parentVolumeId?: number): boolean {
+function matchesCachedChapter(
+  row: Row,
+  cached: KavitaChapter,
+  parentVolumeId?: number,
+  parentVolumeNumber?: number,
+): boolean {
   const volumeId = row.volumeId == null ? parentVolumeId : integer(row.volumeId);
   if (
     volumeId !== cached.volumeId ||
+    parentVolumeNumber !== cached.volumeNumber ||
     row.title !== cached.title ||
     row.titleName !== cached.titleName ||
     row.summary !== cached.summary ||
     integer(row.pages) !== cached.pages ||
-    integer(row.pagesRead) !== cached.pagesRead
+    integer(row.pagesRead) !== cached.pagesRead ||
+    !matchesOptionalNumber(row.sortOrder, cached.sortOrder) ||
+    !matchesOptionalNumber(row.minNumber, cached.minNumber) ||
+    !matchesOptionalNumber(row.maxNumber, cached.maxNumber) ||
+    !matchesOptionalString(row.volumeTitle, cached.volumeTitle) ||
+    !matchesOptionalBoolean(row.hasCoverImage, cached.hasCoverImage) ||
+    !matchesOptionalBoolean(row.isSpecial, cached.isSpecial)
   )
     return false;
   if (
@@ -301,6 +389,7 @@ function chapters(
   markIncomplete: (path: string, value: unknown) => void,
   cache: Map<number, KavitaChapter>,
   parentVolumeId?: number,
+  parentVolumeNumber?: number,
 ): KavitaChapter[] {
   const result: KavitaChapter[] = [];
   for (let index = 0; index < values.length; index += 1) {
@@ -309,7 +398,7 @@ function chapters(
       const candidate = value as Row;
       const candidateId = integer(candidate.id);
       const cached = candidateId === undefined ? undefined : cache.get(candidateId);
-      if (cached && matchesCachedChapter(candidate, cached, parentVolumeId)) {
+      if (cached && matchesCachedChapter(candidate, cached, parentVolumeId, parentVolumeNumber)) {
         result.push(cached);
         continue;
       }
@@ -413,6 +502,54 @@ function chapters(
       'pagesRead',
       onFallback,
     );
+    const sortOrder = optionalFiniteNumber(
+      row.sortOrder,
+      DETAIL_ENDPOINT,
+      base,
+      index,
+      'sortOrder',
+      onFallback,
+    );
+    const minNumber = optionalFiniteNumber(
+      row.minNumber,
+      DETAIL_ENDPOINT,
+      base,
+      index,
+      'minNumber',
+      onFallback,
+    );
+    const maxNumber = optionalFiniteNumber(
+      row.maxNumber,
+      DETAIL_ENDPOINT,
+      base,
+      index,
+      'maxNumber',
+      onFallback,
+    );
+    const volumeTitle = optionalString(
+      row.volumeTitle,
+      DETAIL_ENDPOINT,
+      base,
+      index,
+      'volumeTitle',
+      onFallback,
+    );
+    const hasCoverImage = optionalBoolean(
+      row.hasCoverImage,
+      DETAIL_ENDPOINT,
+      base,
+      index,
+      'hasCoverImage',
+      onFallback,
+    );
+    const isSpecial = optionalBoolean(
+      row.isSpecial,
+      DETAIL_ENDPOINT,
+      base,
+      index,
+      'isSpecial',
+      onFallback,
+    );
     const lastReadingProgressUtc =
       date(
         row.lastReadingProgressUtc,
@@ -424,33 +561,26 @@ function chapters(
         onFallback,
       ) || null;
 
-    const normalized: KavitaChapter =
-      pagesRead === undefined
-        ? {
-            id: chapterId,
-            volumeId,
-            format: 3,
-            files: epubFiles,
-            writers,
-            title,
-            titleName,
-            summary,
-            pages,
-            lastReadingProgressUtc,
-          }
-        : {
-            id: chapterId,
-            volumeId,
-            format: 3,
-            files: epubFiles,
-            writers,
-            title,
-            titleName,
-            summary,
-            pages,
-            pagesRead,
-            lastReadingProgressUtc,
-          };
+    const normalized: KavitaChapter = {
+      id: chapterId,
+      volumeId,
+      format: 3,
+      files: epubFiles,
+      writers,
+      title,
+      titleName,
+      summary,
+      pages,
+      lastReadingProgressUtc,
+    };
+    if (pagesRead !== undefined) normalized.pagesRead = pagesRead;
+    if (sortOrder !== undefined) normalized.sortOrder = sortOrder;
+    if (minNumber !== undefined) normalized.minNumber = minNumber;
+    if (maxNumber !== undefined) normalized.maxNumber = maxNumber;
+    if (parentVolumeNumber !== undefined) normalized.volumeNumber = parentVolumeNumber;
+    if (volumeTitle !== undefined) normalized.volumeTitle = volumeTitle;
+    if (hasCoverImage !== undefined) normalized.hasCoverImage = hasCoverImage;
+    if (isSpecial !== undefined) normalized.isSpecial = isSpecial;
     if (!hadFallback && !cache.has(chapterId)) {
       cache.set(chapterId, normalized);
     }
@@ -495,6 +625,29 @@ export function normalizeSeriesDetail(payload: unknown): KavitaSeriesDetail {
   for (let index = 0; index < rawVolumes.length; index += 1) {
     const volume = object(rawVolumes[index], '$.volumes', index);
     const volumeId = integer(volume.id);
+    const minNumber = optionalFiniteNumber(
+      volume.minNumber,
+      DETAIL_ENDPOINT,
+      '$.volumes',
+      index,
+      'minNumber',
+    );
+    const maxNumber = optionalFiniteNumber(
+      volume.maxNumber,
+      DETAIL_ENDPOINT,
+      '$.volumes',
+      index,
+      'maxNumber',
+    );
+    const number = optionalFiniteNumber(
+      volume.number,
+      DETAIL_ENDPOINT,
+      '$.volumes',
+      index,
+      'number',
+    );
+    const name = optionalString(volume.name, DETAIL_ENDPOINT, '$.volumes', index, 'name');
+    const parentVolumeNumber = minNumber ?? number;
     const rawVolumeChapters = volume.chapters;
     let volumeChapters: unknown[];
     if (rawVolumeChapters == null) {
@@ -509,9 +662,24 @@ export function normalizeSeriesDetail(payload: unknown): KavitaSeriesDetail {
         rawVolumeChapters,
       );
     }
-    const items = chapters(volumeChapters, index, markIncomplete, cache, volumeId);
+    const items = chapters(
+      volumeChapters,
+      index,
+      markIncomplete,
+      cache,
+      volumeId,
+      parentVolumeNumber,
+    );
     if (!items.length) continue;
-    volumes.push({ id: id(volume.id, '$.volumes', index, 'id'), chapters: items });
+    const normalizedVolume: KavitaVolume = {
+      id: id(volume.id, '$.volumes', index, 'id'),
+      chapters: items,
+    };
+    if (minNumber !== undefined) normalizedVolume.minNumber = minNumber;
+    if (maxNumber !== undefined) normalizedVolume.maxNumber = maxNumber;
+    if (number !== undefined) normalizedVolume.number = number;
+    if (name !== undefined) normalizedVolume.name = name;
+    volumes.push(normalizedVolume);
   }
 
   const detail: KavitaSeriesDetail = {

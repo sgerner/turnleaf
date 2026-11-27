@@ -895,3 +895,77 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+it('fetches distinct chapter covers first and falls back to series covers on 404 or empty payloads', async () => {
+  const client = new KavitaClient('https://books.example.com/kavita/', 'abc123');
+  expect(client.chapterCoverUrl(99)).toBe(
+    'https://books.example.com/kavita/api/Image/chapter-cover?chapterId=99',
+  );
+
+  const chapterBytes = new Uint8Array([137, 80, 78, 71]);
+  const seriesBytes = new Uint8Array([255, 216, 255, 224]);
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'image/png' },
+      blob: async () => new Blob([chapterBytes], { type: 'image/png' }),
+    })
+    .mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      headers: { get: () => null },
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'image/jpeg' },
+      blob: async () => new Blob([seriesBytes], { type: 'image/jpeg' }),
+    })
+    .mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+    });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  const distinct = await client.getBookCover(99, 4);
+  expect(distinct.size).toBe(4);
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    1,
+    'https://books.example.com/kavita/api/Image/chapter-cover?chapterId=99',
+    expect.anything(),
+  );
+
+  const fallback = await client.getBookCover(100, 4);
+  expect(fallback.size).toBe(4);
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    2,
+    'https://books.example.com/kavita/api/Image/chapter-cover?chapterId=100',
+    expect.anything(),
+  );
+  expect(fetchMock).toHaveBeenNthCalledWith(
+    3,
+    'https://books.example.com/kavita/api/Image/series-cover?seriesId=4',
+    expect.anything(),
+  );
+
+  await expect(client.getBookCover(101, 4)).rejects.toMatchObject({
+    kind: 'authentication',
+    status: 401,
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(4);
+
+  fetchMock.mockResolvedValueOnce({
+    ok: false,
+    status: 302,
+    type: 'basic',
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'location' ? 'https://attacker.example/cover.png' : null,
+    },
+  });
+  await expect(client.getBookCover(102, 4)).rejects.toThrow('redirected to a different server');
+  expect(fetchMock).toHaveBeenCalledTimes(5);
+});

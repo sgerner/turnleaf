@@ -32,6 +32,15 @@ describe('book accessibility labels', () => {
     expect(downloadProgressLabel(book)).toBe(
       'Download progress for Vol 3, by George Rawlinson, The Seven Great Monarchies',
     );
+
+    const numberedVolume = makeBook({
+      title: "Caliban's War",
+      series: 'The Expanse',
+      volumeNumber: 2,
+    });
+    expect(openBookLabel(numberedVolume)).toBe(
+      "Open Caliban's War, by George Rawlinson, The Expanse · Vol. 2",
+    );
   });
 
   it('suppresses duplicate series names that match the book title', () => {

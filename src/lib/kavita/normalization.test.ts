@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from '../diagnostics/log';
 import { issue51VolumeDetail } from './fixtures/issue-51-volume-detail';
+import { mapSeriesToBooks } from './mapper';
 import {
   KavitaPayloadError,
   normalizeLibraries,
@@ -20,7 +21,6 @@ it.each([null, undefined])(
     expect(normalized).toMatchObject({ incomplete: true, volumes: [] });
   },
 );
-import { mapSeriesToBooks } from './mapper';
 
 function series(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -474,6 +474,85 @@ describe('normalizeSeriesDetail', () => {
     );
   });
 
+  it('normalizes optional chapter and volume sequence metadata and propagates volume numbers', () => {
+    const normalized = normalizeSeriesDetail(
+      detail({
+        volumes: [
+          {
+            id: '15',
+            minNumber: '2',
+            maxNumber: 2,
+            number: 2,
+            name: '2',
+            chapters: [
+              chapter({
+                id: 25,
+                volumeId: undefined,
+                sortOrder: '2.5',
+                minNumber: '2',
+                maxNumber: 2,
+                volumeTitle: 'Vol. 2',
+                hasCoverImage: true,
+                isSpecial: false,
+              }),
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(normalized.volumes![0]).toMatchObject({
+      id: 15,
+      minNumber: 2,
+      maxNumber: 2,
+      number: 2,
+      name: '2',
+    });
+    expect(normalized.volumes![0]!.chapters[0]).toMatchObject({
+      id: 25,
+      volumeId: 15,
+      volumeNumber: 2,
+      sortOrder: 2.5,
+      minNumber: 2,
+      maxNumber: 2,
+      volumeTitle: 'Vol. 2',
+      hasCoverImage: true,
+      isSpecial: false,
+    });
+  });
+
+  it('defaults malformed optional sequence fields to undefined without leaking values', () => {
+    clearDiagnostics();
+    const secret = 'SECRET-SORT-VALUE';
+    const normalized = normalizeSeriesDetail(
+      detail({
+        volumes: [
+          {
+            id: 18,
+            minNumber: secret,
+            chapters: [
+              chapter({
+                sortOrder: { bad: secret },
+                hasCoverImage: 'yes',
+                isSpecial: 1,
+              }),
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(normalized.volumes![0]!.minNumber).toBeUndefined();
+    expect(normalized.volumes![0]!.chapters[0]!.sortOrder).toBeUndefined();
+    expect(normalized.volumes![0]!.chapters[0]!.hasCoverImage).toBeUndefined();
+    expect(normalized.volumes![0]!.chapters[0]!.isSpecial).toBeUndefined();
+    const log = exportDiagnostics({ appVersion: 'test', platform: 'web' });
+    expect(log).toContain('path=$.volumes[0].minNumber');
+    expect(log).toContain('path=$.volumes[0].chapters[0].sortOrder');
+    expect(log).not.toContain(secret);
+    expect(JSON.stringify(normalized)).not.toContain(secret);
+  });
+
   it('reuses clean normalized chapters across collections within one call without sharing across calls', () => {
     const normalized = normalizeSeriesDetail({
       chapters: [chapter()],
@@ -499,7 +578,7 @@ describe('normalizeSeriesDetail', () => {
       storylineChapters: [chapter({ titleName: 'Storyline Edition', pagesRead: 12 })],
       volumes: [
         { id: 10, chapters: [chapter({ title: null })] },
-        { id: 99, chapters: [chapter({ volumeId: undefined })] },
+        { id: 99, minNumber: 3, chapters: [chapter({ volumeId: undefined })] },
       ],
     });
 
@@ -507,6 +586,7 @@ describe('normalizeSeriesDetail', () => {
     expect(differing.storylineChapters[0]!.titleName).toBe('Storyline Edition');
     expect(differing.volumes![0]!.chapters[0]!.title).toBe('');
     expect(differing.volumes![1]!.chapters[0]!.volumeId).toBe(99);
+    expect(differing.volumes![1]!.chapters[0]!.volumeNumber).toBe(3);
     const exported = exportDiagnostics({ appVersion: 'test', platform: 'web' });
     expect(exported).toContain('path=$.volumes[0].chapters[0].title');
 

@@ -38,7 +38,7 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
-import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
+import { cacheBookCover, cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
@@ -376,6 +376,143 @@ describe('native cover cache', () => {
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('caches distinct chapter covers and falls back to series covers on 404 or offline cache hit', async () => {
+    const existing = new Set<string>(['covers/default/4.img']);
+    vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+      if (!existing.has(path)) throw { code: 'OS-PLUG-FILE-0008' };
+      return {
+        type: 'file',
+        size: 128,
+        name: path,
+        mtime: 0,
+        uri: `file://${path}`,
+      };
+    });
+    vi.mocked(FileTransfer.downloadFile)
+      .mockImplementationOnce(async ({ path }) => {
+        existing.add(path.replace(/^file:\/\//, ''));
+        return {};
+      })
+      .mockRejectedValueOnce({
+        code: 'OS-PLUG-FLTR-0010',
+        data: { httpStatus: 404 },
+      })
+      .mockRejectedValueOnce({
+        code: 'OS-PLUG-FLTR-0010',
+        data: { httpStatus: 401 },
+      })
+      .mockRejectedValueOnce({
+        code: 'OS-PLUG-FLTR-0010',
+        data: {
+          httpStatus: 302,
+          headers: { Location: 'https://attacker.example/cover.png' },
+        },
+      });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=41',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 41,
+        seriesId: 4,
+        serverOrigin: 'https://books.example.com',
+      }),
+    ).resolves.toBe('web://file://covers/default/chapter-41.img');
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=42',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 42,
+        seriesId: 4,
+        serverOrigin: 'https://books.example.com',
+      }),
+    ).resolves.toBe('web://file://covers/default/4.img');
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=43',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 43,
+        seriesId: 4,
+        cacheNamespace: 'default',
+        allowDownload: false,
+        serverOrigin: 'https://books.example.com',
+      }),
+    ).resolves.toBe('web://file://covers/default/4.img');
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=44',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 44,
+        seriesId: 4,
+        serverOrigin: 'https://books.example.com',
+      }),
+    ).rejects.toMatchObject({ data: { httpStatus: 401 } });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=45',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=4',
+        apiKey: 'secret',
+        chapterId: 45,
+        seriesId: 4,
+        serverOrigin: 'https://books.example.com',
+      }),
+    ).rejects.toThrow('redirected to a different server');
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(4);
+  });
+
+  it('re-checks connectivity before starting chapter or fallback series cover transfers', async () => {
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    let connected = true;
+    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
+      connected = false;
+      return { uri: `file://${path}` };
+    });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=51',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=5',
+        apiKey: 'secret',
+        chapterId: 51,
+        seriesId: 5,
+        serverOrigin: 'https://books.example.com',
+        canDownload: () => connected,
+      }),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    connected = true;
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      connected = false;
+      throw { code: 'OS-PLUG-FLTR-0010', data: { httpStatus: 404 } };
+    });
+
+    await expect(
+      cacheBookCover({
+        chapterCoverUrl: 'https://books.example.com/api/Image/chapter-cover?chapterId=52',
+        seriesCoverUrl: 'https://books.example.com/api/Image/series-cover?seriesId=5',
+        apiKey: 'secret',
+        chapterId: 52,
+        seriesId: 5,
+        serverOrigin: 'https://books.example.com',
+        canDownload: () => connected,
+      }),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        url: 'https://books.example.com/api/Image/chapter-cover?chapterId=52',
+      }),
+    );
   });
 
   it('follows validated same-origin 3xx cover redirects with disableRedirects enabled', async () => {

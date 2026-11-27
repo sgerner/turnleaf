@@ -339,14 +339,29 @@ export async function deleteDownloadedEpub(relativePath: string): Promise<void> 
   await Filesystem.deleteFile({ path: relativePath, directory: Directory.Data });
 }
 
-export async function cacheCover(
+async function assertCoverDownloadAllowed(
+  allowDownload: boolean,
+  canDownload?: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  if (!allowDownload) throw new Error('Offline');
+  if (canDownload && !(await canDownload())) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    throw new Error('Offline');
+  }
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+}
+
+async function cacheCoverAtKey(
   downloadUrl: string,
   apiKey: string,
-  seriesId: number,
+  fileKey: string,
   signal?: AbortSignal,
   cacheNamespace = 'default',
   allowDownload = true,
   serverOrigin?: string,
+  canDownload?: () => boolean | Promise<boolean>,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const target = assertSafeTransferTarget(
@@ -356,15 +371,15 @@ export async function cacheCover(
   );
   const namespace = safeCoverNamespace(cacheNamespace);
   const directory = `covers/${namespace}`;
-  const path = `${directory}/${seriesId}.img`;
+  const path = `${directory}/${fileKey}.img`;
   const temporaryPath = `${path}.partial`;
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (!allowDownload) throw new Error('Offline');
+    await assertCoverDownloadAllowed(allowDownload, canDownload, signal);
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    await assertCoverDownloadAllowed(allowDownload, canDownload, signal);
     try {
       await downloadFileWithRedirects({
         initialUrl: target.url,
@@ -397,6 +412,85 @@ export async function cacheCover(
   }
   const existing = await Filesystem.getUri({ path, directory: Directory.Data });
   return Capacitor.convertFileSrc(existing.uri);
+}
+
+export async function cacheCover(
+  downloadUrl: string,
+  apiKey: string,
+  seriesId: number,
+  signal?: AbortSignal,
+  cacheNamespace = 'default',
+  allowDownload = true,
+  serverOrigin?: string,
+  canDownload?: () => boolean | Promise<boolean>,
+): Promise<string> {
+  return cacheCoverAtKey(
+    downloadUrl,
+    apiKey,
+    String(seriesId),
+    signal,
+    cacheNamespace,
+    allowDownload,
+    serverOrigin,
+    canDownload,
+  );
+}
+
+export interface CacheBookCoverOptions {
+  chapterCoverUrl: string;
+  seriesCoverUrl: string;
+  apiKey: string;
+  chapterId: number;
+  seriesId: number;
+  signal?: AbortSignal;
+  cacheNamespace?: string;
+  allowDownload?: boolean;
+  serverOrigin?: string;
+  canDownload?: () => boolean | Promise<boolean>;
+}
+
+export async function cacheBookCover({
+  chapterCoverUrl,
+  seriesCoverUrl,
+  apiKey,
+  chapterId,
+  seriesId,
+  signal,
+  cacheNamespace = 'default',
+  allowDownload = true,
+  serverOrigin,
+  canDownload,
+}: CacheBookCoverOptions): Promise<string> {
+  const chapterKey = `chapter-${chapterId}`;
+  try {
+    return await cacheCoverAtKey(
+      chapterCoverUrl,
+      apiKey,
+      chapterKey,
+      signal,
+      cacheNamespace,
+      allowDownload,
+      serverOrigin,
+      canDownload,
+    );
+  } catch (error) {
+    if (signal?.aborted || error instanceof KavitaError) throw error;
+    const failure = error as { code?: unknown; data?: { httpStatus?: unknown } } | null;
+    const httpStatus = failure?.data?.httpStatus;
+    if (httpStatus === 401 || httpStatus === 403 || failure?.code === 'OS-PLUG-FLTR-0008') {
+      throw error;
+    }
+    return cacheCover(
+      seriesCoverUrl,
+      apiKey,
+      seriesId,
+      signal,
+      cacheNamespace,
+      allowDownload,
+      serverOrigin,
+      canDownload,
+    );
+  }
 }
 
 export async function clearCoverCache(): Promise<void> {

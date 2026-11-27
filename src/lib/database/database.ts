@@ -39,6 +39,9 @@ export interface BookRecord {
   downloadPath: string | null;
   downloadStatus: string;
   fileSize: number | null;
+  sortOrder?: number | null;
+  minNumber?: number | null;
+  volumeNumber?: number | null;
   /** False means Kavita no longer advertises the book; local retention may keep it. */
   remoteAvailable?: boolean;
   /** False means Kavita omitted usable progress fields from this metadata snapshot. */
@@ -231,7 +234,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -259,14 +262,94 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+const ALTER_ADD_COLUMN_PATTERN = /^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)\b/i;
+
+function splitSqlStatements(sql: string): string[] {
+  return sql
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0)
+    .map((statement) => `${statement};`);
+}
+
+export async function migrateDatabase(
+  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion'> &
+    Partial<Pick<SQLiteDBConnection, 'query'>>,
+): Promise<void> {
   const current = await db.getVersion();
+  const currentVersion = current.version ?? 0;
+  const tableColumnsCache = new Map<string, Set<string>>();
+
+  const getExistingColumns = async (table: string): Promise<Set<string>> => {
+    const normalizedTable = table.toLowerCase();
+    const cached = tableColumnsCache.get(normalizedTable);
+    if (cached) return cached;
+    if (typeof db.query !== 'function') {
+      const empty = new Set<string>();
+      tableColumnsCache.set(normalizedTable, empty);
+      return empty;
+    }
+    const rows =
+      (await executeNativeQuery({ query: db.query.bind(db) }, `PRAGMA table_info('${table}')`))
+        .values ?? [];
+    const columns = new Set(rows.map((row) => String(row.name).toLowerCase()));
+    tableColumnsCache.set(normalizedTable, columns);
+    return columns;
+  };
+
   for (const migration of migrations) {
-    if (migration.version <= (current.version ?? 0)) continue;
+    if (migration.version <= currentVersion) continue;
+
+    const rawStatements = splitSqlStatements(migration.statements);
+    const hasAlterAddColumn = rawStatements.some((statement) =>
+      ALTER_ADD_COLUMN_PATTERN.test(statement),
+    );
+
+    if (!hasAlterAddColumn) {
+      await executeNativeTransaction(db, [
+        { statement: migration.statements },
+        { statement: `PRAGMA user_version = ${migration.version};` },
+      ]);
+      continue;
+    }
+
+    const filteredStatements: string[] = [];
+    const pendingAdditions: Array<{ columns: Set<string>; column: string }> = [];
+    const addedInMigration = new Set<string>();
+    let skippedColumn = false;
+
+    for (const statement of rawStatements) {
+      const match = ALTER_ADD_COLUMN_PATTERN.exec(statement);
+      if (!match) {
+        filteredStatements.push(statement);
+        continue;
+      }
+      const table = match[1]!;
+      const column = match[2]!;
+      const normalizedColumn = column.toLowerCase();
+      const migrationKey = `${table.toLowerCase()}.${normalizedColumn}`;
+      const existingColumns = await getExistingColumns(table);
+      if (existingColumns.has(normalizedColumn) || addedInMigration.has(migrationKey)) {
+        skippedColumn = true;
+        continue;
+      }
+      filteredStatements.push(statement);
+      addedInMigration.add(migrationKey);
+      pendingAdditions.push({ columns: existingColumns, column: normalizedColumn });
+    }
+
     await executeNativeTransaction(db, [
-      { statement: migration.statements },
+      ...(!skippedColumn
+        ? [{ statement: migration.statements }]
+        : filteredStatements.length > 0
+          ? [{ statement: `${filteredStatements.join('\n')}\n` }]
+          : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
+
+    for (const { columns, column } of pendingAdditions) {
+      columns.add(column);
+    }
   }
 }
 
@@ -377,7 +460,15 @@ export async function reconcileBooks(
       const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
       const merged = [...incoming.values()].map((book) => {
         const previous = existingById.get(book.id);
-        if (!previous) return { ...book, remoteAvailable: true };
+        if (!previous) {
+          return {
+            ...book,
+            remoteAvailable: true,
+            sortOrder: book.sortOrder ?? null,
+            minNumber: book.minNumber ?? null,
+            volumeNumber: book.volumeNumber ?? null,
+          };
+        }
         const reading = state.readingState[book.id];
         const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
         const changedDuringRefresh =
@@ -393,9 +484,16 @@ export async function reconcileBooks(
           remoteAvailable: true,
           downloadPath: previous.downloadPath,
           downloadStatus: previous.downloadStatus,
-          fileSize: previous.fileSize,
+          fileSize: previous.downloadPath
+            ? (previous.fileSize ?? (book.fileSize && book.fileSize > 0 ? book.fileSize : null))
+            : book.fileSize && book.fileSize > 0
+              ? book.fileSize
+              : previous.fileSize,
           pagesRead: preserveProgress ? previous.pagesRead : book.pagesRead,
           lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
+          sortOrder: book.sortOrder ?? null,
+          minNumber: book.minNumber ?? null,
+          volumeNumber: book.volumeNumber ?? null,
         };
       });
       state.books = [
@@ -427,18 +525,24 @@ const preserveReadingProgress = `EXISTS (
 const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
    description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
-   pages, pages_read, created_at, last_read_at, remote_available)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   pages, pages_read, created_at, last_read_at, remote_available,
+   sort_order, min_number, volume_number)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
    library_id=excluded.library_id, series_id=excluded.series_id,
    volume_id=excluded.volume_id, chapter_id=excluded.chapter_id,
    title=excluded.title, author=excluded.author, series=excluded.series,
    description_html=excluded.description_html, format=excluded.format,
-   metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
+   metadata_refreshed_at=excluded.metadata_refreshed_at,
+   file_size=CASE WHEN books.download_path IS NOT NULL THEN COALESCE(books.file_size, NULLIF(excluded.file_size, 0)) ELSE COALESCE(NULLIF(excluded.file_size, 0), books.file_size) END,
+   pages=excluded.pages,
    pages_read=CASE WHEN ?=0 OR ${preserveReadingProgress} THEN books.pages_read ELSE excluded.pages_read END,
    created_at=excluded.created_at,
    last_read_at=CASE WHEN ?=0 OR ?=0 OR ${preserveReadingProgress} THEN books.last_read_at ELSE excluded.last_read_at END,
-   remote_available=excluded.remote_available`;
+   remote_available=excluded.remote_available,
+   sort_order=excluded.sort_order,
+   min_number=excluded.min_number,
+   volume_number=excluded.volume_number`;
 
 function replaceBookTask(
   serverId: string,
@@ -469,6 +573,9 @@ function replaceBookTask(
       book.createdAt,
       book.lastReadAt,
       book.remoteAvailable !== false ? 1 : 0,
+      book.sortOrder ?? null,
+      book.minNumber ?? null,
+      book.volumeNumber ?? null,
       book.remoteProgressKnown === false ? 0 : 1,
       snapshotStartedAt,
       snapshotStartedAt,
@@ -547,7 +654,7 @@ export async function getBooks(
     db,
     `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
       format, pages, pages_read, created_at, last_read_at, download_path, download_status,
-      file_size, remote_available${includeDescription ? ', description_html' : ''}
+      file_size, remote_available, sort_order, min_number, volume_number${includeDescription ? ', description_html' : ''}
       FROM books WHERE server_id = ? ORDER BY title`,
     [serverId],
   );
@@ -570,30 +677,63 @@ export async function getBooks(
     downloadPath: row.download_path ? String(row.download_path) : null,
     downloadStatus: String(row.download_status),
     fileSize: row.file_size == null ? null : Number(row.file_size),
+    sortOrder: row.sort_order == null ? null : Number(row.sort_order),
+    minNumber: row.min_number == null ? null : Number(row.min_number),
+    volumeNumber: row.volume_number == null ? null : Number(row.volume_number),
     remoteAvailable: Number(row.remote_available ?? 1) !== 0,
   }));
+}
+
+export async function getBookDescription(bookId: string): Promise<string | null> {
+  if (!Capacitor.isNativePlatform()) {
+    const book = readBrowserState().books.find((entry) => entry.id === bookId);
+    return book?.descriptionHtml ?? null;
+  }
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    'SELECT description_html FROM books WHERE id = ? LIMIT 1',
+    [bookId],
+  );
+  const row = result.values?.[0] as Record<string, unknown> | undefined;
+  return row?.description_html ? String(row.description_html) : null;
 }
 
 async function updateBookDownloadState(
   bookId: string,
   downloadPath: string | null,
   downloadStatus: string,
-  fileSize: number | null,
+  fileSize?: number | null,
 ): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
       state.books = state.books.map((book) =>
-        book.id === bookId ? { ...book, downloadPath, downloadStatus, fileSize } : book,
+        book.id === bookId
+          ? {
+              ...book,
+              downloadPath,
+              downloadStatus,
+              ...(fileSize !== undefined ? { fileSize } : {}),
+            }
+          : book,
       );
     });
     return;
   }
   const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    'UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?',
-    [downloadPath, downloadStatus, fileSize, bookId],
-  );
+  if (fileSize !== undefined) {
+    await executeNativeRun(
+      db,
+      'UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?',
+      [downloadPath, downloadStatus, fileSize, bookId],
+    );
+    return;
+  }
+  await executeNativeRun(db, 'UPDATE books SET download_path=?, download_status=? WHERE id=?', [
+    downloadPath,
+    downloadStatus,
+    bookId,
+  ]);
 }
 
 export async function markDownloaded(bookId: string, path: string, size: number): Promise<void> {
@@ -1216,7 +1356,7 @@ export async function markSyncFailure(
 }
 
 export async function removeDownload(bookId: string): Promise<void> {
-  await updateBookDownloadState(bookId, null, 'none', null);
+  await updateBookDownloadState(bookId, null, 'none');
 }
 
 export async function getPreferences(keys: readonly string[]): Promise<Map<string, string>> {

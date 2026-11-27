@@ -1,11 +1,25 @@
 import type { BookRecord } from '../database/database';
+import { formatSeriesLabel } from '../library/series-metadata';
 
 export type BookLabelTarget = Pick<
   BookRecord,
-  'id' | 'title' | 'author' | 'series' | 'pages' | 'pagesRead' | 'downloadPath' | 'remoteAvailable'
+  | 'id'
+  | 'title'
+  | 'author'
+  | 'series'
+  | 'volumeNumber'
+  | 'minNumber'
+  | 'sortOrder'
+  | 'pages'
+  | 'pagesRead'
+  | 'downloadPath'
+  | 'remoteAvailable'
 >;
 
-export type BookMetadataTarget = Pick<BookRecord, 'title' | 'author' | 'series'>;
+export type BookMetadataTarget = Pick<
+  BookRecord,
+  'title' | 'author' | 'series' | 'volumeNumber' | 'minNumber' | 'sortOrder'
+>;
 
 export interface BookStatusOptions {
   downloadingBookId?: string | null;
@@ -28,7 +42,7 @@ function metadataParts(book: BookMetadataTarget): string[] {
   const series = book.series?.trim();
   const title = book.title.trim();
   if (series && series.toLowerCase() !== title.toLowerCase()) {
-    parts.push(series);
+    parts.push(formatSeriesLabel(book) ?? series);
   }
   return parts;
 }

@@ -63,6 +63,7 @@ const verifyDownloadedEpubMock = vi.fn(async (path: string) => ({
 vi.mock('../downloads/native-download', () => ({
   EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
   EpubTransferError: class EpubTransferError extends Error {},
+  cacheBookCover: vi.fn(async () => 'cover'),
   cacheCover: vi.fn(async () => 'cover'),
   clearCoverCache: vi.fn(async () => {}),
   cleanupInterruptedEpubDownloads: vi.fn(async () => {}),

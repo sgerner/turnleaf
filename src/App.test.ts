@@ -72,6 +72,7 @@ vi.mock('./lib/database/database', () => ({
   setPreference: setPreferenceMock,
   setPreferences: setPreferencesMock,
   getBooks: getBooksMock,
+  getBookDescription: vi.fn().mockResolvedValue(null),
   getReadingState: getReadingStateMock,
   getSyncStatus: getSyncStatusMock,
   removeServer: removeServerMock,
@@ -88,6 +89,7 @@ vi.mock('./lib/database/database', () => ({
 
 vi.mock('./lib/downloads/native-download', () => ({
   cacheCover: vi.fn(),
+  cacheBookCover: vi.fn(),
   clearCoverCache: clearCoverCacheMock,
   cleanupInterruptedEpubDownloads: cleanupInterruptedEpubDownloadsMock,
   deleteDownloadedEpub: vi.fn().mockResolvedValue(undefined),

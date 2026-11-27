@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { createSharedCoverLoader, loadCoversWithConcurrency } from './cover-loader';
+import {
+  createSharedCoverLoader,
+  evictOffscreenCovers,
+  loadCoversWithConcurrency,
+} from './cover-loader';
 
 describe('loadCoversWithConcurrency', () => {
   it('deduplicates series and limits active loads', async () => {
@@ -153,5 +157,38 @@ describe('createSharedCoverLoader', () => {
 
     releases.get(3)?.();
     await expect(retained).resolves.toBe(3);
+  });
+
+  it('supports string book keys and evicts oldest offscreen covers beyond the bound', async () => {
+    const controller = new AbortController();
+    const loaded: string[] = [];
+    await loadCoversWithConcurrency<string, string>(
+      [
+        { seriesId: 1, chapterId: 10, key: 'server:1:10' },
+        { seriesId: 1, chapterId: 10, key: 'server:1:10' },
+        { seriesId: 1, chapterId: 11, key: 'server:1:11' },
+      ],
+      {
+        signal: controller.signal,
+        load: async (key) => `blob:${key}`,
+        onLoaded: (key) => loaded.push(key),
+      },
+    );
+    expect(loaded).toEqual(['server:1:10', 'server:1:11']);
+
+    const disposed: string[] = [];
+    const current = new Map<string, string>([
+      ['book-1', 'blob:1'],
+      ['book-2', 'blob:2'],
+      ['book-3', 'blob:3'],
+      ['book-4', 'blob:4'],
+    ]);
+    evictOffscreenCovers(current, new Set(['book-2']), 2, (url) => disposed.push(url));
+    expect(Object.fromEntries(current)).toEqual({
+      'book-2': 'blob:2',
+      'book-3': 'blob:3',
+      'book-4': 'blob:4',
+    });
+    expect(disposed).toEqual(['blob:1']);
   });
 });

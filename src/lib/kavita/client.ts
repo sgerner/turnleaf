@@ -123,11 +123,40 @@ export class KavitaClient {
     return this.resolveUrl(`/api/Image/series-cover?seriesId=${seriesId}`);
   }
 
+  chapterCoverUrl(chapterId: number): string {
+    return this.resolveUrl(`/api/Image/chapter-cover?chapterId=${chapterId}`);
+  }
+
   async getCover(seriesId: number, signal?: AbortSignal): Promise<Blob> {
+    return this.fetchCoverBlob(this.coverUrl(seriesId), signal);
+  }
+
+  async getChapterCover(chapterId: number, signal?: AbortSignal): Promise<Blob> {
+    return this.fetchCoverBlob(this.chapterCoverUrl(chapterId), signal);
+  }
+
+  async getBookCover(chapterId: number, seriesId: number, signal?: AbortSignal): Promise<Blob> {
+    try {
+      const blob = await this.getChapterCover(chapterId, signal);
+      if (blob.size > 0) return blob;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (
+        !(error instanceof KavitaError) ||
+        error.kind !== 'server' ||
+        error.status === undefined ||
+        error.status < 400
+      ) {
+        throw error;
+      }
+    }
+    return this.getCover(seriesId, signal);
+  }
+
+  private async fetchCoverBlob(url: string, signal?: AbortSignal): Promise<Blob> {
     if (Capacitor.isNativePlatform()) {
       throw new Error('Covers on native platforms must use cacheCover.');
     }
-    const url = this.coverUrl(seriesId);
     return this.withBrowserTimeout(signal, async (combined) => {
       const response = await this.browserFetchWithRedirects(url, {
         signal: combined,

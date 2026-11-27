@@ -146,12 +146,13 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
           ],
         };
         break;
+      case '/api/Image/chapter-cover':
       case '/api/Image/series-cover':
         if (redirectCrossOrigin) {
           coverRedirects += 1;
           response
             .writeHead(302, {
-              Location: `${foreignOrigin}/api/Image/series-cover${requestUrl.search}`,
+              Location: `${foreignOrigin}${path}${requestUrl.search}`,
             })
             .end();
           return;

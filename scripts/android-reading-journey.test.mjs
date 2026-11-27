@@ -29,7 +29,15 @@ describe('Android reading journey fixture', () => {
     expect(response.headers.get('content-type')).toBe('image/png');
     const bytes = new Uint8Array(await response.arrayBuffer());
     expect(Array.from(bytes.slice(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
-    expect(fixture.covers).toBe(1);
+    const chapterResponse = await fetch(
+      `http://127.0.0.1:${fixture.port}/api/Image/chapter-cover?chapterId=1`,
+      {
+        headers: { 'x-api-key': 'turnleaf-ci-only' },
+      },
+    );
+    expect(chapterResponse.status).toBe(200);
+    expect(chapterResponse.headers.get('content-type')).toBe('image/png');
+    expect(fixture.covers).toBe(2);
     expect(fixture.notFoundPaths).toEqual([]);
   });
 

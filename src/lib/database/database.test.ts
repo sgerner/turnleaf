@@ -5,6 +5,7 @@ import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 import {
   acceptRemoteProgress,
   confirmSync,
+  getBookDescription,
   getBooks,
   getPendingSync,
   getPreferences,
@@ -990,6 +991,51 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
 
+it('retains remote fileSize when removing a download and loads synopsis HTML on demand', async () => {
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
+  });
+  const bookWithSequence: BookRecord = {
+    ...existingBook,
+    descriptionHtml: '<p>Stored synopsis</p>',
+    fileSize: 987654,
+    sortOrder: 3,
+    minNumber: 2,
+    volumeNumber: 2,
+  };
+  localStorage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [bookWithSequence],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+
+  const startupBooks = await getBooks('server', { includeDescription: false });
+  expect(startupBooks[0]).toMatchObject({
+    id: existingBook.id,
+    descriptionHtml: null,
+    fileSize: 987654,
+    sortOrder: 3,
+    minNumber: 2,
+    volumeNumber: 2,
+  });
+  await expect(getBookDescription(existingBook.id)).resolves.toBe('<p>Stored synopsis</p>');
+
+  await removeDownload(existingBook.id);
+  const afterRemove = await getBooks('server', { includeDescription: false });
+  expect(afterRemove[0]).toMatchObject({
+    id: existingBook.id,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 987654,
+  });
+});
+
 it('mirrors browser theme, mode, and surface colors to localStorage and clears them on reset', async () => {
   const storage = new MemoryStorage();
   Object.defineProperty(window, 'localStorage', {
@@ -1105,7 +1151,7 @@ it('marks and removes browser downloads only on the matching book', async () => 
       id: undownloaded.id,
       downloadPath: null,
       downloadStatus: 'none',
-      fileSize: null,
+      fileSize: 9876,
     }),
     expect.objectContaining({
       id: sibling.id,
@@ -1211,4 +1257,40 @@ it('saves normalized browser remote progress and guards against concurrent local
   const setItemSpy = vi.spyOn(storage, 'setItem');
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
+});
+
+it('normalizes omitted sequence fields to null during browser reconcileBooks to match SQLite', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  await saveServer({
+    id: 'server',
+    displayName: 'Test server',
+    baseUrl: 'https://books.example.com',
+    credentialRef: 'credential',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  });
+  await reconcileBooks('server', [
+    {
+      ...existingBook,
+      sortOrder: 2,
+      minNumber: 2,
+      volumeNumber: 2,
+    },
+  ]);
+  expect((await getBooks('server'))[0]).toMatchObject({
+    sortOrder: 2,
+    minNumber: 2,
+    volumeNumber: 2,
+  });
+
+  await reconcileBooks('server', [existingBook]);
+  expect((await getBooks('server'))[0]).toMatchObject({
+    sortOrder: null,
+    minNumber: null,
+    volumeNumber: null,
+  });
 });

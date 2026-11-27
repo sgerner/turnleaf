@@ -227,3 +227,18 @@ it('allows a manual retry after an authorization failure', async () => {
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
+
+it('stops before uploading queued progress when canSync reports offline', async () => {
+  const initial = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}');
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
+  const saveProgress = vi.fn().mockResolvedValue(undefined);
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', async () => false),
+  ).resolves.toBeUndefined();
+
+  expect(saveProgress).not.toHaveBeenCalled();
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
+  expect(saved.syncQueue['book-1']).toBeDefined();
+  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+});
