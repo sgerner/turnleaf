@@ -53,6 +53,7 @@ const { testState, mockBook, mockRendition } = vi.hoisted(() => {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
     spine: {
+      hooks: { content: { register: vi.fn() } },
       each: vi.fn((visit: (section: { href: string; index: number }) => void) => {
         for (const section of state.sections) {
           visit({ href: section.href, index: section.index });

@@ -60,20 +60,24 @@ interface SpineSection {
   href: string;
   index: number;
   url?: string | undefined;
+  document?: Document | undefined;
+  hooks?: EpubSpineHooks | undefined;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
 }
 
-interface EpubSpineHooks {
-  content?:
-    | {
-        register?:
-          | ((
-              callback: (document: Document, section: SpineSection) => Promise<void> | void,
-            ) => void)
-          | undefined;
-      }
+interface EpubSpineContentHook {
+  context?: unknown;
+  register?:
+    | ((callback: (document: Document, section: SpineSection) => Promise<void> | void) => void)
     | undefined;
+  deregister?: ((callback: (...args: unknown[]) => unknown) => void) | undefined;
+  list?: (() => unknown) | undefined;
+  trigger?: ((...args: unknown[]) => Promise<unknown> | unknown) | undefined;
+}
+
+interface EpubSpineHooks {
+  content?: EpubSpineContentHook | undefined;
 }
 
 interface EpubArchiveLike {
@@ -106,11 +110,18 @@ interface EpubResourcesLike {
 export interface EpubBookLike {
   archived?: boolean | undefined;
   archive?: EpubArchiveLike | undefined;
-  loaded?: { resources?: Promise<unknown> | undefined } | undefined;
+  loaded?:
+    | {
+        resources?: Promise<unknown> | undefined;
+        spine?: Promise<unknown> | undefined;
+      }
+    | undefined;
   resources?: EpubResourcesLike | undefined;
   spine?:
     | {
         hooks?: EpubSpineHooks | undefined;
+        spineItems?: SpineSection[] | undefined;
+        each?: ((visit: (section: SpineSection) => void) => void) | undefined;
       }
     | undefined;
 }
@@ -1433,14 +1444,66 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
+type AnySpineHookFn = (...hookArgs: unknown[]) => unknown;
+
+function normalizeError(error: unknown, fallbackMessage: string): Error {
+  if (error instanceof Error) return error;
+  if (typeof error === 'string' && error.trim()) return new Error(error);
+  return new Error(fallbackMessage);
+}
+
+function toAsyncSafeSpineHookFn(
+  task: AnySpineHookFn,
+  wrappedMap: WeakMap<AnySpineHookFn, AnySpineHookFn>,
+): AnySpineHookFn {
+  const existing = wrappedMap.get(task);
+  if (existing) return existing;
+  const wrapped: AnySpineHookFn = function (this: unknown, ...hookArgs: unknown[]): unknown {
+    try {
+      return task.apply(this, hookArgs);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+  wrappedMap.set(task, wrapped);
+  wrappedMap.set(wrapped, wrapped);
+  return wrapped;
+}
+
+export interface EpubSpineSanitizerOptions {
+  isAborted?: (() => boolean) | undefined;
+  onError?: ((error: Error) => void) | undefined;
+  onInstalled?:
+    | ((installation: { contentHook: EpubSpineContentHook; hookTask: AnySpineHookFn }) => void)
+    | undefined;
+  sanitizedDocuments?: WeakSet<Document> | undefined;
+}
+
 export function registerEpubSpineSanitizer(
   book: EpubBookLike,
   stylesheetCache: StylesheetCache = new Map(),
-  options?: { isAborted?: (() => boolean) | undefined } | undefined,
-): void {
-  book.spine?.hooks?.content?.register?.((document: Document, section: SpineSection) => {
+  options?: EpubSpineSanitizerOptions | undefined,
+): boolean {
+  const contentHook = book.spine?.hooks?.content;
+  if (
+    !contentHook ||
+    typeof contentHook !== 'object' ||
+    typeof contentHook.register !== 'function'
+  ) {
+    options?.onError?.(new Error('EPUB spine content sanitizer hook is unavailable.'));
+    return false;
+  }
+  if (contentHook.trigger !== undefined && typeof contentHook.trigger !== 'function') {
+    options?.onError?.(new Error('EPUB spine content trigger hook is invalid.'));
+    return false;
+  }
+
+  const sanitizedDocuments = options?.sanitizedDocuments ?? new WeakSet<Document>();
+  const wrappedTasks = new WeakMap<AnySpineHookFn, AnySpineHookFn>();
+
+  const sanitizeSpineContent = async (document: Document, section: SpineSection): Promise<void> => {
     stripReservedEpubStyleIds(document);
-    return sanitizeEpubDocument(document, stylesheetCache, async (href, currentDocument) => {
+    await sanitizeEpubDocument(document, stylesheetCache, async (href, currentDocument) => {
       if (options?.isAborted?.()) return null;
       if (href.toLowerCase().startsWith('blob:')) {
         return isSameOriginBlobUrl(href, currentDocument.baseURI)
@@ -1468,14 +1531,112 @@ export function registerEpubSpineSanitizer(
       }
       return null;
     });
-  });
+    if (!options?.isAborted?.()) {
+      sanitizedDocuments.add(document);
+    }
+  };
+
+  const wrappedSanitize = toAsyncSafeSpineHookFn(
+    sanitizeSpineContent as AnySpineHookFn,
+    wrappedTasks,
+  );
+  const originalRegister = contentHook.register;
+
+  try {
+    if (typeof contentHook.list === 'function') {
+      const existingHooks = contentHook.list();
+      if (Array.isArray(existingHooks)) {
+        for (let index = 0; index < existingHooks.length; index += 1) {
+          const entry = existingHooks[index];
+          if (typeof entry === 'function') {
+            existingHooks[index] = toAsyncSafeSpineHookFn(entry as AnySpineHookFn, wrappedTasks);
+          }
+        }
+      }
+    }
+    originalRegister.call(
+      contentHook,
+      wrappedSanitize as (document: Document, section: SpineSection) => Promise<void>,
+    );
+    if (typeof contentHook.list === 'function') {
+      const registered = contentHook.list();
+      if (!Array.isArray(registered) || !registered.includes(wrappedSanitize)) {
+        options?.onError?.(new Error('EPUB spine content sanitizer hook failed to register.'));
+        return false;
+      }
+    }
+  } catch (error) {
+    options?.onError?.(
+      normalizeError(error, 'EPUB spine content sanitizer hook registration failed.'),
+    );
+    return false;
+  }
+
+  contentHook.register = function (this: unknown, ...entries: unknown[]): void {
+    const wrappedEntries = entries.map((entry) => {
+      if (typeof entry === 'function') {
+        return toAsyncSafeSpineHookFn(entry as AnySpineHookFn, wrappedTasks);
+      }
+      if (Array.isArray(entry)) {
+        return entry.map((nested) =>
+          typeof nested === 'function'
+            ? toAsyncSafeSpineHookFn(nested as AnySpineHookFn, wrappedTasks)
+            : nested,
+        );
+      }
+      return entry;
+    });
+    (originalRegister as (...registerArgs: unknown[]) => void).apply(this, wrappedEntries);
+  } as EpubSpineContentHook['register'];
+
+  if (typeof contentHook.deregister === 'function') {
+    const originalDeregister = contentHook.deregister;
+    contentHook.deregister = function (this: unknown, fn: AnySpineHookFn): void {
+      if (fn === (sanitizeSpineContent as AnySpineHookFn) || fn === wrappedSanitize) {
+        return;
+      }
+      originalDeregister.call(this, wrappedTasks.get(fn) ?? fn);
+    };
+  }
+
+  if (typeof contentHook.trigger === 'function') {
+    const originalTrigger = contentHook.trigger;
+    contentHook.trigger = async function (this: unknown, ...args: unknown[]): Promise<unknown> {
+      try {
+        if (typeof contentHook.list === 'function') {
+          const registered = contentHook.list();
+          if (!Array.isArray(registered) || !registered.includes(wrappedSanitize)) {
+            throw new Error('EPUB spine content sanitizer hook was removed before render.');
+          }
+        }
+        const result = await originalTrigger.apply(this, args);
+        const doc = args[0];
+        if (
+          doc &&
+          typeof doc === 'object' &&
+          !options?.isAborted?.() &&
+          !sanitizedDocuments.has(doc as Document)
+        ) {
+          throw new Error('EPUB spine content sanitizer did not complete before serialization.');
+        }
+        return result;
+      } catch (error) {
+        const normalized = normalizeError(error, 'EPUB spine content sanitizer failed.');
+        options?.onError?.(normalized);
+        throw normalized;
+      }
+    };
+  }
+
+  options?.onInstalled?.({ contentHook, hookTask: wrappedSanitize });
+  return true;
 }
 
 const interceptedBookProperties = new WeakMap<object, Map<string, (value: unknown) => void>>();
 
 function interceptBookProperty(
   book: object,
-  property: 'archive' | 'resources',
+  property: 'archive' | 'resources' | 'spine',
   onAssign: (value: unknown) => void,
 ): boolean {
   let handlers = interceptedBookProperties.get(book);
@@ -1513,7 +1674,16 @@ export class ReaderSession {
   private readonly createdBlobUrls = new Set<string>();
   private readonly authorStyleMedia = new WeakMap<Element, string | null>();
   private readonly authorInlineStyles = new WeakMap<Element, string>();
+  private readonly sanitizedDocuments = new WeakSet<Document>();
+  private readonly patchedSpineHooks = new WeakMap<object, AnySpineHookFn>();
+  private readonly patchedSections = new WeakSet<object>();
+  private installedSpineContentHook: EpubSpineContentHook | null = null;
+  private installedSpineHookTask: AnySpineHookFn | null = null;
+  private spineSanitizerError: Error | null = null;
+  private rejectSpineSanitizerFailed: ((error: Error) => void) | null = null;
+  private readonly spineSanitizerFailedPromise: Promise<never>;
   private destroyed = false;
+  private bookDestroyed = false;
   private resolveDestroyed: (() => void) | null = null;
   private readonly destroyedPromise = new Promise<void>((resolve) => {
     this.resolveDestroyed = resolve;
@@ -1569,11 +1739,13 @@ export class ReaderSession {
   };
 
   constructor(private readonly bookUrl: string | ArrayBuffer) {
+    this.spineSanitizerFailedPromise = new Promise<never>((_, reject) => {
+      this.rejectSpineSanitizerFailed = reject;
+    });
+    this.spineSanitizerFailedPromise.catch(() => {});
+
     this.book = ePub(bookUrl);
     const book = this.book as unknown as EpubBookLike & object;
-    registerEpubSpineSanitizer(book, this.stylesheetCache, {
-      isAborted: () => this.destroyed,
-    });
     interceptBookProperty(book, 'archive', (archive) => {
       this.installArchiveUrlTracker(archive);
     });
@@ -1601,9 +1773,15 @@ export class ReaderSession {
     };
     if (typeof bookWithReplacements.replacements === 'function') {
       bookWithReplacements.replacements = async () => {
-        if (this.destroyed || !bookWithReplacements.resources) return [];
+        if (this.destroyed || this.spineSanitizerError || !bookWithReplacements.resources) {
+          return [];
+        }
         bookWithReplacements.spine?.hooks?.serialize?.register?.((output, section) => {
-          if (this.destroyed || typeof bookWithReplacements.resources?.substitute !== 'function') {
+          if (
+            this.destroyed ||
+            this.spineSanitizerError ||
+            typeof bookWithReplacements.resources?.substitute !== 'function'
+          ) {
             return;
           }
           section.output = bookWithReplacements.resources.substitute(output, section.url ?? '');
@@ -1611,12 +1789,191 @@ export class ReaderSession {
         if (typeof bookWithReplacements.resources.replacements === 'function') {
           await bookWithReplacements.resources.replacements();
         }
-        if (this.destroyed || typeof bookWithReplacements.resources?.replaceCss !== 'function') {
+        if (
+          this.destroyed ||
+          this.spineSanitizerError ||
+          typeof bookWithReplacements.resources?.replaceCss !== 'function'
+        ) {
           return [];
         }
         return bookWithReplacements.resources.replaceCss();
       };
     }
+
+    this.installSpineSanitizer(book);
+    interceptBookProperty(book, 'spine', () => {
+      if (this.destroyed) return;
+      this.installSpineSanitizer(book);
+    });
+    void book.loaded?.spine?.then(
+      () => {
+        if (this.destroyed) return;
+        this.installSpineSanitizer(book);
+      },
+      () => {},
+    );
+  }
+
+  private recordSpineSanitizerFailure(error: unknown, abortImmediately: boolean): Error {
+    const normalized = normalizeError(
+      error,
+      'EPUB spine content sanitizer hook could not be installed.',
+    );
+    this.spineSanitizerError ??= normalized;
+    this.rejectSpineSanitizerFailed?.(this.spineSanitizerError);
+    if (abortImmediately) {
+      this.destroy();
+    }
+    return this.spineSanitizerError;
+  }
+
+  private installSpineSanitizerOnBookTarget(targetBook: EpubBookLike): {
+    contentHook: EpubSpineContentHook;
+    hookTask: AnySpineHookFn;
+  } | null {
+    const contentHook = targetBook.spine?.hooks?.content;
+    if (contentHook && typeof contentHook === 'object') {
+      const existingTask = this.patchedSpineHooks.get(contentHook);
+      if (existingTask) {
+        if (typeof contentHook.list === 'function') {
+          const registered = contentHook.list();
+          if (!Array.isArray(registered) || !registered.includes(existingTask)) {
+            this.recordSpineSanitizerFailure(
+              new Error('EPUB spine content sanitizer hook was cleared before render.'),
+              true,
+            );
+            return null;
+          }
+        }
+        return { contentHook, hookTask: existingTask };
+      }
+    }
+
+    let installed: { contentHook: EpubSpineContentHook; hookTask: AnySpineHookFn } | null = null;
+    const registered = registerEpubSpineSanitizer(targetBook, this.stylesheetCache, {
+      isAborted: () => this.destroyed && this.spineSanitizerError === null,
+      sanitizedDocuments: this.sanitizedDocuments,
+      onError: (error) => {
+        this.recordSpineSanitizerFailure(error, false);
+      },
+      onInstalled: (record) => {
+        installed = record;
+        this.patchedSpineHooks.set(record.contentHook, record.hookTask);
+      },
+    });
+    if (!registered || !installed) {
+      this.recordSpineSanitizerFailure(
+        this.spineSanitizerError ??
+          new Error('EPUB spine content sanitizer hook could not be installed.'),
+        true,
+      );
+      return null;
+    }
+    return installed;
+  }
+
+  private installSpineSanitizer(book: EpubBookLike): void {
+    const installed = this.installSpineSanitizerOnBookTarget(book);
+    if (!installed) return;
+    this.installedSpineContentHook = installed.contentHook;
+    this.installedSpineHookTask = installed.hookTask;
+  }
+
+  private guardSpineSections(book: EpubBookLike, explicitSections?: SpineSection[]): void {
+    const sections: SpineSection[] = explicitSections
+      ? [...explicitSections]
+      : Array.isArray(book.spine?.spineItems)
+        ? [...book.spine.spineItems]
+        : this.spine
+          ? [...this.spine.sections]
+          : [];
+
+    for (const section of sections) {
+      if (!section || typeof section !== 'object') continue;
+      if ('hooks' in section) {
+        const sectionHook = section.hooks?.content;
+        if (
+          !sectionHook ||
+          typeof sectionHook !== 'object' ||
+          typeof sectionHook.register !== 'function' ||
+          typeof sectionHook.trigger !== 'function'
+        ) {
+          throw this.recordSpineSanitizerFailure(
+            new Error('EPUB section content sanitizer hook is unavailable.'),
+            false,
+          );
+        }
+        if (sectionHook !== this.installedSpineContentHook) {
+          const sectionInstalled = this.installSpineSanitizerOnBookTarget({
+            archived: book.archived,
+            archive: book.archive,
+            spine: { hooks: section.hooks },
+          });
+          if (!sectionInstalled) {
+            throw (
+              this.spineSanitizerError ??
+              new Error('EPUB section content sanitizer hook could not be installed.')
+            );
+          }
+        }
+      }
+
+      if (typeof section.load === 'function' && !this.patchedSections.has(section)) {
+        this.patchedSections.add(section);
+        const originalLoad = section.load;
+        section.load = async (request) => {
+          this.assertSpineSanitizerReady();
+          const loaded = await originalLoad.call(section, request);
+          const sectionDoc = section.document;
+          const abortedCleanly = this.destroyed && this.spineSanitizerError === null;
+          if (
+            !abortedCleanly &&
+            (sectionDoc !== undefined || 'hooks' in section) &&
+            (!sectionDoc || !this.sanitizedDocuments.has(sectionDoc))
+          ) {
+            throw this.recordSpineSanitizerFailure(
+              new Error('EPUB chapter was not sanitized before serialization.'),
+              false,
+            );
+          }
+          return loaded;
+        };
+      }
+    }
+  }
+
+  private assertSpineSanitizerReady(): void {
+    if (this.spineSanitizerError) {
+      throw this.spineSanitizerError;
+    }
+    const book = this.book as unknown as EpubBookLike;
+    const contentHook = book.spine?.hooks?.content;
+    if (
+      !contentHook ||
+      typeof contentHook !== 'object' ||
+      contentHook !== this.installedSpineContentHook ||
+      typeof contentHook.register !== 'function' ||
+      (contentHook.trigger !== undefined && typeof contentHook.trigger !== 'function')
+    ) {
+      throw this.recordSpineSanitizerFailure(
+        new Error('EPUB spine content sanitizer hook is unavailable.'),
+        false,
+      );
+    }
+    if (typeof contentHook.list === 'function') {
+      const registered = contentHook.list();
+      if (
+        !Array.isArray(registered) ||
+        !this.installedSpineHookTask ||
+        !registered.includes(this.installedSpineHookTask)
+      ) {
+        throw this.recordSpineSanitizerFailure(
+          new Error('EPUB spine content sanitizer hook was removed before render.'),
+          false,
+        );
+      }
+    }
+    this.guardSpineSections(book);
   }
 
   async open(
@@ -1634,197 +1991,212 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
-    this.viewportTarget = target;
-    this.rendition = this.book.renderTo(target, {
-      width: '100%',
-      height: '100%',
-      manager: 'default',
-      flow: 'paginated',
-      spread: 'none',
-      resizeOnOrientationChange: true,
-      allowScriptedContent: false,
-    });
-    this.observeViewport(target);
-    this.bindEpubContainer();
-    this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
-    if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
-      this.unloadedHookRegistered = true;
-      this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
-        if (view?.contents) this.cleanupContents(view.contents);
+    try {
+      this.assertSpineSanitizerReady();
+      if (this.destroyed) return;
+      this.viewportTarget = target;
+      this.rendition = this.book.renderTo(target, {
+        width: '100%',
+        height: '100%',
+        manager: 'default',
+        flow: 'paginated',
+        spread: 'none',
+        resizeOnOrientationChange: true,
+        allowScriptedContent: false,
       });
-    }
-    if (onSelection) {
-      this.rendition.hooks.content.register((contents: Contents) => {
-        this.registerContentFocusAndLinks(contents);
-        let tabKeyActive = false;
-        let blurredByTab = false;
-        let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
+      this.observeViewport(target);
+      this.bindEpubContainer();
+      this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
+      if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
+        this.unloadedHookRegistered = true;
+        this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
+          if (view?.contents) this.cleanupContents(view.contents);
+        });
+      }
+      if (onSelection) {
+        this.rendition.hooks.content.register((contents: Contents) => {
+          this.registerContentFocusAndLinks(contents);
+          let tabKeyActive = false;
+          let blurredByTab = false;
+          let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-        const clearTabTimer = () => {
-          if (tabResetTimer !== null) {
-            clearTimeout(tabResetTimer);
-            tabResetTimer = null;
-          }
-        };
-        const handleKeydown = (event: KeyboardEvent) => {
-          if (event.key === 'Tab') {
-            tabKeyActive = true;
-            clearTabTimer();
-            tabResetTimer = setTimeout(() => {
+          const clearTabTimer = () => {
+            if (tabResetTimer !== null) {
+              clearTimeout(tabResetTimer);
               tabResetTimer = null;
+            }
+          };
+          const handleKeydown = (event: KeyboardEvent) => {
+            if (event.key === 'Tab') {
+              tabKeyActive = true;
+              clearTabTimer();
+              tabResetTimer = setTimeout(() => {
+                tabResetTimer = null;
+                tabKeyActive = false;
+              }, 0);
+            } else {
+              clearTabTimer();
               tabKeyActive = false;
-            }, 0);
-          } else {
+              blurredByTab = false;
+            }
+          };
+          const handleWindowBlur = () => {
+            if (tabKeyActive) blurredByTab = true;
+          };
+          const handleFocusOut = (event: FocusEvent) => {
+            if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
+          };
+          const clearBlurGuard = () => {
             clearTabTimer();
             tabKeyActive = false;
             blurredByTab = false;
-          }
-        };
-        const handleWindowBlur = () => {
-          if (tabKeyActive) blurredByTab = true;
-        };
-        const handleFocusOut = (event: FocusEvent) => {
-          if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
-        };
-        const clearBlurGuard = () => {
-          clearTabTimer();
-          tabKeyActive = false;
-          blurredByTab = false;
-        };
-        const handler = () => {
-          const selection = contents.window.getSelection();
-          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
-          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
-          if (!hasRange || !text) {
-            const frame = contents.window.frameElement as HTMLElement | null | undefined;
-            const frameLostFocus = frame
-              ? frame.ownerDocument.activeElement !== frame
-              : typeof contents.document.hasFocus === 'function'
-                ? !contents.document.hasFocus()
-                : false;
-            if (blurredByTab || (tabKeyActive && frameLostFocus)) {
+          };
+          const handler = () => {
+            const selection = contents.window.getSelection();
+            const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+            const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+            if (!hasRange || !text) {
+              const frame = contents.window.frameElement as HTMLElement | null | undefined;
+              const frameLostFocus = frame
+                ? frame.ownerDocument.activeElement !== frame
+                : typeof contents.document.hasFocus === 'function'
+                  ? !contents.document.hasFocus()
+                  : false;
+              if (blurredByTab || (tabKeyActive && frameLostFocus)) {
+                return;
+              }
+              onSelection(null);
               return;
             }
-            onSelection(null);
-            return;
-          }
-          blurredByTab = false;
-          try {
-            onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
-          } catch {
-            // Selection can change while a section is being replaced.
-          }
-        };
-        contents.document.addEventListener('keydown', handleKeydown, true);
-        contents.document.addEventListener('focusout', handleFocusOut);
-        contents.document.addEventListener('focusin', clearBlurGuard);
-        contents.document.addEventListener('pointerdown', clearBlurGuard);
-        contents.document.addEventListener('mousedown', clearBlurGuard);
-        contents.document.addEventListener('selectionchange', handler);
-        contents.window.addEventListener?.('blur', handleWindowBlur);
-        contents.window.addEventListener?.('focus', clearBlurGuard);
-        this.addContentCleanup(contents, () => {
-          clearTabTimer();
-          contents.document.removeEventListener('keydown', handleKeydown, true);
-          contents.document.removeEventListener('focusout', handleFocusOut);
-          contents.document.removeEventListener('focusin', clearBlurGuard);
-          contents.document.removeEventListener('pointerdown', clearBlurGuard);
-          contents.document.removeEventListener('mousedown', clearBlurGuard);
-          contents.document.removeEventListener('selectionchange', handler);
-          contents.window.removeEventListener?.('blur', handleWindowBlur);
-          contents.window.removeEventListener?.('focus', clearBlurGuard);
+            blurredByTab = false;
+            try {
+              onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
+            } catch {
+              // Selection can change while a section is being replaced.
+            }
+          };
+          contents.document.addEventListener('keydown', handleKeydown, true);
+          contents.document.addEventListener('focusout', handleFocusOut);
+          contents.document.addEventListener('focusin', clearBlurGuard);
+          contents.document.addEventListener('pointerdown', clearBlurGuard);
+          contents.document.addEventListener('mousedown', clearBlurGuard);
+          contents.document.addEventListener('selectionchange', handler);
+          contents.window.addEventListener?.('blur', handleWindowBlur);
+          contents.window.addEventListener?.('focus', clearBlurGuard);
+          this.addContentCleanup(contents, () => {
+            clearTabTimer();
+            contents.document.removeEventListener('keydown', handleKeydown, true);
+            contents.document.removeEventListener('focusout', handleFocusOut);
+            contents.document.removeEventListener('focusin', clearBlurGuard);
+            contents.document.removeEventListener('pointerdown', clearBlurGuard);
+            contents.document.removeEventListener('mousedown', clearBlurGuard);
+            contents.document.removeEventListener('selectionchange', handler);
+            contents.window.removeEventListener?.('blur', handleWindowBlur);
+            contents.window.removeEventListener?.('focus', clearBlurGuard);
+          });
         });
-      });
-    }
-    this.onLocation = onLocation;
-    this.relocated = (location) => {
-      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-      const isUserNavigation =
-        this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
-      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (startCfi !== location.start.cfi) onSelection?.(null);
-      this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
-        this.userNavigationPending = false;
-        this.userNavigationStartCfi = null;
-        this.userNavigationOrigin = 'navigation';
-        this.pendingLinkReturnTarget = null;
       }
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.syncVisibleColumnLinks();
-      this.reportLocation(location, origin, returnTarget);
-      if (this.reflowPending) {
-        this.reflowPending = false;
-        this.preserveCfi(location.start.cfi, this.locationGeneration);
+      this.onLocation = onLocation;
+      this.relocated = (location) => {
+        const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+        const isUserNavigation =
+          this.userNavigationPending &&
+          (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+        const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+        const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
+        if (startCfi !== location.start.cfi) onSelection?.(null);
+        this.current = location;
+        if (isUserNavigation || this.userNavigationOrigin === 'link') {
+          this.userNavigationPending = false;
+          this.userNavigationStartCfi = null;
+          this.userNavigationOrigin = 'navigation';
+          this.pendingLinkReturnTarget = null;
+        }
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.syncVisibleColumnLinks();
+        this.reportLocation(location, origin, returnTarget);
+        if (this.reflowPending) {
+          this.reflowPending = false;
+          this.preserveCfi(location.start.cfi, this.locationGeneration);
+        }
+      };
+      this.rendition.on('relocated', this.relocated);
+      this.renderedListener = () => {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.syncVisibleColumnLinks();
+      };
+      this.resizedListener = () => {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.syncVisibleColumnLinks();
+      };
+      this.rendition.on('rendered', this.renderedListener);
+      this.rendition.on('resized', this.resizedListener);
+      this.contentClick = (event, contents) => {
+        const eventTarget = event.target as Element | null;
+        const selection = contents.window.getSelection();
+        if (selection && !selection.isCollapsed) return;
+        const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
+        if (link) {
+          const href = link.getAttribute('href') ?? '';
+          if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
+          return;
+        }
+        if (
+          event.defaultPrevented ||
+          eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
+        ) {
+          return;
+        }
+        const frame = contents.window.frameElement;
+        const viewport = target.getBoundingClientRect();
+        if (!frame || viewport.width === 0) return;
+        // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
+        const position =
+          (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
+        onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
+      };
+      this.rendition.on('click', this.contentClick);
+      if (onKeyboardNavigation) {
+        this.keyboardNavigation = onKeyboardNavigation;
+        this.rendition.on('keydown', this.keyboardNavigation);
       }
-    };
-    this.rendition.on('relocated', this.relocated);
-    this.renderedListener = () => {
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.syncVisibleColumnLinks();
-    };
-    this.resizedListener = () => {
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.syncVisibleColumnLinks();
-    };
-    this.rendition.on('rendered', this.renderedListener);
-    this.rendition.on('resized', this.resizedListener);
-    this.contentClick = (event, contents) => {
-      const eventTarget = event.target as Element | null;
-      const selection = contents.window.getSelection();
-      if (selection && !selection.isCollapsed) return;
-      const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
-      if (link) {
-        const href = link.getAttribute('href') ?? '';
-        if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
-        return;
+      this.applyAppearance(appearance);
+      const restoreGeneration = this.beginLocationOperation(false);
+      await Promise.race([
+        this.rendition.started,
+        this.destroyedPromise,
+        this.spineSanitizerFailedPromise,
+      ]);
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
+      if (this.destroyed) return;
+      this.assertSpineSanitizerReady();
+      this.bindEpubContainer();
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      if (cfi) {
+        try {
+          if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
+        } catch (error) {
+          if (this.spineSanitizerError) throw this.spineSanitizerError;
+          void error;
+          // A saved CFI can name a section removed in a newer copy of the EPUB.
+        }
       }
+      if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
       if (
-        event.defaultPrevented ||
-        eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
+        serverPercentage &&
+        serverPercentage > 0 &&
+        (await this.displayPercentage(serverPercentage, restoreGeneration))
       ) {
         return;
       }
-      const frame = contents.window.frameElement;
-      const viewport = target.getBoundingClientRect();
-      if (!frame || viewport.width === 0) return;
-      // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
-      const position =
-        (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
-      onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
-    };
-    this.rendition.on('click', this.contentClick);
-    if (onKeyboardNavigation) {
-      this.keyboardNavigation = onKeyboardNavigation;
-      this.rendition.on('keydown', this.keyboardNavigation);
+      await this.displayAtGeneration(undefined, restoreGeneration);
+    } catch (error) {
+      this.destroy();
+      throw error;
     }
-    this.applyAppearance(appearance);
-    const restoreGeneration = this.beginLocationOperation(false);
-    await Promise.race([this.rendition.started, this.destroyedPromise]);
-    if (this.destroyed) return;
-    this.bindEpubContainer();
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    if (cfi) {
-      try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
-        // A saved CFI can name a section removed in a newer copy of the EPUB.
-      }
-    }
-    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
-    if (
-      serverPercentage &&
-      serverPercentage > 0 &&
-      (await this.displayPercentage(serverPercentage, restoreGeneration))
-    ) {
-      return;
-    }
-    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -1988,6 +2360,7 @@ export class ReaderSession {
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
     const normalizedQuery = normalizeReaderSearchQuery(query);
     if (!normalizedQuery) return [];
+    this.assertSpineSanitizerReady();
     const results: ReaderSearchResult[] = [];
     const { sections } = this.getSpine();
     const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
@@ -2032,6 +2405,7 @@ export class ReaderSession {
       await this.navigate(() => this.rendition!.display(cfi));
       return true;
     } catch {
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
       return false;
     }
   }
@@ -2200,16 +2574,53 @@ export class ReaderSession {
     for (const url of urls) {
       if (typeof url === 'string' && url.startsWith('blob:')) URL.revokeObjectURL(url);
     }
-    this.book.destroy();
-    const destroyedBook = this.book as unknown as {
-      loaded?: unknown;
-      loading?: unknown;
-      opening?: unknown;
-    };
-    const noopDeferred = { resolve: () => {} };
-    destroyedBook.loaded ??= { displayOptions: Promise.resolve() };
-    destroyedBook.loading ??= { navigation: noopDeferred, displayOptions: noopDeferred };
-    destroyedBook.opening = noopDeferred;
+    if (!this.bookDestroyed) {
+      this.bookDestroyed = true;
+      const destroyedBook = this.book as unknown as {
+        loaded?: unknown;
+        loading?: unknown;
+        opening?: unknown;
+        openContainer?: () => Promise<string>;
+        openPackaging?: () => Promise<void>;
+        unpack?: () => void;
+        replacements?: () => Promise<unknown[]>;
+      };
+      destroyedBook.openContainer = async () => '';
+      destroyedBook.openPackaging = async () => {};
+      destroyedBook.unpack = () => {};
+      destroyedBook.replacements = async () => [];
+      try {
+        this.book.destroy();
+      } catch {
+        // Malformed epub.js books with missing spine hooks can throw inside Spine.destroy().
+      }
+      const noopDeferred = {
+        resolve: () => {},
+        reject: () => {},
+        promise: Promise.resolve(),
+      };
+      destroyedBook.loaded ??= {
+        manifest: Promise.resolve(),
+        spine: Promise.resolve(),
+        metadata: Promise.resolve(),
+        cover: Promise.resolve(),
+        navigation: Promise.resolve(),
+        pageList: Promise.resolve(),
+        resources: Promise.resolve(),
+        displayOptions: Promise.resolve(),
+      };
+      destroyedBook.loading ??= {
+        manifest: noopDeferred,
+        spine: noopDeferred,
+        metadata: noopDeferred,
+        cover: noopDeferred,
+        navigation: noopDeferred,
+        pageList: noopDeferred,
+        resources: noopDeferred,
+        displayOptions: noopDeferred,
+      };
+      destroyedBook.opening = noopDeferred;
+    }
   }
 
   private async prepareContents(contents: Contents): Promise<void> {
@@ -2663,10 +3074,32 @@ export class ReaderSession {
   }
 
   private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertSpineSanitizerReady();
     this.displayOperationCount += 1;
+    const rendition = this.rendition;
+    let onDisplayError: ((error: unknown) => void) | null = null;
+    const displayErrorPromise = new Promise<never>((_, reject) => {
+      onDisplayError = (error: unknown) => {
+        reject(normalizeError(error, 'EPUB chapter display failed.'));
+      };
+    });
+    displayErrorPromise.catch(() => {});
+    if (rendition?.on && onDisplayError) {
+      rendition.on('displayerror', onDisplayError);
+    }
     try {
-      return await operation();
+      const result = await Promise.race([
+        operation(),
+        displayErrorPromise,
+        this.spineSanitizerFailedPromise,
+        this.destroyedPromise.then(() => undefined as T),
+      ]);
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
+      return result;
     } finally {
+      if (rendition?.off && onDisplayError) {
+        rendition.off('displayerror', onDisplayError);
+      }
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
@@ -2928,6 +3361,7 @@ export class ReaderSession {
       await this.runDisplayOperation(() => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation);
     } catch {
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
     }
@@ -2958,6 +3392,7 @@ export class ReaderSession {
     try {
       return await this.displayAtGeneration(section.href, generation);
     } catch {
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
       return false;
     }
   }
@@ -3020,6 +3455,7 @@ export class ReaderSession {
       sections.push(section);
       spineHrefs.push(section.href);
     });
+    this.guardSpineSections(this.book as unknown as EpubBookLike, sections);
     const hrefs = createSpineHrefLookup(spineHrefs);
     this.spine = { sections, indexes, hrefs };
     return this.spine;

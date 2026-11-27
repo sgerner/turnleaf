@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { crc32 } from 'node:zlib';
-import ePub, { EpubCFI, type Contents } from 'epubjs';
+import ePub, { Book, EpubCFI, type Contents } from 'epubjs';
 import { afterEach, expect, it, vi } from 'vitest';
 import indexHtml from '../../../../index.html?raw';
 import { defaultAppearance } from '../appearance';
@@ -1139,4 +1139,260 @@ it('opens a zipped EPUB in ReaderSession with zero outbound requests, aligned se
     expect(tracker.revokedUrls).toContain(url);
   }
   tracker.restore();
+});
+
+it('aborts EPUB open before chapter serialization when the pre-serialization spine content hook is missing or throws', async () => {
+  const tracker = installObjectUrlTracker();
+  const outboundRequests: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const target =
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      outboundRequests.push(target);
+      throw new Error(`Unexpected outbound fetch: ${target}`);
+    }),
+  );
+  const xhrOpenSpy = vi.spyOn(XMLHttpRequest.prototype, 'open').mockImplementation(((
+    method: string,
+    url: string | URL,
+  ) => {
+    outboundRequests.push(`${method} ${String(url)}`);
+    throw new Error(`Unexpected XHR request: ${String(url)}`);
+  }) as typeof XMLHttpRequest.prototype.open);
+
+  const serializeSpy = vi.spyOn(XMLSerializer.prototype, 'serializeToString');
+  const assignedSrcdocs: string[] = [];
+  const nativeCreateElement = document.createElement.bind(document);
+  vi.spyOn(document, 'createElement').mockImplementation(((
+    tagName: string,
+    options?: ElementCreationOptions,
+  ) => {
+    const element = nativeCreateElement(tagName, options);
+    if (tagName.toLowerCase() === 'iframe') {
+      const frame = element as HTMLIFrameElement;
+      const srcdocDescriptor = Object.getOwnPropertyDescriptor(
+        HTMLIFrameElement.prototype,
+        'srcdoc',
+      );
+      if (srcdocDescriptor?.set && srcdocDescriptor.get) {
+        Object.defineProperty(frame, 'srcdoc', {
+          configurable: true,
+          get: () => srcdocDescriptor.get!.call(frame),
+          set: (value: string) => {
+            assignedSrcdocs.push(value);
+            srcdocDescriptor.set!.call(frame, value);
+          },
+        });
+      }
+    }
+    return element;
+  }) as typeof document.createElement);
+
+  // Direct unit checks on registerEpubSpineSanitizer return value & error reporting.
+  const reportedErrors: string[] = [];
+  expect(
+    registerEpubSpineSanitizer({}, new Map(), {
+      onError: (error) => reportedErrors.push(error.message),
+    }),
+  ).toBe(false);
+  expect(
+    registerEpubSpineSanitizer({ spine: { hooks: {} } }, new Map(), {
+      onError: (error) => reportedErrors.push(error.message),
+    }),
+  ).toBe(false);
+  expect(
+    registerEpubSpineSanitizer(
+      {
+        spine: {
+          hooks: {
+            content: {
+              register: () => {
+                throw new Error('direct register failure');
+              },
+            },
+          },
+        },
+      },
+      new Map(),
+      { onError: (error) => reportedErrors.push(error.message) },
+    ),
+  ).toBe(false);
+  expect(
+    registerEpubSpineSanitizer(
+      {
+        spine: {
+          hooks: {
+            content: {
+              register: () => {},
+              list: () => [],
+            },
+          },
+        },
+      },
+      new Map(),
+      { onError: (error) => reportedErrors.push(error.message) },
+    ),
+  ).toBe(false);
+  expect(reportedErrors).toContain('direct register failure');
+  expect(reportedErrors).toHaveLength(4);
+
+  const archive = buildHostileEpubArchive();
+  const viewport = document.createElement('div');
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(
+    new DOMRect(0, 0, 360, 640),
+  );
+  document.body.appendChild(viewport);
+
+  const templateBook = new Book();
+  const HookProto = Object.getPrototypeOf(
+    (templateBook as unknown as { spine: { hooks: { content: object } } }).spine.hooks.content,
+  ) as { register: (...args: unknown[]) => void };
+  templateBook.destroy();
+
+  try {
+    // Case 1: Spine content hook missing at Book construction time (epub.js omits spine.hooks.content).
+    const originalBookOpen = (
+      Book.prototype as unknown as { open: (...args: unknown[]) => Promise<unknown> }
+    ).open;
+    const openSpyMissingHook = vi
+      .spyOn(
+        Book.prototype as unknown as { open: (...args: unknown[]) => Promise<unknown> },
+        'open',
+      )
+      .mockImplementation(function (
+        this: { spine?: { hooks?: { content?: unknown } } },
+        ...args: unknown[]
+      ) {
+        if (this.spine?.hooks) {
+          delete this.spine.hooks.content;
+        }
+        return originalBookOpen.apply(this, args);
+      });
+    const missingAtConstructSession = new ReaderSession(archive);
+    openSpyMissingHook.mockRestore();
+
+    await expect(
+      missingAtConstructSession.open(
+        viewport,
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      ),
+    ).rejects.toThrow(/spine content sanitizer hook/i);
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(assignedSrcdocs).toEqual([]);
+    expect(outboundRequests).toEqual([]);
+    missingAtConstructSession.destroy();
+
+    // Case 2: Spine content hook register() throws when ReaderSession installs the pre-serialization sanitizer.
+    const originalHookRegister = HookProto.register;
+    let hookRegisterCount = 0;
+    const registerThrowSpy = vi.spyOn(HookProto, 'register').mockImplementation(function (
+      this: unknown,
+      ...args: unknown[]
+    ) {
+      hookRegisterCount += 1;
+      // Spine constructor registers replaceBase, replaceCanonical, replaceMeta (calls 1..3).
+      if (hookRegisterCount === 4) {
+        throw new Error('spine register threw');
+      }
+      return originalHookRegister.apply(this, args);
+    });
+    const registerThrowSession = new ReaderSession(archive);
+    registerThrowSpy.mockRestore();
+
+    await expect(
+      registerThrowSession.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+    ).rejects.toThrow('spine register threw');
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(assignedSrcdocs).toEqual([]);
+    expect(outboundRequests).toEqual([]);
+    registerThrowSession.destroy();
+
+    // Case 3: Spine content hook cleared or deleted after construction before open() renders any chapter.
+    const clearedHookSession = new ReaderSession(archive);
+    (
+      clearedHookSession as unknown as {
+        book: { spine: { hooks: { content: { clear: () => void } } } };
+      }
+    ).book.spine.hooks.content.clear();
+    await expect(
+      clearedHookSession.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+    ).rejects.toThrow(/spine content sanitizer hook/i);
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(assignedSrcdocs).toEqual([]);
+    expect(outboundRequests).toEqual([]);
+    clearedHookSession.destroy();
+
+    // Case 4: Spine content hook throws synchronously during chapter load (not swallowed by epub.js Hook.trigger).
+    const syncThrowSession = new ReaderSession(archive);
+    (
+      syncThrowSession as unknown as {
+        book: { spine: { hooks: { content: { register: (fn: () => void) => void } } } };
+      }
+    ).book.spine.hooks.content.register(() => {
+      throw new Error('spine sync hook threw');
+    });
+    await expect(
+      syncThrowSession.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+    ).rejects.toThrow('spine sync hook threw');
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(assignedSrcdocs).toEqual([]);
+    expect(outboundRequests).toEqual([]);
+    syncThrowSession.destroy();
+
+    // Case 5: Spine content hook rejects asynchronously during chapter load even when initial cfi/XPath/percentage are passed.
+    const asyncThrowSession = new ReaderSession(archive);
+    (
+      asyncThrowSession as unknown as {
+        book: {
+          spine: { hooks: { content: { register: (fn: () => Promise<void>) => void } } };
+        };
+      }
+    ).book.spine.hooks.content.register(async () => {
+      throw new Error('spine async hook threw');
+    });
+    await expect(
+      asyncThrowSession.open(
+        viewport,
+        'epubcfi(/6/2!/4/2:0)',
+        '//body/DocFragment[1]/body/p[1]',
+        0.5,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      ),
+    ).rejects.toThrow('spine async hook threw');
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(assignedSrcdocs).toEqual([]);
+    expect(outboundRequests).toEqual([]);
+    expect(xhrOpenSpy).not.toHaveBeenCalled();
+    asyncThrowSession.destroy();
+
+    // Case 6: Spine content hook trigger silently resolves without running the sanitizer.
+    const noopTriggerSession = new ReaderSession(archive);
+    (
+      noopTriggerSession as unknown as {
+        book: { spine: { hooks: { content: { trigger: () => Promise<void> } } } };
+      }
+    ).book.spine.hooks.content.trigger = async () => {};
+    await expect(
+      noopTriggerSession.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+    ).rejects.toThrow(/not sanitized before serialization/i);
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(assignedSrcdocs).toEqual([]);
+    expect(outboundRequests).toEqual([]);
+    noopTriggerSession.destroy();
+
+    for (const url of tracker.createdUrls) {
+      expect(tracker.revokedUrls).toContain(url);
+    }
+  } finally {
+    viewport.remove();
+    tracker.restore();
+  }
 });

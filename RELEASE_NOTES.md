@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Abort EPUB open when pre-serialization spine sanitizer hook fails
 - Harden EPUB CSS token sanitization, fail-closed hooks, and scoped CSP
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
