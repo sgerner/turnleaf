@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix EPUB relocation and viewport resize races during reader open
 - Abort EPUB open when pre-serialization spine sanitizer hook fails
 - Harden EPUB CSS token sanitization, fail-closed hooks, and scoped CSP
 - refactor: consolidate duplicated database persistence helpers

@@ -251,6 +251,7 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let relocatedWork: Promise<void> | null = null;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -838,6 +839,7 @@
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
+      if (relocatedWork) await relocatedWork;
       await flushProgress(client, server.id);
       if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
@@ -1250,6 +1252,7 @@
           openProgressProbe = null;
         }
       }
+      if (relocatedWork) await relocatedWork;
       return { ok: true as const, local: await getReadingState(book.id), remote };
     } catch (error) {
       return { ok: false as const, error };
@@ -1411,6 +1414,7 @@
     }
     if (manual) {
       try {
+        if (relocatedWork) await relocatedWork;
         await flushProgress(client, server.id);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
@@ -1418,6 +1422,7 @@
         void refreshSyncStatus();
       }
     }
+    if (relocatedWork) await relocatedWork;
     const local = await getReadingState(book.id);
     if (local?.pendingSync) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
@@ -1659,7 +1664,16 @@
 
   function handleRelocated(location: ReaderLocation): void {
     if (!reading) return;
-    void relocated(reading.book, location);
+    const book = reading.book;
+    const previous = relocatedWork;
+    const next = (
+      previous ? previous.then(() => relocated(book, location)) : relocated(book, location)
+    )
+      .catch(() => {})
+      .finally(() => {
+        if (relocatedWork === next) relocatedWork = null;
+      });
+    relocatedWork = next;
   }
 
   function registerReaderBackHandler(handler: () => boolean): () => void {

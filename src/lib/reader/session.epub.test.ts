@@ -1064,4 +1064,172 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('does not let a delayed initial rAF relocation steal user navigation origin from next()', async () => {
+    const queuedTasks: Array<() => Promise<unknown> | unknown> = [];
+    const renditionWithQueue = mockRendition as typeof mockRendition & {
+      next?: () => Promise<void>;
+      currentLocation?: () => Location | undefined;
+      q?: { enqueue: (task: () => Promise<unknown> | unknown) => Promise<unknown> };
+    };
+    let activeLocation: Location | undefined;
+    renditionWithQueue.currentLocation = () => activeLocation;
+    renditionWithQueue.q = {
+      enqueue: vi.fn(async (task: () => Promise<unknown> | unknown) => {
+        queuedTasks.push(task);
+      }),
+    };
+    let resolveNext!: () => void;
+    renditionWithQueue.next = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveNext = resolve;
+        }),
+    );
+
+    try {
+      const onLocation = vi.fn();
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        onLocation,
+        vi.fn(),
+      );
+      const relocated = getRenditionListener('relocated');
+
+      // User taps Next page before epub.js's 2-rAF initial reportLocation() has fired.
+      const nextPromise = session.next();
+      expect(queuedTasks).toHaveLength(1);
+
+      // Stale rAF relocation for Chapter 1 fires BEFORE rendition.q dispatches next().
+      const chapterOneLocation = {
+        start: {
+          href: 'first.xhtml',
+          index: 0,
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          percentage: 0,
+          displayed: { page: 1, total: 1 },
+        },
+      } as Location;
+      relocated(chapterOneLocation);
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)', percentage: 0 }),
+        'restore',
+      );
+
+      // Now rendition.q dispatches our marker and next() renders Chapter 2.
+      activeLocation = chapterOneLocation;
+      await queuedTasks.shift()?.();
+      const chapterTwoLocation = {
+        start: {
+          href: 'second.xhtml',
+          index: 1,
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          percentage: 0.5,
+          displayed: { page: 1, total: 1 },
+        },
+      } as Location;
+      activeLocation = chapterTwoLocation;
+      resolveNext();
+      await nextPromise;
+
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)', percentage: 0.5 }),
+        'navigation',
+      );
+
+      // Subsequent 2-rAF reportLocation() for Chapter 2 reports idempotent 'restore'.
+      relocated(chapterTwoLocation);
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)', percentage: 0.5 }),
+        'restore',
+      );
+
+      session.destroy();
+    } finally {
+      delete renditionWithQueue.next;
+      delete renditionWithQueue.currentLocation;
+      delete renditionWithQueue.q;
+    }
+  });
+
+  it('queues premature ResizeObserver callbacks until rendition manager and initial display are ready', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveStarted!: () => void;
+    const originalStarted = mockRendition.started;
+    const renditionWithManager = mockRendition as typeof mockRendition & {
+      manager?: { stage?: object; rendered?: boolean } | undefined;
+      currentLocation?: () => Location | undefined;
+    };
+    mockRendition.started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    renditionWithManager.manager = undefined;
+    const chapterOneLocation = {
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        percentage: 0,
+        displayed: { page: 1, total: 1 },
+      },
+    } as Location;
+    renditionWithManager.currentLocation = () =>
+      renditionWithManager.manager?.rendered ? chapterOneLocation : undefined;
+    mockRendition.display.mockImplementationOnce(async () => {
+      renditionWithManager.manager = { stage: {}, rendered: true };
+      // Resize firing mid-display must also wait until initial display settles.
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+    });
+
+    try {
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 843));
+      const session = new ReaderSession('book.epub');
+      const openPromise = session.open(
+        viewport,
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+
+      // Resize firing before rendition.started / manager initialization must not throw or call resize().
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 900 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      resolveStarted();
+      await openPromise;
+
+      expect(mockRendition.location).toEqual(chapterOneLocation);
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(412, 915);
+      session.destroy();
+    } finally {
+      mockRendition.started = originalStarted;
+      delete renditionWithManager.manager;
+      delete renditionWithManager.currentLocation;
+    }
+  });
 });
