@@ -1,3 +1,4 @@
+import { cssColorToHex } from '../themes/themes';
 import type { ReadingMode } from './appearance';
 
 export type RgbColor = readonly [number, number, number];
@@ -55,49 +56,17 @@ function clampByte(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)));
 }
 
-function linearToSrgbByte(linear: number): number {
-  const c = clampUnit(linear);
-  const encoded = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-  return clampByte(encoded * 255);
-}
-
 function srgbByteToLinear(byte: number): number {
   const c = clampUnit(byte / 255);
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-function oklabToRgb(L: number, a: number, b: number): RgbColor {
-  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
-  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
-  const s_ = L - 0.0894841775 * a - 1.291485548 * b;
-  const l = l_ * l_ * l_;
-  const m = m_ * m_ * m_;
-  const s = s_ * s_ * s_;
-  const r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
-  const g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
-  const bl = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
-  return [linearToSrgbByte(r), linearToSrgbByte(g), linearToSrgbByte(bl)];
-}
-
-function cieLabToRgb(L: number, a: number, b: number): RgbColor {
-  const kappa = 24389 / 27;
-  const epsilon = 216 / 24389;
-  const f1 = (L + 16) / 116;
-  const f0 = a / 500 + f1;
-  const f2 = f1 - b / 200;
-  const x = f0 * f0 * f0 > epsilon ? f0 * f0 * f0 : (116 * f0 - 16) / kappa;
-  const y = L > kappa * epsilon ? Math.pow((L + 16) / 116, 3) : L / kappa;
-  const z = f2 * f2 * f2 > epsilon ? f2 * f2 * f2 : (116 * f2 - 16) / kappa;
-  const x50 = x * (0.3457 / 0.3585);
-  const y50 = y;
-  const z50 = z * ((1 - 0.3457 - 0.3585) / 0.3585);
-  const x65 = 0.9554734527042182 * x50 - 0.023098536874261423 * y50 + 0.0632593086610217 * z50;
-  const y65 = -0.028369706963208136 * x50 + 1.0099954580058226 * y50 + 0.021041398966943008 * z50;
-  const z65 = 0.012314001688319899 * x50 - 0.020507696433477912 * y50 + 1.3303659366080753 * z50;
-  const r = 3.2409699419045226 * x65 - 1.537383177570094 * y65 - 0.4986107602930034 * z65;
-  const g = -0.9692436362808796 * x65 + 1.8759675015077202 * y65 + 0.04155505740717559 * z65;
-  const bl = 0.05563007969699366 * x65 - 0.20397695888897652 * y65 + 1.0569715142428786 * z65;
-  return [linearToSrgbByte(r), linearToSrgbByte(g), linearToSrgbByte(bl)];
+function hexToRgb(hex: string): RgbColor {
+  return [
+    Number.parseInt(hex.slice(1, 3), 16),
+    Number.parseInt(hex.slice(3, 5), 16),
+    Number.parseInt(hex.slice(5, 7), 16),
+  ];
 }
 
 function parseAngleDegrees(raw: string): number {
@@ -119,47 +88,20 @@ function parseChannel(token: string, percentScale: number): number | null {
   return trimmed.endsWith('%') ? (numeric / 100) * percentScale : numeric;
 }
 
-function splitFunctionArgs(body: string): string[] {
-  const withoutAlpha = body.split('/')[0] ?? body;
-  return withoutAlpha
-    .trim()
-    .split(/[\s,]+/)
-    .filter(Boolean);
-}
-
 export function parseCssColor(value: string): RgbColor | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
 
-  if (trimmed.startsWith('#')) {
-    const hex = trimmed.slice(1);
-    if (hex.length === 3 || hex.length === 4) {
-      const r = Number.parseInt(hex[0]! + hex[0]!, 16);
-      const g = Number.parseInt(hex[1]! + hex[1]!, 16);
-      const b = Number.parseInt(hex[2]! + hex[2]!, 16);
-      return [r, g, b].every(Number.isFinite) ? [r, g, b] : null;
-    }
-    if (hex.length === 6 || hex.length === 8) {
-      const r = Number.parseInt(hex.slice(0, 2), 16);
-      const g = Number.parseInt(hex.slice(2, 4), 16);
-      const b = Number.parseInt(hex.slice(4, 6), 16);
-      return [r, g, b].every(Number.isFinite) ? [r, g, b] : null;
-    }
-    return null;
-  }
+  const directHex = cssColorToHex(trimmed);
+  if (directHex) return hexToRgb(directHex);
 
   const fnMatch = trimmed.match(/^([a-z]+)\((.+)\)$/i);
   if (!fnMatch?.[1] || !fnMatch[2]) return null;
   const fn = fnMatch[1].toLowerCase();
-  const args = splitFunctionArgs(fnMatch[2]);
-
-  if ((fn === 'rgb' || fn === 'rgba') && args.length >= 3) {
-    const r = parseChannel(args[0]!, 255);
-    const g = parseChannel(args[1]!, 255);
-    const b = parseChannel(args[2]!, 255);
-    if (r === null || g === null || b === null) return null;
-    return [clampByte(r), clampByte(g), clampByte(b)];
-  }
+  const args = (fnMatch[2].split('/')[0] ?? fnMatch[2])
+    .trim()
+    .split(/[\s,]+/)
+    .filter(Boolean);
 
   if ((fn === 'hsl' || fn === 'hsla') && args.length >= 3) {
     const h = (((parseAngleDegrees(args[0]!) % 360) + 360) % 360) / 60;
@@ -186,36 +128,13 @@ export function parseCssColor(value: string): RgbColor | null {
     return [clampByte((r1 + m) * 255), clampByte((g1 + m) * 255), clampByte((b1 + m) * 255)];
   }
 
-  if (fn === 'oklch' && args.length >= 3) {
-    const L = parseChannel(args[0]!, 1);
-    const C = parseChannel(args[1]!, 0.4);
-    if (L === null || C === null) return null;
-    const hRad = (parseAngleDegrees(args[2]!) * Math.PI) / 180;
-    return oklabToRgb(L, C * Math.cos(hRad), C * Math.sin(hRad));
-  }
-
-  if (fn === 'oklab' && args.length >= 3) {
-    const L = parseChannel(args[0]!, 1);
-    const a = parseChannel(args[1]!, 0.4);
-    const b = parseChannel(args[2]!, 0.4);
-    if (L === null || a === null || b === null) return null;
-    return oklabToRgb(L, a, b);
-  }
-
-  if (fn === 'lab' && args.length >= 3) {
-    const L = parseChannel(args[0]!, 100);
-    const a = parseChannel(args[1]!, 125);
-    const b = parseChannel(args[2]!, 125);
-    if (L === null || a === null || b === null) return null;
-    return cieLabToRgb(L, a, b);
-  }
-
   if (fn === 'lch' && args.length >= 3) {
     const L = parseChannel(args[0]!, 100);
     const C = parseChannel(args[1]!, 150);
     if (L === null || C === null) return null;
     const hRad = (parseAngleDegrees(args[2]!) * Math.PI) / 180;
-    return cieLabToRgb(L, C * Math.cos(hRad), C * Math.sin(hRad));
+    const labHex = cssColorToHex(`lab(${L} ${C * Math.cos(hRad)} ${C * Math.sin(hRad)})`);
+    return labHex ? hexToRgb(labHex) : null;
   }
 
   return null;

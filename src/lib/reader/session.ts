@@ -374,9 +374,7 @@ export class ReaderSession {
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
-  private appliedPaletteKey: string | null = null;
   private highlightStyleKey: string | null = null;
-  private themeObserver: MutationObserver | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
   private viewportTarget: HTMLElement | null = null;
@@ -440,7 +438,6 @@ export class ReaderSession {
       allowScriptedContent: false,
     });
     this.observeViewport(target);
-    this.observeThemeChanges();
     this.bindEpubContainer();
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
     if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
@@ -847,9 +844,6 @@ export class ReaderSession {
     this.appearance = { ...value };
     const rendition = this.rendition;
     if (!rendition) return;
-    const palette = this.resolvePalette(value.mode);
-    const paletteKey = `${document.documentElement.dataset.theme ?? ''}:${JSON.stringify(palette)}`;
-    const paletteChanged = this.appliedPaletteKey !== paletteKey;
     const layoutChanged =
       previous !== null &&
       (previous.fontFamily !== value.fontFamily ||
@@ -861,10 +855,16 @@ export class ReaderSession {
         previous.alignment !== value.alignment ||
         previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
-    const themeChanged =
-      !previous || previous.mode !== value.mode || paletteChanged || layoutChanged;
+    const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
-    this.appliedPaletteKey = paletteKey;
+    const loadedContents =
+      typeof (rendition as Partial<Rendition>).getContents === 'function'
+        ? (rendition.getContents() as unknown as Contents | Contents[])
+        : [];
+    for (const content of Array.isArray(loadedContents) ? loadedContents : [loadedContents]) {
+      content?.document?.getElementById('epubjs-inserted-css-turnleaf')?.remove();
+    }
+    const palette = this.resolvePalette(value.mode);
     const family =
       value.fontFamily === 'book'
         ? 'Iowan Old Style, Georgia, serif'
@@ -872,7 +872,6 @@ export class ReaderSession {
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
     const hyphens = value.hyphenation ? 'auto' : 'none';
-    this.clearInjectedThemeRules(rendition);
     rendition.themes.register('turnleaf', {
       html: {
         background: `${palette.background} !important`,
@@ -925,7 +924,7 @@ export class ReaderSession {
       '::selection': { background: `${palette.selection} !important` },
     });
     rendition.themes.select('turnleaf');
-    if (paletteChanged && this.highlightCfis.size > 0) {
+    if (previous !== null && previous.mode !== value.mode && this.highlightCfis.size > 0) {
       this.updateHighlights([...this.highlightCfis].map((cfi) => ({ cfi })));
     }
     if (!layoutChanged) return;
@@ -958,8 +957,6 @@ export class ReaderSession {
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
     this.rendition?.destroy();
-    this.themeObserver?.disconnect();
-    this.themeObserver = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
@@ -978,7 +975,6 @@ export class ReaderSession {
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
-    this.appliedPaletteKey = null;
     this.highlightStyleKey = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1541,37 +1537,6 @@ export class ReaderSession {
 
   private pageIndex(page: number): number {
     return Math.max(0, page - 1);
-  }
-
-  private observeThemeChanges(): void {
-    if (typeof MutationObserver === 'undefined') return;
-    const refresh = () => {
-      if (this.appearance) this.applyAppearance(this.appearance);
-    };
-    this.themeObserver = new MutationObserver(refresh);
-    this.themeObserver.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ['data-theme', 'style'],
-    });
-    if (document.head) {
-      this.themeObserver.observe(document.head, { childList: true });
-    }
-  }
-
-  private clearInjectedThemeRules(rendition: Rendition): void {
-    const loadedContents =
-      typeof (rendition as Partial<Rendition>).getContents === 'function'
-        ? (rendition.getContents() as unknown as Contents | Contents[])
-        : [];
-    for (const content of Array.isArray(loadedContents) ? loadedContents : [loadedContents]) {
-      for (const id of ['epubjs-inserted-css-turnleaf', 'turnleaf']) {
-        const styleEl = content?.document?.getElementById(id);
-        if (styleEl) {
-          styleEl.textContent = '';
-          styleEl.remove();
-        }
-      }
-    }
   }
 
   private resolvePalette(mode: ReadingMode): ResolvedReaderPalette {
