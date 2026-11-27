@@ -112,9 +112,14 @@ vi.mock('@capacitor/app', () => ({
 }));
 
 vi.mock('./lib/reader/session', () => ({
+  resolveReaderKeyboardAction: vi.fn(() => null),
+  validateExternalBrowserUrl: vi.fn((url: string) => url),
+  validateExternalLaunchUrl: vi.fn((url: string) => url),
   ReaderSession: class MockReaderSession {
     open = openSessionMock;
     tableOfContents = () => [];
+    getVisiblePassages = () => [];
+    clearTextSelection = vi.fn();
     updateHighlights = vi.fn();
     destroy = destroySessionMock;
   },
