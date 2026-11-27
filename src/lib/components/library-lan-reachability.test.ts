@@ -1063,30 +1063,37 @@ describe('LAN transport and Kavita reachability component journeys', () => {
       },
     });
 
-    await waitForCondition(() =>
-      Boolean(container!.textContent?.includes('Kavita could not be reached')),
+    await waitForCondition(
+      () =>
+        Boolean(container!.textContent?.includes('Kavita could not be reached')) &&
+        Boolean(container!.textContent?.includes('failed and remain queued')),
     );
 
-    // Exactly 1 startup probe (/api/Series/v2), 0 background cover requests, and 0 background sync requests.
-    expect(fixture.requests.map((item) => item.path)).toEqual(['/api/Series/v2']);
+    // Concurrent initial catalog probe (/api/Series/v2) and queued progress upload (/api/Reader/progress)
+    // run once on mount (#314), with 0 cover requests while initialRefreshPending / kavitaUnreachable hold.
+    expect([...fixture.requests.map((item) => item.path)].sort()).toEqual([
+      '/api/Reader/progress',
+      '/api/Series/v2',
+    ]);
+    const startupRequestCount = fixture.requests.length;
 
     // Duplicate cellular status events and app backgrounding must not trigger background retries.
     harness.emitNetworkChange({ connected: true, connectionType: 'cellular' });
     harness.emitAppState(false);
     await new Promise((resolve) => setTimeout(resolve, 60));
-    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests).toHaveLength(startupRequestCount);
 
     // Opening a downloaded book while Kavita is unreachable skips remote progress checks immediately.
     container!
       .querySelector<HTMLButtonElement>('[data-book-id="primary:1:101"] [data-book-open]')!
       .click();
     await waitForCondition(() => harness.readerProps !== null);
-    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests).toHaveLength(startupRequestCount);
 
     // Background Reader sync is suppressed while Kavita is unreachable, while manual sync stays enabled.
     expect(harness.readerProps!.onSyncLatest).toBeTypeOf('function');
     await expect(harness.readerProps!.onSyncLatest!(false)).resolves.toBeNull();
-    expect(fixture.requests).toHaveLength(1);
+    expect(fixture.requests).toHaveLength(startupRequestCount);
 
     container!.querySelector<HTMLButtonElement>('[aria-label="Back to library"]')!.click();
     await waitForCondition(() => harness.readerProps === null);

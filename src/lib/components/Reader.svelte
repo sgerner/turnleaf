@@ -28,6 +28,7 @@
   } from '../reader/session';
   import type { ReaderSearchResult } from '../reader/search';
   import {
+    MAX_ANNOTATIONS,
     addAnnotation,
     annotationsMarkdown,
     parseAnnotations,
@@ -36,6 +37,7 @@
     type StoredAnnotation,
   } from '../reader/annotations';
   import {
+    MAX_BOOKMARKS,
     parseBookmarks,
     parseLocationHistory,
     recordLocation,
@@ -52,6 +54,17 @@
     restoreModalFocus,
     trapModalKeydown,
   } from '../a11y/modal-focus';
+  import {
+    TOC_FALLBACK_VIEWPORT_HEIGHT_PX,
+    TOC_OVERSCAN_ROWS,
+    TOC_ROW_HEIGHT_PX,
+    TOC_VIRTUALIZATION_THRESHOLD,
+    canonicalSectionHref,
+    getRenderedTocIndices,
+    indexToc,
+    sectionLabelForHref,
+  } from '../reader/toc';
+  import { calculateVirtualWindow, type VirtualWindow } from './library-virtualization';
 
   type SyncedLocation = {
     xpath: string | null;
@@ -101,6 +114,7 @@
   let searchVisible = $state(false);
   let settingsPanel = $state<HTMLElement | null>(null);
   let tocPanel = $state<HTMLElement | null>(null);
+  let tocScrollContainer = $state<HTMLElement | null>(null);
   let bookmarksPanel = $state<HTMLElement | null>(null);
   let annotationsPanel = $state<HTMLElement | null>(null);
   let searchPanel = $state<HTMLElement | null>(null);
@@ -112,11 +126,17 @@
   let searchOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
   let toc = $state<TocItem[]>([]);
+  let tocVirtualWindow = $state<VirtualWindow>(
+    calculateVirtualWindow(0, 1, TOC_ROW_HEIGHT_PX, 0, 0, TOC_OVERSCAN_ROWS),
+  );
+  let focusedTocIndex = $state(-1);
+  let tocVirtualizationFrame: number | null = null;
   let previousDocumentTitle = '';
   let bookmarks = $state<StoredReaderLocation[]>([]);
   let locationHistory = $state<StoredReaderLocation[]>([]);
   let editingBookmarkId = $state<string | null>(null);
   let bookmarkDraft = $state('');
+  let bookmarkLimitMessage = $state('');
   let annotations = $state<StoredAnnotation[]>([]);
   const androidReader = Capacitor.getPlatform() === 'android';
   let exportMessage = $state('');
@@ -130,6 +150,15 @@
   let annotationMessage = $state('');
   let editingAnnotationId = $state<string | null>(null);
   let annotationDraft = $state('');
+  let annotationLimitMessage = $state('');
+  const annotationDrafts = new SvelteMap<string, string>();
+
+  const BOOKMARK_LIMIT_MESSAGE = `You can save up to ${MAX_BOOKMARKS} bookmarks per book. Delete a bookmark to add another.`;
+  const ANNOTATION_LIMIT_MESSAGE = `You can save up to ${MAX_ANNOTATIONS} highlights per book. Delete a highlight to add another.`;
+
+  function hasSelectionDraft(): boolean {
+    return Boolean(selectedText && annotationDraft.trim());
+  }
   let searchQuery = $state('');
   let searched = $state(false);
   let searchResults = $state<ReaderSearchResult[]>([]);
@@ -208,7 +237,7 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
-        if (location?.cfi !== next.cfi) selectedText = null;
+        if (location?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
@@ -236,8 +265,10 @@
         if (destroyed) return;
         if (selection) {
           selectionMessage = '';
-          selectedText = selection;
-        } else if (!annotationsVisible) {
+          if (!hasSelectionDraft()) {
+            selectedText = selection;
+          }
+        } else if (!annotationsVisible && !hasSelectionDraft()) {
           selectedText = null;
         }
       },
@@ -287,6 +318,20 @@
     void nativeFeatures.setVolumeButtons(appearance.volumeButtons && !hasOpenReaderPanel());
   });
 
+  $effect(() => {
+    if (
+      !tocVisible ||
+      !tocVirtualized ||
+      !tocScrollContainer ||
+      typeof ResizeObserver === 'undefined'
+    ) {
+      return;
+    }
+    const observer = new ResizeObserver(() => scheduleTocVirtualWindow());
+    observer.observe(tocScrollContainer);
+    return () => observer.disconnect();
+  });
+
   async function retryReaderOpen(): Promise<void> {
     if (!startupOpenFailed || !onRetryDownload || retryingReader) return;
     retryingReader = true;
@@ -322,6 +367,7 @@
     window.removeEventListener('keydown', handleKeyboardNavigation);
     document.title = previousDocumentTitle;
     if (hideTimer !== null) window.clearTimeout(hideTimer);
+    if (tocVirtualizationFrame !== null) window.cancelAnimationFrame(tocVirtualizationFrame);
     flushPendingPreferences();
     searchController?.abort();
     const handle = resumeHandle;
@@ -407,11 +453,17 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusModal(() => tocPanel);
+    focusedTocIndex = -1;
+    void initializeTocDialog();
   }
 
   function closeToc(): void {
     tocVisible = false;
+    focusedTocIndex = -1;
+    if (tocVirtualizationFrame !== null) {
+      window.cancelAnimationFrame(tocVirtualizationFrame);
+      tocVirtualizationFrame = null;
+    }
     const opener = tocOpener;
     tocOpener = null;
     restoreModalFocus(opener);
@@ -436,6 +488,7 @@
   function closeBookmarks(): void {
     bookmarksVisible = false;
     editingBookmarkId = null;
+    bookmarkLimitMessage = '';
     const opener = bookmarksOpener;
     bookmarksOpener = null;
     restoreModalFocus(opener);
@@ -456,7 +509,7 @@
     void tick().then(() => viewport?.querySelector<HTMLElement>('iframe')?.focus());
   }
 
-  function openAnnotations(): void {
+  function openAnnotations(focusAnnotationId?: string): void {
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
@@ -474,17 +527,23 @@
     searchController?.abort();
     searchController = null;
     searching = false;
-    focusModal(() => annotationsPanel);
+    if (focusAnnotationId) {
+      focusReaderTarget(annotationsPanel, 'annotation-editor', focusAnnotationId);
+    } else {
+      focusModal(() => annotationsPanel);
+    }
   }
 
   function closeAnnotations(): void {
     annotationsVisible = false;
-    editingAnnotationId = null;
-    selectedText = null;
+    if (!hasSelectionDraft()) {
+      selectedText = null;
+      annotationDraft = '';
+    }
     visiblePassages = [];
     selectedPassageIndex = 0;
-    annotationDraft = '';
     annotationMessage = '';
+    annotationLimitMessage = '';
     exportFallback = '';
     exportMessage = '';
     const opener = annotationsOpener;
@@ -549,30 +608,139 @@
     else showFooter();
   }
 
-  function sectionLabelForHref(href: string, spineIndex: number): string {
-    const sectionHref = href.split('#')[0];
-    const findItem = (items: TocItem[]): TocItem | undefined => {
-      for (const item of items) {
-        if (item.href.split('#')[0] === sectionHref) return item;
-        const child = findItem(item.children);
-        if (child) return child;
-      }
-      return undefined;
-    };
-    const item = findItem(toc);
-    return item?.label || `Section ${spineIndex + 1}`;
+  const tocIndex = $derived(indexToc(toc));
+  const tocRows = $derived(tocIndex.items);
+  const tocVirtualized = $derived(tocRows.length > TOC_VIRTUALIZATION_THRESHOLD);
+  const renderedTocIndices = $derived(
+    tocVirtualized ? getRenderedTocIndices(tocRows.length, tocVirtualWindow, focusedTocIndex) : [],
+  );
+  const activeSectionHref = $derived(location ? canonicalSectionHref(location.href) : '');
+  const activeSectionLabel = $derived(
+    location
+      ? sectionLabelForHref(tocIndex.labels, location.href, location.spineIndex)
+      : 'Opening book...',
+  );
+
+  function tocViewportHeight(container: HTMLElement): number {
+    return container.clientHeight > 0 ? container.clientHeight : TOC_FALLBACK_VIEWPORT_HEIGHT_PX;
   }
 
-  function currentSectionLabel(): string {
-    return location ? sectionLabelForHref(location.href, location.spineIndex) : 'Opening book...';
+  function clampTocScrollTop(scrollTop: number, viewportHeight: number): number {
+    const maxScrollTop = Math.max(0, tocRows.length * TOC_ROW_HEIGHT_PX - viewportHeight);
+    return Math.min(maxScrollTop, Math.max(0, scrollTop));
+  }
+
+  function updateTocVirtualWindow(): void {
+    if (destroyed || !tocVirtualized || !tocScrollContainer) return;
+    const activeControl = document.activeElement?.closest<HTMLElement>('[data-toc-index]');
+    const activeIdx = activeControl ? Number(activeControl.dataset.tocIndex) : -1;
+    focusedTocIndex =
+      Number.isInteger(activeIdx) && activeIdx >= 0 && activeIdx < tocRows.length ? activeIdx : -1;
+    tocVirtualWindow = calculateVirtualWindow(
+      tocRows.length,
+      1,
+      TOC_ROW_HEIGHT_PX,
+      tocScrollContainer.scrollTop,
+      tocViewportHeight(tocScrollContainer),
+      TOC_OVERSCAN_ROWS,
+    );
+  }
+
+  function scheduleTocVirtualWindow(): void {
+    if (
+      destroyed ||
+      !tocVirtualized ||
+      typeof window === 'undefined' ||
+      typeof window.requestAnimationFrame !== 'function' ||
+      tocVirtualizationFrame !== null
+    ) {
+      return;
+    }
+    tocVirtualizationFrame = window.requestAnimationFrame(() => {
+      tocVirtualizationFrame = null;
+      updateTocVirtualWindow();
+    });
+  }
+
+  async function initializeTocDialog(): Promise<void> {
+    await tick();
+    if (destroyed || !tocVisible) return;
+    const container = tocScrollContainer;
+    if (container) {
+      if (tocVirtualized) {
+        const activeIndex = activeSectionHref
+          ? (tocIndex.firstRowBySectionHref.get(activeSectionHref) ?? -1)
+          : -1;
+        const viewportHeight = tocViewportHeight(container);
+        const centerOffset = Math.max(0, Math.floor((viewportHeight - TOC_ROW_HEIGHT_PX) / 2));
+        container.scrollTop =
+          activeIndex >= 0
+            ? clampTocScrollTop(activeIndex * TOC_ROW_HEIGHT_PX - centerOffset, viewportHeight)
+            : 0;
+        updateTocVirtualWindow();
+        await tick();
+      } else if (activeSectionHref) {
+        const currentItem = container.querySelector<HTMLElement>('[aria-current="location"]');
+        currentItem?.scrollIntoView?.({ block: 'nearest' });
+      }
+    }
+    if (destroyed || !tocVisible) return;
+    focusFirstElement(tocPanel);
+  }
+
+  function handleTocFocusIn(event: FocusEvent): void {
+    if (!tocVirtualized || !tocScrollContainer) return;
+    const control = (event.target as Element | null)?.closest<HTMLElement>('[data-toc-index]');
+    const index = control ? Number(control.dataset.tocIndex) : -1;
+    if (!Number.isInteger(index) || index < 0 || index >= tocRows.length) return;
+    focusedTocIndex = index;
+    const viewportHeight = tocViewportHeight(tocScrollContainer);
+    const rowTop = index * TOC_ROW_HEIGHT_PX;
+    const rowBottom = rowTop + TOC_ROW_HEIGHT_PX;
+    if (rowTop < tocScrollContainer.scrollTop) {
+      tocScrollContainer.scrollTop = clampTocScrollTop(rowTop, viewportHeight);
+    } else if (rowBottom > tocScrollContainer.scrollTop + viewportHeight) {
+      tocScrollContainer.scrollTop = clampTocScrollTop(rowBottom - viewportHeight, viewportHeight);
+    }
+    updateTocVirtualWindow();
+  }
+
+  async function scrollToTocRow(index: number): Promise<HTMLButtonElement | null> {
+    const container = tocScrollContainer;
+    if (!container) return null;
+    const viewportHeight = tocViewportHeight(container);
+    const rowTop = index * TOC_ROW_HEIGHT_PX;
+    const rowBottom = rowTop + TOC_ROW_HEIGHT_PX;
+    if (rowTop < container.scrollTop) {
+      container.scrollTop = clampTocScrollTop(rowTop, viewportHeight);
+    } else if (rowBottom > container.scrollTop + viewportHeight) {
+      container.scrollTop = clampTocScrollTop(rowBottom - viewportHeight, viewportHeight);
+    }
+    focusedTocIndex = index;
+    updateTocVirtualWindow();
+    await tick();
+    return container.querySelector<HTMLButtonElement>(`[data-toc-index="${index}"]`);
+  }
+
+  async function continueTocTabbing(event: KeyboardEvent, index: number): Promise<void> {
+    if (event.key !== 'Tab' || event.defaultPrevented || !tocVirtualized || !tocScrollContainer) {
+      return;
+    }
+    const nextIndex = index + (event.shiftKey ? -1 : 1);
+    if (nextIndex < 0 || nextIndex >= tocRows.length) return;
+    if (renderedTocIndices.includes(nextIndex)) return;
+
+    event.preventDefault();
+    const nextButton = await scrollToTocRow(nextIndex);
+    nextButton?.focus();
   }
 
   function searchResultSectionLabel(result: ReaderSearchResult): string {
-    return sectionLabelForHref(result.href, result.spineIndex);
+    return sectionLabelForHref(tocIndex.labels, result.href, result.spineIndex);
   }
 
   function updateDocumentTitle(): void {
-    const section = location ? ` · ${currentSectionLabel()} · page ${location.pageIndex + 1}` : '';
+    const section = location ? ` · ${activeSectionLabel} · page ${location.pageIndex + 1}` : '';
     document.title = `${title}${section} · Turnleaf`;
   }
 
@@ -654,7 +822,16 @@
 
   function toggleCurrentBookmark(): void {
     if (!location) return;
-    bookmarks = toggleBookmark(bookmarks, readerLocation(location));
+    const id = `${location.cfi}|${location.href}`;
+    const wasBookmarked = bookmarks.some((bookmark) => bookmark.id === id);
+    const next = toggleBookmark(bookmarks, readerLocation(location));
+    if (!wasBookmarked && !next.some((bookmark) => bookmark.id === id)) {
+      bookmarkLimitMessage = BOOKMARK_LIMIT_MESSAGE;
+      showControls();
+      return;
+    }
+    bookmarks = next;
+    bookmarkLimitMessage = '';
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
     showControls();
   }
@@ -676,39 +853,95 @@
     const index = bookmarks.findIndex((entry) => entry.id === bookmark.id);
     bookmarks = removeBookmark(bookmarks, bookmark.id);
     if (editingBookmarkId === bookmark.id) editingBookmarkId = null;
+    if (bookmarks.length < MAX_BOOKMARKS) bookmarkLimitMessage = '';
     queuePreference(`readerBookmarks:${bookId}`, JSON.stringify(bookmarks));
     const next = bookmarks[Math.min(Math.max(index, 0), bookmarks.length - 1)];
     focusReaderTarget(bookmarksPanel, next ? 'bookmark-location' : 'bookmark-current', next?.id);
   }
 
-  function saveAnnotation(target: ReaderSelection | null = selectedText): void {
-    if (!target) return;
+  function saveAnnotation(
+    target: ReaderSelection | null = selectedText,
+    openOnLimit = false,
+  ): StoredAnnotation | null {
+    if (!target) return null;
+    const trimmedCfi = target.cfi.trim();
+    const trimmedExcerpt = target.text.trim();
+    if (!trimmedCfi || !trimmedExcerpt) return null;
     const hadNote = Boolean(annotationDraft.trim());
-    annotations = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
+    const next = addAnnotation(annotations, target.cfi, target.text, annotationDraft);
+    const saved = next.find((annotation) => annotation.cfi === trimmedCfi) ?? null;
+    if (!saved) {
+      annotationLimitMessage = ANNOTATION_LIMIT_MESSAGE;
+      annotationMessage = '';
+      if (openOnLimit && !annotationsVisible) openAnnotations();
+      return null;
+    }
+    annotations = next;
+    annotationLimitMessage = '';
+    if (hadNote && annotationDrafts.has(saved.id)) {
+      annotationDrafts.set(saved.id, saved.note);
+    }
     session?.updateHighlights(annotations);
     annotationDraft = '';
     selectedText = null;
     annotationMessage = hadNote ? 'Highlight and note saved.' : 'Highlight saved.';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
+    return saved;
+  }
+
+  function highlightSelection(): void {
+    const restoreFrameFocus = Boolean(
+      selectedTextGroup &&
+      document.activeElement &&
+      selectedTextGroup.contains(document.activeElement),
+    );
+    if (saveAnnotation(selectedText, true)) {
+      selectionMessage = 'Highlight saved.';
+      if (restoreFrameFocus) restoreViewportFrameFocus();
+    }
+  }
+
+  function startSelectionNote(): void {
+    const saved = saveAnnotation(selectedText, true);
+    if (!saved) return;
+    selectionMessage = 'Highlight saved.';
+    editingAnnotationId = saved.id;
+    if (!annotationDrafts.has(saved.id)) {
+      annotationDrafts.set(saved.id, saved.note);
+    }
+    openAnnotations(saved.id);
   }
 
   function editAnnotation(annotation: StoredAnnotation): void {
-    annotations = updateAnnotation(annotations, annotation.id, annotationDraft);
+    const draft = annotationDrafts.get(annotation.id) ?? annotation.note;
+    annotations = updateAnnotation(annotations, annotation.id, draft);
+    annotationDrafts.delete(annotation.id);
     editingAnnotationId = null;
-    annotationDraft = '';
+    annotationLimitMessage = '';
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
   function startAnnotationEdit(annotation: StoredAnnotation): void {
     editingAnnotationId = annotation.id;
-    annotationDraft = annotation.note;
+    if (!annotationDrafts.has(annotation.id)) {
+      annotationDrafts.set(annotation.id, annotation.note);
+    }
     focusReaderTarget(annotationsPanel, 'annotation-editor', annotation.id);
+  }
+
+  function cancelAnnotationEdit(annotation: StoredAnnotation): void {
+    annotationDrafts.delete(annotation.id);
+    editingAnnotationId = null;
+    focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
   }
 
   function deleteAnnotation(annotation: StoredAnnotation): void {
     const index = annotations.findIndex((entry) => entry.id === annotation.id);
     annotations = removeAnnotation(annotations, annotation.id);
+    annotationDrafts.delete(annotation.id);
+    if (editingAnnotationId === annotation.id) editingAnnotationId = null;
+    if (annotations.length < MAX_ANNOTATIONS) annotationLimitMessage = '';
     session?.updateHighlights(annotations);
     queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
     const next = annotations[Math.min(Math.max(index, 0), annotations.length - 1)];
@@ -725,7 +958,7 @@
     );
     try {
       await navigator.clipboard.writeText(selection.text);
-      selectedText = null;
+      if (!hasSelectionDraft()) selectedText = null;
       selectionMessage = 'Selected text copied.';
       if (restoreFrameFocus) restoreViewportFrameFocus();
     } catch {
@@ -968,6 +1201,25 @@
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
     if (destroyed) return;
+    if (
+      !event.defaultPrevented &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key === 'Escape' &&
+      hasOpenReaderPanel()
+    ) {
+      event.preventDefault();
+      if (pendingSyncLocation) closeSyncConfirmation();
+      else if (settingsVisible) closeSettings();
+      else if (tocVisible) closeToc();
+      else if (bookmarksVisible) closeBookmarks();
+      else if (annotationsVisible) closeAnnotations();
+      else if (searchVisible) closeSearch();
+      showControls();
+      return;
+    }
     const action = resolveReaderKeyboardAction(event, {
       hasOpenPanel: hasOpenReaderPanel(),
       hasSelection: selectedText !== null,
@@ -981,7 +1233,7 @@
         selectedTextGroup.contains(document.activeElement),
       );
       session?.clearTextSelection();
-      selectedText = null;
+      if (!hasSelectionDraft()) selectedText = null;
       if (restoreFrameFocus) restoreViewportFrameFocus();
       return;
     }
@@ -1055,16 +1307,7 @@
         class="btn btn-sm preset-filled-primary-700-300 min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={() => {
-          const restoreFrameFocus = Boolean(
-            selectedTextGroup &&
-            document.activeElement &&
-            selectedTextGroup.contains(document.activeElement),
-          );
-          saveAnnotation();
-          selectionMessage = 'Highlight saved.';
-          if (restoreFrameFocus) restoreViewportFrameFocus();
-        }}
+        onclick={highlightSelection}
       >
         Highlight
       </button>
@@ -1072,7 +1315,7 @@
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
-        onclick={openAnnotations}
+        onclick={startSelectionNote}
       >
         Add note
       </button>
@@ -1089,7 +1332,7 @@
 
   <p class="sr-only" aria-live="polite" aria-atomic="true">
     {#if location}
-      {currentSectionLabel()}, page {location.pageIndex + 1} of {location.pageCount},
+      {activeSectionLabel}, page {location.pageIndex + 1} of {location.pageCount},
       {currentProgressLabel()} complete.
     {/if}
   </p>
@@ -1633,7 +1876,9 @@
           {#snippet contentsList(items: TocItem[])}
             <ul class="mt-2 grid list-none gap-1 p-0">
               {#each items as item, index (`${item.href}-${index}`)}
-                {@const isCurrent = location?.href.split('#')[0] === item.href.split('#')[0]}
+                {@const itemSectionHref = canonicalSectionHref(item.href)}
+                {@const isCurrent =
+                  activeSectionHref !== '' && itemSectionHref === activeSectionHref}
                 <li>
                   <button
                     class="btn w-full justify-start text-left {isCurrent
@@ -1657,9 +1902,58 @@
               {/each}
             </ul>
           {/snippet}
-          <div class="mt-3 max-h-[55dvh] overflow-auto">
+          <div
+            bind:this={tocScrollContainer}
+            class="mt-3 max-h-[55dvh] overflow-auto"
+            onscroll={scheduleTocVirtualWindow}
+          >
             {#if toc.length > 0}
-              {@render contentsList(toc)}
+              {#if tocVirtualized}
+                <ul
+                  class="relative mt-2 list-none p-0"
+                  style:height={`${tocVirtualWindow.totalHeight}px`}
+                  onfocusin={handleTocFocusIn}
+                  onfocusout={scheduleTocVirtualWindow}
+                >
+                  {#each renderedTocIndices as rowIndex (rowIndex)}
+                    {@const row = tocRows[rowIndex]!}
+                    {@const isCurrent =
+                      activeSectionHref !== '' && row.sectionHref === activeSectionHref}
+                    <li
+                      class="absolute inset-x-0 flex items-center"
+                      style:top={`${row.index * TOC_ROW_HEIGHT_PX}px`}
+                      style:height={`${TOC_ROW_HEIGHT_PX}px`}
+                      aria-setsize={tocRows.length}
+                      aria-posinset={row.index + 1}
+                    >
+                      <div
+                        class="min-w-0 flex-1 {row.depth > 0
+                          ? 'border-l border-surface-300/50 pl-2'
+                          : ''}"
+                        style:margin-left={row.depth > 0 ? `${row.depth}rem` : undefined}
+                      >
+                        <button
+                          class="btn w-full justify-start text-left {isCurrent
+                            ? 'preset-filled-primary-700-300'
+                            : ''}"
+                          aria-current={isCurrent ? 'location' : undefined}
+                          data-toc-index={row.index}
+                          type="button"
+                          onkeydown={(event) => void continueTocTabbing(event, row.index)}
+                          onclick={() => {
+                            void session?.display(row.href);
+                            closeToc();
+                          }}
+                        >
+                          <span class="truncate">{row.label}</span>
+                        </button>
+                      </div>
+                    </li>
+                  {/each}
+                </ul>
+              {:else}
+                {@render contentsList(toc)}
+              {/if}
             {:else}
               <p class="py-3 text-sm text-surface-700-300">
                 This EPUB does not include a table of contents.
@@ -1771,6 +2065,9 @@
             >
               {currentBookmark() ? 'Remove bookmark at this page' : 'Bookmark this page'}
             </button>
+          {/if}
+          {#if bookmarkLimitMessage}
+            <p class="mt-3 text-sm text-error-700-300" role="alert">{bookmarkLimitMessage}</p>
           {/if}
 
           <section class="mt-5" aria-labelledby="reader-bookmark-list-title">
@@ -1894,13 +2191,18 @@
             Saved on this device. Choose a passage on this page or select text in the book to add a
             highlight and an optional note.
           </p>
+          {#if annotationLimitMessage}
+            <p class="mt-3 text-sm text-error-700-300" role="alert">{annotationLimitMessage}</p>
+          {/if}
 
           {#if selectedText}
             <form
               class="mt-4 rounded-lg preset-tonal-primary p-3"
               onsubmit={(event) => {
                 event.preventDefault();
-                saveAnnotation();
+                if (saveAnnotation()) {
+                  selectionMessage = 'Highlight saved.';
+                }
               }}
             >
               <p class="text-sm italic">“{selectedText.text}”</p>
@@ -1918,6 +2220,7 @@
                   onclick={() => {
                     selectedText = null;
                     annotationDraft = '';
+                    annotationLimitMessage = '';
                   }}
                 >
                   Cancel
@@ -1943,6 +2246,7 @@
                   onchange={(event) => {
                     selectedPassageIndex = Number(event.currentTarget.value);
                     annotationMessage = '';
+                    annotationLimitMessage = '';
                   }}
                 >
                   {#each visiblePassages as passage, index (`${passage.cfi}-${index}`)}
@@ -2030,7 +2334,10 @@
                           class="textarea min-h-20"
                           data-reader-focus="annotation-editor"
                           data-reader-focus-id={annotation.id}
-                          bind:value={annotationDraft}></textarea>
+                          value={annotationDrafts.get(annotation.id) ?? annotation.note}
+                          oninput={(event) =>
+                            annotationDrafts.set(annotation.id, event.currentTarget.value)}
+                        ></textarea>
                       </label>
                       <div class="flex gap-2">
                         <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
@@ -2039,11 +2346,7 @@
                         <button
                           class="btn btn-sm preset-tonal-surface"
                           type="button"
-                          onclick={() => {
-                            editingAnnotationId = null;
-                            annotationDraft = '';
-                            focusReaderTarget(annotationsPanel, 'annotation-edit', annotation.id);
-                          }}
+                          onclick={() => cancelAnnotationEdit(annotation)}
                         >
                           Cancel
                         </button>
@@ -2085,7 +2388,7 @@
 
   {#if footerVisible}
     <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
-      <span class="truncate text-xs">{currentSectionLabel()}</span>
+      <span class="truncate text-xs">{activeSectionLabel}</span>
       <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
     </footer>
   {/if}
