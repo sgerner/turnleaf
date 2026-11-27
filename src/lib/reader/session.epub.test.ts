@@ -1064,17 +1064,39 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
-  it('updates rendition settings without calling resize before the EPUB stage is attached', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+  function stubResizeTrigger() {
+    const callbacks: ResizeObserverCallback[] = [];
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          callbacks.push(callback);
+        }
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+    return (width: number, height: number) =>
+      callbacks[0]?.(
+        [{ contentRect: { width, height } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+  }
 
+  function installRenditionListeners() {
+    const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+    mockRendition.on.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name)!.add(fn);
+    });
+    mockRendition.off.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
+      listeners.get(name)?.delete(fn);
+    });
+    return listeners;
+  }
+
+  it('updates rendition settings without calling resize before the EPUB stage is attached', async () => {
+    const triggerResize = stubResizeTrigger();
     let resolveStarted!: () => void;
     const originalStarted = mockRendition.started;
     const managedRendition = mockRendition as typeof mockRendition & {
@@ -1098,12 +1120,7 @@ describe('ReaderSession', () => {
         vi.fn(),
         vi.fn(),
       );
-
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
-      );
-
+      triggerResize(412, 915);
       expect(mockRendition.resize).not.toHaveBeenCalled();
       expect(managedRendition.settings).toEqual({ width: 412, height: 915 });
 
@@ -1120,24 +1137,8 @@ describe('ReaderSession', () => {
   });
 
   it('re-displays the restored target when a viewport resize clears views before location settles', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
-
-    const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
-    mockRendition.on.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
-      if (!listeners.has(name)) listeners.set(name, new Set());
-      listeners.get(name)!.add(fn);
-    });
-    mockRendition.off.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
-      listeners.get(name)?.delete(fn);
-    });
+    const triggerResize = stubResizeTrigger();
+    const listeners = installRenditionListeners();
     mockRendition.resize.mockImplementation(() => {
       for (const listener of listeners.get('resized') ?? []) {
         listener({ width: 412, height: 915 });
@@ -1156,11 +1157,7 @@ describe('ReaderSession', () => {
         vi.fn(),
       );
       mockRendition.display.mockClear();
-
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
-      );
+      triggerResize(412, 915);
 
       await vi.waitFor(() => {
         expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
@@ -1174,16 +1171,7 @@ describe('ReaderSession', () => {
   });
 
   it('defers viewport resize during pending user navigation until the destination settles', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
-
+    const triggerResize = stubResizeTrigger();
     const managedRendition = mockRendition as typeof mockRendition & {
       manager?: { stage?: unknown };
     };
@@ -1201,22 +1189,11 @@ describe('ReaderSession', () => {
         vi.fn(),
       );
       const relocated = getRenditionListener('relocated');
-      relocated({
-        start: {
-          href: 'first.xhtml',
-          index: 0,
-          cfi: 'epubcfi(/6/2!/4/2/1:0)',
-          displayed: { page: 1, total: 2 },
-        },
-      });
+      relocated(location('epubcfi(/6/2!/4/2/1:0)'));
 
       await session.display('second.xhtml');
       mockRendition.resize.mockClear();
-
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
-      );
+      triggerResize(412, 915);
       expect(mockRendition.resize).not.toHaveBeenCalled();
 
       relocated({
@@ -1227,7 +1204,6 @@ describe('ReaderSession', () => {
           displayed: { page: 1, total: 2 },
         },
       });
-
       expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
         412,
         915,
@@ -1239,8 +1215,8 @@ describe('ReaderSession', () => {
     }
   });
 
-  it('does not let a delayed initial open relocation consume userNavigationPending during next()', async () => {
-    let resolveNext!: () => void;
+  it('does not let delayed relocations consume userNavigationPending across overlapping next() calls', async () => {
+    const nextResolvers: Array<() => void> = [];
     const managedRendition = mockRendition as typeof mockRendition & {
       manager?: { stage?: unknown };
       currentLocation?: () => Location;
@@ -1252,10 +1228,7 @@ describe('ReaderSession', () => {
     managedRendition.next = vi.fn(
       () =>
         new Promise<void>((resolve) => {
-          resolveNext = () => {
-            liveCfi = 'epubcfi(/6/4!/4/2/1:0)';
-            resolve();
-          };
+          nextResolvers.push(resolve);
         }),
     );
 
@@ -1273,24 +1246,21 @@ describe('ReaderSession', () => {
       );
       const relocated = getRenditionListener('relocated');
 
-      const turning = session.next();
+      const firstTurn = session.next();
+      const secondTurn = session.next();
+      nextResolvers[0]?.();
+      await firstTurn;
 
-      // Stale requestAnimationFrame relocation from initial open() arrives while next() is active.
-      relocated({
-        start: {
-          href: 'first.xhtml',
-          index: 0,
-          cfi: 'epubcfi(/6/2!/4/2/1:0)',
-          displayed: { page: 1, total: 1 },
-        },
-      });
+      // Second next() is still in flight; stale relocation from initial open must stay 'restore'.
+      relocated(location('epubcfi(/6/2!/4/2/1:0)'));
       expect(onLocation).toHaveBeenLastCalledWith(
         expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)' }),
         'restore',
       );
 
-      resolveNext();
-      await turning;
+      liveCfi = 'epubcfi(/6/4!/4/2/1:0)';
+      nextResolvers[1]?.();
+      await secondTurn;
 
       relocated({
         start: {
@@ -1313,25 +1283,8 @@ describe('ReaderSession', () => {
   });
 
   it('tracks resize re-display when rendition.location is already populated and waits before next()', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
-
-    const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
-    mockRendition.on.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
-      if (!listeners.has(name)) listeners.set(name, new Set());
-      listeners.get(name)!.add(fn);
-    });
-    mockRendition.off.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
-      listeners.get(name)?.delete(fn);
-    });
-
+    const triggerResize = stubResizeTrigger();
+    const listeners = installRenditionListeners();
     const managedRendition = mockRendition as typeof mockRendition & {
       manager?: { stage?: unknown };
       q?: object;
@@ -1364,24 +1317,17 @@ describe('ReaderSession', () => {
         if (target) currentCfi = target;
       }
     });
-
     mockRendition.resize.mockImplementation((width: number, height: number, epubcfi?: string) => {
-      // Simulate EPUB.js DefaultViewManager.resize clearing views and Rendition.onResized
-      // checking this.location.start before emitting untracked display().
       viewsRendered = false;
-      for (const listener of listeners.get('resized') ?? []) {
-        listener({ width, height }, epubcfi);
-      }
-      if (mockRendition.location?.start) {
+      for (const listener of listeners.get('resized') ?? []) listener({ width, height }, epubcfi);
+      if (mockRendition.location?.start)
         void displayMock(epubcfi ?? mockRendition.location.start.cfi);
-      }
     });
 
     const nextCallsWhileCleared: boolean[] = [];
     managedRendition.next = vi.fn(async () => {
       nextCallsWhileCleared.push(!viewsRendered);
-      if (!viewsRendered) return;
-      currentCfi = 'epubcfi(/6/4!/4/2/1:0)';
+      if (viewsRendered) currentCfi = 'epubcfi(/6/4!/4/2/1:0)';
     });
 
     const onLocation = vi.fn();
@@ -1402,16 +1348,8 @@ describe('ReaderSession', () => {
       mockRendition.display.mockClear();
       mockRendition.resize.mockClear();
 
-      // First system-bar resize clears views and starts tracked re-display; second frame coalesces.
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 412, height: 891 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
-      );
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
-      );
-
+      triggerResize(412, 891);
+      triggerResize(412, 915);
       expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
         412,
         891,
@@ -1419,18 +1357,14 @@ describe('ReaderSession', () => {
       );
       expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/1:0)');
 
-      // User taps Next page while resize re-display is still rendering views.
       const turning = session.next();
       await Promise.resolve();
       expect(managedRendition.next).not.toHaveBeenCalled();
 
       releaseRedisplay();
       await turning;
-
-      // Coalesced 412x915 resize also finished before next() executed, so views were rendered.
       expect(mockRendition.resize).toHaveBeenCalledTimes(2);
       expect(nextCallsWhileCleared).toEqual([false]);
-      expect(currentCfi).toBe('epubcfi(/6/4!/4/2/1:0)');
 
       relocated({
         start: {

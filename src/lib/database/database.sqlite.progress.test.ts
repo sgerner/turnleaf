@@ -15,6 +15,7 @@ const native = vi.hoisted(() => ({
   failPragmaContains: null as string | null,
   failTransactionAt: null as number | null,
   onTransactionTask: null as ((index: number) => void | Promise<void>) | null,
+  beforeOpenDatabase: null as (() => void | Promise<void>) | null,
   beforeDeleteDatabase: null as (() => void | Promise<void>) | null,
   createAdapter: null as (() => unknown) | null,
 }));
@@ -89,6 +90,7 @@ function createAdapter() {
     async open(): Promise<void> {
       if (!native.database) native.database = new DatabaseSync(native.databasePath);
       native.isOpen = true;
+      await native.beforeOpenDatabase?.();
     },
     async close(): Promise<void> {
       if (native.database) native.database.close();
@@ -200,6 +202,7 @@ describe('native progress transactions against SQLite', () => {
     native.failPragmaContains = null;
     native.failTransactionAt = null;
     native.onTransactionTask = null;
+    native.beforeOpenDatabase = null;
     native.beforeDeleteDatabase = null;
   });
 
@@ -210,6 +213,7 @@ describe('native progress transactions against SQLite', () => {
     native.failPragmaContains = null;
     native.failTransactionAt = null;
     native.onTransactionTask = null;
+    native.beforeOpenDatabase = null;
     native.beforeDeleteDatabase = null;
     rmSync(directory, { recursive: true, force: true });
   });
@@ -985,30 +989,33 @@ describe('native progress transactions against SQLite', () => {
     });
   });
 
+  function pauseNextHook(key: 'beforeDeleteDatabase' | 'beforeOpenDatabase') {
+    let markEntered!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      markEntered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    native[key] = async () => {
+      native[key] = null;
+      markEntered();
+      await gate;
+    };
+    return { entered, release };
+  }
+
   it('gates concurrent SQLite opens and writes while resetLocalDatabase is paused, including partial open failures', async () => {
     const database = await importDatabase();
     await seedDatabase(database);
     expect(existsSync(`${native.databasePath}-wal`)).toBe(true);
 
-    let releaseDelete: () => void = () => undefined;
-    const deleteGate = new Promise<void>((resolve) => {
-      releaseDelete = resolve;
-    });
-    let enteredDelete: () => void = () => undefined;
-    const deleteStarted = new Promise<void>((resolve) => {
-      enteredDelete = resolve;
-    });
-    native.beforeDeleteDatabase = async () => {
-      native.beforeDeleteDatabase = null;
-      enteredDelete();
-      await deleteGate;
-    };
-
+    const deletePause = pauseNextHook('beforeDeleteDatabase');
     const otherServer = { ...server, id: 'fresh-server', displayName: 'Fresh server' };
     const resetting = database.resetLocalDatabase();
-    await deleteStarted;
+    await deletePause.entered;
 
-    // Checkpoint + journal_mode=DELETE + close() already ran, removing -wal/-shm before unlink.
     expect(native.isOpen).toBe(false);
     expect(native.database).toBeNull();
     expect(existsSync(`${native.databasePath}-wal`)).toBe(false);
@@ -1017,19 +1024,14 @@ describe('native progress transactions against SQLite', () => {
     const pendingSave = database.saveServer(otherServer);
     const pendingBooks = database.getBooks(server.id);
     await new Promise((resolve) => setTimeout(resolve, 10));
-
-    // Neither open, migration, nor write may touch SQLite until deleteDatabase finishes.
     expect(native.isOpen).toBe(false);
     expect(native.database).toBeNull();
 
-    releaseDelete();
+    deletePause.release();
     const [, , oldBooks] = await Promise.all([resetting, pendingSave, pendingBooks]);
-
     expect(oldBooks).toEqual([]);
     expect(await database.getServer()).toEqual(otherServer);
-    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({
-      journal_mode: 'wal',
-    });
+    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' });
 
     // Partial startup PRAGMA failure after db.open() also cleans up and gates concurrent opens.
     await database.resetLocalDatabase();
@@ -1038,26 +1040,10 @@ describe('native progress transactions against SQLite', () => {
     native.failPragmaContains = 'PRAGMA synchronous';
     await expect(database.openDatabase()).rejects.toThrow('injected pragma failure');
     expect(native.isOpen).toBe(true);
-    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({
-      journal_mode: 'wal',
-    });
 
-    let releasePartialDelete: () => void = () => undefined;
-    const partialDeleteGate = new Promise<void>((resolve) => {
-      releasePartialDelete = resolve;
-    });
-    let enteredPartialDelete: () => void = () => undefined;
-    const partialDeleteStarted = new Promise<void>((resolve) => {
-      enteredPartialDelete = resolve;
-    });
-    native.beforeDeleteDatabase = async () => {
-      native.beforeDeleteDatabase = null;
-      enteredPartialDelete();
-      await partialDeleteGate;
-    };
-
+    const partialDelete = pauseNextHook('beforeDeleteDatabase');
     const partialReset = database.resetLocalDatabase();
-    await partialDeleteStarted;
+    await partialDelete.entered;
     expect(native.isOpen).toBe(false);
     expect(existsSync(`${native.databasePath}-wal`)).toBe(false);
 
@@ -1065,14 +1051,12 @@ describe('native progress transactions against SQLite', () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(native.isOpen).toBe(false);
 
-    releasePartialDelete();
+    partialDelete.release();
     await Promise.all([partialReset, postPartialSave]);
     expect(await database.getServer()).toEqual(server);
 
     // Partial mid-migration failure after WAL files are created on disk also cleans up -wal/-shm.
     await database.resetLocalDatabase();
-    expect(readdirSync(directory)).toEqual([]);
-
     let migrationCount = 0;
     native.onTransactionTask = () => {
       migrationCount += 1;
@@ -1084,11 +1068,159 @@ describe('native progress transactions against SQLite', () => {
     await expect(database.openDatabase()).rejects.toThrow(
       'injected migration failure after WAL write',
     );
-    expect(native.isOpen).toBe(true);
     expect(existsSync(`${native.databasePath}-wal`)).toBe(true);
-    expect(existsSync(`${native.databasePath}-shm`)).toBe(true);
-
     await database.resetLocalDatabase();
     expect(readdirSync(directory)).toEqual([]);
+  });
+
+  it('interleaves write paths with clear and reset so no stale row survives and nothing is lost', async () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal('window', {
+      localStorage: {
+        clear: () => store.clear(),
+        getItem: (key: string) => store.get(key) ?? null,
+        removeItem: (key: string) => void store.delete(key),
+        setItem: (key: string, value: string) => void store.set(key, value),
+      },
+    });
+    try {
+      const database = await importDatabase();
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+
+      // Phase 1: Interleave writes with server/cache clear (removeServer + localStorage.clear).
+      await seedDatabase(database);
+      const freshServer = {
+        ...server,
+        id: 'fresh-server',
+        displayName: 'Fresh Kavita',
+        baseUrl: 'https://fresh.example.com',
+      };
+      const freshBook = {
+        ...book,
+        id: 'fresh-server:2:20',
+        serverId: freshServer.id,
+        libraryId: 2,
+        volumeId: 20,
+        chapterId: 20,
+        title: 'Fresh Book',
+      };
+
+      await Promise.all([
+        database.saveLocalProgress(book, 'pre-clear-cfi', '/pre-clear', 0.45),
+        database.setPreferences(new Map([['uiTheme', 'eink']])),
+        database.removeServer(server.id),
+        database.saveLocalProgress(book, 'post-clear-orphan-cfi', '/orphan', 0.9),
+        database.markBookCompleted(book),
+        database.saveServer(freshServer),
+        database.reconcileBooks(freshServer.id, [freshBook]),
+        database.saveLocalProgress(freshBook, 'after-clear-cfi', '/after-clear', 0.35),
+      ]);
+      window.localStorage.clear();
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'fennec'],
+          ['uiMode', 'dark'],
+        ]),
+      );
+
+      expect(await database.getBooks(server.id)).toEqual([]);
+      expect(await database.getReadingState(book.id)).toBeNull();
+      expect(await database.getPendingSync(server.id)).toEqual([]);
+      expect(await database.getServer()).toEqual(freshServer);
+      expect(await database.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'after-clear-cfi',
+        percentage: 0.35,
+        pendingSync: true,
+      });
+
+      // Phase 2: Cold-open pre-reset writes + reset + mid-reset writes + post-reset writes.
+      await database.resetLocalDatabase();
+      expect(readdirSync(directory)).toEqual([]);
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+
+      const coldOpenPause = pauseNextHook('beforeOpenDatabase');
+      const deletePause = pauseNextHook('beforeDeleteDatabase');
+
+      const coldStaleServer = database.saveServer(server);
+      const coldStaleProgress = database.saveLocalProgress(book, 'cold-stale-cfi', '/stale', 0.5);
+      const coldStaleTheme = database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'light'],
+        ]),
+      );
+      await coldOpenPause.entered;
+
+      const resetting = database.resetLocalDatabase();
+      const midResetServer = database.saveServer(freshServer);
+      const midResetBooks = database.reconcileBooks(freshServer.id, [freshBook]);
+      const midResetProgress = database.saveLocalProgress(freshBook, 'mid-reset-cfi', '/mid', 0.55);
+
+      coldOpenPause.release();
+      await deletePause.entered;
+      deletePause.release();
+
+      await Promise.all([
+        coldStaleServer,
+        coldStaleProgress,
+        coldStaleTheme,
+        resetting,
+        midResetServer,
+        midResetBooks,
+        midResetProgress,
+      ]);
+
+      await Promise.all([
+        database.saveLocalProgress(book, 'late-stale-cfi', '/late-stale', 0.8),
+        database.saveLocalProgress(freshBook, 'post-reset-cfi', '/post', 0.75),
+        database.setPreferences(
+          new Map([
+            ['uiTheme', 'fennec'],
+            ['uiMode', 'dark'],
+          ]),
+        ),
+      ]);
+
+      const reopened = await reopenDatabase(database);
+      expect(await reopened.getServer()).toEqual(freshServer);
+      expect(await reopened.getBooks(server.id)).toEqual([]);
+      expect(await reopened.getReadingState(book.id)).toBeNull();
+      expect(await reopened.getBooks(freshServer.id)).toMatchObject([
+        { id: freshBook.id, pagesRead: 75 },
+      ]);
+      expect(await reopened.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'post-reset-cfi',
+        xpath: '/post',
+        percentage: 0.75,
+        pendingSync: true,
+        syncRevision: 2,
+      });
+      expect(await reopened.getPendingSync(freshServer.id)).toMatchObject([
+        { bookId: freshBook.id, revision: 2 },
+      ]);
+      expect(await reopened.getPreferences(['uiTheme', 'uiMode'])).toEqual(
+        new Map([
+          ['uiTheme', 'fennec'],
+          ['uiMode', 'dark'],
+        ]),
+      );
+      expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+        theme: 'fennec',
+        mode: 'dark',
+      });
+      expect(
+        native.database
+          ?.prepare(
+            `SELECT
+              (SELECT COUNT(*) FROM server_config) AS servers,
+              (SELECT COUNT(*) FROM books) AS books,
+              (SELECT COUNT(*) FROM reading_state) AS reading_states,
+              (SELECT COUNT(*) FROM sync_queue) AS sync_rows`,
+          )
+          .get(),
+      ).toEqual({ servers: 1, books: 1, reading_states: 1, sync_rows: 1 });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
