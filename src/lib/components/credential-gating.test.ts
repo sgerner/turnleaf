@@ -4,6 +4,7 @@ import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as DatabaseModule from '../database/database';
 import type * as NativeDownloadModule from '../downloads/native-download';
+import type * as ThemesModule from '../themes/themes';
 
 const runtime = vi.hoisted(() => ({
   native: true,
@@ -115,9 +116,16 @@ vi.mock('@capacitor/app', () => ({
 
 vi.mock('@capacitor/status-bar', () => ({
   Animation: { None: 'NONE' },
+  Style: {
+    Dark: 'DARK',
+    Light: 'LIGHT',
+    Default: 'DEFAULT',
+  },
   StatusBar: {
     hide: vi.fn(async () => undefined),
     show: vi.fn(async () => undefined),
+    setStyle: vi.fn(async () => undefined),
+    setBackgroundColor: vi.fn(async () => undefined),
   },
 }));
 
@@ -133,10 +141,14 @@ vi.mock('@aparajita/capacitor-secure-storage', () => ({
   SecureStorage: secureStorageMock,
 }));
 
-vi.mock('../themes/themes', () => ({
-  loadTheme: vi.fn(async () => true),
-  skeletonThemes: ['fennec', 'cerberus'],
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn(async () => true),
+    skeletonThemes: ['fennec', 'cerberus'],
+  };
+});
 
 vi.mock('../github/releases', () => ({
   fetchLatestGithubRelease: vi.fn(async () => null),

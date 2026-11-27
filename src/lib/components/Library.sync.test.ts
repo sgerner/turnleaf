@@ -13,6 +13,7 @@ import {
 } from '../database/database';
 import { resetCredentialState } from '../native/credentials';
 import type * as CredentialsModule from '../native/credentials';
+import type * as ThemesModule from '../themes/themes';
 
 const networkListeners = new Set<
   (status: { connected: boolean; connectionType: string }) => void
@@ -81,10 +82,14 @@ vi.mock('../native/credentials', async (importOriginal) => {
   };
 });
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
