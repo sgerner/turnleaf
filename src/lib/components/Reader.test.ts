@@ -41,6 +41,29 @@ describe('Reader mount lifecycle', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    if (typeof Element.prototype.animate !== 'function') {
+      Element.prototype.animate = (() => {
+        const anim = {
+          currentTime: 0,
+          playState: 'running',
+          effect: null,
+          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+          cancel() {
+            anim.playState = 'idle';
+          },
+          finish() {
+            anim.playState = 'finished';
+          },
+        };
+        queueMicrotask(() => {
+          if (anim.playState !== 'idle') {
+            anim.playState = 'finished';
+            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+          }
+        });
+        return anim as unknown as Animation;
+      }) as typeof Element.prototype.animate;
+    }
     getPreferencesMock.mockResolvedValue(new Map());
     setPreferencesMock.mockResolvedValue(undefined);
     openSessionMock.mockResolvedValue(undefined);
@@ -107,7 +130,7 @@ describe('Reader mount lifecycle', () => {
     expect(onMountChange).toHaveBeenCalledWith(true);
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
         'This EPUB could not be opened.',
       );
     });

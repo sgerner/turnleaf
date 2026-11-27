@@ -18,6 +18,8 @@
     busy = false,
     busyLabel,
     opener = undefined,
+    fallbackFocus = undefined,
+    zIndexClass = 'z-60',
     restoreFocusOnConfirm = false,
     onConfirm,
     onCancel,
@@ -31,6 +33,8 @@
     busy?: boolean;
     busyLabel?: string | undefined;
     opener?: HTMLElement | null | undefined;
+    fallbackFocus?: HTMLElement | null | (() => HTMLElement | null) | undefined;
+    zIndexClass?: 'z-40' | 'z-60' | undefined;
     restoreFocusOnConfirm?: boolean;
     onConfirm: () => void | Promise<void>;
     onCancel: () => void;
@@ -55,7 +59,7 @@
 
   onDestroy(() => {
     if (!confirmed || restoreFocusOnConfirm) {
-      restoreModalFocus(capturedOpener);
+      restoreModalFocus(capturedOpener, fallbackFocus);
     }
   });
 
@@ -77,7 +81,7 @@
 </script>
 
 <div
-  class="pointer-events-auto fixed inset-0 z-60 grid place-items-center bg-black/55 p-4"
+  class="pointer-events-auto fixed inset-0 {zIndexClass} grid place-items-center bg-black/55 p-4"
   role="presentation"
   in:fade={{ duration: 120 }}
   onclick={(event) => {

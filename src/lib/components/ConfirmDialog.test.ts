@@ -164,4 +164,38 @@ describe('ConfirmDialog', () => {
     resolveConfirm!();
     await tick();
   });
+
+  it('supports z-40 backdrop layering and restores focus to fallbackFocus when opener disconnects', async () => {
+    const fallback = document.createElement('button');
+    fallback.type = 'button';
+    fallback.textContent = 'Show reading controls';
+    document.body.append(fallback);
+
+    mounted = mount(ConfirmDialog, {
+      target: host,
+      props: {
+        title: 'Move to Kavita’s latest position?',
+        description: 'Kavita has a different reading position saved.',
+        cancelLabel: 'Stay here',
+        confirmLabel: 'Go to latest position',
+        tone: 'primary',
+        zIndexClass: 'z-40',
+        opener: trigger,
+        fallbackFocus: () => fallback,
+        onConfirm: vi.fn(),
+        onCancel: vi.fn(),
+      },
+    });
+    await tick();
+
+    const dialog = host.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    expect(dialog.closest('.z-40')).not.toBeNull();
+    expect(dialog.closest('.z-60')).toBeNull();
+
+    trigger.remove();
+    await unmount(mounted);
+    mounted = null;
+    await tick();
+    expect(document.activeElement).toBe(fallback);
+  });
 });
