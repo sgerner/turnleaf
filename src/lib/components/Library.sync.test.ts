@@ -283,6 +283,36 @@ afterEach(async () => {
 });
 
 describe('Library concurrent progress uploads and catalog refreshes', () => {
+  it('does not start another refresh for a connected event while already online', async () => {
+    let seriesRequests = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Series/v2') {
+        seriesRequests += 1;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Android can report a new connected network during a Wi-Fi-to-cellular handoff.
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(seriesRequests).toBe(1);
+  });
+
   it('starts saveProgress on online mount without awaiting catalog pagination and retains local progress', async () => {
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[4]', 0.4);
 
