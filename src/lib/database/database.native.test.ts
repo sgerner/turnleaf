@@ -34,6 +34,17 @@ const mocks = vi.hoisted(() => {
     reset() {
       databaseVersion = 7;
       vi.clearAllMocks();
+      deleteDatabase.mockImplementation(async () => undefined);
+      executeTransaction.mockImplementation(async () => ({ changes: { changes: 0 } }));
+      db.close.mockImplementation(async () => undefined);
+      db.execute.mockImplementation(async () => ({ changes: { changes: 0 } }));
+      db.getVersion.mockImplementation(async () => ({ version: databaseVersion }));
+      db.open.mockImplementation(async () => undefined);
+      db.query.mockImplementation(async () => ({ values: [] }));
+      db.run.mockImplementation(async () => ({ changes: { changes: 1 } }));
+      sqlite.checkConnectionsConsistency.mockImplementation(async () => ({ result: true }));
+      sqlite.createConnection.mockImplementation(async () => db);
+      sqlite.isConnection.mockImplementation(async () => ({ result: false }));
     },
     setDatabaseVersion(version: number) {
       databaseVersion = version;

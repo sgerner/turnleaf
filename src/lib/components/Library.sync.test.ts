@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
   getPendingSync,
@@ -75,10 +76,14 @@ vi.mock('../native/credentials', () => ({
   removeApiKey: vi.fn(async () => {}),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();

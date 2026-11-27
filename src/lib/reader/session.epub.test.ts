@@ -1063,4 +1063,252 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('updates rendition settings without calling resize before the EPUB stage is attached', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let resolveStarted!: () => void;
+    const originalStarted = mockRendition.started;
+    const managedRendition = mockRendition as typeof mockRendition & {
+      manager?: { stage?: unknown } | undefined;
+      settings?: { width: number | string; height: number | string };
+    };
+    managedRendition.started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    managedRendition.manager = undefined;
+    managedRendition.settings = { width: 412, height: 840 };
+
+    const session = new ReaderSession('book.epub');
+    try {
+      const opening = session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+      expect(managedRendition.settings).toEqual({ width: 412, height: 915 });
+
+      managedRendition.manager = { stage: {} };
+      resolveStarted();
+      await opening;
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+    } finally {
+      session.destroy();
+      managedRendition.started = originalStarted;
+      Reflect.deleteProperty(managedRendition, 'manager');
+      Reflect.deleteProperty(managedRendition, 'settings');
+    }
+  });
+
+  it('re-displays the restored target when a viewport resize clears views before location settles', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+    mockRendition.on.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name)!.add(fn);
+    });
+    mockRendition.off.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
+      listeners.get(name)?.delete(fn);
+    });
+    mockRendition.resize.mockImplementation(() => {
+      for (const listener of listeners.get('resized') ?? []) {
+        listener({ width: 412, height: 915 });
+      }
+    });
+
+    const session = new ReaderSession('book.epub');
+    try {
+      await session.open(
+        document.createElement('div'),
+        'epubcfi(/6/4!/4/2/1:0)',
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      mockRendition.display.mockClear();
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+
+      await vi.waitFor(() => {
+        expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
+      });
+    } finally {
+      session.destroy();
+      mockRendition.on.mockReset();
+      mockRendition.off.mockReset();
+      mockRendition.resize.mockReset();
+    }
+  });
+
+  it('defers viewport resize during pending user navigation until the destination settles', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const managedRendition = mockRendition as typeof mockRendition & {
+      manager?: { stage?: unknown };
+    };
+    managedRendition.manager = { stage: {} };
+
+    const session = new ReaderSession('book.epub');
+    try {
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+      );
+      const relocated = getRenditionListener('relocated');
+      relocated({
+        start: {
+          href: 'first.xhtml',
+          index: 0,
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          displayed: { page: 1, total: 2 },
+        },
+      });
+
+      await session.display('second.xhtml');
+      mockRendition.resize.mockClear();
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      relocated({
+        start: {
+          href: 'second.xhtml',
+          index: 1,
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          displayed: { page: 1, total: 2 },
+        },
+      });
+
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+        412,
+        915,
+        'epubcfi(/6/4!/4/2/1:0)',
+      );
+    } finally {
+      session.destroy();
+      Reflect.deleteProperty(managedRendition, 'manager');
+    }
+  });
+
+  it('does not let a delayed initial open relocation consume userNavigationPending during next()', async () => {
+    let resolveNext!: () => void;
+    const managedRendition = mockRendition as typeof mockRendition & {
+      manager?: { stage?: unknown };
+      currentLocation?: () => Location;
+      next?: () => Promise<void>;
+    };
+    managedRendition.manager = { stage: {} };
+    let liveCfi = 'epubcfi(/6/2!/4/2/1:0)';
+    managedRendition.currentLocation = () => location(liveCfi);
+    managedRendition.next = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveNext = () => {
+            liveCfi = 'epubcfi(/6/4!/4/2/1:0)';
+            resolve();
+          };
+        }),
+    );
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    try {
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        onLocation,
+        vi.fn(),
+      );
+      const relocated = getRenditionListener('relocated');
+
+      const turning = session.next();
+
+      // Stale requestAnimationFrame relocation from initial open() arrives while next() is active.
+      relocated({
+        start: {
+          href: 'first.xhtml',
+          index: 0,
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          displayed: { page: 1, total: 1 },
+        },
+      });
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)' }),
+        'restore',
+      );
+
+      resolveNext();
+      await turning;
+
+      relocated({
+        start: {
+          href: 'second.xhtml',
+          index: 1,
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          displayed: { page: 1, total: 1 },
+        },
+      });
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)' }),
+        'navigation',
+      );
+    } finally {
+      session.destroy();
+      Reflect.deleteProperty(managedRendition, 'manager');
+      Reflect.deleteProperty(managedRendition, 'currentLocation');
+      Reflect.deleteProperty(managedRendition, 'next');
+    }
+  });
 });

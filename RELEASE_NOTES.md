@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: serialize reader viewport resizes with EPUB opening and page turns
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache
