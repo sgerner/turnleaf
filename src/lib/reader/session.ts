@@ -97,13 +97,8 @@ interface EpubHighlightView {
 interface ActiveHighlightViewState {
   sectionIndex: number | null;
   overlay: SVGSVGElement | null;
-  doc: Document | null;
+  contents: Contents | null;
   onResize: (() => void) | null;
-}
-
-interface SelectionObserverState {
-  cancelPending: () => void;
-  dispose: () => void;
 }
 
 function parseCfiSectionIndex(cfi: string): number | null {
@@ -462,12 +457,6 @@ export class ReaderSession {
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
-  private viewRendered:
-    | ((section: { index?: number } | undefined, view: EpubHighlightView | undefined) => void)
-    | null = null;
-  private viewRemoved: ((section: unknown, view: EpubHighlightView | undefined) => void) | null =
-    null;
-  private renditionResized: (() => void) | null = null;
   private current: Location | null = null;
   private spine: {
     sections: SpineSection[];
@@ -488,13 +477,19 @@ export class ReaderSession {
   private lockedScrollLeft = 0;
   private displayOperationCount = 0;
   private aligningFocusTarget: Element | null = null;
+  private renderedListener:
+    ((section?: { index?: number }, view?: EpubHighlightView) => void) | null = null;
+  private removedListener: ((section?: unknown, view?: EpubHighlightView) => void) | null = null;
+  private resizedListener: (() => void) | null = null;
   private unloadedHookRegistered = false;
   private readonly trackedContents = new Set<Contents>();
   private readonly contentCleanups = new Map<Contents, Array<() => void>>();
   private highlightsBySection = new Map<number, string[]>();
   private readonly activeViews = new Map<EpubHighlightView, ActiveHighlightViewState>();
   private readonly resizingViews = new Set<EpubHighlightView>();
-  private readonly selectionObservers = new Map<Document, SelectionObserverState>();
+  private readonly pendingSelectionCancels = new Set<() => void>();
+  private readonly unloadedContents = new WeakSet<Contents>();
+  private readonly contentsFrames = new WeakMap<Contents, Node>();
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -555,27 +550,147 @@ export class ReaderSession {
     }
     if (onSelection) {
       this.rendition.hooks.content.register((contents: Contents) => {
-        this.observeSelection(contents as unknown as EpubRuntimeContents, onSelection);
+        if (!this.isContentsAlive(contents)) return;
+        const frame = contents.window?.frameElement as Node | null | undefined;
+        if (frame) this.contentsFrames.set(contents, frame);
+        disableEpubSelectionListeners(contents as unknown as EpubRuntimeContents);
+        this.registerContentFocusAndLinks(contents);
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let disposed = false;
+        let tabKeyActive = false;
+        let blurredByTab = false;
+        let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const cancelTimer = () => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        };
+        const clearTabTimer = () => {
+          if (tabResetTimer !== null) {
+            clearTimeout(tabResetTimer);
+            tabResetTimer = null;
+          }
+        };
+        const clearBlurGuard = () => {
+          clearTabTimer();
+          tabKeyActive = false;
+          blurredByTab = false;
+        };
+        const cancelPending = () => {
+          cancelTimer();
+          clearBlurGuard();
+        };
+        const shouldPreserveOnTabBlur = () => {
+          const frameEl = contents.window.frameElement as HTMLElement | null | undefined;
+          const frameLostFocus = frameEl
+            ? frameEl.ownerDocument.activeElement !== frameEl
+            : typeof contents.document.hasFocus === 'function'
+              ? !contents.document.hasFocus()
+              : false;
+          return blurredByTab || (tabKeyActive && frameLostFocus);
+        };
+        const emitSelection = () => {
+          if (disposed || !this.isContentsAlive(contents)) return;
+          if (
+            typeof contents.sectionIndex === 'number' &&
+            typeof this.current?.start?.index === 'number' &&
+            contents.sectionIndex !== this.current.start.index
+          ) {
+            return;
+          }
+          const selection = contents.window.getSelection();
+          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+          if (!hasRange || !text) {
+            if (shouldPreserveOnTabBlur()) return;
+            onSelection(null);
+            return;
+          }
+          blurredByTab = false;
+          try {
+            onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
+          } catch {
+            // Selection can change while a section is being replaced.
+          }
+        };
+        const flushPending = () => {
+          if (timer === null) return;
+          cancelTimer();
+          emitSelection();
+        };
+        const handleKeydown = (event: KeyboardEvent) => {
+          if (event.key === 'Tab') {
+            flushPending();
+            tabKeyActive = true;
+            clearTabTimer();
+            tabResetTimer = setTimeout(() => {
+              tabResetTimer = null;
+              tabKeyActive = false;
+            }, 0);
+          } else {
+            if (event.key === 'Escape') flushPending();
+            clearBlurGuard();
+          }
+        };
+        const handleWindowBlur = () => {
+          if (tabKeyActive) blurredByTab = true;
+        };
+        const handleFocusOut = (event: FocusEvent) => {
+          if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
+        };
+        const handler = () => {
+          if (disposed || !this.isContentsAlive(contents)) {
+            cancelPending();
+            return;
+          }
+          const selection = contents.window.getSelection();
+          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+          if (!hasRange || !text) {
+            cancelTimer();
+            if (shouldPreserveOnTabBlur()) return;
+            onSelection(null);
+            return;
+          }
+          blurredByTab = false;
+          cancelTimer();
+          timer = setTimeout(() => {
+            timer = null;
+            emitSelection();
+          }, SELECTION_DEBOUNCE_MS);
+        };
+        contents.document.addEventListener('keydown', handleKeydown, true);
+        contents.document.addEventListener('focusout', handleFocusOut);
+        contents.document.addEventListener('focusin', clearBlurGuard);
+        contents.document.addEventListener('pointerdown', clearBlurGuard);
+        contents.document.addEventListener('mousedown', clearBlurGuard);
+        contents.document.addEventListener('selectionchange', handler, { passive: true });
+        contents.document.addEventListener('pointerup', flushPending, { passive: true });
+        contents.document.addEventListener('mouseup', flushPending, { passive: true });
+        contents.document.addEventListener('touchend', flushPending, { passive: true });
+        contents.window.addEventListener?.('blur', handleWindowBlur);
+        contents.window.addEventListener?.('focus', clearBlurGuard);
+        this.pendingSelectionCancels.add(cancelPending);
+        this.addContentCleanup(contents, () => {
+          disposed = true;
+          cancelPending();
+          this.pendingSelectionCancels.delete(cancelPending);
+          contents.document.removeEventListener('keydown', handleKeydown, true);
+          contents.document.removeEventListener('focusout', handleFocusOut);
+          contents.document.removeEventListener('focusin', clearBlurGuard);
+          contents.document.removeEventListener('pointerdown', clearBlurGuard);
+          contents.document.removeEventListener('mousedown', clearBlurGuard);
+          contents.document.removeEventListener('selectionchange', handler);
+          contents.document.removeEventListener('pointerup', flushPending);
+          contents.document.removeEventListener('mouseup', flushPending);
+          contents.document.removeEventListener('touchend', flushPending);
+          contents.window.removeEventListener?.('blur', handleWindowBlur);
+          contents.window.removeEventListener?.('focus', clearBlurGuard);
+        });
       });
     }
-    this.viewRendered = (section, view) => {
-      this.handleViewRendered(section, view);
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.syncVisibleColumnLinks();
-    };
-    this.viewRemoved = (_section, view) => {
-      this.disposeHighlightView(view);
-    };
-    this.renditionResized = () => {
-      this.syncActiveHighlights(true);
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.syncVisibleColumnLinks();
-    };
-    this.rendition.on('rendered', this.viewRendered);
-    this.rendition.on('removed', this.viewRemoved);
-    this.rendition.on('resized', this.renditionResized);
     this.onLocation = onLocation;
     this.relocated = (location) => {
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
@@ -605,6 +720,26 @@ export class ReaderSession {
       }
     };
     this.rendition.on('relocated', this.relocated);
+    this.renderedListener = (section, view) => {
+      this.handleViewRendered(section, view);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.removedListener = (_section, view) => {
+      this.disposeHighlightView(view);
+    };
+    this.resizedListener = () => {
+      this.cancelPendingSelections();
+      this.cleanupDetachedContents();
+      this.syncActiveHighlights(true);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.rendition.on('rendered', this.renderedListener);
+    this.rendition.on('removed', this.removedListener);
+    this.rendition.on('resized', this.resizedListener);
     this.contentClick = (event, contents) => {
       const eventTarget = event.target as Element | null;
       const selection = contents.window.getSelection();
@@ -749,7 +884,7 @@ export class ReaderSession {
         continue;
       }
       if (state.sectionIndex !== null && changedSections.has(state.sectionIndex)) {
-        this.renderViewHighlights(view, state);
+        this.syncViewHighlights(view, state, true);
       }
     }
   }
@@ -982,20 +1117,18 @@ export class ReaderSession {
       this.epubContainer = null;
     }
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
+    if (this.rendition && this.renderedListener)
+      this.rendition.off('rendered', this.renderedListener);
+    if (this.rendition && this.removedListener) this.rendition.off('removed', this.removedListener);
+    if (this.rendition && this.resizedListener) this.rendition.off('resized', this.resizedListener);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
-    if (this.rendition && this.viewRendered) this.rendition.off('rendered', this.viewRendered);
-    if (this.rendition && this.viewRemoved) this.rendition.off('removed', this.viewRemoved);
-    if (this.rendition && this.renditionResized)
-      this.rendition.off('resized', this.renditionResized);
     for (const view of [...this.activeViews.keys()]) {
       this.disposeHighlightView(view);
     }
-    for (const observer of [...this.selectionObservers.values()]) {
-      observer.dispose();
-    }
     this.resizingViews.clear();
+    this.pendingSelectionCancels.clear();
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -1007,11 +1140,11 @@ export class ReaderSession {
     this.unloadedHookRegistered = false;
     this.rendition = null;
     this.relocated = null;
+    this.renderedListener = null;
+    this.removedListener = null;
+    this.resizedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
-    this.viewRendered = null;
-    this.viewRemoved = null;
-    this.renditionResized = null;
     this.onLocation = null;
     this.current = null;
     this.userNavigationPending = false;
@@ -1038,167 +1171,56 @@ export class ReaderSession {
     this.book.destroy();
   }
 
-  private observeSelection(
-    contents: EpubRuntimeContents,
-    onSelection: (selection: ReaderSelection | null) => void,
-  ): void {
-    disableEpubSelectionListeners(contents);
-    this.registerContentFocusAndLinks(contents as unknown as Contents);
-    const doc = contents.document;
-    for (const [existingDoc, observer] of [...this.selectionObservers.entries()]) {
-      if (existingDoc === doc || existingDoc.defaultView === null) {
-        observer.dispose();
-      }
+  private cancelPendingSelections(): void {
+    for (const cancel of [...this.pendingSelectionCancels]) {
+      cancel();
     }
-
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let tabKeyActive = false;
-    let blurredByTab = false;
-    let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const clearTabTimer = () => {
-      if (tabResetTimer !== null) {
-        clearTimeout(tabResetTimer);
-        tabResetTimer = null;
-      }
-    };
-
-    const cancelTimer = () => {
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    };
-
-    const clearBlurGuard = () => {
-      clearTabTimer();
-      tabKeyActive = false;
-      blurredByTab = false;
-    };
-
-    const cancelPending = () => {
-      cancelTimer();
-      clearBlurGuard();
-    };
-
-    const shouldPreserveSelectionOnTabBlur = () => {
-      const frame = contents.window.frameElement as HTMLElement | null | undefined;
-      const frameLostFocus = frame
-        ? frame.ownerDocument.activeElement !== frame
-        : typeof doc.hasFocus === 'function'
-          ? !doc.hasFocus()
-          : false;
-      return blurredByTab || (tabKeyActive && frameLostFocus);
-    };
-
-    const emitCurrentSelection = () => {
-      const selection = contents.window.getSelection();
-      const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
-      const text = hasRange ? normalizePassageText(selection!.toString()) : '';
-      if (!hasRange || !text) {
-        if (shouldPreserveSelectionOnTabBlur()) return;
-        onSelection(null);
-        return;
-      }
-      blurredByTab = false;
-      try {
-        onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
-      } catch {
-        // Selection can change while a section is being replaced.
-      }
-    };
-
-    const flushPending = () => {
-      if (timer === null) return;
-      cancelTimer();
-      emitCurrentSelection();
-    };
-
-    const handleKeydown = (event: KeyboardEvent) => {
-      if (event.key === 'Tab') {
-        flushPending();
-        tabKeyActive = true;
-        clearTabTimer();
-        tabResetTimer = setTimeout(() => {
-          tabResetTimer = null;
-          tabKeyActive = false;
-        }, 0);
-      } else {
-        if (event.key === 'Escape') flushPending();
-        clearBlurGuard();
-      }
-    };
-
-    const handleWindowBlur = () => {
-      if (tabKeyActive) blurredByTab = true;
-    };
-
-    const handleFocusOut = (event: FocusEvent) => {
-      if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
-    };
-
-    const onSelectionChange = () => {
-      const selection = contents.window.getSelection();
-      const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
-      const text = hasRange ? normalizePassageText(selection!.toString()) : '';
-      if (!hasRange || !text) {
-        cancelTimer();
-        if (shouldPreserveSelectionOnTabBlur()) return;
-        onSelection(null);
-        return;
-      }
-      blurredByTab = false;
-      cancelTimer();
-      timer = setTimeout(() => {
-        timer = null;
-        emitCurrentSelection();
-      }, SELECTION_DEBOUNCE_MS);
-    };
-
-    let disposed = false;
-    const dispose = () => {
-      if (disposed) return;
-      disposed = true;
-      cancelPending();
-      doc.removeEventListener('keydown', handleKeydown, true);
-      doc.removeEventListener('focusout', handleFocusOut);
-      doc.removeEventListener('focusin', clearBlurGuard);
-      doc.removeEventListener('pointerdown', clearBlurGuard);
-      doc.removeEventListener('mousedown', clearBlurGuard);
-      doc.removeEventListener('selectionchange', onSelectionChange);
-      doc.removeEventListener('pointerup', flushPending);
-      doc.removeEventListener('mouseup', flushPending);
-      doc.removeEventListener('touchend', flushPending);
-      contents.window.removeEventListener?.('blur', handleWindowBlur);
-      contents.window.removeEventListener?.('focus', clearBlurGuard);
-      if (this.selectionObservers.get(doc)?.dispose === dispose) {
-        this.selectionObservers.delete(doc);
-      }
-    };
-
-    doc.addEventListener('keydown', handleKeydown, true);
-    doc.addEventListener('focusout', handleFocusOut);
-    doc.addEventListener('focusin', clearBlurGuard);
-    doc.addEventListener('pointerdown', clearBlurGuard);
-    doc.addEventListener('mousedown', clearBlurGuard);
-    doc.addEventListener('selectionchange', onSelectionChange, { passive: true });
-    doc.addEventListener('pointerup', flushPending, { passive: true });
-    doc.addEventListener('mouseup', flushPending, { passive: true });
-    doc.addEventListener('touchend', flushPending, { passive: true });
-    contents.window.addEventListener?.('blur', handleWindowBlur);
-    contents.window.addEventListener?.('focus', clearBlurGuard);
-    this.selectionObservers.set(doc, { cancelPending, dispose });
-    this.addContentCleanup(contents as unknown as Contents, dispose);
   }
 
-  private cancelPendingSelections(): void {
-    for (const observer of this.selectionObservers.values()) {
-      observer.cancelPending();
+  private isContentsAlive(contents: Contents): boolean {
+    if (!this.rendition || this.unloadedContents.has(contents)) return false;
+    const frame =
+      (contents.window?.frameElement as Node | null | undefined) ??
+      this.contentsFrames.get(contents);
+    const container = this.bindEpubContainer(contents);
+    return !container || !frame || container.contains(frame);
+  }
+
+  private cleanupDetachedContents(): void {
+    for (const contents of [...this.trackedContents]) {
+      if (!this.isContentsAlive(contents)) {
+        this.cleanupContents(contents);
+      }
     }
   }
 
   private isViewAlive(view: EpubHighlightView): boolean {
-    return Boolean(view.element && view.contents && view.displayed !== false);
+    if (!this.rendition || !view.element || !view.contents || view.displayed === false) {
+      return false;
+    }
+    const container = this.bindEpubContainer(view.contents as unknown as Contents);
+    if (container && !container.contains(view.element)) return false;
+    const rendition = this.rendition as unknown as {
+      views?: () =>
+        | EpubHighlightView[]
+        | {
+            indexOf?: (item: EpubHighlightView) => number;
+            forEach?: (callback: (item: EpubHighlightView) => void) => void;
+          };
+    };
+    if (typeof rendition.views === 'function') {
+      const views = rendition.views();
+      if (Array.isArray(views)) return views.includes(view);
+      if (typeof views?.indexOf === 'function') return views.indexOf(view) !== -1;
+      if (typeof views?.forEach === 'function') {
+        let found = false;
+        views.forEach((item) => {
+          if (item === view) found = true;
+        });
+        return found;
+      }
+    }
+    return true;
   }
 
   private resolveViewSectionIndex(
@@ -1215,10 +1237,16 @@ export class ReaderSession {
     section?: { index?: number },
   ): ActiveHighlightViewState {
     const sectionIndex = this.resolveViewSectionIndex(view, section);
+    const contents = (view.contents as unknown as Contents | undefined) ?? null;
+    if (contents) {
+      this.unloadedContents.delete(contents);
+      const frame = contents.window?.frameElement as Node | null | undefined;
+      if (frame) this.contentsFrames.set(contents, frame);
+    }
     const existing = this.activeViews.get(view);
     if (existing) {
       if (sectionIndex !== null) existing.sectionIndex = sectionIndex;
-      if (view.contents?.document) existing.doc = view.contents.document;
+      if (contents) existing.contents = contents;
       return existing;
     }
     const onResize =
@@ -1226,13 +1254,13 @@ export class ReaderSession {
         ? () => {
             if (this.resizingViews.has(view) || !this.isViewAlive(view)) return;
             const currentState = this.activeViews.get(view);
-            if (currentState) this.renderViewHighlights(view, currentState);
+            if (currentState) this.syncViewHighlights(view, currentState, false);
           }
         : null;
     const state: ActiveHighlightViewState = {
       sectionIndex,
       overlay: null,
-      doc: view.contents?.document ?? null,
+      contents,
       onResize,
     };
     this.activeViews.set(view, state);
@@ -1262,6 +1290,7 @@ export class ReaderSession {
     section: { index?: number } | undefined,
     view: EpubHighlightView | undefined,
   ): void {
+    this.cleanupDetachedContents();
     for (const existingView of [...this.activeViews.keys()]) {
       if (existingView !== view && !this.isViewAlive(existingView)) {
         this.disposeHighlightView(existingView);
@@ -1288,27 +1317,36 @@ export class ReaderSession {
     state: ActiveHighlightViewState,
     checkResize: boolean,
   ): void {
-    if (checkResize && view.contents?.resizeCheck) {
+    const cfis =
+      state.sectionIndex !== null ? this.highlightsBySection.get(state.sectionIndex) : undefined;
+    if (!view.element || !view.contents || !cfis || cfis.length === 0) {
+      state.overlay?.remove();
+      state.overlay = null;
+      return;
+    }
+    if (checkResize && view.contents.resizeCheck) {
       this.resizingViews.add(view);
       try {
         view.contents.resizeCheck();
       } finally {
         this.resizingViews.delete(view);
       }
+      if (!this.isViewAlive(view)) {
+        this.disposeHighlightView(view);
+        return;
+      }
     }
-    this.renderViewHighlights(view, state);
+    this.renderViewHighlights(view, state, cfis);
   }
 
-  private renderViewHighlights(view: EpubHighlightView, state: ActiveHighlightViewState): void {
+  private renderViewHighlights(
+    view: EpubHighlightView,
+    state: ActiveHighlightViewState,
+    cfis: readonly string[],
+  ): void {
     const container = view.element;
     const contents = view.contents;
-    const cfis =
-      state.sectionIndex !== null ? this.highlightsBySection.get(state.sectionIndex) : undefined;
-    if (!container || !contents || !cfis || cfis.length === 0) {
-      state.overlay?.remove();
-      state.overlay = null;
-      return;
-    }
+    if (!container || !contents) return;
 
     const containerRect = container.getBoundingClientRect?.();
     const iframeRect = view.iframe?.getBoundingClientRect?.();
@@ -1402,17 +1440,19 @@ export class ReaderSession {
     if (state) {
       if (state.onResize) view.off?.('resized', state.onResize);
       state.overlay?.remove();
-      if (state.doc) this.selectionObservers.get(state.doc)?.dispose();
+      state.overlay = null;
       this.activeViews.delete(view);
+      if (state.contents) this.cleanupContents(state.contents);
     }
-    const doc = view.contents?.document;
-    if (doc) this.selectionObservers.get(doc)?.dispose();
     if (view.contents) this.cleanupContents(view.contents as unknown as Contents);
   }
 
   private async prepareContents(contents: Contents): Promise<void> {
+    const frame = contents.window?.frameElement as Node | null | undefined;
+    if (frame) this.contentsFrames.set(contents, frame);
     disableEpubSelectionListeners(contents as unknown as EpubRuntimeContents);
     await this.harden(contents);
+    if (!this.isContentsAlive(contents)) return;
     this.registerContentFocusAndLinks(contents);
     this.syncVisibleColumnLinks();
   }
@@ -1483,6 +1523,7 @@ export class ReaderSession {
   }
 
   private cleanupContents(contents: Contents): void {
+    this.unloadedContents.add(contents);
     const cleanups = this.contentCleanups.get(contents);
     if (cleanups) {
       for (const cleanup of cleanups) cleanup();
@@ -1872,6 +1913,7 @@ export class ReaderSession {
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
+    this.cancelPendingSelections();
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
@@ -1885,6 +1927,7 @@ export class ReaderSession {
   private beginLinkedNavigation(): void {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
+    this.cancelPendingSelections();
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;

@@ -80,7 +80,10 @@ function location(cfi: string): Location {
 describe('ReaderSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRendition.display.mockImplementation(async () => {});
+    mockRendition.resize.mockImplementation(() => {});
     mockRendition.getContents.mockReturnValue([]);
+    (mockRendition as { views?: unknown }).views = undefined;
     mockBook.packaging = { navPath: '', ncxPath: '' };
     mockBook.navigation.toc = [];
     mockBook.spine.sections = [...defaultSpineSections];
@@ -699,7 +702,7 @@ describe('ReaderSession', () => {
     const removed = mockRendition.on.mock.calls.find(([name]) => name === 'removed')?.[1];
     const click = mockRendition.on.mock.calls.find(([name]) => name === 'click')?.[1];
 
-    // Chapter with zero highlights skips SVG creation completely.
+    // Chapter with zero highlights skips resizeCheck and SVG creation completely.
     const emptyViewElement = document.createElement('div');
     const emptyView = {
       index: 1,
@@ -713,7 +716,7 @@ describe('ReaderSession', () => {
       },
     };
     rendered({ index: 1 }, emptyView);
-    expect(emptyView.contents.resizeCheck).toHaveBeenCalledOnce();
+    expect(emptyView.contents.resizeCheck).not.toHaveBeenCalled();
     expect(emptyViewElement.querySelector('svg')).toBeNull();
 
     // Chapter with highlights runs resizeCheck before reading client rects and tolerates stale CFIs.
@@ -851,6 +854,205 @@ describe('ReaderSession', () => {
     );
 
     expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+    session.destroy();
+  });
+
+  it('aborts an in-flight display during a resize, cleans up the aborted view, and reports the final CFI', async () => {
+    vi.useFakeTimers();
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const firstHighlightCfi = 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:8)';
+    const secondHighlightCfi = 'epubcfi(/6/4!/4/2/1:0,/1:0,/1:8)';
+    const initialCfi = 'epubcfi(/6/2!/4/2/1:0)';
+    const targetCfi = 'epubcfi(/6/4!/4/2/1:0)';
+    const finalCfi = 'epubcfi(/6/2!/4/2/1:6)';
+
+    const viewport = document.createElement('div');
+    const container = document.createElement('div');
+    container.className = 'epub-container';
+    viewport.append(container);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
+    vi.spyOn(container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 400));
+
+    let activeViews: unknown[] = [];
+    (mockRendition as { views?: () => unknown[] }).views = () => activeViews;
+
+    const onLocation = vi.fn();
+    const onSelection = vi.fn();
+    const session = new ReaderSession('book.epub');
+    session.updateHighlights([{ cfi: firstHighlightCfi }, { cfi: secondHighlightCfi }]);
+
+    await session.open(
+      viewport,
+      initialCfi,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+      onSelection,
+    );
+
+    const prepareContents = mockRendition.hooks.content.register.mock.calls[0]?.[0];
+    const registerSelection = mockRendition.hooks.content.register.mock.calls[1]?.[0];
+    const rendered = mockRendition.on.mock.calls.find(([name]) => name === 'rendered')?.[1];
+    const resized = mockRendition.on.mock.calls.find(([name]) => name === 'resized')?.[1];
+    const relocated = getRenditionListener('relocated');
+
+    const makeView = (sectionIndex: number, rect: DOMRect) => {
+      const element = document.createElement('div');
+      const iframe = document.createElement('iframe');
+      element.append(iframe);
+      vi.spyOn(element, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 480, 640));
+      vi.spyOn(iframe, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 480, 640));
+      const doc = document.implementation.createHTMLDocument(`section-${sectionIndex}`);
+      const paragraph = doc.createElement('p');
+      paragraph.textContent = `Section ${sectionIndex} passage`;
+      doc.body.append(paragraph);
+      const contentsWindow = new EventTarget() as Window & EventTarget;
+      Object.defineProperties(contentsWindow, {
+        frameElement: { value: iframe, configurable: true },
+        scrollX: { value: 0 },
+        scrollY: { value: 0 },
+        getSelection: {
+          value: () => ({
+            isCollapsed: false,
+            rangeCount: 1,
+            toString: () => paragraph.textContent ?? '',
+            getRangeAt: () => {
+              const range = doc.createRange();
+              range.selectNodeContents(paragraph);
+              return range;
+            },
+          }),
+        },
+      });
+      const contents = {
+        document: doc,
+        window: contentsWindow,
+        sectionIndex,
+        resizeCheck: vi.fn(),
+        cfiFromRange: () => `epubcfi(/6/${(sectionIndex + 1) * 2}!/4/2/1:0,/1:0,/1:7)`,
+        range: () => ({ getClientRects: () => [rect] }) as unknown as Range,
+      };
+      return {
+        index: sectionIndex,
+        displayed: true as boolean,
+        element,
+        iframe,
+        contents: contents as typeof contents | undefined,
+        rawContents: contents,
+      };
+    };
+
+    const initialView = makeView(0, new DOMRect(20, 32, 160, 20));
+    container.append(initialView.element);
+    activeViews = [initialView];
+    await prepareContents(initialView.rawContents);
+    registerSelection(initialView.rawContents);
+    rendered({ index: 0 }, initialView);
+    relocated({
+      start: {
+        cfi: initialCfi,
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 4 },
+      },
+    } as Location);
+
+    expect(initialView.element.querySelector('svg.turnleaf-highlight-layer')).not.toBeNull();
+
+    // Start a debounced selection on Chapter 1, then kick off an in-flight display to Chapter 2.
+    initialView.rawContents.document.dispatchEvent(new Event('selectionchange'));
+    onLocation.mockClear();
+    onSelection.mockClear();
+
+    const abortedView = makeView(1, new DOMRect(24, 40, 180, 22));
+    let rejectInFlightDisplay: ((reason?: unknown) => void) | null = null;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          container.append(abortedView.element);
+          activeViews = [abortedView];
+          rejectInFlightDisplay = reject;
+        }),
+    );
+
+    const inFlightDisplay = session.displayCfi(targetCfi);
+
+    // Resize arrives while displayCfi(targetCfi) is still in flight, clearing views and aborting the display.
+    mockRendition.resize.mockImplementationOnce(() => {
+      initialView.displayed = false;
+      initialView.contents = undefined;
+      initialView.element.remove();
+      abortedView.element.remove();
+      activeViews = [];
+      rejectInFlightDisplay?.(new Error('Display aborted by resize'));
+      resized?.();
+    });
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+    expect(await inFlightDisplay).toBe(false);
+
+    // Late callbacks from the orphaned view must not render overlays, run resizeCheck, or attach listeners.
+    await prepareContents(abortedView.rawContents);
+    registerSelection(abortedView.rawContents);
+    rendered({ index: 1 }, abortedView);
+    abortedView.rawContents.document.dispatchEvent(new Event('selectionchange'));
+    expect(abortedView.rawContents.resizeCheck).not.toHaveBeenCalled();
+    expect(abortedView.element.querySelector('svg')).toBeNull();
+    expect(initialView.element.querySelector('svg')).toBeNull();
+
+    // The resize reflow completes on Chapter 1 and reports the final reflowed CFI as a restore.
+    const resizedView = makeView(0, new DOMRect(36, 64, 240, 24));
+    container.append(resizedView.element);
+    activeViews = [resizedView];
+    await prepareContents(resizedView.rawContents);
+    registerSelection(resizedView.rawContents);
+    rendered({ index: 0 }, resizedView);
+    relocated({
+      start: {
+        cfi: finalCfi,
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0.1,
+        displayed: { page: 1, total: 6 },
+      },
+    } as Location);
+
+    vi.advanceTimersByTime(200);
+
+    expect(onSelection).toHaveBeenCalledExactlyOnceWith(null);
+    expect(resizedView.rawContents.resizeCheck).toHaveBeenCalledOnce();
+    const resizedRect = resizedView.element.querySelector('g.turnleaf-highlight rect');
+    expect(resizedRect?.getAttribute('x')).toBe('36');
+    expect(resizedRect?.getAttribute('y')).toBe('64');
+    expect(onLocation).toHaveBeenCalledOnce();
+    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({
+        cfi: finalCfi,
+        href: 'first.xhtml',
+        spineIndex: 0,
+        pageIndex: 0,
+        pageCount: 6,
+      }),
+    );
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
     session.destroy();
   });
 
