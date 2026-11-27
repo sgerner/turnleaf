@@ -362,6 +362,7 @@
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
   let pluginConnected = true;
+  let connectivitySequence = 0;
   let webViewOnlineTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
@@ -442,6 +443,24 @@
 
   function handleWindowOffline(): void {
     applyConnectivity();
+  }
+
+  function handleNativeNetworkChange(connected: boolean): void {
+    const sequence = ++connectivitySequence;
+    if (connected) {
+      applyConnectivity(true);
+      return;
+    }
+    applyConnectivity(false);
+    if (!Capacitor.isNativePlatform()) return;
+    void Network.getStatus()
+      .then((status) => {
+        if (destroyed || sequence !== connectivitySequence) return;
+        if (status.connected) {
+          applyConnectivity(true);
+        }
+      })
+      .catch(() => {});
   }
 
   function clearSyncTimer(): void {
@@ -924,7 +943,7 @@
     cleanups.push(
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
-          applyConnectivity(connected);
+          handleNativeNetworkChange(connected);
         }),
       ),
     );

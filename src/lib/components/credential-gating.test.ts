@@ -1514,6 +1514,13 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       expect(nativeCalls.length).toBeGreaterThanOrEqual(1);
       expect(nativeCalls.length).toBeLessThanOrEqual(2);
 
+      // Android cellular-to-Wi-Fi default network handover emits onLost(cellular) -> connected: false
+      // even though Network.getStatus() remains connected: true on Wi-Fi
+      for (const listener of runtime.networkListeners) {
+        listener({ connected: false, connectionType: 'none' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
       // Rotate API key in Settings and verify queued progress flushes cleanly without transient missing alerts
       const recoverBtn = target.querySelector<HTMLButtonElement>('[data-credential-recover]');
       expect(recoverBtn).not.toBeNull();

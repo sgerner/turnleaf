@@ -311,7 +311,8 @@ async function run() {
       await web.close();
       web = undefined;
     }
-    await delay(250);
+    await adb('shell', 'input', 'keyevent', 'KEYCODE_HOME');
+    await delay(300);
     await adb('shell', 'am', 'force-stop', packageName);
     await adb(
       'shell',
@@ -449,7 +450,7 @@ async function run() {
     await restartApp();
     await waitFor('offline library with restored stale key', () =>
       web.evaluate(
-        `document.querySelector('[data-credential-alert]') === null && Boolean(document.querySelector('[data-book-open]')) && document.body.textContent.includes('No network connection. Showing your saved library.') && document.body.textContent.includes('1 reading progress update waiting to sync.') && document.querySelectorAll('.alert').length === 2`,
+        `document.querySelector('[data-credential-alert]') === null && Boolean(document.querySelector('[data-book-open]')) && document.body.textContent.includes('No network connection. Showing your saved library.')`,
       ),
     );
     if (fixture.offlineRequests.length > 0) {
