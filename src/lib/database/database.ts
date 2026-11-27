@@ -102,14 +102,14 @@ export function mergeReaderPreferenceValue(
         }
         const existingDate = typeof existing.createdAt === 'string' ? existing.createdAt : '';
         const nextDate = typeof next.createdAt === 'string' ? next.createdAt : '';
+        const existingNote = typeof existing.note === 'string' ? existing.note.trim() : '';
         const nextNote = typeof next.note === 'string' ? next.note.trim() : '';
         if (nextDate >= existingDate || nextNote) {
-          merged.set(key, nextNote ? next : { ...next, note: existing.note ?? next.note });
+          merged.set(key, nextNote ? next : { ...next, note: existingNote || next.note });
         }
       });
-      return JSON.stringify([...merged.values()].slice(-200));
+      return JSON.stringify([...merged.values()]);
     }
-    const limit = prefix === 'readerHistory:' ? 12 : 100;
     const merged = new Map<string, Record<string, unknown>>();
     const keyOf = (entry: unknown, index: number): string => {
       if (!entry || typeof entry !== 'object') return `idx:${index}`;
@@ -130,7 +130,8 @@ export function mergeReaderPreferenceValue(
       const nextSaved = typeof record.savedAt === 'string' ? record.savedAt : '';
       if (nextSaved > existingSaved) merged.set(key, record);
     }
-    return JSON.stringify([...merged.values()].slice(0, limit));
+    const values = [...merged.values()];
+    return JSON.stringify(prefix === 'readerHistory:' ? values.slice(0, 12) : values);
   } catch {
     return newRaw;
   }
