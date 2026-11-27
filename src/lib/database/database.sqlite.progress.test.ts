@@ -1280,7 +1280,7 @@ describe('native progress transactions against SQLite', () => {
     expect(native.database?.prepare('PRAGMA foreign_key_check').all() ?? []).toEqual([]);
   });
 
-  it('reconciles missing #330 v8 columns on a populated #328-only v8 SQLite file during openDatabase and syncs remapped progress', async () => {
+  it('upgrades a populated v7 SQLite file (including pre-existing remote_file_size) idempotently to v8 during openDatabase and syncs remapped progress', async () => {
     const { migrations } = await import('./schema');
     const seeded = new DatabaseSync(native.databasePath);
     seeded.exec('PRAGMA foreign_keys = ON;');
@@ -1288,16 +1288,7 @@ describe('native progress transactions against SQLite', () => {
       seeded.exec(migration.statements);
       seeded.exec(`PRAGMA user_version = ${migration.version};`);
     }
-    seeded.exec(`
-      ALTER TABLE books ADD COLUMN file_id INTEGER;
-      ALTER TABLE books ADD COLUMN file_name TEXT;
-      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
-      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
-      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
-      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
-      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
-      PRAGMA user_version = 8;
-    `);
+    seeded.exec('ALTER TABLE books ADD COLUMN remote_file_size INTEGER;');
     const ts = '2026-08-15T00:00:00.000Z';
     seeded
       .prepare(
@@ -1311,12 +1302,10 @@ describe('native progress transactions against SQLite', () => {
         `INSERT INTO books
           (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
            description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
-           pages, pages_read, created_at, last_read_at, remote_available,
-           file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress)
+           pages, pages_read, created_at, last_read_at, remote_available, remote_file_size)
           VALUES ('server:42:100', ?, 1, 42, 10, 100, 'Earthsea', 'Ursula K. Le Guin', 'Earthsea Cycle',
            NULL, 'epub', ?, 'books/earthsea-1.epub', 'available', 220000,
-           200, 90, ?, ?, 1,
-           2114, 'earthsea-1.epub', 220000, 0, 1, 1)`,
+           200, 90, ?, ?, 1, 220000)`,
       )
       .run(server.id, ts, ts, ts);
     seeded
@@ -1387,22 +1376,48 @@ describe('native progress transactions against SQLite', () => {
       }),
     ]);
 
+    const columns = (
+      native.database?.prepare("PRAGMA table_info('books')").all() as Array<{ name: string }>
+    ).map((col) => col.name);
+    expect(columns).toEqual([
+      'id',
+      'server_id',
+      'library_id',
+      'series_id',
+      'volume_id',
+      'chapter_id',
+      'title',
+      'author',
+      'series',
+      'description_html',
+      'cover_path',
+      'format',
+      'metadata_refreshed_at',
+      'download_path',
+      'download_status',
+      'file_size',
+      'pages',
+      'pages_read',
+      'created_at',
+      'last_read_at',
+      'remote_available',
+      'remote_file_size',
+      'downloaded_bytes',
+      'downloaded_pages',
+      'chapter_key',
+    ]);
+
     const rawRow = native.database
       ?.prepare(
-        `SELECT file_id, file_name, remote_file_size, downloaded_bytes, downloaded_pages,
-          chapter_key, multi_file_chapter, sync_progress
+        `SELECT remote_file_size, downloaded_bytes, downloaded_pages, chapter_key
          FROM books WHERE id='server:42:101'`,
       )
       .get();
     expect(rawRow).toEqual({
-      file_id: 2114,
-      file_name: 'earthsea-1.epub',
       remote_file_size: 260000,
       downloaded_bytes: 220000,
       downloaded_pages: 200,
       chapter_key: 'isbn:9780547773742',
-      multi_file_chapter: 1,
-      sync_progress: 1,
     });
     const versionRow = native.database?.prepare('PRAGMA user_version').get() as {
       user_version: number;

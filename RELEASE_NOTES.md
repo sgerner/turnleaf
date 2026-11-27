@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Coordinate idempotent SQLite v8 migration across open PRs
-- test: preserve database exports in reader alert mock
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

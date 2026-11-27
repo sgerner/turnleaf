@@ -442,77 +442,54 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
   }
 });
 
-it('reconciles missing #330 v8 columns on a #328-only v8 database without duplicating remote_file_size', async () => {
+it('checks PRAGMA table_info before ALTER TABLE ADD COLUMN and skips pre-existing v8 columns when upgrading from v7', async () => {
   const { openDatabase, resetLocalDatabase } = await import('./database');
   await resetLocalDatabase();
-  mocks.setDatabaseVersion(8);
+  mocks.setDatabaseVersion(7);
   mocks.executeTransaction.mockClear();
   mocks.db.query.mockResolvedValueOnce({
     values: [
-      { kind: 'column', name: 'id' },
-      { kind: 'column', name: 'file_id' },
-      { kind: 'column', name: 'file_name' },
-      { kind: 'column', name: 'remote_file_size' },
-      { kind: 'column', name: 'chapter_epub_index' },
-      { kind: 'column', name: 'multi_file_chapter' },
-      { kind: 'column', name: 'sync_progress' },
-      { kind: 'index', name: 'books_server_file_idx' },
+      { cid: 0, name: 'id', type: 'TEXT' },
+      { cid: 21, name: 'remote_file_size', type: 'INTEGER' },
+      { cid: 22, name: 'downloaded_bytes', type: 'INTEGER' },
     ],
   });
 
   await openDatabase();
 
+  expect(mocks.db.query).toHaveBeenCalledExactlyOnceWith("PRAGMA table_info('books');");
   expect(mocks.executeTransaction).toHaveBeenCalledOnce();
   const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
-  expect(tasks).toHaveLength(1);
-  const statement = tasks?.[0]?.statement ?? '';
-  expect(statement).toContain('ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;');
-  expect(statement).toContain('ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;');
-  expect(statement).toContain('ALTER TABLE books ADD COLUMN chapter_key TEXT;');
-  expect(statement).not.toContain('remote_file_size');
-  expect(statement).not.toContain('ADD COLUMN file_id');
-  expect(JSON.stringify(tasks)).not.toContain('PRAGMA user_version');
+  expect(tasks).toEqual([
+    {
+      statement: [
+        'ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;',
+        'ALTER TABLE books ADD COLUMN chapter_key TEXT;',
+      ].join('\n'),
+    },
+    { statement: 'PRAGMA user_version = 8;' },
+  ]);
 });
 
-it('reconciles missing #328 v8 columns and index on a #330-only database already at v10 without downgrading user_version', async () => {
+it('skips all ALTER TABLE ADD COLUMN statements and advances user_version when all v8 columns already exist at v7', async () => {
   const { openDatabase, resetLocalDatabase } = await import('./database');
   await resetLocalDatabase();
-  mocks.setDatabaseVersion(10);
+  mocks.setDatabaseVersion(7);
   mocks.executeTransaction.mockClear();
   mocks.db.query.mockResolvedValueOnce({
     values: [
-      { kind: 'column', name: 'id' },
-      { kind: 'column', name: 'remote_file_size' },
-      { kind: 'column', name: 'downloaded_bytes' },
-      { kind: 'column', name: 'downloaded_pages' },
-      { kind: 'column', name: 'chapter_key' },
-      { kind: 'column', name: 'sort_order' },
-      { kind: 'column', name: 'min_number' },
-      { kind: 'column', name: 'volume_number' },
+      { cid: 0, name: 'id', type: 'TEXT' },
+      { cid: 21, name: 'remote_file_size', type: 'INTEGER' },
+      { cid: 22, name: 'downloaded_bytes', type: 'INTEGER' },
+      { cid: 23, name: 'downloaded_pages', type: 'INTEGER' },
+      { cid: 24, name: 'chapter_key', type: 'TEXT' },
     ],
   });
 
   await openDatabase();
 
+  expect(mocks.db.query).toHaveBeenCalledExactlyOnceWith("PRAGMA table_info('books');");
   expect(mocks.executeTransaction).toHaveBeenCalledOnce();
   const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
-  expect(tasks).toHaveLength(1);
-  const statement = tasks?.[0]?.statement ?? '';
-  expect(statement).toContain('ALTER TABLE books ADD COLUMN file_id INTEGER;');
-  expect(statement).toContain('ALTER TABLE books ADD COLUMN file_name TEXT;');
-  expect(statement).toContain(
-    'ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;',
-  );
-  expect(statement).toContain(
-    'ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;',
-  );
-  expect(statement).toContain(
-    'ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;',
-  );
-  expect(statement).toContain(
-    'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);',
-  );
-  expect(statement).not.toContain('remote_file_size');
-  expect(statement).not.toContain('downloaded_bytes');
-  expect(JSON.stringify(tasks)).not.toContain('PRAGMA user_version');
+  expect(tasks).toEqual([{ statement: 'PRAGMA user_version = 8;' }]);
 });
