@@ -45,22 +45,8 @@
 
 <style>
   .dialog-backdrop {
-    padding-top: max(
-      1rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    padding-inline-end: max(
-      1rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      1rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
-    padding-inline-start: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
+    padding: max(1rem, var(--safe-top, 0px)) max(1rem, var(--safe-right, 0px))
+      max(1rem, var(--safe-bottom, 0px)) max(1rem, var(--safe-left, 0px));
   }
 
   .dialog-card {
@@ -76,25 +62,8 @@
 
   @media (max-height: 24rem) {
     .dialog-backdrop {
-      padding-top: max(
-        0.25rem,
-        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-      );
-      padding-inline-end: max(
-        0.5rem,
-        var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-      );
-      padding-bottom: max(
-        0.25rem,
-        var(
-          --safe-bottom,
-          max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
-        )
-      );
-      padding-inline-start: max(
-        0.5rem,
-        var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-      );
+      padding: max(0.25rem, var(--safe-top, 0px)) max(0.5rem, var(--safe-right, 0px))
+        max(0.25rem, var(--safe-bottom, 0px)) max(0.5rem, var(--safe-left, 0px));
     }
 
     .dialog-card {

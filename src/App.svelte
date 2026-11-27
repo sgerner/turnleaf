@@ -63,8 +63,8 @@
   let apiKey = $state<string | null>(null);
   let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
-  let releaseBanner = $state<ReleaseBanner | null>(null);
   let readerOpen = $state(false);
+  let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
 
   async function loadLocalData(): Promise<void> {
@@ -73,7 +73,6 @@
     server = null;
     apiKey = null;
     readerOpen = false;
-    stageOverlayActive = false;
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -172,44 +171,46 @@
 
   {#if releaseBanner}
     <div class="release-banner" inert={readerOpen || stageOverlayActive} transition:fade>
-      <div
-        class="mx-auto flex w-full max-w-4xl flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
-      >
-        <div class="min-w-0">
-          <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
-          <p class="mt-1 font-medium text-surface-950-50">
-            Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
-              ? ` · ${releaseBanner.title}`
-              : ''}
-          </p>
-          <p class="text-sm text-surface-700-300">A newer GitHub release was found at startup.</p>
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-          {#if releaseBanner.downloadUrl}
+      <div class="release-banner-inner mx-auto w-full max-w-4xl pb-2">
+        <div
+          class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div class="min-w-0">
+            <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
+            <p class="mt-1 font-medium text-surface-950-50">
+              Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
+                ? ` · ${releaseBanner.title}`
+                : ''}
+            </p>
+            <p class="text-sm text-surface-700-300">A newer GitHub release was found at startup.</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            {#if releaseBanner.downloadUrl}
+              <a
+                class="btn btn-sm preset-filled-success-500 !text-sm"
+                href={releaseBanner.downloadUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Download APK <span class="sr-only">(opens in a new tab)</span>
+              </a>
+            {/if}
             <a
-              class="btn btn-sm preset-filled-success-500 !text-sm"
-              href={releaseBanner.downloadUrl}
+              class="btn btn-sm preset-filled-tertiary-500 !text-sm"
+              href={releaseBanner.releaseUrl}
               target="_blank"
               rel="noreferrer"
             >
-              Download APK <span class="sr-only">(opens in a new tab)</span>
+              Release notes <span class="sr-only">(opens in a new tab)</span>
             </a>
-          {/if}
-          <a
-            class="btn btn-sm preset-filled-tertiary-500 !text-sm"
-            href={releaseBanner.releaseUrl}
-            target="_blank"
-            rel="noreferrer"
-          >
-            Release notes <span class="sr-only">(opens in a new tab)</span>
-          </a>
-          <button
-            class="btn btn-sm preset-tonal-error !text-sm"
-            type="button"
-            onclick={() => (releaseBanner = null)}
-          >
-            Dismiss
-          </button>
+            <button
+              class="btn btn-sm preset-tonal-error !text-sm"
+              type="button"
+              onclick={() => (releaseBanner = null)}
+            >
+              Dismiss
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -217,7 +218,7 @@
 
   <div class="app-stage">
     {#if booting}
-      <main class="boot-stage grid min-h-full place-items-center" aria-label="Opening Turnleaf">
+      <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
           <TurnleafLogo size={104} />
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
@@ -233,61 +234,57 @@
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
         onReaderOpenChange={(open) => (readerOpen = open)}
-        onOverlayActiveChange={(active) => (stageOverlayActive = active)}
         onChangeServerAddress={() => {
           readerOpen = false;
-          stageOverlayActive = false;
           changingServerAddress = true;
         }}
         onServerDeleted={() => {
           readerOpen = false;
-          stageOverlayActive = false;
           server = null;
           apiKey = null;
         }}
+        onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
     {:else if startupError}
-      <div class="startup-error-shell mx-auto max-w-lg">
-        <div class="alert preset-tonal-error flex flex-col gap-3" role="alert">
-          <p>{startupError}</p>
-          <div class="flex flex-wrap gap-2">
+      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
+        <p>{startupError}</p>
+        <div class="flex flex-wrap gap-2">
+          <button
+            class="btn btn-sm preset-filled-error-500 !text-sm"
+            type="button"
+            onclick={() => void loadLocalData()}
+            disabled={repairing}
+          >
+            Retry
+          </button>
+          {#if server}
             <button
-              class="btn btn-sm preset-filled-error-500 !text-sm"
+              class="btn btn-sm preset-tonal-surface !text-sm"
               type="button"
-              onclick={() => void loadLocalData()}
-              disabled={repairing}
+              onclick={() => (startupError = '')}
             >
-              Retry
+              Enter auth key
             </button>
-            {#if server}
-              <button
-                class="btn btn-sm preset-tonal-surface !text-sm"
-                type="button"
-                onclick={() => (startupError = '')}
-              >
-                Enter auth key
-              </button>
-            {:else}
-              <button
-                class="btn btn-sm preset-tonal-error !text-sm"
-                type="button"
-                disabled={repairing}
-                onclick={() => {
-                  if (
-                    window.confirm(
-                      'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
-                    )
-                  ) {
-                    void repairLocalData();
-                  }
-                }}
-              >
-                {repairing ? 'Resetting...' : 'Reset local data'}
-              </button>
-            {/if}
-          </div>
-          <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
+          {:else}
+            <button
+              class="btn btn-sm preset-tonal-error !text-sm"
+              type="button"
+              disabled={repairing}
+              onclick={() => {
+                if (
+                  window.confirm(
+                    'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
+                  )
+                ) {
+                  void repairLocalData();
+                }
+              }}
+            >
+              {repairing ? 'Resetting...' : 'Reset local data'}
+            </button>
+          {/if}
         </div>
+        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
     {:else}
       <Onboarding
@@ -442,23 +439,12 @@
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     scroll-padding-block: 8px;
-    padding-top: max(
-      1rem,
-      calc(
-        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
-          0.5rem
-      )
-    );
-    padding-inline-start: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: 0.5rem;
     z-index: 1;
+  }
+
+  .release-banner-inner {
+    padding-top: max(1rem, calc(var(--safe-top, 0px) + 0.5rem));
+    padding-inline: max(1rem, var(--safe-left, 0px)) max(1rem, var(--safe-right, 0px));
   }
 
   .app-stage {
@@ -470,47 +456,6 @@
     -webkit-overflow-scrolling: touch;
     scroll-padding-block: 8px;
     z-index: 1;
-  }
-
-  .boot-stage {
-    padding-top: max(
-      1.5rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    padding-inline-start: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      1.5rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
-  }
-
-  .startup-error-shell {
-    padding-top: max(
-      1.5rem,
-      calc(
-        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
-          0.5rem
-      )
-    );
-    padding-inline-start: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      1.5rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
   }
 
   :global([data-mode='dark']) .orb {

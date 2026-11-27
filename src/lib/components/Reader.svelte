@@ -12,11 +12,13 @@
     applySystemBarsStyle,
     applyThemeColorMeta,
     hideSystemBars,
-    resolveReaderSystemBars,
-    resolveShellSystemBars,
     showSystemBars,
   } from '../native/system-bars';
-  import * as ThemesModule from '../themes/themes';
+  import {
+    DEFAULT_THEME,
+    resolveReaderAppearanceChrome,
+    resolveShellAppearanceChrome,
+  } from '../themes/themes';
   import { VolumeButtons } from '../native/volume-buttons';
   import {
     createReaderNativeFeatures,
@@ -201,25 +203,11 @@
   let localNavigationDuringSession = false;
 
   async function restoreShellSystemBars(): Promise<void> {
+    const shellTheme = document.documentElement.dataset.theme || DEFAULT_THEME;
     const shellMode = document.documentElement.dataset.mode === 'light' ? 'light' : 'dark';
-    try {
-      if (typeof ThemesModule.resolveShellAppearanceChrome === 'function') {
-        const shellTheme =
-          document.documentElement.dataset.theme ?? ThemesModule.DEFAULT_THEME ?? 'fennec';
-        const { metaColor, style } = ThemesModule.resolveShellAppearanceChrome(
-          shellTheme,
-          shellMode,
-        );
-        applyThemeColorMeta(metaColor);
-        await applySystemBarsStyle(style);
-        return;
-      }
-    } catch {
-      // Fall back to DOM surface resolution under partial ../themes/themes mocks.
-    }
-    const resolved = resolveShellSystemBars(shellMode);
-    applyThemeColorMeta(resolved.themeColor);
-    await applySystemBarsStyle(resolved.style);
+    const { metaColor, style } = resolveShellAppearanceChrome(shellTheme, shellMode);
+    applyThemeColorMeta(metaColor);
+    await applySystemBarsStyle(style);
   }
 
   const nativeFeatures = Capacitor.isNativePlatform()
@@ -363,12 +351,13 @@
     const mode = appearance.mode;
     const shell = readerShell;
     if (destroyed) return;
-    const resolved = resolveReaderSystemBars(mode, shell);
-    applyThemeColorMeta(resolved.themeColor);
+    const shellTheme = document.documentElement.dataset.theme || DEFAULT_THEME;
+    const { hexColor, style } = resolveReaderAppearanceChrome(shellTheme, mode, shell);
+    applyThemeColorMeta(hexColor);
     if (nativeFeatures) {
-      void nativeFeatures.setBarStyle(resolved.style);
+      void nativeFeatures.setBarStyle(style);
     } else {
-      void enqueueNativeWindowAction(() => applySystemBarsStyle(resolved.style));
+      void enqueueNativeWindowAction(() => applySystemBarsStyle(style));
     }
   });
 
@@ -2678,22 +2667,10 @@
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(
-      0.5rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    --reader-safe-right: var(
-      --safe-right,
-      max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px))
-    );
-    --reader-safe-bottom: max(
-      1rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
-    --reader-safe-left: var(
-      --safe-left,
-      max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px))
-    );
+    --reader-safe-top: max(0.5rem, var(--safe-top, 0px));
+    --reader-safe-right: var(--safe-right, 0px);
+    --reader-safe-bottom: max(1rem, var(--safe-bottom, 0px));
+    --reader-safe-left: var(--safe-left, 0px);
     --reader-progress-height: 0.25rem;
   }
 
@@ -2742,7 +2719,7 @@
     position: absolute;
     left: max(1rem, var(--reader-safe-left));
     right: max(1rem, var(--reader-safe-right));
-    bottom: max(3rem, env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+    bottom: max(3rem, var(--safe-bottom, 0px));
     z-index: 30;
   }
 
@@ -2750,15 +2727,13 @@
     position: absolute;
     left: max(0.5rem, var(--reader-safe-left));
     right: max(0.5rem, var(--reader-safe-right));
-    bottom: max(2rem, env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+    bottom: max(2rem, var(--safe-bottom, 0px));
     z-index: 30;
   }
 
   .reader-alert-backdrop {
-    padding-top: max(1rem, var(--reader-safe-top));
-    padding-inline-end: max(1rem, var(--reader-safe-right));
-    padding-bottom: max(1rem, var(--reader-safe-bottom));
-    padding-inline-start: max(1rem, var(--reader-safe-left));
+    padding: max(1rem, var(--reader-safe-top)) max(1rem, var(--reader-safe-right))
+      max(1rem, var(--reader-safe-bottom)) max(1rem, var(--reader-safe-left));
   }
 
   .reader-alert-backdrop > .card {
@@ -2793,10 +2768,7 @@
     top: 0;
     left: var(--reader-safe-left);
     right: var(--reader-safe-right);
-    height: max(
-      4rem,
-      calc(max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)) + 3rem)
-    );
+    height: max(4rem, calc(var(--safe-top, 0px) + 3rem));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2808,10 +2780,7 @@
     left: var(--reader-safe-left);
     right: var(--reader-safe-right);
     bottom: 0;
-    height: max(
-      2.5rem,
-      calc(max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 1.5rem)
-    );
+    height: max(2.5rem, calc(var(--safe-bottom, 0px) + 1.5rem));
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2850,22 +2819,14 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding-inline-start: max(
-      1rem,
-      env(safe-area-inset-left, 0px),
-      var(--safe-area-inset-left, 0px)
-    );
-    padding-inline-end: max(
-      1rem,
-      env(safe-area-inset-right, 0px),
-      var(--safe-area-inset-right, 0px)
-    );
+    padding-inline-start: max(1rem, var(--reader-safe-left));
+    padding-inline-end: max(1rem, var(--reader-safe-right));
     color: var(--reader-bar-text);
   }
 
   .reader-top {
     top: 0;
-    padding-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+    padding-top: var(--reader-safe-top);
   }
 
   .reader-toolbar {
@@ -2952,13 +2913,7 @@
   }
 
   .reader-bottom {
-    bottom: calc(
-      var(--reader-progress-height) +
-        max(
-          1.5rem,
-          max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 1rem
-        )
-    );
+    bottom: calc(var(--reader-progress-height) + max(1.5rem, var(--safe-bottom, 0px) + 1rem));
     justify-content: space-between;
     padding-bottom: 0;
   }
@@ -2988,8 +2943,8 @@
 
   .reader-progress-reveal {
     position: absolute;
-    right: max(1rem, env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
-    bottom: max(0.25rem, env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+    right: max(1rem, var(--reader-safe-right));
+    bottom: max(0.25rem, var(--safe-bottom, 0px));
     z-index: 19;
     min-width: 3rem;
     min-height: 2.75rem;
@@ -2998,24 +2953,14 @@
 
   .reader-settings {
     position: absolute;
-    left: max(1rem, env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
-    right: max(1rem, env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
-    bottom: max(
-      4rem,
-      calc(max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 3rem)
-    );
+    left: max(1rem, var(--reader-safe-left));
+    right: max(1rem, var(--reader-safe-right));
+    bottom: max(4rem, calc(var(--safe-bottom, 0px) + 3rem));
     margin-inline: auto;
     max-width: 30rem;
     max-height: min(
       75dvh,
-      calc(
-        100dvh -
-          max(
-            4rem,
-            max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 3rem
-          ) -
-          max(1rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))
-      )
+      calc(100dvh - max(4rem, var(--safe-bottom, 0px) + 3rem) - max(1rem, var(--safe-top, 0px)))
     );
     overflow: auto;
     padding: 1.25rem;

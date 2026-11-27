@@ -60,12 +60,13 @@
     type LibraryViewMode,
     type VirtualWindow,
   } from './library-virtualization';
-  import * as ThemesModule from '../themes/themes';
   import {
+    DEFAULT_THEME,
+    isSkeletonTheme,
     loadTheme,
     skeletonThemes,
+    themeSwatches,
     type SkeletonTheme,
-    type ThemeSwatch,
   } from '../themes/themes';
   import {
     bookActionsLabel,
@@ -104,7 +105,7 @@
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
-    onOverlayActiveChange?: ((active: boolean) => void) | undefined;
+    onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   let activeApiKey = $derived(apiKey);
@@ -255,37 +256,8 @@
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
-  function resolveActiveTheme(candidate: string): SkeletonTheme {
-    try {
-      if (typeof ThemesModule.isSkeletonTheme === 'function') {
-        return ThemesModule.isSkeletonTheme(candidate)
-          ? candidate
-          : (ThemesModule.DEFAULT_THEME ?? 'fennec');
-      }
-    } catch {
-      // Partial ../themes/themes mock in unit tests.
-    }
-    return skeletonThemes.includes(candidate as SkeletonTheme)
-      ? (candidate as SkeletonTheme)
-      : 'fennec';
-  }
-
-  function resolveThemeSwatch(option: SkeletonTheme): ThemeSwatch {
-    try {
-      const swatches = ThemesModule.themeSwatches;
-      if (swatches?.[option]) return swatches[option];
-    } catch {
-      // Partial ../themes/themes mock in unit tests.
-    }
-    return {
-      primary: 'var(--color-primary-500)',
-      secondary: 'var(--color-secondary-500)',
-      tertiary: 'var(--color-tertiary-500)',
-    };
-  }
-
   let settingsVisible = $state(false);
-  let pendingTheme = $derived<SkeletonTheme>(resolveActiveTheme(theme));
+  let pendingTheme = $derived<SkeletonTheme>(isSkeletonTheme(theme) ? theme : DEFAULT_THEME);
   let pendingMode = $derived<'light' | 'dark'>(mode);
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
@@ -761,6 +733,7 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          const wasOffline = offline;
           offline = !connected;
           if (!connected) {
             refreshController?.abort();
@@ -773,7 +746,7 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected) {
+          if (connected && wasOffline) {
             const baselineRevision = activeSyncStartRevision ?? messageRevision;
             const baselineMessage = activeSyncStartRevision !== null ? '' : message;
             void syncProgress(false);
@@ -891,7 +864,6 @@
   onDestroy(() => {
     destroyed = true;
     onReaderOpenChange?.(false);
-    onOverlayActiveChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -1769,7 +1741,7 @@
 
 {#if reading}
   {#await import('./Reader.svelte')}
-    <p class="library-reader-status" role="status">Opening reader…</p>
+    <p class="m-8" role="status">Opening reader…</p>
   {:then { default: Reader }}
     <Reader
       bookUrl={reading.url}
@@ -1789,7 +1761,7 @@
       registerBackHandler={registerReaderBackHandler}
     />
   {:catch}
-    <div class="library-reader-status grid justify-items-start gap-3">
+    <div class="m-8 grid justify-items-start gap-3">
       <p role="alert">Turnleaf could not load the reader. Reload the app to try again.</p>
       <button class="btn preset-tonal-surface" type="button" onclick={() => void closeReader()}>
         Back to library
@@ -2868,7 +2840,7 @@
       <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
       <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
         {#each skeletonThemes as option (option)}
-          {@const swatch = resolveThemeSwatch(option)}
+          {@const swatch = themeSwatches[option]}
           <button
             class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
             option
@@ -3083,112 +3055,30 @@
 
 <style>
   .library-main {
-    padding-top: max(
-      1.5rem,
-      calc(
-        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
-          0.5rem
-      )
-    );
-    padding-inline-start: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      4rem,
-      calc(
-        var(
-            --safe-bottom,
-            max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
-          ) +
-          2rem
-      )
-    );
+    padding-top: max(1.5rem, calc(var(--safe-top, 0px) + 0.5rem));
+    padding-inline: max(1rem, var(--safe-left, 0px)) max(1rem, var(--safe-right, 0px));
+    padding-bottom: max(4rem, calc(var(--safe-bottom, 0px) + 2rem));
   }
 
   @media (min-width: 40rem) {
     .library-main {
-      padding-inline-start: max(
-        1.5rem,
-        var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-      );
-      padding-inline-end: max(
-        1.5rem,
-        var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-      );
+      padding-inline: max(1.5rem, var(--safe-left, 0px)) max(1.5rem, var(--safe-right, 0px));
     }
   }
 
-  .library-reader-status {
-    padding-top: max(
-      2rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    padding-inline-start: max(
-      2rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      2rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      2rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
-  }
-
   .library-skip-link:focus {
-    top: max(
-      1rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    left: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
+    top: max(1rem, var(--safe-top, 0px));
+    left: max(1rem, var(--safe-left, 0px));
   }
 
   .library-modal-backdrop {
-    padding-top: max(
-      1rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    padding-inline-start: max(
-      1rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      1rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
+    padding: max(1rem, var(--safe-top, 0px)) max(1rem, var(--safe-right, 0px))
+      max(1rem, var(--safe-bottom, 0px)) max(1rem, var(--safe-left, 0px));
   }
 
   .library-conflict-backdrop {
-    padding-top: max(
-      1.25rem,
-      var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)))
-    );
-    padding-inline-start: max(
-      1.25rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1.25rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      1.25rem,
-      var(--safe-bottom, max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)))
-    );
+    padding: max(1.25rem, var(--safe-top, 0px)) max(1.25rem, var(--safe-right, 0px))
+      max(1.25rem, var(--safe-bottom, 0px)) max(1.25rem, var(--safe-left, 0px));
   }
 
   .switch-track {

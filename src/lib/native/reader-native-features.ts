@@ -29,8 +29,6 @@ export function enqueueNativeWindowAction(operation: () => Promise<void>): Promi
   return next;
 }
 
-export const enqueueNativeOperation = enqueueNativeWindowAction;
-
 export function createReaderNativeFeatures(
   actions: ReaderNativeFeatureActions,
 ): ReaderNativeFeatures {

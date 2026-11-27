@@ -3,14 +3,22 @@
 import { SystemBarsStyle } from '@capacitor/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const systemBarsMock = vi.hoisted(() => ({
+const nativeMocks = vi.hoisted(() => ({
+  isNative: true,
   setStyle: vi.fn(async (_options: { style: SystemBarsStyle }): Promise<void> => undefined),
   hide: vi.fn(async (): Promise<void> => undefined),
   show: vi.fn(async (): Promise<void> => undefined),
 }));
 
 vi.mock('@capacitor/core', () => ({
-  SystemBars: systemBarsMock,
+  Capacitor: {
+    isNativePlatform: () => nativeMocks.isNative,
+  },
+  SystemBars: {
+    setStyle: nativeMocks.setStyle,
+    hide: nativeMocks.hide,
+    show: nativeMocks.show,
+  },
   SystemBarsStyle: {
     Dark: 'DARK',
     Light: 'LIGHT',
@@ -18,93 +26,71 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
+import {
+  resolveReaderAppearanceChrome,
+  resolveShellAppearanceChrome,
+  skeletonThemes,
+  syncShellAppearanceChrome,
+} from '../themes/themes';
 import { createReaderNativeFeatures } from './reader-native-features';
 import {
   WCAG_ICON_LUMINANCE_THRESHOLD,
-  parseCssColorToLinearRgb,
-  relativeLuminance,
-  resolveReaderSystemBars,
-  resolveShellSystemBars,
-  resolveSystemBarsFromColor,
-  syncShellSystemBars,
+  applySystemBarsStyle,
+  applyThemeColorMeta,
+  hexRelativeLuminance,
+  systemBarsStyleForHex,
   systemBarsStyleForLuminance,
   wcagContrastRatio,
 } from './system-bars';
 
-describe('system-bars color luminance and WCAG contrast', () => {
+describe('system-bars WCAG luminance and contrast', () => {
   beforeEach(() => {
+    nativeMocks.isNative = true;
+    nativeMocks.setStyle.mockReset();
     document.head.innerHTML = '<meta name="theme-color" content="#000000" />';
-    document.documentElement.removeAttribute('style');
-    systemBarsMock.setStyle.mockReset();
+    document.body.removeAttribute('style');
   });
 
-  it('parses hex, rgb, color(srgb), oklch, and oklab CSS colors', () => {
-    expect(parseCssColorToLinearRgb('#ffffff')).toEqual({ r: 1, g: 1, b: 1 });
-    expect(parseCssColorToLinearRgb('#000')).toEqual({ r: 0, g: 0, b: 0 });
-    expect(parseCssColorToLinearRgb('rgb(33, 34, 39)')).not.toBeNull();
-    expect(parseCssColorToLinearRgb('color(srgb 1 1 1)')).toEqual({ r: 1, g: 1, b: 1 });
-    expect(parseCssColorToLinearRgb('oklch(1 0 0)')?.r).toBeCloseTo(1, 4);
-    expect(parseCssColorToLinearRgb('oklch(0 0 0)')).toEqual({ r: 0, g: 0, b: 0 });
-    expect(parseCssColorToLinearRgb('oklab(0.5 0 0)')).not.toBeNull();
-    expect(parseCssColorToLinearRgb('lab(100% 0 0)')?.r).toBeCloseTo(1, 3);
-    expect(parseCssColorToLinearRgb('lab(0% 0 0)')).toEqual({ r: 0, g: 0, b: 0 });
-    expect(parseCssColorToLinearRgb('lch(50% 0 0)')).not.toBeNull();
-    expect(parseCssColorToLinearRgb('transparent')).toBeNull();
-    expect(parseCssColorToLinearRgb('rgba(255, 255, 255, 0)')).toBeNull();
-  });
+  it('keeps >= 3:1 icon contrast across all 23 themes (including fennec and eink) in light and dark modes', () => {
+    expect(hexRelativeLuminance('#ffffff')).toBe(1);
+    expect(hexRelativeLuminance('#000000')).toBe(0);
+    expect(hexRelativeLuminance('invalid')).toBeNull();
 
-  it('keeps at least 3:1 icon contrast across fennec and eink light and dark surfaces', () => {
-    const surfaces = [
-      { name: 'fennec-light', css: 'oklch(0.98 0.005 264)', expected: SystemBarsStyle.Light },
-      { name: 'fennec-dark', css: '#212227', expected: SystemBarsStyle.Dark },
-      { name: 'eink-light', css: 'oklch(1 0 0)', expected: SystemBarsStyle.Light },
-      { name: 'eink-dark', css: 'oklch(0 0 0)', expected: SystemBarsStyle.Dark },
-    ];
-
-    for (const surface of surfaces) {
-      const resolved = resolveSystemBarsFromColor(surface.css, 'dark');
-      expect(resolved.style, surface.name).toBe(surface.expected);
-      const iconLuminance = resolved.style === SystemBarsStyle.Light ? 0 : 1;
-      expect(wcagContrastRatio(resolved.luminance, iconLuminance), surface.name).toBeGreaterThan(3);
+    for (const theme of skeletonThemes) {
+      for (const mode of ['light', 'dark'] as const) {
+        const shell = resolveShellAppearanceChrome(theme, mode);
+        const reader = resolveReaderAppearanceChrome(theme, mode);
+        const shellIconY = shell.style === SystemBarsStyle.Light ? 0 : 1;
+        const readerIconY = reader.style === SystemBarsStyle.Light ? 0 : 1;
+        expect(
+          wcagContrastRatio(shell.luminance, shellIconY),
+          `${theme} shell ${mode}`,
+        ).toBeGreaterThan(3);
+        expect(
+          wcagContrastRatio(reader.luminance, readerIconY),
+          `${theme} reader ${mode}`,
+        ).toBeGreaterThan(3);
+      }
     }
 
-    // Even right at the luminance crossover, icon contrast stays >= 4.58:1 (> 3:1).
+    expect(resolveShellAppearanceChrome('eink', 'light').style).toBe(SystemBarsStyle.Light);
+    expect(resolveShellAppearanceChrome('eink', 'dark').style).toBe(SystemBarsStyle.Dark);
+    expect(resolveShellAppearanceChrome('fennec', 'light').style).toBe(SystemBarsStyle.Light);
+    expect(resolveShellAppearanceChrome('fennec', 'dark').style).toBe(SystemBarsStyle.Dark);
+
     const justAbove = WCAG_ICON_LUMINANCE_THRESHOLD + 0.0001;
     const justBelow = WCAG_ICON_LUMINANCE_THRESHOLD - 0.0001;
     expect(systemBarsStyleForLuminance(justAbove)).toBe(SystemBarsStyle.Light);
     expect(systemBarsStyleForLuminance(justBelow)).toBe(SystemBarsStyle.Dark);
     expect(wcagContrastRatio(justAbove, 0)).toBeGreaterThan(4.5);
     expect(wcagContrastRatio(justBelow, 1)).toBeGreaterThan(4.5);
+    expect(systemBarsStyleForHex(null, 'light').style).toBe(SystemBarsStyle.Light);
+    expect(systemBarsStyleForHex(null, 'dark').style).toBe(SystemBarsStyle.Dark);
   });
 
-  it('resolves nested var() surface tokens for shell and reader modes', () => {
-    document.documentElement.style.setProperty('--color-surface-50', 'oklch(1 0 0)');
-    document.documentElement.style.setProperty('--color-surface-950', 'oklch(0 0 0)');
-    document.documentElement.style.setProperty('--color-root-bg-light', 'var(--color-surface-50)');
-    document.documentElement.style.setProperty('--color-root-bg-dark', 'var(--color-surface-950)');
-
-    const shellLight = resolveShellSystemBars('light', document);
-    const shellDark = resolveShellSystemBars('dark', document);
-    expect(shellLight.style).toBe(SystemBarsStyle.Light);
-    expect(shellLight.themeColor).toBe('#ffffff');
-    expect(shellDark.style).toBe(SystemBarsStyle.Dark);
-    expect(shellDark.themeColor).toBe('#000000');
-
-    const readerEl = document.createElement('div');
-    readerEl.style.backgroundColor = 'rgb(255, 255, 255)';
-    document.body.appendChild(readerEl);
-    const readerLight = resolveReaderSystemBars('light', readerEl, document);
-    expect(readerLight.style).toBe(SystemBarsStyle.Light);
-    expect(relativeLuminance({ r: 1, g: 1, b: 1 })).toBe(1);
-    readerEl.remove();
-  });
-
-  it('updates meta theme-color and serializes SystemBars.setStyle after reader teardown', async () => {
-    document.documentElement.style.setProperty('--color-root-bg-light', '#ffffff');
-    document.documentElement.style.setProperty('--color-root-bg-dark', '#212227');
-
+  it('serializes SystemBars.setStyle across shell updates and reader teardown', async () => {
     const calls: string[] = [];
-    systemBarsMock.setStyle.mockImplementation(async ({ style }: { style: SystemBarsStyle }) => {
+    nativeMocks.setStyle.mockImplementation(async ({ style }: { style: SystemBarsStyle }) => {
       calls.push(`system:${style}`);
     });
 
@@ -116,14 +102,16 @@ describe('system-bars color luminance and WCAG contrast', () => {
       setKeepAwake: async () => undefined,
       setBarStyle: async (style) => void calls.push(`reader:${style}`),
       restoreBarStyle: async () => {
-        const shell = resolveShellSystemBars('light', document);
-        await systemBarsMock.setStyle({ style: shell.style });
+        const shell = resolveShellAppearanceChrome('eink', 'light');
+        applyThemeColorMeta(shell.metaColor);
+        await applySystemBarsStyle(shell.style);
       },
     });
 
-    await syncShellSystemBars('light', document);
-    expect(document.querySelector('meta[name="theme-color"]')?.getAttribute('content')).toBe(
-      '#ffffff',
+    syncShellAppearanceChrome('eink', 'light');
+    await vi.waitFor(() => expect(calls).toEqual([`system:${SystemBarsStyle.Light}`]));
+    expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toBe(
+      'oklch(1 0 0)',
     );
 
     await readerFeatures.enable(false);

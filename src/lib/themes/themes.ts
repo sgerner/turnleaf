@@ -3,8 +3,7 @@ import { enqueueNativeWindowAction } from '../native/reader-native-features';
 import {
   applySystemBarsStyle,
   applyThemeColorMeta,
-  parseCssColorToLinearRgb,
-  resolveSystemBarsFromColor,
+  systemBarsStyleForHex,
 } from '../native/system-bars';
 
 const themeStyles = {
@@ -612,7 +611,7 @@ function hasNativeSystemBarsBridge(): boolean {
 export function resolveShellAppearanceChrome(
   theme: string,
   mode: UiMode,
-): { metaColor: string; style: SystemBarsStyle } {
+): { metaColor: string; hexColor: string; style: SystemBarsStyle; luminance: number } {
   const fallbackColor = getThemeRootBackground(theme, mode);
   let resolvedColor = fallbackColor;
 
@@ -623,14 +622,32 @@ export function resolveShellAppearanceChrome(
     }
   }
 
-  const { style } = parseCssColorToLinearRgb(resolvedColor)
-    ? resolveSystemBarsFromColor(resolvedColor, mode)
-    : resolveSystemBarsFromColor(fallbackColor, mode);
+  const fallbackHex = cssColorToHex(fallbackColor) ?? (mode === 'light' ? '#ffffff' : '#212227');
+  const hexColor = cssColorToHex(resolvedColor) ?? fallbackHex;
+  const { style, luminance } = systemBarsStyleForHex(hexColor, mode);
 
   return {
     metaColor: resolvedColor,
+    hexColor,
     style,
+    luminance,
   };
+}
+
+export function resolveReaderAppearanceChrome(
+  theme: string,
+  mode: UiMode,
+  readerElement?: Element | null,
+): { hexColor: string; style: SystemBarsStyle; luminance: number } {
+  const tokens = isSkeletonTheme(theme) ? themeTokens[theme] : themeTokens[DEFAULT_THEME];
+  const fallbackColor = mode === 'dark' ? tokens.surfaceDark : tokens.surfaceLight;
+  const fallbackHex = cssColorToHex(fallbackColor) ?? (mode === 'light' ? '#ffffff' : '#212227');
+  const elementColor = readerElement ? getComputedStyle(readerElement).backgroundColor : '';
+  const hexColor =
+    (isUsableCssColor(elementColor) ? cssColorToHex(elementColor) : null) ?? fallbackHex;
+  const { style, luminance } = systemBarsStyleForHex(hexColor, mode);
+
+  return { hexColor, style, luminance };
 }
 
 let shellChromeGeneration = 0;

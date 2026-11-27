@@ -405,65 +405,21 @@
 
 <style>
   .onboarding-main {
-    padding-top: max(
-      3rem,
-      calc(
-        var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
-          0.5rem
-      )
-    );
-    padding-inline-start: max(
-      1.5rem,
-      var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-    );
-    padding-inline-end: max(
-      1.5rem,
-      var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-    );
-    padding-bottom: max(
-      2.5rem,
-      calc(
-        var(
-            --safe-bottom,
-            max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
-          ) +
-          1rem
-      )
-    );
+    padding-top: max(3rem, calc(var(--safe-top, 0px) + 0.5rem));
+    padding-inline: max(1.5rem, var(--safe-left, 0px)) max(1.5rem, var(--safe-right, 0px));
+    padding-bottom: max(2.5rem, calc(var(--safe-bottom, 0px) + 1rem));
   }
 
   @media (min-width: 40rem) {
     .onboarding-main {
-      padding-inline-start: max(
-        2rem,
-        var(--safe-left, max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)))
-      );
-      padding-inline-end: max(
-        2rem,
-        var(--safe-right, max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)))
-      );
+      padding-inline: max(2rem, var(--safe-left, 0px)) max(2rem, var(--safe-right, 0px));
     }
   }
 
   @media (min-width: 64rem) {
     .onboarding-main {
-      padding-top: max(
-        4rem,
-        calc(
-          var(--safe-top, max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px))) +
-            1rem
-        )
-      );
-      padding-bottom: max(
-        4rem,
-        calc(
-          var(
-              --safe-bottom,
-              max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
-            ) +
-            1rem
-        )
-      );
+      padding-top: max(4rem, calc(var(--safe-top, 0px) + 1rem));
+      padding-bottom: max(4rem, calc(var(--safe-bottom, 0px) + 1rem));
     }
   }
 </style>
