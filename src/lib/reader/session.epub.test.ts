@@ -733,6 +733,117 @@ describe('ReaderSession', () => {
     }
   });
 
+  it('defers resize while navigation is in flight without losing a newer navigation and preserves visible CFI across resize', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    const disconnectSpy = vi.fn();
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {
+        disconnectSpy();
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    try {
+      const viewport = document.createElement('div');
+      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 891));
+      const onLocation = vi.fn();
+      const session = new ReaderSession('book.epub');
+      await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+      const relocated = getRenditionListener('relocated');
+      relocated(location('epubcfi(/6/2!/4/2:0)'));
+      mockRendition.display.mockClear();
+      mockRendition.resize.mockClear();
+
+      // Start older navigation (ch1) and newer navigation (ch2) while a viewport resize arrives mid-flight
+      let resolveFirstNav!: () => void;
+      let resolveSecondNav!: () => void;
+      mockRendition.display
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              resolveFirstNav = resolve;
+            }),
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              resolveSecondNav = resolve;
+            }),
+        );
+
+      const firstNav = session.display('first.xhtml');
+      const secondNav = session.display('second.xhtml');
+
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 520, height: 900 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      // Resolving older navigation must NOT flush resize while newer navigation is still in flight
+      resolveFirstNav();
+      await firstNav;
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+
+      // Resolving newer navigation lands on ch2 CFI and flushes pending resize while preserving visible ch2 CFI
+      mockRendition.display.mockImplementation(async () => {});
+      relocated(location('epubcfi(/6/4!/4/8:0)'));
+      mockRendition.display.mockClear();
+      resolveSecondNav();
+      await secondNav;
+
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(520, 900);
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/8:0)');
+      expect(onLocation.mock.calls.at(-1)?.[0]).toMatchObject({ cfi: 'epubcfi(/6/4!/4/8:0)' });
+      expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+
+      // Subsequent resize also preserves the current visible CFI
+      mockRendition.display.mockClear();
+      mockRendition.resize.mockClear();
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 600, height: 820 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(600, 820);
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/8:0)');
+
+      session.destroy();
+      expect(disconnectSpy).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('cleans up window resize fallback listener and ignores late resizes after destroy', async () => {
+    vi.stubGlobal('ResizeObserver', undefined);
+    const addSpy = vi.spyOn(window, 'addEventListener');
+    const removeSpy = vi.spyOn(window, 'removeEventListener');
+
+    try {
+      const viewport = document.createElement('div');
+      let currentRect = new DOMRect(0, 0, 400, 700);
+      vi.spyOn(viewport, 'getBoundingClientRect').mockImplementation(() => currentRect);
+
+      const session = new ReaderSession('book.epub');
+      await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+      expect(addSpy).toHaveBeenCalledWith('resize', expect.any(Function));
+
+      session.destroy();
+      expect(removeSpy).toHaveBeenCalledWith('resize', expect.any(Function));
+
+      mockRendition.resize.mockClear();
+      currentRect = new DOMRect(0, 0, 500, 800);
+      window.dispatchEvent(new Event('resize'));
+      expect(mockRendition.resize).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const onLocation = vi.fn();

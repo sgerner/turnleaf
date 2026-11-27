@@ -180,6 +180,185 @@ it('redirects stray focusin outside an active modal and releases inert before re
   expect(document.activeElement).toBe(opener);
 });
 
+it('retains previous inert, aria-hidden, and iframe tabindex values across nested modals and restores dynamically added siblings when the final modal closes', async () => {
+  document.body.innerHTML = '';
+  const appShell = document.createElement('div');
+  appShell.className = 'app-shell';
+
+  const attrInertSibling = document.createElement('aside');
+  attrInertSibling.setAttribute('inert', '');
+  attrInertSibling.inert = true;
+  attrInertSibling.setAttribute('aria-hidden', 'false');
+
+  const propOnlyInertSibling = document.createElement('section');
+  propOnlyInertSibling.inert = true;
+
+  const ariaHiddenSibling = document.createElement('div');
+  ariaHiddenSibling.setAttribute('aria-hidden', 'true');
+
+  const activeStage = document.createElement('div');
+  activeStage.className = 'app-stage';
+
+  const readerShell = document.createElement('main');
+  const viewport = document.createElement('div');
+  const presetIframe = document.createElement('iframe');
+  presetIframe.setAttribute('tabindex', '0');
+  presetIframe.setAttribute('aria-hidden', 'false');
+  const plainIframe = document.createElement('iframe');
+  viewport.append(presetIframe, plainIframe);
+
+  const overlay = document.createElement('div');
+  const toolbar = document.createElement('header');
+  const outerModal = document.createElement('div');
+  outerModal.tabIndex = -1;
+  const outerButton = document.createElement('button');
+  outerModal.append(outerButton);
+  overlay.append(toolbar, outerModal);
+
+  readerShell.append(viewport, overlay);
+  activeStage.append(readerShell);
+  appShell.append(attrInertSibling, propOnlyInertSibling, ariaHiddenSibling, activeStage);
+  document.body.append(appShell);
+
+  // Activate outer modal (e.g. bookmarks subpanel inside .reader-overlay)
+  const outerCleanup = activateModal(outerModal);
+  expect(document.activeElement).toBe(outerButton);
+  expect(viewport.hasAttribute('inert')).toBe(true);
+  expect(presetIframe.getAttribute('tabindex')).toBe('-1');
+  expect(presetIframe.getAttribute('aria-hidden')).toBe('true');
+  expect(plainIframe.getAttribute('tabindex')).toBe('-1');
+  expect(toolbar.hasAttribute('inert')).toBe(true);
+  expect(overlay.hasAttribute('inert')).toBe(false);
+
+  // Mount and activate nested inner modal (e.g. z-40 error alertdialog outside .reader-overlay)
+  const alertBackdrop = document.createElement('div');
+  const innerModal = document.createElement('div');
+  innerModal.tabIndex = -1;
+  const innerButton = document.createElement('button');
+  innerModal.append(innerButton);
+  alertBackdrop.append(innerModal);
+  readerShell.append(alertBackdrop);
+  await Promise.resolve();
+
+  const innerCleanup = activateModal(innerModal);
+  expect(document.activeElement).toBe(innerButton);
+  expect(alertBackdrop.hasAttribute('inert')).toBe(false);
+  expect(innerModal.hasAttribute('inert')).toBe(false);
+  expect(overlay.hasAttribute('inert')).toBe(true);
+  expect(overlay.getAttribute('aria-hidden')).toBe('true');
+
+  // Stray focusin outside innerModal routes to innerButton without ping-ponging to outerButton
+  toolbar.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+  expect(document.activeElement).toBe(innerButton);
+
+  // Dynamically add a sibling + dynamic iframe while nested inner modal is open
+  const dynamicSibling = document.createElement('div');
+  const dynamicIframe = document.createElement('iframe');
+  dynamicIframe.setAttribute('tabindex', '2');
+  dynamicSibling.append(dynamicIframe);
+  readerShell.append(dynamicSibling);
+  await Promise.resolve();
+
+  expect(dynamicSibling.hasAttribute('inert')).toBe(true);
+  expect(dynamicSibling.getAttribute('aria-hidden')).toBe('true');
+  expect(dynamicIframe.hasAttribute('inert')).toBe(true);
+  expect(dynamicIframe.getAttribute('aria-hidden')).toBe('true');
+  expect(dynamicIframe.getAttribute('tabindex')).toBe('-1');
+
+  // Deactivate inner modal first: overlay un-inerts, while outer modal keeps siblings + dynamicSibling isolated!
+  deactivateModal(innerCleanup, innerModal);
+  alertBackdrop.remove();
+
+  expect(overlay.hasAttribute('inert')).toBe(false);
+  expect(overlay.hasAttribute('aria-hidden')).toBe(false);
+  expect(viewport.hasAttribute('inert')).toBe(true);
+  expect(presetIframe.getAttribute('tabindex')).toBe('-1');
+  expect(dynamicSibling.hasAttribute('inert')).toBe(true);
+  expect(dynamicIframe.getAttribute('tabindex')).toBe('-1');
+
+  outerButton.focus();
+  expect(document.activeElement).toBe(outerButton);
+
+  // Deactivate final (outer) modal: all pre-modal inert, aria-hidden, and iframe tabindex states are restored!
+  deactivateModal(outerCleanup, outerModal);
+
+  expect(attrInertSibling.hasAttribute('inert')).toBe(true);
+  expect(attrInertSibling.inert).toBe(true);
+  expect(attrInertSibling.getAttribute('aria-hidden')).toBe('false');
+
+  expect(propOnlyInertSibling.hasAttribute('inert')).toBe(false);
+  expect(propOnlyInertSibling.inert).toBe(true);
+  expect(propOnlyInertSibling.hasAttribute('aria-hidden')).toBe(false);
+
+  expect(ariaHiddenSibling.hasAttribute('inert')).toBe(false);
+  expect(ariaHiddenSibling.inert).toBe(false);
+  expect(ariaHiddenSibling.getAttribute('aria-hidden')).toBe('true');
+
+  expect(viewport.hasAttribute('inert')).toBe(false);
+  expect(viewport.inert).toBe(false);
+  expect(presetIframe.hasAttribute('inert')).toBe(false);
+  expect(presetIframe.getAttribute('aria-hidden')).toBe('false');
+  expect(presetIframe.getAttribute('tabindex')).toBe('0');
+
+  expect(plainIframe.hasAttribute('inert')).toBe(false);
+  expect(plainIframe.hasAttribute('aria-hidden')).toBe(false);
+  expect(plainIframe.hasAttribute('tabindex')).toBe(false);
+
+  expect(dynamicSibling.hasAttribute('inert')).toBe(false);
+  expect(dynamicSibling.inert).toBe(false);
+  expect(dynamicSibling.hasAttribute('aria-hidden')).toBe(false);
+  expect(dynamicIframe.hasAttribute('inert')).toBe(false);
+  expect(dynamicIframe.hasAttribute('aria-hidden')).toBe(false);
+  expect(dynamicIframe.getAttribute('tabindex')).toBe('2');
+});
+
+it('falls back when opener is disabled, disconnected, document.body, or inside an inert ancestor', () => {
+  const fallback = document.createElement('button');
+  document.body.append(fallback);
+
+  const disabledOpener = document.createElement('button');
+  disabledOpener.disabled = true;
+  document.body.append(disabledOpener);
+  first.focus();
+  restoreFocus(disabledOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const disconnectedOpener = document.createElement('button');
+  first.focus();
+  restoreFocus(disconnectedOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  first.focus();
+  restoreFocus(document.body, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const inertWrapper = document.createElement('div');
+  inertWrapper.setAttribute('inert', '');
+  const inertOpener = document.createElement('button');
+  inertWrapper.append(inertOpener);
+  document.body.append(inertWrapper);
+  first.focus();
+  restoreFocus(inertOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const propertyInertWrapper = document.createElement('div');
+  propertyInertWrapper.inert = true;
+  const propertyInertOpener = document.createElement('button');
+  propertyInertWrapper.append(propertyInertOpener);
+  document.body.append(propertyInertWrapper);
+  first.focus();
+  restoreFocus(propertyInertOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const toolbarFallback = document.createElement('header');
+  const toolbarButton = document.createElement('button');
+  toolbarFallback.append(toolbarButton);
+  document.body.append(toolbarFallback);
+  first.focus();
+  restoreFocus(document.body, toolbarFallback);
+  expect(document.activeElement).toBe(toolbarButton);
+});
+
 it('short-circuits focus checks across 1,500 controls without filtering middle rows', () => {
   const largeDialog = document.createElement('div');
   largeDialog.tabIndex = -1;
@@ -305,4 +484,10 @@ it('defers focus restoration to connected enabled openers and skips disconnected
   restoreModalFocus(opener);
   await tick();
   expect(document.activeElement).toBe(first);
+
+  const fallback = document.createElement('button');
+  document.body.append(fallback);
+  restoreModalFocus(opener, () => fallback);
+  await tick();
+  expect(document.activeElement).toBe(fallback);
 });

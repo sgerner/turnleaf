@@ -4,6 +4,7 @@ import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BookRecord, ServerConfig, StoredReadingState } from '../database/database';
 import type { KavitaProgress } from '../kavita/types';
+import type * as ThemesModule from '../themes/themes';
 
 const mocks = vi.hoisted(() => {
   let backListener: (() => void) | null = null;
@@ -113,10 +114,14 @@ vi.mock('../native/credentials', () => ({
   removeApiKey: vi.fn(async () => {}),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 vi.mock('../github/releases', () => ({
   fetchLatestGithubRelease: vi.fn(async () => mocks.getReleaseBanner()),
@@ -535,5 +540,35 @@ describe('Library virtualized focus, feed semantics, sticky banner, and modal is
     expect(banner.hasAttribute('inert')).toBe(false);
     expect(libraryMain.hasAttribute('inert')).toBe(false);
     expect(document.activeElement).toBe(openBookBtn);
+
+    // 4. Transition from Book actions -> Open book -> Sync conflict -> Cancel restores focus to Book actions trigger.
+    actionsOpener.focus();
+    actionsOpener.click();
+    await settle();
+    const menuOpenBookBtn = Array.from(
+      stage.querySelectorAll<HTMLButtonElement>(
+        '[role="dialog"][aria-labelledby="book-actions-title"] button',
+      ),
+    ).find((btn) => btn.textContent?.includes('Open book'))!;
+    menuOpenBookBtn.focus();
+    menuOpenBookBtn.click();
+    await settle();
+
+    const conflictFromMenu = stage.querySelector<HTMLElement>(
+      '[role="dialog"][aria-labelledby="sync-conflict-title"]',
+    );
+    expect(conflictFromMenu).not.toBeNull();
+    expect(banner.hasAttribute('inert')).toBe(true);
+    expect(libraryMain.hasAttribute('inert')).toBe(true);
+
+    const cancelConflictBtn = Array.from(
+      conflictFromMenu!.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((btn) => btn.textContent?.trim() === 'Cancel')!;
+    cancelConflictBtn.click();
+    await settle();
+
+    expect(banner.hasAttribute('inert')).toBe(false);
+    expect(libraryMain.hasAttribute('inert')).toBe(false);
+    expect(document.activeElement).toBe(actionsOpener);
   });
 });

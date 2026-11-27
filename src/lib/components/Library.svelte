@@ -60,7 +60,14 @@
     type LibraryViewMode,
     type VirtualWindow,
   } from './library-virtualization';
-  import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import {
+    DEFAULT_THEME,
+    isSkeletonTheme,
+    loadTheme,
+    skeletonThemes,
+    themeSwatches,
+    type SkeletonTheme,
+  } from '../themes/themes';
   import {
     bookActionsLabel,
     downloadProgressLabel,
@@ -250,12 +257,14 @@
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
-  let pendingTheme = $state<SkeletonTheme>('vintage');
-  let pendingMode = $state<'light' | 'dark'>('dark');
+  let pendingTheme = $derived<SkeletonTheme>(isSkeletonTheme(theme) ? theme : DEFAULT_THEME);
+  let pendingMode = $derived<'light' | 'dark'>(mode);
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
+  let appearanceError = $state('');
   let settingsError = $state('');
+  let themeSwitchSequence = 0;
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
@@ -265,6 +274,7 @@
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
+  let pendingMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
   let modalCleanup: (() => void) | null = null;
@@ -444,7 +454,10 @@
   function getStickyBannerOffset(container: HTMLElement | null, containerTop = 0): number {
     if (!container) return 0;
     const tracked = Number(container.dataset.stickyBannerHeight) || 0;
-    const banner = container.querySelector<HTMLElement>('[data-release-banner]');
+    const banner =
+      container.querySelector<HTMLElement>('[data-release-banner]') ??
+      container.parentElement?.querySelector<HTMLElement>('[data-release-banner]') ??
+      null;
     if (!banner || banner.hidden) return Math.max(0, Math.ceil(tracked));
     const bannerRect = banner.getBoundingClientRect();
     const measured =
@@ -918,8 +931,6 @@
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
-    pendingTheme = theme as SkeletonTheme;
-    pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
     downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
     hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
@@ -1701,8 +1712,13 @@
   }
 
   async function syncFurthest(book: BookRecord): Promise<void> {
-    closeMenu();
-    await open(book, { preferFurthest: true });
+    pendingMenuOpener = actionMenuOpener;
+    dismissMenu(false);
+    try {
+      await open(book, { preferFurthest: true });
+    } finally {
+      pendingMenuOpener = null;
+    }
   }
 
   async function closeReader(): Promise<void> {
@@ -1732,22 +1748,32 @@
   }
 
   function closeMenu(): void {
+    dismissMenu(true);
+  }
+
+  function dismissMenu(restoreAfterClose = true): void {
     const closing = actionMenuDialog;
     actionMenuBook = null;
     const opener = actionMenuOpener;
     actionMenuOpener = null;
     releaseModal(closing);
+    if (!restoreAfterClose) return;
     void tick().then(() => {
-      if (reading || actionMenuBook || !libraryMain) return;
-      restoreFocus(opener);
-      if (!libraryMain.contains(document.activeElement)) {
-        libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+      if (destroyed || reading || actionMenuBook || conflict || settingsVisible || !libraryMain) {
+        return;
       }
+      restoreFocus(opener, libraryMain.querySelector<HTMLElement>('#library-results'));
     });
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
-    conflictOpener = activeElement();
+    const active = activeElement();
+    const activeUnavailable =
+      !active ||
+      active === document.body ||
+      Boolean(active.closest('[inert], [aria-hidden="true"]'));
+    conflictOpener = activeUnavailable && pendingMenuOpener ? pendingMenuOpener : active;
+    pendingMenuOpener = null;
     conflictError = '';
     conflict = next;
     focusModal(() => (conflict ? conflictDialog : null));
@@ -1766,8 +1792,8 @@
     conflictOpener = null;
     releaseModal(closing);
     void tick().then(() => {
-      if (reading || conflict) return;
-      restoreFocus(opener);
+      if (destroyed || reading || actionMenuBook || conflict || settingsVisible) return;
+      restoreFocus(opener, libraryMain?.querySelector<HTMLElement>('#library-results') ?? null);
     });
   }
 
@@ -1820,7 +1846,6 @@
   function openSettings(): void {
     settingsOpener = activeElement();
     settingsVisible = true;
-    void Promise.allSettled(skeletonThemes.map(loadTheme));
     focusModal(() => (settingsVisible ? settingsDialog : null));
   }
 
@@ -1832,8 +1857,8 @@
     settingsOpener = null;
     releaseModal(closing);
     void tick().then(() => {
-      if (settingsVisible) return;
-      restoreFocus(opener);
+      if (destroyed || reading || actionMenuBook || conflict || settingsVisible) return;
+      restoreFocus(opener, libraryMain?.querySelector<HTMLElement>('#library-results') ?? null);
     });
   }
 
@@ -1877,12 +1902,18 @@
   }
 
   async function updateTheme(next: SkeletonTheme): Promise<void> {
+    const requestId = ++themeSwitchSequence;
     try {
-      await loadTheme(next);
+      const loaded = await loadTheme(next);
+      if (!loaded) throw new Error('Theme unavailable');
     } catch {
-      settingsError = 'The theme could not load. Try again.';
+      if (requestId === themeSwitchSequence && !destroyed) {
+        appearanceError = 'The theme could not load. Try again.';
+      }
       return;
     }
+    if (requestId !== themeSwitchSequence || destroyed) return;
+    appearanceError = '';
     pendingTheme = next;
     onThemeChange(next);
     await setPreference('uiTheme', next);
@@ -2850,8 +2881,24 @@
           type="button"
           onclick={() => {
             const book = actionMenuBook;
-            closeMenu();
-            if (book) void open(book);
+            const opener = actionMenuOpener;
+            pendingMenuOpener = opener;
+            dismissMenu(false);
+            if (book) {
+              void open(book).finally(() => {
+                if (pendingMenuOpener === opener) pendingMenuOpener = null;
+                if (
+                  !destroyed &&
+                  !reading &&
+                  !actionMenuBook &&
+                  !conflict &&
+                  !settingsVisible &&
+                  libraryMain
+                ) {
+                  restoreFocus(opener, libraryMain.querySelector<HTMLElement>('#library-results'));
+                }
+              });
+            }
           }}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -3089,6 +3136,7 @@
       <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
       <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
         {#each skeletonThemes as option (option)}
+          {@const swatch = themeSwatches[option]}
           <button
             class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
             option
@@ -3100,11 +3148,10 @@
             title={option}
             onclick={() => void updateTheme(option)}
           >
-            <span class="flex h-full w-full" data-theme={option}>
-              <span class="h-full flex-1" style:background-color="var(--color-primary-500)"></span>
-              <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-              ></span>
-              <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"></span>
+            <span class="flex h-full w-full">
+              <span class="h-full flex-1" style:background-color={swatch.primary}></span>
+              <span class="h-full flex-1" style:background-color={swatch.secondary}></span>
+              <span class="h-full flex-1" style:background-color={swatch.tertiary}></span>
             </span>
             {#if pendingTheme === option}
               <span class="absolute inset-0 grid place-items-center bg-black/20" aria-hidden="true">
@@ -3116,6 +3163,11 @@
           </button>
         {/each}
       </div>
+      {#if appearanceError}
+        <div class="alert preset-tonal-error mt-3" role="alert">
+          {appearanceError}
+        </div>
+      {/if}
 
       <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
       <p class="mt-1 text-sm text-surface-700-300">

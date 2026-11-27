@@ -25,12 +25,28 @@ interface SavedIframeState extends SavedElementState {
   previousTabIndex: string | null;
 }
 
+interface ActiveModalEntry {
+  container: HTMLElement;
+  syncAncestors: () => void;
+}
+
 const isolatedElements = new WeakMap<HTMLElement, SavedElementState>();
 const isolatedIframes = new WeakMap<HTMLIFrameElement, SavedIframeState>();
+const activeModalStacks = new WeakMap<Document, ActiveModalEntry[]>();
 
 function setInertState(element: HTMLElement, value: boolean): void {
   element.inert = value;
   if (value) element.setAttribute('inert', '');
+  else element.removeAttribute('inert');
+}
+
+function restoreInertState(
+  element: HTMLElement,
+  previousInert: boolean,
+  hadInertAttribute: boolean,
+): void {
+  element.inert = previousInert;
+  if (hadInertAttribute) element.setAttribute('inert', '');
   else element.removeAttribute('inert');
 }
 
@@ -39,11 +55,27 @@ function restoreAttribute(element: HTMLElement, name: string, previous: string |
   else element.setAttribute(name, previous);
 }
 
+function isHiddenOrInert(element: HTMLElement): boolean {
+  if (element.closest('[hidden], [inert], [aria-hidden="true"]')) return true;
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    if (current.inert) return true;
+  }
+  return false;
+}
+
 export function isFocusableElement(element: HTMLElement): boolean {
-  return (
-    element.tabIndex >= 0 &&
+  return element.tabIndex >= 0 && !element.matches(':disabled') && !isHiddenOrInert(element);
+}
+
+function canRestoreFocusTarget(element: HTMLElement | null | undefined): element is HTMLElement {
+  return Boolean(
+    element &&
+    element.isConnected &&
+    element !== document.body &&
+    element !== document.documentElement &&
+    !element.hasAttribute('disabled') &&
     !element.matches(':disabled') &&
-    !element.closest('[hidden], [inert], [aria-hidden="true"]')
+    !isHiddenOrInert(element),
   );
 }
 
@@ -89,15 +121,17 @@ export function focusModal(getContainer: () => HTMLElement | null): void {
   void tick().then(() => focusFirstElement(getContainer()));
 }
 
-export function restoreFocus(element: HTMLElement | null): void {
-  if (
-    element?.isConnected &&
-    !element.hasAttribute('disabled') &&
-    !element.matches(':disabled') &&
-    !element.closest('[inert], [hidden]')
-  ) {
+export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement | null): void {
+  if (canRestoreFocusTarget(element)) {
     element.focus();
+    return;
   }
+  if (!canRestoreFocusTarget(fallback)) return;
+  if (fallback.matches(FOCUSABLE_SELECTOR) && fallback.tabIndex >= 0) {
+    fallback.focus();
+    return;
+  }
+  focusFirstElement(fallback);
 }
 
 export function isolateModalBackground(
@@ -106,10 +140,13 @@ export function isolateModalBackground(
 ): () => void {
   if (!container || !container.isConnected) return () => {};
 
-  const doc = container.ownerDocument;
+  const modalContainer = container;
+  const doc = modalContainer.ownerDocument;
   const boundary =
-    (boundarySelector === '.app-stage' ? container.closest<HTMLElement>('.app-shell') : null) ??
-    container.closest<HTMLElement>(boundarySelector) ??
+    (boundarySelector === '.app-stage'
+      ? modalContainer.closest<HTMLElement>('.app-shell')
+      : null) ??
+    modalContainer.closest<HTMLElement>(boundarySelector) ??
     doc.body;
   if (!boundary) return () => {};
 
@@ -118,20 +155,48 @@ export function isolateModalBackground(
   const observedAncestors = new Set<HTMLElement>();
   let released = false;
 
+  const entry: ActiveModalEntry = {
+    container: modalContainer,
+    syncAncestors,
+  };
+  const initialStack = activeModalStacks.get(doc) ?? [];
+  initialStack.push(entry);
+  activeModalStacks.set(doc, initialStack);
+
+  const isUpperModalBranch = (candidate: HTMLElement): boolean => {
+    const stack = activeModalStacks.get(doc);
+    if (!stack) return false;
+    const entryIndex = stack.indexOf(entry);
+    if (entryIndex < 0) return false;
+    for (let index = entryIndex + 1; index < stack.length; index += 1) {
+      const upper = stack[index];
+      if (
+        upper &&
+        upper.container.isConnected &&
+        (upper.container === candidate || candidate.contains(upper.container))
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   const isolateIframe = (iframe: HTMLIFrameElement): void => {
-    if (sessionIframes.has(iframe)) return;
-    sessionIframes.add(iframe);
-    const existing = isolatedIframes.get(iframe);
-    if (existing) {
-      existing.count += 1;
-    } else {
-      isolatedIframes.set(iframe, {
-        count: 1,
-        hadInertAttribute: iframe.hasAttribute('inert'),
-        previousInert: Boolean(iframe.inert),
-        previousAriaHidden: iframe.getAttribute('aria-hidden'),
-        previousTabIndex: iframe.getAttribute('tabindex'),
-      });
+    if (isUpperModalBranch(iframe)) return;
+    if (!sessionIframes.has(iframe)) {
+      sessionIframes.add(iframe);
+      const existing = isolatedIframes.get(iframe);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        isolatedIframes.set(iframe, {
+          count: 1,
+          hadInertAttribute: iframe.hasAttribute('inert'),
+          previousInert: Boolean(iframe.inert),
+          previousAriaHidden: iframe.getAttribute('aria-hidden'),
+          previousTabIndex: iframe.getAttribute('tabindex'),
+        });
+      }
     }
     setInertState(iframe, true);
     iframe.setAttribute('aria-hidden', 'true');
@@ -139,7 +204,7 @@ export function isolateModalBackground(
   };
 
   const isolateSibling = (sibling: HTMLElement): void => {
-    if (IGNORED_TAGS.has(sibling.tagName)) return;
+    if (IGNORED_TAGS.has(sibling.tagName) || isUpperModalBranch(sibling)) return;
     if (!sessionElements.has(sibling)) {
       sessionElements.add(sibling);
       const existing = isolatedElements.get(sibling);
@@ -170,14 +235,47 @@ export function isolateModalBackground(
 
   const observer =
     typeof MutationObserver !== 'undefined'
-      ? new MutationObserver(() => {
-          if (!released && container.isConnected) syncAncestors();
+      ? new MutationObserver((records) => {
+          if (released || !modalContainer.isConnected) return;
+          const hasOutsideMutation = records.some(
+            (record) => !modalContainer.contains(record.target),
+          );
+          if (hasOutsideMutation) syncAncestors();
         })
       : null;
 
+  if (observer) {
+    observedAncestors.add(boundary);
+    observer.observe(boundary, { childList: true, subtree: true });
+  }
+
+  const hasUpperModalOutside = (branchNode: HTMLElement): boolean => {
+    const stack = activeModalStacks.get(doc);
+    if (!stack) return false;
+    const entryIndex = stack.indexOf(entry);
+    if (entryIndex < 0) return false;
+    for (let index = entryIndex + 1; index < stack.length; index += 1) {
+      const upper = stack[index];
+      if (upper && upper.container.isConnected && !branchNode.contains(upper.container)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   function syncAncestors(): void {
-    let branch: HTMLElement | null = container;
+    if (released || !modalContainer.isConnected) return;
+    let branch: HTMLElement | null = modalContainer;
     while (branch && branch !== doc.documentElement) {
+      const savedBranchState = isolatedElements.get(branch);
+      if (savedBranchState && !hasUpperModalOutside(branch)) {
+        restoreInertState(
+          branch,
+          savedBranchState.previousInert,
+          savedBranchState.hadInertAttribute,
+        );
+        restoreAttribute(branch, 'aria-hidden', savedBranchState.previousAriaHidden);
+      }
       const parent: HTMLElement | null = branch.parentElement;
       if (!parent) break;
       if (observer && !observedAncestors.has(parent)) {
@@ -197,10 +295,20 @@ export function isolateModalBackground(
   syncAncestors();
 
   const handleFocusIn = (event: FocusEvent): void => {
-    if (released || !container.isConnected) return;
+    if (released || !modalContainer.isConnected) return;
+    const stack = activeModalStacks.get(doc);
+    if (stack) {
+      for (let index = stack.length - 1; index >= 0; index -= 1) {
+        const candidate = stack[index];
+        if (candidate?.container.isConnected) {
+          if (candidate !== entry) return;
+          break;
+        }
+      }
+    }
     const target = event.target;
-    if (target instanceof Node && !container.contains(target)) {
-      focusFirstElement(container);
+    if (target instanceof Node && !modalContainer.contains(target)) {
+      focusFirstElement(modalContainer);
     }
   };
   doc.addEventListener('focusin', handleFocusIn, true);
@@ -212,15 +320,28 @@ export function isolateModalBackground(
     observedAncestors.clear();
     doc.removeEventListener('focusin', handleFocusIn, true);
 
+    const stack = activeModalStacks.get(doc);
+    if (stack) {
+      const entryIndex = stack.indexOf(entry);
+      if (entryIndex >= 0) stack.splice(entryIndex, 1);
+      if (stack.length === 0) {
+        activeModalStacks.delete(doc);
+      } else {
+        for (const remaining of stack) {
+          if (remaining.container.isConnected) {
+            remaining.syncAncestors();
+          }
+        }
+      }
+    }
+
     for (const iframe of sessionIframes) {
       const state = isolatedIframes.get(iframe);
       if (!state) continue;
       state.count -= 1;
       if (state.count > 0) continue;
       isolatedIframes.delete(iframe);
-      iframe.inert = state.previousInert;
-      if (state.hadInertAttribute || state.previousInert) iframe.setAttribute('inert', '');
-      else iframe.removeAttribute('inert');
+      restoreInertState(iframe, state.previousInert, state.hadInertAttribute);
       restoreAttribute(iframe, 'aria-hidden', state.previousAriaHidden);
       restoreAttribute(iframe, 'tabindex', state.previousTabIndex);
     }
@@ -233,9 +354,7 @@ export function isolateModalBackground(
       if (state.count > 0) continue;
       isolatedElements.delete(element);
       if (!element.hasAttribute('data-modal-backdrop')) {
-        element.inert = state.previousInert;
-        if (state.hadInertAttribute || state.previousInert) element.setAttribute('inert', '');
-        else element.removeAttribute('inert');
+        restoreInertState(element, state.previousInert, state.hadInertAttribute);
       }
       restoreAttribute(element, 'aria-hidden', state.previousAriaHidden);
     }
@@ -247,13 +366,14 @@ export function activateModal(
   container: HTMLElement | null,
   previousCleanup?: (() => void) | null,
   boundarySelector = '.app-stage',
+  autoFocus = true,
 ): () => void {
   previousCleanup?.();
   if (!container || !container.isConnected) return () => {};
   setInertState(container, false);
   container.removeAttribute('aria-hidden');
   const cleanup = isolateModalBackground(container, boundarySelector);
-  focusFirstElement(container);
+  if (autoFocus) focusFirstElement(container);
   return cleanup;
 }
 
@@ -268,8 +388,13 @@ export function deactivateModal(
   }
 }
 
-export function restoreModalFocus(element: HTMLElement | null): void {
-  void tick().then(() => restoreFocus(element));
+export function restoreModalFocus(
+  element: HTMLElement | null,
+  fallback?: HTMLElement | null | (() => HTMLElement | null),
+): void {
+  void tick().then(() =>
+    restoreFocus(element, typeof fallback === 'function' ? fallback() : fallback),
+  );
 }
 
 export function trapModalKeydown(
