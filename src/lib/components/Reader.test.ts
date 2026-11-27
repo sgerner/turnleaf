@@ -2,16 +2,22 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import { defaultAppearance } from '../reader/appearance';
 import type * as SessionModule from '../reader/session';
 
-const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
-  () => ({
-    getPreferencesMock: vi.fn(),
-    setPreferencesMock: vi.fn(),
-    openSessionMock: vi.fn(),
-    destroySessionMock: vi.fn(),
-  }),
-);
+const {
+  getPreferencesMock,
+  setPreferencesMock,
+  openSessionMock,
+  applyAppearanceMock,
+  destroySessionMock,
+} = vi.hoisted(() => ({
+  getPreferencesMock: vi.fn(),
+  setPreferencesMock: vi.fn(),
+  openSessionMock: vi.fn(),
+  applyAppearanceMock: vi.fn(),
+  destroySessionMock: vi.fn(),
+}));
 
 vi.mock('../database/database', () => ({
   getPreferences: getPreferencesMock,
@@ -24,6 +30,7 @@ vi.mock('../reader/session', async (importOriginal) => {
     ...actual,
     ReaderSession: class MockReaderSession {
       open = openSessionMock;
+      applyAppearance = applyAppearanceMock;
       tableOfContents = () => [];
       getVisiblePassages = () => [];
       clearTextSelection = vi.fn();
@@ -163,5 +170,151 @@ describe('Reader mount lifecycle', () => {
     await unmount(mounted);
     mounted = null;
     expect(destroySessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('batches slider input via requestAnimationFrame and flushes combined state when toggling publisher formatting', async () => {
+    const rafCallbacks: FrameRequestCallback[] = [];
+    let nextRafId = 1;
+    const rafSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((callback: FrameRequestCallback) => {
+        const id = nextRafId++;
+        rafCallbacks.push(callback);
+        return id;
+      });
+    const cancelRafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {
+      rafCallbacks.length = 0;
+    });
+
+    try {
+      mounted = mount(Reader, {
+        target,
+        props: {
+          bookUrl: 'blob:appearance-book',
+          bookId: 'book-4',
+          title: 'Appearance Book',
+          initialCfi: 'epubcfi(/6/2!/4/2/10:0)',
+          onBack: vi.fn(),
+          onRelocated: vi.fn(),
+        },
+      });
+      flushSync();
+
+      await vi.waitFor(() => {
+        expect(openSessionMock).toHaveBeenCalledOnce();
+      });
+
+      const showControlsBtn = target.querySelector<HTMLButtonElement>(
+        'button[aria-label="Show reading controls"]',
+      );
+      expect(showControlsBtn).not.toBeNull();
+      showControlsBtn!.click();
+      flushSync();
+
+      const openAppearanceBtn = target.querySelector<HTMLButtonElement>(
+        'button[aria-label="Text, reading appearance"]',
+      );
+      expect(openAppearanceBtn).not.toBeNull();
+      openAppearanceBtn!.click();
+      flushSync();
+
+      applyAppearanceMock.mockClear();
+      rafCallbacks.length = 0;
+
+      const fontSizeInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Text size"]',
+      );
+      const lineHeightInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Line height"]',
+      );
+      const marginInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Page margins"]',
+      );
+      const bottomMarginInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Bottom margin"]',
+      );
+      const paragraphSpacingInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Paragraph spacing"]',
+      );
+      expect(fontSizeInput).not.toBeNull();
+      expect(lineHeightInput).not.toBeNull();
+      expect(marginInput).not.toBeNull();
+      expect(bottomMarginInput).not.toBeNull();
+      expect(paragraphSpacingInput).not.toBeNull();
+
+      // 1. 30-step slider burst across all 5 range sliders coalesces into a single rAF applyAppearance call
+      for (let step = 1; step <= 30; step += 1) {
+        fontSizeInput!.value = String(16 + (step % 9));
+        fontSizeInput!.dispatchEvent(new Event('input', { bubbles: true }));
+        if (step % 5 === 0) {
+          lineHeightInput!.value = (1.4 + (step / 5) * 0.1).toFixed(1);
+          lineHeightInput!.dispatchEvent(new Event('input', { bubbles: true }));
+          marginInput!.value = String(16 + step);
+          marginInput!.dispatchEvent(new Event('input', { bubbles: true }));
+          bottomMarginInput!.value = String((step % 8) * 4);
+          bottomMarginInput!.dispatchEvent(new Event('input', { bubbles: true }));
+          paragraphSpacingInput!.value = ((step % 11) * 0.1).toFixed(1);
+          paragraphSpacingInput!.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+      flushSync();
+
+      // Labels and aria-valuetext update immediately while session.applyAppearance is deferred to one rAF
+      expect(fontSizeInput!.getAttribute('aria-valuetext')).toBe('19 pixels');
+      expect(lineHeightInput!.getAttribute('aria-valuetext')).toBe('2.0');
+      expect(marginInput!.getAttribute('aria-valuetext')).toBe('46 pixels');
+      expect(bottomMarginInput!.getAttribute('aria-valuetext')).toBe('24 pixels');
+      expect(paragraphSpacingInput!.getAttribute('aria-valuetext')).toBe('0.8 em');
+      expect(applyAppearanceMock).not.toHaveBeenCalled();
+      expect(rafCallbacks).toHaveLength(1);
+
+      const frameCallback = rafCallbacks.shift()!;
+      frameCallback(16);
+      expect(applyAppearanceMock).toHaveBeenCalledExactlyOnceWith({
+        ...defaultAppearance,
+        fontSize: 19,
+        lineHeight: 2,
+        margin: 46,
+        bottomMargin: 24,
+        paragraphSpacing: 0.8,
+      });
+
+      // 2. Subsequent slider input followed immediately by toggling "Respect publisher formatting"
+      // cancels the pending slider rAF and flushes both updates synchronously.
+      applyAppearanceMock.mockClear();
+      fontSizeInput!.value = '24';
+      fontSizeInput!.dispatchEvent(new Event('input', { bubbles: true }));
+      paragraphSpacingInput!.value = '1';
+      paragraphSpacingInput!.dispatchEvent(new Event('input', { bubbles: true }));
+      flushSync();
+      expect(applyAppearanceMock).not.toHaveBeenCalled();
+      expect(rafCallbacks).toHaveLength(1);
+
+      const publisherCheckbox = Array.from(
+        target.querySelectorAll<HTMLLabelElement>('#reader-appearance label'),
+      )
+        .find((label) => label.textContent?.includes('Respect publisher formatting'))
+        ?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+      expect(publisherCheckbox).not.toBeNull();
+      expect(publisherCheckbox!.checked).toBe(true);
+
+      publisherCheckbox!.checked = false;
+      publisherCheckbox!.dispatchEvent(new Event('change', { bubbles: true }));
+      flushSync();
+
+      expect(cancelRafSpy).toHaveBeenCalledOnce();
+      expect(applyAppearanceMock).toHaveBeenCalledExactlyOnceWith({
+        ...defaultAppearance,
+        fontSize: 24,
+        lineHeight: 2,
+        margin: 46,
+        bottomMargin: 24,
+        paragraphSpacing: 1,
+        publisherStyles: false,
+      });
+    } finally {
+      rafSpy.mockRestore();
+      cancelRafSpy.mockRestore();
+    }
   });
 });

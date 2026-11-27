@@ -20,6 +20,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     { href: 'first.xhtml', index: 0 },
     { href: 'second.xhtml', index: 1 },
   ];
+  let loadedContents: unknown[] = [];
   const rendition = {
     hooks: { content: { register: vi.fn() } },
     on: vi.fn(),
@@ -28,8 +29,12 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     location: undefined as { start: { cfi: string } } | undefined,
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
+    getContents: vi.fn((): unknown[] => loadedContents),
+    setContents(next: unknown[]) {
+      loadedContents = next;
+      rendition.getContents.mockImplementation(() => loadedContents);
+    },
     display: vi.fn(async () => {}),
-    getContents: vi.fn((): unknown[] => []),
     resize: vi.fn(),
     destroy: vi.fn(),
   };
@@ -80,14 +85,16 @@ function location(cfi: string): Location {
 describe('ReaderSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockRendition.getContents.mockReturnValue([]);
     mockBook.packaging = { navPath: '', ncxPath: '' };
     mockBook.navigation.toc = [];
     mockBook.spine.sections = [...defaultSpineSections];
     mockRendition.location = undefined;
+    mockRendition.setContents([]);
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it('forwards EPUB iframe key events to the reader and removes the listener on destroy', async () => {
     const onKeyboardNavigation = vi.fn();
@@ -886,15 +893,18 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
-  it('registers themes on initial mount and mode updates without reflowing the CFI', async () => {
+  it('applies theme CSS on initial mount and mode updates without reflowing the CFI', async () => {
     const unopened = new ReaderSession('book.epub');
     unopened.applyAppearance(defaultAppearance);
     expect(mockRendition.themes.register).not.toHaveBeenCalled();
     expect(mockRendition.themes.select).not.toHaveBeenCalled();
+    expect(mockRendition.getContents).not.toHaveBeenCalled();
     expect(mockRendition.display).not.toHaveBeenCalled();
     unopened.destroy();
     vi.clearAllMocks();
 
+    const chapterDoc = document.implementation.createHTMLDocument('chapter');
+    mockRendition.setContents([{ document: chapterDoc }]);
     mockRendition.location = { start: { cfi: 'epubcfi(/6/2!/4/2/1:0)' } };
     const session = new ReaderSession('book.epub');
     await session.open(
@@ -907,13 +917,10 @@ describe('ReaderSession', () => {
       vi.fn(),
     );
 
-    expect(mockRendition.themes.register).toHaveBeenCalledExactlyOnceWith(
-      'turnleaf',
-      expect.objectContaining({
-        a: { color: '--color-primary-700 !important' },
-      }),
-    );
-    expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+    const styleEl = chapterDoc.getElementById('epubjs-inserted-css-turnleaf');
+    expect(styleEl?.textContent).toContain('a { color: --color-primary-700 !important; }');
+    expect(mockRendition.themes.register).not.toHaveBeenCalled();
+    expect(mockRendition.themes.select).not.toHaveBeenCalled();
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith();
 
     const relocated = mockRendition.on.mock.calls.find(([name]) => name === 'relocated')?.[1];
@@ -928,18 +935,16 @@ describe('ReaderSession', () => {
     vi.clearAllMocks();
 
     session.applyAppearance({ ...defaultAppearance, mode: 'dark' });
-    expect(mockRendition.themes.register).toHaveBeenCalledExactlyOnceWith(
-      'turnleaf',
-      expect.objectContaining({
-        a: { color: '--color-primary-300 !important' },
-      }),
-    );
-    expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+    expect(styleEl?.textContent).toContain('a { color: --color-primary-300 !important; }');
+    expect(mockRendition.themes.register).not.toHaveBeenCalled();
+    expect(mockRendition.themes.select).not.toHaveBeenCalled();
     expect(mockRendition.display).not.toHaveBeenCalled();
     session.destroy();
   });
 
-  it('re-registers the theme and preserves the current CFI across layout updates', async () => {
+  it('updates theme CSS and preserves the current CFI across layout updates', async () => {
+    const chapterDoc = document.implementation.createHTMLDocument('chapter');
+    mockRendition.setContents([{ document: chapterDoc }]);
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
@@ -973,18 +978,24 @@ describe('ReaderSession', () => {
     ];
 
     let current = { ...defaultAppearance };
+    let previousCss = chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent ?? '';
     for (const patch of layoutPatches) {
       vi.clearAllMocks();
       current = { ...current, ...patch };
       session.applyAppearance(current);
-      expect(mockRendition.themes.register).toHaveBeenCalledOnce();
-      expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+      const nextCss = chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent ?? '';
+      expect(nextCss).not.toBe(previousCss);
+      previousCss = nextCss;
+      expect(mockRendition.themes.register).not.toHaveBeenCalled();
+      expect(mockRendition.themes.select).not.toHaveBeenCalled();
       expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/1:0)');
     }
     session.destroy();
   });
 
-  it('skips theme registration and CFI reflow for non-theme appearance toggles', async () => {
+  it('skips theme updates and CFI reflow for non-theme appearance toggles', async () => {
+    const chapterDoc = document.implementation.createHTMLDocument('chapter');
+    mockRendition.setContents([{ document: chapterDoc }]);
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
@@ -1019,11 +1030,14 @@ describe('ReaderSession', () => {
 
     expect(mockRendition.themes.register).not.toHaveBeenCalled();
     expect(mockRendition.themes.select).not.toHaveBeenCalled();
+    expect(mockRendition.getContents).not.toHaveBeenCalled();
     expect(mockRendition.display).not.toHaveBeenCalled();
     session.destroy();
   });
 
   it('defers CFI preservation until pending user navigation settles', async () => {
+    const chapterDoc = document.implementation.createHTMLDocument('chapter');
+    mockRendition.setContents([{ document: chapterDoc }]);
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
@@ -1048,8 +1062,8 @@ describe('ReaderSession', () => {
     vi.clearAllMocks();
 
     session.applyAppearance({ ...defaultAppearance, fontSize: 24 });
-    expect(mockRendition.themes.register).toHaveBeenCalledOnce();
-    expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
+    expect(mockRendition.themes.register).not.toHaveBeenCalled();
+    expect(mockRendition.themes.select).not.toHaveBeenCalled();
     expect(mockRendition.display).not.toHaveBeenCalled();
 
     relocated({
@@ -1060,6 +1074,9 @@ describe('ReaderSession', () => {
         displayed: { page: 1, total: 4 },
       },
     });
+    expect(chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent).toContain(
+      'font-size: 24px !important;',
+    );
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });

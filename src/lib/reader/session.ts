@@ -69,6 +69,15 @@ interface EpubTocItem {
   subitems?: EpubTocItem[];
 }
 
+const TURNLEAF_STYLE_ID = 'epubjs-inserted-css-turnleaf';
+
+type ResolvedModeColors = {
+  background: string;
+  text: string;
+  link: string;
+  selection: string;
+};
+
 const MODE_COLORS = {
   light: {
     background: '--color-surface-50',
@@ -386,6 +395,8 @@ export class ReaderSession {
   private userNavigationStartCfi: string | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
+  private readonly paletteCache = new Map<string, ResolvedModeColors>();
+  private themeCss = '';
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -865,58 +876,10 @@ export class ReaderSession {
         previous.alignment !== value.alignment ||
         previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
-    const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
-    if (!themeChanged) return;
-    const loadedContents =
-      typeof (rendition as Partial<Rendition>).getContents === 'function'
-        ? (rendition.getContents() as unknown as Contents | Contents[])
-        : [];
-    for (const content of Array.isArray(loadedContents) ? loadedContents : [loadedContents]) {
-      content?.document?.getElementById('epubjs-inserted-css-turnleaf')?.remove();
-    }
-    const colors = MODE_COLORS[value.mode];
-    const family =
-      value.fontFamily === 'book'
-        ? 'Iowan Old Style, Georgia, serif'
-        : value.fontFamily === 'accessible'
-          ? 'Atkinson Hyperlegible, Verdana, sans-serif'
-          : 'Avenir Next, Segoe UI, sans-serif';
-    const hyphens = value.hyphenation ? 'auto' : 'none';
-    rendition.themes.register('turnleaf', {
-      html: {
-        background: `${this.resolveToken(colors.background)} !important`,
-        'box-sizing': 'border-box',
-      },
-      body: {
-        color: `${this.resolveToken(colors.text)} !important`,
-        background: `${this.resolveToken(colors.background)} !important`,
-        'font-family': `${family} !important`,
-        'font-size': `${value.fontSize}px !important`,
-        'line-height': `${value.lineHeight} !important`,
-        'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
-        padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
-        'box-sizing': 'border-box',
-      },
-      p: value.publisherStyles
-        ? {
-            'margin-bottom': `${value.paragraphSpacing}em`,
-            hyphens,
-          }
-        : {
-            'margin-bottom': `${value.paragraphSpacing}em !important`,
-            'text-align': `${value.alignment} !important`,
-            hyphens: `${hyphens} !important`,
-          },
-      'img, svg, video, canvas, table, pre, blockquote': {
-        'max-width': '100% !important',
-      },
-      img: {
-        height: 'auto !important',
-      },
-      a: { color: `${this.resolveToken(colors.link)} !important` },
-      '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
-    });
-    rendition.themes.select('turnleaf');
+    const nextCss = this.buildThemeCss(value, this.resolveModeColors(value.mode));
+    if (nextCss === this.themeCss && !layoutChanged) return;
+    this.themeCss = nextCss;
+    this.syncThemeCss(nextCss);
     if (!layoutChanged) return;
     this.syncVisibleColumnLinks();
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
@@ -965,6 +928,8 @@ export class ReaderSession {
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
+    this.themeCss = '';
+    this.paletteCache.clear();
     this.highlightCfis.clear();
     this.reflowPending = false;
     this.spine = null;
@@ -990,8 +955,11 @@ export class ReaderSession {
     this.syncVisibleColumnLinks();
   }
 
-  private harden(contents: Contents): Promise<void> {
-    return sanitizeEpubDocument(contents.document, this.stylesheetCache);
+  private async harden(contents: Contents): Promise<void> {
+    await sanitizeEpubDocument(contents.document, this.stylesheetCache);
+    if (this.themeCss) {
+      this.applyThemeCssToDocument(contents.document, this.themeCss);
+    }
   }
 
   private addContentCleanup(contents: Contents, cleanup: () => void): void {
@@ -1479,6 +1447,62 @@ export class ReaderSession {
     });
   }
 
+  private buildThemeCss(value: Appearance, colors: ResolvedModeColors): string {
+    const family =
+      value.fontFamily === 'book'
+        ? 'Iowan Old Style, Georgia, serif'
+        : value.fontFamily === 'accessible'
+          ? 'Atkinson Hyperlegible, Verdana, sans-serif'
+          : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
+    const bodyTextAlign = value.publisherStyles ? value.alignment : `${value.alignment} !important`;
+    const paragraphRule = value.publisherStyles
+      ? `p { margin-bottom: ${value.paragraphSpacing}em; hyphens: ${hyphens}; }`
+      : `p { margin-bottom: ${value.paragraphSpacing}em !important; text-align: ${value.alignment} !important; hyphens: ${hyphens} !important; }`;
+    return [
+      `html { background: ${colors.background} !important; box-sizing: border-box; }`,
+      `body { color: ${colors.text} !important; background: ${colors.background} !important; font-family: ${family} !important; font-size: ${value.fontSize}px !important; line-height: ${value.lineHeight} !important; text-align: ${bodyTextAlign}; padding: 0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important; box-sizing: border-box; }`,
+      paragraphRule,
+      'img, svg, video, canvas, table, pre, blockquote { max-width: 100% !important; }',
+      'img { height: auto !important; }',
+      `a { color: ${colors.link} !important; }`,
+      `::selection { background: ${colors.selection} !important; }`,
+    ].join('\n');
+  }
+
+  private syncThemeCss(css: string): void {
+    const rawContents = (this.rendition?.getContents?.() ?? []) as unknown;
+    const list = Array.isArray(rawContents) ? rawContents : [rawContents];
+    const documents = new Set<Document>();
+    for (const item of [...list, ...this.trackedContents]) {
+      const doc = (item as Contents | null | undefined)?.document;
+      if (doc && !documents.has(doc)) {
+        documents.add(doc);
+        this.applyThemeCssToDocument(doc, css);
+      }
+    }
+  }
+
+  private applyThemeCssToDocument(document: Document | null | undefined, css: string): void {
+    if (!document) return;
+    let style = document.getElementById(TURNLEAF_STYLE_ID) as HTMLStyleElement | null;
+    if (!style) {
+      const head =
+        document.head ??
+        document.documentElement?.insertBefore(
+          document.createElement('head'),
+          document.documentElement.firstChild,
+        );
+      if (!head) return;
+      style = document.createElement('style');
+      style.id = TURNLEAF_STYLE_ID;
+      head.appendChild(style);
+    }
+    if (style.textContent !== css) {
+      style.textContent = css;
+    }
+  }
+
   private getSpine(): NonNullable<ReaderSession['spine']> {
     if (this.spine) return this.spine;
     const sections: SpineSection[] = [];
@@ -1528,7 +1552,21 @@ export class ReaderSession {
     return Math.max(0, page - 1);
   }
 
-  private resolveToken(token: string): string {
-    return getComputedStyle(document.documentElement).getPropertyValue(token).trim() || token;
+  private resolveModeColors(mode: Appearance['mode']): ResolvedModeColors {
+    const root = document.documentElement;
+    const cacheKey = `${mode}\0${root.dataset.theme ?? ''}\0${root.dataset.mode ?? ''}\0${root.getAttribute('style') ?? ''}`;
+    const cached = this.paletteCache.get(cacheKey);
+    if (cached) return cached;
+    const computed = getComputedStyle(root);
+    const tokens = MODE_COLORS[mode];
+    const resolve = (token: string): string => computed.getPropertyValue(token).trim() || token;
+    const resolved: ResolvedModeColors = {
+      background: resolve(tokens.background),
+      text: resolve(tokens.text),
+      link: resolve(tokens.link),
+      selection: resolve(tokens.selection),
+    };
+    this.paletteCache.set(cacheKey, resolved);
+    return resolved;
   }
 }

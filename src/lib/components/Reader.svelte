@@ -181,6 +181,7 @@
   let hideTimer: number | null = null;
   let footerVisible = $state(false);
   let bottomSwipeStart: { id: number; x: number; y: number } | null = null;
+  let appearanceFrame: number | null = null;
   let saveTimer: number | null = null;
   let resumeHandle: PluginListenerHandle | null = null;
   let removeBackHandler: (() => void) | null = null;
@@ -310,7 +311,10 @@
       const handle = await App.addListener('appStateChange', ({ isActive }) => {
         if (destroyed) return;
         if (isActive) void syncLatestLocation(false);
-        else flushPendingPreferences();
+        else {
+          flushPendingAppearance();
+          flushPendingPreferences();
+        }
       });
       if (destroyed) {
         await handle.remove();
@@ -374,6 +378,7 @@
   }
 
   onDestroy(() => {
+    flushPendingAppearance();
     destroyed = true;
     onMountChange?.(false);
     removeBackHandler?.();
@@ -500,6 +505,7 @@
   }
 
   function closeSettings(): void {
+    flushPendingAppearance();
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
@@ -508,6 +514,7 @@
   }
 
   function openToc(): void {
+    flushPendingAppearance();
     pauseChromeHide();
     tocOpener = activeElement();
     tocVisible = true;
@@ -537,6 +544,7 @@
   }
 
   function openBookmarks(): void {
+    flushPendingAppearance();
     pauseChromeHide();
     bookmarksOpener = activeElement();
     bookmarksVisible = true;
@@ -576,6 +584,7 @@
   }
 
   function openAnnotations(focusAnnotationId?: string): void {
+    flushPendingAppearance();
     controlsVisible = true;
     pauseChromeHide();
     annotationsOpener = activeElement();
@@ -623,6 +632,7 @@
   }
 
   function openSearch(): void {
+    flushPendingAppearance();
     pauseChromeHide();
     searchOpener = activeElement();
     searchVisible = true;
@@ -650,6 +660,7 @@
   }
 
   function closeOpenSubpanels(): void {
+    flushPendingAppearance();
     settingsVisible = false;
     tocVisible = false;
     focusedTocIndex = -1;
@@ -867,15 +878,43 @@
     }, 5_000);
   }
 
-  function updateAppearance(patch: Partial<Appearance>): void {
+  function flushPendingAppearance(): void {
+    if (appearanceFrame === null) return;
+    window.cancelAnimationFrame(appearanceFrame);
+    appearanceFrame = null;
+    if (!destroyed) session?.applyAppearance(appearance);
+  }
+
+  function updateAppearance(patch: Partial<Appearance>, deferSessionUpdate = false): void {
     appearance = { ...appearance, ...patch };
-    session?.applyAppearance(appearance);
+    if (deferSessionUpdate) {
+      if (appearanceFrame === null) {
+        appearanceFrame = window.requestAnimationFrame(() => {
+          appearanceFrame = null;
+          if (!destroyed) session?.applyAppearance(appearance);
+        });
+      }
+    } else {
+      if (appearanceFrame !== null) {
+        window.cancelAnimationFrame(appearanceFrame);
+        appearanceFrame = null;
+      }
+      session?.applyAppearance(appearance);
+    }
     if (patch.keepAwake !== undefined) {
       void nativeFeatures?.setKeepAwake(patch.keepAwake);
     }
     if (saveTimer !== null) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(flushPendingPreferences, 500);
     showControls();
+  }
+
+  function commitSliderAppearance(patch: Partial<Appearance>): void {
+    const changed = (Object.keys(patch) as Array<keyof Appearance>).some(
+      (key) => appearance[key] !== patch[key],
+    );
+    if (changed) updateAppearance(patch);
+    else flushPendingAppearance();
   }
 
   function readerLocation(
@@ -1143,6 +1182,7 @@
 
   async function openSearchResult(result: ReaderSearchResult): Promise<void> {
     if (!session) return;
+    flushPendingAppearance();
     try {
       await session.displayCfi(result.cfi);
       closeSearch();
@@ -1154,6 +1194,7 @@
 
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
     if (!session) return;
+    flushPendingAppearance();
     const opener = activeElement();
     try {
       const restored = await session.displayCfi(saved.cfi);
@@ -1167,6 +1208,7 @@
 
   async function returnToLink(): Promise<void> {
     if (!session || !linkReturnTarget) return;
+    flushPendingAppearance();
     const opener = activeElement();
     const restoreLink = opener === returnToLinkButton;
     const target = linkReturnTarget;
@@ -1188,6 +1230,7 @@
     if (!session || Boolean(error)) return;
     const opener = activeElement();
     try {
+      flushPendingAppearance();
       if (direction === 'next') await session.next();
       else await session.previous();
     } catch (cause) {
@@ -1803,7 +1846,10 @@
               min="14"
               max="34"
               value={appearance.fontSize}
-              oninput={(event) => updateAppearance({ fontSize: Number(event.currentTarget.value) })}
+              oninput={(event) =>
+                updateAppearance({ fontSize: Number(event.currentTarget.value) }, true)}
+              onchange={(event) =>
+                commitSliderAppearance({ fontSize: Number(event.currentTarget.value) })}
             />
           </label>
           <label class="label mt-4">
@@ -1820,7 +1866,9 @@
               step="0.1"
               value={appearance.lineHeight}
               oninput={(event) =>
-                updateAppearance({ lineHeight: Number(event.currentTarget.value) })}
+                updateAppearance({ lineHeight: Number(event.currentTarget.value) }, true)}
+              onchange={(event) =>
+                commitSliderAppearance({ lineHeight: Number(event.currentTarget.value) })}
             />
           </label>
           <label class="label mt-4">
@@ -1835,7 +1883,10 @@
               min="8"
               max="56"
               value={appearance.margin}
-              oninput={(event) => updateAppearance({ margin: Number(event.currentTarget.value) })}
+              oninput={(event) =>
+                updateAppearance({ margin: Number(event.currentTarget.value) }, true)}
+              onchange={(event) =>
+                commitSliderAppearance({ margin: Number(event.currentTarget.value) })}
             />
           </label>
           <label class="label mt-4">
@@ -1852,7 +1903,9 @@
               step="2"
               value={appearance.bottomMargin}
               oninput={(event) =>
-                updateAppearance({ bottomMargin: Number(event.currentTarget.value) })}
+                updateAppearance({ bottomMargin: Number(event.currentTarget.value) }, true)}
+              onchange={(event) =>
+                commitSliderAppearance({ bottomMargin: Number(event.currentTarget.value) })}
             />
           </label>
           <label class="label mt-4">
@@ -1870,7 +1923,9 @@
               step="0.1"
               value={appearance.paragraphSpacing}
               oninput={(event) =>
-                updateAppearance({ paragraphSpacing: Number(event.currentTarget.value) })}
+                updateAppearance({ paragraphSpacing: Number(event.currentTarget.value) }, true)}
+              onchange={(event) =>
+                commitSliderAppearance({ paragraphSpacing: Number(event.currentTarget.value) })}
             />
           </label>
           <label class="label mt-4">
