@@ -1590,4 +1590,63 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     );
     expect(offlineRequests).toEqual([]);
   });
+
+  it('chains a fresh progress sync on reconnect when connectivity drops and recovers while an in-flight upload is still settling', async () => {
+    runtime.native = true;
+    runtime.online = true;
+    secureStorageMock.values.set('server_primary_api_key', 'valid-native-key');
+    seedDatabase({
+      books: [downloadedBook, onlineOnlyBook],
+      pendingSync: true,
+      secondPendingSync: true,
+    });
+
+    let fixtureOffline = false;
+    const offlineRequests: string[] = [];
+    let releaseFirstUpload = () => {};
+    let firstUploadStarted = false;
+
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      if (fixtureOffline) {
+        offlineRequests.push(`${options.method ?? 'GET'} ${options.url}`);
+      }
+      if (options.url.includes('/api/Reader/progress')) {
+        if (!firstUploadStarted) {
+          firstUploadStarted = true;
+          await new Promise<void>((resolve) => {
+            releaseFirstUpload = resolve;
+          });
+        }
+        return { status: 204, headers: {}, url: options.url, data: '' };
+      }
+      if (options.url.includes('/api/Series/v2')) {
+        return { status: 200, headers: {}, url: options.url, data: '[]' };
+      }
+      throw new Error(`Unexpected native request ${options.url}`);
+    });
+
+    mounted = mount(App, { target });
+    await waitForCondition(() => firstUploadStarted);
+
+    // Connectivity drops while the first upload socket is still in flight (aborting syncQueueController),
+    // then reconnects and settles (500ms) BEFORE the first upload socket finishes resolving.
+    runtime.online = false;
+    fixtureOffline = true;
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: false });
+    }
+
+    runtime.online = true;
+    fixtureOffline = false;
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: true });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 560));
+    expect(offlineRequests).toEqual([]);
+
+    // Now the in-flight first upload finishes; chained syncProgress must run and upload the second book!
+    releaseFirstUpload();
+    await waitForCondition(async () => (await Database.getPendingSync('primary')).length === 0);
+    expect(offlineRequests).toEqual([]);
+  });
 });

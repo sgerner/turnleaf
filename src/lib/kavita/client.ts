@@ -102,22 +102,34 @@ export class KavitaClient {
     }
   }
 
-  private assertTransportReady(
+  private assertDispatchReadySync(
     signal?: AbortSignal | null,
     probe = this.probe,
   ): void | Promise<void> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     this.assertCredentialReady(probe);
-    const preflight = this.beforeDispatch?.();
-    if (!preflight && !Capacitor.isNativePlatform()) {
+    const check = this.beforeDispatch?.();
+    if (!check) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       this.assertCredentialReady(probe);
       return;
     }
-    return this.awaitTransportReady(preflight, signal, probe);
+    return check.then(() => {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      this.assertCredentialReady(probe);
+    });
   }
 
-  private async awaitTransportReady(
+  private assertTransportReady(
+    signal?: AbortSignal | null,
+    probe = this.probe,
+  ): void | Promise<void> {
+    const preflight = this.assertDispatchReadySync(signal, probe);
+    if (!Capacitor.isNativePlatform()) return preflight;
+    return this.awaitNativeTransportReady(preflight, signal, probe);
+  }
+
+  private async awaitNativeTransportReady(
     preflight: void | Promise<void>,
     signal?: AbortSignal | null,
     probe = this.probe,
@@ -125,18 +137,12 @@ export class KavitaClient {
     if (preflight) await preflight;
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     this.assertCredentialReady(probe);
-    if (Capacitor.isNativePlatform()) {
-      const status = await Network.getStatus().catch(() => null);
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      this.assertCredentialReady(probe);
-      if (status?.connected !== true) {
-        this.onOffline?.();
-        throw new KavitaOfflineError();
-      }
-      const postCheck = this.beforeDispatch?.();
-      if (postCheck) await postCheck;
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      this.assertCredentialReady(probe);
+    const status = await Network.getStatus().catch(() => null);
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    this.assertCredentialReady(probe);
+    if (status?.connected !== true) {
+      this.onOffline?.();
+      throw new KavitaOfflineError();
     }
   }
 
@@ -341,6 +347,10 @@ export class KavitaClient {
       while (true) {
         const gate = this.assertTransportReady(init.signal, probe);
         if (gate) await gate;
+        const postCheck = this.assertDispatchReadySync(init.signal, probe);
+        if (postCheck) await postCheck;
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        this.assertCredentialReady(probe);
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (!probe && (response.status === 401 || response.status === 403)) {
           this.localRejectedStatus = response.status;
@@ -381,7 +391,11 @@ export class KavitaClient {
     const redirects = createRedirectState(url, new URL(this.baseUrl).origin, init.method ?? 'GET');
     while (true) {
       const gate = this.assertTransportReady(init.signal, probe);
-      if (gate) await gate;
+      if (gate) {
+        await gate;
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        this.assertCredentialReady(probe);
+      }
       const response = await fetch(redirects.currentUrl, { ...init, redirect: 'manual' });
       if (!probe && init.signal?.aborted && (response.status === 401 || response.status === 403)) {
         this.localRejectedStatus = response.status;

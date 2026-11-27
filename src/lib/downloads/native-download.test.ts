@@ -896,5 +896,63 @@ describe('native EPUB credential gating', () => {
     ).rejects.toThrow('Offline');
     expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
     expect(onOffline).toHaveBeenCalledTimes(1);
+
+    // Synchronous beforeDispatch check right before FileTransfer.downloadFile catches
+    // microtask offline transitions after Network.getStatus() resolves, and AbortSignal
+    // aborts the 750ms retry sleep immediately.
+    native.connected = true;
+    vi.mocked(FileTransfer.downloadFile).mockReset();
+    let gateOffline = false;
+    vi.mocked(Network.getStatus).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          queueMicrotask(() => {
+            resolve({ connected: true, connectionType: 'cellular' });
+            queueMicrotask(() => {
+              gateOffline = true;
+            });
+          });
+        }),
+    );
+    await expect(
+      downloadEpub(
+        'https://books.example.com/book.epub',
+        'transfer-key',
+        'book-microtask-offline',
+        undefined,
+        'https://books.example.com',
+        state.epoch,
+        undefined,
+        {
+          beforeDispatch: () => {
+            if (gateOffline) throw new Error('Offline');
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      status: undefined,
+      connectionFailed: true,
+    });
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+
+    const retryAbortController = new AbortController();
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      setTimeout(() => retryAbortController.abort(), 15);
+      throw { code: 'OS-PLUG-FLTR-0008', data: { httpStatus: 503 } };
+    });
+    const startedAt = Date.now();
+    await expect(
+      downloadEpub(
+        'https://books.example.com/book.epub',
+        'transfer-key',
+        'book-abort-backoff',
+        undefined,
+        'https://books.example.com',
+        state.epoch,
+        retryAbortController.signal,
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
   });
 });

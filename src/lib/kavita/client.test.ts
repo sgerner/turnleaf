@@ -1193,4 +1193,43 @@ it('gates initial, retry, and redirect dispatches against live native Network.ge
 
   await expect(gatedBrowserClient.getBookSeries()).rejects.toBeInstanceOf(KavitaOfflineError);
   expect(redirectFetch).toHaveBeenCalledTimes(1);
+
+  // 5) Microtask offline transition right after Network.getStatus() resolves (without aborting
+  //    init.signal, matching saveProgress during handleOfflineTransition) still blocks dispatch
+  capacitorRuntime.native = true;
+  capacitorRuntime.connected = true;
+  vi.mocked(CapacitorHttp.request).mockReset();
+  let libraryOffline = false;
+  vi.mocked(Network.getStatus).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        queueMicrotask(() => {
+          resolve({ connected: true, connectionType: 'cellular' });
+          queueMicrotask(() => {
+            libraryOffline = true;
+          });
+        });
+      }),
+  );
+  const microtaskGatedClient = new KavitaClient('https://books.example.com', 'live-key', {
+    credentialEpoch: loaded.epoch,
+    beforeDispatch: () => {
+      if (libraryOffline) throw new KavitaOfflineError();
+    },
+  });
+  const unAbortedSyncController = new AbortController();
+  await expect(
+    microtaskGatedClient.saveProgress(
+      {
+        volumeId: 1,
+        chapterId: 1,
+        pageNum: 12,
+        seriesId: 1,
+        libraryId: 1,
+        bookScrollId: null,
+      },
+      unAbortedSyncController.signal,
+    ),
+  ).rejects.toBeInstanceOf(KavitaOfflineError);
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
 });

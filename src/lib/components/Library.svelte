@@ -1015,6 +1015,9 @@
   }
 
   function syncProgress(showFeedback = true): Promise<void> {
+    if (syncWork && (syncController?.signal.aborted || syncQueueController?.signal.aborted)) {
+      return syncWork.then(() => syncProgress(showFeedback));
+    }
     if (syncWork) return syncWork;
     if (
       destroyed ||
@@ -2186,8 +2189,12 @@
 
       const result = await new KavitaClient(server.baseUrl, nextKey, {
         probe: true,
+        beforeDispatch: () => {
+          if (destroyed) throw new DOMException('Aborted', 'AbortError');
+        },
         onOffline: handleOfflineTransition,
       }).testConnection();
+      if (destroyed) return;
       if (result.bookLibraries.length === 0) {
         throw new Error(
           'This account has no book or light novel libraries. Only EPUB books are supported.',
@@ -2232,8 +2239,10 @@
         catalogCheckPending = false;
       }
     } catch (cause) {
-      settingsError =
-        cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
+      if (!destroyed) {
+        settingsError =
+          cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
+      }
     } finally {
       replacingApiKey = false;
     }

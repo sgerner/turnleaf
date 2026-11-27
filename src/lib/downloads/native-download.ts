@@ -156,6 +156,51 @@ export interface NativeTransferGate {
   onOffline?: (() => void) | undefined;
 }
 
+function runTransferBeforeHop(
+  apiKey: string,
+  epoch: number | undefined,
+  beforeDispatch: (() => void | Promise<void>) | undefined,
+  createAuthError: () => Error,
+  mapDispatchError: (error: unknown) => Error,
+): void | Promise<void> {
+  if (!canSendCredential(apiKey, epoch)) throw createAuthError();
+  let pending: void | Promise<void>;
+  try {
+    pending = beforeDispatch?.();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw mapDispatchError(error);
+  }
+  if (!pending) {
+    if (!canSendCredential(apiKey, epoch)) throw createAuthError();
+    return;
+  }
+  return pending.then(
+    () => {
+      if (!canSendCredential(apiKey, epoch)) throw createAuthError();
+    },
+    (error: unknown) => {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error;
+      throw mapDispatchError(error);
+    },
+  );
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 async function downloadFileWithRedirects(options: {
   initialUrl: string;
   normalizedInitialUrl: string;
@@ -180,7 +225,8 @@ async function downloadFileWithRedirects(options: {
   );
   while (true) {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    await options.beforeHop?.();
+    const preCheck = options.beforeHop?.();
+    if (preCheck) await preCheck;
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     if (Capacitor.isNativePlatform()) {
       const status = await Network.getStatus().catch(() => null);
@@ -189,7 +235,8 @@ async function downloadFileWithRedirects(options: {
         options.onOffline?.();
         throw options.createOfflineError();
       }
-      await options.beforeHop?.();
+      const postCheck = options.beforeHop?.();
+      if (postCheck) await postCheck;
       if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     }
     options.onHop?.(redirects.currentUrl);
@@ -278,20 +325,14 @@ export async function downloadEpub(
           apiKey,
           progress: Boolean(listener),
           signal,
-          beforeHop: async () => {
-            if (!canSendCredential(apiKey, epoch)) {
-              throw new EpubTransferError(401, false);
-            }
-            try {
-              await transportGate?.beforeDispatch?.();
-            } catch (error) {
-              if (error instanceof DOMException && error.name === 'AbortError') throw error;
-              throw new EpubTransferError(undefined, true);
-            }
-            if (!canSendCredential(apiKey, epoch)) {
-              throw new EpubTransferError(401, false);
-            }
-          },
+          beforeHop: () =>
+            runTransferBeforeHop(
+              apiKey,
+              epoch,
+              transportGate?.beforeDispatch,
+              () => new EpubTransferError(401, false),
+              () => new EpubTransferError(undefined, true),
+            ),
           onOffline: transportGate?.onOffline,
           createOfflineError: () => new EpubTransferError(undefined, true),
           onHop: (url) => {
@@ -339,7 +380,7 @@ export async function downloadEpub(
           status,
           detail: 'download-retry',
         });
-        await new Promise((resolve) => setTimeout(resolve, 750));
+        await abortableDelay(750, signal);
       }
     }
     if (signal?.aborted || !canSendCredential(apiKey, epoch)) {
@@ -464,16 +505,14 @@ export async function cacheCover(
         connectTimeout: 5_000,
         readTimeout: 5_000,
         signal,
-        beforeHop: async () => {
-          if (!canSendCredential(apiKey, epoch)) throw new Error('Offline');
-          try {
-            await transportGate?.beforeDispatch?.();
-          } catch (error) {
-            if (error instanceof DOMException && error.name === 'AbortError') throw error;
-            throw new Error('Offline', { cause: error });
-          }
-          if (!canSendCredential(apiKey, epoch)) throw new Error('Offline');
-        },
+        beforeHop: () =>
+          runTransferBeforeHop(
+            apiKey,
+            epoch,
+            transportGate?.beforeDispatch,
+            () => new Error('Offline'),
+            (error) => new Error('Offline', { cause: error }),
+          ),
         onOffline: transportGate?.onOffline,
         createOfflineError: () => new Error('Offline'),
         onHttpError: (httpStatus) => {
