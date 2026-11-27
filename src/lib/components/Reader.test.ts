@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as SessionModule from '../reader/session';
 
 const {
   getPreferencesMock,
@@ -23,16 +24,16 @@ vi.mock('../database/database', () => ({
 }));
 
 vi.mock('../reader/session', async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>();
+  const actual = await importOriginal<typeof SessionModule>();
   return {
     ...actual,
     ReaderSession: class MockReaderSession {
       open = openSessionMock;
       next = nextSessionMock;
       tableOfContents = () => [];
-      updateHighlights = vi.fn();
-      clearTextSelection = vi.fn();
       getVisiblePassages = () => [];
+      clearTextSelection = vi.fn();
+      updateHighlights = vi.fn();
       destroy = destroySessionMock;
     },
   };
@@ -136,7 +137,7 @@ describe('Reader mount lifecycle', () => {
     expect(onMountChange).toHaveBeenCalledWith(true);
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
         'This EPUB could not be opened.',
       );
     });

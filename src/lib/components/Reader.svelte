@@ -118,7 +118,9 @@
   let viewport: HTMLDivElement;
   let readerToolbar = $state<HTMLElement | null>(null);
   let topRevealButton = $state<HTMLButtonElement | null>(null);
+  let returnToLinkButton = $state<HTMLButtonElement | null>(null);
   let session: ReaderSession | null = null;
+  let sessionReady = $state(false);
   let controlsVisible = $state(false);
   let settingsVisible = $state(false);
   let tocVisible = $state(false);
@@ -133,6 +135,7 @@
   let searchPanel = $state<HTMLElement | null>(null);
   let syncConfirmationPanel = $state<HTMLElement | null>(null);
   let endOfBookPanel = $state<HTMLElement | null>(null);
+  let errorPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
   let tocOpener: HTMLElement | null = null;
   let bookmarksOpener: HTMLElement | null = null;
@@ -144,6 +147,8 @@
   let openingNextBook = $state(false);
   let endOfBookError = $state('');
   let endOfBookAnnouncement = $state('');
+  let errorOpener: HTMLElement | null = null;
+  let errorRestoreReturnLink = false;
   let toc = $state<TocItem[]>([]);
   let tocVirtualWindow = $state<VirtualWindow>(
     calculateVirtualWindow(0, 1, TOC_ROW_HEIGHT_PX, 0, 0, TOC_OVERSCAN_ROWS),
@@ -235,9 +240,12 @@
     } catch {
       if (destroyed) return;
       startupOpenFailed = true;
-      error = 'This EPUB could not be opened. The download may be incomplete or corrupted.';
       session?.destroy();
       session = null;
+      sessionReady = false;
+      openReaderError(
+        'This EPUB could not be opened. The download may be incomplete or corrupted.',
+      );
       await restoreNativeReaderChrome();
       return;
     }
@@ -294,6 +302,7 @@
       handleKeyboardNavigation,
     );
     if (!destroyed) {
+      sessionReady = true;
       toc = nextSession.tableOfContents();
       nextSession.updateHighlights(annotations);
       updateDocumentTitle();
@@ -362,11 +371,13 @@
       await openReaderSession();
       if (destroyed) return;
       startupOpenFailed = false;
+      restoreModalFocus(null, () => readerToolbar ?? topRevealButton);
       await listenForReaderResume();
     } catch (cause) {
       if (destroyed) return;
       session?.destroy();
       session = null;
+      sessionReady = false;
       await restoreNativeReaderChrome();
       startupOpenFailed = true;
       error =
@@ -375,6 +386,9 @@
           : 'The EPUB could not be opened after retrying the download.';
     } finally {
       retryingReader = false;
+      if (!destroyed && error) {
+        void tick().then(() => focusFirstElement(errorPanel));
+      }
     }
   }
 
@@ -423,8 +437,60 @@
       annotationsVisible ||
       searchVisible ||
       pendingSyncLocation !== null ||
-      endOfBookVisible
+      endOfBookVisible ||
+      Boolean(error)
     );
+  }
+
+  function hasTopLevelAlert(): boolean {
+    return pendingSyncLocation !== null || endOfBookVisible || Boolean(error);
+  }
+
+  function canDismissError(): boolean {
+    return session !== null && sessionReady && !startupOpenFailed;
+  }
+
+  function errorFallbackTarget(): HTMLElement | null {
+    if (errorRestoreReturnLink && returnToLinkButton) return returnToLinkButton;
+    if (settingsVisible) return settingsPanel;
+    if (tocVisible) return tocPanel;
+    if (bookmarksVisible) return bookmarksPanel;
+    if (annotationsVisible) return annotationsPanel;
+    if (searchVisible) return searchPanel;
+    return readerToolbar ?? topRevealButton;
+  }
+
+  function openReaderError(
+    message: string,
+    opener: HTMLElement | null = null,
+    restoreReturnLink = false,
+  ): void {
+    pauseChromeHide();
+    errorOpener = opener;
+    errorRestoreReturnLink = restoreReturnLink;
+    error = message;
+    focusModal(() => errorPanel);
+  }
+
+  function dismissError(): void {
+    if (!canDismissError()) return;
+    error = '';
+    const opener = errorOpener;
+    errorOpener = null;
+    void tick().then(() => {
+      const fallback = errorFallbackTarget();
+      errorRestoreReturnLink = false;
+      restoreFocus(opener, fallback);
+    });
+    resumeChromeHide();
+  }
+
+  function handleErrorDialogClose(): void {
+    if (canDismissError()) {
+      dismissError();
+    } else if (!retryingReader) {
+      onBack();
+    }
   }
 
   function pauseChromeHide(): void {
@@ -603,24 +669,63 @@
     resumeChromeHide();
   }
 
-  function openSyncConfirmation(progress: SyncedLocation): void {
+  function closeOpenSubpanels(): void {
+    settingsVisible = false;
+    tocVisible = false;
+    focusedTocIndex = -1;
+    if (tocVirtualizationFrame !== null) {
+      window.cancelAnimationFrame(tocVirtualizationFrame);
+      tocVirtualizationFrame = null;
+    }
+    bookmarksVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
+    editingBookmarkId = null;
+    bookmarkLimitMessage = '';
+    if (!hasSelectionDraft()) {
+      selectedText = null;
+      annotationDraft = '';
+    }
+    visiblePassages = [];
+    selectedPassageIndex = 0;
+    annotationMessage = '';
+    annotationLimitMessage = '';
+    exportFallback = '';
+    exportMessage = '';
+    searchController?.abort();
+    searchController = null;
+    searching = false;
+  }
+
+  function openSyncConfirmation(
+    progress: SyncedLocation,
+    opener: HTMLElement | null = activeElement(),
+  ): void {
     pauseChromeHide();
-    syncConfirmationOpener = activeElement();
+    syncConfirmationOpener = opener;
+    closeOpenSubpanels();
     pendingSyncLocation = progress;
     focusModal(() => syncConfirmationPanel);
   }
 
-  function closeSyncConfirmation(): void {
+  function closeSyncConfirmation(restore = true): void {
     pendingSyncLocation = null;
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
-    restoreModalFocus(opener);
+    if (restore) {
+      restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
+    }
     resumeChromeHide();
   }
 
-  function openEndOfBook(): void {
+  function openEndOfBook(opener: HTMLElement | null = activeElement()): void {
     pauseChromeHide();
-    endOfBookOpener = activeElement();
+    endOfBookOpener = opener;
     endOfBookError = '';
     endOfBookAnnouncement = nextBook
       ? `Finished ${title}. Next volume ready: ${nextBook.title}.`
@@ -635,7 +740,7 @@
     endOfBookError = '';
     const opener = endOfBookOpener;
     endOfBookOpener = null;
-    restoreModalFocus(opener);
+    restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
     resumeChromeHide();
   }
 
@@ -1106,18 +1211,21 @@
 
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
     if (!session) return;
+    const opener = activeElement();
     try {
       const restored = await session.displayCfi(saved.cfi);
       if (!restored && saved.href) await session.display(saved.href);
       closeBookmarks();
       showControls();
     } catch {
-      error = 'This saved location is no longer available in the current EPUB.';
+      openReaderError('This saved location is no longer available in the current EPUB.', opener);
     }
   }
 
   async function returnToLink(): Promise<void> {
     if (!session || !linkReturnTarget) return;
+    const opener = activeElement();
+    const restoreLink = opener === returnToLinkButton;
     const target = linkReturnTarget;
     try {
       const restored = await session.displayCfi(target.cfi);
@@ -1125,28 +1233,35 @@
       linkReturnTarget = null;
       showControls();
     } catch {
-      error = 'The location before this link is no longer available in the current EPUB.';
+      openReaderError(
+        'The location before this link is no longer available in the current EPUB.',
+        opener,
+        restoreLink,
+      );
     }
   }
 
   async function turn(direction: 'next' | 'previous'): Promise<void> {
+    if (!session || Boolean(error)) return;
+    const opener = activeElement();
     try {
-      if (!session) throw new Error('Reader session is unavailable.');
       if (direction === 'next') {
         const advanced = await session.next();
-        if (!advanced && !destroyed) {
+        if (advanced === false && !destroyed) {
           onBookCompleted?.();
-          openEndOfBook();
+          openEndOfBook(opener);
         }
       } else {
         if (endOfBookVisible) closeEndOfBook();
         await session.previous();
       }
     } catch (cause) {
-      error =
+      openReaderError(
         cause instanceof Error
           ? cause.message
-          : 'This page could not be displayed. Try reopening the book.';
+          : 'This page could not be displayed. Try reopening the book.',
+        opener,
+      );
     }
   }
 
@@ -1207,25 +1322,35 @@
   async function confirmSyncLocation(): Promise<void> {
     const progress = pendingSyncLocation;
     const reader = session;
-    closeSyncConfirmation();
-    if (!progress || !reader) return;
+    const opener = syncConfirmationOpener;
+    if (!progress || !reader) {
+      closeSyncConfirmation();
+      return;
+    }
+    closeSyncConfirmation(false);
     try {
       await progress.accept?.();
       if (destroyed || session !== reader) return;
       await displaySyncedLocation(reader, progress);
+      showControls();
+      restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
     } catch (cause) {
-      error =
+      if (destroyed || session !== reader) return;
+      openReaderError(
         cause instanceof Error
           ? cause.message
-          : 'Kavita’s latest reading position could not be opened.';
+          : 'Kavita’s latest reading position could not be opened.',
+        opener,
+      );
     }
-    showControls();
   }
 
   async function syncLatestLocation(showFeedback = true): Promise<void> {
     if (!session || !onSyncLatest || syncingLatest) return;
     if (!showFeedback && (initialCfi || localNavigationDuringSession)) return;
     const reader = session;
+    const opener = showFeedback ? activeElement() : null;
+    if (showFeedback) pauseChromeHide();
     syncingLatest = true;
     readerSyncMessage = '';
     try {
@@ -1233,7 +1358,7 @@
       if (destroyed || session !== reader || (!showFeedback && localNavigationDuringSession))
         return;
       if (progress && showFeedback && hasDivergentSyncLocation(progress)) {
-        openSyncConfirmation(progress);
+        openSyncConfirmation(progress, opener);
         return;
       }
       if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
@@ -1245,14 +1370,24 @@
         readerSyncMessage = 'Reading progress synced.';
         showControls();
       }
-    } catch (error) {
+    } catch (cause) {
       if (showFeedback && !destroyed && session === reader) {
         readerSyncMessage =
-          error instanceof Error ? error.message : 'Reading progress could not sync.';
+          cause instanceof Error ? cause.message : 'Reading progress could not sync.';
         showControls();
       }
     } finally {
       syncingLatest = false;
+      if (!destroyed) {
+        resumeChromeHide();
+        if (showFeedback && !hasOpenReaderPanel() && opener) {
+          void tick().then(() => {
+            if (!destroyed && !hasOpenReaderPanel() && document.activeElement === document.body) {
+              restoreFocus(opener, readerToolbar ?? topRevealButton);
+            }
+          });
+        }
+      }
     }
   }
 
@@ -1265,9 +1400,8 @@
   }
 
   function handleKeyboardNavigation(event: KeyboardEvent): void {
-    if (destroyed) return;
+    if (destroyed || event.defaultPrevented) return;
     if (
-      !event.defaultPrevented &&
       !event.ctrlKey &&
       !event.metaKey &&
       !event.altKey &&
@@ -1276,12 +1410,19 @@
       hasOpenReaderPanel()
     ) {
       event.preventDefault();
+      if (error) {
+        handleErrorDialogClose();
+        return;
+      }
+      if (pendingSyncLocation) {
+        closeSyncConfirmation();
+        return;
+      }
       if (endOfBookVisible) {
         closeEndOfBook();
         return;
       }
-      if (pendingSyncLocation) closeSyncConfirmation();
-      else if (settingsVisible) closeSettings();
+      if (settingsVisible) closeSettings();
       else if (tocVisible) closeToc();
       else if (bookmarksVisible) closeBookmarks();
       else if (annotationsVisible) closeAnnotations();
@@ -1310,22 +1451,32 @@
   }
 
   function handleBackButton(): boolean {
+    if (error) {
+      handleErrorDialogClose();
+      return true;
+    }
+    if (pendingSyncLocation) {
+      closeSyncConfirmation();
+      return true;
+    }
     if (endOfBookVisible) {
       closeEndOfBook();
       return true;
     }
-    if (pendingSyncLocation) closeSyncConfirmation();
-    else if (settingsVisible) closeSettings();
+    if (settingsVisible) closeSettings();
     else if (tocVisible) closeToc();
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
     else if (searchVisible) closeSearch();
-    else if (linkReturnTarget) void returnToLink();
-    else if (controlsVisible) {
+    else if (linkReturnTarget) {
+      void returnToLink();
+      return true;
+    } else if (controlsVisible) {
       controlsVisible = false;
       footerVisible = false;
       pauseChromeHide();
       void tick().then(() => topRevealButton?.focus());
+      return true;
     } else {
       onBack();
       return true;
@@ -1335,6 +1486,7 @@
   }
 
   function handleBottomSwipeStart(event: PointerEvent): void {
+    if (hasOpenReaderPanel()) return;
     if (event.pointerType === 'mouse' && event.button !== 0) return;
     bottomSwipeStart = { id: event.pointerId, x: event.clientX, y: event.clientY };
   }
@@ -1366,7 +1518,7 @@
 
 <main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
   <h1 class="sr-only">{title}</h1>
-  <div class="reader-viewport" bind:this={viewport}></div>
+  <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
   <p class="sr-only" role="status">{selectionMessage}</p>
   {#if selectedText && !hasOpenReaderPanel()}
@@ -1418,19 +1570,7 @@
     Press Escape to close an open reader panel or clear selected text.
   </p>
 
-  <nav
-    class="tap-zones"
-    aria-label="Page navigation"
-    inert={Boolean(
-      settingsVisible ||
-      tocVisible ||
-      bookmarksVisible ||
-      annotationsVisible ||
-      searchVisible ||
-      pendingSyncLocation ||
-      endOfBookVisible,
-    )}
-  >
+  <nav class="tap-zones" aria-label="Page navigation" inert={hasOpenReaderPanel()}>
     <button
       type="button"
       aria-label="Previous page"
@@ -1453,6 +1593,7 @@
 
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
+      bind:this={returnToLinkButton}
       class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
       type="button"
       aria-label="Return to the location before this link"
@@ -1490,11 +1631,12 @@
     </div>
   {/if}
 
-  {#if !controlsVisible && !endOfBookVisible}
+  {#if !controlsVisible}
     <button
       type="button"
       class="reader-top-reveal"
       bind:this={topRevealButton}
+      inert={hasOpenReaderPanel()}
       aria-label="Show reading controls"
       onclick={showControls}
     ></button>
@@ -1580,41 +1722,17 @@
     </div>
   {/if}
 
-  {#if error}
-    <div class="absolute inset-0 grid place-items-center p-8" role="alert">
-      <div class="card preset-tonal-error max-w-sm p-6 text-center">
-        <p>{error}</p>
-        <div class="mt-5 flex flex-wrap justify-center gap-3">
-          {#if startupOpenFailed && onRetryDownload}
-            <button
-              class="btn preset-filled-primary-700-300"
-              type="button"
-              disabled={retryingReader}
-              onclick={() => void retryReaderOpen()}
-            >
-              {retryingReader ? 'Retrying download…' : 'Retry download'}
-            </button>
-          {/if}
-          <button class="btn preset-filled-error-500" type="button" onclick={onBack}>Back</button>
-        </div>
-      </div>
-    </div>
-  {/if}
-
   {#if controlsVisible}
-    <div class="reader-overlay" data-controls transition:fade={{ duration: 120 }}>
+    <div
+      class="reader-overlay"
+      data-controls
+      inert={hasTopLevelAlert()}
+      transition:fade={{ duration: 120 }}
+    >
       <header
         bind:this={readerToolbar}
         class="reader-bar reader-top"
-        inert={Boolean(
-          settingsVisible ||
-          tocVisible ||
-          bookmarksVisible ||
-          annotationsVisible ||
-          searchVisible ||
-          pendingSyncLocation ||
-          endOfBookVisible,
-        )}
+        inert={hasOpenReaderPanel()}
         transition:fly={{ y: -8, duration: 140 }}
       >
         <div class="reader-toolbar">
@@ -1741,59 +1859,23 @@
         </div>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || pendingSyncLocation}
+      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible}
         <button
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
           aria-label="Close reader panel"
           onclick={() =>
-            pendingSyncLocation
-              ? closeSyncConfirmation()
-              : settingsVisible
-                ? closeSettings()
-                : tocVisible
-                  ? closeToc()
-                  : bookmarksVisible
-                    ? closeBookmarks()
-                    : annotationsVisible
-                      ? closeAnnotations()
-                      : closeSearch()}
+            settingsVisible
+              ? closeSettings()
+              : tocVisible
+                ? closeToc()
+                : bookmarksVisible
+                  ? closeBookmarks()
+                  : annotationsVisible
+                    ? closeAnnotations()
+                    : closeSearch()}
         ></button>
-      {/if}
-
-      {#if pendingSyncLocation}
-        <div
-          bind:this={syncConfirmationPanel}
-          class="reader-settings card preset-filled-surface-50-950 relative max-w-sm"
-          role="alertdialog"
-          aria-modal="true"
-          aria-labelledby="reader-sync-confirm-title"
-          aria-describedby="reader-sync-confirm-description"
-          tabindex="-1"
-          onkeydown={(event) =>
-            trapModalKeydown(event, syncConfirmationPanel!, closeSyncConfirmation)}
-          transition:fly={{ y: 12, duration: 150 }}
-        >
-          <h2 id="reader-sync-confirm-title" class="font-serif text-xl">
-            Move to Kavita’s latest position?
-          </h2>
-          <p id="reader-sync-confirm-description" class="mt-3 text-sm text-surface-700-300">
-            Kavita has a different reading position saved. Move this reader there?
-          </p>
-          <div class="mt-5 flex flex-wrap justify-end gap-2">
-            <button class="btn preset-tonal-surface" type="button" onclick={closeSyncConfirmation}>
-              Stay here
-            </button>
-            <button
-              class="btn preset-filled-primary-700-300"
-              type="button"
-              onclick={() => void confirmSyncLocation()}
-            >
-              Go to latest position
-            </button>
-          </div>
-        </div>
       {/if}
 
       {#snippet readerPanelHeader(
@@ -2545,7 +2627,11 @@
   {/if}
 
   {#if footerVisible}
-    <footer class="reader-bar reader-bottom" transition:fly={{ y: 8, duration: 140 }}>
+    <footer
+      class="reader-bar reader-bottom"
+      inert={hasOpenReaderPanel()}
+      transition:fly={{ y: 8, duration: 140 }}
+    >
       <span class="truncate text-xs">{activeSectionLabel}</span>
       <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
     </footer>
@@ -2554,6 +2640,7 @@
   <button
     class="reader-progress-reveal btn btn-sm preset-tonal-surface"
     type="button"
+    inert={hasOpenReaderPanel()}
     aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
     aria-pressed={footerVisible}
     title={footerVisible ? 'Hide reading details' : 'Show reading details'}
@@ -2565,11 +2652,111 @@
   <div
     class="reader-bottom-reveal"
     aria-hidden="true"
+    inert={hasOpenReaderPanel()}
     onpointerdown={handleBottomSwipeStart}
     onpointermove={handleBottomSwipeMove}
     onpointerup={handleBottomSwipeEnd}
     onpointercancel={handleBottomSwipeEnd}
   ></div>
+
+  {#if pendingSyncLocation}
+    <div
+      class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-4"
+      role="presentation"
+      transition:fade={{ duration: 120 }}
+      onclick={(event) => event.target === event.currentTarget && closeSyncConfirmation()}
+    >
+      <div
+        bind:this={syncConfirmationPanel}
+        class="card preset-filled-surface-50-950 max-h-[calc(100dvh-2rem)] w-full max-w-sm overflow-auto p-5 shadow-xl"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="reader-sync-confirm-title"
+        aria-describedby="reader-sync-confirm-description"
+        tabindex="-1"
+        onkeydown={(event) =>
+          trapModalKeydown(event, syncConfirmationPanel!, () => closeSyncConfirmation())}
+        transition:fly={{ y: 12, duration: 150 }}
+      >
+        <h2 id="reader-sync-confirm-title" class="font-serif text-xl">
+          Move to Kavita’s latest position?
+        </h2>
+        <p id="reader-sync-confirm-description" class="mt-3 text-sm text-surface-700-300">
+          Kavita has a different reading position saved. Move this reader there?
+        </p>
+        <div class="mt-5 flex flex-wrap justify-end gap-2">
+          <button
+            class="btn min-h-11 preset-tonal-surface"
+            type="button"
+            onclick={() => closeSyncConfirmation()}
+          >
+            Stay here
+          </button>
+          <button
+            class="btn min-h-11 preset-filled-primary-700-300"
+            type="button"
+            onclick={() => void confirmSyncLocation()}
+          >
+            Go to latest position
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if error}
+    <div
+      class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-4"
+      role="presentation"
+      transition:fade={{ duration: 120 }}
+      onclick={(event) => {
+        if (event.target === event.currentTarget && canDismissError()) dismissError();
+      }}
+    >
+      <div
+        bind:this={errorPanel}
+        class="card preset-tonal-error max-h-[calc(100dvh-2rem)] w-full max-w-sm overflow-auto p-5 text-center shadow-xl"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="reader-error-title"
+        aria-describedby="reader-error-description"
+        tabindex="-1"
+        onkeydown={(event) => trapModalKeydown(event, errorPanel!, handleErrorDialogClose)}
+        transition:fly={{ y: 12, duration: 150 }}
+      >
+        <h2 id="reader-error-title" class="font-serif text-xl">
+          {startupOpenFailed ? 'Unable to open book' : 'Reader problem'}
+        </h2>
+        <p id="reader-error-description" class="mt-3 text-sm" aria-live="polite" aria-atomic="true">
+          {error}
+        </p>
+        <div class="mt-5 flex flex-wrap justify-center gap-3">
+          {#if canDismissError()}
+            <button
+              class="btn min-h-11 preset-filled-primary-700-300"
+              type="button"
+              onclick={dismissError}
+            >
+              Dismiss
+            </button>
+          {/if}
+          {#if startupOpenFailed && onRetryDownload}
+            <button
+              class="btn min-h-11 preset-filled-primary-700-300"
+              type="button"
+              disabled={retryingReader}
+              onclick={() => void retryReaderOpen()}
+            >
+              {retryingReader ? 'Retrying download…' : 'Retry download'}
+            </button>
+          {/if}
+          <button class="btn min-h-11 preset-filled-error-500" type="button" onclick={onBack}>
+            Back
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </main>
 
 <style>
