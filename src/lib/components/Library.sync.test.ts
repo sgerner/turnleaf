@@ -75,10 +75,16 @@ vi.mock('../native/credentials', () => ({
   removeApiKey: vi.fn(async () => {}),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+import type * as ThemesModule from '../themes/themes';
+
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
