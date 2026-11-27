@@ -1,8 +1,10 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { fade, fly } from 'svelte/transition';
   import { focusFirstElement, restoreFocus } from '../a11y/modal-focus';
   import type { ServerConfig } from '../database/database';
+  import { getDiagnosticCount, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
+  import { KavitaError } from '../kavita/client';
   import {
     classifyConnectionError,
     INITIAL_SETUP_MESSAGES,
@@ -11,8 +13,10 @@
     verifyKavitaConnection,
     type InvalidConnectionField,
   } from '../kavita/connection';
-  import { extractPastedOpdsUrl, normalizeServerUrl } from '../kavita/url';
+  import { extractPastedOpdsUrl, normalizeServerUrl, ServerUrlError } from '../kavita/url';
+  import { handleOnboardingBack, type RegisterBackHandler } from '../native/back-button';
   import { saveApiKey } from '../native/credentials';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
 
   let {
@@ -23,7 +27,7 @@
   }: {
     savedServer?: ServerConfig | null;
     autoFocus?: boolean;
-    registerBackHandler?: ((handler: () => boolean) => () => void) | undefined;
+    registerBackHandler?: RegisterBackHandler | undefined;
     onConnected: (server: ServerConfig, key: string) => void;
   } = $props();
 
@@ -39,22 +43,28 @@
   let error = $state('');
   let invalidField = $state<InvalidConnectionField>(null);
   let showKey = $state(false);
+  let diagnosticCount = $state(getDiagnosticCount());
+
+  $effect(() =>
+    subscribeDiagnostics((count) => {
+      diagnosticCount = count;
+    }),
+  );
 
   $effect(() => {
     if (!autoFocus) return;
     void tick().then(() => focusFirstElement(formElement));
   });
 
-  $effect(() => {
-    if (!registerBackHandler) return;
-    return registerBackHandler(() => {
-      if (savedServer && changeServerAddress) {
-        if (!busy) toggleChangeServerAddress(false);
-        return true;
-      }
-      return false;
-    });
-  });
+  onMount(() =>
+    registerBackHandler?.(() =>
+      handleOnboardingBack({
+        busy,
+        onCancel:
+          savedServer && changeServerAddress ? () => toggleChangeServerAddress(false) : undefined,
+      }),
+    ),
+  );
 
   function toggleChangeServerAddress(next = !changeServerAddress): void {
     changeServerAddress = next;
@@ -87,24 +97,32 @@
     invalidField = null;
     busy = true;
     const changingServerAddress = Boolean(savedServer && changeServerAddress);
+    let eventsRecorded = -1;
+    const unsubscribe = subscribeDiagnostics(() => {
+      eventsRecorded += 1;
+    });
 
     try {
       const normalized = normalizeServerUrl(
         savedServer && !changingServerAddress ? savedServer.baseUrl : serverUrl,
       );
-      if (!savedServer || changingServerAddress) {
-        serverUrl = normalized.baseUrl;
-      }
-      if (!apiKey.trim() && normalized.apiKey) {
-        apiKey = normalized.apiKey;
-      }
       if ((!savedServer || changingServerAddress) && normalized.insecure && !allowHttp) {
         invalidField = 'address';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'insecure-http-blocked',
+        });
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
-      const key = apiKey.trim();
+      const key = apiKey.trim() || normalized.apiKey || '';
       if (!key) {
         invalidField = 'key';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'missing-auth-key',
+        });
         throw new Error('Enter a Kavita auth key.');
       }
 
@@ -119,9 +137,20 @@
             key,
             result.version,
           );
+          serverUrl = normalized.baseUrl;
         } else {
-          await saveApiKey(savedServer.credentialRef, key);
+          try {
+            await saveApiKey(savedServer.credentialRef, key);
+          } catch (credentialError) {
+            recordDiagnostic({
+              category: 'startup',
+              endpoint: 'local/credentials',
+              detail: 'credential-save-failed',
+            });
+            throw credentialError;
+          }
         }
+        apiKey = '';
         onConnected(connectedServer, key);
         return;
       }
@@ -138,13 +167,37 @@
       };
 
       await saveConnection(server, key, INITIAL_SETUP_MESSAGES);
+      serverUrl = normalized.baseUrl;
       apiKey = '';
       onConnected(server, key);
     } catch (cause) {
+      if (cause instanceof ServerUrlError) {
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'invalid-server-url',
+        });
+      } else if (eventsRecorded === 0) {
+        if (cause instanceof KavitaError) {
+          recordDiagnostic({
+            category: cause.kind === 'invalid-response' ? 'response' : 'request',
+            endpoint: '/api/Library/libraries',
+            ...(cause.status !== undefined ? { status: cause.status } : {}),
+            detail: cause.kind,
+          });
+        } else {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/setup',
+            detail: 'setup-failed',
+          });
+        }
+      }
       const classified = classifyConnectionError(cause, 'Turnleaf could not complete setup.');
       if (!invalidField) invalidField = classified.invalidField;
       error = classified.message;
     } finally {
+      unsubscribe();
       busy = false;
     }
   }
@@ -292,6 +345,10 @@
       >
         {error}
       </div>
+
+      {#if error || diagnosticCount > 0}
+        <DiagnosticsPanel compact kavitaVersion={savedServer?.kavitaVersion} />
+      {/if}
 
       <button
         class="btn btn-lg preset-filled-primary-700-300 min-h-11 w-full"

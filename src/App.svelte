@@ -5,7 +5,9 @@
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
+  import DiagnosticsPanel from './lib/components/DiagnosticsPanel.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
+  import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
   import {
     getPreferences,
@@ -13,6 +15,7 @@
     resetLocalDatabase,
     type ServerConfig,
   } from './lib/database/database';
+  import { createBackButtonStack } from './lib/native/back-button';
   import { getApiKey } from './lib/native/credentials';
   import { loadTheme } from './lib/themes/themes';
 
@@ -32,14 +35,14 @@
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
-  let activeBackHandler: (() => boolean) | null = null;
-
-  function registerBackHandler(handler: () => boolean): () => void {
-    activeBackHandler = handler;
-    return () => {
-      if (activeBackHandler === handler) activeBackHandler = null;
-    };
-  }
+  const backStack = createBackButtonStack({
+    exitApp: () => {
+      void Promise.resolve()
+        .then(() => App.exitApp())
+        .catch(() => {});
+    },
+  });
+  const registerBackHandler = backStack.register;
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -63,11 +66,21 @@
         try {
           apiKey = await getApiKey(saved.credentialRef);
         } catch {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/credentials',
+            detail: 'credential-read-failed',
+          });
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
       }
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-open-failed',
+      });
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
@@ -79,11 +92,7 @@
     let destroyed = false;
     let removeBackListener: (() => Promise<void>) | null = null;
     void App.addListener('backButton', () => {
-      if (destroyed) return;
-      if (activeBackHandler?.()) return;
-      void Promise.resolve()
-        .then(() => App.exitApp())
-        .catch(() => {});
+      if (!destroyed) backStack.dispatch();
     })
       .then((handle) => {
         if (destroyed) void handle.remove();
@@ -91,10 +100,12 @@
       })
       .catch(() => {});
 
+    void hydrateDiagnostics();
     void loadLocalData();
 
     return () => {
       destroyed = true;
+      backStack.clear();
       if (removeBackListener) void removeBackListener();
     };
   });
@@ -103,8 +114,14 @@
     repairing = true;
     try {
       await resetLocalDatabase();
+      await clearDiagnostics();
       await loadLocalData();
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-reset-failed',
+      });
       startupError =
         'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
       return;
@@ -258,6 +275,7 @@
             </button>
           {/if}
         </div>
+        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
     {:else}
       <Onboarding

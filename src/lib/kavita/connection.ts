@@ -1,4 +1,5 @@
 import { saveServer, type ServerConfig } from '../database/database';
+import { recordDiagnostic } from '../diagnostics/log';
 import { removeApiKey, saveApiKey } from '../native/credentials';
 import { KavitaClient, KavitaError } from './client';
 import type { ConnectedServer } from './types';
@@ -30,15 +31,34 @@ export async function saveConnection(
   key: string,
   messages: SaveConnectionMessages,
 ): Promise<void> {
-  await saveApiKey(server.credentialRef, key);
+  try {
+    await saveApiKey(server.credentialRef, key);
+  } catch (credentialError) {
+    recordDiagnostic({
+      category: 'startup',
+      endpoint: 'local/credentials',
+      detail: 'credential-save-failed',
+    });
+    throw credentialError;
+  }
   try {
     await saveServer(server);
   } catch (storageError) {
     try {
       await removeApiKey(server.credentialRef);
     } catch (cleanupError) {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/credentials',
+        detail: 'credential-cleanup-failed',
+      });
       throw new Error(messages.cleanupFailed, { cause: cleanupError });
     }
+    recordDiagnostic({
+      category: 'startup',
+      endpoint: 'local/database',
+      detail: 'server-save-failed',
+    });
     throw new Error(messages.saveFailed, { cause: storageError });
   }
 }
@@ -63,6 +83,11 @@ export async function verifyKavitaConnection(
   }
 
   if (result.bookLibraries.length === 0) {
+    recordDiagnostic({
+      category: 'validation',
+      endpoint: '/api/Library/libraries',
+      detail: 'no-book-libraries',
+    });
     throw new Error(
       'This account has no book or light novel libraries. Other media types are not supported.',
     );

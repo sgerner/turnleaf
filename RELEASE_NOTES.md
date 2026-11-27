@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Edit Kavita server addresses inline from Settings and accept pasted OPDS URLs without exposing tokens in diagnostics.
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache

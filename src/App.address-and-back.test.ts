@@ -5,8 +5,12 @@ import { flushSync, mount, unmount } from 'svelte';
 
 const mocks = vi.hoisted(() => {
   const backListeners = new Set<() => void>();
+  const networkListeners = new Set<
+    (status: { connected: boolean; connectionType?: string }) => void
+  >();
   return {
     backListeners,
+    networkListeners,
     exitApp: vi.fn(async () => {}),
     getServer: vi.fn(),
     saveServer: vi.fn(),
@@ -57,7 +61,22 @@ vi.mock('@capacitor/core', () => ({
 vi.mock('@capacitor/network', () => ({
   Network: {
     getStatus: vi.fn(async () => ({ connected: mocks.networkConnected })),
-    addListener: vi.fn(async () => ({ remove: async () => {} })),
+    addListener: vi.fn(
+      async (
+        event: string,
+        listener: (status: { connected: boolean; connectionType?: string }) => void,
+      ) => {
+        if (event === 'networkStatusChange') {
+          mocks.networkListeners.add(listener);
+          return {
+            remove: async () => {
+              mocks.networkListeners.delete(listener);
+            },
+          };
+        }
+        return { remove: async () => {} };
+      },
+    ),
   },
 }));
 
@@ -107,6 +126,7 @@ vi.mock('./lib/downloads/native-download', () => ({
 }));
 
 import App from './App.svelte';
+import { clearDiagnostics, exportDiagnostics } from './lib/diagnostics/log';
 
 let target: HTMLDivElement;
 let instance: Record<string, unknown> | null = null;
@@ -148,8 +168,10 @@ function pressAndroidBack(): void {
 }
 
 describe('Onboarding, inline Settings address editing, OPDS paste, and Android Back', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     mocks.backListeners.clear();
+    mocks.networkListeners.clear();
+    await clearDiagnostics();
     mocks.exitApp.mockClear();
     mocks.getServer.mockReset().mockResolvedValue(null);
     mocks.saveServer.mockReset().mockResolvedValue(undefined);
@@ -553,5 +575,74 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
       }),
     );
     expect(mocks.saveServer.mock.calls.at(-1)?.[0]?.baseUrl).not.toContain('pasted-settings-key');
+  });
+
+  it('registers a single native backButton listener, consumes Back while busy, and redacts OPDS tokens from diagnostics', async () => {
+    let resolveAuthCheck!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveAuthCheck = resolve;
+        }),
+    );
+
+    instance = mount(App, { target });
+    await settle();
+    expect(mocks.backListeners.size).toBe(1);
+
+    const urlInput = target.querySelector<HTMLInputElement>('input[type="url"]')!;
+    pasteText(urlInput, 'https://secret-host.example.com/kavita/api/opds/ultra-secret-opds-token');
+
+    target.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
+    flushSync();
+
+    // Pressing Back while connection verification is busy must neither exit nor reset inputs
+    pressAndroidBack();
+    await settle();
+    expect(mocks.exitApp).not.toHaveBeenCalled();
+
+    resolveAuthCheck({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      json: async () => ({ message: 'Unauthorized ultra-secret-opds-token' }),
+    } as unknown as Response);
+    await settle();
+
+    const exported = exportDiagnostics({ appVersion: '0.3.5', platform: 'web' });
+    expect(exported).toContain('endpoint=/api/Library/libraries status=401');
+    expect(exported).not.toContain('ultra-secret-opds-token');
+    expect(exported).not.toContain('secret-host.example.com');
+  });
+
+  it('sends zero authenticated requests after offline transition even when preceded by a cellular handoff event', async () => {
+    mocks.getServer.mockResolvedValue({
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: 'https://books.example.com',
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.5',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    });
+    mocks.getApiKey.mockResolvedValue('saved-active-key');
+
+    instance = mount(App, { target });
+    await settle();
+    expect(mocks.backListeners.size).toBe(1);
+
+    vi.mocked(fetch).mockClear();
+
+    // Simulate Wi-Fi disabling first (brief cellular connected event while already online)
+    for (const listener of mocks.networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    // Immediately followed by mobile data disabling (full offline)
+    mocks.networkConnected = false;
+    for (const listener of mocks.networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    await settle();
+
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

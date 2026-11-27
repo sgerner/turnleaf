@@ -50,12 +50,14 @@
   } from '../kavita/connection';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
-  import { extractPastedOpdsUrl, normalizeServerUrl } from '../kavita/url';
+  import { extractPastedOpdsUrl, normalizeServerUrl, ServerUrlError } from '../kavita/url';
   import type { ReaderLocation } from '../reader/session';
+  import { handleLibraryBack, type RegisterBackHandler } from '../native/back-button';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
+  import { clearDiagnostics, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import DialogShell from './DialogShell.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import {
@@ -106,23 +108,26 @@
     onServerChange: (server: ServerConfig, apiKey: string) => void;
     onServerDeleted: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
-    registerBackHandler?: ((handler: () => boolean) => () => void) | undefined;
+    registerBackHandler?: RegisterBackHandler | undefined;
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  let activeApiKey = $derived(apiKey);
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
+  const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
         client.coverUrl(seriesId),
-        apiKey,
+        activeApiKey,
         seriesId,
         signal,
         server.id,
-        await networkAvailable(),
+        () => networkAvailable(),
+        serverOrigin,
       );
     }
-    if (offline) throw new Error('Offline');
+    if (!(await networkAvailable())) throw new Error('Offline');
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
@@ -219,7 +224,6 @@
     xpath: string | null;
     percentage: number | null;
   } | null>(null);
-  let readerBackHandler: (() => boolean) | null = null;
   let conflict = $state<{
     book: BookRecord;
     url: string;
@@ -241,6 +245,7 @@
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
   let message = $state('');
+  let messageRevision = 0;
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
     failedCount: 0,
@@ -249,13 +254,12 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
-  let diagnosticsVisible = $state(false);
-  let diagnosticsOutput = $state('');
   let pendingTheme = $state<SkeletonTheme>('vintage');
   let pendingMode = $state<'light' | 'dark'>('dark');
   let pendingAutoSync = $state(false);
@@ -269,7 +273,6 @@
   let addressError = $state('');
   let addressInvalidField = $state<InvalidConnectionField>(null);
   let addressStatusMessage = $state('');
-  let diagnosticsMessage = $state('');
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
@@ -321,6 +324,7 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  let removeBackHandler: (() => void) | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -637,39 +641,28 @@
     }
   });
 
-  function handleBackNavigation(): boolean {
+  function handleBackButton(): boolean {
     if (destroyed) return false;
-    if (conflict) {
-      closeConflict();
-      return true;
-    }
-    if (actionMenuBook) {
-      closeMenu();
-      return true;
-    }
-    if (reading) {
-      if (!readerBackHandler?.()) void closeReader();
-      return true;
-    }
-    if (settingsVisible && editingServerAddress) {
-      if (!savingServerAddress) cancelServerAddressEdit();
-      return true;
-    }
-    if (settingsVisible) {
-      if (!savingServerAddress && !replacingApiKey && !deletingServer) closeSettings();
-      return true;
-    }
-    if (filtersVisible) {
-      filtersVisible = false;
-      return true;
-    }
-    return false;
+    return handleLibraryBack({
+      hasConflict: Boolean(conflict),
+      acceptingRemoteProgress,
+      hasActionMenu: Boolean(actionMenuBook),
+      hasOpenReader: Boolean(reading),
+      editingServerAddress,
+      savingServerAddress,
+      settingsBusy: replacingApiKey || deletingServer,
+      settingsVisible,
+      filtersVisible,
+      closeConflict,
+      closeActionMenu: closeMenu,
+      closeReader: () => void closeReader(),
+      cancelServerAddressEdit,
+      closeSettings,
+      closeFilters: () => {
+        filtersVisible = false;
+      },
+    });
   }
-
-  $effect(() => {
-    if (!registerBackHandler) return;
-    return registerBackHandler(handleBackNavigation);
-  });
 
   $effect(() => {
     if (theme === observedTheme) return;
@@ -731,6 +724,7 @@
   });
 
   onMount(async () => {
+    if (registerBackHandler) removeBackHandler = registerBackHandler(handleBackButton);
     void cleanupInterruptedEpubDownloads();
     const container = libraryMain?.closest<HTMLElement>('.app-stage') ?? null;
     scrollContainer = container;
@@ -777,49 +771,49 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          const wasOffline = offline;
+          const wasUnreachable = kavitaUnreachable;
           offline = !connected;
+          kavitaUnreachable = false;
           if (!connected) {
+            if (syncTimer !== null) {
+              window.clearTimeout(syncTimer);
+              syncTimer = null;
+            }
             refreshController?.abort();
             openProgressProbe?.abort();
+            cancelCoverLoading();
+            sharedCoverLoader.cancel();
           }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
           offlineMessage = connected
             ? ''
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          if (connected && (wasOffline || wasUnreachable)) {
+            coverReloadRequest += 1;
+            const baselineRevision = activeSyncStartRevision ?? messageRevision;
+            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+            void syncProgress(false);
+            void startRefresh(false, baselineRevision, baselineMessage);
+          } else if (connected && !wasOffline && syncTimer === null) {
+            void syncProgress(false);
+          }
         }),
       ),
     );
     cleanups.push(
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
-          if (!destroyed && !isActive) void syncProgress(false);
+          if (!destroyed && !isActive && !offline) void syncProgress(false);
         }),
       ),
     );
-    if (!registerBackHandler) {
-      cleanups.push(
-        await registerListener(
-          await App.addListener('backButton', () => {
-            if (destroyed) return;
-            if (!handleBackNavigation()) {
-              void Promise.resolve()
-                .then(() => App.exitApp())
-                .catch(() => {});
-            }
-          }),
-        ),
-      );
-    }
     if (!destroyed && !offline) {
-      await refresh();
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
       void syncProgress(false);
+      await startRefresh(false, baselineRevision, baselineMessage);
     }
   });
 
@@ -833,11 +827,15 @@
     return handle.remove;
   }
 
-  async function networkAvailable(): Promise<boolean> {
+  function networkAvailable(): boolean | Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
-    const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    return Network.getStatus()
+      .catch(() => null)
+      .then((status) => {
+        if (status && !status.connected && !destroyed) offline = true;
+        return !offline && !destroyed && status?.connected === true;
+      });
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -860,16 +858,25 @@
     return syncWork;
   }
 
+  function setMessage(next: string): void {
+    messageRevision += 1;
+    message = next;
+  }
+
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    activeSyncStartRevision = messageRevision;
     try {
-      if (!(await networkAvailable())) {
+      const available = Capacitor.isNativePlatform()
+        ? await networkAvailable()
+        : !offline && !destroyed;
+      if (!available) {
         if (showFeedback)
-          message = 'Offline. Reading progress will retry when Kavita is available.';
+          setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id);
-      if (showFeedback) message = 'Reading progress synced.';
+      await flushProgress(client, server.id, () => networkAvailable());
+      if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
         error instanceof AggregateError &&
@@ -877,21 +884,28 @@
           (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
         )
       ) {
-        message =
-          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
+        setMessage(
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+        );
       } else if (showFeedback) {
-        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+        setMessage('Some reading progress is waiting to sync. Retry when Kavita is available.');
       }
     } finally {
       await refreshSyncStatus();
+      activeSyncStartRevision = null;
       syncing = false;
     }
   }
 
   onDestroy(() => {
     destroyed = true;
+    removeBackHandler?.();
+    removeBackHandler = null;
     onReaderOpenChange?.(false);
-    if (syncTimer !== null) window.clearTimeout(syncTimer);
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer);
+      syncTimer = null;
+    }
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
@@ -904,23 +918,48 @@
   });
 
   function refresh(): Promise<void> {
+    return startRefresh(false);
+  }
+
+  function startRefresh(
+    preserveMessage: boolean,
+    requestedRevision = messageRevision,
+    requestedMessage = message,
+  ): Promise<void> {
     if (destroyed || offline) return Promise.resolve();
-    if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
+    if (refreshWork && refreshController?.signal.aborted) {
+      return refreshWork.then(() =>
+        startRefresh(preserveMessage, requestedRevision, requestedMessage),
+      );
+    }
     if (!refreshWork) {
-      refreshWork = refreshCatalog().finally(() => {
-        refreshWork = null;
-      });
+      const work = refreshCatalog(preserveMessage, requestedRevision, requestedMessage).finally(
+        () => {
+          if (refreshWork === work) {
+            refreshController = null;
+            refreshWork = null;
+            refreshing = false;
+          }
+        },
+      );
+      refreshWork = work;
     }
     return refreshWork;
   }
 
-  async function refreshCatalog(): Promise<void> {
+  async function refreshCatalog(
+    preserveMessage: boolean,
+    initialRevision: number,
+    initialMessage: string,
+  ): Promise<void> {
     refreshing = true;
     const controller = new AbortController();
     refreshController = controller;
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
-    message = '';
+    if (!preserveMessage && messageRevision === initialRevision && message === initialMessage) {
+      message = '';
+    }
     try {
       if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
@@ -928,13 +967,14 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !(await networkAvailable())) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
           ...(
             await Promise.all(
               batch.map(async (item) => {
+                if (controller.signal.aborted || !(await networkAvailable())) return [];
                 const detail = await client.getSeriesDetail(item.id, controller.signal);
                 if (detail.incomplete) incomplete = true;
                 return mapSeriesToBooks(server.id, item, detail);
@@ -943,7 +983,7 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || !(await networkAvailable())) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -983,7 +1023,6 @@
         detail:
           cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
       });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       const savedBooks = displayableBooks.length
         ? 'Showing your saved library.'
         : 'No saved books are available yet.';
@@ -1005,9 +1044,6 @@
       } else {
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
-    } finally {
-      refreshController = null;
-      refreshing = false;
     }
   }
 
@@ -1088,11 +1124,12 @@
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
-        apiKey,
+        activeApiKey,
         book.id.replaceAll(':', '-'),
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        serverOrigin,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1149,6 +1186,10 @@
         } else {
           message = 'The file transfer failed.';
         }
+      } else if (error instanceof KavitaError) {
+        status = error.status;
+        detail = 'download-transfer';
+        message = error.message;
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
@@ -1164,7 +1205,6 @@
           'The download finished, but its saved status could not be checked. Refresh before retrying.';
       }
       recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       message += ' Open Settings to copy diagnostics.';
       downloadFailureBook = book;
       return null;
@@ -1266,6 +1306,8 @@
       return;
     }
     if (destroyed || reading || conflict || resolvingOpenProgress) return;
+    cancelCoverLoading();
+    sharedCoverLoader.cancel();
     resolvingOpenProgress = true;
     let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
     let local: StoredReadingState | null = null;
@@ -1395,8 +1437,12 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
+    void refreshSyncStatus();
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    syncTimer = window.setTimeout(() => {
+      syncTimer = null;
+      void syncProgress(false);
+    }, 2_500);
   }
 
   async function syncLatestForReader(
@@ -1414,7 +1460,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, () => networkAvailable());
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
@@ -1424,6 +1470,10 @@
     const local = await getReadingState(book.id);
     if (local?.pendingSync) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
+      return null;
+    }
+    if (!(await networkAvailable())) {
+      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
     }
     const remote = await client.getProgress(book.chapterId);
@@ -1463,6 +1513,7 @@
       savedBook.pagesRead = book.pages;
       savedBook.lastReadAt = new Date().toISOString();
     }
+    void refreshSyncStatus();
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
@@ -1641,19 +1692,29 @@
     addressStatusMessage = '';
     settingsError = '';
     savingServerAddress = true;
+    let eventsRecorded = -1;
+    const unsubscribe = subscribeDiagnostics(() => {
+      eventsRecorded += 1;
+    });
     try {
       const normalized = normalizeServerUrl(nextServerUrl);
-      nextServerUrl = normalized.baseUrl;
-      if (!replacementApiKey.trim() && normalized.apiKey) {
-        replacementApiKey = normalized.apiKey;
-      }
       if (normalized.insecure && !allowInsecureServerUrl) {
         addressInvalidField = 'address';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'insecure-http-blocked',
+        });
         throw new Error('Confirm that you accept an unencrypted HTTP connection.');
       }
-      const candidateKey = replacementApiKey.trim() || apiKey;
+      const candidateKey = replacementApiKey.trim() || normalized.apiKey || activeApiKey;
       if (!candidateKey) {
         addressInvalidField = 'key';
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'missing-auth-key',
+        });
         throw new Error('Enter a Kavita auth key.');
       }
 
@@ -1665,26 +1726,51 @@
         result.version,
       );
 
-      const keyChanged = candidateKey !== apiKey;
+      // An upload started with the previous connection may still be finishing.
+      while (syncWork) await syncWork;
+      refreshController?.abort();
+      cancelCoverLoading();
+      clearCovers();
+      coverReloadRequest += 1;
+
+      const keyChanged = candidateKey !== activeApiKey;
+      activeApiKey = candidateKey;
       onServerChange(updatedServer, candidateKey);
       if (keyChanged) onApiKeyChange(candidateKey);
+      nextServerUrl = normalized.baseUrl;
       replacementApiKey = '';
       editingServerAddress = false;
       allowInsecureServerUrl = false;
       savingServerAddress = false;
       addressStatusMessage = 'Server address updated.';
-      message = 'Server address updated.';
+      setMessage('Server address updated.');
       await tick();
       restoreFocus(changeServerAddressButton);
 
-      refreshController?.abort();
-      cancelCoverLoading();
-      clearCovers();
-      coverReloadRequest += 1;
-      await syncWork;
-      await refresh();
-      await syncProgress(false);
+      await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
+      if (cause instanceof ServerUrlError) {
+        recordDiagnostic({
+          category: 'validation',
+          endpoint: 'local/setup',
+          detail: 'invalid-server-url',
+        });
+      } else if (eventsRecorded === 0) {
+        if (cause instanceof KavitaError) {
+          recordDiagnostic({
+            category: cause.kind === 'invalid-response' ? 'response' : 'request',
+            endpoint: '/api/Library/libraries',
+            ...(cause.status !== undefined ? { status: cause.status } : {}),
+            detail: cause.kind,
+          });
+        } else {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/setup',
+            detail: 'setup-failed',
+          });
+        }
+      }
       const classified = classifyConnectionError(
         cause,
         'Turnleaf could not update the server address.',
@@ -1692,81 +1778,10 @@
       if (!addressInvalidField) addressInvalidField = classified.invalidField;
       addressError = classified.message;
     } finally {
+      unsubscribe();
       savingServerAddress = false;
     }
   }
-
-  function diagnosticsText(): string {
-    return exportDiagnostics({
-      appVersion: __APP_VERSION__,
-      platform: Capacitor.getPlatform(),
-      kavitaVersion: server.kavitaVersion,
-    });
-  }
-
-  async function copyDiagnostics(): Promise<void> {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    try {
-      const text = diagnosticsOutput;
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const field = document.createElement('textarea');
-        field.value = text;
-        field.setAttribute('readonly', '');
-        field.style.position = 'fixed';
-        field.style.opacity = '0';
-        document.body.appendChild(field);
-        let copied = false;
-        try {
-          field.select();
-          copied = document.execCommand('copy');
-        } finally {
-          field.remove();
-        }
-        if (!copied) throw new Error('Clipboard unavailable');
-      }
-      diagnosticsMessage = 'Diagnostics copied. Review them before sharing.';
-    } catch {
-      diagnosticsVisible = true;
-      diagnosticsMessage =
-        'Copy is unavailable here. Open the log below to select and copy it, or download it.';
-    }
-  }
-
-  function downloadDiagnostics(): void {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    const file = new Blob([diagnosticsOutput], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'turnleaf-diagnostics.txt';
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    diagnosticsVisible = true;
-    diagnosticsMessage =
-      'Review the log before sharing. If the file did not download, select and copy it below.';
-  }
-
-  function showDiagnostics(): void {
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsVisible = !diagnosticsVisible;
-  }
-
-  function selectDiagnostics(): void {
-    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-diagnostics-output');
-    field?.focus();
-    field?.select();
-  }
-
-  function clearDiagnosticLog(): void {
-    clearDiagnostics();
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsMessage = 'Diagnostics cleared.';
-  }
-
   async function removeAllDownloads(): Promise<void> {
     const candidates = books.filter((item) => item.downloadPath);
     if (
@@ -1834,13 +1849,6 @@
     void relocated(reading.book, location);
   }
 
-  function registerReaderBackHandler(handler: () => boolean): () => void {
-    readerBackHandler = handler;
-    return () => {
-      if (readerBackHandler === handler) readerBackHandler = null;
-    };
-  }
-
   async function updateApiKey(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     settingsError = '';
@@ -1851,22 +1859,29 @@
 
       const result = await verifyKavitaConnection(server.baseUrl, nextKey);
 
+      const previousKey = activeApiKey;
       const updatedServer: ServerConfig = {
         ...server,
         kavitaVersion: result.version,
         lastConnectedAt: new Date().toISOString(),
       };
       await saveApiKey(server.credentialRef, nextKey);
-      await saveServer(updatedServer);
+      try {
+        await saveServer(updatedServer);
+      } catch (storageError) {
+        await saveApiKey(server.credentialRef, previousKey).catch(() => {});
+        throw storageError;
+      }
+      // An upload started with the previous key may still be finishing.
+      while (syncWork) await syncWork;
+      refreshController?.abort();
+      activeApiKey = nextKey;
       onServerChange(updatedServer, nextKey);
       onApiKeyChange(nextKey);
       replacementApiKey = '';
-      message = 'API key updated.';
+      setMessage('API key updated.');
       closeSettings();
-      // An upload started with the previous key may still be finishing.
-      await syncWork;
-      await refresh();
-      await syncProgress(false);
+      await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
       settingsError = classifyConnectionError(
         cause,
@@ -1890,6 +1905,7 @@
         credentialCleanupComplete = true;
       }
       await removeServer(server.id);
+      await clearDiagnostics();
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
       closeSettings();
@@ -1925,7 +1941,7 @@
         ? undefined
         : retryReaderDownload}
       onMountChange={onReaderOpenChange}
-      registerBackHandler={registerReaderBackHandler}
+      {registerBackHandler}
     />
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
@@ -3278,57 +3294,7 @@
         </div>
       </dl>
     </section>
-    <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-      <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-      <p class="mt-1 text-sm text-surface-700-300">
-        Copy or download recent connection and book download details. The log includes API routes,
-        HTTP statuses, and failure categories. It stays in memory until the app closes or you clear
-        it. Review it before sharing.
-      </p>
-      <div class="mt-3 grid grid-cols-2 gap-2">
-        <button
-          class="btn preset-tonal-surface"
-          type="button"
-          onclick={() => void copyDiagnostics()}
-        >
-          Copy diagnostics
-        </button>
-        <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
-          Download log
-        </button>
-      </div>
-      <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
-        {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-      </button>
-      {#if diagnosticsVisible}
-        <div class="mt-3 grid gap-2">
-          <p class="text-sm text-surface-700-300">
-            If copy or download is unavailable, select all text below, then copy it manually.
-          </p>
-          <textarea
-            id="turnleaf-diagnostics-output"
-            class="input min-h-48 w-full font-mono text-xs"
-            readonly
-            rows="10"
-            bind:value={diagnosticsOutput}
-            aria-label="Turnleaf diagnostics log"
-            onclick={selectDiagnostics}></textarea>
-          <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
-            Select all text
-          </button>
-        </div>
-      {/if}
-      <button
-        class="btn preset-tonal-surface mt-2 w-full"
-        type="button"
-        onclick={clearDiagnosticLog}
-      >
-        Clear diagnostics
-      </button>
-      {#if diagnosticsMessage}
-        <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-      {/if}
-    </section>
+    <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
     {#if confirmDeleteServer}
       <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
         <p class="text-sm font-medium text-error-700-300">Delete this server?</p>

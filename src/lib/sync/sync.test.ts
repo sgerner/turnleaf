@@ -227,3 +227,22 @@ it('allows a manual retry after an authorization failure', async () => {
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
+
+it('stops without sending saveProgress if connectivity drops before upload starts', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}')),
+  );
+  const saveProgress = vi.fn().mockResolvedValue(undefined);
+  const canSync = vi.fn(async () => false);
+
+  await flushProgress({ saveProgress } as never, 'server', canSync);
+
+  expect(canSync).toHaveBeenCalledOnce();
+  expect(saveProgress).not.toHaveBeenCalled();
+  const stillQueued = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(stillQueued.syncQueue['book-1']).toBeDefined();
+  expect(stillQueued.syncQueue['book-1']?.lastError).toBeNull();
+});
