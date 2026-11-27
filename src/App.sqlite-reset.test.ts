@@ -2,6 +2,7 @@
 
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as ThemesModule from './lib/themes/themes';
 
 const mocks = vi.hoisted(() => {
   const dataFiles = new Map<string, string>([
@@ -93,10 +94,14 @@ vi.mock('./lib/github/releases', () => ({
   fetchLatestGithubRelease: vi.fn(async () => null),
 }));
 
-vi.mock('./lib/themes/themes', () => ({
-  loadTheme: vi.fn(async () => true),
-  skeletonThemes: ['fennec', 'vintage'],
-}));
+vi.mock('./lib/themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn(async () => true),
+    skeletonThemes: ['fennec', 'vintage'],
+  };
+});
 
 import App from './App.svelte';
 

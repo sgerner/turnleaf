@@ -3,6 +3,7 @@
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BookRecord, ServerConfig } from '../database/database';
+import type * as ThemesModule from '../themes/themes';
 
 const mocks = vi.hoisted(() => {
   const events: string[] = [];
@@ -102,10 +103,14 @@ vi.mock('../native/credentials', () => ({
   saveApiKey: vi.fn(async () => undefined),
 }));
 
-vi.mock('../themes/themes', () => ({
-  loadTheme: vi.fn(async () => true),
-  skeletonThemes: ['fennec', 'vintage'],
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn(async () => true),
+    skeletonThemes: ['fennec', 'vintage'],
+  };
+});
 
 vi.mock('../database/database', () => ({
   acceptRemoteProgress: vi.fn(async () => true),

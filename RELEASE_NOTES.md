@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Address PR review feedback on SQLite reset barrier and note salvage
+- Reset corrupt SQLite databases natively and add reading notes backup/restore
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache

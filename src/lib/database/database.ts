@@ -14,6 +14,7 @@ import {
   READING_NOTE_PREFERENCE_PREFIXES,
   type BookNoteMetadata,
 } from '../reader/notes-backup';
+import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 import { migrations } from './schema';
 
 export interface ServerConfig {
@@ -60,6 +61,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 }
 
 let connection: SQLiteDBConnection | null = null;
+const closedConnections = new WeakSet<object>();
 let opening: Promise<SQLiteDBConnection> | null = null;
 let resetting: Promise<void> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
@@ -95,11 +97,20 @@ function enqueueNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
   return next;
 }
 
+function assertActiveNativeConnection(db: object): void {
+  if (closedConnections.has(db)) {
+    throw new Error('Local database connection was closed by reset.');
+  }
+}
+
 async function executeNativeTransaction(
   db: Pick<SQLiteDBConnection, 'executeTransaction'>,
   tasks: capTask[],
 ): Promise<void> {
-  await enqueueNativeWrite(() => db.executeTransaction(tasks).then(() => undefined));
+  await enqueueNativeWrite(() => {
+    assertActiveNativeConnection(db);
+    return db.executeTransaction(tasks).then(() => undefined);
+  });
 }
 
 async function executeNativeRun(
@@ -107,14 +118,20 @@ async function executeNativeRun(
   statement: string,
   values: unknown[] = [],
 ): Promise<void> {
-  await enqueueNativeWrite(() => db.run(statement, values).then(() => undefined));
+  await enqueueNativeWrite(() => {
+    assertActiveNativeConnection(db);
+    return db.run(statement, values).then(() => undefined);
+  });
 }
 
 async function executeNativeStatement(
   db: Pick<SQLiteDBConnection, 'execute'>,
   statement: string,
 ): Promise<void> {
-  await enqueueNativeWrite(() => db.execute(statement).then(() => undefined));
+  await enqueueNativeWrite(() => {
+    assertActiveNativeConnection(db);
+    return db.execute(statement).then(() => undefined);
+  });
 }
 
 async function executeNativeQuery(
@@ -122,9 +139,10 @@ async function executeNativeQuery(
   statement: string,
   values?: unknown[],
 ): Promise<DBSQLiteValues> {
-  return enqueueNativeWrite(() =>
-    values === undefined ? db.query(statement) : db.query(statement, values),
-  );
+  return enqueueNativeWrite(() => {
+    assertActiveNativeConnection(db);
+    return values === undefined ? db.query(statement) : db.query(statement, values);
+  });
 }
 
 function parseReadingStateRow(row: Record<string, unknown> | undefined): StoredReadingState | null {
@@ -255,6 +273,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       ? await sqlite.retrieveConnection('turnleaf', false)
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
+  closedConnections.delete(db);
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
   await migrate(db);
   return db;
@@ -263,6 +282,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 export async function resetLocalDatabase(): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
+    clearBootThemeCache();
     return;
   }
 
@@ -294,6 +314,7 @@ async function performNativeDatabaseReset(): Promise<void> {
       opening = null;
 
       for (const handle of handlesToClose) {
+        closedConnections.add(handle);
         try {
           await handle.close();
         } catch {
@@ -310,6 +331,7 @@ async function performNativeDatabaseReset(): Promise<void> {
       } else {
         await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
       }
+      clearBootThemeCache();
     } catch (error) {
       throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
     }
@@ -1394,8 +1416,16 @@ export async function setPreference(key: string, value: string): Promise<void> {
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
+    let nextTheme: string | undefined;
+    let nextMode: string | undefined;
     updateBrowserState((state) => {
       for (const [key, value] of preferences) state.preferences[key] = value;
+      nextTheme = state.preferences.uiTheme;
+      nextMode = state.preferences.uiMode;
+    });
+    mirrorBootThemePreferences(preferences, {
+      theme: nextTheme,
+      mode: nextMode,
     });
     return;
   }
@@ -1408,4 +1438,5 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
+  mirrorBootThemePreferences(preferences);
 }

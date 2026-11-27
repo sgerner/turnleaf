@@ -25,6 +25,7 @@ import {
   setPreferences,
   type BookRecord,
 } from './database';
+import { BOOT_THEME_STORAGE_KEY, themeTokens } from '../themes/themes';
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
 
@@ -1050,6 +1051,37 @@ it('retains unavailable remote books in browser storage when bookmarks or annota
     `readerBookmarks:${notedBook.id}`,
     `readerBookmarks:${emptyNotesBook.id}`,
   ]);
+});
+
+it('mirrors browser theme, mode, and surface colors to localStorage and clears them on reset', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  await setPreference('uiMode', 'light');
+  expect(JSON.parse(storage.getItem(BOOT_THEME_STORAGE_KEY) ?? '{}')).toEqual({
+    theme: 'fennec',
+    mode: 'light',
+    rootBgLight: themeTokens.fennec.rootBgLight,
+    rootBgDark: themeTokens.fennec.rootBgDark,
+    surfaceLight: themeTokens.fennec.surfaceLight,
+    surfaceDark: themeTokens.fennec.surfaceDark,
+  });
+
+  await setPreference('uiTheme', 'eink');
+  expect(JSON.parse(storage.getItem(BOOT_THEME_STORAGE_KEY) ?? '{}')).toEqual({
+    theme: 'eink',
+    mode: 'light',
+    rootBgLight: 'oklch(1 0 0)',
+    rootBgDark: 'oklch(0 0 0)',
+    surfaceLight: 'oklch(1 0 0)',
+    surfaceDark: 'oklch(0 0 0)',
+  });
+
+  await resetLocalDatabase();
+  expect(storage.getItem(BOOT_THEME_STORAGE_KEY)).toBeNull();
 });
 
 it('round-trips library filter preferences in browser storage and clears them on database reset', async () => {
