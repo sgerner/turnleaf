@@ -443,6 +443,7 @@
 
   function errorFallbackTarget(): HTMLElement | null {
     if (errorRestoreReturnLink && returnToLinkButton) return returnToLinkButton;
+    if (pendingSyncLocation) return syncConfirmationPanel;
     if (settingsVisible) return settingsPanel;
     if (tocVisible) return tocPanel;
     if (bookmarksVisible) return bookmarksPanel;
@@ -707,7 +708,7 @@
     syncConfirmationOpener = opener;
     closeOpenSubpanels();
     pendingSyncLocation = progress;
-    focusModal(() => syncConfirmationPanel);
+    if (!error) focusModal(() => syncConfirmationPanel);
   }
 
   function closeSyncConfirmation(restore = true): void {
@@ -1470,7 +1471,11 @@
   });
 </script>
 
-<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+<main
+  class="reader-shell"
+  data-mode={appearance.mode}
+  aria-describedby={hasOpenReaderPanel() ? undefined : 'reader-keyboard-help'}
+>
   <h1 class="sr-only" inert={hasOpenReaderPanel()}>{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
@@ -2536,6 +2541,7 @@
     <div
       class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-4"
       role="presentation"
+      inert={Boolean(error)}
       transition:fade={{ duration: 120 }}
       onclick={(event) => event.target === event.currentTarget && closeSyncConfirmation()}
     >

@@ -1063,4 +1063,224 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('sets the book title on the EPUB iframe and falls back when blank or missing frameElement', async () => {
+    const session = new ReaderSession('book.epub', 'The Left Hand of Darkness');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    const prepareContents = mockRendition.hooks.content.register.mock.calls[0]?.[0] as (
+      contents: Contents,
+    ) => Promise<void>;
+    const frame = document.createElement('iframe');
+    const doc = document.implementation.createHTMLDocument('chapter');
+    doc.body.innerHTML = '<p>One</p>';
+
+    await prepareContents({
+      document: doc,
+      window: { frameElement: frame },
+    } as unknown as Contents);
+    expect(frame.getAttribute('title')).toBe('The Left Hand of Darkness');
+
+    await expect(
+      prepareContents({ document: doc, window: { frameElement: null } } as unknown as Contents),
+    ).resolves.toBeUndefined();
+    session.destroy();
+
+    const fallbackSession = new ReaderSession('book.epub', '   ');
+    await fallbackSession.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const fallbackPrepare = mockRendition.hooks.content.register.mock.calls.at(-1)?.[0] as (
+      contents: Contents,
+    ) => Promise<void>;
+    const unnamedFrame = document.createElement('iframe');
+    await fallbackPrepare({
+      document: doc,
+      window: { frameElement: unnamedFrame },
+    } as unknown as Contents);
+    expect(unnamedFrame.getAttribute('title')).toBe('Book content');
+    fallbackSession.destroy();
+  });
+
+  it('navigates and reports navigation progress when assistive focus moves to an off-screen element', async () => {
+    mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub', 'Sample Book');
+    const viewport = document.createElement('div');
+    const container = document.createElement('div');
+    container.className = 'epub-container';
+    const frame = document.createElement('iframe');
+    container.append(frame);
+    viewport.append(container);
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 500));
+    vi.spyOn(container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 300, 500));
+    const frameRect = vi
+      .spyOn(frame, 'getBoundingClientRect')
+      .mockReturnValue(new DOMRect(0, 0, 900, 500));
+
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const prepareContents = mockRendition.hooks.content.register.mock.calls[0]?.[0];
+    const relocated = getRenditionListener('relocated');
+
+    const doc = document.implementation.createHTMLDocument('chapter');
+    const col3Heading = doc.createElement('h2');
+    col3Heading.setAttribute('tabindex', '-1');
+    col3Heading.textContent = 'Column three heading';
+    vi.spyOn(col3Heading, 'getClientRects').mockReturnValue([
+      new DOMRect(620, 24, 180, 24),
+    ] as unknown as DOMRectList);
+    doc.body.append(col3Heading);
+
+    await prepareContents({
+      window: { frameElement: frame },
+      document: doc,
+      sectionIndex: 0,
+      cfiFromRange: () => 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:20)',
+    });
+
+    relocated(location('epubcfi(/6/2!/4/1:0)'));
+    mockRendition.display.mockClear();
+
+    mockRendition.display.mockImplementationOnce(async () => {
+      container.scrollLeft = 600;
+      frameRect.mockReturnValue(new DOMRect(-600, 0, 900, 500));
+      relocated({
+        start: {
+          cfi: 'epubcfi(/6/2!/4/2/1:0)',
+          href: 'chapter.xhtml',
+          index: 0,
+          percentage: 2 / 3,
+          displayed: { page: 3, total: 3 },
+        },
+      } as Location);
+    });
+
+    col3Heading.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/2!/4/2/1:0,/1:0,/1:20)');
+    });
+    expect(onLocation.mock.calls.at(-1)).toEqual([
+      expect.objectContaining({
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        pageIndex: 2,
+        pageCount: 3,
+      }),
+      'navigation',
+    ]);
+
+    session.destroy();
+  });
+
+  it('aborts a display that is in flight during a resize and preserves the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub', 'Resize Book');
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 600));
+
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+
+    // Establish initial location at chapter 1.
+    relocated(location('epubcfi(/6/2!/4/2/1:0)'));
+    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)' }),
+    );
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    onLocation.mockClear();
+
+    // 1. Start a display that remains in flight when a viewport resize fires and aborts it.
+    let rejectInFlightDisplay!: (reason?: unknown) => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectInFlightDisplay = reject;
+        }),
+    );
+
+    const abortedDisplay = session.displayCfi('epubcfi(/6/4!/4/2/1:0)');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+
+    rejectInFlightDisplay(new DOMException('The operation was aborted.', 'AbortError'));
+    await expect(abortedDisplay).resolves.toBe(false);
+
+    // Post-resize relocation reports the reflowed chapter 1 CFI as 'restore', never the aborted target.
+    relocated(location('epubcfi(/6/2!/4/2/1:8)'));
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:8)' }),
+      'restore',
+    );
+
+    // 2. Start a multi-step display that is aborted mid-resize by a newer CFI display and check final CFI.
+    onLocation.mockClear();
+    let resolveChapterLoad!: () => void;
+    mockRendition.display
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveChapterLoad = resolve;
+          }),
+      )
+      .mockImplementationOnce(async () => {
+        relocated({
+          start: {
+            cfi: 'epubcfi(/6/4!/4/6/1:0)',
+            href: 'second.xhtml',
+            index: 1,
+            percentage: 0.75,
+            displayed: { page: 3, total: 4 },
+          },
+        } as Location);
+      });
+
+    const supersededServerDisplay = session.displayServerLocation(
+      '//body/DocFragment[2]/body/p[1]',
+    );
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 520, height: 700 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenLastCalledWith(520, 700);
+
+    const finalNavigation = session.displayCfi('epubcfi(/6/4!/4/6/1:0)');
+    resolveChapterLoad();
+
+    await expect(supersededServerDisplay).resolves.toBe(false);
+    await expect(finalNavigation).resolves.toBe(true);
+    expect(onLocation.mock.calls.at(-1)).toEqual([
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/6/1:0)' }),
+      'navigation',
+    ]);
+
+    session.destroy();
+  });
 });

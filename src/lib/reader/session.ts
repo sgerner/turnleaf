@@ -1,4 +1,4 @@
-import ePub, { type Book, type Contents, type Location, type Rendition } from 'epubjs';
+import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
 import {
   clipReaderSearchExcerpt,
@@ -368,35 +368,13 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
-interface RenditionScrollManager {
-  _onScroll?: (() => void) | undefined;
-  afterScrolled?: ReturnType<typeof setTimeout> | undefined;
-  container?: HTMLElement | undefined;
-  ignore?: boolean | undefined;
-  isPaginated?: boolean | undefined;
-  scrollLeft?: number | undefined;
-  layout?:
-    | {
-        delta?: number | undefined;
-        pageWidth?: number | undefined;
-        width?: number | undefined;
-      }
-    | undefined;
-  scrollTo?: ((x: number, y: number, silent?: boolean) => void) | undefined;
-  on?: ((event: string, listener: () => void) => void) | undefined;
-  off?: ((event: string, listener: () => void) => void) | undefined;
-}
-
 export class ReaderSession {
-  private readonly book: Book;
+  private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
   private rendition: Rendition | null = null;
-  private viewportTarget: HTMLElement | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
-  private managerScroll: (() => void) | null = null;
-  private targetScroll: ((event: Event) => void) | null = null;
   private current: Location | null = null;
   private spine: {
     sections: SpineSection[];
@@ -407,20 +385,14 @@ export class ReaderSession {
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
-  private scrollNavigationPending = false;
-  private scrollNavigationStartCfi: string | null = null;
-  private alignedScrollLeft = 0;
-  private lastDomScrollLeft = 0;
-  private lastDomScrollTop = 0;
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private viewportTarget: HTMLElement | null = null;
   private epubContainer: HTMLElement | null = null;
   private lockedScrollLeft = 0;
-  private suppressFocusScroll = false;
-  private focusScrollTimer: ReturnType<typeof setTimeout> | null = null;
   private displayOperationCount = 0;
   private aligningFocusTarget: Element | null = null;
   private renderedListener: (() => void) | null = null;
@@ -436,6 +408,18 @@ export class ReaderSession {
         returnTarget?: ReaderLinkReturnTarget,
       ) => void)
     | null = null;
+
+  private readonly handleContainerScroll = (): void => {
+    const container = this.epubContainer;
+    if (!container) return;
+    if (this.isProgrammaticScrollAllowed()) {
+      this.lockedScrollLeft = container.scrollLeft;
+      return;
+    }
+    if (container.scrollLeft !== this.lockedScrollLeft) {
+      container.scrollLeft = this.lockedScrollLeft;
+    }
+  };
 
   constructor(
     private readonly bookUrl: string,
@@ -471,41 +455,6 @@ export class ReaderSession {
     });
     this.observeViewport(target);
     this.bindEpubContainer();
-    this.targetScroll = (event: Event) => {
-      const manager = this.getScrollManager();
-      const candidate = event.target as HTMLElement | null;
-      const scroller =
-        candidate && typeof candidate.scrollLeft === 'number'
-          ? candidate
-          : (manager?.container ?? this.epubContainer ?? target);
-      if (
-        manager?.container &&
-        scroller !== manager.container &&
-        scroller !== this.epubContainer &&
-        scroller !== target
-      ) {
-        return;
-      }
-      this.lastDomScrollLeft = scroller.scrollLeft;
-      this.lastDomScrollTop = scroller.scrollTop ?? 0;
-      if (typeof manager?._onScroll === 'function') return;
-      if (this.suppressFocusScroll) {
-        this.clearFocusScrollSuppression();
-        if (!this.isProgrammaticScrollAllowed()) {
-          scroller.scrollLeft = this.lockedScrollLeft;
-          if (manager) manager.scrollLeft = this.lockedScrollLeft;
-        }
-        return;
-      }
-      if (manager?.ignore || this.isProgrammaticScrollAllowed()) {
-        if (manager?.ignore) manager.ignore = false;
-        this.syncContainerScroll(scroller);
-        return;
-      }
-      this.handleUnignoredScroll(scroller);
-    };
-    target.addEventListener('scroll', this.targetScroll, true);
-    this.attachManagerScroll();
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
     if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
       this.unloadedHookRegistered = true;
@@ -598,19 +547,11 @@ export class ReaderSession {
     }
     this.onLocation = onLocation;
     this.relocated = (location) => {
-      const startCfi =
-        this.userNavigationStartCfi ??
-        this.scrollNavigationStartCfi ??
-        this.current?.start.cfi ??
-        null;
-      const hasPendingNavigation = this.userNavigationPending || this.scrollNavigationPending;
+      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
       const isUserNavigation =
-        hasPendingNavigation && (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-      const origin = isUserNavigation
-        ? this.userNavigationPending
-          ? this.userNavigationOrigin
-          : 'navigation'
-        : 'restore';
+        this.userNavigationPending &&
+        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
@@ -620,17 +561,8 @@ export class ReaderSession {
         this.userNavigationOrigin = 'navigation';
         this.pendingLinkReturnTarget = null;
       }
-      this.scrollNavigationPending = false;
-      this.scrollNavigationStartCfi = null;
-      const manager = this.getScrollManager();
-      const container = this.bindEpubContainer() ?? manager?.container ?? null;
-      const hasPendingDomScroll = Boolean(
-        container &&
-        (container.scrollLeft !== this.lastDomScrollLeft ||
-          (container.scrollTop ?? 0) !== this.lastDomScrollTop),
-      );
-      if (manager?.ignore && !hasPendingDomScroll) manager.ignore = false;
-      this.syncContainerScroll(container);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
@@ -640,13 +572,13 @@ export class ReaderSession {
     };
     this.rendition.on('relocated', this.relocated);
     this.renderedListener = () => {
-      const container = this.bindEpubContainer() ?? this.getScrollManager()?.container ?? null;
-      this.syncContainerScroll(container);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
     };
     this.resizedListener = () => {
-      const container = this.bindEpubContainer() ?? this.getScrollManager()?.container ?? null;
-      this.syncContainerScroll(container);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
     };
     this.rendition.on('rendered', this.renderedListener);
@@ -685,7 +617,6 @@ export class ReaderSession {
     await this.rendition.started;
     this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    this.attachManagerScroll();
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -1002,19 +933,15 @@ export class ReaderSession {
 
   destroy(): void {
     this.locationGeneration += 1;
-    this.clearFocusScrollSuppression();
-    this.clearManagerScrollTimer();
-    const manager = this.getScrollManager();
-    if (manager?.off && this.managerScroll) manager.off('scroll', this.managerScroll);
-    if (this.viewportTarget && this.targetScroll) {
-      this.viewportTarget.removeEventListener('scroll', this.targetScroll, true);
-    }
     for (const contents of [...this.trackedContents]) {
       this.cleanupContents(contents);
     }
     this.trackedContents.clear();
     this.contentCleanups.clear();
-    this.epubContainer = null;
+    if (this.epubContainer) {
+      this.epubContainer.removeEventListener('scroll', this.handleContainerScroll);
+      this.epubContainer = null;
+    }
     if (this.rendition && this.relocated) this.rendition.off('relocated', this.relocated);
     if (this.rendition && this.renderedListener)
       this.rendition.off('rendered', this.renderedListener);
@@ -1037,24 +964,16 @@ export class ReaderSession {
     this.resizedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
-    this.managerScroll = null;
-    this.targetScroll = null;
     this.onLocation = null;
     this.current = null;
-    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
-    this.scrollNavigationPending = false;
-    this.scrollNavigationStartCfi = null;
-    this.alignedScrollLeft = 0;
-    this.lastDomScrollLeft = 0;
-    this.lastDomScrollTop = 0;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
     // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
-    const book = this.book as Book & {
+    const book = this.book as typeof this.book & {
       archive?: { urlCache?: Record<string, string> };
       resources?: { replacementUrls?: string[] };
     };
@@ -1066,6 +985,10 @@ export class ReaderSession {
       if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
     }
     this.book.destroy();
+  }
+
+  private frameTitle(): string {
+    return this.title.trim() || 'Book content';
   }
 
   private async prepareContents(contents: Contents): Promise<void> {
@@ -1094,18 +1017,9 @@ export class ReaderSession {
     if (!doc?.addEventListener) return;
 
     const handleFocusIn = (event: FocusEvent) => {
-      this.clearFocusScrollSuppression();
       const rawTarget = event.target as Element | null;
       if (!rawTarget || rawTarget.nodeType !== 1 || rawTarget === this.aligningFocusTarget) return;
-      const rawTag = rawTarget.localName?.toLowerCase();
-      if (
-        rawTarget === doc.documentElement ||
-        rawTarget === doc.body ||
-        rawTag === 'html' ||
-        rawTag === 'body'
-      ) {
-        return;
-      }
+      if (rawTarget === doc.documentElement || rawTarget === doc.body) return;
 
       const container = this.bindEpubContainer(contents);
       if (
@@ -1120,39 +1034,23 @@ export class ReaderSession {
         (rawTarget.closest?.(
           'a[href], area[href], button, input, select, textarea, [tabindex]',
         ) as HTMLElement | null) ?? (rawTarget as HTMLElement);
-      const focusTag = focusTarget.localName?.toLowerCase();
-      if (
-        focusTarget === doc.documentElement ||
-        focusTarget === doc.body ||
-        focusTag === 'html' ||
-        focusTag === 'body'
-      ) {
+      if (focusTarget === doc.documentElement || focusTarget === doc.body) return;
+
+      const metrics = this.getViewportMetrics(contents);
+      if (!metrics || this.isElementVisibleInViewport(focusTarget, contents, metrics)) {
+        if (
+          container &&
+          !this.isProgrammaticScrollAllowed() &&
+          container.scrollLeft !== this.lockedScrollLeft
+        ) {
+          container.scrollLeft = this.lockedScrollLeft;
+        }
         return;
       }
 
-      const metrics = this.getViewportMetrics(contents);
-      if (metrics) {
-        if (this.isElementVisibleInViewport(focusTarget, contents, metrics)) {
-          if (
-            container &&
-            !this.isProgrammaticScrollAllowed() &&
-            container.scrollLeft !== this.lockedScrollLeft
-          ) {
-            container.scrollLeft = this.lockedScrollLeft;
-          }
-          this.armFocusScrollSuppression();
-          return;
-        }
-
-        const cfi = this.cfiForElement(focusTarget, contents);
-        if (cfi && this.rendition) {
-          this.armFocusScrollSuppression();
-          void this.alignOffscreenFocus(cfi, focusTarget, contents);
-          return;
-        }
-      }
-
-      this.alignFocusToColumn(focusTarget);
+      const cfi = this.cfiForElement(focusTarget, contents);
+      if (!cfi || !this.rendition) return;
+      void this.alignOffscreenFocus(cfi, focusTarget, contents);
     };
 
     doc.addEventListener('focusin', handleFocusIn);
@@ -1207,9 +1105,8 @@ export class ReaderSession {
     if (!this.rendition) return;
     try {
       await this.navigate(() => this.rendition!.display(cfi));
-      const container =
-        this.bindEpubContainer(contents) ?? this.getScrollManager()?.container ?? null;
-      this.syncContainerScroll(container);
+      const container = this.bindEpubContainer(contents);
+      if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
       if (element.isConnected && contents.document?.activeElement !== element) {
         this.aligningFocusTarget = element;
@@ -1221,8 +1118,6 @@ export class ReaderSession {
       }
     } catch {
       // Ignore canceled or stale focus alignment when switching chapters.
-    } finally {
-      this.clearFocusScrollSuppression();
     }
   }
 
@@ -1233,33 +1128,12 @@ export class ReaderSession {
     const queriedContainer =
       frameContainer ?? this.viewportTarget?.querySelector<HTMLElement>('.epub-container') ?? null;
     if (queriedContainer && queriedContainer !== this.epubContainer) {
+      this.epubContainer?.removeEventListener('scroll', this.handleContainerScroll);
       this.epubContainer = queriedContainer;
-      this.syncContainerScroll(queriedContainer);
+      this.lockedScrollLeft = queriedContainer.scrollLeft;
+      queriedContainer.addEventListener('scroll', this.handleContainerScroll);
     }
     return this.epubContainer;
-  }
-
-  private syncContainerScroll(container: HTMLElement | null): void {
-    if (!container) return;
-    this.lockedScrollLeft = container.scrollLeft;
-    this.alignedScrollLeft = container.scrollLeft;
-  }
-
-  private armFocusScrollSuppression(): void {
-    this.clearFocusScrollSuppression();
-    this.suppressFocusScroll = true;
-    this.focusScrollTimer = setTimeout(() => {
-      this.focusScrollTimer = null;
-      this.suppressFocusScroll = false;
-    }, 0);
-  }
-
-  private clearFocusScrollSuppression(): void {
-    if (this.focusScrollTimer !== null) {
-      clearTimeout(this.focusScrollTimer);
-      this.focusScrollTimer = null;
-    }
-    this.suppressFocusScroll = false;
   }
 
   private isProgrammaticScrollAllowed(): boolean {
@@ -1271,8 +1145,8 @@ export class ReaderSession {
     try {
       return await operation();
     } finally {
-      const container = this.bindEpubContainer() ?? this.getScrollManager()?.container ?? null;
-      this.syncContainerScroll(container);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
       this.syncVisibleColumnLinks();
     }
@@ -1454,144 +1328,18 @@ export class ReaderSession {
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.scrollNavigationPending = false;
-      this.scrollNavigationStartCfi = null;
-      this.clearManagerScrollTimer();
       this.viewportSize = { width, height };
       this.displayOperationCount += 1;
       try {
         this.rendition.resize(width, height);
       } finally {
-        const container = this.bindEpubContainer() ?? this.getScrollManager()?.container ?? null;
-        this.syncContainerScroll(container);
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
         this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
         this.syncVisibleColumnLinks();
       }
     });
     this.resizeObserver.observe(target);
-  }
-
-  private frameTitle(): string {
-    return this.title.trim() || 'Book content';
-  }
-
-  private getScrollManager(): RenditionScrollManager | null {
-    return (
-      (this.rendition as (Rendition & { manager?: RenditionScrollManager }) | null)?.manager ?? null
-    );
-  }
-
-  private clearManagerScrollTimer(): void {
-    const manager = this.getScrollManager();
-    if (manager?.afterScrolled !== undefined) {
-      clearTimeout(manager.afterScrolled);
-      manager.afterScrolled = undefined;
-    }
-  }
-
-  private attachManagerScroll(): void {
-    if (this.managerScroll) return;
-    const manager = this.getScrollManager();
-    if (!manager?.on) return;
-    this.managerScroll = () => {
-      const currentManager = this.getScrollManager();
-      const scroller = currentManager?.container ?? this.epubContainer ?? this.viewportTarget;
-      if (!scroller) return;
-      if (this.suppressFocusScroll) {
-        this.clearFocusScrollSuppression();
-        if (!this.isProgrammaticScrollAllowed()) {
-          this.scrollContainerTo(scroller, this.lockedScrollLeft);
-        }
-        return;
-      }
-      if (this.isProgrammaticScrollAllowed()) {
-        this.syncContainerScroll(scroller);
-        return;
-      }
-      this.handleUnignoredScroll(scroller);
-    };
-    manager.on('scroll', this.managerScroll);
-  }
-
-  private beginScrollNavigation(): void {
-    if (this.userNavigationPending) return;
-    this.scrollNavigationPending = true;
-    this.scrollNavigationStartCfi ??=
-      this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null;
-  }
-
-  private columnDelta(scroller: HTMLElement): number {
-    const manager = this.getScrollManager();
-    if (manager?.isPaginated === false) return 0;
-    const delta =
-      manager?.layout?.delta ||
-      manager?.layout?.pageWidth ||
-      manager?.layout?.width ||
-      scroller.clientWidth ||
-      this.viewportTarget?.getBoundingClientRect().width ||
-      0;
-    return Number.isFinite(delta) && delta > 0 ? delta : 0;
-  }
-
-  private alignScrollOffset(scrollLeft: number, scroller: HTMLElement, delta: number): number {
-    let aligned = Math.round(scrollLeft / delta) * delta;
-    if (scrollLeft > this.alignedScrollLeft && aligned <= this.alignedScrollLeft) {
-      aligned = this.alignedScrollLeft + delta;
-    } else if (scrollLeft < this.alignedScrollLeft && aligned >= this.alignedScrollLeft) {
-      aligned = Math.max(0, this.alignedScrollLeft - delta);
-    }
-    if (scroller.scrollWidth > delta) {
-      aligned = Math.min(aligned, scroller.scrollWidth - delta);
-    }
-    return Math.max(0, aligned);
-  }
-
-  private scrollContainerTo(scroller: HTMLElement, alignedLeft: number): void {
-    const manager = this.getScrollManager();
-    if (manager) manager.scrollLeft = alignedLeft;
-    if (manager?.scrollTo) manager.scrollTo(alignedLeft, scroller.scrollTop, true);
-    else scroller.scrollLeft = alignedLeft;
-    this.alignedScrollLeft = alignedLeft;
-    this.lockedScrollLeft = alignedLeft;
-  }
-
-  private handleUnignoredScroll(scroller: HTMLElement): void {
-    const scrollLeft = scroller.scrollLeft;
-    if (scrollLeft === this.alignedScrollLeft) return;
-    this.beginScrollNavigation();
-    const delta = this.columnDelta(scroller);
-    if (!delta) {
-      this.alignedScrollLeft = scrollLeft;
-      this.lockedScrollLeft = scrollLeft;
-      return;
-    }
-    const aligned = this.alignScrollOffset(scrollLeft, scroller, delta);
-    if (aligned !== scrollLeft) this.scrollContainerTo(scroller, aligned);
-    else {
-      this.alignedScrollLeft = aligned;
-      this.lockedScrollLeft = aligned;
-    }
-    this.syncVisibleColumnLinks();
-  }
-
-  private alignFocusToColumn(target: Element): void {
-    const scroller =
-      this.getScrollManager()?.container ?? this.epubContainer ?? this.viewportTarget;
-    if (!scroller) return;
-    const delta = this.columnDelta(scroller);
-    if (!delta) return;
-    const rect = target.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0 && rect.left === 0) return;
-    let columnLeft = Math.max(0, Math.floor(rect.left / delta) * delta);
-    if (scroller.scrollWidth > delta) {
-      columnLeft = Math.min(columnLeft, scroller.scrollWidth - delta);
-    }
-    if (columnLeft === scroller.scrollLeft) return;
-    this.clearManagerScrollTimer();
-    this.beginScrollNavigation();
-    this.scrollContainerTo(scroller, columnLeft);
-    this.syncVisibleColumnLinks();
-    void this.rendition?.reportLocation?.();
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -1709,9 +1457,6 @@ export class ReaderSession {
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
-    this.scrollNavigationPending = false;
-    this.scrollNavigationStartCfi = null;
-    this.clearManagerScrollTimer();
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
       ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
@@ -1726,9 +1471,6 @@ export class ReaderSession {
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
     this.userNavigationOrigin = 'link';
-    this.scrollNavigationPending = false;
-    this.scrollNavigationStartCfi = null;
-    this.clearManagerScrollTimer();
     this.pendingLinkReturnTarget = { cfi: start.cfi, href: start.href };
   }
 
@@ -1741,9 +1483,6 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    this.scrollNavigationPending = false;
-    this.scrollNavigationStartCfi = null;
-    this.clearManagerScrollTimer();
     void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
