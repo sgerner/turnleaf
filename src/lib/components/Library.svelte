@@ -2094,6 +2094,98 @@
         {/if}
       </div>
     {/if}
+    {#snippet downloadProgressBar(book: BookRecord | undefined, trackClass: string)}
+      <div
+        class={trackClass}
+        role="progressbar"
+        aria-label={book ? downloadProgressLabel(book) : 'Download progress for book'}
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={downloadPercent ?? undefined}
+        aria-valuetext={downloadProgressValueText(downloadPercent)}
+      >
+        <div
+          class="h-full preset-filled-primary-600-400"
+          class:animate-pulse={downloadPercent === null}
+          style:width={`${downloadPercent ?? 35}%`}
+        ></div>
+      </div>
+    {/snippet}
+
+    {#snippet coverBadges(book: BookRecord, badgeClass: string)}
+      {#if book.downloadPath && book.remoteAvailable !== false}
+        <span aria-hidden="true" class="badge-icon preset-filled-primary-600-400 {badgeClass}">
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+            <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+          </svg>
+        </span>
+      {/if}
+      {#if book.remoteAvailable === false && book.downloadPath}
+        <span class="badge-icon preset-filled-warning-500 {badgeClass}">
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+            <path
+              fill="currentColor"
+              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
+            />
+          </svg>
+          <span class="sr-only">Removed from server</span>
+        </span>
+      {/if}
+    {/snippet}
+
+    {#snippet readingProgressBar(book: BookRecord, trackClass: string)}
+      {@const progress = progressOf(book)}
+      {#if progress > 0}
+        {@const roundedProgress = Math.round(progress)}
+        <div
+          class={trackClass}
+          role="progressbar"
+          aria-label={`Reading progress for ${book.title}`}
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={roundedProgress}
+          aria-valuetext={`${roundedProgress}% complete`}
+        >
+          <div class="h-full preset-filled-primary-600-400" style:width={`${progress}%`}></div>
+        </div>
+      {/if}
+    {/snippet}
+
+    {#snippet cardButtons(book: BookRecord, bookIndex: number, includeProgressInLabel: boolean)}
+      {@const openLabel = openBookLabel(book, {
+        includeProgress: includeProgressInLabel,
+        downloadingBookId,
+        downloadPercent,
+      })}
+      <button
+        class="absolute inset-0 z-0 rounded-lg text-left"
+        type="button"
+        data-book-open
+        onclick={() => void open(book)}
+        onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
+        aria-label={openLabel}
+        disabled={downloadingBookId === book.id}
+      >
+        <span class="sr-only">{openLabel}</span>
+      </button>
+      <button
+        class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
+        type="button"
+        data-book-actions
+        onclick={() => openMenu(book)}
+        onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
+        aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
+        title="More actions"
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+          <path
+            fill="currentColor"
+            d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
+          />
+        </svg>
+      </button>
+    {/snippet}
+
     {#if message}
       <div
         class="alert preset-tonal-surface mt-4 flex flex-wrap items-center justify-between gap-3"
@@ -2104,23 +2196,10 @@
         {#if downloadingBookId}
           {@const downloadingBook = books.find((book) => book.id === downloadingBookId)}
           <div class="flex shrink-0 items-center gap-2">
-            <div
-              class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
-              role="progressbar"
-              aria-label={downloadingBook
-                ? downloadProgressLabel(downloadingBook)
-                : 'Download progress for book'}
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={downloadPercent ?? undefined}
-              aria-valuetext={downloadProgressValueText(downloadPercent)}
-            >
-              <div
-                class="h-full preset-filled-primary-600-400"
-                class:animate-pulse={downloadPercent === null}
-                style:width={`${downloadPercent ?? 35}%`}
-              ></div>
-            </div>
+            {@render downloadProgressBar(
+              downloadingBook,
+              'h-2 w-24 overflow-hidden rounded-full bg-surface-300-700',
+            )}
             <span class="min-w-8 text-right text-xs tabular-nums">
               {downloadPercent === null ? '…' : `${downloadPercent}%`}
             </span>
@@ -2289,32 +2368,7 @@
                             alt=""
                           />
                         {/if}
-                        {#if book.downloadPath && book.remoteAvailable !== false}
-                          <span
-                            aria-hidden="true"
-                            class="badge-icon preset-filled-primary-600-400 absolute left-1 top-1 h-6 w-6 p-0"
-                          >
-                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                              <path
-                                fill="currentColor"
-                                d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
-                              />
-                            </svg>
-                          </span>
-                        {/if}
-                        {#if book.remoteAvailable === false && book.downloadPath}
-                          <span
-                            class="badge-icon preset-filled-warning-500 absolute left-1 top-1 h-6 w-6 p-0"
-                          >
-                            <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                              <path
-                                fill="currentColor"
-                                d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
-                              />
-                            </svg>
-                            <span class="sr-only">Removed from server</span>
-                          </span>
-                        {/if}
+                        {@render coverBadges(book, 'absolute left-1 top-1 h-6 w-6 p-0')}
                       </div>
                       <div class="min-w-0 flex-1">
                         <h2
@@ -2329,77 +2383,18 @@
                           <p class="mt-1 truncate text-xs text-surface-700-300">{book.series}</p>
                         {/if}
                         {#if downloadingBookId === book.id}
-                          <div
-                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
-                            role="progressbar"
-                            aria-label={downloadProgressLabel(book)}
-                            aria-valuemin="0"
-                            aria-valuemax="100"
-                            aria-valuenow={downloadPercent ?? undefined}
-                            aria-valuetext={downloadProgressValueText(downloadPercent)}
-                          >
-                            <div
-                              class="h-full preset-filled-primary-600-400"
-                              class:animate-pulse={downloadPercent === null}
-                              style:width={`${downloadPercent ?? 35}%`}
-                            ></div>
-                          </div>
+                          {@render downloadProgressBar(
+                            book,
+                            'mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700',
+                          )}
                         {/if}
-                        {#if progressOf(book) > 0}
-                          <div
-                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
-                            role="progressbar"
-                            aria-label={`Reading progress for ${book.title}`}
-                            aria-valuemin="0"
-                            aria-valuemax="100"
-                            aria-valuenow={Math.round(progressOf(book))}
-                            aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                          >
-                            <div
-                              class="h-full preset-filled-primary-600-400"
-                              style:width={`${progressOf(book)}%`}
-                            ></div>
-                          </div>
-                        {/if}
+                        {@render readingProgressBar(
+                          book,
+                          'mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700',
+                        )}
                       </div>
                     </div>
-                    <button
-                      class="absolute inset-0 z-0 rounded-lg text-left"
-                      type="button"
-                      data-book-open
-                      onclick={() => void open(book)}
-                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book, {
-                        includeProgress: false,
-                        downloadingBookId,
-                        downloadPercent,
-                      })}
-                      disabled={downloadingBookId === book.id}
-                    >
-                      <span class="sr-only">
-                        {openBookLabel(book, {
-                          includeProgress: false,
-                          downloadingBookId,
-                          downloadPercent,
-                        })}
-                      </span>
-                    </button>
-                    <button
-                      class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
-                      type="button"
-                      data-book-actions
-                      onclick={() => openMenu(book)}
-                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
-                      title="More actions"
-                    >
-                      <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                        <path
-                          fill="currentColor"
-                          d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
-                        />
-                      </svg>
-                    </button>
+                    {@render cardButtons(book, bookIndex, false)}
                   </div>
                 {:else}
                   <div class="group relative">
@@ -2415,32 +2410,7 @@
                           alt=""
                         />
                       {/if}
-                      {#if book.downloadPath && book.remoteAvailable !== false}
-                        <span
-                          aria-hidden="true"
-                          class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                            <path
-                              fill="currentColor"
-                              d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"
-                            />
-                          </svg>
-                        </span>
-                      {/if}
-                      {#if book.remoteAvailable === false && book.downloadPath}
-                        <span
-                          class="badge-icon preset-filled-warning-500 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
-                        >
-                          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                            <path
-                              fill="currentColor"
-                              d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
-                            />
-                          </svg>
-                          <span class="sr-only">Removed from server</span>
-                        </span>
-                      {/if}
+                      {@render coverBadges(book, 'absolute left-2 top-2 h-7 w-7 p-0 shadow-md')}
                       {#if downloadingBookId === book.id}
                         <span
                           class="badge-icon preset-filled-primary-600-400 absolute left-2 top-2 h-7 w-7 p-0 shadow-md"
@@ -2459,52 +2429,12 @@
                           </svg>
                         </span>
                       {/if}
-                      {#if progressOf(book) > 0}
-                        <div
-                          class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2"
-                          role="progressbar"
-                          aria-label={`Reading progress for ${book.title}`}
-                          aria-valuemin="0"
-                          aria-valuemax="100"
-                          aria-valuenow={Math.round(progressOf(book))}
-                          aria-valuetext={`${Math.round(progressOf(book))}% complete`}
-                        >
-                          <div
-                            class="h-full preset-filled-primary-600-400"
-                            style:width={`${progressOf(book)}%`}
-                          ></div>
-                        </div>
-                      {/if}
+                      {@render readingProgressBar(
+                        book,
+                        'pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2',
+                      )}
                     </div>
-                    <button
-                      class="absolute inset-0 z-0 rounded-lg text-left"
-                      type="button"
-                      data-book-open
-                      onclick={() => void open(book)}
-                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'open')}
-                      aria-label={openBookLabel(book, { downloadingBookId, downloadPercent })}
-                      disabled={downloadingBookId === book.id}
-                    >
-                      <span class="sr-only">
-                        {openBookLabel(book, { downloadingBookId, downloadPercent })}
-                      </span>
-                    </button>
-                    <button
-                      class="btn btn-sm preset-tonal-tertiary absolute right-3 top-3 z-10 h-11 w-11 !p-0 shadow-md"
-                      type="button"
-                      data-book-actions
-                      onclick={() => openMenu(book)}
-                      onkeydown={(event) => void continueTabbing(event, bookIndex, 'actions')}
-                      aria-label={bookActionsLabel(book, { downloadingBookId, downloadPercent })}
-                      title="More actions"
-                    >
-                      <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-                        <path
-                          fill="currentColor"
-                          d="M12 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z"
-                        />
-                      </svg>
-                    </button>
+                    {@render cardButtons(book, bookIndex, true)}
                     <div class="mt-3">
                       <h2
                         class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
