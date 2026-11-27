@@ -2,6 +2,7 @@
 
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as DatabaseModule from '../database/database';
 import type * as SessionModule from '../reader/session';
 import type {
   ReaderLinkReturnTarget,
@@ -102,10 +103,14 @@ vi.mock('../reader/session', async (importOriginal) => {
   };
 });
 
-vi.mock('../database/database', () => ({
-  getPreferences: mocks.getPreferencesMock,
-  setPreferences: mocks.setPreferencesMock,
-}));
+vi.mock('../database/database', async (importOriginal) => {
+  const actual = await importOriginal<typeof DatabaseModule>();
+  return {
+    ...actual,
+    getPreferences: mocks.getPreferencesMock,
+    setPreferences: mocks.setPreferencesMock,
+  };
+});
 
 import Reader from './Reader.svelte';
 
