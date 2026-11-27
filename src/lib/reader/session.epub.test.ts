@@ -34,6 +34,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     destroy: vi.fn(),
   };
   const spine = {
+    hooks: { content: { register: vi.fn() } },
     sections: [...defaultSpineSections],
     each: vi.fn((visit: (section: TestSpineSection) => void) => {
       for (const section of spine.sections) {

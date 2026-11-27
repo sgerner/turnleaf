@@ -59,8 +59,45 @@ export function resolveReaderKeyboardAction(
 interface SpineSection {
   href: string;
   index: number;
+  url?: string | undefined;
+  document?: Document | undefined;
+  hooks?: EpubSpineHooks | undefined;
   load: (request: (url: string) => Promise<Document>) => Promise<unknown>;
   unload: () => void;
+}
+
+interface EpubSpineContentHook {
+  register?:
+    | ((callback: (document: Document, section: SpineSection) => Promise<void> | void) => void)
+    | undefined;
+  deregister?: ((callback: (...args: unknown[]) => unknown) => void) | undefined;
+  list?: (() => unknown) | undefined;
+  trigger?: ((...args: unknown[]) => Promise<unknown> | unknown) | undefined;
+}
+
+interface EpubSpineHooks {
+  content?: EpubSpineContentHook | undefined;
+}
+
+interface EpubArchiveLike {
+  urlCache?: Record<string, string> | undefined;
+  getText?: ((url: string) => Promise<string> | undefined) | undefined;
+}
+
+export interface EpubBookLike {
+  archived?: boolean | undefined;
+  archive?: EpubArchiveLike | undefined;
+  isOpen?: boolean | undefined;
+  opened?: Promise<unknown> | undefined;
+  loaded?: { spine?: Promise<unknown> | undefined } | undefined;
+  resources?: { replacementUrls?: string[] | undefined } | undefined;
+  spine?:
+    | {
+        hooks?: EpubSpineHooks | undefined;
+        spineItems?: SpineSection[] | undefined;
+        each?: ((visit: (section: SpineSection) => void) => void) | undefined;
+      }
+    | undefined;
 }
 
 interface EpubTocItem {
@@ -101,27 +138,85 @@ const RESOURCE_ATTRIBUTES = new Set([
 ]);
 
 const REMOVABLE_ELEMENTS = new Set(['script', 'iframe', 'object', 'embed', 'form']);
-const SANITIZED_NONCE_ATTRIBUTE = 'data-turnleaf-sanitized';
 const MAX_STYLESHEET_CACHE_ENTRIES = 32;
+const MAX_STYLESHEET_IMPORT_DEPTH = 4;
+const MAX_STYLESHEET_IMPORT_COUNT = 16;
+const EPUB_ARCHIVE_ORIGIN = 'https://epub.turnleaf.invalid';
+const EPUBJS_THEME_STYLE_PREFIX = 'epubjs-inserted-css-';
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:gif|jpe?g|png|webp|avif);base64,[a-z0-9+/=\t\r\n ]+$/i;
 const SAFE_DATA_FONT =
-  /^data:font\/(?:woff2?|ttf|otf|sfnt|collection|opentype|truetype)(?:;charset=[a-z0-9._-]+)?;base64,[a-z0-9+/=\t\r\n ]+$/i;
+  /^data:(?:font\/(?:woff2?|ttf|otf|sfnt|collection|opentype|truetype)|application\/(?:font-woff2?|font-sfnt|vnd\.ms-opentype|x-font-(?:ttf|truetype|opentype|otf|woff)))(?:;charset=[a-z0-9._-]+)?;base64,[a-z0-9+/=\t\r\n ]+$/i;
 const SAFE_DATA_STYLESHEET = /^data:text\/css(?:;charset=[^;,\r\n]+)?(?:;base64)?,/i;
 const BASE64_PAYLOAD = /^[a-z0-9+/=\t\r\n ]*$/i;
 // eslint-disable-next-line no-control-regex
 const UNSAFE_CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 // eslint-disable-next-line no-control-regex
 const UNSAFE_CSS_CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-const CSS_NEEDS_SANITIZATION = /@import|url\(/i;
-const CSS_IMPORT_PATTERN =
-  /@import\s+(?:url\(\s*(?:'([^']*)'\s*|"([^"]*)"\s*|([^'")\s][^')"]*))\)|'([^']*)'|"([^"]*)"|([^\s;'")]+))([^;{}]*;?)/gi;
-const CSS_URL_PATTERN = /url\(\s*(?:'([^']*)'\s*|"([^"]*)"\s*|([^'")\s][^')"]*)?)\)/gi;
+// eslint-disable-next-line no-control-regex
+const CSS_REQUIRES_TOKENIZATION = /[@(<\\\u0000-\u0008\u000b-\u001f\u007f]|\/\*|-->/;
 const STYLESHEET_REL_TOKEN = /(?:^|\s)stylesheet(?:\s|$)/i;
+
+export const EPUB_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "base-uri 'self'",
+  "connect-src 'none'",
+  "font-src 'self' data: blob:",
+  "form-action 'none'",
+  "frame-src 'none'",
+  "img-src 'self' data: blob:",
+  "manifest-src 'none'",
+  "media-src 'self' data: blob:",
+  "object-src 'none'",
+  "script-src 'none'",
+  "style-src 'self' 'unsafe-inline' data: blob:",
+  "worker-src 'none'",
+].join('; ');
+
 const PASSAGE_BLOCK_SELECTOR = 'p, li, blockquote, pre, h1, h2, h3, h4, h5, h6, dt, dd, figcaption';
 const FOCUSABLE_LINK_SELECTOR = 'a[href], area[href]';
 const SAVED_TABINDEX_ATTR = 'data-turnleaf-tabindex';
 const VIEWPORT_RECT_EPSILON = 0.5;
+
+function createEpubElement<K extends keyof HTMLElementTagNameMap>(
+  document: Document,
+  tagName: K,
+): HTMLElementTagNameMap[K] {
+  const namespace = document.documentElement?.namespaceURI;
+  return (
+    namespace ? document.createElementNS(namespace, tagName) : document.createElement(tagName)
+  ) as HTMLElementTagNameMap[K];
+}
+
+function isSameOriginBlobUrl(value: string, baseURI?: string): boolean {
+  if (!value.toLowerCase().startsWith('blob:')) return false;
+  const inner = value.slice(5).trim();
+  if (inner.toLowerCase().startsWith('nodedata:')) return true;
+  try {
+    const innerUrl = new URL(inner);
+    const normalizedBase = baseURI?.toLowerCase().startsWith('blob:') ? baseURI.slice(5) : baseURI;
+    const reference =
+      normalizedBase &&
+      !normalizedBase.startsWith('about:') &&
+      !normalizedBase.toLowerCase().startsWith('nodedata:')
+        ? new URL(normalizedBase)
+        : typeof window !== 'undefined'
+          ? new URL(window.location.href)
+          : null;
+    if (['capacitor:', 'ionic:', 'file:'].includes(innerUrl.protocol)) {
+      return reference
+        ? innerUrl.protocol === reference.protocol && innerUrl.host === reference.host
+        : ['localhost', ''].includes(innerUrl.hostname);
+    }
+    if (!['http:', 'https:'].includes(innerUrl.protocol)) return false;
+    if (reference && reference.origin !== 'null' && innerUrl.origin === reference.origin) {
+      return true;
+    }
+    return ['localhost', '127.0.0.1', '[::1]'].includes(innerUrl.hostname);
+  } catch {
+    return false;
+  }
+}
 
 function normalizePassageText(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
@@ -185,7 +280,11 @@ function decodedReference(value: string): string | null {
   }
 }
 
-function isSafeEpubReference(value: string, kind: EpubReferenceKind): boolean {
+function isSafeEpubReference(
+  value: string,
+  kind: EpubReferenceKind,
+  baseURI?: string | undefined,
+): boolean {
   const trimmed = value.trim();
   if (!trimmed) return false;
   if (/^data:/i.test(trimmed)) {
@@ -197,74 +296,679 @@ function isSafeEpubReference(value: string, kind: EpubReferenceKind): boolean {
   const decoded = decodedReference(trimmed);
   if (!decoded) return false;
   if (decoded.startsWith('#')) return true;
-  if (kind !== 'link' && decoded.toLowerCase().startsWith('blob:')) return true;
+  if (kind !== 'link' && decoded.toLowerCase().startsWith('blob:')) {
+    return isSameOriginBlobUrl(decoded, baseURI);
+  }
   if (/^[a-z][a-z\d+.-]*:/i.test(decoded)) return false;
   if (decoded.startsWith('/') || decoded.startsWith('\\')) return false;
   return true;
 }
 
-function sanitizeSrcset(value: string): string | null {
+function sanitizeSrcset(value: string, baseURI?: string | undefined): string | null {
   const candidates = value
     .split(',')
     .map((candidate) => candidate.trim())
     .filter(Boolean)
     .map((candidate) => {
       const match = candidate.match(/^(\S+)(?:\s+(.+))?$/);
-      if (!match?.[1] || !isSafeEpubReference(match[1], 'resource')) return null;
+      if (!match?.[1] || !isSafeEpubReference(match[1], 'resource', baseURI)) return null;
       return match[2] ? `${match[1]} ${match[2]}` : match[1];
     })
     .filter((candidate): candidate is string => candidate !== null);
   return candidates.length ? candidates.join(', ') : null;
 }
 
-function resolveRelativeStylesheetAsset(reference: string, baseUrl?: URL): string | null {
-  if (!baseUrl) return null;
-  const trimmed = reference.trim();
-  if (!trimmed || trimmed.startsWith('#') || /^(?:data|blob):/i.test(trimmed)) return null;
-  try {
-    return new URL(trimmed, baseUrl).href;
-  } catch {
-    return null;
-  }
+type CssTokenType =
+  | 'at-keyword'
+  | 'bad-string'
+  | 'bad-url'
+  | 'brace-close'
+  | 'brace-open'
+  | 'cdc'
+  | 'cdo'
+  | 'comma'
+  | 'comment'
+  | 'function'
+  | 'ident'
+  | 'other'
+  | 'paren-close'
+  | 'paren-open'
+  | 'semicolon'
+  | 'string'
+  | 'url'
+  | 'whitespace';
+
+interface CssToken {
+  type: CssTokenType;
+  value: string;
+  raw: string;
 }
 
-function sanitizeCss(value: string, baseUrl?: URL): string {
-  if (!CSS_NEEDS_SANITIZATION.test(value)) return value;
-  const withoutRemoteImports = value.replace(
-    CSS_IMPORT_PATTERN,
-    (
-      statement,
-      urlSingle?: string,
-      urlDouble?: string,
-      urlBare?: string,
-      strSingle?: string,
-      strDouble?: string,
-      strBare?: string,
-      suffix = '',
-    ) => {
-      const target = urlSingle ?? urlDouble ?? urlBare ?? strSingle ?? strDouble ?? strBare ?? '';
-      if (!target || !isSafeEpubReference(target, 'resource')) return '';
-      const resolved = resolveRelativeStylesheetAsset(target, baseUrl);
-      return resolved ? `@import "${resolved}"${suffix}` : statement;
-    },
+function preprocessCssInput(raw: string): string {
+  return raw.replace(/\r\n|\r|\f/g, '\n').replaceAll('\0', '\uFFFD');
+}
+
+function isCssWhitespace(character: string | undefined): boolean {
+  return character === ' ' || character === '\t' || character === '\n';
+}
+
+function isHexDigitCode(code: number): boolean {
+  return (
+    (code >= 0x30 && code <= 0x39) ||
+    (code >= 0x41 && code <= 0x46) ||
+    (code >= 0x61 && code <= 0x66)
   );
-  return withoutRemoteImports.replace(
-    CSS_URL_PATTERN,
-    (whole, singleQuoted?: string, doubleQuoted?: string, unquoted?: string) => {
-      const target = singleQuoted ?? doubleQuoted ?? unquoted ?? '';
-      if (!isSafeEpubReference(target, 'resource')) return 'none';
-      const resolved = resolveRelativeStylesheetAsset(target, baseUrl);
-      return resolved ? `url("${resolved}")` : whole;
-    },
+}
+
+function isIdentStartCode(code: number): boolean {
+  return (
+    (code >= 0x41 && code <= 0x5a) ||
+    (code >= 0x61 && code <= 0x7a) ||
+    code === 0x5f ||
+    code >= 0x80
   );
+}
+
+function isIdentCode(code: number): boolean {
+  return isIdentStartCode(code) || (code >= 0x30 && code <= 0x39) || code === 0x2d;
+}
+
+function isNonPrintableCssCode(code: number): boolean {
+  return code <= 0x08 || code === 0x0b || (code >= 0x0e && code <= 0x1f) || code === 0x7f;
+}
+
+function isValidCssEscape(input: string, index: number): boolean {
+  return input[index] === '\\' && input[index + 1] !== '\n';
+}
+
+function wouldStartCssIdent(input: string, index: number): boolean {
+  if (index >= input.length) return false;
+  const first = input.charCodeAt(index);
+  if (first === 0x2d) {
+    if (index + 1 >= input.length) return false;
+    const second = input.charCodeAt(index + 1);
+    return isIdentStartCode(second) || second === 0x2d || isValidCssEscape(input, index + 1);
+  }
+  if (isIdentStartCode(first)) return true;
+  if (first === 0x5c) return isValidCssEscape(input, index);
+  return false;
+}
+
+function consumeCssEscapedCodePoint(
+  input: string,
+  slashIndex: number,
+): { value: string; next: number } {
+  let cursor = slashIndex + 1;
+  if (cursor >= input.length) return { value: '\uFFFD', next: cursor };
+  const firstCode = input.charCodeAt(cursor);
+  if (isHexDigitCode(firstCode)) {
+    let hexEnd = cursor + 1;
+    while (
+      hexEnd < input.length &&
+      hexEnd - cursor < 6 &&
+      isHexDigitCode(input.charCodeAt(hexEnd))
+    ) {
+      hexEnd += 1;
+    }
+    const codePoint = Number.parseInt(input.slice(cursor, hexEnd), 16);
+    cursor = hexEnd;
+    if (isCssWhitespace(input[cursor])) cursor += 1;
+    if (
+      !Number.isFinite(codePoint) ||
+      codePoint === 0 ||
+      (codePoint >= 0xd800 && codePoint <= 0xdfff) ||
+      codePoint > 0x10ffff
+    ) {
+      return { value: '\uFFFD', next: cursor };
+    }
+    return { value: String.fromCodePoint(codePoint), next: cursor };
+  }
+  const codePoint = input.codePointAt(cursor)!;
+  return { value: String.fromCodePoint(codePoint), next: cursor + (codePoint > 0xffff ? 2 : 1) };
+}
+
+function consumeCssIdentSequence(
+  input: string,
+  startIndex: number,
+): { value: string; next: number } {
+  let cursor = startIndex;
+  let value = '';
+  while (cursor < input.length) {
+    if (isValidCssEscape(input, cursor)) {
+      const escaped = consumeCssEscapedCodePoint(input, cursor);
+      value += escaped.value;
+      cursor = escaped.next;
+      continue;
+    }
+    const codePoint = input.codePointAt(cursor)!;
+    if (!isIdentCode(codePoint)) break;
+    value += String.fromCodePoint(codePoint);
+    cursor += codePoint > 0xffff ? 2 : 1;
+  }
+  return { value, next: cursor };
+}
+
+function consumeCssStringToken(
+  input: string,
+  quoteIndex: number,
+): { token: CssToken; next: number } {
+  const quote = input[quoteIndex]!;
+  let cursor = quoteIndex + 1;
+  let value = '';
+  while (cursor < input.length) {
+    const ch = input[cursor]!;
+    if (ch === quote) {
+      cursor += 1;
+      return {
+        token: { type: 'string', value, raw: input.slice(quoteIndex, cursor) },
+        next: cursor,
+      };
+    }
+    if (ch === '\n') {
+      return {
+        token: { type: 'bad-string', value: '', raw: input.slice(quoteIndex, cursor) },
+        next: cursor,
+      };
+    }
+    if (ch === '\\') {
+      if (cursor + 1 >= input.length) {
+        cursor += 1;
+        break;
+      }
+      if (input[cursor + 1] === '\n') {
+        cursor += 2;
+        continue;
+      }
+      const escaped = consumeCssEscapedCodePoint(input, cursor);
+      value += escaped.value;
+      cursor = escaped.next;
+      continue;
+    }
+    value += ch;
+    cursor += 1;
+  }
+  return {
+    token: { type: 'string', value, raw: input.slice(quoteIndex, cursor) },
+    next: cursor,
+  };
+}
+
+function consumeBadCssUrlRemnants(input: string, startIndex: number): number {
+  let cursor = startIndex;
+  while (cursor < input.length) {
+    if (isValidCssEscape(input, cursor)) {
+      cursor = consumeCssEscapedCodePoint(input, cursor).next;
+    } else if (input[cursor] === ')') {
+      return cursor + 1;
+    } else {
+      cursor += 1;
+    }
+  }
+  return cursor;
+}
+
+function consumeCssUrlToken(
+  input: string,
+  afterOpenParenIndex: number,
+  tokenStartIndex: number,
+): { token: CssToken; next: number } {
+  let cursor = afterOpenParenIndex;
+  while (cursor < input.length && isCssWhitespace(input[cursor])) cursor += 1;
+  let value = '';
+  while (cursor < input.length) {
+    const ch = input[cursor]!;
+    const code = input.charCodeAt(cursor);
+    if (ch === ')') {
+      cursor += 1;
+      return {
+        token: { type: 'url', value, raw: input.slice(tokenStartIndex, cursor) },
+        next: cursor,
+      };
+    }
+    if (isCssWhitespace(ch)) {
+      while (cursor < input.length && isCssWhitespace(input[cursor])) cursor += 1;
+      if (cursor >= input.length) {
+        return {
+          token: { type: 'url', value, raw: input.slice(tokenStartIndex, cursor) },
+          next: cursor,
+        };
+      }
+      if (input[cursor] === ')') {
+        cursor += 1;
+        return {
+          token: { type: 'url', value, raw: input.slice(tokenStartIndex, cursor) },
+          next: cursor,
+        };
+      }
+      cursor = consumeBadCssUrlRemnants(input, cursor);
+      return {
+        token: { type: 'bad-url', value: '', raw: input.slice(tokenStartIndex, cursor) },
+        next: cursor,
+      };
+    }
+    if (ch === '"' || ch === "'" || ch === '(' || isNonPrintableCssCode(code)) {
+      cursor = consumeBadCssUrlRemnants(input, cursor + 1);
+      return {
+        token: { type: 'bad-url', value: '', raw: input.slice(tokenStartIndex, cursor) },
+        next: cursor,
+      };
+    }
+    if (ch === '\\') {
+      if (isValidCssEscape(input, cursor)) {
+        const escaped = consumeCssEscapedCodePoint(input, cursor);
+        value += escaped.value;
+        cursor = escaped.next;
+        continue;
+      }
+      cursor = consumeBadCssUrlRemnants(input, cursor + 1);
+      return {
+        token: { type: 'bad-url', value: '', raw: input.slice(tokenStartIndex, cursor) },
+        next: cursor,
+      };
+    }
+    value += ch;
+    cursor += 1;
+  }
+  return {
+    token: { type: 'url', value, raw: input.slice(tokenStartIndex, cursor) },
+    next: cursor,
+  };
+}
+
+function tokenizeCss(rawInput: string): CssToken[] {
+  const input = preprocessCssInput(rawInput);
+  const tokens: CssToken[] = [];
+  let cursor = 0;
+
+  while (cursor < input.length) {
+    const ch = input[cursor]!;
+    if (ch === '/' && input[cursor + 1] === '*') {
+      const closeIndex = input.indexOf('*/', cursor + 2);
+      const next = closeIndex === -1 ? input.length : closeIndex + 2;
+      tokens.push({ type: 'comment', value: '', raw: input.slice(cursor, next) });
+      cursor = next;
+      continue;
+    }
+    if (isCssWhitespace(ch)) {
+      let next = cursor + 1;
+      while (next < input.length && isCssWhitespace(input[next])) next += 1;
+      const raw = input.slice(cursor, next);
+      tokens.push({ type: 'whitespace', value: raw, raw });
+      cursor = next;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const parsed = consumeCssStringToken(input, cursor);
+      tokens.push(parsed.token);
+      cursor = parsed.next;
+      continue;
+    }
+    if (ch === '<' && input.startsWith('<!--', cursor)) {
+      tokens.push({ type: 'cdo', value: '<!--', raw: '<!--' });
+      cursor += 4;
+      continue;
+    }
+    if (ch === '-' && input.startsWith('-->', cursor)) {
+      tokens.push({ type: 'cdc', value: '-->', raw: '-->' });
+      cursor += 3;
+      continue;
+    }
+    if (ch === '@' && wouldStartCssIdent(input, cursor + 1)) {
+      const ident = consumeCssIdentSequence(input, cursor + 1);
+      tokens.push({
+        type: 'at-keyword',
+        value: ident.value,
+        raw: input.slice(cursor, ident.next),
+      });
+      cursor = ident.next;
+      continue;
+    }
+    if (wouldStartCssIdent(input, cursor)) {
+      const ident = consumeCssIdentSequence(input, cursor);
+      if (input[ident.next] === '(') {
+        const afterParen = ident.next + 1;
+        if (ident.value.toLowerCase() === 'url') {
+          let peek = afterParen;
+          while (peek < input.length && isCssWhitespace(input[peek])) peek += 1;
+          const nextChar = input[peek];
+          if (nextChar !== '"' && nextChar !== "'") {
+            const urlResult = consumeCssUrlToken(input, afterParen, cursor);
+            tokens.push(urlResult.token);
+            cursor = urlResult.next;
+            continue;
+          }
+        }
+        tokens.push({
+          type: 'function',
+          value: ident.value,
+          raw: input.slice(cursor, afterParen),
+        });
+        cursor = afterParen;
+        continue;
+      }
+      tokens.push({ type: 'ident', value: ident.value, raw: input.slice(cursor, ident.next) });
+      cursor = ident.next;
+      continue;
+    }
+    if (ch === '#') {
+      let next = cursor + 1;
+      while (next < input.length) {
+        if (isValidCssEscape(input, next)) {
+          next = consumeCssEscapedCodePoint(input, next).next;
+        } else if (isIdentCode(input.codePointAt(next)!)) {
+          next += input.codePointAt(next)! > 0xffff ? 2 : 1;
+        } else {
+          break;
+        }
+      }
+      const raw = input.slice(cursor, next);
+      tokens.push({ type: 'other', value: raw, raw });
+      cursor = next;
+      continue;
+    }
+    const singleType: CssTokenType =
+      ch === '('
+        ? 'paren-open'
+        : ch === ')'
+          ? 'paren-close'
+          : ch === '{'
+            ? 'brace-open'
+            : ch === '}'
+              ? 'brace-close'
+              : ch === ';'
+                ? 'semicolon'
+                : ch === ','
+                  ? 'comma'
+                  : 'other';
+    tokens.push({ type: singleType, value: ch, raw: ch });
+    cursor += 1;
+  }
+
+  return tokens;
+}
+
+function escapeCssString(value: string): string {
+  let escaped = '';
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (character === '\\' || character === '"') {
+      escaped += `\\${character}`;
+    } else if (character === '<') {
+      escaped += '\\3c ';
+    } else if (code <= 0x1f || code === 0x7f) {
+      escaped += `\\${code.toString(16)} `;
+    } else {
+      escaped += character;
+    }
+  }
+  return escaped;
+}
+
+function isCssTrivia(token: CssToken | undefined): boolean {
+  return token?.type === 'whitespace' || token?.type === 'comment';
+}
+
+function consumeBalancedParenTokens(
+  tokens: readonly CssToken[],
+  startIndex: number,
+): { inner: CssToken[]; next: number } {
+  let depth = 1;
+  let cursor = startIndex;
+  while (cursor < tokens.length) {
+    const current = tokens[cursor]!;
+    if (current.type === 'function' || current.type === 'paren-open') {
+      depth += 1;
+    } else if (current.type === 'paren-close') {
+      depth -= 1;
+      if (depth === 0) {
+        return { inner: tokens.slice(startIndex, cursor), next: cursor + 1 };
+      }
+    }
+    cursor += 1;
+  }
+  return { inner: tokens.slice(startIndex, cursor), next: cursor };
+}
+
+interface ParsedCssImport {
+  target: string | null;
+  mediaTokens: CssToken[];
+  next: number;
+}
+
+function consumeCssImportStatement(tokens: readonly CssToken[], atIndex: number): ParsedCssImport {
+  const prelude: CssToken[] = [];
+  let cursor = atIndex + 1;
+  let parenDepth = 0;
+  let hasBlock = false;
+
+  while (cursor < tokens.length) {
+    const current = tokens[cursor]!;
+    if (parenDepth === 0) {
+      if (current.type === 'semicolon') {
+        cursor += 1;
+        break;
+      }
+      if (current.type === 'brace-close') {
+        break;
+      }
+      if (current.type === 'brace-open') {
+        hasBlock = true;
+        let braceDepth = 1;
+        cursor += 1;
+        while (cursor < tokens.length && braceDepth > 0) {
+          if (tokens[cursor]!.type === 'brace-open') braceDepth += 1;
+          else if (tokens[cursor]!.type === 'brace-close') braceDepth -= 1;
+          cursor += 1;
+        }
+        break;
+      }
+    }
+    if (current.type === 'function' || current.type === 'paren-open') parenDepth += 1;
+    else if (current.type === 'paren-close' && parenDepth > 0) parenDepth -= 1;
+    prelude.push(current);
+    cursor += 1;
+  }
+
+  if (hasBlock) {
+    return { target: null, mediaTokens: [], next: cursor };
+  }
+
+  let p = 0;
+  while (p < prelude.length && isCssTrivia(prelude[p])) p += 1;
+  const first = prelude[p];
+  let target: string;
+  if (first?.type === 'string' || first?.type === 'url') {
+    target = first.value;
+    p += 1;
+  } else if (first?.type === 'function' && first.value.toLowerCase() === 'url') {
+    const balanced = consumeBalancedParenTokens(prelude, p + 1);
+    const significant = balanced.inner.filter((token) => !isCssTrivia(token));
+    if (significant.length === 1 && significant[0]?.type === 'string') {
+      target = significant[0].value;
+      p = balanced.next;
+    } else {
+      return { target: null, mediaTokens: [], next: cursor };
+    }
+  } else {
+    return { target: null, mediaTokens: [], next: cursor };
+  }
+
+  while (p < prelude.length && isCssTrivia(prelude[p])) p += 1;
+  const mediaTokens = prelude.slice(p);
+  if (
+    mediaTokens.some(
+      (token) =>
+        token.type === 'bad-string' || token.type === 'bad-url' || token.type === 'at-keyword',
+    )
+  ) {
+    return { target: null, mediaTokens: [], next: cursor };
+  }
+
+  return { target, mediaTokens, next: cursor };
+}
+
+type CssResourceResolver = (reference: string) => string | null;
+
+function normalizeCssDataUri(trimmed: string): string {
+  const comma = trimmed.indexOf(',');
+  if (comma < 0) return trimmed;
+  return `${trimmed.slice(0, comma + 1)}${trimmed.slice(comma + 1).replace(/[\t\r\n ]+/g, '')}`;
+}
+
+function defaultCssResourceResolver(
+  reference: string,
+  baseURI?: string | undefined,
+): string | null {
+  if (!isSafeEpubReference(reference, 'resource', baseURI)) return null;
+  const trimmed = reference.trim();
+  if (/^data:/i.test(trimmed)) return normalizeCssDataUri(trimmed);
+  return decodedReference(trimmed);
+}
+
+function sanitizeImageSetTokens(
+  fnName: string,
+  innerTokens: readonly CssToken[],
+  resolveResource: CssResourceResolver,
+): string {
+  const groups: CssToken[][] = [];
+  let current: CssToken[] = [];
+  let depth = 0;
+  for (const token of innerTokens) {
+    if (depth === 0 && token.type === 'comma') {
+      groups.push(current);
+      current = [];
+      continue;
+    }
+    if (token.type === 'function' || token.type === 'paren-open') depth += 1;
+    else if (token.type === 'paren-close' && depth > 0) depth -= 1;
+    current.push(token);
+  }
+  groups.push(current);
+
+  const safeCandidates: string[] = [];
+  for (const group of groups) {
+    let idx = 0;
+    while (idx < group.length && isCssTrivia(group[idx])) idx += 1;
+    const head = group[idx];
+    if (!head) continue;
+    if (head.type === 'string') {
+      const resolved = resolveResource(head.value);
+      if (!resolved) continue;
+      const rest = sanitizeCssTokens(group.slice(idx + 1), resolveResource).trim();
+      const normalizedUrl = `url("${escapeCssString(resolved)}")`;
+      safeCandidates.push(rest ? `${normalizedUrl} ${rest}` : normalizedUrl);
+      continue;
+    }
+    const sanitizedGroup = sanitizeCssTokens(group.slice(idx), resolveResource).trim();
+    if (!sanitizedGroup || /^none(?:\s|$)/i.test(sanitizedGroup)) continue;
+    safeCandidates.push(sanitizedGroup);
+  }
+
+  return safeCandidates.length > 0 ? `${fnName}(${safeCandidates.join(', ')})` : 'none';
+}
+
+function sanitizeCssTokens(
+  tokens: readonly CssToken[],
+  resolveResource: CssResourceResolver,
+): string {
+  let output = '';
+  let index = 0;
+
+  while (index < tokens.length) {
+    const token = tokens[index]!;
+    if (token.type === 'comment' || token.type === 'cdo' || token.type === 'cdc') {
+      output += ' ';
+      index += 1;
+      continue;
+    }
+    if (token.type === 'bad-url') {
+      output += 'none';
+      index += 1;
+      continue;
+    }
+    if (token.type === 'bad-string') {
+      output += '""';
+      index += 1;
+      continue;
+    }
+    if (token.type === 'string') {
+      output += `"${escapeCssString(token.value)}"`;
+      index += 1;
+      continue;
+    }
+    if (token.type === 'url') {
+      const resolved = resolveResource(token.value);
+      output += resolved ? `url("${escapeCssString(resolved)}")` : 'none';
+      index += 1;
+      continue;
+    }
+    if (token.type === 'at-keyword' && token.value.toLowerCase() === 'import') {
+      const parsed = consumeCssImportStatement(tokens, index);
+      index = parsed.next;
+      continue;
+    }
+    if (token.type === 'function') {
+      const fnName = token.value.toLowerCase();
+      const balanced = consumeBalancedParenTokens(tokens, index + 1);
+      index = balanced.next;
+      if (fnName === 'url' || fnName === 'src') {
+        const significant = balanced.inner.filter((entry) => !isCssTrivia(entry));
+        if (significant.length === 1 && significant[0]?.type === 'string') {
+          const resolved = resolveResource(significant[0].value);
+          output += resolved ? `url("${escapeCssString(resolved)}")` : 'none';
+        } else {
+          output += 'none';
+        }
+        continue;
+      }
+      if (fnName === 'image-set' || fnName === '-webkit-image-set') {
+        output += sanitizeImageSetTokens(fnName, balanced.inner, resolveResource);
+        continue;
+      }
+      if (fnName === 'expression') {
+        output += 'none';
+        continue;
+      }
+      const sanitizedInner = sanitizeCssTokens(balanced.inner, resolveResource);
+      output += `${token.raw}${sanitizedInner})`;
+      continue;
+    }
+    if (token.type === 'other' && token.value === '<' && tokens[index + 1]?.value === '/') {
+      output += '< ';
+      index += 1;
+      continue;
+    }
+    output += token.raw;
+    index += 1;
+  }
+
+  return output;
+}
+
+export function sanitizeCss(value: string, baseURI?: string | undefined): string {
+  if (!CSS_REQUIRES_TOKENIZATION.test(value)) return value;
+  return sanitizeCssTokens(tokenizeCss(value), (reference) =>
+    defaultCssResourceResolver(reference, baseURI),
+  );
+}
+
+function isLocalUrlObject(url: URL, referenceBaseURI?: string): boolean {
+  if (url.protocol === 'blob:') return isSameOriginBlobUrl(url.href, referenceBaseURI);
+  if (['file:', 'capacitor:', 'ionic:'].includes(url.protocol)) return true;
+  if (!['http:', 'https:'].includes(url.protocol)) return false;
+  if (
+    typeof window !== 'undefined' &&
+    window.location.origin !== 'null' &&
+    url.origin === window.location.origin
+  ) {
+    return true;
+  }
+  return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
 }
 
 function isLocalContentUrl(value: string, document: Document): boolean {
   try {
-    const url = new URL(value, document.baseURI);
-    if (['blob:', 'file:', 'capacitor:', 'ionic:'].includes(url.protocol)) return true;
-    if (!['http:', 'https:'].includes(url.protocol)) return false;
-    return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    return isLocalUrlObject(new URL(value, document.baseURI), document.baseURI);
   } catch {
     return false;
   }
@@ -290,108 +994,282 @@ function decodeDataStylesheet(value: string): string | null {
   }
 }
 
-interface StylesheetCacheEntry {
-  promise: Promise<string | null>;
-  blobUrl: string | null;
-  revoked: boolean;
-}
+export type StylesheetCache = Map<string, Promise<string | null>>;
+export type StylesheetResolver = (href: string, document: Document) => Promise<string | null>;
 
-export type StylesheetCache = Map<string, StylesheetCacheEntry>;
-
-interface SanitizeEpubOptions {
-  nonce?: string | undefined;
-  archived?: boolean | undefined;
-  preservedStylesheetPaths?: ReadonlySet<string> | undefined;
-  sectionUrl?: string | undefined;
-}
-
-function revokeStylesheetCacheEntry(entry: StylesheetCacheEntry): void {
-  entry.revoked = true;
-  if (entry.blobUrl?.startsWith('blob:')) {
-    URL.revokeObjectURL(entry.blobUrl);
+function rememberCachedStylesheet(
+  key: string,
+  loader: () => Promise<string | null>,
+  cache: StylesheetCache,
+): Promise<string | null> {
+  const existing = cache.get(key);
+  if (existing) {
+    cache.delete(key);
+    cache.set(key, existing);
+    return existing;
   }
-  entry.blobUrl = null;
-}
-
-function createSanitizationNonce(): string {
-  if (typeof crypto !== 'undefined') {
-    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-    if (typeof crypto.getRandomValues === 'function') {
-      const bytes = new Uint8Array(16);
-      crypto.getRandomValues(bytes);
-      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-    }
+  const request = loader().catch(() => null);
+  if (cache.size >= MAX_STYLESHEET_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
   }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  cache.set(key, request);
+  return request.then((stylesheet) => {
+    if (stylesheet === null && cache.get(key) === request) cache.delete(key);
+    return stylesheet;
+  });
 }
 
-function resolveArchivePath(href: string, basePath?: string): string | null {
+function resolveSameHostUrl(reference: string, baseUrl: URL): URL | null {
   try {
-    const base = basePath
-      ? new URL(basePath.startsWith('/') ? basePath : `/${basePath}`, 'https://epub.local')
-      : new URL('https://epub.local/');
-    const resolved = new URL(href, base);
-    if (resolved.origin !== 'https://epub.local') return null;
-    return decodeURIComponent(resolved.pathname);
+    const resolved = new URL(reference, baseUrl);
+    return resolved.protocol === baseUrl.protocol && resolved.host === baseUrl.host
+      ? resolved
+      : null;
   } catch {
     return null;
   }
 }
 
-async function loadLocalStylesheet(url: URL, cache: StylesheetCache): Promise<string | null> {
-  const key = url.href;
-  const existing = cache.get(key);
-  if (existing && !existing.revoked) {
-    cache.delete(key);
-    cache.set(key, existing);
-    return existing.promise;
-  }
-  const entry: StylesheetCacheEntry = {
-    promise: Promise.resolve(null),
-    blobUrl: null,
-    revoked: false,
-  };
-  const request = fetch(url)
-    .then(async (response) => {
-      if (!response.ok) return null;
-      const sanitized = sanitizeCss(await response.text(), url);
-      if (entry.revoked) return null;
-      const blobUrl = URL.createObjectURL(new Blob([sanitized], { type: 'text/css' }));
-      if (entry.revoked) {
-        URL.revokeObjectURL(blobUrl);
-        return null;
-      }
-      entry.blobUrl = blobUrl;
-      return blobUrl;
-    })
-    .catch(() => null);
-  entry.promise = request;
-  if (cache.size >= MAX_STYLESHEET_CACHE_ENTRIES) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) {
-      const evicted = cache.get(oldest);
-      cache.delete(oldest);
-      if (evicted) revokeStylesheetCacheEntry(evicted);
-    }
-  }
-  cache.set(key, entry);
-  const stylesheet = await request;
-  if (stylesheet === null && cache.get(key) === entry) cache.delete(key);
-  return stylesheet;
+function rewriteLocalCssResource(reference: string, stylesheetUrl: URL): string | null {
+  if (!isSafeEpubReference(reference, 'resource', stylesheetUrl.href)) return null;
+  const trimmed = reference.trim();
+  if (/^data:/i.test(trimmed)) return normalizeCssDataUri(trimmed);
+  const decoded = decodedReference(trimmed);
+  if (!decoded) return null;
+  if (decoded.startsWith('#') || decoded.toLowerCase().startsWith('blob:')) return decoded;
+  if (stylesheetUrl.protocol === 'blob:') return decoded;
+  return resolveSameHostUrl(decoded, stylesheetUrl)?.href ?? null;
 }
 
-function isCachedStylesheetBlob(href: string, cache: StylesheetCache): boolean {
-  for (const entry of cache.values()) {
-    if (!entry.revoked && entry.blobUrl === href) return true;
+async function sanitizeCssTokensWithImports(
+  tokens: readonly CssToken[],
+  resolveResource: CssResourceResolver,
+  resolveImportTarget: (target: string) => Promise<string | null>,
+): Promise<string> {
+  if (
+    !tokens.some((token) => token.type === 'at-keyword' && token.value.toLowerCase() === 'import')
+  ) {
+    return sanitizeCssTokens(tokens, resolveResource);
   }
-  return false;
+  let output = '';
+  let chunkStart = 0;
+  let index = 0;
+  while (index < tokens.length) {
+    const token = tokens[index]!;
+    if (token.type === 'at-keyword' && token.value.toLowerCase() === 'import') {
+      if (index > chunkStart) {
+        output += sanitizeCssTokens(tokens.slice(chunkStart, index), resolveResource);
+      }
+      const parsed = consumeCssImportStatement(tokens, index);
+      index = parsed.next;
+      chunkStart = index;
+      if (parsed.target !== null) {
+        const importedCss = await resolveImportTarget(parsed.target);
+        if (importedCss) {
+          const media = sanitizeCssTokens(parsed.mediaTokens, resolveResource).trim();
+          output += media ? `@media ${media} {\n${importedCss}\n}` : importedCss;
+        }
+      }
+      continue;
+    }
+    index += 1;
+  }
+  if (chunkStart < tokens.length) {
+    output += sanitizeCssTokens(tokens.slice(chunkStart), resolveResource);
+  }
+  return output;
+}
+
+async function resolveLocalStylesheet(
+  stylesheetUrl: URL,
+  visited: ReadonlySet<string>,
+  depth = 0,
+  budget: { remaining: number } = { remaining: MAX_STYLESHEET_IMPORT_COUNT },
+): Promise<string | null> {
+  if (depth > MAX_STYLESHEET_IMPORT_DEPTH) return null;
+  let raw: string;
+  try {
+    const response = await fetch(stylesheetUrl);
+    if (!response.ok) return null;
+    raw = await response.text();
+  } catch {
+    return null;
+  }
+  const resolveResource: CssResourceResolver = (reference) =>
+    rewriteLocalCssResource(reference, stylesheetUrl);
+  return sanitizeCssTokensWithImports(tokenizeCss(raw), resolveResource, async (target) => {
+    if (!isSafeEpubReference(target, 'stylesheet', stylesheetUrl.href)) return null;
+    const embedded = decodeDataStylesheet(target);
+    if (embedded !== null) return sanitizeCss(embedded, stylesheetUrl.href);
+    if (stylesheetUrl.protocol === 'blob:' || budget.remaining <= 0) return null;
+    const decoded = decodedReference(target);
+    const importedUrl = decoded ? resolveSameHostUrl(decoded, stylesheetUrl) : null;
+    if (!importedUrl || !isLocalUrlObject(importedUrl, stylesheetUrl.href)) return null;
+    if (visited.has(importedUrl.href)) return null;
+    budget.remaining -= 1;
+    return resolveLocalStylesheet(
+      importedUrl,
+      new Set([...visited, importedUrl.href]),
+      depth + 1,
+      budget,
+    );
+  });
+}
+
+async function loadLocalStylesheet(url: URL, cache: StylesheetCache): Promise<string | null> {
+  const key = url.href;
+  return rememberCachedStylesheet(key, () => resolveLocalStylesheet(url, new Set([key])), cache);
+}
+
+function relativeArchivePath(fromDirectory: string, toPath: string): string {
+  const fromSegments = fromDirectory.split('/').filter(Boolean);
+  const toSegments = toPath.split('/').slice(1);
+  const toDirectories = toSegments.slice(0, -1);
+  const filename = toSegments.at(-1) ?? '';
+  let shared = 0;
+  while (
+    shared < fromSegments.length &&
+    shared < toDirectories.length &&
+    fromSegments[shared] === toDirectories[shared]
+  ) {
+    shared += 1;
+  }
+  const upward = Array.from({ length: fromSegments.length - shared }, () => '..');
+  return [...upward, ...toDirectories.slice(shared), filename].filter(Boolean).join('/');
+}
+
+function resolveArchiveUrl(reference: string, basePath: string): URL | null {
+  try {
+    const base = new URL(basePath.startsWith('/') ? basePath : `/${basePath}`, EPUB_ARCHIVE_ORIGIN);
+    const resolved = new URL(reference, base);
+    return resolved.origin === EPUB_ARCHIVE_ORIGIN ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+function archiveDirectoryOf(pathname: string): string {
+  const slashIndex = pathname.lastIndexOf('/');
+  return slashIndex >= 0 ? pathname.slice(0, slashIndex + 1) : '/';
+}
+
+function rewriteArchivedCssResource(
+  reference: string,
+  archive: EpubArchiveLike,
+  stylesheetPath: string,
+  sectionDirectory: string,
+  baseURI?: string | undefined,
+): string | null {
+  if (!isSafeEpubReference(reference, 'resource', baseURI)) return null;
+  const trimmed = reference.trim();
+  if (/^data:/i.test(trimmed)) return normalizeCssDataUri(trimmed);
+  const decoded = decodedReference(trimmed);
+  if (!decoded) return null;
+  if (decoded.startsWith('#') || decoded.toLowerCase().startsWith('blob:')) return decoded;
+  const assetUrl = resolveArchiveUrl(decoded, stylesheetPath);
+  if (!assetUrl) return null;
+  const cachedUrl =
+    archive.urlCache?.[assetUrl.pathname] ?? archive.urlCache?.[assetUrl.pathname.slice(1)];
+  if (cachedUrl !== undefined) {
+    return isSafeEpubReference(cachedUrl, 'resource', baseURI) ? cachedUrl : null;
+  }
+  return relativeArchivePath(sectionDirectory, assetUrl.pathname);
+}
+
+async function resolveArchivedStylesheet(
+  archive: EpubArchiveLike,
+  stylesheetPath: string,
+  sectionDirectory: string,
+  visited: ReadonlySet<string>,
+  depth = 0,
+  budget: { remaining: number } = { remaining: MAX_STYLESHEET_IMPORT_COUNT },
+  baseURI?: string | undefined,
+  isAborted?: (() => boolean) | undefined,
+): Promise<string | null> {
+  if (depth > MAX_STYLESHEET_IMPORT_DEPTH || !archive.getText || isAborted?.()) {
+    return null;
+  }
+  let raw: string | undefined;
+  try {
+    raw = await archive.getText(stylesheetPath);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== 'string' || isAborted?.()) return null;
+
+  const resolveResource: CssResourceResolver = (reference) =>
+    rewriteArchivedCssResource(reference, archive, stylesheetPath, sectionDirectory, baseURI);
+  return sanitizeCssTokensWithImports(tokenizeCss(raw), resolveResource, async (target) => {
+    if (isAborted?.() || !isSafeEpubReference(target, 'stylesheet', baseURI)) return null;
+    const embedded = decodeDataStylesheet(target);
+    if (embedded !== null) return sanitizeCss(embedded, baseURI);
+    if (budget.remaining <= 0) return null;
+    const decoded = decodedReference(target);
+    const importedUrl = decoded ? resolveArchiveUrl(decoded, stylesheetPath) : null;
+    if (!importedUrl || visited.has(importedUrl.pathname)) return null;
+    budget.remaining -= 1;
+    return resolveArchivedStylesheet(
+      archive,
+      importedUrl.pathname,
+      sectionDirectory,
+      new Set([...visited, importedUrl.pathname]),
+      depth + 1,
+      budget,
+      baseURI,
+      isAborted,
+    );
+  });
+}
+
+async function loadArchivedStylesheet(
+  archive: EpubArchiveLike,
+  stylesheetPath: string,
+  sectionDirectory: string,
+  cache: StylesheetCache,
+  baseURI?: string | undefined,
+  isAborted?: (() => boolean) | undefined,
+): Promise<string | null> {
+  if (!archive.getText || isAborted?.()) return null;
+  const hasCachedUrls = Boolean(archive.urlCache && Object.keys(archive.urlCache).length > 0);
+  const key = `archive:${hasCachedUrls ? 'cached' : 'rel'}:${sectionDirectory}->${stylesheetPath}`;
+  return rememberCachedStylesheet(
+    key,
+    () =>
+      resolveArchivedStylesheet(
+        archive,
+        stylesheetPath,
+        sectionDirectory,
+        new Set([stylesheetPath]),
+        0,
+        { remaining: MAX_STYLESHEET_IMPORT_COUNT },
+        baseURI,
+        isAborted,
+      ),
+    cache,
+  );
+}
+
+async function sanitizeStyleBlockCss(
+  value: string,
+  document: Document,
+  resolveStylesheet: StylesheetResolver,
+): Promise<string> {
+  if (!CSS_REQUIRES_TOKENIZATION.test(value)) return value;
+  const resolveResource: CssResourceResolver = (reference) =>
+    defaultCssResourceResolver(reference, document.baseURI);
+  return sanitizeCssTokensWithImports(tokenizeCss(value), resolveResource, async (target) => {
+    if (!isSafeEpubReference(target, 'stylesheet', document.baseURI)) return null;
+    const embedded = decodeDataStylesheet(target);
+    if (embedded !== null) return sanitizeCss(embedded, document.baseURI);
+    return resolveStylesheet(target, document);
+  });
 }
 
 async function sanitizeStylesheets(
   document: Document,
   links: HTMLLinkElement[],
-  cache: StylesheetCache,
-  options?: SanitizeEpubOptions,
+  resolveStylesheet: StylesheetResolver,
 ): Promise<void> {
   if (!links.length) return;
   await Promise.all(
@@ -401,37 +1279,19 @@ async function sanitizeStylesheets(
         link.remove();
         return;
       }
-      if (SAFE_DATA_STYLESHEET.test(href)) {
-        const embedded = decodeDataStylesheet(href);
-        const stylesheet = embedded !== null ? sanitizeCss(embedded) : '';
-        if (stylesheet) {
-          const style = document.createElement('style');
-          style.textContent = stylesheet;
-          link.replaceWith(style);
-        } else {
-          link.remove();
-        }
-        return;
-      }
-      if (isCachedStylesheetBlob(href, cache)) {
-        return;
-      }
-      if (options?.archived) {
-        const archivePath = resolveArchivePath(href, options.sectionUrl);
-        if (!archivePath || !options.preservedStylesheetPaths?.has(archivePath)) {
-          link.remove();
-        }
-        return;
-      }
-      if (!isLocalContentUrl(href, document)) {
-        link.remove();
-        return;
-      }
-      const blobUrl = await loadLocalStylesheet(new URL(href, document.baseURI), cache);
-      if (!blobUrl) {
-        link.remove();
-      } else if (link.getAttribute('href') !== blobUrl) {
-        link.setAttribute('href', blobUrl);
+      const placeholder = document.createComment('');
+      link.replaceWith(placeholder);
+      const embedded = decodeDataStylesheet(href);
+      const stylesheet =
+        embedded !== null
+          ? sanitizeCss(embedded, document.baseURI)
+          : await resolveStylesheet(href, document);
+      if (stylesheet?.trim()) {
+        const style = createEpubElement(document, 'style');
+        style.textContent = stylesheet;
+        placeholder.replaceWith(style);
+      } else {
+        placeholder.remove();
       }
     }),
   );
@@ -440,29 +1300,24 @@ async function sanitizeStylesheets(
 function installEpubContentPolicy(document: Document): void {
   const head =
     document.head ??
+    document.querySelector('head') ??
     document.documentElement.insertBefore(
-      document.createElement('head'),
+      createEpubElement(document, 'head'),
       document.documentElement.firstChild,
     );
-  const policy = document.createElement('meta');
-  policy.setAttribute('http-equiv', 'Content-Security-Policy');
-  policy.setAttribute(
-    'content',
-    [
-      "default-src 'none'",
-      "base-uri 'self'",
-      "connect-src 'none'",
-      "font-src 'self' data: blob:",
-      "frame-src 'none'",
-      "img-src 'self' data: blob:",
-      "manifest-src 'none'",
-      "media-src 'self' data: blob:",
-      "object-src 'none'",
-      "script-src 'none'",
-      "style-src 'self' 'unsafe-inline' data: blob:",
-      "worker-src 'none'",
-    ].join('; '),
+  const existing = [...head.children].find(
+    (element) =>
+      element.localName === 'meta' &&
+      element.getAttribute('http-equiv')?.toLowerCase() === 'content-security-policy' &&
+      element.getAttribute('content') === EPUB_CONTENT_SECURITY_POLICY,
   );
+  if (existing) {
+    if (head.firstElementChild !== existing) head.prepend(existing);
+    return;
+  }
+  const policy = createEpubElement(document, 'meta');
+  policy.setAttribute('http-equiv', 'Content-Security-Policy');
+  policy.setAttribute('content', EPUB_CONTENT_SECURITY_POLICY);
   head.prepend(policy);
 }
 
@@ -497,35 +1352,60 @@ function hasHttpEquivAttribute(element: Element): boolean {
 export async function sanitizeEpubDocument(
   document: Document,
   stylesheetCache: StylesheetCache = new Map(),
-  options?: SanitizeEpubOptions,
+  resolveStylesheet?: StylesheetResolver | undefined,
 ): Promise<void> {
   const root = document.documentElement;
   if (!root) return;
-  if (options?.nonce && root.getAttribute(SANITIZED_NONCE_ATTRIBUTE) === options.nonce) {
-    return;
-  }
 
+  const effectiveResolver: StylesheetResolver =
+    resolveStylesheet ??
+    ((href, currentDocument) =>
+      isLocalContentUrl(href, currentDocument)
+        ? loadLocalStylesheet(new URL(href, currentDocument.baseURI), stylesheetCache)
+        : Promise.resolve(null));
+
+  const inlineStyles: HTMLStyleElement[] = [];
   const stylesheetLinks: HTMLLinkElement[] = [];
+  let seenSafeBase = false;
+  let seenPolicy = false;
+
   let current: Element | null = root;
   while (current) {
     const element = current;
     const tag = element.localName.toLowerCase();
 
-    if (REMOVABLE_ELEMENTS.has(tag) || (tag === 'meta' && hasHttpEquivAttribute(element))) {
+    if (REMOVABLE_ELEMENTS.has(tag)) {
       const next = nextElementSkippingChildren(element, root);
       element.remove();
       current = next;
       continue;
     }
 
-    if (tag === 'base') {
-      const href = element.getAttribute('href') ?? '';
-      if (!isSafeBaseReference(href, document)) {
+    if (tag === 'meta' && hasHttpEquivAttribute(element)) {
+      if (
+        !seenPolicy &&
+        element.parentElement?.localName.toLowerCase() === 'head' &&
+        element.getAttribute('http-equiv')?.toLowerCase() === 'content-security-policy' &&
+        element.getAttribute('content') === EPUB_CONTENT_SECURITY_POLICY
+      ) {
+        seenPolicy = true;
+      } else {
         const next = nextElementSkippingChildren(element, root);
         element.remove();
         current = next;
         continue;
       }
+    }
+
+    if (tag === 'base') {
+      const href = element.getAttribute('href') ?? '';
+      if (seenSafeBase || !isSafeBaseReference(href, document)) {
+        const next = nextElementSkippingChildren(element, root);
+        element.remove();
+        current = next;
+        continue;
+      }
+      seenSafeBase = true;
     }
 
     let isStylesheetLink = false;
@@ -534,46 +1414,56 @@ export async function sanitizeEpubDocument(
         tag === 'link' && STYLESHEET_REL_TOKEN.test(element.getAttribute('rel') ?? '');
       for (const attributeName of element.getAttributeNames()) {
         const name = attributeName.toLowerCase();
+        const colonIndex = name.indexOf(':');
+        const localName = colonIndex >= 0 ? name.slice(colonIndex + 1) : name;
         if (
-          name === SANITIZED_NONCE_ATTRIBUTE ||
           name === SAVED_TABINDEX_ATTR ||
+          name === 'data-turnleaf-sanitized' ||
           name.startsWith('on') ||
-          name === 'ping'
+          localName.startsWith('on') ||
+          name === 'ping' ||
+          localName === 'ping'
         ) {
           element.removeAttribute(attributeName);
           continue;
         }
-        if (name === 'srcset' || name === 'imagesrcset') {
+        if (
+          name === 'srcset' ||
+          localName === 'srcset' ||
+          name === 'imagesrcset' ||
+          localName === 'imagesrcset'
+        ) {
           const value = element.getAttribute(attributeName) ?? '';
-          const safeSrcset = sanitizeSrcset(value);
+          const safeSrcset = sanitizeSrcset(value, document.baseURI);
           if (!safeSrcset) element.removeAttribute(attributeName);
           else if (safeSrcset !== value) element.setAttribute(attributeName, safeSrcset);
           continue;
         }
-        if (name === 'style') {
+        if (name === 'style' || localName === 'style') {
           const value = element.getAttribute(attributeName) ?? '';
-          const safeStyle = sanitizeCss(value);
+          const safeStyle = sanitizeCss(value, document.baseURI);
           if (!safeStyle) element.removeAttribute(attributeName);
           else if (safeStyle !== value) element.setAttribute(attributeName, safeStyle);
           continue;
         }
-        if (tag === 'base' && name === 'href') continue;
-        if (!RESOURCE_ATTRIBUTES.has(name)) continue;
+        if (tag === 'base' && (name === 'href' || localName === 'href')) continue;
+        if (!RESOURCE_ATTRIBUTES.has(name) && !RESOURCE_ATTRIBUTES.has(localName)) continue;
+        const isHref = name === 'href' || localName === 'href';
         const value = element.getAttribute(attributeName) ?? '';
         const kind: EpubReferenceKind =
-          name === 'href' && (tag === 'a' || tag === 'area')
+          isHref && (tag === 'a' || tag === 'area')
             ? 'link'
-            : name === 'href' && isStylesheetLink
+            : isHref && isStylesheetLink
               ? 'stylesheet'
               : 'resource';
-        if (!isSafeEpubReference(value, kind)) element.removeAttribute(attributeName);
+        if (!isSafeEpubReference(value, kind, document.baseURI)) {
+          element.removeAttribute(attributeName);
+        }
       }
     }
 
     if (tag === 'style') {
-      const rawCss = element.textContent ?? '';
-      const safeCss = sanitizeCss(rawCss);
-      if (safeCss !== rawCss) element.textContent = safeCss;
+      inlineStyles.push(element as HTMLStyleElement);
     } else if (isStylesheetLink) {
       if (element.hasAttribute('href')) {
         stylesheetLinks.push(element as HTMLLinkElement);
@@ -590,47 +1480,286 @@ export async function sanitizeEpubDocument(
 
   if (!document.documentElement) return;
   installEpubContentPolicy(document);
-  await sanitizeStylesheets(document, stylesheetLinks, stylesheetCache, options);
-  if (options?.nonce) {
-    document.documentElement.setAttribute(SANITIZED_NONCE_ATTRIBUTE, options.nonce);
+
+  if (inlineStyles.length > 0) {
+    await Promise.all(
+      inlineStyles.map(async (style) => {
+        const rawCss = style.textContent ?? '';
+        if (style.id.startsWith(EPUBJS_THEME_STYLE_PREFIX) && !rawCss.trim()) return;
+        const safeCss = await sanitizeStyleBlockCss(rawCss, document, effectiveResolver);
+        if (!safeCss.trim()) {
+          if (!style.id.startsWith(EPUBJS_THEME_STYLE_PREFIX)) style.remove();
+          return;
+        }
+        if (safeCss !== rawCss) style.textContent = safeCss;
+      }),
+    );
   }
+
+  await sanitizeStylesheets(document, stylesheetLinks, effectiveResolver);
 }
 
-interface BookArchive {
-  urlCache?: Record<string, string>;
-  getText?: (url: string) => Promise<string> | undefined;
+type AnySpineHookFn = (...hookArgs: unknown[]) => unknown;
+
+function normalizeError(error: unknown, fallbackMessage: string): Error {
+  if (error instanceof Error) return error;
+  if (typeof error === 'string' && error.trim()) return new Error(error);
+  return new Error(fallbackMessage);
 }
 
-interface BookResources {
-  urls?: string[];
-  cssUrls?: string[];
-  replacementUrls?: string[];
-  settings?: { resolver?: (href: string) => string };
-  substitute?: (content: string, url?: string) => string;
-}
-
-interface InternalBook {
-  archived?: boolean;
-  archive?: BookArchive;
-  resources?: BookResources;
-  resolve?: (path: string, absolute?: boolean) => string;
-  spine?: {
-    hooks?: {
-      content?: {
-        register: (
-          hook: (document: Document, section?: SpineSection & { url?: string }) => Promise<void>,
-        ) => void;
-      };
-    };
+function toAsyncSafeSpineHookFn(
+  task: AnySpineHookFn,
+  wrappedMap: WeakMap<AnySpineHookFn, AnySpineHookFn>,
+): AnySpineHookFn {
+  const existing = wrappedMap.get(task);
+  if (existing) return existing;
+  const wrapped: AnySpineHookFn = function (this: unknown, ...hookArgs: unknown[]): unknown {
+    try {
+      return task.apply(this, hookArgs);
+    } catch (error) {
+      return Promise.reject(error);
+    }
   };
+  wrappedMap.set(task, wrapped);
+  wrappedMap.set(wrapped, wrapped);
+  return wrapped;
+}
+
+interface SpineSanitizerRegistration {
+  task: AnySpineHookFn;
+  rawTask: AnySpineHookFn;
+  sanitizedDocuments: WeakSet<Document>;
+  isAborted?: (() => boolean) | undefined;
+  onError?: ((error: Error) => void) | undefined;
+}
+
+interface SpineHookGuardState {
+  originalRegister: NonNullable<EpubSpineContentHook['register']>;
+  wrappedTasks: WeakMap<AnySpineHookFn, AnySpineHookFn>;
+  sanitizers: Set<SpineSanitizerRegistration>;
+}
+
+const spineHookGuards = new WeakMap<object, SpineHookGuardState>();
+
+function stripReservedEpubStyleIds(document: Document): void {
+  document.querySelectorAll<HTMLElement>('[id]').forEach((element) => {
+    if (element.id.startsWith(EPUBJS_THEME_STYLE_PREFIX)) {
+      element.removeAttribute('id');
+    }
+  });
+}
+
+export interface EpubSpineSanitizerOptions {
+  isAborted?: (() => boolean) | undefined;
+  onError?: ((error: Error) => void) | undefined;
+  sanitizedDocuments?: WeakSet<Document> | undefined;
+}
+
+export function registerEpubSpineSanitizer(
+  book: EpubBookLike,
+  stylesheetCache: StylesheetCache = new Map(),
+  options?: EpubSpineSanitizerOptions | undefined,
+): { contentHook: EpubSpineContentHook; hookTask: AnySpineHookFn } {
+  const contentHook = book?.spine?.hooks?.content;
+  if (
+    !contentHook ||
+    typeof contentHook !== 'object' ||
+    typeof contentHook.register !== 'function'
+  ) {
+    const error = new Error('EPUB spine content sanitizer hook is unavailable.');
+    options?.onError?.(error);
+    throw error;
+  }
+  if (contentHook.trigger !== undefined && typeof contentHook.trigger !== 'function') {
+    const error = new Error('EPUB spine content trigger hook is invalid.');
+    options?.onError?.(error);
+    throw error;
+  }
+
+  let guard = spineHookGuards.get(contentHook);
+  if (!guard) {
+    const originalRegister = contentHook.register;
+    const wrappedTasks = new WeakMap<AnySpineHookFn, AnySpineHookFn>();
+    const sanitizers = new Set<SpineSanitizerRegistration>();
+    guard = { originalRegister, wrappedTasks, sanitizers };
+    spineHookGuards.set(contentHook, guard);
+
+    if (typeof contentHook.list === 'function') {
+      const existingHooks = contentHook.list();
+      if (Array.isArray(existingHooks)) {
+        for (let index = 0; index < existingHooks.length; index += 1) {
+          const entry = existingHooks[index];
+          if (typeof entry === 'function') {
+            existingHooks[index] = toAsyncSafeSpineHookFn(entry as AnySpineHookFn, wrappedTasks);
+          }
+        }
+      }
+    }
+
+    contentHook.register = function (this: unknown, ...entries: unknown[]): void {
+      const wrappedEntries = entries.map((entry) => {
+        if (typeof entry === 'function') {
+          return toAsyncSafeSpineHookFn(entry as AnySpineHookFn, wrappedTasks);
+        }
+        if (Array.isArray(entry)) {
+          return entry.map((nested) =>
+            typeof nested === 'function'
+              ? toAsyncSafeSpineHookFn(nested as AnySpineHookFn, wrappedTasks)
+              : nested,
+          );
+        }
+        return entry;
+      });
+      (originalRegister as (...registerArgs: unknown[]) => void).apply(this, wrappedEntries);
+    } as EpubSpineContentHook['register'];
+
+    if (typeof contentHook.deregister === 'function') {
+      const originalDeregister = contentHook.deregister;
+      contentHook.deregister = function (this: unknown, fn: AnySpineHookFn): void {
+        for (const entry of sanitizers) {
+          if (fn === entry.rawTask || fn === entry.task) return;
+        }
+        originalDeregister.call(this, wrappedTasks.get(fn) ?? fn);
+      };
+    }
+
+    if (typeof contentHook.trigger === 'function') {
+      const originalTrigger = contentHook.trigger;
+      contentHook.trigger = async function (this: unknown, ...args: unknown[]): Promise<unknown> {
+        const activeSanitizers = [...sanitizers].filter((entry) => !entry.isAborted?.());
+        try {
+          if (typeof contentHook.list === 'function') {
+            const registered = contentHook.list();
+            for (const entry of activeSanitizers) {
+              if (!Array.isArray(registered) || !registered.includes(entry.task)) {
+                throw new Error('EPUB spine content sanitizer hook was removed before render.');
+              }
+            }
+          }
+          const result = await originalTrigger.apply(this, args);
+          const doc = args[0];
+          if (doc && typeof doc === 'object') {
+            for (const entry of activeSanitizers) {
+              if (!entry.isAborted?.() && !entry.sanitizedDocuments.has(doc as Document)) {
+                throw new Error(
+                  'EPUB spine content sanitizer did not complete before serialization.',
+                );
+              }
+            }
+          }
+          return result;
+        } catch (error) {
+          const normalized = normalizeError(error, 'EPUB spine content sanitizer failed.');
+          for (const entry of activeSanitizers) {
+            entry.onError?.(normalized);
+          }
+          throw normalized;
+        }
+      };
+    }
+  }
+
+  const sanitizedDocuments = options?.sanitizedDocuments ?? new WeakSet<Document>();
+  const sanitizeSpineContent = async (document: Document, section: SpineSection): Promise<void> => {
+    stripReservedEpubStyleIds(document);
+    await sanitizeEpubDocument(document, stylesheetCache, async (href, currentDocument) => {
+      if (options?.isAborted?.()) return null;
+      if (href.toLowerCase().startsWith('blob:')) {
+        return isSameOriginBlobUrl(href, currentDocument.baseURI)
+          ? loadLocalStylesheet(new URL(href), stylesheetCache)
+          : null;
+      }
+      const sectionPath = section?.url ?? section?.href;
+      if (book.archive?.getText && sectionPath) {
+        const sectionUrl = resolveArchiveUrl(sectionPath, '/');
+        const stylesheetUrl = sectionUrl ? resolveArchiveUrl(href, sectionUrl.pathname) : null;
+        if (!stylesheetUrl || !sectionUrl) return null;
+        return loadArchivedStylesheet(
+          book.archive,
+          stylesheetUrl.pathname,
+          archiveDirectoryOf(sectionUrl.pathname),
+          stylesheetCache,
+          currentDocument.baseURI,
+          options?.isAborted,
+        );
+      }
+      if (book.archived) return null;
+      if (isLocalContentUrl(href, currentDocument)) {
+        return loadLocalStylesheet(new URL(href, currentDocument.baseURI), stylesheetCache);
+      }
+      return null;
+    });
+    if (!options?.isAborted?.()) {
+      sanitizedDocuments.add(document);
+    }
+  };
+
+  const wrappedSanitize = toAsyncSafeSpineHookFn(
+    sanitizeSpineContent as AnySpineHookFn,
+    guard.wrappedTasks,
+  );
+  const registration: SpineSanitizerRegistration = {
+    task: wrappedSanitize,
+    rawTask: sanitizeSpineContent as AnySpineHookFn,
+    sanitizedDocuments,
+    isAborted: options?.isAborted,
+    onError: options?.onError,
+  };
+
+  try {
+    guard.originalRegister.call(
+      contentHook,
+      wrappedSanitize as (document: Document, section: SpineSection) => Promise<void>,
+    );
+    if (typeof contentHook.list === 'function') {
+      const registered = contentHook.list();
+      if (!Array.isArray(registered) || !registered.includes(wrappedSanitize)) {
+        throw new Error('EPUB spine content sanitizer hook failed to register.');
+      }
+    }
+  } catch (error) {
+    const normalized = normalizeError(
+      error,
+      'EPUB spine content sanitizer hook registration failed.',
+    );
+    options?.onError?.(normalized);
+    throw normalized;
+  }
+
+  guard.sanitizers.add(registration);
+  return { contentHook, hookTask: wrappedSanitize };
+}
+
+function observeSpineAssignment(book: object, onSpineChange: () => void): void {
+  let currentSpine = (book as { spine?: unknown }).spine;
+  try {
+    Object.defineProperty(book, 'spine', {
+      configurable: true,
+      enumerable: true,
+      get: () => currentSpine,
+      set: (nextSpine: unknown) => {
+        currentSpine = nextSpine;
+        onSpineChange();
+      },
+    });
+  } catch {
+    // Non-configurable mock properties are validated in assertSpineSanitizerReady().
+  }
 }
 
 export class ReaderSession {
   private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
-  private readonly sanitizationNonce = createSanitizationNonce();
-  private sanitizedResourcePaths: Promise<ReadonlySet<string>> | null = null;
+  private readonly sanitizedDocuments = new WeakSet<Document>();
+  private readonly patchedSpineHooks = new WeakMap<object, AnySpineHookFn>();
+  private readonly patchedSections = new WeakSet<object>();
+  private installedSpineContentHook: EpubSpineContentHook | null = null;
+  private installedSpineHookTask: AnySpineHookFn | null = null;
+  private spineSanitizerError: Error | null = null;
+  private rejectSpineSanitizerFailed: ((error: Error) => void) | null = null;
+  private readonly spineSanitizerFailedPromise: Promise<never>;
   private destroyed = false;
+  private bookDestroyed = false;
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
@@ -681,8 +1810,177 @@ export class ReaderSession {
     }
   };
 
-  constructor(private readonly bookUrl: string) {
-    this.book = ePub(bookUrl);
+  constructor(private readonly bookUrl: string | ArrayBuffer) {
+    this.spineSanitizerFailedPromise = new Promise<never>((_, reject) => {
+      this.rejectSpineSanitizerFailed = reject;
+    });
+    this.spineSanitizerFailedPromise.catch(() => {});
+
+    this.book = ePub(bookUrl as string);
+    const book = this.book as unknown as EpubBookLike & object;
+    this.installSpineSanitizer(book);
+    observeSpineAssignment(book, () => {
+      if (!this.destroyed) this.installSpineSanitizer(book);
+    });
+    void book.loaded?.spine?.then(
+      () => {
+        if (!this.destroyed) this.installSpineSanitizer(book);
+      },
+      () => {},
+    );
+  }
+
+  private recordSpineSanitizerFailure(error: unknown, abortSession: boolean): Error {
+    const normalized = normalizeError(
+      error,
+      'EPUB spine content sanitizer hook could not be installed.',
+    );
+    this.spineSanitizerError ??= normalized;
+    this.rejectSpineSanitizerFailed?.(this.spineSanitizerError);
+    if (abortSession) this.destroy();
+    return this.spineSanitizerError;
+  }
+
+  private installSpineSanitizerOnTarget(targetBook: EpubBookLike): {
+    contentHook: EpubSpineContentHook;
+    hookTask: AnySpineHookFn;
+  } | null {
+    const contentHook = targetBook.spine?.hooks?.content;
+    if (contentHook && typeof contentHook === 'object') {
+      const existingTask = this.patchedSpineHooks.get(contentHook);
+      if (existingTask) {
+        if (typeof contentHook.list === 'function') {
+          const registered = contentHook.list();
+          if (!Array.isArray(registered) || !registered.includes(existingTask)) {
+            this.recordSpineSanitizerFailure(
+              new Error('EPUB spine content sanitizer hook was cleared before render.'),
+              true,
+            );
+            return null;
+          }
+        }
+        return { contentHook, hookTask: existingTask };
+      }
+    }
+
+    try {
+      const installed = registerEpubSpineSanitizer(targetBook, this.stylesheetCache, {
+        isAborted: () => this.destroyed && this.spineSanitizerError === null,
+        sanitizedDocuments: this.sanitizedDocuments,
+        onError: (error) => {
+          this.recordSpineSanitizerFailure(error, false);
+        },
+      });
+      this.patchedSpineHooks.set(installed.contentHook, installed.hookTask);
+      return installed;
+    } catch (error) {
+      this.recordSpineSanitizerFailure(error, true);
+      return null;
+    }
+  }
+
+  private installSpineSanitizer(book: EpubBookLike): void {
+    const installed = this.installSpineSanitizerOnTarget(book);
+    if (!installed) return;
+    this.installedSpineContentHook = installed.contentHook;
+    this.installedSpineHookTask = installed.hookTask;
+  }
+
+  private guardSpineSections(book: EpubBookLike, explicitSections?: SpineSection[]): void {
+    const sections: SpineSection[] = explicitSections
+      ? [...explicitSections]
+      : Array.isArray(book.spine?.spineItems)
+        ? [...book.spine.spineItems]
+        : this.spine
+          ? [...this.spine.sections]
+          : [];
+
+    for (const section of sections) {
+      if (!section || typeof section !== 'object') continue;
+      if ('hooks' in section) {
+        const sectionHook = section.hooks?.content;
+        if (
+          !sectionHook ||
+          typeof sectionHook !== 'object' ||
+          typeof sectionHook.register !== 'function' ||
+          typeof sectionHook.trigger !== 'function'
+        ) {
+          throw this.recordSpineSanitizerFailure(
+            new Error('EPUB section content sanitizer hook is unavailable.'),
+            false,
+          );
+        }
+        if (sectionHook !== this.installedSpineContentHook) {
+          const sectionInstalled = this.installSpineSanitizerOnTarget({
+            archived: book.archived,
+            archive: book.archive,
+            spine: { hooks: section.hooks },
+          });
+          if (!sectionInstalled) {
+            throw (
+              this.spineSanitizerError ??
+              new Error('EPUB section content sanitizer hook could not be installed.')
+            );
+          }
+        }
+      }
+
+      if (typeof section.load === 'function' && !this.patchedSections.has(section)) {
+        this.patchedSections.add(section);
+        const originalLoad = section.load;
+        section.load = async (request) => {
+          this.assertSpineSanitizerReady();
+          const loaded = await originalLoad.call(section, request);
+          const sectionDoc = section.document;
+          const abortedCleanly = this.destroyed && this.spineSanitizerError === null;
+          if (
+            !abortedCleanly &&
+            (sectionDoc !== undefined || 'hooks' in section) &&
+            (!sectionDoc || !this.sanitizedDocuments.has(sectionDoc))
+          ) {
+            throw this.recordSpineSanitizerFailure(
+              new Error('EPUB chapter was not sanitized before serialization.'),
+              false,
+            );
+          }
+          return loaded;
+        };
+      }
+    }
+  }
+
+  private assertSpineSanitizerReady(): void {
+    if (this.spineSanitizerError) {
+      throw this.spineSanitizerError;
+    }
+    const book = this.book as unknown as EpubBookLike;
+    const contentHook = book.spine?.hooks?.content;
+    if (
+      !contentHook ||
+      typeof contentHook !== 'object' ||
+      contentHook !== this.installedSpineContentHook ||
+      typeof contentHook.register !== 'function' ||
+      (contentHook.trigger !== undefined && typeof contentHook.trigger !== 'function')
+    ) {
+      throw this.recordSpineSanitizerFailure(
+        new Error('EPUB spine content sanitizer hook is unavailable.'),
+        false,
+      );
+    }
+    if (typeof contentHook.list === 'function') {
+      const registered = contentHook.list();
+      if (
+        !Array.isArray(registered) ||
+        !this.installedSpineHookTask ||
+        !registered.includes(this.installedSpineHookTask)
+      ) {
+        throw this.recordSpineSanitizerFailure(
+          new Error('EPUB spine content sanitizer hook was removed before render.'),
+          false,
+        );
+      }
+    }
+    this.guardSpineSections(book);
   }
 
   async open(
@@ -700,7 +1998,41 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
-    this.destroyed = false;
+    try {
+      await this.openSession(
+        target,
+        cfi,
+        serverXPath,
+        serverPercentage,
+        appearance,
+        onLocation,
+        onTap,
+        onSelection,
+        onKeyboardNavigation,
+      );
+    } catch (error) {
+      this.destroy();
+      throw error;
+    }
+  }
+
+  private async openSession(
+    target: HTMLElement,
+    cfi: string | null,
+    serverXPath: string | null,
+    serverPercentage: number | null,
+    appearance: Appearance,
+    onLocation: (
+      location: ReaderLocation,
+      origin: ReaderLocationOrigin,
+      returnTarget?: ReaderLinkReturnTarget,
+    ) => void,
+    onTap: (zone: 'previous' | 'center' | 'next') => void,
+    onSelection?: (selection: ReaderSelection | null) => void,
+    onKeyboardNavigation?: (event: KeyboardEvent) => void,
+  ): Promise<void> {
+    this.assertSpineSanitizerReady();
+    if (this.destroyed) return;
     this.viewportTarget = target;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -713,11 +2045,6 @@ export class ReaderSession {
     });
     this.observeViewport(target);
     this.bindEpubContainer();
-    const internalBook = this.book as typeof this.book & InternalBook;
-    internalBook.spine?.hooks?.content?.register(
-      (document: Document, section?: SpineSection & { url?: string }) =>
-        this.hardenSpineDocument(document, section),
-    );
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
     if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
       this.unloadedHookRegistered = true;
@@ -877,15 +2204,16 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
+    await Promise.race([this.rendition.started, this.spineSanitizerFailedPromise]);
+    this.assertSpineSanitizerReady();
     this.bindEpubContainer();
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    await this.ensureResourcesSanitized();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-      } catch {
+      } catch (error) {
+        if (this.spineSanitizerError) throw this.spineSanitizerError;
+        void error;
         // A saved CFI can name a section removed in a newer copy of the EPUB.
       }
     }
@@ -1059,6 +2387,7 @@ export class ReaderSession {
   }
 
   async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
+    this.assertSpineSanitizerReady();
     const normalizedQuery = normalizeReaderSearchQuery(query);
     if (!normalizedQuery) return [];
     const results: ReaderSearchResult[] = [];
@@ -1237,25 +2566,38 @@ export class ReaderSession {
     this.highlightCfis.clear();
     this.reflowPending = false;
     this.spine = null;
-    this.sanitizedResourcePaths = null;
-    // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
-    const book = this.book as typeof this.book & InternalBook;
-    const urls = new Set([
-      ...Object.values(book.archive?.urlCache ?? {}),
-      ...(book.resources?.replacementUrls ?? []),
-    ]);
-    for (const entry of this.stylesheetCache.values()) {
-      entry.revoked = true;
-      if (entry.blobUrl) {
-        urls.add(entry.blobUrl);
-        entry.blobUrl = null;
-      }
-    }
     this.stylesheetCache.clear();
-    for (const url of urls) {
-      if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+    // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
+    const book = this.book as unknown as EpubBookLike & { destroy?: () => void };
+    const revokeBookBlobs = () => {
+      const urls = new Set([
+        ...Object.values(book.archive?.urlCache ?? {}),
+        ...(book.resources?.replacementUrls ?? []),
+      ]);
+      for (const url of urls) {
+        if (url?.startsWith('blob:')) URL.revokeObjectURL(url);
+      }
+    };
+    const finalizeBookDestroy = () => {
+      if (this.bookDestroyed) return;
+      this.bookDestroyed = true;
+      revokeBookBlobs();
+      try {
+        book.destroy?.();
+      } catch {
+        // Ignore teardown errors when epub.js hooks were absent or partially initialized.
+      }
+    };
+    revokeBookBlobs();
+    const hasPendingUnpack =
+      (typeof this.bookUrl === 'string' ? this.bookUrl.length > 0 : true) &&
+      !book.isOpen &&
+      typeof book.opened?.then === 'function';
+    if (hasPendingUnpack) {
+      void book.opened!.then(finalizeBookDestroy, finalizeBookDestroy);
+    } else {
+      finalizeBookDestroy();
     }
-    this.book.destroy();
   }
 
   private async prepareContents(contents: Contents): Promise<void> {
@@ -1264,108 +2606,12 @@ export class ReaderSession {
     this.syncVisibleColumnLinks();
   }
 
-  private harden(contents: Contents): Promise<void> {
-    if (
-      contents.document.documentElement?.getAttribute(SANITIZED_NONCE_ATTRIBUTE) ===
-      this.sanitizationNonce
-    ) {
-      return Promise.resolve();
+  private async harden(contents: Contents): Promise<void> {
+    if (this.sanitizedDocuments.has(contents.document)) return;
+    await sanitizeEpubDocument(contents.document, this.stylesheetCache);
+    if (!this.destroyed) {
+      this.sanitizedDocuments.add(contents.document);
     }
-    return sanitizeEpubDocument(contents.document, this.stylesheetCache, {
-      nonce: this.sanitizationNonce,
-    });
-  }
-
-  private async hardenSpineDocument(
-    document: Document,
-    section?: SpineSection & { url?: string },
-  ): Promise<void> {
-    const internalBook = this.book as typeof this.book & InternalBook;
-    const preservedStylesheetPaths = await this.ensureResourcesSanitized();
-    return sanitizeEpubDocument(document, this.stylesheetCache, {
-      nonce: this.sanitizationNonce,
-      archived: Boolean(internalBook.archived),
-      preservedStylesheetPaths,
-      sectionUrl: section?.url ?? section?.href,
-    });
-  }
-
-  private ensureResourcesSanitized(): Promise<ReadonlySet<string>> {
-    this.sanitizedResourcePaths ??= this.sanitizeBookResources();
-    return this.sanitizedResourcePaths;
-  }
-
-  private async sanitizeBookResources(): Promise<ReadonlySet<string>> {
-    const paths = new Set<string>();
-    const internalBook = this.book as typeof this.book & InternalBook;
-    const resources = internalBook.resources;
-    if (!resources?.urls || !resources.cssUrls || !resources.replacementUrls?.length) {
-      return paths;
-    }
-    const resolver =
-      resources.settings?.resolver ??
-      (typeof internalBook.resolve === 'function'
-        ? (href: string) => internalBook.resolve!(href, true)
-        : undefined);
-
-    await Promise.all(
-      resources.cssUrls.map(async (cssHref) => {
-        const index = resources.urls!.indexOf(cssHref);
-        if (index < 0) return;
-        const currentUrl = resources.replacementUrls![index];
-        if (!currentUrl) return;
-
-        const canonicalHref = resolver ? resolver(cssHref) : cssHref;
-        let rawCss: string | null = null;
-        if (typeof internalBook.archive?.getText === 'function') {
-          try {
-            const archiveText = await internalBook.archive.getText(canonicalHref);
-            if (typeof archiveText === 'string') {
-              rawCss =
-                typeof resources.substitute === 'function'
-                  ? resources.substitute(archiveText, canonicalHref)
-                  : archiveText;
-            }
-          } catch {
-            rawCss = null;
-          }
-        }
-        if (rawCss === null) {
-          if (/^data:/i.test(currentUrl)) {
-            rawCss = decodeDataStylesheet(currentUrl);
-          } else if (currentUrl.startsWith('blob:')) {
-            try {
-              const response = await fetch(currentUrl);
-              rawCss = response.ok ? await response.text() : null;
-            } catch {
-              rawCss = null;
-            }
-          }
-        }
-        if (rawCss === null) {
-          if (currentUrl.startsWith('blob:')) URL.revokeObjectURL(currentUrl);
-          resources.replacementUrls![index] = '';
-          return;
-        }
-
-        const sanitized = sanitizeCss(rawCss);
-        if (this.destroyed) return;
-
-        if (sanitized !== rawCss || !currentUrl.startsWith('blob:')) {
-          const nextBlobUrl = URL.createObjectURL(new Blob([sanitized], { type: 'text/css' }));
-          if (this.destroyed) {
-            URL.revokeObjectURL(nextBlobUrl);
-            return;
-          }
-          if (currentUrl.startsWith('blob:')) URL.revokeObjectURL(currentUrl);
-          resources.replacementUrls![index] = nextBlobUrl;
-        }
-
-        const canonicalPath = resolveArchivePath(canonicalHref);
-        if (canonicalPath) paths.add(canonicalPath);
-      }),
-    );
-    return paths;
   }
 
   private addContentCleanup(contents: Contents, cleanup: () => void): void {
@@ -1506,10 +2752,36 @@ export class ReaderSession {
   }
 
   private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.assertSpineSanitizerReady();
     this.displayOperationCount += 1;
+    const rendition = this.rendition as
+      | (Rendition & {
+          on?: (event: string, handler: (error: unknown) => void) => void;
+          off?: (event: string, handler: (error: unknown) => void) => void;
+        })
+      | null;
+    let displayErrorListener: ((error: unknown) => void) | null = null;
+    const displayErrorPromise = new Promise<never>((_, reject) => {
+      displayErrorListener = (error: unknown) => {
+        reject(normalizeError(error, 'EPUB section display failed.'));
+      };
+    });
+    displayErrorPromise.catch(() => {});
+    if (displayErrorListener && typeof rendition?.on === 'function') {
+      rendition.on('displayerror', displayErrorListener);
+    }
     try {
-      return await operation();
+      const result = await Promise.race([
+        operation(),
+        displayErrorPromise,
+        this.spineSanitizerFailedPromise,
+      ]);
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
+      return result;
     } finally {
+      if (displayErrorListener && typeof rendition?.off === 'function') {
+        rendition.off('displayerror', displayErrorListener);
+      }
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
@@ -1770,7 +3042,9 @@ export class ReaderSession {
       if (!(contents.range(cfi) as Range | null)) return false;
       await this.runDisplayOperation(() => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation);
-    } catch {
+    } catch (error) {
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
+      void error;
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
     }
@@ -1800,7 +3074,9 @@ export class ReaderSession {
     if (!section) return false;
     try {
       return await this.displayAtGeneration(section.href, generation);
-    } catch {
+    } catch (error) {
+      if (this.spineSanitizerError) throw this.spineSanitizerError;
+      void error;
       return false;
     }
   }
@@ -1863,6 +3139,7 @@ export class ReaderSession {
       sections.push(section);
       spineHrefs.push(section.href);
     });
+    this.guardSpineSections(this.book as unknown as EpubBookLike, sections);
     const hrefs = createSpineHrefLookup(spineHrefs);
     this.spine = { sections, indexes, hrefs };
     return this.spine;

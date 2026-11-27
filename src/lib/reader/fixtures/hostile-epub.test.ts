@@ -1,16 +1,81 @@
 // @vitest-environment jsdom
 
-import { resolveObjectURL } from 'node:buffer';
+import JSZip from 'jszip';
 import type { Contents, Rendition } from 'epubjs';
 import { afterEach, expect, it, vi } from 'vitest';
 import { defaultAppearance } from '../appearance';
-import { ReaderSession, sanitizeEpubDocument, type StylesheetCache } from '../session';
+import {
+  EPUB_CONTENT_SECURITY_POLICY,
+  ReaderSession,
+  registerEpubSpineSanitizer,
+  sanitizeCss,
+  sanitizeEpubDocument,
+  type EpubBookLike,
+  type StylesheetCache,
+} from '../session';
 import fixture from './hostile-epub.xhtml?raw';
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+
+async function buildPackagedEpub(options: {
+  chapters: Array<{ href: string; xhtml: string }>;
+  stylesheets?: Record<string, string>;
+}): Promise<ArrayBuffer> {
+  const zip = new JSZip();
+  zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
+  zip.file(
+    'META-INF/container.xml',
+    `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml" />
+  </rootfiles>
+</container>`,
+  );
+
+  const stylesheets = options.stylesheets ?? {};
+  const manifestItems = [
+    ...options.chapters.map(
+      (chapter, index) =>
+        `<item id="ch-${index}" href="${chapter.href}" media-type="application/xhtml+xml" />`,
+    ),
+    ...Object.keys(stylesheets).map(
+      (href, index) => `<item id="css-${index}" href="${href}" media-type="text/css" />`,
+    ),
+  ].join('\n    ');
+  const spineRefs = options.chapters
+    .map((_, index) => `<itemref idref="ch-${index}" />`)
+    .join('\n    ');
+
+  zip.file(
+    'OEBPS/content.opf',
+    `<?xml version="1.0" encoding="UTF-8"?>
+<package version="3.0" unique-identifier="book-id" xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="book-id">urn:uuid:hostile-epub-test</dc:identifier>
+    <dc:title>Hostile EPUB Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    ${manifestItems}
+  </manifest>
+  <spine>
+    ${spineRefs}
+  </spine>
+</package>`,
+  );
+
+  for (const chapter of options.chapters) {
+    zip.file(`OEBPS/${chapter.href}`, chapter.xhtml);
+  }
+  for (const [href, css] of Object.entries(stylesheets)) {
+    zip.file(`OEBPS/${href}`, css);
+  }
+  return zip.generateAsync({ type: 'arraybuffer' });
+}
 
 it('keeps local EPUB content while removing network and executable references', async () => {
   const document = new DOMParser().parseFromString(fixture, 'application/xhtml+xml');
@@ -21,7 +86,7 @@ it('keeps local EPUB content while removing network and executable references', 
   expect(document.querySelector('script, iframe, form, meta[http-equiv="refresh"]')).toBeNull();
   expect(
     document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content'),
-  ).toContain("connect-src 'none'");
+  ).toBe(EPUB_CONTENT_SECURITY_POLICY);
   expect(document.body?.getAttribute('onload')).toBeNull();
   expect(document.querySelector('#internal')?.getAttribute('href')).toBe('chapter-2.xhtml#section');
   expect(document.querySelector('#fragment')?.getAttribute('href')).toBe('#section');
@@ -46,7 +111,7 @@ it('keeps local EPUB content while removing network and executable references', 
   expect(document.querySelector('style')?.textContent).not.toContain('attacker.example');
 });
 
-it('sanitizes a local stylesheet into a shared blob link while keeping links attached until ready', async () => {
+it('detaches local stylesheet links before fetch, inlines nested @import rules, and deduplicates cached CSS across chapters', async () => {
   const chapter = () =>
     new DOMParser().parseFromString(
       '<html><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/book.css" /><link rel="stylesheet" href="styles/book.css" /></head><body /></html>',
@@ -55,15 +120,26 @@ it('sanitizes a local stylesheet into a shared blob link while keeping links att
   const document = chapter();
   const anotherChapter = chapter();
   const stylesheetCache: StylesheetCache = new Map();
-  let resolveFetch: ((response: Response) => void) | undefined;
+  let resolveBookCss: ((response: Response) => void) | undefined;
   vi.stubGlobal(
     'fetch',
-    vi.fn(
-      () =>
-        new Promise<Response>((resolve) => {
-          resolveFetch = resolve;
-        }),
-    ),
+    vi.fn((input: URL | RequestInfo) => {
+      const href = input instanceof URL ? input.href : String(input);
+      if (href.endsWith('/styles/book.css')) {
+        return new Promise<Response>((resolve) => {
+          resolveBookCss = resolve;
+        });
+      }
+      if (href.endsWith('/styles/typography.css')) {
+        return Promise.resolve(
+          new Response(
+            '@import "book.css"; body { font-family: Georgia, serif; background: url(https://attacker.example/nested); }',
+            { status: 200, headers: { 'content-type': 'text/css' } },
+          ),
+        );
+      }
+      return Promise.resolve(new Response('', { status: 404 }));
+    }),
   );
 
   const sanitizing = Promise.all([
@@ -73,14 +149,12 @@ it('sanitizes a local stylesheet into a shared blob link while keeping links att
 
   expect(
     document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content'),
-  ).toContain("style-src 'self' 'unsafe-inline' data: blob:");
-  expect(document.querySelectorAll('link[rel="stylesheet"][href="styles/book.css"]')).toHaveLength(
-    2,
-  );
+  ).toBe(EPUB_CONTENT_SECURITY_POLICY);
+  expect(document.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(0);
 
-  resolveFetch?.(
+  resolveBookCss?.(
     new Response(
-      '@import "typography.css"; @import url("https://attacker.example/remote.css"); .cover { background: url(../Images/cover.jpg); } .remote { background: url(https://attacker.example/pixel); }',
+      '@import "typography.css" screen; @import url("https://attacker.example/remote.css"); .cover { background: url(../Images/cover.jpg); } .remote { background: url(https://attacker.example/pixel); }',
       {
         status: 200,
         headers: { 'content-type': 'text/css' },
@@ -89,44 +163,57 @@ it('sanitizes a local stylesheet into a shared blob link while keeping links att
   );
   await sanitizing;
 
-  expect(fetch).toHaveBeenCalledOnce();
-  expect(document.querySelectorAll('style')).toHaveLength(0);
-  expect(anotherChapter.querySelectorAll('style')).toHaveLength(0);
-  expect(document.querySelector('base')?.getAttribute('href')).toContain('localhost');
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(document.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(0);
+  expect(document.querySelectorAll('style')).toHaveLength(2);
+  expect(anotherChapter.querySelectorAll('style')).toHaveLength(2);
 
-  const links = [
-    ...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]'),
-    ...anotherChapter.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]'),
-  ];
-  expect(links).toHaveLength(4);
-  const sharedHref = links[0]?.getAttribute('href') ?? '';
-  expect(sharedHref).toMatch(/^blob:/);
-  for (const link of links) {
-    expect(link.getAttribute('href')).toBe(sharedHref);
-  }
-
-  const blobText = await resolveObjectURL(sharedHref)?.text();
-  expect(blobText).toContain(
-    '@import "http://localhost/_capacitor_file/books/book.epub/OEBPS/styles/typography.css";',
-  );
-  expect(blobText).toContain(
+  const inlinedCss = document.querySelector('style')?.textContent ?? '';
+  expect(inlinedCss).toContain('@media screen');
+  expect(inlinedCss).toContain('font-family: Georgia, serif');
+  expect(inlinedCss).toContain(
     'url("http://localhost/_capacitor_file/books/book.epub/OEBPS/Images/cover.jpg")',
   );
-  expect(blobText).not.toContain('attacker.example');
-
-  const requested = vi.mocked(fetch).mock.calls[0]?.[0];
-  expect(requested instanceof URL ? requested.href : requested).toBe(
-    'http://localhost/_capacitor_file/books/book.epub/OEBPS/styles/book.css',
-  );
-  URL.revokeObjectURL(sharedHref);
+  expect(inlinedCss).not.toContain('@import');
+  expect(inlinedCss).not.toContain('attacker.example');
+  expect(anotherChapter.querySelector('style')?.textContent).toBe(inlinedCss);
 });
 
-it('preserves RFC 2045 wrapped data:image and data:font assets while rejecting SVG data URIs', async () => {
+it('normalizes CSS hex escapes, comments, image-set, and legacy expression() tokens while keeping plain CSS on the fast path', () => {
+  const plain = 'p { margin: 0; text-indent: 1.5em; font-style: italic; }';
+  expect(sanitizeCss(plain)).toBe(plain);
+
+  const obfuscated = sanitizeCss(`
+    @\\69 mport "https://attacker.example/escaped.css";
+    .escaped-fn { background-image: \\75 rl("ht\\74ps\\3a //attacker.example/exfil.png"); }
+    .escaped-safe { background-image: \\75 rl("../Images/safe.png"); }
+    .set {
+      background-image: image-set(
+        "https://attacker.example/1x.png" 1x,
+        "../Images/cover-2x.png" 2x
+      );
+    }
+    .legacy { width: expression(alert(1)); }
+    .breakout::after { content: "</style><img src=x onerror=alert(1)>"; }
+    /* https://attacker.example/comment */
+  `);
+
+  expect(obfuscated).not.toContain('attacker.example');
+  expect(obfuscated).not.toContain('</style>');
+  expect(obfuscated).toContain('\\3c /style>');
+  expect(obfuscated).not.toContain('@import');
+  expect(obfuscated).not.toContain('expression(');
+  expect(obfuscated).toContain('url("../Images/safe.png")');
+  expect(obfuscated).toContain('image-set(url("../Images/cover-2x.png") 2x)');
+});
+
+it('preserves RFC 2045 wrapped data:image and data:font assets while rejecting SVG data URIs and skipping unchanged style mutations', async () => {
   const pngLine1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YA';
   const pngLine2 = 'AAAASUVORK5CYII=';
   const wrappedPng = `data:image/png;base64,${pngLine1}\r\n${pngLine2}`;
   const xmlWrappedPng = `data:image/png;base64,${pngLine1}&#13;&#10;${pngLine2}`;
-  const wrappedFont = `data:font/woff2;base64,${'d09GMgABAAAAAAK8AA0AAAAABbQAAActAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGhYbgcg='}\r\n${'PAr4GYACCahEICo1oATYCJAMUBCAFhG4HbBv8Z8S8xZ4A'}`;
+  const cssContinuedFont = `data:font/woff2;base64,${'d09GMgABAAAAAAK8AA0AAAAABbQAAActAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGhYbgcg='}\\\r\n${'PAr4GYACCahEICo1oATYCJAMUBCAFhG4HbBv8Z8S8xZ4A'}`;
+  const spacedPng = `data:image/png;base64,${pngLine1} ${pngLine2}`;
   const document = new DOMParser().parseFromString(
     `<html xmlns="http://www.w3.org/1999/xhtml" data-turnleaf-sanitized="forged">
       <head>
@@ -134,12 +221,12 @@ it('preserves RFC 2045 wrapped data:image and data:font assets while rejecting S
           @font-face {
             font-family: "EmbeddedSerif";
             src: url(
-              "${wrappedFont}"
+              "${cssContinuedFont}"
             ) format("woff2");
           }
           .banner {
             background-image: url(
-              '${wrappedPng}'
+              '${spacedPng}'
             );
           }
           .tracking {
@@ -184,47 +271,151 @@ it('preserves RFC 2045 wrapped data:image and data:font assets while rejecting S
   );
 });
 
-it('revokes evicted stylesheet blobs when cache capacity is exceeded', async () => {
+it('evicts least-recently-used stylesheets past 32 entries without breaking styles in active chapters', async () => {
   const stylesheetCache: StylesheetCache = new Map();
-  const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(
-      async (input: URL | RequestInfo) =>
-        new Response(`.sheet { content: "${String(input)}"; }`, {
-          status: 200,
-          headers: { 'content-type': 'text/css' },
-        }),
-    ),
+  const fetchSpy = vi.fn(
+    async (input: URL | RequestInfo) =>
+      new Response(`.sheet { content: "${String(input)}"; }`, {
+        status: 200,
+        headers: { 'content-type': 'text/css' },
+      }),
   );
+  vi.stubGlobal('fetch', fetchSpy);
 
-  const createdBlobs: string[] = [];
-  for (let index = 0; index < 33; index += 1) {
-    const doc = new DOMParser().parseFromString(
+  const chapterFor = (index: number) =>
+    new DOMParser().parseFromString(
       `<html><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/sheet-${index}.css" /></head><body /></html>`,
       'application/xhtml+xml',
     );
-    await sanitizeEpubDocument(doc, stylesheetCache);
-    createdBlobs.push(doc.querySelector('link[rel="stylesheet"]')?.getAttribute('href') ?? '');
-  }
 
+  const activeChapterZero = chapterFor(0);
+  await sanitizeEpubDocument(activeChapterZero, stylesheetCache);
+  for (let index = 1; index < 32; index += 1) {
+    await sanitizeEpubDocument(chapterFor(index), stylesheetCache);
+  }
+  // Touch sheet-0 so sheet-1 becomes the least-recently-used entry.
+  await sanitizeEpubDocument(chapterFor(0), stylesheetCache);
+  expect(fetchSpy).toHaveBeenCalledTimes(32);
+
+  // Loading sheet-32 evicts sheet-1 while keeping sheet-0 cached and activeChapterZero intact.
+  await sanitizeEpubDocument(chapterFor(32), stylesheetCache);
   expect(stylesheetCache.size).toBe(32);
-  expect(revokeSpy).toHaveBeenCalledWith(createdBlobs[0]);
-  for (const url of createdBlobs.slice(1)) {
-    if (url.startsWith('blob:')) URL.revokeObjectURL(url);
+  expect(activeChapterZero.querySelector('style')?.textContent).toContain('sheet-0.css');
+
+  await sanitizeEpubDocument(chapterFor(0), stylesheetCache);
+  expect(fetchSpy).toHaveBeenCalledTimes(33);
+
+  await sanitizeEpubDocument(chapterFor(1), stylesheetCache);
+  expect(fetchSpy).toHaveBeenCalledTimes(34);
+});
+
+it('fails closed when the epub.js pre-serialization spine content hook is absent or removed', async () => {
+  expect(() => registerEpubSpineSanitizer({} as EpubBookLike)).toThrow(
+    /spine content sanitizer hook is unavailable/i,
+  );
+  expect(() => registerEpubSpineSanitizer({ spine: {} } as EpubBookLike)).toThrow(
+    /spine content sanitizer hook is unavailable/i,
+  );
+  expect(() =>
+    registerEpubSpineSanitizer({
+      spine: { hooks: { content: {} } },
+    } as EpubBookLike),
+  ).toThrow(/spine content sanitizer hook is unavailable/i);
+
+  const epubBytes = await buildPackagedEpub({
+    chapters: [
+      {
+        href: 'Text/chapter-1.xhtml',
+        xhtml: `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><link rel="stylesheet" href="https://attacker.example/leak.css" /></head>
+  <body><script>window.__pwned = true;</script><p>Hostile chapter</p></body>
+</html>`,
+      },
+    ],
+  });
+
+  const serializeSpy = vi.spyOn(XMLSerializer.prototype, 'serializeToString');
+  const viewport = globalThis.document.createElement('div');
+  globalThis.document.body.appendChild(viewport);
+
+  try {
+    for (const removeHook of [
+      (book: { spine: { hooks?: { content?: unknown } | undefined } }) => {
+        if (book.spine.hooks) book.spine.hooks.content = undefined;
+      },
+      (book: { spine: { hooks?: { content?: unknown } | undefined } }) => {
+        book.spine.hooks = undefined;
+      },
+    ]) {
+      const session = new ReaderSession(epubBytes);
+      const internalBook = (
+        session as unknown as { book: { spine: { hooks?: { content?: unknown } | undefined } } }
+      ).book;
+      removeHook(internalBook);
+
+      await expect(
+        session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+      ).rejects.toThrow(/spine content sanitizer hook is unavailable/i);
+      await expect(session.search('Hostile')).rejects.toThrow(
+        /spine content sanitizer hook is unavailable/i,
+      );
+    }
+
+    // Simulate epub.js returning a Book without spine.hooks.content to new ReaderSession().
+    const ePub = (await import('epubjs')).default;
+    const sampleBook = ePub('');
+    const bookProto = Object.getPrototypeOf(sampleBook) as object;
+    let capturedSpine: { hooks?: { content?: unknown } } | undefined;
+    Object.defineProperty(bookProto, 'spine', {
+      configurable: true,
+      get: () => capturedSpine,
+      set: (next: { hooks?: { content?: unknown } } | undefined) => {
+        if (next?.hooks) next.hooks.content = undefined;
+        capturedSpine = next;
+      },
+    });
+    let constructedWithoutHook: ReaderSession;
+    try {
+      constructedWithoutHook = new ReaderSession(epubBytes);
+    } finally {
+      delete (bookProto as { spine?: unknown }).spine;
+      sampleBook.destroy();
+    }
+
+    await expect(
+      constructedWithoutHook.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+    ).rejects.toThrow(/spine content sanitizer hook is unavailable/i);
+
+    // Also verify synchronous throws inside spine.hooks.content fail closed instead of being swallowed by epub.js Hook.trigger.
+    const throwingSession = new ReaderSession(epubBytes);
+    const throwingBook = (
+      throwingSession as unknown as {
+        book: { spine: { hooks: { content: { register: (fn: () => void) => void } } } };
+      }
+    ).book;
+    throwingBook.spine.hooks.content.register(() => {
+      throw new Error('Injected synchronous spine hook failure');
+    });
+
+    await expect(
+      throwingSession.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn()),
+    ).rejects.toThrow(/Injected synchronous spine hook failure/i);
+
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(viewport.querySelectorAll('iframe')).toHaveLength(0);
+  } finally {
+    viewport.remove();
   }
 });
 
-it('hardens chapters in spine.hooks.content, skips sanitized documents in rendition.hooks.content, and revokes blobs on destroy', async () => {
-  const unsanitizedArchiveCssBlob = URL.createObjectURL(
-    new Blob(
-      [
-        '.cover { background: url(blob:http://localhost/cover-asset); } .evil { background: url(https://attacker.example/leak); }',
-      ],
-      { type: 'text/css' },
-    ),
-  );
-  const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
+it('sanitizes archived chapters pre-serialization via registerEpubSpineSanitizer and caches shared stylesheets across chapters', async () => {
+  const getTextSpy = vi.fn(async (path: string) => {
+    if (path === '/OEBPS/Styles/book.css') {
+      return '.cover { background: url(../Images/cover.jpg); } .evil { background: url(https://attacker.example/leak); }';
+    }
+    return '';
+  });
 
   const session = new ReaderSession('');
   const renditionHooks: Array<(contents: Contents) => Promise<void> | void> = [];
@@ -250,16 +441,12 @@ it('hardens chapters in spine.hooks.content, skips sanitized documents in rendit
     session as unknown as {
       book: {
         archived: boolean;
-        archive: { getText: (url: string) => Promise<string>; destroy: () => void };
-        renderTo: () => Rendition;
-        resources: {
-          urls: string[];
-          cssUrls: string[];
-          replacementUrls: string[];
-          settings: { resolver: (href: string) => string };
-          substitute: (content: string) => string;
+        archive: {
+          urlCache: Record<string, string>;
+          getText: (url: string) => Promise<string>;
           destroy: () => void;
         };
+        renderTo: () => Rendition;
         spine: {
           hooks: {
             content: {
@@ -274,39 +461,19 @@ it('hardens chapters in spine.hooks.content, skips sanitized documents in rendit
     }
   ).book;
 
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async (input: URL | RequestInfo) => {
-      const href = String(input);
-      if (href.startsWith('blob:')) throw new TypeError('CSP connect-src blocks blob: fetch');
-      return new Response('body { color: inherit; }', {
-        status: 200,
-        headers: { 'content-type': 'text/css' },
-      });
-    }),
-  );
+  const coverBlobUrl = URL.createObjectURL(new Blob(['cover'], { type: 'image/jpeg' }));
+  const revokeSpy = vi.spyOn(URL, 'revokeObjectURL');
 
   internalBook.archived = true;
   internalBook.archive = {
-    getText: vi.fn(
-      async () =>
-        '.cover { background: url(../Images/cover.jpg); } .evil { background: url(https://attacker.example/leak); }',
-    ),
-    destroy: vi.fn(),
-  };
-  internalBook.resources = {
-    urls: ['Styles/book.css'],
-    cssUrls: ['Styles/book.css'],
-    replacementUrls: [unsanitizedArchiveCssBlob],
-    settings: { resolver: (href: string) => `/OEBPS/${href}` },
-    substitute: (content: string) =>
-      content.replace('../Images/cover.jpg', 'blob:http://localhost/cover-asset'),
+    urlCache: { '/OEBPS/Images/cover.jpg': coverBlobUrl },
+    getText: getTextSpy,
     destroy: vi.fn(),
   };
   internalBook.renderTo = vi.fn(() => mockRendition);
 
   await session.open(
-    document.createElement('div'),
+    globalThis.document.createElement('div'),
     null,
     null,
     null,
@@ -315,73 +482,51 @@ it('hardens chapters in spine.hooks.content, skips sanitized documents in rendit
     vi.fn(),
   );
 
-  const sanitizedArchiveCssBlob = internalBook.resources.replacementUrls[0] ?? '';
-  expect(sanitizedArchiveCssBlob).toMatch(/^blob:/);
-  expect(sanitizedArchiveCssBlob).not.toBe(unsanitizedArchiveCssBlob);
-  expect(revokeSpy).toHaveBeenCalledWith(unsanitizedArchiveCssBlob);
-  const sanitizedArchiveCss = await resolveObjectURL(sanitizedArchiveCssBlob)?.text();
-  expect(sanitizedArchiveCss).toContain('blob:http://localhost/cover-asset');
-  expect(sanitizedArchiveCss).not.toContain('attacker.example');
+  const makeChapter = (title: string) =>
+    new DOMParser().parseFromString(
+      `<html xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+          <link rel="stylesheet" href="../Styles/book.css" />
+          <link rel="stylesheet" href="https://attacker.example/remote.css" />
+        </head>
+        <body onclick="alert(1)">
+          <script>alert(1)</script>
+          <p>${title}</p>
+        </body>
+      </html>`,
+      'application/xhtml+xml',
+    );
 
-  const spineChapter = new DOMParser().parseFromString(
-    `<html xmlns="http://www.w3.org/1999/xhtml" data-turnleaf-sanitized="forged-nonce">
-      <head>
-        <link rel="stylesheet" href="../Styles/book.css" />
-        <link rel="stylesheet" href="../Styles/missing.css" />
-      </head>
-      <body onclick="alert(1)">
-        <script>alert(1)</script>
-        <p>Chapter text</p>
-      </body>
-    </html>`,
-    'application/xhtml+xml',
-  );
+  const chapterOne = makeChapter('Chapter One');
+  const chapterTwo = makeChapter('Chapter Two');
 
-  await internalBook.spine.hooks.content.trigger(spineChapter, {
+  await internalBook.spine.hooks.content.trigger(chapterOne, {
     href: 'Text/chapter-1.xhtml',
     url: '/OEBPS/Text/chapter-1.xhtml',
     idref: 'chapter-1',
   });
+  await internalBook.spine.hooks.content.trigger(chapterTwo, {
+    href: 'Text/chapter-2.xhtml',
+    url: '/OEBPS/Text/chapter-2.xhtml',
+    idref: 'chapter-2',
+  });
 
-  const nonce = spineChapter.documentElement.getAttribute('data-turnleaf-sanitized');
-  expect(nonce).toBeTruthy();
-  expect(nonce).not.toBe('forged-nonce');
-  expect(spineChapter.querySelector('script')).toBeNull();
-  expect(spineChapter.body?.getAttribute('onclick')).toBeNull();
-  expect(spineChapter.querySelector('link[href="../Styles/book.css"]')).not.toBeNull();
-  expect(spineChapter.querySelector('link[href="../Styles/missing.css"]')).toBeNull();
+  // Both chapters in /OEBPS/Text/ share the cached sanitized stylesheet without re-reading archive.getText.
+  expect(getTextSpy).toHaveBeenCalledOnce();
+  expect(chapterOne.querySelector('script')).toBeNull();
+  expect(chapterOne.body?.getAttribute('onclick')).toBeNull();
+  expect(chapterOne.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(0);
+  expect(chapterOne.querySelector('style')?.textContent).toContain(coverBlobUrl);
+  expect(chapterOne.querySelector('style')?.textContent).not.toContain('attacker.example');
+  expect(chapterTwo.querySelector('style')?.textContent).toBe(
+    chapterOne.querySelector('style')?.textContent,
+  );
 
-  // Simulate XMLSerializer -> iframe.srcdoc -> rendition.hooks.content
-  const serialized = new XMLSerializer().serializeToString(spineChapter.documentElement);
-  const iframeDocument = new DOMParser().parseFromString(serialized, 'text/html');
-  const paragraph = iframeDocument.querySelector('p')!;
-  const hasAttributesSpy = vi.spyOn(paragraph, 'hasAttributes');
-
-  await renditionHooks[0]?.({ document: iframeDocument } as unknown as Contents);
+  // Passing the same Document instance to rendition.hooks.content is skipped via WeakSet<Document>.
+  const hasAttributesSpy = vi.spyOn(chapterOne.querySelector('p')!, 'hasAttributes');
+  await renditionHooks[0]?.({ document: chapterOne } as unknown as Contents);
   expect(hasAttributesSpy).not.toHaveBeenCalled();
 
-  // Fallback hardening in rendition.hooks.content still sanitizes uncached documents with forged nonces
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(
-      async () =>
-        new Response('body { color: inherit; }', {
-          status: 200,
-          headers: { 'content-type': 'text/css' },
-        }),
-    ),
-  );
-  const uncachedDocument = new DOMParser().parseFromString(
-    '<html data-turnleaf-sanitized="forged"><head><base href="http://localhost/_capacitor_file/books/book.epub/OEBPS/" /><link rel="stylesheet" href="styles/local.css" /></head><body><script>evil()</script></body></html>',
-    'application/xhtml+xml',
-  );
-  await renditionHooks[0]?.({ document: uncachedDocument } as unknown as Contents);
-  expect(uncachedDocument.querySelector('script')).toBeNull();
-  const cachedBlobHref =
-    uncachedDocument.querySelector('link[rel="stylesheet"]')?.getAttribute('href') ?? '';
-  expect(cachedBlobHref).toMatch(/^blob:/);
-
   session.destroy();
-  expect(revokeSpy).toHaveBeenCalledWith(sanitizedArchiveCssBlob);
-  expect(revokeSpy).toHaveBeenCalledWith(cachedBlobHref);
+  expect(revokeSpy).toHaveBeenCalledWith(coverBlobUrl);
 });
