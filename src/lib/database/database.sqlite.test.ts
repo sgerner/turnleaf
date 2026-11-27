@@ -1239,7 +1239,7 @@ describe('coordinated schema v8-v11 migrations and legacy study-data rollback ag
         await migrateDatabase(recordingAdapter);
         assertReconciliationPrecededStudyCopyAndDelete(executedStatements);
 
-        // Any subsequent #328/#330/#339 migration sets are safe no-ops once at v10.
+        // Any subsequent #328/#330/#339 migration sets are safe no-ops once at v11.
         await runSimpleMigrations(baseAdapter, scenario.followupMigrations);
 
         expect(await baseAdapter.getVersion(), scenario.label).toEqual({
@@ -1331,7 +1331,7 @@ describe('coordinated schema v8-v11 migrations and legacy study-data rollback ag
     db = undefined;
   });
 
-  it('upgrades populated v7 databases cleanly when #345 lands first (reconciling v8+v9 before copying/deleting legacy preferences) and #328/#330/#339 migrations run afterward', async () => {
+  it('upgrades populated v7 databases cleanly when #345 lands first (reconciling v8-v10 before copying/deleting legacy preferences) and #328/#330/#339 migrations run afterward', async () => {
     db = createV7Database();
     seedV7StudyPreferencesFixture(db);
     const baseAdapter = createMigrationAdapter(db);
