@@ -2,7 +2,12 @@
 
 ## Unreleased
 
+- Preload reader in parallel, trim bundles, and enable Android R8
 - fix: serialize native SQLite resets and guard clear/reset interleaving
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
