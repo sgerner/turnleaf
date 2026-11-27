@@ -348,6 +348,8 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     close() {
       server.close();
       foreignServer.close();
+      server.closeAllConnections?.();
+      foreignServer.closeAllConnections?.();
     },
   };
 }
