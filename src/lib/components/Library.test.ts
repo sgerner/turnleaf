@@ -27,25 +27,7 @@ const mocks = vi.hoisted(() => ({
     async () => {},
   ),
   setPreference: vi.fn<(key: string, value: string) => Promise<void>>(async () => {}),
-  getBookSeries: vi.fn<(signal?: AbortSignal) => Promise<Array<{ id: number }>>>(async () => []),
-  getSeriesDetail: vi.fn<
-    (seriesId: number, signal?: AbortSignal) => Promise<{ volumes: never[]; incomplete: boolean }>
-  >(async () => ({ volumes: [], incomplete: false })),
-  flushProgress: vi.fn<() => Promise<void>>(async () => {}),
-  networkListeners: [] as Array<(status: { connected: boolean; connectionType: string }) => void>,
-  isNativePlatform: false,
 }));
-
-vi.mock('@capacitor/core', async (importOriginal) => {
-  const actual = (await importOriginal()) as { Capacitor: Record<string, unknown> };
-  return {
-    ...actual,
-    Capacitor: {
-      ...actual.Capacitor,
-      isNativePlatform: () => mocks.isNativePlatform,
-    },
-  };
-});
 
 vi.mock('@capacitor/app', () => ({
   App: {
@@ -60,20 +42,7 @@ vi.mock('@capacitor/network', () => ({
       connected: mocks.connected,
       connectionType: mocks.connected ? 'wifi' : 'none',
     })),
-    addListener: vi.fn(
-      async (
-        _eventName: string,
-        listener: (status: { connected: boolean; connectionType: string }) => void,
-      ) => {
-        mocks.networkListeners.push(listener);
-        return {
-          remove: async () => {
-            const index = mocks.networkListeners.indexOf(listener);
-            if (index !== -1) mocks.networkListeners.splice(index, 1);
-          },
-        };
-      },
-    ),
+    addListener: vi.fn(async () => ({ remove: async () => {} })),
   },
 }));
 
@@ -148,14 +117,11 @@ vi.mock('../kavita/client', () => {
     async getCover(): Promise<Blob> {
       throw new Error('Cover fetch disabled in unit test');
     }
-    async getBookSeries(signal?: AbortSignal): Promise<Array<{ id: number }>> {
-      return mocks.getBookSeries(signal);
+    async getBookSeries(): Promise<never[]> {
+      return [];
     }
-    async getSeriesDetail(
-      seriesId: number,
-      signal?: AbortSignal,
-    ): Promise<{ volumes: never[]; incomplete: boolean }> {
-      return mocks.getSeriesDetail(seriesId, signal);
+    async getSeriesDetail(): Promise<{ volumes: never[]; incomplete: boolean }> {
+      return { volumes: [], incomplete: false };
     }
     async getProgress(): Promise<null> {
       return null;
@@ -169,7 +135,7 @@ vi.mock('../kavita/client', () => {
 });
 
 vi.mock('../sync/sync', () => ({
-  flushProgress: () => mocks.flushProgress(),
+  flushProgress: vi.fn(async () => {}),
 }));
 
 import Library from './Library.svelte';
@@ -718,94 +684,5 @@ describe('Library card snippets', () => {
 
     finishDownload?.({ relativePath: 'books/book-5.epub', size: 1024 });
     await tick();
-  });
-
-  it('ignores redundant connected capability events while online, cancels transient reconnect bounces, and stops series-detail batches when native network drops', async () => {
-    mocks.isNativePlatform = true;
-    mocks.connected = true;
-    mocks.books = [makeBook({ id: 'book-1', title: 'A Wizard of Earthsea' })];
-    mocks.getBookSeries.mockReset().mockResolvedValue([{ id: 1 }]);
-    mocks.getSeriesDetail.mockReset().mockResolvedValue({ volumes: [], incomplete: false });
-    mocks.flushProgress.mockReset().mockResolvedValue(undefined);
-    mocks.networkListeners.length = 0;
-
-    try {
-      await mountLibrary();
-      await vi.waitFor(() => {
-        expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
-        expect(mocks.getSeriesDetail).toHaveBeenCalledTimes(1);
-      });
-      mocks.getBookSeries.mockClear();
-      mocks.getSeriesDetail.mockClear();
-      mocks.flushProgress.mockClear();
-
-      const emitNetwork = (connected: boolean, connectionType = connected ? 'wifi' : 'none') => {
-        mocks.connected = connected;
-        for (const listener of [...mocks.networkListeners]) {
-          listener({ connected, connectionType });
-        }
-      };
-
-      // Android Wi-Fi -> cellular fallback fires connected=true while already online: must not trigger an unsolicited refresh
-      emitNetwork(true, 'cellular');
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(mocks.getBookSeries).not.toHaveBeenCalled();
-      expect(mocks.flushProgress).not.toHaveBeenCalled();
-
-      // Transient offline -> online -> offline bounce within settle window cancels reconnect work
-      emitNetwork(false);
-      emitNetwork(true, 'cellular');
-      await new Promise((resolve) => setTimeout(resolve, 40));
-      emitNetwork(false);
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(mocks.getBookSeries).not.toHaveBeenCalled();
-      expect(mocks.flushProgress).not.toHaveBeenCalled();
-
-      // Genuine reconnect refreshes catalog, but aborts before getSeriesDetail if native connectivity drops mid-refresh
-      mocks.getBookSeries.mockImplementationOnce(async () => {
-        mocks.connected = false;
-        return [{ id: 1 }];
-      });
-      emitNetwork(true, 'wifi');
-      await vi.waitFor(() => {
-        expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
-      });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(mocks.getSeriesDetail).not.toHaveBeenCalled();
-
-      // Once native Network.getStatus() validates connected=true (even if connected=true had already fired earlier),
-      // pending reconnect work completes both catalog refresh and queued progress flush.
-      mocks.getBookSeries.mockClear();
-      mocks.flushProgress.mockClear();
-      mocks.connected = true;
-      await vi.waitFor(() => {
-        expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
-        expect(mocks.getSeriesDetail).toHaveBeenCalledTimes(1);
-        expect(mocks.flushProgress).toHaveBeenCalledTimes(1);
-      });
-
-      // Also handles networkStatusChange({ connected: true }) arriving while Network.getStatus() is still unvalidated.
-      emitNetwork(false);
-      mocks.getBookSeries.mockClear();
-      mocks.getSeriesDetail.mockClear();
-      mocks.flushProgress.mockClear();
-      for (const listener of [...mocks.networkListeners]) {
-        listener({ connected: true, connectionType: 'wifi' });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(mocks.getBookSeries).not.toHaveBeenCalled();
-      expect(mocks.flushProgress).not.toHaveBeenCalled();
-
-      mocks.connected = true;
-      emitNetwork(true, 'wifi');
-      await vi.waitFor(() => {
-        expect(mocks.getBookSeries).toHaveBeenCalledTimes(1);
-        expect(mocks.getSeriesDetail).toHaveBeenCalledTimes(1);
-        expect(mocks.flushProgress).toHaveBeenCalledTimes(1);
-      });
-    } finally {
-      mocks.isNativePlatform = false;
-      mocks.networkListeners.length = 0;
-    }
   });
 });

@@ -119,7 +119,7 @@
         seriesId,
         signal,
         server.id,
-        networkAvailable,
+        await networkAvailable(),
         serverOrigin,
       );
     }
@@ -313,11 +313,6 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
-  let reconnectTimer: number | null = null;
-  let reconnectNeeded = false;
-  const RECONNECT_SETTLE_MS = 150;
-  const RECONNECT_RETRY_MS = 250;
-  const MAX_RECONNECT_VALIDATION_RETRIES = 20;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -723,7 +718,6 @@
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     offline = !(await Network.getStatus().catch(() => null))?.connected;
-    reconnectNeeded = offline;
     if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
@@ -739,44 +733,24 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
-          const wasOffline = offline;
           offline = !connected;
           if (!connected) {
-            reconnectNeeded = true;
-            if (reconnectTimer !== null) {
-              window.clearTimeout(reconnectTimer);
-              reconnectTimer = null;
-            }
-            if (syncTimer !== null) {
-              window.clearTimeout(syncTimer);
-              syncTimer = null;
-            }
             refreshController?.abort();
             openProgressProbe?.abort();
-            cancelCoverLoading();
-            sharedCoverLoader.cancel();
-            if (!wasOffline) {
-              coverReloadRequest += 1;
-              kavitaUnreachable = false;
-            }
-            offlineMessage = displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-            return;
           }
-          if (!wasOffline && !kavitaUnreachable && !reconnectNeeded) return;
-          offlineMessage = '';
-          if (Capacitor.isNativePlatform()) {
-            scheduleReconnect();
-            return;
-          }
-          reconnectNeeded = false;
           coverReloadRequest += 1;
           kavitaUnreachable = false;
-          const baselineRevision = activeSyncStartRevision ?? messageRevision;
-          const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-          void syncProgress(false);
-          void startRefresh(false, baselineRevision, baselineMessage);
+          offlineMessage = connected
+            ? ''
+            : displayableBooks.length
+              ? 'No network connection. Showing your saved library.'
+              : 'No network connection. Connect to Kavita to load your library.';
+          if (connected) {
+            const baselineRevision = activeSyncStartRevision ?? messageRevision;
+            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+            void syncProgress(false);
+            void startRefresh(false, baselineRevision, baselineMessage);
+          }
         }),
       ),
     );
@@ -820,39 +794,6 @@
     return handle.remove;
   }
 
-  function scheduleReconnect(
-    delayMs = RECONNECT_SETTLE_MS,
-    retriesRemaining = MAX_RECONNECT_VALIDATION_RETRIES,
-  ): void {
-    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-    reconnectTimer = window.setTimeout(() => {
-      reconnectTimer = null;
-      void (async () => {
-        if (destroyed || offline) return;
-        if (!(await networkAvailable())) {
-          reconnectNeeded = true;
-          if (!destroyed && !offline && retriesRemaining > 0) {
-            scheduleReconnect(RECONNECT_RETRY_MS, retriesRemaining - 1);
-          }
-          return;
-        }
-        reconnectNeeded = false;
-        coverReloadRequest += 1;
-        kavitaUnreachable = false;
-        const baselineRevision = activeSyncStartRevision ?? messageRevision;
-        const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-        const progressPromise = syncProgress(false).catch(() => {});
-        const refreshPromise = startRefresh(false, baselineRevision, baselineMessage).catch(
-          () => {},
-        );
-        await Promise.all([progressPromise, refreshPromise]);
-        if (reconnectNeeded && !destroyed && !offline && retriesRemaining > 0) {
-          scheduleReconnect(RECONNECT_RETRY_MS, retriesRemaining - 1);
-        }
-      })();
-    }, delayMs);
-  }
-
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
@@ -893,16 +834,11 @@
         ? await networkAvailable()
         : !offline && !destroyed;
       if (!available) {
-        if (!offline && !destroyed) reconnectNeeded = true;
         if (showFeedback)
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(
-        client,
-        server.id,
-        Capacitor.isNativePlatform() ? networkAvailable : undefined,
-      );
+      await flushProgress(client, server.id);
       if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
@@ -927,7 +863,6 @@
   onDestroy(() => {
     destroyed = true;
     onReaderOpenChange?.(false);
-    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -984,21 +919,12 @@
       message = '';
     }
     try {
-      if (!(await networkAvailable())) {
-        if (!offline && !destroyed) reconnectNeeded = true;
-        return;
-      }
-      if (controller.signal.aborted) return;
+      if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (!(await networkAvailable())) {
-          if (!offline && !destroyed) reconnectNeeded = true;
-          controller.abort();
-          return;
-        }
         if (controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
@@ -1485,7 +1411,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id, networkAvailable);
+        await flushProgress(client, server.id);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {

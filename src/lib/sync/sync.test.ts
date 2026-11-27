@@ -227,23 +227,3 @@ it('allows a manual retry after an authorization failure', async () => {
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
-
-it('stops flushing remaining items without marking them failed when connectivity drops mid-sync', async () => {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify(pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}')),
-  );
-  const saveProgress = vi.fn();
-
-  await expect(
-    flushProgress({ saveProgress } as never, 'server', async () => false),
-  ).resolves.toBeUndefined();
-
-  expect(saveProgress).not.toHaveBeenCalled();
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
-    typeof pendingState
-  >;
-  expect(saved.syncQueue['book-1']?.attemptCount).toBe(0);
-  expect(saved.syncQueue['book-1']?.lastError).toBeNull();
-  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
-});

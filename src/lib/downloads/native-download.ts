@@ -155,7 +155,6 @@ async function downloadFileWithRedirects(options: {
   connectTimeout?: number;
   readTimeout?: number;
   signal?: AbortSignal | undefined;
-  allowHop?: (() => boolean | Promise<boolean>) | undefined;
   onHop?: ((url: string) => void) | undefined;
 }): Promise<void> {
   const redirects = createRedirectState(
@@ -165,10 +164,6 @@ async function downloadFileWithRedirects(options: {
     options.normalizedInitialUrl,
   );
   while (true) {
-    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (redirects.redirectCount > 0 && options.allowHop && !(await options.allowHop())) {
-      throw new Error('Offline');
-    }
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.onHop?.(redirects.currentUrl);
     try {
@@ -350,7 +345,7 @@ export async function cacheCover(
   seriesId: number,
   signal?: AbortSignal,
   cacheNamespace = 'default',
-  allowDownload: boolean | (() => boolean | Promise<boolean>) = true,
+  allowDownload = true,
   serverOrigin?: string,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -366,18 +361,10 @@ export async function cacheCover(
   const valid = await Filesystem.stat({ path, directory: Directory.Data }).catch(() => null);
   if (!valid || valid.type !== 'file' || valid.size === 0) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const initiallyAllowed =
-      typeof allowDownload === 'function' ? await allowDownload() : allowDownload;
-    if (!initiallyAllowed) throw new Error('Offline');
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (!allowDownload) throw new Error('Offline');
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (typeof allowDownload === 'function' && !(await allowDownload())) {
-      throw new Error('Offline');
-    }
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     try {
       await downloadFileWithRedirects({
         initialUrl: target.url,
@@ -388,7 +375,6 @@ export async function cacheCover(
         connectTimeout: 5_000,
         readTimeout: 5_000,
         signal,
-        allowHop: typeof allowDownload === 'function' ? allowDownload : undefined,
       });
       const downloaded = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
       if (downloaded.type !== 'file' || downloaded.size === 0)
