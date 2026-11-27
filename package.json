@@ -31,6 +31,7 @@
     "android:smoke": "node scripts/android-smoke.mjs",
     "android:journey": "node scripts/android-reading-journey.mjs",
     "android:release": "node scripts/android-build.mjs release",
+    "android:verify-release": "node scripts/verify-release-apk.mjs",
     "ios:sync": "node scripts/ios-sync.mjs",
     "ios:check": "node scripts/ios-sync.mjs --check",
     "ios:simulator": "node scripts/ios-simulator-build.mjs",
@@ -47,7 +48,7 @@
     "@capacitor/network": "^8.0.1",
     "@capacitor/status-bar": "^8.0.4",
     "epubjs": "^0.3.93",
-    "svelte": "^5.58.0"
+    "svelte": "^5.59.2"
   },
   "devDependencies": {
     "@capacitor/android": "^8.6.2",
@@ -55,7 +56,7 @@
     "@capacitor/ios": "^8.6.2",
     "@eslint/js": "^10.0.1",
     "@skeletonlabs/skeleton": "^5.0.6",
-    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@sveltejs/vite-plugin-svelte": "^7.3.2",
     "@tailwindcss/vite": "^4.3.5",
     "@types/node": "^26.6.6",
     "eslint": "^10.15.0",
