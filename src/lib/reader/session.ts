@@ -387,6 +387,12 @@ export class ReaderSession {
   private userNavigationOrigin: ReaderLocationOrigin = 'navigation';
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
+  private initialOpenComplete = false;
+  private navigationDisplayCount = 0;
+  private openingPromise: Promise<void> | null = null;
+  private activeResize: Promise<void> | null = null;
+  private pendingResize: { width: number; height: number } | null = null;
+  private lastDisplayTarget: string | undefined = undefined;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
@@ -441,13 +447,17 @@ export class ReaderSession {
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.viewportTarget = target;
+    this.resetViewportLifecycle();
+    const { width, height } = target.getBoundingClientRect();
+    const initialWidth = Math.floor(width);
+    const initialHeight = Math.floor(height);
     this.rendition = this.book.renderTo(target, {
-      width: '100%',
-      height: '100%',
+      width: initialWidth > 0 ? initialWidth : '100%',
+      height: initialHeight > 0 ? initialHeight : '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: true,
+      resizeOnOrientationChange: false,
       allowScriptedContent: false,
     });
     this.observeViewport(target);
@@ -544,15 +554,29 @@ export class ReaderSession {
     }
     this.onLocation = onLocation;
     this.relocated = (location) => {
+      const staleDuringActiveNavigation =
+        this.navigationDisplayCount > 0 && this.hasManagedRendition();
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
       const isUserNavigation =
+        !staleDuringActiveNavigation &&
         this.userNavigationPending &&
         (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
+      if (location.start?.cfi) this.lastDisplayTarget = location.start.cfi;
+      const settledBoundaryNavigation =
+        !staleDuringActiveNavigation &&
+        this.userNavigationPending &&
+        this.displayOperationCount === 0 &&
+        startCfi !== null &&
+        this.liveRenditionStart()?.cfi === startCfi;
+      if (
+        isUserNavigation ||
+        settledBoundaryNavigation ||
+        (!staleDuringActiveNavigation && this.userNavigationOrigin === 'link')
+      ) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
         this.userNavigationOrigin = 'navigation';
@@ -562,10 +586,11 @@ export class ReaderSession {
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
       this.reportLocation(location, origin, returnTarget);
-      if (this.reflowPending) {
+      if (this.reflowPending && !this.userNavigationPending) {
         this.reflowPending = false;
         this.preserveCfi(location.start.cfi, this.locationGeneration);
       }
+      void this.flushPendingResize();
     };
     this.rendition.on('relocated', this.relocated);
     this.renderedListener = () => {
@@ -611,9 +636,31 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
-    this.bindEpubContainer();
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    const opening = (async () => {
+      await this.rendition!.started;
+      this.bindEpubContainer();
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      await this.restoreInitialLocation(cfi, serverXPath, serverPercentage, restoreGeneration);
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      this.initialOpenComplete = true;
+      await this.flushPendingResize();
+    })();
+    this.openingPromise = opening;
+    try {
+      await opening;
+    } finally {
+      if (this.openingPromise === opening) {
+        this.openingPromise = null;
+      }
+    }
+  }
+
+  private async restoreInitialLocation(
+    cfi: string | null,
+    serverXPath: string | null,
+    serverPercentage: number | null,
+    restoreGeneration: number,
+  ): Promise<void> {
     if (cfi) {
       try {
         if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
@@ -828,12 +875,14 @@ export class ReaderSession {
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     const target = this.resolveDisplayTarget(href);
+    this.lastDisplayTarget = target;
     await this.navigate(() => this.rendition!.display(target));
   }
 
   async displayCfi(cfi: string): Promise<boolean> {
     if (!this.rendition) return false;
     try {
+      this.lastDisplayTarget = cfi;
       await this.navigate(() => this.rendition!.display(cfi));
       return true;
     } catch {
@@ -919,7 +968,7 @@ export class ReaderSession {
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
     this.syncVisibleColumnLinks();
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    const cfi = this.resolveCurrentStart()?.cfi ?? null;
     if (!cfi) return;
     if (this.userNavigationPending) {
       this.reflowPending = true;
@@ -967,6 +1016,7 @@ export class ReaderSession {
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
+    this.resetViewportLifecycle();
     this.spine = null;
     this.stylesheetCache.clear();
     // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
@@ -1128,7 +1178,9 @@ export class ReaderSession {
   }
 
   private isProgrammaticScrollAllowed(): boolean {
-    return this.displayOperationCount > 0 || this.userNavigationPending;
+    return (
+      this.displayOperationCount > 0 || this.userNavigationPending || this.activeResize !== null
+    );
   }
 
   private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1140,6 +1192,7 @@ export class ReaderSession {
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
       this.syncVisibleColumnLinks();
+      void this.flushPendingResize();
     }
   }
 
@@ -1307,6 +1360,55 @@ export class ReaderSession {
     return cfi && text ? [{ cfi, text }] : [];
   }
 
+  private resetViewportLifecycle(): void {
+    this.initialOpenComplete = false;
+    this.navigationDisplayCount = 0;
+    this.openingPromise = null;
+    this.activeResize = null;
+    this.pendingResize = null;
+    this.lastDisplayTarget = undefined;
+  }
+
+  private hasManagedRendition(): boolean {
+    return Boolean(
+      this.rendition &&
+      ('manager' in this.rendition || 'q' in this.rendition || 'settings' in this.rendition),
+    );
+  }
+
+  private isRenditionStageReady(): boolean {
+    const rendition = this.rendition as
+      (Rendition & { manager?: { stage?: unknown } | null }) | null;
+    if (!rendition) return false;
+    return this.hasManagedRendition() ? Boolean(rendition.manager?.stage) : true;
+  }
+
+  private liveRenditionStart(): Location['start'] | null {
+    if (!this.hasManagedRendition() || !this.isRenditionStageReady()) return null;
+    const rendition = this.rendition as (Rendition & { currentLocation?: () => unknown }) | null;
+    if (typeof rendition?.currentLocation !== 'function') return null;
+    try {
+      const live = rendition.currentLocation() as Partial<Location> | undefined;
+      return live && typeof live === 'object' && live.start?.cfi ? live.start : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveCurrentStart(): Location['start'] | null {
+    return this.current?.start ?? this.rendition?.location?.start ?? this.liveRenditionStart();
+  }
+
+  private shouldDeferResize(): boolean {
+    return (
+      !this.initialOpenComplete ||
+      !this.isRenditionStageReady() ||
+      this.activeResize !== null ||
+      this.displayOperationCount > 0 ||
+      this.userNavigationPending
+    );
+  }
+
   private observeViewport(target: HTMLElement): void {
     const initial = target.getBoundingClientRect();
     this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
@@ -1318,19 +1420,99 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
-      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-      this.viewportSize = { width, height };
-      this.displayOperationCount += 1;
-      try {
-        this.rendition.resize(width, height);
-      } finally {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-        this.syncVisibleColumnLinks();
+      if (
+        this.viewportSize?.width === width &&
+        this.viewportSize.height === height &&
+        !this.pendingResize
+      ) {
+        return;
       }
+      const stagedRendition = this.rendition as Rendition & {
+        manager?: { stage?: unknown } | null;
+        settings?: { width?: number | string; height?: number | string };
+      };
+      if (this.hasManagedRendition() && !this.isRenditionStageReady() && stagedRendition.settings) {
+        stagedRendition.settings.width = width;
+        stagedRendition.settings.height = height;
+        this.viewportSize = { width, height };
+        this.pendingResize = null;
+        return;
+      }
+      if (this.shouldDeferResize()) {
+        this.pendingResize = { width, height };
+        return;
+      }
+      void this.applyResize(width, height);
     });
     this.resizeObserver.observe(target);
+  }
+
+  private async flushPendingResize(): Promise<void> {
+    if (!this.pendingResize || this.shouldDeferResize()) return;
+    const { width, height } = this.pendingResize;
+    this.pendingResize = null;
+    await this.applyResize(width, height);
+  }
+
+  private async applyResize(width: number, height: number): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition || !this.isRenditionStageReady()) return;
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    const task = this.performResize(rendition, width, height);
+    this.activeResize = task;
+    try {
+      await task;
+    } finally {
+      if (this.activeResize === task) {
+        this.activeResize = null;
+      }
+      void this.flushPendingResize();
+    }
+  }
+
+  private async performResize(rendition: Rendition, width: number, height: number): Promise<void> {
+    this.viewportSize = { width, height };
+    const fallbackCfi = this.resolveCurrentStart()?.cfi;
+    const mutableRendition = rendition as Omit<Rendition, 'location'> & {
+      location: Location | undefined;
+      resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
+    };
+    const previousLocation = mutableRendition.location;
+    let managerEmittedResize = false;
+    const markResized = () => {
+      managerEmittedResize = true;
+    };
+    rendition.on('resized', markResized);
+    this.displayOperationCount += 1;
+    try {
+      // Prevent EPUB.js Rendition.onResized from queueing an untracked display();
+      // performResize restores the target via displayAtGeneration under activeResize.
+      if (previousLocation?.start) {
+        mutableRendition.location = undefined;
+      }
+      if (fallbackCfi && this.hasManagedRendition()) {
+        mutableRendition.resize(width, height, fallbackCfi);
+      } else {
+        rendition.resize(width, height);
+      }
+    } finally {
+      rendition.off('resized', markResized);
+      if (!managerEmittedResize && previousLocation !== undefined) {
+        mutableRendition.location = previousLocation;
+      }
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+      this.syncVisibleColumnLinks();
+    }
+    if (!managerEmittedResize || this.rendition !== rendition) return;
+    const restoreTarget = fallbackCfi ?? this.lastDisplayTarget;
+    const generation = this.locationGeneration;
+    try {
+      await this.displayAtGeneration(restoreTarget, generation);
+    } catch {
+      // Ignore errors if the reader closes while restoring after resize.
+    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -1368,6 +1550,7 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
+    this.lastDisplayTarget = target;
     await this.runDisplayOperation(async () => {
       if (target === undefined) await rendition.display();
       else await rendition.display(target);
@@ -1383,6 +1566,7 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
+      this.lastDisplayTarget = section.href;
       await this.runDisplayOperation(() => rendition.display(section.href));
       if (!this.isCurrentLocationOperation(generation)) return false;
       if (target.contentXPath === '/html/body') return true;
@@ -1394,6 +1578,7 @@ export class ReaderSession {
       if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
+      this.lastDisplayTarget = cfi;
       await this.runDisplayOperation(() => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation);
     } catch {
@@ -1431,8 +1616,33 @@ export class ReaderSession {
     }
   }
 
+  private async settleBeforeNavigation(): Promise<void> {
+    if (this.openingPromise) {
+      try {
+        await this.openingPromise;
+      } catch {
+        // Navigation will bail below if opening failed or closed the session.
+      }
+    }
+    while (this.activeResize) {
+      await this.activeResize;
+    }
+    while (this.pendingResize && !this.shouldDeferResize()) {
+      await this.flushPendingResize();
+    }
+  }
+
   private async navigate(display: () => Promise<unknown>): Promise<void> {
+    if (
+      this.openingPromise !== null ||
+      this.activeResize !== null ||
+      (this.pendingResize !== null && !this.shouldDeferResize())
+    ) {
+      await this.settleBeforeNavigation();
+      if (!this.rendition) throw new Error('Reader is not open.');
+    }
     const generation = this.beginLocationOperation(true);
+    this.navigationDisplayCount += 1;
     try {
       await this.runDisplayOperation(display);
     } catch (error) {
@@ -1441,6 +1651,9 @@ export class ReaderSession {
         this.userNavigationStartCfi = null;
       }
       throw error;
+    } finally {
+      this.navigationDisplayCount = Math.max(0, this.navigationDisplayCount - 1);
+      void this.flushPendingResize();
     }
   }
 
@@ -1449,14 +1662,12 @@ export class ReaderSession {
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
-    this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
-      : null;
+    this.userNavigationStartCfi = userNavigation ? (this.resolveCurrentStart()?.cfi ?? null) : null;
     return this.locationGeneration;
   }
 
   private beginLinkedNavigation(): void {
-    const start = this.current?.start ?? this.rendition?.location?.start;
+    const start = this.resolveCurrentStart();
     if (!start) return;
     this.locationGeneration += 1;
     this.userNavigationPending = true;

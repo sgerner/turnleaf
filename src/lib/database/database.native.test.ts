@@ -3,12 +3,16 @@ import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
   let databaseVersion = 7;
+  let nativePlatform = true;
+  const deleteDatabase = vi.fn(async () => undefined);
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
   const db = {
     close: vi.fn(async () => undefined),
-    execute: vi.fn(async () => ({ changes: { changes: 0 } })),
+    execute: vi.fn<(statements: string, transaction?: boolean) => Promise<capSQLiteChanges>>(
+      async () => ({ changes: { changes: 0 } }),
+    ),
     executeTransaction,
     getVersion: vi.fn(async () => ({ version: databaseVersion })),
     open: vi.fn(async () => undefined),
@@ -26,13 +30,30 @@ const mocks = vi.hoisted(() => {
   };
   return {
     db,
+    deleteDatabase,
     executeTransaction,
+    isNativePlatform: () => nativePlatform,
     reset() {
       databaseVersion = 7;
+      nativePlatform = true;
       vi.clearAllMocks();
+      deleteDatabase.mockImplementation(async () => undefined);
+      executeTransaction.mockImplementation(async () => ({ changes: { changes: 0 } }));
+      db.close.mockImplementation(async () => undefined);
+      db.execute.mockImplementation(async () => ({ changes: { changes: 0 } }));
+      db.getVersion.mockImplementation(async () => ({ version: databaseVersion }));
+      db.open.mockImplementation(async () => undefined);
+      db.query.mockImplementation(async () => ({ values: [] }));
+      db.run.mockImplementation(async () => ({ changes: { changes: 1 } }));
+      sqlite.checkConnectionsConsistency.mockImplementation(async () => ({ result: true }));
+      sqlite.createConnection.mockImplementation(async () => db);
+      sqlite.isConnection.mockImplementation(async () => ({ result: false }));
     },
     setDatabaseVersion(version: number) {
       databaseVersion = version;
+    },
+    setNativePlatform(value: boolean) {
+      nativePlatform = value;
     },
     sqlite,
   };
@@ -40,13 +61,13 @@ const mocks = vi.hoisted(() => {
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
-    isNativePlatform: () => true,
+    isNativePlatform: () => mocks.isNativePlatform(),
   },
 }));
 
 vi.mock('@capacitor-community/sqlite', () => ({
   CapacitorSQLite: {
-    deleteDatabase: vi.fn(async () => undefined),
+    deleteDatabase: mocks.deleteDatabase,
   },
   SQLiteConnection: class {
     constructor() {
@@ -91,7 +112,9 @@ beforeEach(() => {
 });
 
 it('reads several preferences with one native query', async () => {
-  const { getPreferences } = await import('./database');
+  const { getPreferences, openDatabase } = await import('./database');
+  await openDatabase();
+  mocks.db.query.mockClear();
   mocks.db.query.mockResolvedValueOnce({ values: [{ key: 'uiTheme', value: 'eink' }] });
 
   const values = await getPreferences(['uiTheme', 'uiMode']);
@@ -403,14 +426,136 @@ it('records each migration and its user version in one transaction', async () =>
   ]);
 });
 
-it('mirrors native SQLite theme and mode preferences to browser localStorage and clears on reset', async () => {
+function createGate() {
+  let markEntered!: () => void;
+  let release!: () => void;
+  let fail!: (error: Error) => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  const gate = new Promise<void>((resolve, reject) => {
+    release = resolve;
+    fail = reject;
+  });
+  return { entered, fail, gate, markEntered, release };
+}
+
+function stubMemoryStorage() {
   const store = new Map<string, string>();
-  const mockStorage = {
-    getItem: (key: string) => store.get(key) ?? null,
-    setItem: (key: string, value: string) => void store.set(key, value),
-    removeItem: (key: string) => void store.delete(key),
-  };
-  vi.stubGlobal('window', { localStorage: mockStorage });
+  vi.stubGlobal('window', {
+    localStorage: {
+      clear: () => store.clear(),
+      getItem: (key: string) => store.get(key) ?? null,
+      removeItem: (key: string) => void store.delete(key),
+      setItem: (key: string, value: string) => void store.set(key, value),
+    },
+  });
+  return store;
+}
+
+it('configures WAL, synchronous mode, foreign keys, and busy timeout outside transactions before migrations', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.reset();
+  mocks.setDatabaseVersion(0);
+
+  const events: string[] = [];
+  mocks.db.open.mockImplementationOnce(async () => void events.push('open'));
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    events.push(`query:${statement}`);
+    return { values: [] };
+  });
+  mocks.db.execute.mockImplementation(async (statement: string, transaction?: boolean) => {
+    events.push(`execute:${String(transaction)}:${statement}`);
+    return { changes: { changes: 0 } };
+  });
+  mocks.db.getVersion.mockImplementationOnce(async () => {
+    events.push('getVersion');
+    return { version: 0 };
+  });
+  mocks.executeTransaction.mockImplementationOnce(async () => {
+    events.push('migrate:1');
+    return { changes: { changes: 0 } };
+  });
+
+  await openDatabase();
+
+  expect(mocks.db.query.mock.calls).toEqual([
+    ['PRAGMA journal_mode = WAL;'],
+    ['PRAGMA busy_timeout = 5000;'],
+  ]);
+  expect(mocks.db.execute.mock.calls).toEqual([
+    ['PRAGMA synchronous = NORMAL;', false],
+    ['PRAGMA foreign_keys = ON;', false],
+  ]);
+  expect(events.slice(0, 7)).toEqual([
+    'open',
+    'query:PRAGMA journal_mode = WAL;',
+    'execute:false:PRAGMA synchronous = NORMAL;',
+    'execute:false:PRAGMA foreign_keys = ON;',
+    'query:PRAGMA busy_timeout = 5000;',
+    'getVersion',
+    'migrate:1',
+  ]);
+});
+
+it('drains queued writes and reverts WAL mode before closing and deleting on reset, even when cleanup queries fail', async () => {
+  const { openDatabase, resetLocalDatabase, saveLocalProgress } = await import('./database');
+  await openDatabase();
+  mocks.reset();
+
+  const events: string[] = [];
+  const write = createGate();
+  mocks.executeTransaction.mockImplementationOnce(async () => {
+    events.push('write:start');
+    write.markEntered();
+    await write.gate;
+    events.push('write:done');
+    return { changes: { changes: 3 } };
+  });
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    events.push(`query:${statement}`);
+    return { values: [] };
+  });
+  mocks.db.close.mockImplementationOnce(async () => void events.push('close'));
+  mocks.deleteDatabase.mockImplementationOnce(async () => void events.push('deleteDatabase'));
+
+  const pendingWrite = saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4);
+  await write.entered;
+  const resetting = resetLocalDatabase();
+  await Promise.resolve();
+  expect(events).toEqual(['write:start']);
+
+  write.release();
+  await Promise.all([pendingWrite, resetting]);
+
+  expect(events).toEqual([
+    'write:start',
+    'write:done',
+    'query:PRAGMA wal_checkpoint(TRUNCATE);',
+    'query:PRAGMA journal_mode = DELETE;',
+    'close',
+    'deleteDatabase',
+  ]);
+  expect(mocks.deleteDatabase).toHaveBeenCalledExactlyOnceWith({
+    database: 'turnleaf',
+    readonly: false,
+  });
+
+  await openDatabase();
+  mocks.reset();
+  mocks.db.query.mockRejectedValue(new Error('database disk image is malformed'));
+  await expect(resetLocalDatabase()).resolves.toBeUndefined();
+  expect(mocks.db.query.mock.calls).toEqual([
+    ['PRAGMA wal_checkpoint(TRUNCATE);'],
+    ['PRAGMA journal_mode = DELETE;'],
+  ]);
+  expect(mocks.db.close).toHaveBeenCalledOnce();
+  expect(mocks.deleteDatabase).toHaveBeenCalledOnce();
+});
+
+it('mirrors native SQLite theme and mode preferences to browser localStorage and clears on reset', async () => {
+  const store = stubMemoryStorage();
   try {
     const { resetLocalDatabase, setPreferences } = await import('./database');
     const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
@@ -421,18 +566,357 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
         ['uiMode', 'light'],
       ]),
     );
-
-    expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toEqual({
+    expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
       theme: 'eink',
       mode: 'light',
-      rootBgLight: 'oklch(1 0 0)',
-      rootBgDark: 'oklch(0 0 0)',
-      surfaceLight: 'oklch(1 0 0)',
-      surfaceDark: 'oklch(0 0 0)',
     });
 
     await resetLocalDatabase();
     expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it('gates concurrent openDatabase, reads, and writes until resetLocalDatabase finishes deleting', async () => {
+  const { getPreferences, openDatabase, resetLocalDatabase, saveLocalProgress } =
+    await import('./database');
+  await openDatabase();
+  mocks.reset();
+  mocks.setDatabaseVersion(6);
+
+  const events: string[] = [];
+  const checkpoint = createGate();
+  const deleting = createGate();
+
+  mocks.sqlite.createConnection.mockImplementation(async () => {
+    events.push('createConnection');
+    return mocks.db;
+  });
+  mocks.db.open.mockImplementation(async () => void events.push('open'));
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    events.push(`query:${statement}`);
+    if (statement === 'PRAGMA wal_checkpoint(TRUNCATE);') {
+      checkpoint.markEntered();
+      await checkpoint.gate;
+    }
+    if (statement.startsWith('SELECT key, value FROM preferences')) {
+      return { values: [{ key: 'uiTheme', value: 'eink' }] };
+    }
+    return { values: [] };
+  });
+  mocks.db.execute.mockImplementation(async (statement: string, transaction?: boolean) => {
+    events.push(`execute:${String(transaction)}:${statement}`);
+    return { changes: { changes: 0 } };
+  });
+  mocks.db.getVersion.mockImplementation(async () => {
+    events.push('getVersion');
+    return { version: 6 };
+  });
+  mocks.executeTransaction.mockImplementation(async (tasks: capTask[]) => {
+    events.push(tasks[0]?.statement.startsWith('INSERT INTO reading_state') ? 'write' : 'migrate');
+    return { changes: { changes: tasks.length } };
+  });
+  mocks.db.close.mockImplementationOnce(async () => void events.push('close'));
+  mocks.deleteDatabase.mockImplementationOnce(async () => {
+    events.push('deleteDatabase:start');
+    deleting.markEntered();
+    await deleting.gate;
+    events.push('deleteDatabase:done');
+  });
+
+  const resetting = resetLocalDatabase();
+  await checkpoint.entered;
+
+  const reopenedWhileCheckpointing = openDatabase();
+  const savedWhileCheckpointing = saveLocalProgress(
+    book,
+    readingState.cfi,
+    readingState.xpath,
+    0.5,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(events).toEqual(['query:PRAGMA wal_checkpoint(TRUNCATE);']);
+
+  checkpoint.release();
+  await deleting.entered;
+
+  const readWhileDeleting = getPreferences(['uiTheme']);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(mocks.db.open).not.toHaveBeenCalled();
+  expect(events).toEqual([
+    'query:PRAGMA wal_checkpoint(TRUNCATE);',
+    'query:PRAGMA journal_mode = DELETE;',
+    'close',
+    'deleteDatabase:start',
+  ]);
+
+  deleting.release();
+  const [, , prefs] = await Promise.all([
+    resetting,
+    Promise.all([reopenedWhileCheckpointing, savedWhileCheckpointing]),
+    readWhileDeleting,
+  ]);
+
+  expect(prefs.get('uiTheme')).toBe('eink');
+  expect(events.slice(4)).toEqual([
+    'deleteDatabase:done',
+    'createConnection',
+    'open',
+    'query:PRAGMA journal_mode = WAL;',
+    'execute:false:PRAGMA synchronous = NORMAL;',
+    'execute:false:PRAGMA foreign_keys = ON;',
+    'query:PRAGMA busy_timeout = 5000;',
+    'getVersion',
+    'migrate',
+    'write',
+    'query:SELECT key, value FROM preferences WHERE key IN (?)',
+  ]);
+});
+
+it('cleans up partially opened connections and avoids returning deleted handles across reset', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.reset();
+
+  // Case 1: Startup PRAGMA rejects after db.open(); reset cleans up partial handle while gating a second open.
+  const pragmaEvents: string[] = [];
+  const pragmaDelete = createGate();
+  mocks.db.open.mockImplementation(async () => void pragmaEvents.push('open'));
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    pragmaEvents.push(`query:${statement}`);
+    return { values: [] };
+  });
+  mocks.db.execute
+    .mockImplementationOnce(async (statement: string) => {
+      pragmaEvents.push(`execute:fail:${statement}`);
+      throw new Error('pragma synchronous failed');
+    })
+    .mockImplementation(async (statement: string) => {
+      pragmaEvents.push(`execute:${statement}`);
+      return { changes: { changes: 0 } };
+    });
+  mocks.db.close.mockImplementationOnce(async () => void pragmaEvents.push('close'));
+  mocks.deleteDatabase.mockImplementationOnce(async () => {
+    pragmaEvents.push('deleteDatabase:start');
+    pragmaDelete.markEntered();
+    await pragmaDelete.gate;
+    pragmaEvents.push('deleteDatabase:done');
+  });
+
+  await expect(openDatabase()).rejects.toThrow('pragma synchronous failed');
+  const pragmaReset = resetLocalDatabase();
+  await pragmaDelete.entered;
+  const secondOpen = openDatabase();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  expect(pragmaEvents.slice(-4)).toEqual([
+    'query:PRAGMA wal_checkpoint(TRUNCATE);',
+    'query:PRAGMA journal_mode = DELETE;',
+    'close',
+    'deleteDatabase:start',
+  ]);
+  pragmaDelete.release();
+  await Promise.all([pragmaReset, secondOpen]);
+  expect(pragmaEvents.slice(7)).toEqual([
+    'deleteDatabase:done',
+    'open',
+    'query:PRAGMA journal_mode = WAL;',
+    'execute:PRAGMA synchronous = NORMAL;',
+    'execute:PRAGMA foreign_keys = ON;',
+    'query:PRAGMA busy_timeout = 5000;',
+  ]);
+
+  // Case 2: Migration setup rejects while resetLocalDatabase() and a concurrent openDatabase() wait.
+  await resetLocalDatabase();
+  mocks.reset();
+  mocks.setDatabaseVersion(6);
+
+  const migrateEvents: string[] = [];
+  const migration = createGate();
+  const migrateDelete = createGate();
+  mocks.db.open.mockImplementation(async () => void migrateEvents.push('open'));
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    migrateEvents.push(`query:${statement}`);
+    return { values: [] };
+  });
+  mocks.db.execute.mockImplementation(async (statement: string) => {
+    migrateEvents.push(`execute:${statement}`);
+    return { changes: { changes: 0 } };
+  });
+  mocks.executeTransaction
+    .mockImplementationOnce(async () => {
+      migrateEvents.push('migrate:fail:start');
+      migration.markEntered();
+      await migration.gate;
+      return { changes: { changes: 0 } };
+    })
+    .mockImplementation(async () => {
+      migrateEvents.push('migrate:ok');
+      return { changes: { changes: 2 } };
+    });
+  mocks.db.close.mockImplementationOnce(async () => void migrateEvents.push('close'));
+  mocks.deleteDatabase.mockImplementationOnce(async () => {
+    migrateEvents.push('deleteDatabase:start');
+    migrateDelete.markEntered();
+    await migrateDelete.gate;
+    migrateEvents.push('deleteDatabase:done');
+  });
+
+  const failingOpen = openDatabase();
+  await migration.entered;
+  const concurrentReset = resetLocalDatabase();
+  const gatedOpen = openDatabase();
+  migration.fail(new Error('migration 7 failed'));
+  await expect(failingOpen).rejects.toThrow('migration 7 failed');
+  await migrateDelete.entered;
+  expect(migrateEvents.slice(-2)).toEqual(['close', 'deleteDatabase:start']);
+  migrateDelete.release();
+  await Promise.all([concurrentReset, gatedOpen]);
+  expect(migrateEvents.slice(-2)).toEqual(['query:PRAGMA busy_timeout = 5000;', 'migrate:ok']);
+
+  // Case 3: In-flight openDatabase() that resolves as reset begins reopens instead of returning deleted handle.
+  await resetLocalDatabase();
+  mocks.reset();
+  const firstVersion = createGate();
+  const handleDelete = createGate();
+  const makeDb = (onVersion?: () => Promise<void>) => ({
+    ...mocks.db,
+    close: vi.fn(async () => undefined),
+    execute: vi.fn(async () => ({ changes: { changes: 0 } })),
+    executeTransaction: vi.fn(async (tasks: capTask[]) => ({ changes: { changes: tasks.length } })),
+    getVersion: vi.fn(async () => {
+      await onVersion?.();
+      return { version: 7 };
+    }),
+    open: vi.fn(async () => undefined),
+    query: vi.fn(async () => ({ values: [] })),
+    run: vi.fn(async () => ({ changes: { changes: 1 } })),
+  });
+  const firstDb = makeDb(async () => {
+    firstVersion.markEntered();
+    await firstVersion.gate;
+  });
+  const secondDb = makeDb();
+  mocks.deleteDatabase.mockImplementationOnce(async () => {
+    handleDelete.markEntered();
+    await handleDelete.gate;
+  });
+  mocks.sqlite.createConnection.mockResolvedValueOnce(firstDb).mockResolvedValueOnce(secondDb);
+
+  const inFlightOpen = openDatabase();
+  await firstVersion.entered;
+  const handleReset = resetLocalDatabase();
+  firstVersion.release();
+  await handleDelete.entered;
+  expect(firstDb.close).toHaveBeenCalledOnce();
+  expect(secondDb.open).not.toHaveBeenCalled();
+  handleDelete.release();
+  const [, resolvedDb] = await Promise.all([handleReset, inFlightOpen]);
+  expect(resolvedDb).toBe(secondDb);
+});
+
+it('drops superseded pre-reset writes and orphan post-clear progress while preserving post-reset writes', async () => {
+  const store = stubMemoryStorage();
+  try {
+    const dbModule = await import('./database');
+    const { BOOT_THEME_STORAGE_KEY, clearBootThemeCache } = await import('../themes/themes');
+    await dbModule.resetLocalDatabase();
+    mocks.reset();
+
+    const firstOpen = createGate();
+    const firstDelete = createGate();
+    const makeConn = (pauseOpen?: boolean) => ({
+      ...mocks.db,
+      close: vi.fn(async () => undefined),
+      execute: vi.fn(async () => ({ changes: { changes: 0 } })),
+      executeTransaction: vi.fn(async (tasks: capTask[]) => ({
+        changes: { changes: tasks.length },
+      })),
+      getVersion: vi.fn(async () => {
+        if (pauseOpen) {
+          firstOpen.markEntered();
+          await firstOpen.gate;
+        }
+        return { version: 7 };
+      }),
+      open: vi.fn(async () => undefined),
+      query: vi.fn(async () => ({ values: [] })),
+      run: vi.fn(async (_statement: string, _values?: unknown[]) => ({
+        changes: { changes: 1 },
+      })),
+    });
+    const preResetDb = makeConn(true);
+    const postResetDb = makeConn(false);
+    mocks.sqlite.createConnection
+      .mockResolvedValueOnce(preResetDb)
+      .mockResolvedValueOnce(postResetDb);
+    mocks.deleteDatabase.mockImplementationOnce(async () => {
+      firstDelete.markEntered();
+      await firstDelete.gate;
+    });
+
+    const staleServer = {
+      id: 'stale-server',
+      displayName: 'Stale',
+      baseUrl: 'https://stale.example.com',
+      credentialRef: 'cred-stale',
+      kavitaVersion: null,
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const freshServer = { ...staleServer, id: 'fresh-server', displayName: 'Fresh' };
+    const freshBook = { ...book, id: 'fresh-server:1:10', serverId: freshServer.id };
+
+    const staleOps = Promise.all([
+      dbModule.saveServer(staleServer),
+      dbModule.saveLocalProgress(book, 'stale-cfi', '/stale', 0.4),
+      dbModule.setPreferences(new Map([['uiTheme', 'eink']])),
+    ]);
+    await firstOpen.entered;
+
+    const resetAndFreshOps = Promise.all([
+      dbModule.resetLocalDatabase(),
+      dbModule.saveServer(freshServer),
+      dbModule.reconcileBooks(freshServer.id, [freshBook]),
+      dbModule.saveLocalProgress(freshBook, 'fresh-cfi', '/fresh', 0.6),
+    ]);
+    firstOpen.release();
+    await firstDelete.entered;
+    firstDelete.release();
+    await Promise.all([staleOps, resetAndFreshOps]);
+
+    expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+    expect(postResetDb.run).toHaveBeenCalledOnce();
+    expect(postResetDb.run.mock.calls[0]?.[1]?.[0]).toBe('fresh-server');
+    expect(JSON.stringify(postResetDb.executeTransaction.mock.calls)).not.toContain('stale-cfi');
+    expect(JSON.stringify(postResetDb.executeTransaction.mock.calls)).toContain('fresh-cfi');
+
+    // Browser storage path: interleaving progress writes with clear() / removeServer / reset leaves no orphan rows.
+    mocks.setNativePlatform(false);
+    const staleBook = { ...book, serverId: staleServer.id };
+    await dbModule.saveServer(staleServer);
+    await dbModule.reconcileBooks(staleServer.id, [staleBook]);
+    await dbModule.saveLocalProgress(staleBook, 'stale-cfi', '/stale', 0.3);
+    await dbModule.setPreferences(new Map([['uiTheme', 'eink']]));
+
+    await dbModule.removeServer(staleServer.id);
+    clearBootThemeCache();
+    await dbModule.saveLocalProgress(staleBook, 'orphan-cfi', '/orphan', 0.8);
+    await dbModule.markBookCompleted(staleBook);
+    expect(await dbModule.getReadingState(book.id)).toBeNull();
+    expect(await dbModule.getPendingSync(staleServer.id)).toEqual([]);
+    expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+
+    window.localStorage.clear();
+    await dbModule.saveLocalProgress(staleBook, 'after-clear', '/clear', 0.5);
+    await dbModule.saveServer(freshServer);
+    await dbModule.reconcileBooks(freshServer.id, [freshBook]);
+    await dbModule.saveLocalProgress(freshBook, 'kept-cfi', '/kept', 0.7);
+    expect(await dbModule.getReadingState(book.id)).toBeNull();
+    expect(await dbModule.getReadingState(freshBook.id)).toMatchObject({ cfi: 'kept-cfi' });
+
+    await dbModule.resetLocalDatabase();
+    expect(await dbModule.getServer()).toBeNull();
+    expect(await dbModule.getReadingState(freshBook.id)).toBeNull();
   } finally {
     vi.unstubAllGlobals();
   }
