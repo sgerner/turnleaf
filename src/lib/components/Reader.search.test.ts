@@ -454,4 +454,75 @@ describe('Reader search workflow and floating match bar', () => {
     expect(target.querySelector('[data-reader-search-bar]')).toBeNull();
     expect(onRelocated).not.toHaveBeenCalled();
   });
+
+  it('opens a modal alertdialog when stepping to an unavailable match and restores focus to the match bar on dismiss', async () => {
+    const results = [makeResult(0, 'Harbor', 0), makeResult(1, 'Harbor', 1)];
+    sessionMock.search.mockResolvedValueOnce({
+      results,
+      scannedChapters: 2,
+      skippedChapters: 0,
+      totalChapters: 2,
+      nextCursor: null,
+    } satisfies ReaderSearchBatch);
+
+    component = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'book.epub',
+        bookId: 'book-4',
+        title: 'Alert Focus Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await flushAsync();
+
+    sessionMock.onLocation?.(makeLocation('origin-cfi', 'ch1.xhtml', 0), 'restore');
+    flushSync();
+
+    await openSearchPanel();
+    const input = target.querySelector<HTMLInputElement>('#reader-search-query')!;
+    input.value = 'Harbor';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    target
+      .querySelector<HTMLFormElement>('#reader-search form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushAsync();
+
+    target.querySelectorAll<HTMLButtonElement>('[data-reader-focus="search-result"]')[0]?.click();
+    await flushAsync();
+
+    const matchBar = target.querySelector<HTMLElement>('[data-reader-search-bar]')!;
+    const nextBtn = matchBar.querySelector<HTMLButtonElement>('[aria-label="Next search match"]')!;
+
+    sessionMock.displayCfi.mockResolvedValueOnce(false);
+    sessionMock.display.mockRejectedValueOnce(new Error('Missing chapter'));
+
+    nextBtn.focus();
+    nextBtn.click();
+    await flushAsync();
+
+    const errorDialog = target.querySelector<HTMLElement>(
+      '[role="alertdialog"][aria-modal="true"]',
+    );
+    expect(errorDialog).not.toBeNull();
+    expect(errorDialog?.textContent).toContain(
+      'This search result is no longer available in the current EPUB.',
+    );
+    expect(matchBar.classList.contains('hidden')).toBe(true);
+    expect(matchBar.inert).toBe(true);
+
+    const dismissBtn = Array.from(errorDialog!.querySelectorAll<HTMLButtonElement>('button')).find(
+      (btn) => btn.textContent?.trim() === 'Dismiss',
+    )!;
+    expect(document.activeElement).toBe(dismissBtn);
+
+    dismissBtn.click();
+    await flushAsync();
+
+    expect(target.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(matchBar.classList.contains('hidden')).toBe(false);
+    expect(matchBar.inert).toBe(false);
+    expect(document.activeElement).toBe(nextBtn);
+  });
 });
