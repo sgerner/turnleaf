@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix(sync): cancel in-flight requests on disconnect and gate reconnects
 - fix(android): prevent cellular fallback flap and retry pending reconnect sync
 - fix(android): prevent offline request leaks and startup viewport resize races
 - refactor: consolidate duplicated database persistence helpers

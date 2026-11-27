@@ -845,3 +845,26 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
     'repeated series page',
   );
 });
+
+it('rejects in-flight native requests immediately when signal aborts without recording diagnostics', async () => {
+  capacitorRuntime.native = true;
+  clearDiagnostics();
+  const controller = new AbortController();
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(() => new Promise(() => {}));
+
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+  const pending = client.saveProgress(
+    {
+      libraryId: 1,
+      seriesId: 2,
+      volumeId: 3,
+      chapterId: 4,
+      pageNum: 5,
+    },
+    controller.signal,
+  );
+  controller.abort();
+
+  await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+});

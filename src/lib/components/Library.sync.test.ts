@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Capacitor } from '@capacitor/core';
 import { flushSync, mount, unmount } from 'svelte';
 import {
   getBooks,
@@ -308,7 +309,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     expect(booksAfterReconcile[0]?.pagesRead).toBe(40);
   });
 
-  it('uploads queued progress during a brief reconnect window and cancels only catalog refresh on disconnect', async () => {
+  it('uploads completed items during a brief reconnect window and cancels in-flight catalog and progress work on disconnect', async () => {
     networkConnected = false;
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/8)', '//body/p[8]', 0.55, 2);
 
@@ -335,6 +336,9 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
         if (uploadCalls === 2) {
           secondUploadStarted.resolve();
           await secondUploadGate.promise;
+          if (init?.signal?.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
+          }
         }
         return new Response(null, { status: 204 });
       }
@@ -354,7 +358,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
       return jsonResponse({});
     });
 
-    await mountLibrary();
+    const { target } = await mountLibrary();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fetchSpy).not.toHaveBeenCalled();
 
@@ -368,17 +372,30 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     await waitForCondition(() => catalogSignals.length === 1);
     expect(uploadCalls).toBe(2);
 
-    // Network drops mid-refresh (within 2-second window): catalog refresh aborts, in-flight upload does not
+    // Network drops mid-refresh and mid-upload: both catalog refresh and in-flight upload abort
     networkConnected = false;
     for (const listener of networkListeners) {
       listener({ connected: false, connectionType: 'none' });
     }
 
     expect(catalogSignals[0]?.aborted).toBe(true);
-    expect(progressSignals[1]?.aborted).toBe(false);
+    expect(progressSignals[1]?.aborted).toBe(true);
 
     secondUploadGate.resolve();
+    await waitForCondition(() =>
+      Boolean(target.textContent?.includes('1 reading progress update waiting to sync.')),
+    );
+    expect(target.textContent).not.toContain('failed and remain queued');
+    const remaining = await getPendingSync(server.id);
+    expect(remaining.map((item) => item.bookId)).toEqual([secondBook.id]);
+
+    // Confirmed reconnect uploads the preserved item
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
     await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    expect(uploadCalls).toBe(3);
   });
 
   it('awaits active syncWork in updateApiKey before switching keys, then runs syncProgress and refresh concurrently while preserving notice', async () => {
@@ -627,5 +644,172 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('invalidates in-flight catalog and progress requests on disconnect and blocks new requests until a confirmed reconnect', async () => {
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/10)', '//body/p[10]', 0.5, 2);
+
+    const catalogStarted = deferred<void>();
+    const progressStarted = deferred<void>();
+    const releaseCatalog = deferred<Response>();
+    const observedPaths: string[] = [];
+    let holdCatalog = true;
+    let holdProgress = true;
+    let catalogSignal: AbortSignal | undefined;
+    let progressSignal: AbortSignal | undefined;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      observedPaths.push(url.pathname);
+      if (url.pathname === '/api/Series/v2') {
+        catalogSignal = init?.signal ?? undefined;
+        if (holdCatalog) {
+          holdCatalog = false;
+          catalogStarted.resolve();
+          return releaseCatalog.promise;
+        }
+        return jsonResponse([seriesListItem(50)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(50));
+      }
+      if (url.pathname === '/api/Reader/progress') {
+        progressSignal = init?.signal ?? undefined;
+        if (holdProgress) {
+          holdProgress = false;
+          progressStarted.resolve();
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              'abort',
+              () => reject(new DOMException('Aborted', 'AbortError')),
+              { once: true },
+            );
+          });
+        }
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await Promise.all([catalogStarted.promise, progressStarted.promise]);
+
+    // Disconnect while both /api/Series/v2 and /api/Reader/progress are in flight
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+
+    expect(catalogSignal?.aborted).toBe(true);
+    expect(progressSignal?.aborted).toBe(true);
+
+    // Even if the pre-disconnect /api/Series/v2 response resolves at the boundary,
+    // Library must discard it and never request /api/Series/series-detail while offline
+    releaseCatalog.resolve(jsonResponse([seriesListItem(50)]));
+    await waitForCondition(() =>
+      Boolean(target.textContent?.includes('1 reading progress update waiting to sync.')),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const countAfterDisconnect = observedPaths.length;
+    expect(observedPaths).not.toContain('/api/Series/series-detail');
+    expect(target.textContent).toContain('No network connection. Showing your saved library.');
+    expect(target.textContent).not.toContain('failed and remain queued');
+    expect(await getPendingSync(server.id)).toHaveLength(1);
+
+    // App backgrounding and unconfirmed reconnect events must not start any authenticated requests
+    for (const listener of appStateListeners) {
+      listener({ isActive: false });
+    }
+    for (const listener of networkListeners) {
+      // Spurious online event while Network.getStatus() still reports disconnected
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(observedPaths).toHaveLength(countAfterDisconnect);
+    expect(target.textContent).toContain('No network connection. Showing your saved library.');
+    expect(await getPendingSync(server.id)).toHaveLength(1);
+
+    // Confirmed reconnect flushes preserved progress and refreshes catalog
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    await waitForCondition(() => observedPaths.includes('/api/Series/series-detail'));
+    await waitForCondition(
+      () =>
+        !target.querySelector('p[role="status"]')?.textContent?.includes('No network connection.'),
+    );
+    expect(target.querySelector('p[role="status"]')?.textContent).not.toContain(
+      'No network connection.',
+    );
+  });
+
+  it('ignores transient native cellular fallback flaps before NATIVE_RECONNECT_SETTLE_MS elapses', async () => {
+    networkConnected = false;
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/12)', '//body/p[12]', 0.6, 3);
+
+    const observedPaths: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      observedPaths.push(url.pathname);
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(60)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(60));
+      }
+      if (url.pathname === '/api/Reader/progress') {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() =>
+      Boolean(target.textContent?.includes('1 reading progress update waiting to sync.')),
+    );
+    expect(observedPaths).toEqual([]);
+
+    const nativeSpy = vi.spyOn(Capacitor, 'isNativePlatform');
+
+    // Transient dying-cellular promotion briefly reports connected: true, then drops within 250ms
+    nativeSpy.mockReturnValueOnce(true);
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 260));
+
+    expect(observedPaths).toEqual([]);
+    expect(await getPendingSync(server.id)).toHaveLength(1);
+    expect(target.querySelector('p[role="status"]')?.textContent).toContain(
+      'No network connection.',
+    );
+
+    // Sustained reconnect waits out NATIVE_RECONNECT_SETTLE_MS before starting requests
+    nativeSpy.mockReturnValueOnce(true);
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(observedPaths).toEqual([]);
+
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0, 3_000);
+    await waitForCondition(() => observedPaths.includes('/api/Series/series-detail'), 3_000);
+    expect(observedPaths).toContain('/api/Reader/progress');
   });
 });

@@ -13,37 +13,49 @@ export function flushProgress(
   client: KavitaClient,
   serverId: string,
   canSync: () => boolean | Promise<boolean> = () => true,
+  signal?: AbortSignal,
 ): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId, canSync).finally(() => {
+  const current = run(client, serverId, canSync, signal).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
   return current;
 }
 
+async function isSyncInterrupted(
+  canSync: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return true;
+  const allowed = await canSync();
+  return !allowed || Boolean(signal?.aborted);
+}
+
 async function run(
   client: KavitaClient,
   serverId: string,
   canSync: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
 ): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
   while (true) {
-    if (!(await canSync())) break;
+    if (await isSyncInterrupted(canSync, signal)) break;
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
-    if (pending.length === 0) break;
+    if (pending.length === 0 || (await isSyncInterrupted(canSync, signal))) break;
     for (const item of pending) {
-      if (!(await canSync())) break;
+      if (await isSyncInterrupted(canSync, signal)) break;
       attempted.set(item.bookId, item);
       try {
-        await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
-        await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
+        const payload = JSON.parse(item.payload) as KavitaProgress;
+        await (signal ? client.saveProgress(payload, signal) : client.saveProgress(payload));
       } catch (error) {
+        if (await isSyncInterrupted(canSync, signal)) break;
         await markSyncFailure(
           item.bookId,
           error instanceof Error ? error.message : 'Sync failed',
@@ -51,7 +63,10 @@ async function run(
           item.updatedAt,
         );
         failures.push(error);
+        continue;
       }
+      if (signal?.aborted) break;
+      await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
     }
   }
   if (failures.length > 0) {

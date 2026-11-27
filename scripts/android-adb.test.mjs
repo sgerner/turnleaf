@@ -4,10 +4,12 @@ import {
   DEFAULT_FONT_SCALE,
   KEYCODE_BACK,
   KEYCODE_VOLUME_DOWN,
+  areRadiosDisconnected,
   createAdbRunner,
   dumpWindowState,
   getFontScale,
   getImmersiveModeConfirmations,
+  parseConnectivityDump,
   parseWindowDump,
   sendKeyEvent,
   setFontScale,
@@ -223,6 +225,59 @@ describe('Android ADB journey helpers', () => {
         'secure',
         'immersive_mode_confirmations',
       ],
+    ]);
+  });
+
+  it('parses dumpsys connectivity across active Wi-Fi, dying cellular fallback, and disconnected states', async () => {
+    const activeWifiDump = `
+Current Networks:
+  NetworkAgentInfo{network{100} handle{432902426637} ni{WIFI CONNECTED extra: "AndroidWifi"} Score(60)
+    nc{[ Transports: WIFI Capabilities: NOT_METERED&INTERNET&VALIDATED ]}
+  }
+Active default network: 100
+`;
+    const dyingCellularFallbackDump = `
+Current Networks:
+  NetworkAgentInfo{network{101} handle{437197393933} ni{MOBILE[LTE] CONNECTED extra: epc.tmobile.com} Score(50)
+    nc{[ Transports: CELLULAR Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VPN&VALIDATED ]}
+  }
+Active default network: none
+`;
+    const fullyDisconnectedDump = `
+Current Networks:
+Active default network: none
+`;
+
+    expect(parseConnectivityDump(activeWifiDump)).toEqual({
+      defaultNetwork: '100',
+      connectedTransports: ['wifi'],
+      disconnected: false,
+    });
+    expect(parseConnectivityDump(dyingCellularFallbackDump)).toEqual({
+      defaultNetwork: null,
+      connectedTransports: ['cellular'],
+      disconnected: false,
+    });
+    expect(parseConnectivityDump(fullyDisconnectedDump)).toEqual({
+      defaultNetwork: null,
+      connectedTransports: [],
+      disconnected: true,
+    });
+
+    const calls = [];
+    let dumpOutput = dyingCellularFallbackDump;
+    const execFileImpl = vi.fn((command, args, _options, callback) => {
+      calls.push([command, ...args]);
+      callback(null, { stdout: dumpOutput, stderr: '' });
+    });
+    const adb = createAdbRunner({ getSerial: () => 'emulator-5554', execFileImpl });
+
+    expect(await areRadiosDisconnected(adb)).toBe(false);
+    dumpOutput = fullyDisconnectedDump;
+    expect(await areRadiosDisconnected(adb)).toBe(true);
+    expect(calls).toEqual([
+      ['adb', '-s', 'emulator-5554', 'shell', 'dumpsys', 'connectivity'],
+      ['adb', '-s', 'emulator-5554', 'shell', 'dumpsys', 'connectivity'],
     ]);
   });
 });

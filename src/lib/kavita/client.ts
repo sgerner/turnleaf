@@ -67,6 +67,7 @@ export class KavitaClient {
     const series: KavitaSeries[] = [];
     const seenSeriesIds = new Set<number>();
     for (let pageNumber = 1; pageNumber <= MAX_SERIES_PAGES; pageNumber += 1) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const options: RequestInit = {
         method: 'POST',
         body: JSON.stringify({
@@ -200,7 +201,9 @@ export class KavitaClient {
         return await this.parseJsonPayload<T>(path, () => response.json() as Promise<T>);
       } catch (error) {
         if (error instanceof KavitaError) throw error;
-        recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+        if (!init.signal?.aborted) {
+          recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+        }
         const message = timeoutSignal.aborted
           ? 'Kavita did not respond in time.'
           : 'Kavita could not be reached. Check the address and network.';
@@ -229,7 +232,10 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
-        response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
+        response = await this.raceSignal(
+          init.signal,
+          CapacitorHttp.request({ ...options, url: redirects.currentUrl }),
+        );
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (
           !advanceRedirect(redirects, response.status, nativeHeader(response.headers, 'location'))
@@ -269,6 +275,19 @@ export class KavitaClient {
         return response;
       }
     }
+  }
+
+  private raceSignal<T>(signal: AbortSignal | null | undefined, work: Promise<T>): Promise<T> {
+    if (!signal) return work;
+    if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    return Promise.race([work, aborted]).finally(() => {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+    });
   }
 
   private async withBrowserTimeout<T>(

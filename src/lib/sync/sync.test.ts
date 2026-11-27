@@ -267,3 +267,86 @@ it('stops uploading queued items without losing them when canSync reports offlin
   expect(saved.syncQueue['book-2']?.lastError).toBeNull();
   expect(saved.readingState['book-2']?.pendingSync).toBe(true);
 });
+
+it('cancels an in-flight upload on abort and preserves the queued item without failure for retry', async () => {
+  const initial = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":12}');
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
+
+  let online = true;
+  let observedSignal: AbortSignal | undefined;
+  let notifyStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    notifyStarted = resolve;
+  });
+
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce((_payload: unknown, signal?: AbortSignal) => {
+      observedSignal = signal;
+      notifyStarted();
+      return new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
+          once: true,
+        });
+      });
+    })
+    .mockResolvedValueOnce(undefined);
+
+  const controller = new AbortController();
+  const disconnectedFlush = flushProgress(
+    { saveProgress } as never,
+    'server',
+    () => online,
+    controller.signal,
+  );
+  await started;
+
+  online = false;
+  controller.abort();
+
+  await expect(disconnectedFlush).resolves.toBeUndefined();
+  expect(observedSignal?.aborted).toBe(true);
+
+  const afterDisconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
+  expect(afterDisconnect.syncQueue['book-1']).toMatchObject({
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    revision: 1,
+  });
+  expect(afterDisconnect.readingState['book-1']?.pendingSync).toBe(true);
+
+  online = true;
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', () => online),
+  ).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+
+  const afterReconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
+  expect(afterReconnect.syncQueue['book-1']).toBeUndefined();
+  expect(afterReconnect.readingState['book-1']?.pendingSync).toBe(false);
+});
+
+it('preserves queued progress without marking failure when saveProgress rejects after connectivity drops', async () => {
+  const initial = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":15}');
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
+
+  let online = true;
+  const saveProgress = vi.fn().mockImplementationOnce(async () => {
+    online = false;
+    throw new Error('Network dropped mid-request');
+  });
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', () => online),
+  ).resolves.toBeUndefined();
+
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
+  expect(saved.syncQueue['book-1']).toMatchObject({
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    revision: 1,
+  });
+  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+});
