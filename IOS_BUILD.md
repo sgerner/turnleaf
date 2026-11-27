@@ -1,21 +1,22 @@
 # iOS Build on macOS
 
-The iOS Capacitor project is scaffolded and synchronized. It was not compiled or simulator-tested on Linux.
+The iOS Capacitor project is synchronized on Linux (`npm run ios:check`) and compiled for an unsigned iPhone Simulator target on `macos-latest` (`npm run ios:simulator`) in CI, alongside CodeQL Swift analysis.
 
-The iOS release status remains **unverified** until the checks below are completed on macOS and at
-least one real iPhone. Record the date, device/OS, app build, and result for each check before
-describing an iOS build as ready.
+The iOS production release status remains **unverified** until signed archive and physical-device checks below are completed on macOS and at least one real iPhone. Record the date, device/OS, app build, and result for each check before describing an iOS build as ready.
 
-## macOS commands
+## Local and CI commands
 
 ```bash
 xcode-select --install
 brew install node cocoapods
 npm ci
-npm run build
 npm run ios:sync
+npm run ios:check
+npm run ios:simulator
 npm run ios:open
 ```
+
+`npm run ios:sync` builds the web bundle, runs `cap sync ios`, aligns `MARKETING_VERSION` in `ios/App/App.xcodeproj/project.pbxproj` with `package.json`, and checks `PrivacyInfo.xcprivacy` target resource membership. `npm run ios:check` runs on both Linux and macOS and fails if `Package.swift`, `MARKETING_VERSION`, or `PrivacyInfo.xcprivacy` target membership drifts from `package.json` and `ios/App/App/`. `npm run ios:simulator` compiles an unsigned `App.app` bundle with `xcodebuild` (`generic/platform=iOS Simulator`, `CODE_SIGNING_ALLOWED=NO`) and verifies that the built bundle includes `PrivacyInfo.xcprivacy` and matches `package.json` `CFBundleShortVersionString`.
 
 Capacitor 8 generated this project with Swift Package Manager, so CocoaPods is installed for plugin/tooling compatibility but `pod install` is not currently required. If the project is intentionally converted to CocoaPods later:
 
@@ -29,7 +30,7 @@ In Xcode:
 
 1. Select the `App` target, then Signing & Capabilities.
 2. Choose the owning Apple Developer team and confirm the unique bundle ID `app.turnleaf.reader`.
-3. Confirm `PrivacyInfo.xcprivacy` has target membership.
+3. Confirm `PrivacyInfo.xcprivacy` remains in `App` target resources (`Copy Bundle Resources`).
 4. Select an iPhone simulator or connected device and use Product > Build.
 5. Use Product > Archive for a distribution build, then validate signing in Organizer.
 
