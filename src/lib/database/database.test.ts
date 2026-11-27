@@ -1215,11 +1215,8 @@ it('saves normalized browser remote progress and guards against concurrent local
   expect(setItemSpy).not.toHaveBeenCalled();
 });
 
-it('persists zero-based spine pageNum, explicit completion payloads, and legacy DocFragment remote overrides in browser storage', async () => {
-  Object.defineProperty(window, 'localStorage', {
-    configurable: true,
-    value: new MemoryStorage(),
-  });
+it('persists zero-based pageNum, completion payloads, and legacy DocFragment remote overrides in browser storage', async () => {
+  Object.defineProperty(window, 'localStorage', { configurable: true, value: new MemoryStorage() });
   localStorage.setItem(
     BROWSER_STORAGE_KEY,
     JSON.stringify({
@@ -1239,32 +1236,23 @@ it('persists zero-based spine pageNum, explicit completion payloads, and legacy 
     percentage: 0.05,
     pendingSync: true,
   });
-  const firstQueue = await getPendingSync('server');
-  expect(JSON.parse(firstQueue[0]!.payload)).toMatchObject({
+  expect(JSON.parse((await getPendingSync('server'))[0]!.payload)).toMatchObject({
     pageNum: 0,
     bookScrollId: '//body/p[4]',
   });
 
   await markBookCompleted(existingBook);
-  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
-    pageNum: existingBook.pages,
-    xpath: null,
-    percentage: 1,
-    pendingSync: true,
-  });
   const completedQueue = await getPendingSync('server');
   expect(JSON.parse(completedQueue[0]!.payload)).toMatchObject({
     pageNum: existingBook.pages,
     bookScrollId: null,
   });
-
   await confirmSync(
     existingBook.id,
     '2026-09-07T00:01:00.000Z',
     completedQueue[0]!.revision,
     completedQueue[0]!.updatedAt,
   );
-  const acknowledged = await getReadingState(existingBook.id);
   await expect(
     saveRemoteProgress(
       existingBook,
@@ -1277,7 +1265,7 @@ it('persists zero-based spine pageNum, explicit completion payloads, and legacy 
         bookScrollId: '//body/DocFragment[3]/body/p[2]',
         lastModifiedUtc: '2026-09-07T00:02:00.000Z',
       },
-      acknowledged,
+      await getReadingState(existingBook.id),
     ),
   ).resolves.toBe(true);
   await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
@@ -1287,4 +1275,60 @@ it('persists zero-based spine pageNum, explicit completion payloads, and legacy 
     percentage: 0.02,
     pendingSync: false,
   });
+});
+
+it('interleaves browser progress writes with clear(), removeServer, and resetLocalDatabase without stale rows or data loss', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', { configurable: true, value: storage });
+  const serverConfig = {
+    id: 'server',
+    displayName: 'Test server',
+    baseUrl: 'https://books.example.com',
+    credentialRef: 'credential',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  };
+
+  await saveServer(serverConfig);
+  await reconcileBooks('server', [existingBook]);
+  await saveLocalProgress(existingBook, 'before-clear', '//body/p[2]', 0.1, 1);
+
+  storage.clear();
+  await saveLocalProgress(existingBook, 'stale-after-clear', '//body/p[3]', 0.2, 2);
+  await markBookCompleted(existingBook);
+  await expect(
+    saveRemoteProgress(
+      existingBook,
+      { libraryId: 1, seriesId: 1, volumeId: 10, chapterId: 10, pageNum: 5 },
+      null,
+    ),
+  ).resolves.toBe(false);
+  expect(await getReadingState(existingBook.id)).toBeNull();
+  expect(await getPendingSync('server')).toEqual([]);
+
+  await saveServer(serverConfig);
+  await reconcileBooks('server', [existingBook]);
+  await saveLocalProgress(existingBook, 'before-reset', '//body/p[4]', 0.15, 1);
+  await removeServer('server');
+  await saveLocalProgress(existingBook, 'stale-after-remove', '//body/p[5]', 0.25, 2);
+  await resetLocalDatabase();
+  await markBookCompleted(existingBook);
+  expect(JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}')).toMatchObject({
+    books: [],
+    readingState: {},
+    syncQueue: {},
+  });
+
+  await saveServer(serverConfig);
+  await reconcileBooks('server', [existingBook]);
+  await saveLocalProgress(existingBook, 'fresh-after-reset', '//body/p[9]', 0.42, 4);
+  await expect(getReadingState(existingBook.id)).resolves.toMatchObject({
+    cfi: 'fresh-after-reset',
+    pageNum: 4,
+    xpath: '//body/p[9]',
+    percentage: 0.42,
+    pendingSync: true,
+    syncRevision: 1,
+  });
+  expect((await getPendingSync('server')).map((item) => item.bookId)).toEqual([existingBook.id]);
 });

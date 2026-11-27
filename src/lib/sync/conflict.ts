@@ -83,8 +83,15 @@ function sameKavitaLocation(
 ): boolean {
   const localXPath = local.xpath?.trim();
   const remoteXPath = remote.bookScrollId?.trim();
+  if (bookPages > 0) {
+    const localCompleted = local.pageNum != null && local.pageNum >= bookPages && !localXPath;
+    const remoteCompleted = remote.pageNum >= bookPages;
+    if (localCompleted || remoteCompleted) return localCompleted && remoteCompleted;
+  }
+  if (!localXPath && !remoteXPath) {
+    return local.pageNum != null && local.pageNum === remote.pageNum && remote.pageNum > 0;
+  }
   if (!localXPath || !remoteXPath) return false;
-  if (bookPages > 0 && remote.pageNum >= bookPages) return false;
 
   const localTarget = parseKavitaXPath(localXPath, local.pageNum);
   const remoteTarget = parseKavitaXPath(remoteXPath, remote.pageNum);
@@ -94,9 +101,7 @@ function sameKavitaLocation(
       localTarget.contentXPath === remoteTarget.contentXPath
     );
   }
-  if (localTarget || remoteTarget) {
-    return local.pageNum == null && localXPath === remoteXPath;
-  }
+  if (localTarget || remoteTarget) return local.pageNum == null && localXPath === remoteXPath;
   return (local.pageNum == null || local.pageNum === remote.pageNum) && localXPath === remoteXPath;
 }
 
@@ -136,6 +141,14 @@ export function chooseOpenProgress(
       return location === 'remote' ? 'remote' : 'local';
     }
     const remotePage = resolveKavitaPageNumber(remote.pageNum, remote.bookScrollId, bookPages) ?? 0;
+    const localPage = local.xpath?.trim()
+      ? resolveKavitaPageNumber(local.pageNum, local.xpath, bookPages)
+      : null;
+    if (localPage !== null) {
+      if (remotePage > localPage) return 'remote';
+      if (localPage > remotePage) return 'local';
+      if (!remote.bookScrollId?.trim()) return 'local';
+    }
     const remotePercentage = bookPages > 0 ? remotePage / bookPages : 0;
     return chooseFurthestProgress(local.percentage, remotePercentage);
   }

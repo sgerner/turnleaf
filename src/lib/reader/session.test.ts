@@ -132,67 +132,28 @@ describe('Kavita EPUB locations', () => {
     expect(toKavitaXPath('/html[1]/body[1]/div[2]/p[3]', 0)).toBe('//body/div[2]/p[3]');
   });
 
-  it('combines zero-based Kavita pageNum with chapter-scoped body paths', () => {
-    expect(parseKavitaXPath('//body/section[1]/p[4]', 0)).toEqual({
-      spineIndex: 0,
-      contentXPath: '/html/body/section[1]/p[4]',
-    });
-    expect(parseKavitaXPath('/body/div[2]/p[1]', 2)).toEqual({
-      spineIndex: 2,
-      contentXPath: '/html/body/div[2]/p[1]',
-    });
-    expect(parseKavitaXPath('/html/body/p[3]', 4)).toEqual({
-      spineIndex: 4,
-      contentXPath: '/html/body/p[3]',
-    });
-    expect(parseKavitaXPath('//body', 1)).toEqual({
-      spineIndex: 1,
-      contentXPath: '/html/body',
-    });
-  });
-
-  it('normalizes KOReader unindexed steps and text-node offset suffixes', () => {
-    expect(parseKavitaXPath('//body/div/p[4]/text()[1].18', 0)).toEqual({
-      spineIndex: 0,
-      contentXPath: '/html/body/div[1]/p[4]',
-    });
-    expect(parseKavitaXPath('/body/DocFragment[2]/body/div/section/p[3]/text().0')).toEqual({
-      spineIndex: 1,
-      contentXPath: '/html/body/div[1]/section[1]/p[3]',
-    });
-  });
-
-  it('parses Kavita Web element-ID anchors with zero-based spine indices', () => {
-    expect(parseKavitaXPath('id("note-1")', 0)).toEqual({
-      spineIndex: 0,
-      contentXPath: 'id("note-1")',
-    });
-    expect(parseKavitaXPath('id("sec:1.2")/div/p[2]', 3)).toEqual({
-      spineIndex: 3,
-      contentXPath: 'id("sec:1.2")/div[1]/p[2]',
-    });
-    expect(parseKavitaXPath('//*[@id="fn-4"]/span[2]', 1)).toEqual({
-      spineIndex: 1,
-      contentXPath: 'id("fn-4")/span[2]',
-    });
-  });
-
-  it('maps legacy DocFragment locations back to zero-based EPUB spine indices', () => {
-    expect(parseKavitaXPath('//body/DocFragment[3]/body/section[1]/p[4]')).toEqual({
-      spineIndex: 2,
-      contentXPath: '/html/body/section[1]/p[4]',
-    });
-    expect(parseKavitaXPath('//body/DocFragment[3]/body/section[1]/p[4]', 3)).toEqual({
-      spineIndex: 2,
-      contentXPath: '/html/body/section[1]/p[4]',
-    });
-  });
-
-  it('accepts legacy Kavita chapter-body locations with a trailing slash', () => {
-    expect(parseKavitaXPath('//body/DocFragment[2]/body/')).toEqual({
-      spineIndex: 1,
-      contentXPath: '/html/body',
-    });
+  it.each([
+    ['//body/section[1]/p[4]', 0, { spineIndex: 0, contentXPath: '/html/body/section[1]/p[4]' }],
+    ['/body/div[2]/p[1]', 2, { spineIndex: 2, contentXPath: '/html/body/div[2]/p[1]' }],
+    ['/html/body/p[3]', 4, { spineIndex: 4, contentXPath: '/html/body/p[3]' }],
+    ['//body', 1, { spineIndex: 1, contentXPath: '/html/body' }],
+    ['//body/div/p[4]/text()[1].18', 0, { spineIndex: 0, contentXPath: '/html/body/div[1]/p[4]' }],
+    [
+      '/body/DocFragment[2]/body/div/section/p[3]/text().0',
+      undefined,
+      { spineIndex: 1, contentXPath: '/html/body/div[1]/section[1]/p[3]' },
+    ],
+    ['id("note-1")', 0, { spineIndex: 0, contentXPath: 'id("note-1")' }],
+    ['id("sec:1.2")/div/p[2]', 3, { spineIndex: 3, contentXPath: 'id("sec:1.2")/div[1]/p[2]' }],
+    ['//*[@id="fn-4"]/span[2]', 1, { spineIndex: 1, contentXPath: 'id("fn-4")/span[2]' }],
+    [
+      '//body/DocFragment[3]/body/section[1]/p[4]',
+      3,
+      { spineIndex: 2, contentXPath: '/html/body/section[1]/p[4]' },
+    ],
+    ['//body/DocFragment[2]/body/', undefined, { spineIndex: 1, contentXPath: '/html/body' }],
+  ] as const)('parses %s at spine %s into canonical target', (xpath, spine, expected) => {
+    expect(parseKavitaXPath(xpath, spine)).toEqual(expected);
   });
 
   it('resolves legacy DocFragment page numbers without overriding explicit completion', () => {
@@ -564,8 +525,12 @@ describe('ReaderSession XPath restoration', () => {
     session.destroy();
   });
 
-  it('maps zero-based chapter percentages accurately across small and large spine counts', async () => {
-    testState.sections = Array.from({ length: 49 }, (_, index) => ({
+  it.each([
+    [49, 1 / 49, 'chapter-2.xhtml'],
+    [2000, 1999 / 2000, 'chapter-2000.xhtml'],
+  ])('maps zero-based chapter percentage for %i-spine EPUB to %s', async (count, pct, expected) => {
+    vi.clearAllMocks();
+    testState.sections = Array.from({ length: count }, (_, index) => ({
       href: `chapter-${index + 1}.xhtml`,
       index,
     }));
@@ -574,31 +539,13 @@ describe('ReaderSession XPath restoration', () => {
       document.createElement('div'),
       null,
       null,
-      1 / 49,
+      pct,
       defaultAppearance,
       vi.fn(),
       vi.fn(),
     );
-    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-2.xhtml');
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(expected);
     session.destroy();
-
-    vi.clearAllMocks();
-    testState.sections = Array.from({ length: 2000 }, (_, index) => ({
-      href: `chapter-${index + 1}.xhtml`,
-      index,
-    }));
-    const largeSession = new ReaderSession('large.epub');
-    await largeSession.open(
-      document.createElement('div'),
-      null,
-      null,
-      1999 / 2000,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-    );
-    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('chapter-2000.xhtml');
-    largeSession.destroy();
   });
 
   it('matches active chapter elements against both canonical body paths and ID-anchored locators', async () => {

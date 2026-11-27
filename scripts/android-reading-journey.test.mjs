@@ -10,27 +10,15 @@ const STORAGE_KEY = 'turnleaf_browser_database_v1';
 
 class MemoryStorage {
   values = new Map();
-
-  get length() {
-    return this.values.size;
-  }
-
   clear() {
     this.values.clear();
   }
-
   getItem(key) {
     return this.values.get(key) ?? null;
   }
-
-  key(index) {
-    return [...this.values.keys()][index] ?? null;
-  }
-
   removeItem(key) {
     this.values.delete(key);
   }
-
   setItem(key, value) {
     this.values.set(key, String(value));
   }
@@ -86,53 +74,27 @@ describe('Kavita ProgressDto journey fixture contract', () => {
     vi.unstubAllGlobals();
   });
 
-  async function postRawProgress(payload) {
-    return fetch(`http://127.0.0.1:${fixture.port}/api/Reader/progress`, {
+  it.each([
+    { pageNum: 0, bookScrollId: '//body/DocFragment[1]/body/p[1]' },
+    { pageNum: 0, bookScrollId: 'epubcfi(/6/2!/4/2)' },
+    { pageNum: 3, bookScrollId: null },
+  ])('rejects invalid progress payload %o with HTTP 400', async (override) => {
+    const response = await fetch(`http://127.0.0.1:${fixture.port}/api/Reader/progress`, {
       method: 'POST',
-      headers: {
-        'x-api-key': 'turnleaf-ci-only',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
+      headers: { 'x-api-key': 'turnleaf-ci-only', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        libraryId: 1,
+        seriesId: 1,
+        volumeId: 1,
+        chapterId: 1,
+        ...override,
+      }),
     });
-  }
-
-  it('rejects DocFragment wrappers, EPUB CFIs, and out-of-range page numbers with HTTP 400', async () => {
-    const docFragment = await postRawProgress({
-      libraryId: 1,
-      seriesId: 1,
-      volumeId: 1,
-      chapterId: 1,
-      pageNum: 0,
-      bookScrollId: '//body/DocFragment[1]/body/p[1]',
-    });
-    expect(docFragment.status).toBe(400);
-
-    const cfi = await postRawProgress({
-      libraryId: 1,
-      seriesId: 1,
-      volumeId: 1,
-      chapterId: 1,
-      pageNum: 0,
-      bookScrollId: 'epubcfi(/6/2!/4/2)',
-    });
-    expect(cfi.status).toBe(400);
-
-    const outOfRange = await postRawProgress({
-      libraryId: 1,
-      seriesId: 1,
-      volumeId: 1,
-      chapterId: 1,
-      pageNum: 3,
-      bookScrollId: null,
-    });
-    expect(outOfRange.status).toBe(400);
+    expect(response.status).toBe(400);
   });
 
-  it('enforces Kavita page-zero unstarted guard while flushProgress bootstraps and persists chapter-zero progress', async () => {
+  it('enforces Kavita page-zero unstarted guard while flushProgress bootstraps and completes', async () => {
     const client = new KavitaClient(`http://127.0.0.1:${fixture.port}`, 'turnleaf-ci-only');
-
-    // Direct save with pageNum === 0 on an unstarted book mirrors Kavita's no-op guard.
     await client.saveProgress({
       libraryId: 1,
       seriesId: 1,
@@ -141,26 +103,15 @@ describe('Kavita ProgressDto journey fixture contract', () => {
       pageNum: 0,
       bookScrollId: '//body/p[2]',
     });
-    expect(await client.getProgress(1)).toMatchObject({
-      pageNum: 0,
-      bookScrollId: null,
-    });
+    expect(await client.getProgress(1)).toMatchObject({ pageNum: 0, bookScrollId: null });
 
-    // Turnleaf's flushProgress bootstraps pageNum: 1 before saving chapter-zero progress.
     await saveLocalProgress(book, 'epubcfi(/6/2!/4/4)', '//body/p[2]', 0.25, 0);
     await flushProgress(client, 'server');
-    expect(await client.getProgress(1)).toMatchObject({
-      pageNum: 0,
-      bookScrollId: '//body/p[2]',
-    });
+    expect(await client.getProgress(1)).toMatchObject({ pageNum: 0, bookScrollId: '//body/p[2]' });
 
-    // Explicit completion sends pageNum = book.pages (2) and bookScrollId = null.
-    await markBookCompleted(book, null);
+    await markBookCompleted(book);
     await flushProgress(client, 'server');
-    expect(await client.getProgress(1)).toMatchObject({
-      pageNum: 2,
-      bookScrollId: null,
-    });
+    expect(await client.getProgress(1)).toMatchObject({ pageNum: 2, bookScrollId: null });
   });
 });
 

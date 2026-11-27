@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Harden Kavita progress sync across clear/reset and cross-device edge cases
+- Align EPUB reading progress sync with Kavita's zero-based ProgressDto contract and guard queued progress across storage resets
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

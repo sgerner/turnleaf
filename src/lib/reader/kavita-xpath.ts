@@ -8,34 +8,19 @@ export interface KavitaXPathStep {
   index: number;
 }
 
-interface KavitaDocFragmentMatch {
-  fragment: number;
-  content: string;
-}
-
-interface KavitaIdAnchorMatch {
-  id: string;
-  content: string;
-}
-
 function isValidSpineIndex(value: number | null | undefined): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
-function stripKoreaderSuffix(content: string): string {
-  return content
+function parseContentSteps(content: string): KavitaXPathStep[] | null {
+  const cleaned = content
     .replace(/\/+$/, '')
     .replace(/(?:\/text\(\)(?:\[\d+])?)?(?:\.\d+)?$/i, '')
     .replace(/\/+$/, '');
-}
-
-function parseContentSteps(content: string): KavitaXPathStep[] | null {
-  const cleaned = stripKoreaderSuffix(content);
   if (!cleaned) return [];
   if (!cleaned.startsWith('/')) return null;
-  const parts = cleaned.split('/').filter(Boolean);
   const steps: KavitaXPathStep[] = [];
-  for (const part of parts) {
+  for (const part of cleaned.split('/').filter(Boolean)) {
     const match = part.match(/^([A-Za-z0-9:_-]+)(?:\[(\d+)])?$/);
     if (!match?.[1]) return null;
     const index = match[2] !== undefined ? Number(match[2]) : 1;
@@ -49,35 +34,20 @@ function formatContentSteps(steps: KavitaXPathStep[]): string {
   return steps.length ? `/${steps.map((step) => `${step.tag}[${step.index}]`).join('/')}` : '';
 }
 
-function formatIdAnchor(id: string): string {
-  const quote = id.includes('"') && !id.includes("'") ? "'" : '"';
-  return `id(${quote}${id}${quote})`;
-}
-
-function matchDocFragmentXPath(xpath: string): KavitaDocFragmentMatch | null {
+function matchDocFragmentXPath(xpath: string): { fragment: number; content: string } | null {
   const match = xpath.match(/^\/{1,2}body\/DocFragment\[(\d+)]\/body(?<content>(?:\/.*)?)$/i);
-  if (!match?.[1]) return null;
-  return {
-    fragment: Number(match[1]),
-    content: match.groups?.content ?? '',
-  };
+  return match?.[1] ? { fragment: Number(match[1]), content: match.groups?.content ?? '' } : null;
 }
 
-function matchIdAnchorXPath(xpath: string): KavitaIdAnchorMatch | null {
-  const idFunc = xpath.match(
-    /^(?:\/{1,2})?id\((?<quote>["'])(?<id>[^"']+)\k<quote>\)(?<content>(?:\/.*)?)$/i,
-  );
-  if (idFunc?.groups?.id) {
-    if (idFunc.groups.id.includes('"') && idFunc.groups.id.includes("'")) return null;
-    return { id: idFunc.groups.id, content: idFunc.groups.content ?? '' };
-  }
-  const attrMatch = xpath.match(
-    /^\/{1,2}[A-Za-z0-9:*_-]+\[@id=(?<quote>["'])(?<id>[^"']+)\k<quote>](?<content>(?:\/.*)?)$/i,
-  );
-  if (attrMatch?.groups?.id) {
-    return { id: attrMatch.groups.id, content: attrMatch.groups.content ?? '' };
-  }
-  return null;
+function matchIdAnchorXPath(xpath: string): { id: string; content: string } | null {
+  const idMatch =
+    xpath.match(/^(?:\/{1,2})?id\((?<q>["'])(?<id>[^"']+)\k<q>\)(?<content>(?:\/.*)?)$/i) ??
+    xpath.match(
+      /^\/{1,2}[A-Za-z0-9:*_-]+\[@id=(?<q>["'])(?<id>[^"']+)\k<q>](?<content>(?:\/.*)?)$/i,
+    );
+  const id = idMatch?.groups?.id;
+  if (!id || (id.includes('"') && id.includes("'"))) return null;
+  return { id, content: idMatch.groups?.content ?? '' };
 }
 
 function matchBodyXPath(xpath: string): string | null {
@@ -92,15 +62,10 @@ export function resolveKavitaPageNumber(
   xpath?: string | null,
   totalPages = 0,
 ): number | null {
-  if (totalPages > 0 && isValidSpineIndex(pageNum) && pageNum >= totalPages) {
-    return pageNum;
-  }
-  const trimmed = xpath?.trim();
-  if (trimmed) {
-    const legacy = matchDocFragmentXPath(trimmed);
-    if (legacy) {
-      return Number.isInteger(legacy.fragment) && legacy.fragment >= 1 ? legacy.fragment - 1 : null;
-    }
+  if (totalPages > 0 && isValidSpineIndex(pageNum) && pageNum >= totalPages) return pageNum;
+  const legacy = xpath ? matchDocFragmentXPath(xpath.trim()) : null;
+  if (legacy) {
+    return Number.isInteger(legacy.fragment) && legacy.fragment >= 1 ? legacy.fragment - 1 : null;
   }
   return isValidSpineIndex(pageNum) ? pageNum : null;
 }
@@ -114,13 +79,13 @@ export function parseKavitaXPath(
 
   if (/^\/{1,2}body\/DocFragment(?:\[|\/|$)/i.test(trimmed)) {
     const legacy = matchDocFragmentXPath(trimmed);
-    if (!legacy || !Number.isInteger(legacy.fragment) || legacy.fragment < 1) return null;
-    const steps = parseContentSteps(legacy.content);
-    if (!steps) return null;
-    return {
-      spineIndex: legacy.fragment - 1,
-      contentXPath: `/html/body${formatContentSteps(steps)}`,
-    };
+    const steps =
+      legacy && Number.isInteger(legacy.fragment) && legacy.fragment >= 1
+        ? parseContentSteps(legacy.content)
+        : null;
+    return legacy && steps
+      ? { spineIndex: legacy.fragment - 1, contentXPath: `/html/body${formatContentSteps(steps)}` }
+      : null;
   }
 
   const idMatch = matchIdAnchorXPath(trimmed);
@@ -128,30 +93,24 @@ export function parseKavitaXPath(
     if (!isValidSpineIndex(spineIndex)) return null;
     const steps = parseContentSteps(idMatch.content);
     if (!steps) return null;
+    const quote = idMatch.id.includes('"') ? "'" : '"';
     return {
       spineIndex,
-      contentXPath: `${formatIdAnchor(idMatch.id)}${formatContentSteps(steps)}`,
+      contentXPath: `id(${quote}${idMatch.id}${quote})${formatContentSteps(steps)}`,
     };
   }
 
   const bodyContent = matchBodyXPath(trimmed);
-  if (bodyContent !== null) {
-    if (!isValidSpineIndex(spineIndex)) return null;
+  if (bodyContent !== null && isValidSpineIndex(spineIndex)) {
     const steps = parseContentSteps(bodyContent);
-    if (!steps) return null;
-    return {
-      spineIndex,
-      contentXPath: `/html/body${formatContentSteps(steps)}`,
-    };
+    if (steps) return { spineIndex, contentXPath: `/html/body${formatContentSteps(steps)}` };
   }
-
   return null;
 }
 
 export function bodyContentSteps(contentXPath: string): KavitaXPathStep[] | null {
   const bodyContent = matchBodyXPath(contentXPath);
-  if (bodyContent === null) return null;
-  return parseContentSteps(bodyContent);
+  return bodyContent === null ? null : parseContentSteps(bodyContent);
 }
 
 export function kavitaXPathSteps(
@@ -159,10 +118,8 @@ export function kavitaXPathSteps(
   spineIndex?: number | null,
 ): KavitaXPathStep[] | null {
   const target = parseKavitaXPath(xpath, spineIndex);
-  if (!target) return null;
-  const steps = bodyContentSteps(target.contentXPath);
-  if (!steps) return null;
-  return [{ tag: 'spine', index: target.spineIndex }, ...steps];
+  const steps = target ? bodyContentSteps(target.contentXPath) : null;
+  return target && steps ? [{ tag: 'spine', index: target.spineIndex }, ...steps] : null;
 }
 
 export function toKavitaXPath(contentXPath: string, spineIndex?: number): string | null {
@@ -175,23 +132,21 @@ export function toKavitaXPath(contentXPath: string, spineIndex?: number): string
   const normalized =
     stripped === '' || stripped === '/' ? '' : stripped.startsWith('/') ? stripped : `/${stripped}`;
   const steps = parseContentSteps(normalized);
-  if (!steps) return null;
-  return `//body${formatContentSteps(steps)}`;
+  return steps ? `//body${formatContentSteps(steps)}` : null;
 }
 
 export function resolveContentXPath(document: Document, xpath: string): Element | null {
   const trimmed = xpath.trim();
-  if (!trimmed) return null;
-  const body =
-    [...document.documentElement.children].find(
-      (element) => element.localName.toLowerCase() === 'body',
-    ) ?? null;
+  const body = trimmed
+    ? ([...document.documentElement.children].find(
+        (element) => element.localName.toLowerCase() === 'body',
+      ) ?? null)
+    : null;
   if (!body) return null;
 
-  let current: Element | null;
-  let steps: KavitaXPathStep[] | null;
-
   const idMatch = matchIdAnchorXPath(trimmed);
+  let current: Element | null = body;
+  let steps: KavitaXPathStep[] | null;
   if (idMatch) {
     const byId = document.getElementById(idMatch.id);
     current =
@@ -206,10 +161,8 @@ export function resolveContentXPath(document: Document, xpath: string): Element 
   } else {
     const bodyContent = matchBodyXPath(trimmed);
     if (bodyContent === null) return null;
-    current = body;
     steps = parseContentSteps(bodyContent);
   }
-
   if (!current || !steps) return null;
 
   for (const step of steps) {

@@ -195,37 +195,53 @@ describe('reader open progress selection', () => {
     ).toBe('local');
   });
 
-  it('reconciles legacy DocFragment locators cleanly with canonical zero-based remote locators', () => {
+  it('reconciles legacy DocFragment locators, completion states, and XPath-less remote chapters cleanly', () => {
     expect(
       chooseOpenProgress(
-        {
-          ...local,
-          pageNum: null,
-          xpath: '//body/DocFragment[2]/body/p[4]',
-        },
-        {
-          pageNum: 1,
-          bookScrollId: '//body/p[4]',
-        },
+        { ...local, pageNum: null, xpath: '//body/DocFragment[2]/body/p[4]' },
+        { pageNum: 1, bookScrollId: '//body/p[4]' },
         100,
         true,
       ),
     ).toBe('local');
     expect(
       chooseOpenProgress(
-        {
-          ...local,
-          pageNum: null,
-          xpath: '//body/DocFragment[2]/body/p[4]',
-        },
-        {
-          pageNum: 1,
-          bookScrollId: '//body/p[9]',
-        },
+        { ...local, pageNum: null, xpath: '//body/DocFragment[2]/body/p[4]' },
+        { pageNum: 1, bookScrollId: '//body/p[9]' },
         100,
         true,
       ),
     ).toBe('remote');
+    expect(
+      chooseOpenProgress(
+        { pageNum: 100, percentage: 1, pendingSync: true, xpath: null },
+        { pageNum: 100, bookScrollId: null },
+        100,
+        false,
+      ),
+    ).toBe('local');
+    expect(
+      chooseOpenProgress(
+        { pageNum: 0, percentage: 0.35, pendingSync: false, xpath: '//body/p[50]' },
+        { pageNum: 3, bookScrollId: null },
+        10,
+        true,
+      ),
+    ).toBe('remote');
+    expect(
+      chooseOpenProgress(
+        {
+          cfi: 'epubcfi(/6/4!/4/8)',
+          pageNum: 1,
+          percentage: 0.4,
+          pendingSync: false,
+          xpath: '//body/p[20]',
+        },
+        { pageNum: 1, bookScrollId: null },
+        2,
+        true,
+      ),
+    ).toBe('local');
   });
 
   it('prefers remote completion even when it has an older locator', () => {

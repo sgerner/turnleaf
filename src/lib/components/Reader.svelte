@@ -1239,16 +1239,11 @@
       const localTarget = parseKavitaXPath(localXPath, location.spineIndex);
       const serverTarget = parseKavitaXPath(serverXPath, progress.pageNum);
       if (localTarget && serverTarget) {
-        if (
-          localTarget.spineIndex === serverTarget.spineIndex &&
-          localTarget.contentXPath === serverTarget.contentXPath
-        ) {
-          return false;
-        }
-        if (session?.matchesServerLocation(serverXPath, progress.pageNum)) {
-          return false;
-        }
-        return true;
+        return !(
+          (localTarget.spineIndex === serverTarget.spineIndex &&
+            localTarget.contentXPath === serverTarget.contentXPath) ||
+          session?.matchesServerLocation?.(serverXPath, progress.pageNum)
+        );
       }
       if (progress.pageNum != null && progress.pageNum !== location.spineIndex) {
         return true;

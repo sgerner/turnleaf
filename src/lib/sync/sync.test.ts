@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { saveLocalProgress } from '../database/database';
+import {
+  getPendingSync,
+  getReadingState,
+  resetLocalDatabase,
+  saveLocalProgress,
+} from '../database/database';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -228,19 +233,21 @@ it('allows a manual retry after an authorization failure', async () => {
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
 
-it('bootstraps Kavita progress before saving non-zero progress inside chapter index zero for an unstarted book', async () => {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      serverConfig: { id: 'server' },
-      books: [{ ...book }],
-      readingState: {},
-      syncQueue: {},
-      preferences: {},
-    }),
-  );
-  await saveLocalProgress(book, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.04, 0);
+it('bootstraps multi-chapter books at chapter index zero and skips started, book-start, or single-spine books', async () => {
+  const seed = (pages = book.pages) =>
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        serverConfig: { id: 'server' },
+        books: [{ ...book, pages }],
+        readingState: {},
+        syncQueue: {},
+        preferences: {},
+      }),
+    );
 
+  seed();
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.04, 0);
   const getProgress = vi.fn().mockResolvedValue({
     libraryId: 1,
     seriesId: 1,
@@ -250,80 +257,50 @@ it('bootstraps Kavita progress before saving non-zero progress inside chapter in
     bookScrollId: null,
   });
   const saveProgress = vi.fn().mockResolvedValue(undefined);
-
   await flushProgress({ getProgress, saveProgress } as never, 'server');
+  expect(saveProgress.mock.calls.map(([arg]) => [arg.pageNum, arg.bookScrollId])).toEqual([
+    [1, null],
+    [0, '//body/p[3]'],
+  ]);
 
-  expect(getProgress).toHaveBeenCalledExactlyOnceWith(1);
-  expect(saveProgress).toHaveBeenCalledTimes(2);
-  expect(saveProgress).toHaveBeenNthCalledWith(1, {
-    libraryId: 1,
-    seriesId: 1,
-    volumeId: 1,
-    chapterId: 1,
-    pageNum: 1,
-    bookScrollId: null,
-  });
-  expect(saveProgress).toHaveBeenNthCalledWith(2, {
-    libraryId: 1,
-    seriesId: 1,
-    volumeId: 1,
-    chapterId: 1,
-    pageNum: 0,
-    bookScrollId: '//body/p[3]',
-  });
-});
-
-it('skips chapter-zero bootstrap when remote progress already exists or local progress is at book start', async () => {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      serverConfig: { id: 'server' },
-      books: [{ ...book }],
-      readingState: {},
-      syncQueue: {},
-      preferences: {},
-    }),
-  );
-  await saveLocalProgress(book, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.04, 0);
-
-  const getStartedProgress = vi.fn().mockResolvedValue({
-    libraryId: 1,
-    seriesId: 1,
-    volumeId: 1,
-    chapterId: 1,
-    pageNum: 0,
-    bookScrollId: '//body/p[1]',
-  });
-  const saveStartedProgress = vi.fn().mockResolvedValue(undefined);
+  // Remote already started -> no bootstrap; book start (0%, //body/p[1]) -> no getProgress or bootstrap.
+  await saveLocalProgress(book, 'epubcfi(/6/2!/4/8)', '//body/p[4]', 0.06, 0);
+  const saveStarted = vi.fn().mockResolvedValue(undefined);
   await flushProgress(
-    { getProgress: getStartedProgress, saveProgress: saveStartedProgress } as never,
+    {
+      getProgress: vi.fn().mockResolvedValue({ ...book, pageNum: 0, bookScrollId: '//body/p[1]' }),
+      saveProgress: saveStarted,
+    } as never,
     'server',
   );
-  expect(saveStartedProgress).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ pageNum: 0, bookScrollId: '//body/p[3]' }),
+  expect(saveStarted).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ pageNum: 0, bookScrollId: '//body/p[4]' }),
   );
 
   await saveLocalProgress(book, 'epubcfi(/6/2!/4/2)', '//body/p[1]', 0, 0);
-  const getUnstartedProgress = vi.fn().mockResolvedValue({
-    libraryId: 1,
-    seriesId: 1,
-    volumeId: 1,
-    chapterId: 1,
-    pageNum: 0,
-    bookScrollId: null,
-  });
-  const saveInitialProgress = vi.fn().mockResolvedValue(undefined);
+  const probeAtStart = vi.fn();
+  const saveAtStart = vi.fn().mockResolvedValue(undefined);
+  await flushProgress({ getProgress: probeAtStart, saveProgress: saveAtStart } as never, 'server');
+  expect(probeAtStart).not.toHaveBeenCalled();
+  expect(saveAtStart).toHaveBeenCalledOnce();
+
+  // Single-spine EPUB (pages = 1) must never send pageNum = 1 (completion) during mid-book reading.
+  seed(1);
+  await saveLocalProgress({ ...book, pages: 1 }, 'epubcfi(/6/2!/4/6)', '//body/p[3]', 0.4, 0);
+  const saveSingleSpine = vi.fn().mockResolvedValue(undefined);
   await flushProgress(
-    { getProgress: getUnstartedProgress, saveProgress: saveInitialProgress } as never,
+    {
+      getProgress: vi.fn().mockResolvedValue({ ...book, pageNum: 0, bookScrollId: null }),
+      saveProgress: saveSingleSpine,
+    } as never,
     'server',
   );
-  expect(getUnstartedProgress).not.toHaveBeenCalled();
-  expect(saveInitialProgress).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ pageNum: 0, bookScrollId: '//body/p[1]' }),
+  expect(saveSingleSpine).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ pageNum: 0, bookScrollId: '//body/p[3]' }),
   );
 });
 
-it('retries chapter-zero save without repeating bootstrap if interrupted after bootstrap', async () => {
+it('retries interrupted chapter-zero uploads and preserves post-clear/reset progress across in-flight flushes', async () => {
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
@@ -338,39 +315,57 @@ it('retries chapter-zero save without repeating bootstrap if interrupted after b
 
   const getProgress = vi
     .fn()
-    .mockResolvedValueOnce({
-      libraryId: 1,
-      seriesId: 1,
-      volumeId: 1,
-      chapterId: 1,
-      pageNum: 0,
-      bookScrollId: null,
-    })
-    .mockResolvedValueOnce({
-      libraryId: 1,
-      seriesId: 1,
-      volumeId: 1,
-      chapterId: 1,
-      pageNum: 1,
-      bookScrollId: null,
-    });
+    .mockResolvedValueOnce({ ...book, pageNum: 0, bookScrollId: null })
+    .mockResolvedValueOnce({ ...book, pageNum: 1, bookScrollId: null });
   const saveProgress = vi
     .fn()
     .mockResolvedValueOnce(undefined)
     .mockRejectedValueOnce(new Error('network lost after bootstrap'))
     .mockResolvedValueOnce(undefined);
-
   const client = { getProgress, saveProgress } as never;
   await expect(flushProgress(client, 'server')).rejects.toThrow('1 reading progress item failed');
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
-
   expect(saveProgress).toHaveBeenCalledTimes(3);
-  expect(saveProgress).toHaveBeenNthCalledWith(3, {
-    libraryId: 1,
-    seriesId: 1,
-    volumeId: 1,
-    chapterId: 1,
-    pageNum: 0,
-    bookScrollId: '//body/p[3]',
+
+  // Interleave an in-flight flush with localStorage.clear() + reset + fresh save at the same revision.
+  await saveLocalProgress(book, 'stale-cfi', '//body/p[2]', 0.1, 1);
+  let releaseUpload!: () => void;
+  const inFlightSave = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        releaseUpload = resolve;
+      }),
+  );
+  const flushing = flushProgress({ saveProgress: inFlightSave } as never, 'server');
+  await vi.waitFor(() => expect(inFlightSave).toHaveBeenCalledOnce());
+
+  localStorage.clear();
+  await resetLocalDatabase();
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [{ ...book }],
+      readingState: {},
+      syncQueue: {},
+      preferences: {},
+    }),
+  );
+  await saveLocalProgress(book, 'post-reset-cfi', '//body/p[8]', 0.5, 4);
+  releaseUpload();
+  await flushing;
+
+  expect(await getReadingState(book.id)).toMatchObject({
+    cfi: 'post-reset-cfi',
+    pageNum: 4,
+    pendingSync: true,
   });
+  expect(await getPendingSync('server')).toHaveLength(1);
+
+  const postResetSave = vi.fn().mockResolvedValue(undefined);
+  await flushProgress({ saveProgress: postResetSave } as never, 'server');
+  expect(postResetSave).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ pageNum: 4, bookScrollId: '//body/p[8]' }),
+  );
+  expect(await getPendingSync('server')).toEqual([]);
 });
