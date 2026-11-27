@@ -7,6 +7,7 @@ import { clearDiagnostics, getDiagnosticCount } from '../diagnostics/log';
 import type { BookRecord, PendingSyncItem, StoredReadingState } from '../database/database';
 import { cacheCover, downloadEpub } from '../downloads/native-download';
 import type { ReaderLocation } from '../reader/session';
+import type * as ThemesModule from '../themes/themes';
 import Library from './Library.svelte';
 
 const runtime = vi.hoisted(() => ({
@@ -197,10 +198,14 @@ vi.mock('../downloads/native-download', () => ({
   })),
 }));
 
-vi.mock('../themes/themes', () => ({
-  loadTheme: vi.fn(async () => {}),
-  skeletonThemes: ['vintage'],
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn(async () => true),
+    skeletonThemes: ['vintage'],
+  };
+});
 
 vi.mock('./Reader.svelte', () => ({
   default: (_anchor: unknown, props: Record<string, unknown>) => {
