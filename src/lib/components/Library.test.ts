@@ -2,6 +2,7 @@
 
 import { mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as ThemesModule from '../themes/themes';
 
 const mocks = vi.hoisted(() => {
   let connected = true;
@@ -143,10 +144,14 @@ vi.mock('../sync/sync', () => ({
   flushProgress: mocks.flushProgress,
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['vintage', 'fennec'],
-  loadTheme: vi.fn(() => Promise.resolve(true)),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['vintage', 'fennec'],
+    loadTheme: vi.fn(() => Promise.resolve(true)),
+  };
+});
 
 vi.mock('./Reader.svelte', () => {
   throw new Error('Reader view stub');
