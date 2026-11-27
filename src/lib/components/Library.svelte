@@ -48,9 +48,11 @@
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
-  import { clearDiagnostics, exportDiagnostics, recordDiagnostic } from '../diagnostics/log';
+  import { clearDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
   import { flushProgress } from '../sync/sync';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
+  import DialogShell from './DialogShell.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
   import {
     calculateVirtualWindow,
@@ -77,7 +79,14 @@
     sortDisplayableIndices,
     type LibrarySortOrder,
   } from './library-catalog';
-  import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
+  import {
+    DEFAULT_THEME,
+    isSkeletonTheme,
+    loadTheme,
+    skeletonThemes,
+    themeSwatches,
+    type SkeletonTheme,
+  } from '../themes/themes';
   import {
     bookActionsLabel,
     downloadProgressLabel,
@@ -103,6 +112,7 @@
     onServerDeleted,
     onChangeServerAddress,
     onReaderOpenChange,
+    onOverlayActiveChange,
   }: {
     server: ServerConfig;
     apiKey: string;
@@ -114,17 +124,21 @@
     onServerDeleted: () => void;
     onChangeServerAddress: () => void;
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
+    onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  let activeApiKey = $derived(apiKey);
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
+  const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
         client.coverUrl(seriesId),
-        apiKey,
+        activeApiKey,
         seriesId,
         signal,
         server.id,
         await networkAvailable(),
+        serverOrigin,
       );
     }
     if (offline) throw new Error('Offline');
@@ -248,6 +262,7 @@
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
   let message = $state('');
+  let messageRevision = 0;
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
     failedCount: 0,
@@ -256,20 +271,20 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
   let acceptingRemoteProgress = $state(false);
   let settingsVisible = $state(false);
-  let diagnosticsVisible = $state(false);
-  let diagnosticsOutput = $state('');
-  let pendingTheme = $state<SkeletonTheme>('vintage');
-  let pendingMode = $state<'light' | 'dark'>('dark');
+  let pendingTheme = $derived<SkeletonTheme>(isSkeletonTheme(theme) ? theme : DEFAULT_THEME);
+  let pendingMode = $derived<'light' | 'dark'>(mode);
   let pendingAutoSync = $state(false);
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
+  let appearanceError = $state('');
   let settingsError = $state('');
-  let diagnosticsMessage = $state('');
+  let themeSwitchSequence = 0;
   let replacingApiKey = $state(false);
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
@@ -278,9 +293,11 @@
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
+  let confirmDeleteDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
+  let confirmDeleteOpener: HTMLElement | null = null;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
@@ -668,6 +685,14 @@
   });
 
   $effect(() => {
+    const overlayActive = Boolean(
+      reading || actionMenuBook || conflict || settingsVisible || confirmDeleteServer,
+    );
+    onOverlayActiveChange?.(overlayActive);
+    return () => onOverlayActiveChange?.(false);
+  });
+
+  $effect(() => {
     const [, ids] = visibleCoverKey.split(':');
     if (loading) return;
     const items = ids ? ids.split(',').map((id) => ({ seriesId: Number(id) })) : [];
@@ -761,8 +786,6 @@
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
-    pendingTheme = theme as SkeletonTheme;
-    pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
     downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
     hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);
@@ -798,10 +821,12 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          if (connected) {
+            const baselineRevision = activeSyncStartRevision ?? messageRevision;
+            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+            void syncProgress(false);
+            void startRefresh(false, baselineRevision, baselineMessage);
+          }
         }),
       ),
     );
@@ -821,15 +846,18 @@
           else if (reading) {
             if (readerBackHandler?.()) return;
             void closeReader();
-          } else if (settingsVisible) closeSettings();
+          } else if (confirmDeleteServer && !deletingServer) cancelConfirmDeleteServer();
+          else if (settingsVisible) closeSettings();
           else if (filtersVisible) filtersVisible = false;
           else void App.exitApp();
         }),
       ),
     );
     if (!destroyed && !offline) {
-      await refresh();
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
       void syncProgress(false);
+      await startRefresh(false, baselineRevision, baselineMessage);
     }
   });
 
@@ -870,16 +898,25 @@
     return syncWork;
   }
 
+  function setMessage(next: string): void {
+    messageRevision += 1;
+    message = next;
+  }
+
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    activeSyncStartRevision = messageRevision;
     try {
-      if (!(await networkAvailable())) {
+      const available = Capacitor.isNativePlatform()
+        ? await networkAvailable()
+        : !offline && !destroyed;
+      if (!available) {
         if (showFeedback)
-          message = 'Offline. Reading progress will retry when Kavita is available.';
+          setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
       await flushProgress(client, server.id);
-      if (showFeedback) message = 'Reading progress synced.';
+      if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
         error instanceof AggregateError &&
@@ -887,13 +924,15 @@
           (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
         )
       ) {
-        message =
-          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
+        setMessage(
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+        );
       } else if (showFeedback) {
-        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+        setMessage('Some reading progress is waiting to sync. Retry when Kavita is available.');
       }
     } finally {
       await refreshSyncStatus();
+      activeSyncStartRevision = null;
       syncing = false;
     }
   }
@@ -914,23 +953,48 @@
   });
 
   function refresh(): Promise<void> {
+    return startRefresh(false);
+  }
+
+  function startRefresh(
+    preserveMessage: boolean,
+    requestedRevision = messageRevision,
+    requestedMessage = message,
+  ): Promise<void> {
     if (destroyed || offline) return Promise.resolve();
-    if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
+    if (refreshWork && refreshController?.signal.aborted) {
+      return refreshWork.then(() =>
+        startRefresh(preserveMessage, requestedRevision, requestedMessage),
+      );
+    }
     if (!refreshWork) {
-      refreshWork = refreshCatalog().finally(() => {
-        refreshWork = null;
-      });
+      const work = refreshCatalog(preserveMessage, requestedRevision, requestedMessage).finally(
+        () => {
+          if (refreshWork === work) {
+            refreshController = null;
+            refreshWork = null;
+            refreshing = false;
+          }
+        },
+      );
+      refreshWork = work;
     }
     return refreshWork;
   }
 
-  async function refreshCatalog(): Promise<void> {
+  async function refreshCatalog(
+    preserveMessage: boolean,
+    initialRevision: number,
+    initialMessage: string,
+  ): Promise<void> {
     refreshing = true;
     const controller = new AbortController();
     refreshController = controller;
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
-    message = '';
+    if (!preserveMessage && messageRevision === initialRevision && message === initialMessage) {
+      message = '';
+    }
     try {
       if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
@@ -993,7 +1057,6 @@
         detail:
           cause instanceof KavitaError ? cause.kind.replace('_', '-') : 'library-refresh-failed',
       });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       const savedBooks = displayableBooks.length
         ? 'Showing your saved library.'
         : 'No saved books are available yet.';
@@ -1015,9 +1078,6 @@
       } else {
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
-    } finally {
-      refreshController = null;
-      refreshing = false;
     }
   }
 
@@ -1098,11 +1158,12 @@
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
-        apiKey,
+        activeApiKey,
         book.id.replaceAll(':', '-'),
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
+        serverOrigin,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1163,6 +1224,10 @@
         } else {
           message = 'The file transfer failed.';
         }
+      } else if (error instanceof KavitaError) {
+        status = error.status;
+        detail = 'download-transfer';
+        message = error.message;
       } else if (error instanceof EpubValidationError) {
         detail = 'download-validation';
         message = error.message;
@@ -1178,7 +1243,6 @@
           'The download finished, but its saved status could not be checked. Refresh before retrying.';
       }
       recordDiagnostic({ category: 'download', endpoint: EPUB_DOWNLOAD_ENDPOINT, status, detail });
-      if (diagnosticsVisible) diagnosticsOutput = diagnosticsText();
       message += ' Open Settings to copy diagnostics.';
       downloadFailureBook = book;
       return null;
@@ -1605,87 +1669,33 @@
   function openSettings(): void {
     settingsOpener = activeElement();
     settingsVisible = true;
-    void Promise.allSettled(skeletonThemes.map(loadTheme));
     focusModal(() => settingsDialog);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
+    confirmDeleteServer = false;
+    confirmDeleteOpener = null;
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
     restoreModalFocus(opener);
   }
 
-  function diagnosticsText(): string {
-    return exportDiagnostics({
-      appVersion: __APP_VERSION__,
-      platform: Capacitor.getPlatform(),
-      kavitaVersion: server.kavitaVersion,
+  function openConfirmDeleteServer(): void {
+    confirmDeleteOpener = activeElement();
+    confirmDeleteServer = true;
+    void tick().then(() => {
+      confirmDeleteDialog?.scrollIntoView?.({ block: 'nearest' });
     });
+    focusModal(() => confirmDeleteDialog);
   }
 
-  async function copyDiagnostics(): Promise<void> {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    try {
-      const text = diagnosticsOutput;
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const field = document.createElement('textarea');
-        field.value = text;
-        field.setAttribute('readonly', '');
-        field.style.position = 'fixed';
-        field.style.opacity = '0';
-        document.body.appendChild(field);
-        let copied = false;
-        try {
-          field.select();
-          copied = document.execCommand('copy');
-        } finally {
-          field.remove();
-        }
-        if (!copied) throw new Error('Clipboard unavailable');
-      }
-      diagnosticsMessage = 'Diagnostics copied. Review them before sharing.';
-    } catch {
-      diagnosticsVisible = true;
-      diagnosticsMessage =
-        'Copy is unavailable here. Open the log below to select and copy it, or download it.';
-    }
-  }
-
-  function downloadDiagnostics(): void {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    const file = new Blob([diagnosticsOutput], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'turnleaf-diagnostics.txt';
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    diagnosticsVisible = true;
-    diagnosticsMessage =
-      'Review the log before sharing. If the file did not download, select and copy it below.';
-  }
-
-  function showDiagnostics(): void {
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsVisible = !diagnosticsVisible;
-  }
-
-  function selectDiagnostics(): void {
-    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-diagnostics-output');
-    field?.focus();
-    field?.select();
-  }
-
-  function clearDiagnosticLog(): void {
-    clearDiagnostics();
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsMessage = 'Diagnostics cleared.';
+  function cancelConfirmDeleteServer(): void {
+    confirmDeleteServer = false;
+    const opener = confirmDeleteOpener;
+    confirmDeleteOpener = null;
+    restoreModalFocus(opener, () => settingsDialog);
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -1745,12 +1755,18 @@
   }
 
   async function updateTheme(next: SkeletonTheme): Promise<void> {
+    const requestId = ++themeSwitchSequence;
     try {
-      await loadTheme(next);
+      const loaded = await loadTheme(next);
+      if (!loaded) throw new Error('Theme unavailable');
     } catch {
-      settingsError = 'The theme could not load. Try again.';
+      if (requestId === themeSwitchSequence && !destroyed) {
+        appearanceError = 'The theme could not load. Try again.';
+      }
       return;
     }
+    if (requestId !== themeSwitchSequence || destroyed) return;
+    appearanceError = '';
     pendingTheme = next;
     onThemeChange(next);
     await setPreference('uiTheme', next);
@@ -1801,14 +1817,15 @@
       };
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
+      // An upload started with the previous key may still be finishing.
+      while (syncWork) await syncWork;
+      refreshController?.abort();
+      activeApiKey = nextKey;
       onApiKeyChange(nextKey);
       replacementApiKey = '';
-      message = 'API key updated.';
+      setMessage('API key updated.');
       closeSettings();
-      // An upload started with the previous key may still be finishing.
-      await syncWork;
-      await refresh();
-      await syncProgress(false);
+      await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
@@ -1845,6 +1862,7 @@
         credentialCleanupComplete = true;
       }
       await removeServer(server.id);
+      await clearDiagnostics();
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
       closeSettings();
@@ -1858,6 +1876,9 @@
       cleanupInProgress = false;
       deletingServer = false;
       confirmDeleteServer = false;
+      const opener = confirmDeleteOpener;
+      confirmDeleteOpener = null;
+      if (settingsVisible && opener) restoreModalFocus(opener);
     }
   }
 </script>
@@ -1895,7 +1916,7 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
-    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
+    inert={Boolean(actionMenuBook || conflict || settingsVisible || confirmDeleteServer)}
   >
     <a
       href="#library-results"
@@ -2895,30 +2916,25 @@
 {/if}
 
 {#if settingsVisible}
-  <div
-    class="fixed inset-0 z-50 grid place-items-center bg-black/55 p-4"
-    role="presentation"
-    transition:fade
-    onclick={(event) => event.target === event.currentTarget && closeSettings()}
+  <DialogShell
+    bind:dialogElement={settingsDialog}
+    labelledBy="library-settings-title"
+    onClose={() => {
+      if (confirmDeleteServer) {
+        if (!deletingServer) cancelConfirmDeleteServer();
+      } else {
+        closeSettings();
+      }
+    }}
   >
-    <div
-      bind:this={settingsDialog}
-      class="card preset-filled-surface-50-950 relative max-h-[88dvh] w-full max-w-md overflow-auto p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="library-settings-title"
-      tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, settingsDialog!, closeSettings)}
-      transition:fly={{ y: 16, duration: 150 }}
-    >
-      <div
-        class="sticky top-0 z-10 -mx-6 -mt-6 mb-6 flex items-center justify-between gap-3 bg-inherit px-6 pb-3 pt-6"
-      >
+    {#snippet header()}
+      <div class="flex items-center justify-between gap-3">
         <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
         <button
           class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
           type="button"
           onclick={closeSettings}
+          disabled={deletingServer}
           aria-label="Close settings"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -2929,8 +2945,10 @@
           </svg>
         </button>
       </div>
+    {/snippet}
 
-      <section class="mt-6" aria-labelledby="library-settings-appearance-title">
+    <div inert={confirmDeleteServer}>
+      <section class="mt-3" aria-labelledby="library-settings-appearance-title">
         <h3 id="library-settings-appearance-title" class="text-lg font-medium">
           Application appearance
         </h3>
@@ -2975,6 +2993,7 @@
         <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Theme palette</p>
         <div class="mt-3 flex flex-wrap gap-2" role="group" aria-label="Theme palette">
           {#each skeletonThemes as option (option)}
+            {@const swatch = themeSwatches[option]}
             <button
               class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
               option
@@ -2986,13 +3005,10 @@
               title={option}
               onclick={() => void updateTheme(option)}
             >
-              <span class="flex h-full w-full" data-theme={option}>
-                <span class="h-full flex-1" style:background-color="var(--color-primary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-secondary-500)"
-                ></span>
-                <span class="h-full flex-1" style:background-color="var(--color-tertiary-500)"
-                ></span>
+              <span class="flex h-full w-full">
+                <span class="h-full flex-1" style:background-color={swatch.primary}></span>
+                <span class="h-full flex-1" style:background-color={swatch.secondary}></span>
+                <span class="h-full flex-1" style:background-color={swatch.tertiary}></span>
               </span>
               {#if pendingTheme === option}
                 <span
@@ -3007,6 +3023,11 @@
             </button>
           {/each}
         </div>
+        {#if appearanceError}
+          <div class="alert preset-tonal-error mt-3" role="alert">
+            {appearanceError}
+          </div>
+        {/if}
 
         <p class="mt-6 text-xs uppercase tracking-wider text-surface-700-300">Sync</p>
         <p class="mt-1 text-sm text-surface-700-300">
@@ -3120,7 +3141,7 @@
           <button
             class="btn preset-tonal-error"
             type="button"
-            onclick={() => (confirmDeleteServer = true)}
+            onclick={openConfirmDeleteServer}
             disabled={deletingServer || cleanupInProgress || Boolean(downloadingBookId)}
           >
             Delete server
@@ -3158,90 +3179,45 @@
           </div>
         </dl>
       </section>
-      <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-        <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-        <p class="mt-1 text-sm text-surface-700-300">
-          Copy or download recent connection and book download details. The log includes API routes,
-          HTTP statuses, and failure categories. It stays in memory until the app closes or you
-          clear it. Review it before sharing.
+      <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
+    </div>
+    {#if confirmDeleteServer}
+      <div
+        bind:this={confirmDeleteDialog}
+        class="mt-7 rounded-xl border border-error-500/35 p-4"
+        role="region"
+        aria-labelledby="library-confirm-delete-server-title"
+        tabindex="-1"
+        transition:fade
+      >
+        <p id="library-confirm-delete-server-title" class="text-sm font-medium text-error-700-300">
+          Delete this server?
         </p>
-        <div class="mt-3 grid grid-cols-2 gap-2">
+        <p class="mt-2 text-sm text-surface-700-300">
+          This removes the server connection, downloaded books, cached covers, and local progress
+          from this device.
+        </p>
+        <div class="mt-4 flex gap-2">
+          <button
+            class="btn preset-outlined-error-500"
+            type="button"
+            onclick={() => void deleteServer()}
+            disabled={deletingServer || cleanupInProgress}
+          >
+            {deletingServer ? 'Deleting...' : 'Delete now'}
+          </button>
           <button
             class="btn preset-tonal-surface"
             type="button"
-            onclick={() => void copyDiagnostics()}
+            onclick={cancelConfirmDeleteServer}
+            disabled={deletingServer}
           >
-            Copy diagnostics
-          </button>
-          <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
-            Download log
+            Cancel
           </button>
         </div>
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={showDiagnostics}
-        >
-          {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-        </button>
-        {#if diagnosticsVisible}
-          <div class="mt-3 grid gap-2">
-            <p class="text-sm text-surface-700-300">
-              If copy or download is unavailable, select all text below, then copy it manually.
-            </p>
-            <textarea
-              id="turnleaf-diagnostics-output"
-              class="input min-h-48 w-full font-mono text-xs"
-              readonly
-              rows="10"
-              bind:value={diagnosticsOutput}
-              aria-label="Turnleaf diagnostics log"
-              onclick={selectDiagnostics}></textarea>
-            <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
-              Select all text
-            </button>
-          </div>
-        {/if}
-        <button
-          class="btn preset-tonal-surface mt-2 w-full"
-          type="button"
-          onclick={clearDiagnosticLog}
-        >
-          Clear diagnostics
-        </button>
-        {#if diagnosticsMessage}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-        {/if}
-      </section>
-      {#if confirmDeleteServer}
-        <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-          <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-          <p class="mt-2 text-sm text-surface-700-300">
-            This removes the server connection, downloaded books, cached covers, and local progress
-            from this device.
-          </p>
-          <div class="mt-4 flex gap-2">
-            <button
-              class="btn preset-outlined-error-500"
-              type="button"
-              onclick={() => void deleteServer()}
-              disabled={deletingServer || cleanupInProgress}
-            >
-              {deletingServer ? 'Deleting...' : 'Delete now'}
-            </button>
-            <button
-              class="btn preset-tonal-surface"
-              type="button"
-              onclick={() => (confirmDeleteServer = false)}
-              disabled={deletingServer}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      {/if}
-    </div>
-  </div>
+      </div>
+    {/if}
+  </DialogShell>
 {/if}
 
 <style>

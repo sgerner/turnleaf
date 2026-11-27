@@ -11,6 +11,7 @@ import type {
 } from '../database/database';
 import type { KavitaProgress } from '../kavita/types';
 import type { ReaderLocation } from '../reader/session';
+import type * as ThemesModule from '../themes/themes';
 import { bookActionsLabel, openBookLabel } from '../a11y/book-labels';
 
 const mocks = vi.hoisted(() => ({
@@ -174,10 +175,14 @@ vi.mock('../sync/sync', () => ({
   flushProgress: mocks.flushProgress,
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['vintage', 'fennec'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['vintage', 'fennec'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 vi.mock('../kavita/client', () => ({
   KavitaError: class KavitaError extends Error {
@@ -266,7 +271,12 @@ async function settle(): Promise<void> {
 
 const mountedInstances: Array<Record<string, unknown>> = [];
 
-function renderLibrary(overrides: Partial<{ onServerDeleted: () => void }> = {}) {
+function renderLibrary(
+  overrides: Partial<{
+    onServerDeleted: () => void;
+    onOverlayActiveChange: (active: boolean) => void;
+  }> = {},
+) {
   const target = document.createElement('div');
   document.body.appendChild(target);
   const instance = mount(Library, {
@@ -281,6 +291,9 @@ function renderLibrary(overrides: Partial<{ onServerDeleted: () => void }> = {})
       onApiKeyChange: vi.fn(),
       onServerDeleted: overrides.onServerDeleted ?? vi.fn(),
       onChangeServerAddress: vi.fn(),
+      ...(overrides.onOverlayActiveChange
+        ? { onOverlayActiveChange: overrides.onOverlayActiveChange }
+        : {}),
     },
   });
   flushSync();
@@ -759,5 +772,102 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
     expect(mocks.removeServer).not.toHaveBeenCalled();
     expect(target.textContent).toContain('Could not remove the server safely');
     expect(target.textContent).toContain('Retry cleanup before deleting this server.');
+  });
+
+  it('keeps DialogShell header/body layout, overlay inert state, and focus handling across delete confirmation', async () => {
+    const catalog = makeCatalog(4, 2);
+    mocks.getBooks.mockResolvedValueOnce(catalog);
+    const onOverlayActiveChange = vi.fn();
+
+    const { target } = renderLibrary({ onOverlayActiveChange });
+    await settle();
+
+    const isInert = (element: HTMLElement) =>
+      Boolean(element.inert || element.hasAttribute('inert'));
+
+    const main = target.querySelector<HTMLElement>('main')!;
+    expect(isInert(main)).toBe(false);
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(false);
+
+    const openSettingsBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Open settings"]',
+    )!;
+    openSettingsBtn.focus();
+    openSettingsBtn.click();
+    await settle();
+
+    expect(isInert(main)).toBe(true);
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(true);
+
+    const dialog = target.querySelector<HTMLElement>('[role="dialog"]')!;
+    const header = dialog.querySelector<HTMLElement>('.dialog-header')!;
+    const body = dialog.querySelector<HTMLElement>('.dialog-body')!;
+    const closeSettingsBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Close settings"]',
+    )!;
+    const deleteServerBtn = Array.from(body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Delete server',
+    )!;
+    const removeAllBtn = Array.from(body.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.includes('Remove all downloaded books'),
+    )!;
+
+    expect(header.contains(closeSettingsBtn)).toBe(true);
+    expect(body.classList.contains('overflow-y-auto')).toBe(true);
+    expect(body.contains(deleteServerBtn)).toBe(true);
+    expect(body.contains(removeAllBtn)).toBe(true);
+    expect(document.activeElement).toBe(closeSettingsBtn);
+
+    deleteServerBtn.focus();
+    deleteServerBtn.click();
+    await settle();
+
+    const confirmRegion = body.querySelector<HTMLElement>(
+      '[aria-labelledby="library-confirm-delete-server-title"]',
+    )!;
+    const deleteNowBtn = Array.from(
+      confirmRegion.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((button) => button.textContent?.trim() === 'Delete now')!;
+    const cancelDeleteBtn = Array.from(
+      confirmRegion.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((button) => button.textContent?.trim() === 'Cancel')!;
+    const settingsSectionsWrapper = body.firstElementChild as HTMLElement;
+
+    expect(confirmRegion).not.toBeNull();
+    expect(isInert(settingsSectionsWrapper)).toBe(true);
+    expect(isInert(main)).toBe(true);
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(true);
+    expect(document.activeElement).toBe(deleteNowBtn);
+
+    // Forward Tab from Cancel wraps directly to Close settings, skipping inert settings controls.
+    cancelDeleteBtn.focus();
+    cancelDeleteBtn.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }),
+    );
+    expect(document.activeElement).toBe(closeSettingsBtn);
+
+    // Pressing Escape inside delete confirmation cancels confirmation first and restores focus to Delete server.
+    deleteNowBtn.focus();
+    deleteNowBtn.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+    );
+    await settle();
+
+    expect(
+      body.querySelector('[aria-labelledby="library-confirm-delete-server-title"]'),
+    ).toBeNull();
+    expect(isInert(settingsSectionsWrapper)).toBe(false);
+    expect(target.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(isInert(main)).toBe(true);
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(true);
+    expect(document.activeElement).toBe(deleteServerBtn);
+
+    closeSettingsBtn.click();
+    await settle();
+
+    expect(target.querySelector('[role="dialog"]')).toBeNull();
+    expect(isInert(main)).toBe(false);
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(false);
+    expect(document.activeElement).toBe(openSettingsBtn);
   });
 });

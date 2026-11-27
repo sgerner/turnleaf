@@ -399,6 +399,7 @@ export class ReaderSession {
   private openPromise: Promise<void> | null = null;
   private resizeRecoveryPromise: Promise<void> | null = null;
   private resizeRelocationPending = false;
+  private relocationCount = 0;
   private pendingNavigationCount = 0;
   private relocationWaiters: Array<(didRelocate: boolean) => void> = [];
   private viewportTarget: HTMLElement | null = null;
@@ -560,9 +561,12 @@ export class ReaderSession {
       }
       this.onLocation = onLocation;
       this.relocated = (location) => {
+        this.relocationCount += 1;
+        const wasResizeRelocation = this.resizeRelocationPending;
         this.resizeRelocationPending = false;
         const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
         const isUserNavigation =
+          !wasResizeRelocation &&
           this.userNavigationPending &&
           (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
         const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
@@ -570,7 +574,7 @@ export class ReaderSession {
         if (startCfi !== location.start.cfi) onSelection?.(null);
         this.current = location;
         this.lastDisplayTarget = { target: location.start.cfi };
-        if (isUserNavigation || this.userNavigationOrigin === 'link') {
+        if (isUserNavigation || (!wasResizeRelocation && this.userNavigationOrigin === 'link')) {
           this.userNavigationPending = false;
           this.userNavigationStartCfi = null;
           this.userNavigationOrigin = 'navigation';
@@ -580,7 +584,11 @@ export class ReaderSession {
         if (container) this.lockedScrollLeft = container.scrollLeft;
         this.syncVisibleColumnLinks();
         this.reportLocation(location, origin, returnTarget);
-        if (this.reflowPending) {
+        if (
+          this.reflowPending &&
+          !this.userNavigationPending &&
+          this.pendingNavigationCount === 0
+        ) {
           this.reflowPending = false;
           this.preserveCfi(location.start.cfi, this.locationGeneration);
         }
@@ -655,12 +663,19 @@ export class ReaderSession {
       await this.displayAtGeneration(undefined, restoreGeneration);
     })();
     this.openPromise = openOperation;
+    let opened = false;
     try {
       await openOperation;
+      opened = true;
     } finally {
       if (this.openPromise === openOperation) this.openPromise = null;
       this.opening = false;
-      this.flushPendingViewportResize();
+      if (opened) {
+        this.flushPendingViewportResize();
+      } else {
+        this.pendingViewportSize = null;
+        this.clearPendingResizeFallback();
+      }
     }
   }
 
@@ -953,7 +968,7 @@ export class ReaderSession {
     this.syncVisibleColumnLinks();
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
-    if (this.userNavigationPending) {
+    if (this.userNavigationPending || this.pendingNavigationCount > 0) {
       this.reflowPending = true;
       return;
     }
@@ -989,6 +1004,7 @@ export class ReaderSession {
     this.openPromise = null;
     this.resizeRecoveryPromise = null;
     this.resizeRelocationPending = false;
+    this.relocationCount = 0;
     this.pendingNavigationCount = 0;
     this.viewportTarget = null;
     this.lockedScrollLeft = 0;
@@ -1004,7 +1020,10 @@ export class ReaderSession {
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1361,7 +1380,19 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
+      if (
+        !this.pendingViewportSize &&
+        this.viewportSize?.width === width &&
+        this.viewportSize.height === height
+      ) {
+        return;
+      }
       if (this.shouldDeferViewportResize()) {
+        if (this.viewportSize?.width === width && this.viewportSize.height === height) {
+          this.pendingViewportSize = null;
+          this.clearPendingResizeFallback();
+          return;
+        }
         this.pendingViewportSize = { width, height };
         this.schedulePendingResizeFallback();
         return;
@@ -1463,8 +1494,20 @@ export class ReaderSession {
   }
 
   private reopenAfterUnlocatedResize(target: string | undefined, generation: number): void {
+    const relocationCountBefore = this.relocationCount;
     const recovery = this.displayAtGeneration(target, generation)
-      .then(() => undefined)
+      .then((applied) => {
+        const rendition = this.rendition as
+          (Rendition & { manager?: { views?: { length?: number } } }) | null;
+        if (
+          applied &&
+          this.relocationCount === relocationCountBefore &&
+          (rendition?.manager?.views?.length ?? 0) > 0 &&
+          !rendition?.location?.start
+        ) {
+          this.resizeRelocationPending = true;
+        }
+      })
       .catch(() => {
         // Recovery display is best-effort if the reader closes during resize.
       })
@@ -1665,7 +1708,12 @@ export class ReaderSession {
 
   private preserveCfi(cfi: string, generation: number): void {
     const rendition = this.rendition;
-    if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
+    if (
+      !rendition ||
+      !this.isCurrentLocationOperation(generation) ||
+      this.userNavigationPending ||
+      this.pendingNavigationCount > 0
+    ) {
       return;
     }
     this.lastDisplayTarget = { target: cfi };
