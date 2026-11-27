@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Guard destructive reading actions with confirmation dialogs
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests

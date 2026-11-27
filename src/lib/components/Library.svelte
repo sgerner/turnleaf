@@ -1524,10 +1524,11 @@
       return;
     }
     await markBookCompleted(book);
-    const now = new Date().toISOString();
-    books = books.map((item) =>
-      item.id === book.id ? { ...item, pagesRead: book.pages, lastReadAt: now } : item,
-    );
+    const savedBook = books.find((item) => item.id === book.id);
+    if (savedBook) {
+      savedBook.pagesRead = book.pages;
+      savedBook.lastReadAt = new Date().toISOString();
+    }
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     libraryConfirm = null;
@@ -3088,7 +3089,9 @@
         <button
           class="btn preset-tonal-error"
           type="button"
-          disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+          disabled={Boolean(downloadingBookId) ||
+            cleanupInProgress ||
+            !books.some((book) => book.downloadPath)}
           onclick={requestRemoveAllDownloads}
         >
           Remove all downloaded books
