@@ -236,6 +236,7 @@ async function mountLibrary(
 
 beforeEach(async () => {
   networkConnected = true;
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   networkListeners.clear();
   appStateListeners.clear();
   verifyDownloadedEpubMock.mockClear();
@@ -661,5 +662,51 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
+  });
+
+  it('waits for WebView navigator.onLine before syncing and refreshing after native Network reconnects', async () => {
+    networkConnected = false;
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/8)', '//body/p[8]', 0.5, 2);
+
+    const observedPaths: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      observedPaths.push(url.pathname);
+      if (url.pathname === '/api/Reader/progress') {
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(50)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(50));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    await mountLibrary();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(observedPaths).toEqual([]);
+
+    // Native Network plugin reports connected before Chromium WebView updates navigator.onLine.
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(observedPaths).toEqual([]);
+    expect((await getPendingSync(server.id)).length).toBe(1);
+
+    // WebView finishes updating navigator.onLine and dispatches window 'online'.
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
+    window.dispatchEvent(new Event('online'));
+
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    await waitForCondition(() => observedPaths.includes('/api/Series/v2'));
+    expect(observedPaths).toContain('/api/Reader/progress');
   });
 });

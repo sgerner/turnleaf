@@ -14,14 +14,8 @@ interface ActiveFlush {
 
 const flushing = new Map<string, ActiveFlush>();
 
-function isTransportDropped(signal?: AbortSignal): boolean {
-  return (
-    Boolean(signal?.aborted) || (typeof navigator !== 'undefined' && navigator.onLine === false)
-  );
-}
-
 function isTransportAbort(signal: AbortSignal | undefined, error: unknown): boolean {
-  if (isTransportDropped(signal)) return true;
+  if (signal?.aborted) return true;
   if (error instanceof DOMException && error.name === 'AbortError') return true;
   return (
     error instanceof KavitaError &&
@@ -35,7 +29,7 @@ export function flushProgress(
   serverId: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  if (isTransportDropped(signal)) return Promise.resolve();
+  if (signal?.aborted) return Promise.resolve();
   const active = flushing.get(serverId);
   if (active) {
     if (active.signal?.aborted) {
@@ -55,14 +49,14 @@ async function run(client: KavitaClient, serverId: string, signal?: AbortSignal)
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
   let stopped = false;
-  while (!stopped && !isTransportDropped(signal)) {
+  while (!stopped && !signal?.aborted) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
-    if (pending.length === 0 || isTransportDropped(signal)) break;
+    if (pending.length === 0 || signal?.aborted) break;
     for (const item of pending) {
-      if (isTransportDropped(signal)) {
+      if (signal?.aborted) {
         stopped = true;
         break;
       }
