@@ -339,7 +339,7 @@ describe('Reader destructive action confirmations', () => {
     expect(currentToggle.textContent?.trim()).toBe('Bookmark this page');
   });
 
-  it('uses ConfirmDialog when manual sync finds a divergent Kavita reading position, awaiting async acceptance and surfacing rejection errors', async () => {
+  it('preserves z-40 sync confirmation alertdialog when manual sync finds a divergent Kavita reading position, awaiting async acceptance and surfacing rejection errors', async () => {
     let resolveAccept: (() => void) | null = null;
     let shouldRejectAccept = false;
     const accept = vi.fn(
@@ -527,7 +527,7 @@ describe('Reader destructive action confirmations', () => {
     await flushUi();
 
     expect(host.querySelector('[role="alertdialog"]')).not.toBeNull();
-    expect(panel.inert).toBe(true);
+    expect(host.querySelector<HTMLElement>('.reader-overlay')?.inert).toBe(true);
 
     // Window-level Escape cancels ConfirmDialog first without closing Highlights and notes
     window.dispatchEvent(
@@ -536,7 +536,7 @@ describe('Reader destructive action confirmations', () => {
     await flushUi();
     expect(host.querySelector('[role="alertdialog"]')).toBeNull();
     expect(host.querySelector('#reader-annotations')).not.toBeNull();
-    expect(panel.inert).toBe(false);
+    expect(host.querySelector<HTMLElement>('.reader-overlay')?.inert).toBe(false);
     expect(document.activeElement).toBe(deleteBtn);
 
     // Confirming deletes the highlight, clears stale saved banner, announces deletion, and focuses fallback heading

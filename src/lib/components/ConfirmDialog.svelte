@@ -20,7 +20,6 @@
     opener = undefined,
     fallbackFocus = undefined,
     zIndexClass = 'z-60',
-    restoreFocusOnConfirm = false,
     onConfirm,
     onCancel,
     children,
@@ -35,7 +34,6 @@
     opener?: HTMLElement | null | undefined;
     fallbackFocus?: HTMLElement | null | (() => HTMLElement | null) | undefined;
     zIndexClass?: 'z-40' | 'z-60' | undefined;
-    restoreFocusOnConfirm?: boolean;
     onConfirm: () => void | Promise<void>;
     onCancel: () => void;
     children?: Snippet | undefined;
@@ -59,7 +57,7 @@
   });
 
   onDestroy(() => {
-    if (!confirmed || restoreFocusOnConfirm) {
+    if (!confirmed) {
       restoreModalFocus(capturedOpener, fallbackFocus);
     }
   });

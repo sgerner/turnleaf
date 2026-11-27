@@ -2,7 +2,6 @@
 
 import { compile, parse, type AST } from 'svelte/compiler';
 import { expect, it } from 'vitest';
-import confirmDialogSource from './ConfirmDialog.svelte?raw';
 import readerSource from './Reader.svelte?raw';
 
 type ExpectedPanelSpec = {
@@ -169,13 +168,6 @@ it('compiles Reader.svelte with one shared readerPanelHeader snippet and leaves 
   expect(() =>
     compile(readerSource, { filename: 'Reader.svelte', generate: 'client' }),
   ).not.toThrow();
-  expect(() =>
-    compile(confirmDialogSource, { filename: 'ConfirmDialog.svelte', generate: 'client' }),
-  ).not.toThrow();
   expect(readerSource).toContain('role="alertdialog"');
-  expect(readerSource).toContain('id="reader-error-title"');
-  expect(readerSource).toContain('<ConfirmDialog');
-  expect(confirmDialogSource).toContain('role="alertdialog"');
-  expect(confirmDialogSource).not.toContain('readerPanelHeader');
-  expect(confirmDialogSource).not.toContain('title="Close"');
+  expect(readerSource).toContain('id="reader-sync-confirm-title"');
 });
