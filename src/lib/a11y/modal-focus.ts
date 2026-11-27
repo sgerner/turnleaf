@@ -34,13 +34,21 @@ export type FocusFallbackTarget =
 
 export type ModalFocusTrapOptions = (() => void) | { onClose: () => void };
 
+function isHiddenOrInert(element: Element): boolean {
+  if (element.closest(HIDDEN_OR_INERT_SELECTOR)) return true;
+  for (let current: Element | null = element; current; current = current.parentElement) {
+    if (current instanceof HTMLElement && current.inert) return true;
+  }
+  return false;
+}
+
 function isAvailableElement(element: Element | null | undefined): element is HTMLElement {
   return (
     element instanceof HTMLElement &&
     element.isConnected &&
     !element.hasAttribute('disabled') &&
     !element.matches(':disabled') &&
-    !element.closest(HIDDEN_OR_INERT_SELECTOR)
+    !isHiddenOrInert(element)
   );
 }
 
@@ -64,7 +72,7 @@ function hasLostFocus(): boolean {
     active === document.body ||
     active === document.documentElement ||
     !active.isConnected ||
-    Boolean(active.closest(HIDDEN_OR_INERT_SELECTOR))
+    isHiddenOrInert(active)
   );
 }
 
@@ -109,10 +117,18 @@ function resolveDefaultFallback(): HTMLElement | null {
 }
 
 export function isFocusableElement(element: HTMLElement): boolean {
-  return (
-    element.tabIndex >= 0 &&
+  return element.tabIndex >= 0 && !element.matches(':disabled') && !isHiddenOrInert(element);
+}
+
+function canRestoreFocusTarget(element: HTMLElement | null | undefined): element is HTMLElement {
+  return Boolean(
+    element &&
+    element.isConnected &&
+    element !== document.body &&
+    element !== document.documentElement &&
+    !element.hasAttribute('disabled') &&
     !element.matches(':disabled') &&
-    !element.closest(HIDDEN_OR_INERT_SELECTOR)
+    !isHiddenOrInert(element),
   );
 }
 
@@ -158,12 +174,25 @@ export function focusModal(getContainer: () => HTMLElement | null): void {
   void tick().then(() => focusFirstElement(getContainer()));
 }
 
-export function restoreFocus(element: HTMLElement | null): void {
-  focusElement(element);
+export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement | null): void {
+  if (canRestoreFocusTarget(element) && focusElement(element)) {
+    return;
+  }
+  if (!canRestoreFocusTarget(fallback)) return;
+  if (fallback.matches(FOCUSABLE_SELECTOR) && fallback.tabIndex >= 0) {
+    focusElement(fallback);
+    return;
+  }
+  focusFirstElement(fallback);
 }
 
-export function restoreModalFocus(element: HTMLElement | null): void {
-  void tick().then(() => restoreFocus(element));
+export function restoreModalFocus(
+  element: HTMLElement | null,
+  fallback?: HTMLElement | null | (() => HTMLElement | null),
+): void {
+  void tick().then(() =>
+    restoreFocus(element, typeof fallback === 'function' ? fallback() : fallback),
+  );
 }
 
 export function trapModalKeydown(
@@ -251,7 +280,7 @@ export function focusAfterUnmount(
       if (!node.isConnected || node.matches(':disabled') || node.hasAttribute('disabled')) {
         return;
       }
-      if (node.closest(HIDDEN_OR_INERT_SELECTOR)) {
+      if (isHiddenOrInert(node)) {
         if (hadFocus && !restoredOnInert && restoreToFallback()) {
           restoredOnInert = true;
           hadFocus = false;
@@ -298,12 +327,7 @@ export function modalFocusTrap(
   };
 
   const onKeydown = (event: KeyboardEvent): void => {
-    if (
-      destroyed ||
-      event.defaultPrevented ||
-      !node.isConnected ||
-      node.closest(HIDDEN_OR_INERT_SELECTOR)
-    ) {
+    if (destroyed || event.defaultPrevented || !node.isConnected || isHiddenOrInert(node)) {
       return;
     }
     trapModalKeydown(event, node, getClose());
