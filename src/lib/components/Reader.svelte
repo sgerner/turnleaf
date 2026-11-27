@@ -26,7 +26,11 @@
     type ReaderSelection,
     type TocItem,
   } from '../reader/session';
-  import type { ReaderSearchResult } from '../reader/search';
+  import {
+    DEFAULT_SEARCH_MATCH_LIMIT,
+    type ReaderSearchCursor,
+    type ReaderSearchResult,
+  } from '../reader/search';
   import {
     MAX_ANNOTATIONS,
     addAnnotation,
@@ -165,8 +169,21 @@
     return Boolean(selectedText && annotationDraft.trim());
   }
   let searchQuery = $state('');
+  let searchedQuery = $state('');
   let searched = $state(false);
   let searchResults = $state<ReaderSearchResult[]>([]);
+  let searchScannedChapters = $state(0);
+  let searchSkippedChapters = $state(0);
+  let searchTotalChapters = $state(0);
+  let searchNextCursor = $state<ReaderSearchCursor | null>(null);
+  let activeSearchIndex = $state<number | null>(null);
+  let searchBarVisible = $state(false);
+  let searchReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
+  let matchBarCounterButton = $state<HTMLButtonElement | null>(null);
+  let searchOpenedFromMatchBar = false;
+  let searchNavigationDepth = 0;
+  let searchStepGeneration = 0;
+  let readerNavigationGeneration = 0;
   let searching = $state(false);
   let readerSyncMessage = $state('');
   let searchError = $state('');
@@ -249,12 +266,17 @@
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
+        const transientSearch = searchBarVisible || searchNavigationDepth > 0;
         if (origin === 'link') {
+          readerNavigationGeneration += 1;
+          if (!searchBarVisible && searchNavigationDepth > 0) {
+            searchStepGeneration += 1;
+          }
           linkReturnTarget = returnTarget ?? null;
-        } else if (origin === 'navigation') {
+        } else if (origin === 'navigation' && !transientSearch) {
           linkReturnTarget = null;
         }
-        if (origin === 'navigation' || origin === 'link') {
+        if ((origin === 'navigation' || origin === 'link') && !transientSearch) {
           localNavigationDuringSession = true;
           onRelocated(next);
           locationHistory = recordLocation(locationHistory, next);
@@ -437,6 +459,7 @@
     if (bookmarksVisible) return bookmarksPanel;
     if (annotationsVisible) return annotationsPanel;
     if (searchVisible) return searchPanel;
+    if (searchBarVisible && matchBarCounterButton) return matchBarCounterButton;
     return readerToolbar ?? topRevealButton;
   }
 
@@ -484,6 +507,23 @@
     if (controlsVisible && !hasOpenReaderPanel()) scheduleChromeHide();
   }
 
+  function cancelActiveSearchRequest(): void {
+    searchController?.abort();
+    searchController = null;
+    searching = false;
+  }
+
+  function advanceReaderNavigation(clearTransientSearch = false): void {
+    readerNavigationGeneration += 1;
+    searchStepGeneration += 1;
+    if (clearTransientSearch && (searchBarVisible || searchReturnTarget !== null)) {
+      session?.setSearchHighlight(null);
+      searchBarVisible = false;
+      activeSearchIndex = null;
+      searchReturnTarget = null;
+    }
+  }
+
   function openSettings(): void {
     pauseChromeHide();
     settingsOpener = activeElement();
@@ -492,10 +532,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    searchOpenedFromMatchBar = false;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    cancelActiveSearchRequest();
     focusModal(() => settingsPanel);
   }
 
@@ -515,10 +557,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    searchOpenedFromMatchBar = false;
     settingsOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    cancelActiveSearchRequest();
     focusedTocIndex = -1;
     void initializeTocDialog();
   }
@@ -544,10 +588,12 @@
     tocVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    searchOpenedFromMatchBar = false;
     settingsOpener = null;
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    cancelActiveSearchRequest();
     focusModal(() => bookmarksPanel);
   }
 
@@ -586,13 +632,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     searchVisible = false;
+    searchOpenedFromMatchBar = false;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     searchOpener = null;
-    searchController?.abort();
-    searchController = null;
-    searching = false;
+    cancelActiveSearchRequest();
     if (focusAnnotationId) {
       focusReaderTarget(annotationsPanel, 'annotation-editor', focusAnnotationId);
     } else {
@@ -622,7 +667,9 @@
     resumeChromeHide();
   }
 
-  function openSearch(): void {
+  function openSearch(focusActiveResult = false): void {
+    searchOpenedFromMatchBar = focusActiveResult && !controlsVisible;
+    controlsVisible = true;
     pauseChromeHide();
     searchOpener = activeElement();
     searchVisible = true;
@@ -635,17 +682,45 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchError = '';
+    if (
+      focusActiveResult &&
+      activeSearchIndex !== null &&
+      activeSearchIndex >= 0 &&
+      activeSearchIndex < searchResults.length
+    ) {
+      const targetIndex = activeSearchIndex;
+      void tick().then(() => {
+        const controls =
+          searchPanel?.querySelectorAll<HTMLElement>('[data-reader-focus="search-result"]') ?? [];
+        const element = [...controls].find(
+          (control) => control.dataset.readerFocusId === String(targetIndex),
+        );
+        if (element) {
+          element.scrollIntoView?.({ block: 'nearest' });
+          element.focus();
+        } else {
+          focusFirstElement(searchPanel);
+        }
+      });
+      return;
+    }
     focusModal(() => searchPanel);
   }
 
   function closeSearch(): void {
     searchVisible = false;
-    searchController?.abort();
-    searchController = null;
-    searching = false;
+    cancelActiveSearchRequest();
+    const hideChrome = searchOpenedFromMatchBar;
+    searchOpenedFromMatchBar = false;
+    if (hideChrome) {
+      controlsVisible = false;
+      footerVisible = false;
+    }
     const opener = searchOpener;
     searchOpener = null;
-    restoreModalFocus(opener);
+    restoreModalFocus(opener, () =>
+      searchBarVisible ? matchBarCounterButton : (readerToolbar ?? topRevealButton),
+    );
     resumeChromeHide();
   }
 
@@ -660,6 +735,7 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    searchOpenedFromMatchBar = false;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
@@ -677,9 +753,7 @@
     annotationLimitMessage = '';
     exportFallback = '';
     exportMessage = '';
-    searchController?.abort();
-    searchController = null;
-    searching = false;
+    cancelActiveSearchRequest();
   }
 
   function openSyncConfirmation(
@@ -1111,10 +1185,19 @@
   }
 
   async function runSearch(): Promise<void> {
-    if (!session || !searchQuery.trim()) {
+    const query = searchQuery.trim();
+    if (!session || !query) {
       searched = false;
+      searchedQuery = '';
       searchResults = [];
-      searchError = searchQuery.trim() ? 'The reader is still opening.' : '';
+      searchScannedChapters = 0;
+      searchSkippedChapters = 0;
+      searchTotalChapters = 0;
+      searchNextCursor = null;
+      activeSearchIndex = null;
+      session?.setSearchHighlight(null);
+      if (!searchReturnTarget) searchBarVisible = false;
+      searchError = query ? 'The reader is still opening.' : '';
       return;
     }
     searchController?.abort();
@@ -1123,14 +1206,26 @@
     searching = true;
     searchError = '';
     try {
-      const results = await session.search(searchQuery, controller.signal);
-      if (searchController === controller) {
-        searchResults = results;
+      const batch = await session.search(query, controller.signal);
+      if (searchController === controller && !controller.signal.aborted && !destroyed) {
+        searchedQuery = query;
+        searchResults = batch.results;
+        searchScannedChapters = batch.scannedChapters;
+        searchSkippedChapters = batch.skippedChapters;
+        searchTotalChapters = batch.totalChapters;
+        searchNextCursor = batch.nextCursor;
+        activeSearchIndex = null;
+        session.setSearchHighlight(null);
+        if (!searchReturnTarget) searchBarVisible = false;
         searched = true;
       }
     } catch (cause) {
       if (!controller.signal.aborted) {
         searchResults = [];
+        searchScannedChapters = 0;
+        searchSkippedChapters = 0;
+        searchTotalChapters = 0;
+        searchNextCursor = null;
         searchError = cause instanceof Error ? cause.message : 'Search could not be completed.';
       }
     } finally {
@@ -1141,20 +1236,276 @@
     }
   }
 
-  async function openSearchResult(result: ReaderSearchResult): Promise<void> {
-    if (!session) return;
+  async function continueSearch(): Promise<void> {
+    if (!session || !searchedQuery || !searchNextCursor || searching) return;
+    const cursor = searchNextCursor;
+    const previousCount = searchResults.length;
+    const hadFocusOnMore = activeElement()?.dataset.readerFocus === 'search-more';
+    searchController?.abort();
+    const controller = new AbortController();
+    searchController = controller;
+    searching = true;
+    searchError = '';
     try {
-      await session.displayCfi(result.cfi);
-      closeSearch();
-      showControls();
+      const batch = await session.search(
+        searchedQuery,
+        controller.signal,
+        DEFAULT_SEARCH_MATCH_LIMIT,
+        cursor,
+      );
+      if (searchController === controller && !controller.signal.aborted && !destroyed) {
+        searchResults = [...searchResults, ...batch.results];
+        const newlyScannedChapters =
+          cursor.matchIndex > 0 ? Math.max(0, batch.scannedChapters - 1) : batch.scannedChapters;
+        searchScannedChapters = Math.min(
+          batch.totalChapters,
+          searchScannedChapters + newlyScannedChapters,
+        );
+        searchSkippedChapters = batch.skippedChapters;
+        searchTotalChapters = batch.totalChapters;
+        searchNextCursor = batch.nextCursor;
+        if (hadFocusOnMore) {
+          if (batch.nextCursor) {
+            focusReaderTarget(searchPanel, 'search-more');
+          } else if (searchResults.length > previousCount) {
+            focusReaderTarget(searchPanel, 'search-result', String(previousCount));
+          } else if (searchResults.length > 0) {
+            focusReaderTarget(searchPanel, 'search-result', String(searchResults.length - 1));
+          } else {
+            void tick().then(() => {
+              searchPanel?.querySelector<HTMLElement>('#reader-search-query')?.focus();
+            });
+          }
+        }
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        searchError =
+          cause instanceof Error ? cause.message : 'Remaining chapters could not be searched.';
+      }
+    } finally {
+      if (searchController === controller) {
+        searching = false;
+        searchController = null;
+      }
+    }
+  }
+
+  async function navigateToSearchMatch(index: number, closeDialog: boolean): Promise<void> {
+    if (!session) return;
+    const result = searchResults[index];
+    if (!result) return;
+
+    const opener = activeElement();
+    const stepId = ++searchStepGeneration;
+    const navGen = readerNavigationGeneration;
+    const previousReturnTarget = searchReturnTarget;
+    const originTarget =
+      searchReturnTarget ??
+      (location
+        ? { cfi: location.cfi, href: location.href }
+        : initialCfi
+          ? { cfi: initialCfi, href: '' }
+          : null);
+    searchReturnTarget = originTarget;
+    searchNavigationDepth += 1;
+
+    try {
+      const genBeforeCfi = session.currentLocationGeneration?.();
+      const displayed = await session.displayCfi(result.cfi, false);
+      const cfiSuperseded =
+        genBeforeCfi !== undefined && session.currentLocationGeneration?.() !== genBeforeCfi + 1;
+      if (
+        destroyed ||
+        stepId !== searchStepGeneration ||
+        navGen !== readerNavigationGeneration ||
+        cfiSuperseded
+      ) {
+        if (stepId === searchStepGeneration && !searchBarVisible) {
+          searchReturnTarget = previousReturnTarget;
+        }
+        return;
+      }
+      if (!displayed) {
+        if (!result.href) throw new Error('Unavailable search result');
+        const genBeforeHref = session.currentLocationGeneration?.();
+        await session.display(result.href, false);
+        const hrefSuperseded =
+          genBeforeHref !== undefined &&
+          session.currentLocationGeneration?.() !== genBeforeHref + 1;
+        if (
+          destroyed ||
+          stepId !== searchStepGeneration ||
+          navGen !== readerNavigationGeneration ||
+          hrefSuperseded
+        ) {
+          if (stepId === searchStepGeneration && !searchBarVisible) {
+            searchReturnTarget = previousReturnTarget;
+          }
+          return;
+        }
+      }
+      activeSearchIndex = index;
+      searchBarVisible = true;
+      session.setSearchHighlight(result.cfi);
+      if (closeDialog) {
+        cancelActiveSearchRequest();
+        searchVisible = false;
+        searchOpener = null;
+        searchOpenedFromMatchBar = false;
+        controlsVisible = false;
+        footerVisible = false;
+        pauseChromeHide();
+        restoreModalFocus(null, () => matchBarCounterButton);
+      }
     } catch {
-      searchError = 'This search result is no longer available in the current EPUB.';
+      if (destroyed || stepId !== searchStepGeneration || navGen !== readerNavigationGeneration) {
+        return;
+      }
+      if (!searchBarVisible) {
+        searchReturnTarget = previousReturnTarget;
+      }
+      const message = 'This search result is no longer available in the current EPUB.';
+      if (searchVisible) searchError = message;
+      else openReaderError(message, opener);
+    } finally {
+      searchNavigationDepth = Math.max(0, searchNavigationDepth - 1);
+    }
+  }
+
+  async function openSearchResult(result: ReaderSearchResult, index?: number): Promise<void> {
+    const resolvedIndex =
+      index ?? searchResults.findIndex((candidate) => candidate.cfi === result.cfi);
+    if (resolvedIndex < 0) return;
+    await navigateToSearchMatch(resolvedIndex, true);
+  }
+
+  async function stepSearchResult(delta: -1 | 1): Promise<void> {
+    if (searchResults.length === 0) return;
+    const current = activeSearchIndex ?? 0;
+    const nextIndex = (current + delta + searchResults.length) % searchResults.length;
+    await navigateToSearchMatch(nextIndex, false);
+  }
+
+  function dismissSearchBar(): void {
+    searchStepGeneration += 1;
+    const focusWasInMatchBar = Boolean(activeElement()?.closest('[data-reader-search-bar]'));
+    session?.setSearchHighlight(null);
+    searchBarVisible = false;
+    activeSearchIndex = null;
+    searchReturnTarget = null;
+    if (focusWasInMatchBar) {
+      restoreModalFocus(null, () =>
+        controlsVisible
+          ? (readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ??
+            readerToolbar)
+          : topRevealButton,
+      );
+    }
+  }
+
+  async function returnFromSearch(): Promise<void> {
+    if (!session) return;
+    const opener = activeElement();
+    const restoreReaderFocus =
+      Boolean(opener?.closest('[data-reader-search-bar]')) ||
+      opener === null ||
+      opener === document.body;
+    const stepId = ++searchStepGeneration;
+    const navGen = readerNavigationGeneration;
+    const target = searchReturnTarget;
+    if (!target) {
+      session.setSearchHighlight(null);
+      searchBarVisible = false;
+      activeSearchIndex = null;
+      searchReturnTarget = null;
+      showControls();
+      if (restoreReaderFocus) {
+        restoreModalFocus(
+          null,
+          () =>
+            readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ??
+            readerToolbar ??
+            topRevealButton,
+        );
+      }
+      return;
+    }
+    searchNavigationDepth += 1;
+    try {
+      let restored = false;
+      if (target.cfi) {
+        const genBeforeCfi = session.currentLocationGeneration?.();
+        restored = await session.displayCfi(target.cfi, false);
+        const cfiSuperseded =
+          genBeforeCfi !== undefined && session.currentLocationGeneration?.() !== genBeforeCfi + 1;
+        if (
+          destroyed ||
+          stepId !== searchStepGeneration ||
+          navGen !== readerNavigationGeneration ||
+          cfiSuperseded
+        ) {
+          if (!destroyed && stepId === searchStepGeneration) {
+            session.setSearchHighlight(null);
+            searchBarVisible = false;
+            activeSearchIndex = null;
+            searchReturnTarget = null;
+          }
+          return;
+        }
+      }
+      if (!restored && target.href) {
+        const genBeforeHref = session.currentLocationGeneration?.();
+        await session.display(target.href, false);
+        const hrefSuperseded =
+          genBeforeHref !== undefined &&
+          session.currentLocationGeneration?.() !== genBeforeHref + 1;
+        if (
+          destroyed ||
+          stepId !== searchStepGeneration ||
+          navGen !== readerNavigationGeneration ||
+          hrefSuperseded
+        ) {
+          if (!destroyed && stepId === searchStepGeneration) {
+            session.setSearchHighlight(null);
+            searchBarVisible = false;
+            activeSearchIndex = null;
+            searchReturnTarget = null;
+          }
+          return;
+        }
+      }
+      session.setSearchHighlight(null);
+      searchBarVisible = false;
+      activeSearchIndex = null;
+      searchReturnTarget = null;
+      showControls();
+      if (restoreReaderFocus) {
+        restoreModalFocus(
+          null,
+          () =>
+            readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ??
+            readerToolbar ??
+            topRevealButton,
+        );
+      }
+    } catch {
+      if (destroyed || stepId !== searchStepGeneration || navGen !== readerNavigationGeneration) {
+        return;
+      }
+      openReaderError(
+        'The location before this search is no longer available in the current EPUB.',
+        opener,
+      );
+    } finally {
+      searchNavigationDepth = Math.max(0, searchNavigationDepth - 1);
     }
   }
 
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
     if (!session) return;
     const opener = activeElement();
+    advanceReaderNavigation(true);
     try {
       const restored = await session.displayCfi(saved.cfi);
       if (!restored && saved.href) await session.display(saved.href);
@@ -1170,6 +1521,7 @@
     const opener = activeElement();
     const restoreLink = opener === returnToLinkButton;
     const target = linkReturnTarget;
+    advanceReaderNavigation(true);
     try {
       const restored = await session.displayCfi(target.cfi);
       if (!restored && target.href) await session.display(target.href);
@@ -1187,6 +1539,10 @@
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     if (!session || Boolean(error)) return;
     const opener = activeElement();
+    readerNavigationGeneration += 1;
+    if (!searchBarVisible && searchNavigationDepth > 0) {
+      searchStepGeneration += 1;
+    }
     try {
       if (direction === 'next') await session.next();
       else await session.previous();
@@ -1266,6 +1622,7 @@
     try {
       await progress.accept?.();
       if (destroyed || session !== reader) return;
+      advanceReaderNavigation(true);
       await displaySyncedLocation(reader, progress);
       showControls();
       restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
@@ -1299,6 +1656,7 @@
       if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
         await progress.accept?.();
         if (destroyed || session !== reader || localNavigationDuringSession) return;
+        advanceReaderNavigation(true);
         await displaySyncedLocation(reader, progress);
       }
       if (showFeedback) {
@@ -1357,13 +1715,17 @@
       else if (tocVisible) closeToc();
       else if (bookmarksVisible) closeBookmarks();
       else if (annotationsVisible) closeAnnotations();
-      else if (searchVisible) closeSearch();
+      else if (searchVisible) {
+        closeSearch();
+        if (!controlsVisible) return;
+      }
       showControls();
       return;
     }
     const action = resolveReaderKeyboardAction(event, {
       hasOpenPanel: hasOpenReaderPanel(),
       hasSelection: selectedText !== null,
+      hasSearchBar: searchBarVisible,
     });
     if (!action) return;
     event.preventDefault();
@@ -1376,6 +1738,10 @@
       session?.clearTextSelection();
       if (!hasSelectionDraft()) selectedText = null;
       if (restoreFrameFocus) restoreViewportFrameFocus();
+      return;
+    }
+    if (action === 'dismiss-search') {
+      dismissSearchBar();
       return;
     }
     void turn(action);
@@ -1394,8 +1760,15 @@
     else if (tocVisible) closeToc();
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
-    else if (searchVisible) closeSearch();
-    else if (linkReturnTarget) {
+    else if (searchVisible) {
+      closeSearch();
+      if (!controlsVisible) return true;
+    } else if (searchReturnTarget) {
+      void returnFromSearch();
+      return true;
+    } else if (searchBarVisible) {
+      dismissSearchBar();
+    } else if (linkReturnTarget) {
       void returnToLink();
       return true;
     } else if (controlsVisible) {
@@ -1451,7 +1824,9 @@
   {#if selectedText && !hasOpenReaderPanel()}
     <div
       bind:this={selectedTextGroup}
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      class="absolute inset-x-0 {searchBarVisible
+        ? 'bottom-[calc(max(0.5rem,env(safe-area-inset-bottom))+3.75rem)]'
+        : 'bottom-[max(2rem,env(safe-area-inset-bottom))]'} z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
       role="group"
       aria-label="Selected text"
     >
@@ -1518,13 +1893,89 @@
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
       bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
+      class="absolute right-[max(1rem,env(safe-area-inset-right))] {searchBarVisible
+        ? 'bottom-[calc(max(0.5rem,env(safe-area-inset-bottom))+3.75rem)]'
+        : 'bottom-[calc(var(--reader-safe-bottom)+0.75rem)]'} z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
       type="button"
       aria-label="Return to the location before this link"
       onclick={() => void returnToLink()}
     >
       Return to link
     </button>
+  {/if}
+
+  {#if searchBarVisible}
+    <div
+      class="reader-search-bar card preset-filled-surface-50-950 shadow-lg"
+      class:hidden={hasOpenReaderPanel()}
+      inert={hasOpenReaderPanel()}
+      data-reader-search-bar
+      role="toolbar"
+      aria-label="Search match navigation"
+    >
+      <button
+        class="reader-search-bar-btn btn btn-sm preset-tonal-surface p-0"
+        type="button"
+        aria-label="Previous search match"
+        title="Previous match"
+        disabled={searchResults.length <= 1}
+        onclick={() => void stepSearchResult(-1)}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path fill="currentColor" d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+        </svg>
+      </button>
+      <button
+        bind:this={matchBarCounterButton}
+        class="reader-search-bar-btn reader-search-bar-counter btn btn-sm preset-tonal-primary px-2.5 tabular-nums"
+        type="button"
+        disabled={searchResults.length === 0}
+        aria-label={activeSearchIndex !== null && searchResults.length > 0
+          ? `Match ${activeSearchIndex + 1} of ${searchResults.length}, reopen search results`
+          : 'Reopen search results'}
+        title="Reopen search results"
+        onclick={() => openSearch(true)}
+      >
+        {activeSearchIndex !== null && searchResults.length > 0
+          ? `${activeSearchIndex + 1} / ${searchResults.length}`
+          : `0 / ${searchResults.length}`}
+      </button>
+      <button
+        class="reader-search-bar-btn btn btn-sm preset-tonal-surface p-0"
+        type="button"
+        aria-label="Next search match"
+        title="Next match"
+        disabled={searchResults.length <= 1}
+        onclick={() => void stepSearchResult(1)}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
+          <path fill="currentColor" d="M8.59 16.59 10 18l6-6-6-6-1.41 1.41L13.17 12z" />
+        </svg>
+      </button>
+      <button
+        class="reader-search-bar-btn btn btn-sm preset-filled-primary-700-300 px-2.5"
+        type="button"
+        disabled={!searchReturnTarget}
+        aria-label="Return to pre-search reading location"
+        onclick={() => void returnFromSearch()}
+      >
+        Return
+      </button>
+      <button
+        class="reader-search-bar-btn btn btn-sm preset-tonal-surface p-0"
+        type="button"
+        aria-label="Close search match bar"
+        title="Close search match bar"
+        onclick={dismissSearchBar}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+          <path
+            fill="currentColor"
+            d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+          />
+        </svg>
+      </button>
+    </div>
   {/if}
 
   {#if readerSyncMessage && controlsVisible}
@@ -1971,6 +2422,7 @@
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
                     onclick={() => {
+                      advanceReaderNavigation(true);
                       void session?.display(item.href);
                       closeToc();
                     }}
@@ -2025,6 +2477,7 @@
                           type="button"
                           onkeydown={(event) => void continueTocTabbing(event, row.index)}
                           onclick={() => {
+                            advanceReaderNavigation(true);
                             void session?.display(row.href);
                             closeToc();
                           }}
@@ -2089,27 +2542,71 @@
             <p class="mt-3 text-sm text-error-700-300" role="alert">{searchError}</p>
           {/if}
           <p class="mt-3 text-sm text-surface-700-300" role="status">
-            {#if searched && !searching && !searchError}
-              {searchResults.length === 0
-                ? 'No matches found.'
-                : `${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} shown.`}
+            {#if searched && !searchError}
+              {#if searchResults.length === 0 && searchNextCursor}
+                {`No matches found in ${searchScannedChapters} of ${searchTotalChapters} chapters (${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter' : 'chapters'} skipped).`}
+              {:else if searchResults.length === 0 && !searching}
+                No matches found.
+              {:else if searchResults.length > 0 && searchNextCursor}
+                {searchSkippedChapters > 0
+                  ? `${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} shown across ${searchScannedChapters} of ${searchTotalChapters} chapters (${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter' : 'chapters'} skipped).`
+                  : `${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} shown. More matches remain in this chapter.`}
+              {:else if searchResults.length > 0 && !searching}
+                {`${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} shown.`}
+              {/if}
             {/if}
           </p>
+          {#if searchNextCursor && !searchError}
+            <div
+              class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg preset-tonal-warning p-3 text-sm"
+            >
+              <span>
+                {searchResults.length === 0
+                  ? `Search paused after ${searchScannedChapters} of ${searchTotalChapters} chapters. ${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter remains' : 'chapters remain'} unsearched.`
+                  : searchSkippedChapters > 0
+                    ? `Search paused after ${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} (${searchScannedChapters} of ${searchTotalChapters} chapters). ${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter remains' : 'chapters remain'} unsearched.`
+                    : `Search paused after ${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} in the final chapter.`}
+              </span>
+              <button
+                class="btn btn-sm min-h-11 preset-filled-primary-700-300"
+                type="button"
+                data-reader-focus="search-more"
+                disabled={searching}
+                onclick={() => void continueSearch()}
+              >
+                {searching ? 'Searching…' : 'Search remaining chapters'}
+              </button>
+            </div>
+          {/if}
           {#if searchResults.length > 0}
             <ol class="mt-4 grid gap-2" aria-label="Search results">
-              {#each searchResults as result, index (result.cfi)}
+              {#each searchResults as result, index (`${result.cfi}-${index}`)}
+                {@const isActiveMatch = activeSearchIndex === index}
                 <li>
                   <button
-                    class="btn w-full justify-start text-left"
+                    class="btn w-full justify-start text-left {isActiveMatch
+                      ? 'preset-tonal-primary active-mode'
+                      : ''}"
                     type="button"
-                    onclick={() => void openSearchResult(result)}
+                    aria-current={isActiveMatch ? 'true' : undefined}
+                    data-reader-focus="search-result"
+                    data-reader-focus-id={String(index)}
+                    onclick={() => void openSearchResult(result, index)}
                   >
-                    <span class="mr-2 text-xs text-surface-700-300">{index + 1}</span>
+                    <span class="mr-2 text-xs text-surface-700-300 tabular-nums">{index + 1}</span>
                     <span class="min-w-0">
                       <span class="mb-1 block text-xs text-surface-700-300">
                         {searchResultSectionLabel(result)}
                       </span>
-                      <span class="line-clamp-3">{result.excerpt}</span>
+                      <span class="line-clamp-3">
+                        {#each result.segments as segment, segmentIndex (segmentIndex)}
+                          {#if segment.match}
+                            <mark class="reader-search-excerpt-match">{segment.text}</mark>
+                          {:else}
+                            {segment.text}
+                          {/if}
+                        {/each}
+                      </span>
                     </span>
                   </button>
                 </li>
@@ -2398,6 +2895,7 @@
                     class="w-full text-left text-sm italic"
                     type="button"
                     onclick={() => {
+                      advanceReaderNavigation(true);
                       void session?.displayCfi(annotation.cfi);
                       closeAnnotations();
                     }}
@@ -2481,17 +2979,19 @@
     </footer>
   {/if}
 
-  <button
-    class="reader-progress-reveal btn btn-sm preset-tonal-surface"
-    type="button"
-    inert={hasOpenReaderPanel()}
-    aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
-    aria-pressed={footerVisible}
-    title={footerVisible ? 'Hide reading details' : 'Show reading details'}
-    onclick={toggleFooter}
-  >
-    {currentProgressLabel()}
-  </button>
+  {#if !(searchBarVisible && !hasOpenReaderPanel())}
+    <button
+      class="reader-progress-reveal btn btn-sm preset-tonal-surface"
+      type="button"
+      inert={hasOpenReaderPanel()}
+      aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
+      aria-pressed={footerVisible}
+      title={footerVisible ? 'Hide reading details' : 'Show reading details'}
+      onclick={toggleFooter}
+    >
+      {currentProgressLabel()}
+    </button>
+  {/if}
 
   <div
     class="reader-bottom-reveal"
@@ -2893,5 +3393,45 @@
 
   .active-mode {
     box-shadow: inset 0 0 0 2px currentColor;
+  }
+
+  .reader-search-bar {
+    position: absolute;
+    left: max(0.5rem, env(safe-area-inset-left));
+    right: max(0.5rem, env(safe-area-inset-right));
+    bottom: max(0.5rem, env(safe-area-inset-bottom));
+    z-index: 30;
+    margin-inline: auto;
+    display: flex;
+    width: fit-content;
+    max-width: calc(100% - 1rem);
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+    padding: 0.25rem;
+    pointer-events: auto;
+  }
+
+  .reader-search-bar.hidden {
+    display: none;
+  }
+
+  .reader-search-bar-btn {
+    min-width: max(2.75rem, 44px);
+    min-height: max(2.75rem, 44px);
+  }
+
+  .reader-search-bar-counter {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .reader-search-excerpt-match {
+    background: color-mix(in oklab, var(--color-warning-400, currentColor) 32%, transparent);
+    color: inherit;
+    font-weight: 700;
+    border-radius: 0.125rem;
+    padding-inline: 0.1rem;
   }
 </style>

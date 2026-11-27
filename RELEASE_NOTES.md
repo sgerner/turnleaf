@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- feat: add bounded search batches and floating match bar
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

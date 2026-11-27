@@ -1,8 +1,13 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
 import {
+  DEFAULT_SEARCH_CHAPTER_LIMIT,
+  DEFAULT_SEARCH_MATCH_LIMIT,
   clipReaderSearchExcerpt,
   normalizeReaderSearchQuery,
+  splitReaderSearchExcerpt,
+  type ReaderSearchBatch,
+  type ReaderSearchCursor,
   type ReaderSearchResult,
 } from './search';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
@@ -35,17 +40,20 @@ export interface ReaderSelection {
   text: string;
 }
 
-export type ReaderKeyboardAction = 'next' | 'previous' | 'clear-selection' | null;
+export type ReaderKeyboardAction =
+  'next' | 'previous' | 'clear-selection' | 'dismiss-search' | null;
 
 export function resolveReaderKeyboardAction(
   event: KeyboardEvent,
-  options: { hasOpenPanel?: boolean; hasSelection?: boolean } = {},
+  options: { hasOpenPanel?: boolean; hasSelection?: boolean; hasSearchBar?: boolean } = {},
 ): ReaderKeyboardAction {
   if (event.defaultPrevented) return null;
   if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return null;
   if (options.hasOpenPanel) return null;
   if (event.key === 'Escape') {
-    return options.hasSelection ? 'clear-selection' : null;
+    if (options.hasSelection) return 'clear-selection';
+    if (options.hasSearchBar) return 'dismiss-search';
+    return null;
   }
   const target = event.target as Element | null;
   if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
@@ -83,6 +91,19 @@ const MODE_COLORS = {
     selection: '--color-primary-800',
   },
 } as const;
+
+const USER_HIGHLIGHT_STYLES = {
+  fill: '#facc15',
+  'fill-opacity': '0.38',
+};
+
+const SEARCH_HIGHLIGHT_STYLES = {
+  fill: '#0ea5e9',
+  'fill-opacity': '0.32',
+  stroke: '#0284c7',
+  'stroke-opacity': '0.85',
+  'stroke-width': '1.5',
+};
 
 type EpubReferenceKind = 'link' | 'resource' | 'stylesheet';
 
@@ -390,6 +411,9 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
+  private activeDisplayCount = 0;
+  private lastDisplayedTarget: string | undefined = undefined;
+  private hasDisplayedTarget = false;
   private viewportTarget: HTMLElement | null = null;
   private epubContainer: HTMLElement | null = null;
   private lockedScrollLeft = 0;
@@ -401,6 +425,7 @@ export class ReaderSession {
   private readonly trackedContents = new Set<Contents>();
   private readonly contentCleanups = new Map<Contents, Array<() => void>>();
   private highlightCfis = new Set<string>();
+  private activeSearchCfi: string | null = null;
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -441,6 +466,9 @@ export class ReaderSession {
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.viewportTarget = target;
+    this.activeDisplayCount = 0;
+    this.lastDisplayedTarget = undefined;
+    this.hasDisplayedTarget = false;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
@@ -552,6 +580,8 @@ export class ReaderSession {
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
+      this.lastDisplayedTarget = location.start.cfi;
+      this.hasDisplayedTarget = true;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -692,23 +722,19 @@ export class ReaderSession {
 
     const next = new Set(annotations.map((annotation) => annotation.cfi));
     for (const cfi of this.highlightCfis) {
-      if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
+      if (!next.has(cfi) && cfi !== this.activeSearchCfi) {
+        rendition.annotations.remove(cfi, 'highlight');
+      }
     }
 
     const applied = new Set<string>();
     for (const cfi of next) {
-      if (this.highlightCfis.has(cfi)) {
+      if (this.highlightCfis.has(cfi) || cfi === this.activeSearchCfi) {
         applied.add(cfi);
         continue;
       }
-      try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
-          fill: '#facc15',
-          'fill-opacity': '0.38',
-        });
+      if (this.applyUserHighlight(cfi)) {
         applied.add(cfi);
-      } catch {
-        // A saved CFI can stop matching after an EPUB is replaced or changed.
       }
     }
     this.highlightCfis = applied;
@@ -790,52 +816,193 @@ export class ReaderSession {
     }
   }
 
-  async search(query: string, signal?: AbortSignal, limit = 100): Promise<ReaderSearchResult[]> {
-    const normalizedQuery = normalizeReaderSearchQuery(query);
-    if (!normalizedQuery) return [];
-    const results: ReaderSearchResult[] = [];
-    const { sections } = this.getSpine();
-    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
+  setSearchHighlight(cfi: string | null): void {
+    const rendition = this.rendition;
+    const nextCfi = cfi?.trim() || null;
+    if (!rendition) {
+      this.activeSearchCfi = nextCfi;
+      return;
+    }
+    if (this.activeSearchCfi === nextCfi) return;
 
-    for (const section of sections) {
+    const previousCfi = this.activeSearchCfi;
+    this.activeSearchCfi = null;
+    if (previousCfi) {
+      rendition.annotations.remove(previousCfi, 'highlight');
+      if (this.highlightCfis.has(previousCfi)) {
+        this.applyUserHighlight(previousCfi);
+      }
+    }
+
+    if (!nextCfi) return;
+
+    if (this.highlightCfis.has(nextCfi)) {
+      rendition.annotations.remove(nextCfi, 'highlight');
+    }
+    try {
+      rendition.annotations.highlight(
+        nextCfi,
+        {},
+        undefined,
+        'turnleaf-search-highlight',
+        SEARCH_HIGHLIGHT_STYLES,
+      );
+      this.activeSearchCfi = nextCfi;
+    } catch {
+      if (this.highlightCfis.has(nextCfi)) {
+        this.applyUserHighlight(nextCfi);
+      }
+    }
+  }
+
+  private applyUserHighlight(cfi: string): boolean {
+    if (!this.rendition) return false;
+    try {
+      this.rendition.annotations.highlight(
+        cfi,
+        {},
+        undefined,
+        'turnleaf-highlight',
+        USER_HIGHLIGHT_STYLES,
+      );
+      return true;
+    } catch {
+      // A saved CFI can stop matching after an EPUB is replaced or changed.
+      return false;
+    }
+  }
+
+  async search(
+    query: string,
+    signal?: AbortSignal,
+    limit = DEFAULT_SEARCH_MATCH_LIMIT,
+    cursor: ReaderSearchCursor | null = null,
+    chapterLimit = DEFAULT_SEARCH_CHAPTER_LIMIT,
+  ): Promise<ReaderSearchBatch> {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const normalizedQuery = normalizeReaderSearchQuery(query);
+    const { sections } = this.getSpine();
+    const totalChapters = sections.length;
+    if (!normalizedQuery || limit <= 0 || chapterLimit <= 0) {
+      return {
+        results: [],
+        scannedChapters: 0,
+        skippedChapters: 0,
+        totalChapters,
+        nextCursor: null,
+      };
+    }
+
+    const startSection = Math.max(0, cursor?.sectionIndex ?? 0);
+    const initialMatchIndex = Math.max(0, cursor?.matchIndex ?? 0);
+    if (startSection >= totalChapters) {
+      return {
+        results: [],
+        scannedChapters: 0,
+        skippedChapters: 0,
+        totalChapters,
+        nextCursor: null,
+      };
+    }
+
+    const results: ReaderSearchResult[] = [];
+    const request = this.book.load.bind(this.book) as (url: string) => Promise<Document>;
+    let scannedChapters = 0;
+
+    for (
+      let sectionPosition = startSection;
+      sectionPosition < totalChapters;
+      sectionPosition += 1
+    ) {
+      const section = sections[sectionPosition]!;
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const wasLoaded = Boolean((section as unknown as { contents?: unknown }).contents);
       try {
         await section.load(request);
-        const matches = (
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        scannedChapters += 1;
+        const rawMatches = (
           section as unknown as {
             search: (value: string) => Array<{ cfi: string; excerpt: string }>;
           }
         ).search(normalizedQuery);
-        for (const match of matches) {
+        const matches = rawMatches.filter((match) => Boolean(match.cfi));
+        const matchStart = sectionPosition === startSection ? initialMatchIndex : 0;
+
+        for (let matchIndex = matchStart; matchIndex < matches.length; matchIndex += 1) {
           if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-          if (!match.cfi) continue;
+          const match = matches[matchIndex]!;
+          const excerpt = clipReaderSearchExcerpt(match.excerpt, 180, normalizedQuery);
           results.push({
             cfi: match.cfi,
-            excerpt: clipReaderSearchExcerpt(match.excerpt),
+            excerpt,
+            segments: splitReaderSearchExcerpt(excerpt, normalizedQuery),
             href: section.href,
             spineIndex: section.index,
           });
-          if (results.length >= limit) return results;
+          if (results.length >= limit) {
+            const hasMoreInSection = matchIndex + 1 < matches.length;
+            const hasMoreSections = sectionPosition + 1 < totalChapters;
+            const nextCursor: ReaderSearchCursor | null = hasMoreInSection
+              ? { sectionIndex: sectionPosition, matchIndex: matchIndex + 1 }
+              : hasMoreSections
+                ? { sectionIndex: sectionPosition + 1, matchIndex: 0 }
+                : null;
+            return {
+              results,
+              scannedChapters,
+              skippedChapters: totalChapters - (sectionPosition + 1),
+              totalChapters,
+              nextCursor,
+            };
+          }
+        }
+
+        if (scannedChapters >= chapterLimit && sectionPosition + 1 < totalChapters) {
+          return {
+            results,
+            scannedChapters,
+            skippedChapters: totalChapters - (sectionPosition + 1),
+            totalChapters,
+            nextCursor: { sectionIndex: sectionPosition + 1, matchIndex: 0 },
+          };
         }
       } finally {
         if (!wasLoaded) section.unload();
       }
     }
-    return results;
+
+    return {
+      results,
+      scannedChapters,
+      skippedChapters: 0,
+      totalChapters,
+      nextCursor: null,
+    };
   }
 
-  async display(href: string): Promise<void> {
+  currentLocationGeneration(): number {
+    return this.locationGeneration;
+  }
+
+  async display(href: string, userNavigation = true): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     const target = this.resolveDisplayTarget(href);
-    await this.navigate(() => this.rendition!.display(target));
+    if (userNavigation) {
+      await this.navigate(() => this.rendition!.display(target), target);
+      return;
+    }
+    const generation = this.beginLocationOperation(false);
+    await this.displayAtGeneration(target, generation);
   }
 
-  async displayCfi(cfi: string): Promise<boolean> {
+  async displayCfi(cfi: string, userNavigation = true): Promise<boolean> {
     if (!this.rendition) return false;
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
-      return true;
+      if (userNavigation) {
+        return await this.navigate(() => this.rendition!.display(cfi), cfi);
+      }
+      return await this.displayAtGeneration(cfi, this.beginLocationOperation(false));
     } catch {
       return false;
     }
@@ -950,6 +1117,9 @@ export class ReaderSession {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.viewportSize = null;
+    this.activeDisplayCount = 0;
+    this.lastDisplayedTarget = undefined;
+    this.hasDisplayedTarget = false;
     this.viewportTarget = null;
     this.lockedScrollLeft = 0;
     this.displayOperationCount = 0;
@@ -966,6 +1136,7 @@ export class ReaderSession {
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
+    this.activeSearchCfi = null;
     this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
@@ -1368,11 +1539,22 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    await this.runDisplayOperation(async () => {
-      if (target === undefined) await rendition.display();
-      else await rendition.display(target);
-    });
-    return this.isCurrentLocationOperation(generation);
+    this.activeDisplayCount += 1;
+    try {
+      await this.runDisplayOperation(async () => {
+        if (target === undefined) await rendition.display();
+        else await rendition.display(target);
+      });
+      if (this.isCurrentLocationOperation(generation)) {
+        this.lastDisplayedTarget = target;
+        this.hasDisplayedTarget = true;
+        return true;
+      }
+      await this.reconcileSupersededDisplay(target);
+      return false;
+    } finally {
+      this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
+    }
   }
 
   private async displayXPath(xpath: string, generation: number): Promise<boolean> {
@@ -1382,9 +1564,15 @@ export class ReaderSession {
     if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
+    this.activeDisplayCount += 1;
     try {
       await this.runDisplayOperation(() => rendition.display(section.href));
-      if (!this.isCurrentLocationOperation(generation)) return false;
+      if (!this.isCurrentLocationOperation(generation)) {
+        await this.reconcileSupersededDisplay(section.href);
+        return false;
+      }
+      this.lastDisplayedTarget = section.href;
+      this.hasDisplayedTarget = true;
       if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
@@ -1395,10 +1583,18 @@ export class ReaderSession {
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
       await this.runDisplayOperation(() => rendition.display(cfi));
-      return this.isCurrentLocationOperation(generation);
+      if (this.isCurrentLocationOperation(generation)) {
+        this.lastDisplayedTarget = cfi;
+        this.hasDisplayedTarget = true;
+        return true;
+      }
+      await this.reconcileSupersededDisplay(cfi);
+      return false;
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
+    } finally {
+      this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
     }
   }
 
@@ -1431,16 +1627,43 @@ export class ReaderSession {
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
+  private async navigate(display: () => Promise<unknown>, target?: string): Promise<boolean> {
     const generation = this.beginLocationOperation(true);
+    this.activeDisplayCount += 1;
     try {
       await this.runDisplayOperation(display);
+      if (this.isCurrentLocationOperation(generation)) {
+        if (target !== undefined) {
+          this.lastDisplayedTarget = target;
+          this.hasDisplayedTarget = true;
+        }
+        return true;
+      }
+      await this.reconcileSupersededDisplay(target);
+      return false;
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+      } else {
+        await this.reconcileSupersededDisplay(target);
+        return false;
       }
       throw error;
+    } finally {
+      this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
+    }
+  }
+
+  private async reconcileSupersededDisplay(staleTarget?: string): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition || this.activeDisplayCount > 1 || !this.hasDisplayedTarget) return;
+    const activeTarget = this.current?.start.cfi ?? this.lastDisplayedTarget;
+    if (activeTarget === undefined || activeTarget === staleTarget) return;
+    try {
+      await this.runDisplayOperation(() => rendition.display(activeTarget));
+    } catch {
+      // Keep the session stable if the active target cannot be re-displayed during teardown.
     }
   }
 
