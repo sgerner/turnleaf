@@ -1,5 +1,6 @@
 import { Capacitor } from '@capacitor/core';
 import { Directory, Filesystem } from '@capacitor/filesystem';
+import { Network } from '@capacitor/network';
 import { recordDiagnostic } from '../diagnostics/log';
 import {
   advanceRedirect,
@@ -127,6 +128,14 @@ async function downloadWithSafeRedirects(options: {
   try {
     while (true) {
       if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const networkStatus = await Network.getStatus().catch(() => null);
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (
+        networkStatus?.connected !== true ||
+        (typeof navigator !== 'undefined' && navigator.onLine === false)
+      ) {
+        throw new KavitaError('Kavita could not be reached while offline.', 'network');
+      }
       activeHopTransferId = `${baseTransferId}-hop-${redirects.redirectCount}`;
       options.onHopTransferId?.(activeHopTransferId);
       const response = await PrivateTransfer.downloadFile({

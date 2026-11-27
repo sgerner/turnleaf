@@ -13,6 +13,7 @@ const native = vi.hoisted(() => ({
   body: new Uint8Array(),
   deleted: [] as string[],
   renamed: false,
+  connected: true,
   progressListener: null as
     | ((event: {
         transferId?: string;
@@ -55,7 +56,17 @@ vi.mock('@capacitor/filesystem', () => ({
   },
 }));
 
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    })),
+  },
+}));
+
 import { Filesystem } from '@capacitor/filesystem';
+import { Network } from '@capacitor/network';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import { PRIVATE_TRANSFER_CONNECTION_FAILED, PrivateTransfer } from '../native/private-transfer';
 import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
@@ -66,10 +77,18 @@ function encoded(bytes: Uint8Array): string {
 
 beforeEach(() => {
   clearDiagnostics();
+  Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, value: true });
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
+  native.connected = true;
   native.progressListener = null;
+  vi.mocked(Network.getStatus)
+    .mockReset()
+    .mockImplementation(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    }));
   vi.mocked(PrivateTransfer.downloadFile)
     .mockReset()
     .mockResolvedValue({ status: 200, bytesWritten: 64 });
@@ -580,6 +599,73 @@ describe('native cover cache', () => {
       expect(native.deleted).toContain('covers/server-1/7.img.partial');
     },
   );
+
+  it('blocks native EPUB and cover transfers when the transport or WebView is offline', async () => {
+    vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+      if (path === 'books' || path === 'covers/server-1' || path === 'covers/server-1/7.img') {
+        throw new Error('missing');
+      }
+      return {
+        type: 'file',
+        size: native.body.length,
+        name: path,
+        mtime: 0,
+        uri: `file://${path}`,
+      };
+    });
+    vi.mocked(Network.getStatus).mockResolvedValueOnce({
+      connected: false,
+      connectionType: 'none',
+    });
+    await expect(
+      downloadEpub('https://books.example.com/book.epub', 'secret', 'book-1', undefined),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached while offline.',
+    });
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
+
+    Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, value: false });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+      ),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached while offline.',
+    });
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
+
+    Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, value: true });
+    vi.mocked(Network.getStatus)
+      .mockResolvedValueOnce({ connected: true, connectionType: 'wifi' })
+      .mockResolvedValueOnce({ connected: false, connectionType: 'none' });
+    vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+      status: 302,
+      location: 'https://books.example.com/cover-v2',
+    });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+      ),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached while offline.',
+    });
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('Android manifest and storage permission bounds', () => {
