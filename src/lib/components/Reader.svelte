@@ -183,6 +183,7 @@
   let searchOpenedFromMatchBar = false;
   let searchNavigationDepth = 0;
   let searchStepGeneration = 0;
+  let readerNavigationGeneration = 0;
   let searching = $state(false);
   let readerSyncMessage = $state('');
   let searchError = $state('');
@@ -508,6 +509,17 @@
     searching = false;
   }
 
+  function advanceReaderNavigation(clearTransientSearch = false): void {
+    readerNavigationGeneration += 1;
+    searchStepGeneration += 1;
+    if (clearTransientSearch && (searchBarVisible || searchReturnTarget !== null)) {
+      session?.setSearchHighlight(null);
+      searchBarVisible = false;
+      activeSearchIndex = null;
+      searchReturnTarget = null;
+    }
+  }
+
   function openSettings(): void {
     pauseChromeHide();
     settingsOpener = activeElement();
@@ -702,13 +714,9 @@
     }
     const opener = searchOpener;
     searchOpener = null;
-    void tick().then(() => {
-      if (opener?.isConnected && opener !== document.body) {
-        restoreFocus(opener);
-      } else if (searchBarVisible && matchBarCounterButton?.isConnected) {
-        matchBarCounterButton.focus();
-      }
-    });
+    restoreModalFocus(opener, () =>
+      searchBarVisible ? matchBarCounterButton : (readerToolbar ?? topRevealButton),
+    );
     resumeChromeHide();
   }
 
@@ -1195,7 +1203,7 @@
     searchError = '';
     try {
       const batch = await session.search(query, controller.signal);
-      if (searchController === controller) {
+      if (searchController === controller && !controller.signal.aborted && !destroyed) {
         searchedQuery = query;
         searchResults = batch.results;
         searchScannedChapters = batch.scannedChapters;
@@ -1241,7 +1249,7 @@
         DEFAULT_SEARCH_MATCH_LIMIT,
         cursor,
       );
-      if (searchController === controller) {
+      if (searchController === controller && !controller.signal.aborted && !destroyed) {
         searchResults = [...searchResults, ...batch.results];
         const newlyScannedChapters =
           cursor.matchIndex > 0 ? Math.max(0, batch.scannedChapters - 1) : batch.scannedChapters;
@@ -1286,6 +1294,7 @@
 
     const opener = activeElement();
     const stepId = ++searchStepGeneration;
+    const navGen = readerNavigationGeneration;
     const previousReturnTarget = searchReturnTarget;
     const originTarget =
       searchReturnTarget ??
@@ -1298,12 +1307,40 @@
     searchNavigationDepth += 1;
 
     try {
+      const genBeforeCfi = session.currentLocationGeneration?.();
       const displayed = await session.displayCfi(result.cfi, false);
-      if (!displayed) {
-        if (result.href) await session.display(result.href, false);
-        else throw new Error('Unavailable search result');
+      const cfiSuperseded =
+        genBeforeCfi !== undefined && session.currentLocationGeneration?.() !== genBeforeCfi + 1;
+      if (
+        destroyed ||
+        stepId !== searchStepGeneration ||
+        navGen !== readerNavigationGeneration ||
+        cfiSuperseded
+      ) {
+        if (stepId === searchStepGeneration && !searchBarVisible) {
+          searchReturnTarget = previousReturnTarget;
+        }
+        return;
       }
-      if (destroyed || stepId !== searchStepGeneration) return;
+      if (!displayed) {
+        if (!result.href) throw new Error('Unavailable search result');
+        const genBeforeHref = session.currentLocationGeneration?.();
+        await session.display(result.href, false);
+        const hrefSuperseded =
+          genBeforeHref !== undefined &&
+          session.currentLocationGeneration?.() !== genBeforeHref + 1;
+        if (
+          destroyed ||
+          stepId !== searchStepGeneration ||
+          navGen !== readerNavigationGeneration ||
+          hrefSuperseded
+        ) {
+          if (stepId === searchStepGeneration && !searchBarVisible) {
+            searchReturnTarget = previousReturnTarget;
+          }
+          return;
+        }
+      }
       activeSearchIndex = index;
       searchBarVisible = true;
       session.setSearchHighlight(result.cfi);
@@ -1315,10 +1352,13 @@
         controlsVisible = false;
         footerVisible = false;
         pauseChromeHide();
-        void tick().then(() => matchBarCounterButton?.focus());
+        restoreModalFocus(null, () => matchBarCounterButton);
       }
     } catch {
-      if (stepId === searchStepGeneration && !searchBarVisible) {
+      if (destroyed || stepId !== searchStepGeneration || navGen !== readerNavigationGeneration) {
+        return;
+      }
+      if (!searchBarVisible) {
         searchReturnTarget = previousReturnTarget;
       }
       const message = 'This search result is no longer available in the current EPUB.';
@@ -1351,32 +1391,104 @@
     activeSearchIndex = null;
     searchReturnTarget = null;
     if (focusWasInMatchBar) {
-      void tick().then(() => {
-        if (controlsVisible) focusFirstElement(readerToolbar);
-        else topRevealButton?.focus();
-      });
+      restoreModalFocus(null, () =>
+        controlsVisible
+          ? (readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ??
+            readerToolbar)
+          : topRevealButton,
+      );
     }
   }
 
   async function returnFromSearch(): Promise<void> {
     if (!session) return;
     const opener = activeElement();
-    searchStepGeneration += 1;
+    const restoreReaderFocus =
+      Boolean(opener?.closest('[data-reader-search-bar]')) ||
+      opener === null ||
+      opener === document.body;
+    const stepId = ++searchStepGeneration;
+    const navGen = readerNavigationGeneration;
     const target = searchReturnTarget;
-    session.setSearchHighlight(null);
-    searchBarVisible = false;
-    activeSearchIndex = null;
-    searchReturnTarget = null;
     if (!target) {
+      session.setSearchHighlight(null);
+      searchBarVisible = false;
+      activeSearchIndex = null;
+      searchReturnTarget = null;
       showControls();
+      if (restoreReaderFocus) {
+        restoreModalFocus(
+          null,
+          () =>
+            readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ??
+            readerToolbar ??
+            topRevealButton,
+        );
+      }
       return;
     }
     searchNavigationDepth += 1;
     try {
-      const restored = target.cfi ? await session.displayCfi(target.cfi, false) : false;
-      if (!restored && target.href) await session.display(target.href, false);
+      let restored = false;
+      if (target.cfi) {
+        const genBeforeCfi = session.currentLocationGeneration?.();
+        restored = await session.displayCfi(target.cfi, false);
+        const cfiSuperseded =
+          genBeforeCfi !== undefined && session.currentLocationGeneration?.() !== genBeforeCfi + 1;
+        if (
+          destroyed ||
+          stepId !== searchStepGeneration ||
+          navGen !== readerNavigationGeneration ||
+          cfiSuperseded
+        ) {
+          if (!destroyed && stepId === searchStepGeneration) {
+            session.setSearchHighlight(null);
+            searchBarVisible = false;
+            activeSearchIndex = null;
+            searchReturnTarget = null;
+          }
+          return;
+        }
+      }
+      if (!restored && target.href) {
+        const genBeforeHref = session.currentLocationGeneration?.();
+        await session.display(target.href, false);
+        const hrefSuperseded =
+          genBeforeHref !== undefined &&
+          session.currentLocationGeneration?.() !== genBeforeHref + 1;
+        if (
+          destroyed ||
+          stepId !== searchStepGeneration ||
+          navGen !== readerNavigationGeneration ||
+          hrefSuperseded
+        ) {
+          if (!destroyed && stepId === searchStepGeneration) {
+            session.setSearchHighlight(null);
+            searchBarVisible = false;
+            activeSearchIndex = null;
+            searchReturnTarget = null;
+          }
+          return;
+        }
+      }
+      session.setSearchHighlight(null);
+      searchBarVisible = false;
+      activeSearchIndex = null;
+      searchReturnTarget = null;
       showControls();
+      if (restoreReaderFocus) {
+        restoreModalFocus(
+          null,
+          () =>
+            readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ??
+            readerToolbar ??
+            topRevealButton,
+        );
+      }
     } catch {
+      if (destroyed || stepId !== searchStepGeneration || navGen !== readerNavigationGeneration) {
+        return;
+      }
       openReaderError(
         'The location before this search is no longer available in the current EPUB.',
         opener,
@@ -1389,6 +1501,7 @@
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
     if (!session) return;
     const opener = activeElement();
+    advanceReaderNavigation(true);
     try {
       const restored = await session.displayCfi(saved.cfi);
       if (!restored && saved.href) await session.display(saved.href);
@@ -1404,6 +1517,7 @@
     const opener = activeElement();
     const restoreLink = opener === returnToLinkButton;
     const target = linkReturnTarget;
+    advanceReaderNavigation(true);
     try {
       const restored = await session.displayCfi(target.cfi);
       if (!restored && target.href) await session.display(target.href);
@@ -1421,6 +1535,10 @@
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     if (!session || Boolean(error)) return;
     const opener = activeElement();
+    readerNavigationGeneration += 1;
+    if (!searchBarVisible && searchNavigationDepth > 0) {
+      searchStepGeneration += 1;
+    }
     try {
       if (direction === 'next') await session.next();
       else await session.previous();
@@ -1500,6 +1618,7 @@
     try {
       await progress.accept?.();
       if (destroyed || session !== reader) return;
+      advanceReaderNavigation(true);
       await displaySyncedLocation(reader, progress);
       showControls();
       restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
@@ -1533,6 +1652,7 @@
       if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
         await progress.accept?.();
         if (destroyed || session !== reader || localNavigationDuringSession) return;
+        advanceReaderNavigation(true);
         await displaySyncedLocation(reader, progress);
       }
       if (showFeedback) {
@@ -2298,6 +2418,7 @@
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
                     onclick={() => {
+                      advanceReaderNavigation(true);
                       void session?.display(item.href);
                       closeToc();
                     }}
@@ -2352,6 +2473,7 @@
                           type="button"
                           onkeydown={(event) => void continueTocTabbing(event, row.index)}
                           onclick={() => {
+                            advanceReaderNavigation(true);
                             void session?.display(row.href);
                             closeToc();
                           }}
@@ -2769,6 +2891,7 @@
                     class="w-full text-left text-sm italic"
                     type="button"
                     onclick={() => {
+                      advanceReaderNavigation(true);
                       void session?.displayCfi(annotation.cfi);
                       closeAnnotations();
                     }}

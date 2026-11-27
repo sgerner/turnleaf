@@ -415,7 +415,7 @@ export class ReaderSession {
   private viewportSize: { width: number; height: number } | null = null;
   private pendingViewportSize: { width: number; height: number } | null = null;
   private readyForResize = false;
-  private displayInFlight = false;
+  private activeDisplayCount = 0;
   private lastDisplayedTarget: string | undefined = undefined;
   private hasDisplayedTarget = false;
   private viewportTarget: HTMLElement | null = null;
@@ -478,6 +478,7 @@ export class ReaderSession {
     this.lastDisplayedTarget = undefined;
     this.hasDisplayedTarget = false;
     this.readyForResize = false;
+    this.activeDisplayCount = 0;
     this.rendition = this.book.renderTo(target, {
       width: initialWidth > 0 ? initialWidth : '100%',
       height: initialHeight > 0 ? initialHeight : '100%',
@@ -1011,13 +1012,15 @@ export class ReaderSession {
     };
   }
 
+  currentLocationGeneration(): number {
+    return this.locationGeneration;
+  }
+
   async display(href: string, userNavigation = true): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     const target = this.resolveDisplayTarget(href);
     if (userNavigation) {
-      this.lastDisplayedTarget = target;
-      this.hasDisplayedTarget = true;
-      await this.navigate(() => this.rendition!.display(target));
+      await this.navigate(() => this.rendition!.display(target), target);
       return;
     }
     const generation = this.beginLocationOperation(false);
@@ -1028,10 +1031,7 @@ export class ReaderSession {
     if (!this.rendition) return false;
     try {
       if (userNavigation) {
-        this.lastDisplayedTarget = cfi;
-        this.hasDisplayedTarget = true;
-        await this.navigate(() => this.rendition!.display(cfi));
-        return true;
+        return await this.navigate(() => this.rendition!.display(cfi), cfi);
       }
       return await this.displayAtGeneration(cfi, this.beginLocationOperation(false));
     } catch {
@@ -1154,7 +1154,7 @@ export class ReaderSession {
     this.viewportSize = null;
     this.pendingViewportSize = null;
     this.readyForResize = false;
-    this.displayInFlight = false;
+    this.activeDisplayCount = 0;
     this.lastDisplayedTarget = undefined;
     this.hasDisplayedTarget = false;
     this.viewportTarget = null;
@@ -1524,7 +1524,7 @@ export class ReaderSession {
         this.pendingViewportSize = null;
         return;
       }
-      if (!this.readyForResize || this.displayInFlight || this.userNavigationPending) {
+      if (!this.readyForResize || this.activeDisplayCount > 0 || this.userNavigationPending) {
         this.pendingViewportSize = { width, height };
         return;
       }
@@ -1553,7 +1553,7 @@ export class ReaderSession {
   private flushPendingViewportResize(): void {
     if (
       !this.readyForResize ||
-      this.displayInFlight ||
+      this.activeDisplayCount > 0 ||
       this.userNavigationPending ||
       !this.pendingViewportSize
     ) {
@@ -1594,7 +1594,7 @@ export class ReaderSession {
     const viewsAfter = internal.manager?.views?.length ?? 0;
     if (internal.manager && !hadLocation && viewsAfter === 0 && this.hasDisplayedTarget) {
       const generation = this.locationGeneration;
-      this.displayInFlight = true;
+      this.activeDisplayCount += 1;
       const recovery = this.runDisplayOperation(() =>
         fallbackTarget === undefined ? rendition.display() : rendition.display(fallbackTarget),
       );
@@ -1606,7 +1606,7 @@ export class ReaderSession {
           return undefined;
         })
         .finally(() => {
-          this.displayInFlight = false;
+          this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
           this.flushPendingViewportResize();
         });
     }
@@ -1647,7 +1647,7 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    this.displayInFlight = true;
+    this.activeDisplayCount += 1;
     try {
       await this.runDisplayOperation(async () => {
         if (target === undefined) await rendition.display();
@@ -1659,9 +1659,10 @@ export class ReaderSession {
         this.hasDisplayedTarget = true;
         return true;
       }
+      await this.reconcileSupersededDisplay(target);
       return false;
     } finally {
-      this.displayInFlight = false;
+      this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
       this.flushPendingViewportResize();
     }
   }
@@ -1673,10 +1674,13 @@ export class ReaderSession {
     if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
-    this.displayInFlight = true;
+    this.activeDisplayCount += 1;
     try {
       await this.runDisplayOperation(() => rendition.display(section.href));
-      if (!this.isCurrentLocationOperation(generation)) return false;
+      if (!this.isCurrentLocationOperation(generation)) {
+        await this.reconcileSupersededDisplay(section.href);
+        return false;
+      }
       if (!this.current) this.current = this.liveLocation();
       this.lastDisplayedTarget = section.href;
       this.hasDisplayedTarget = true;
@@ -1696,12 +1700,13 @@ export class ReaderSession {
         this.hasDisplayedTarget = true;
         return true;
       }
+      await this.reconcileSupersededDisplay(cfi);
       return false;
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
     } finally {
-      this.displayInFlight = false;
+      this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
       this.flushPendingViewportResize();
     }
   }
@@ -1735,21 +1740,46 @@ export class ReaderSession {
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
+  private async navigate(display: () => Promise<unknown>, target?: string): Promise<boolean> {
     const generation = this.beginLocationOperation(true);
-    this.displayInFlight = true;
+    this.activeDisplayCount += 1;
     try {
       await this.runDisplayOperation(display);
+      if (this.isCurrentLocationOperation(generation)) {
+        if (!this.current) this.current = this.liveLocation();
+        if (target !== undefined) {
+          this.lastDisplayedTarget = target;
+          this.hasDisplayedTarget = true;
+        }
+        return true;
+      }
+      await this.reconcileSupersededDisplay(target);
+      return false;
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
         this.userNavigationStartPage = null;
+      } else {
+        await this.reconcileSupersededDisplay(target);
+        return false;
       }
       throw error;
     } finally {
-      this.displayInFlight = false;
+      this.activeDisplayCount = Math.max(0, this.activeDisplayCount - 1);
       this.flushPendingViewportResize();
+    }
+  }
+
+  private async reconcileSupersededDisplay(staleTarget?: string): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition || this.activeDisplayCount > 1 || !this.hasDisplayedTarget) return;
+    const activeTarget = this.current?.start.cfi ?? this.lastDisplayedTarget;
+    if (activeTarget === undefined || activeTarget === staleTarget) return;
+    try {
+      await this.runDisplayOperation(() => rendition.display(activeTarget));
+    } catch {
+      // Keep the session stable if the active target cannot be re-displayed during teardown.
     }
   }
 

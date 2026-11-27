@@ -361,4 +361,72 @@ describe('ReaderSession search batches and transient highlights', () => {
 
     session.destroy();
   });
+
+  it('cancels an initial search batch mid-chapter on AbortSignal and unloads the scanned chapter', async () => {
+    const controller = new AbortController();
+    const ch1 = makeSection(0, [
+      { cfi: 'cfi-1', excerpt: 'Harbor one' },
+      { cfi: 'cfi-2', excerpt: 'Harbor two' },
+    ]);
+    ch1.search = vi.fn(() => {
+      controller.abort();
+      return [
+        { cfi: 'cfi-1', excerpt: 'Harbor one' },
+        { cfi: 'cfi-2', excerpt: 'Harbor two' },
+      ];
+    });
+    const ch2 = makeSection(1, [{ cfi: 'cfi-3', excerpt: 'Harbor three' }]);
+    setSections([ch1, ch2]);
+
+    const session = new ReaderSession('book.epub');
+    await expect(session.search('harbor', controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+
+    expect(ch1.unload).toHaveBeenCalledOnce();
+    expect(ch2.load).not.toHaveBeenCalled();
+
+    session.destroy();
+  });
+
+  it('prevents a stale search displayCfi completion from overwriting a newer reader navigation', async () => {
+    setSections([makeSection(0, []), makeSection(1, []), makeSection(2, [])]);
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    mockRendition.display.mockClear();
+
+    let resolveStaleSearchDisplay!: () => void;
+    mockRendition.display
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveStaleSearchDisplay = resolve;
+          }),
+      )
+      .mockImplementation(async () => {});
+
+    const staleSearchJump = session.displayCfi('epubcfi(/6/2!/4/2/1:0)', false);
+    const staleGen = session.currentLocationGeneration();
+
+    // User jumps to chapter 3 before the older search display finishes.
+    await session.display('chapter-3.xhtml', true);
+    expect(session.currentLocationGeneration()).toBeGreaterThan(staleGen);
+    expect(mockRendition.display).toHaveBeenLastCalledWith('chapter-3.xhtml');
+
+    // Now the stale search display finishes late; it must return false and restore chapter-3.xhtml.
+    resolveStaleSearchDisplay();
+    await expect(staleSearchJump).resolves.toBe(false);
+    expect(mockRendition.display).toHaveBeenLastCalledWith('chapter-3.xhtml');
+
+    session.destroy();
+  });
 });

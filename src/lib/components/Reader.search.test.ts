@@ -664,4 +664,194 @@ describe('Reader search workflow and floating match bar', () => {
     expect(matchBar.inert).toBe(false);
     expect(document.activeElement).toBe(nextBtn);
   });
+
+  it('restores focus across result jump, reopened search close, match-bar Return, and match-bar Close', async () => {
+    const results = [makeResult(0, 'Harbor', 0), makeResult(1, 'Harbor', 1)];
+    sessionMock.search.mockResolvedValue({
+      results,
+      scannedChapters: 2,
+      skippedChapters: 0,
+      totalChapters: 2,
+      nextCursor: null,
+    } satisfies ReaderSearchBatch);
+
+    component = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'book.epub',
+        bookId: 'book-focus',
+        title: 'Focus Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await flushAsync();
+
+    sessionMock.onLocation?.(makeLocation('origin-cfi', 'ch1.xhtml', 0), 'restore');
+    flushSync();
+
+    await openSearchPanel();
+    const input = target.querySelector<HTMLInputElement>('#reader-search-query')!;
+    input.value = 'Harbor';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    target
+      .querySelector<HTMLFormElement>('#reader-search form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushAsync();
+
+    // Selecting result #1 closes modal and focuses the match bar counter button.
+    target.querySelectorAll<HTMLButtonElement>('[data-reader-focus="search-result"]')[0]?.click();
+    await flushAsync();
+    const counterBtn = target.querySelector<HTMLButtonElement>('.reader-search-bar-counter')!;
+    expect(document.activeElement).toBe(counterBtn);
+
+    // Reopening via 1 / 2 and closing without selecting restores focus back to the 1 / 2 counter button.
+    counterBtn.click();
+    await flushAsync();
+    const closeSearchDialogBtn = target.querySelector<HTMLButtonElement>(
+      '#reader-search button[title="Close"]',
+    )!;
+    closeSearchDialogBtn.click();
+    await flushAsync();
+    expect(target.querySelector('#reader-search')).toBeNull();
+    expect(document.activeElement).toBe(counterBtn);
+
+    // Clicking Return restores the pre-search location, reveals controls, and focuses the reader Search button.
+    const returnBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Return to pre-search reading location"]',
+    )!;
+    returnBtn.focus();
+    returnBtn.click();
+    await flushAsync();
+
+    const toolbarSearchBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-controls="reader-search"]',
+    )!;
+    expect(toolbarSearchBtn).not.toBeNull();
+    expect(document.activeElement).toBe(toolbarSearchBtn);
+
+    // Selecting another result and clicking Close in the match bar restores focus to topRevealButton when chrome is hidden.
+    toolbarSearchBtn.click();
+    await flushAsync();
+    target.querySelectorAll<HTMLButtonElement>('[data-reader-focus="search-result"]')[1]?.click();
+    await flushAsync();
+
+    const closeBarBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Close search match bar"]',
+    )!;
+    closeBarBtn.focus();
+    closeBarBtn.click();
+    await flushAsync();
+
+    const topRevealBtn = target.querySelector<HTMLButtonElement>('.reader-top-reveal')!;
+    expect(document.activeElement).toBe(topRevealBtn);
+  });
+
+  it('aborts in-flight search batches on panel close or query replacement and ignores stale search/display completions', async () => {
+    const signals: AbortSignal[] = [];
+    let resolveFirstBatch!: (batch: ReaderSearchBatch) => void;
+
+    sessionMock.search
+      .mockImplementationOnce(
+        (_query: string, signal?: AbortSignal) =>
+          new Promise<ReaderSearchBatch>((resolve) => {
+            if (signal) signals.push(signal);
+            resolveFirstBatch = resolve;
+          }),
+      )
+      .mockImplementationOnce(async (_query: string, signal?: AbortSignal) => {
+        if (signal) signals.push(signal);
+        return {
+          results: [makeResult(0, 'Beacon', 1)],
+          scannedChapters: 3,
+          skippedChapters: 0,
+          totalChapters: 3,
+          nextCursor: null,
+        } satisfies ReaderSearchBatch;
+      });
+
+    component = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'book.epub',
+        bookId: 'book-stale',
+        title: 'Stale Guard Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await flushAsync();
+
+    sessionMock.onLocation?.(makeLocation('origin-cfi', 'chapter-1.xhtml', 0), 'restore');
+    flushSync();
+
+    await openSearchPanel();
+    const input = target.querySelector<HTMLInputElement>('#reader-search-query')!;
+    const form = target.querySelector<HTMLFormElement>('#reader-search form')!;
+
+    input.value = 'Harbor';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushAsync();
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+
+    // Submitting a newer query aborts the in-flight first batch; resolving the first batch late must not overwrite Beacon.
+    input.value = 'Beacon';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushAsync();
+
+    expect(signals[0]?.aborted).toBe(true);
+    resolveFirstBatch({
+      results: [makeResult(0, 'Harbor', 0), makeResult(1, 'Harbor', 0)],
+      scannedChapters: 1,
+      skippedChapters: 2,
+      totalChapters: 3,
+      nextCursor: { sectionIndex: 1, matchIndex: 0 },
+    });
+    await flushAsync();
+
+    const marks = target.querySelectorAll('#reader-search mark.reader-search-excerpt-match');
+    expect(marks).toHaveLength(1);
+    expect(marks[0]?.textContent).toBe('Beacon');
+    expect(target.querySelector('[data-reader-focus="search-more"]')).toBeNull();
+
+    // Start a slow search result displayCfi, then navigate via TOC before displayCfi finishes.
+    let resolveSlowResultCfi!: (displayed: boolean) => void;
+    sessionMock.displayCfi.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveSlowResultCfi = resolve;
+        }),
+    );
+    sessionMock.display.mockClear();
+    sessionMock.setSearchHighlight.mockClear();
+
+    target.querySelectorAll<HTMLButtonElement>('[data-reader-focus="search-result"]')[0]?.click();
+    flushSync();
+
+    // User switches to Contents and jumps to Chapter 3 while the search display is still pending.
+    target.querySelector<HTMLButtonElement>('[aria-controls="reader-contents"]')?.click();
+    await flushAsync();
+    const tocButtons = Array.from(
+      target.querySelectorAll<HTMLButtonElement>('#reader-contents button'),
+    );
+    const ch3Button = tocButtons.find((btn) => btn.textContent?.includes('Chapter 3'))!;
+    ch3Button.click();
+    await flushAsync();
+
+    expect(sessionMock.display).toHaveBeenCalledExactlyOnceWith('chapter-3.xhtml');
+
+    // Late-resolving stale displayCfi(false) must NOT trigger fallback display(result.href) or show the match bar.
+    resolveSlowResultCfi(false);
+    await flushAsync();
+
+    expect(sessionMock.display).toHaveBeenCalledExactlyOnceWith('chapter-3.xhtml');
+    expect(sessionMock.setSearchHighlight).not.toHaveBeenCalledWith(
+      expect.stringContaining('epubcfi'),
+    );
+    expect(target.querySelector('[data-reader-search-bar]')).toBeNull();
+  });
 });
