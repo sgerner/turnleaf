@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { crc32 } from 'node:zlib';
 import { createCdpClient } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
 import { resolveDeviceSerial } from './android-device.mjs';
@@ -14,10 +15,39 @@ import { main as smoke } from './android-smoke.mjs';
 const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
+const ONE_PIXEL_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==',
+  'base64',
+);
 const coverPng = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
   'base64',
 );
+
+let cachedSampleFont;
+function readSampleWoff2Font() {
+  if (cachedSampleFont) return cachedSampleFont;
+  const archive = readFileSync(
+    new URL('../dev/kavita/data/Books/lorem-ipsum.epub', import.meta.url),
+  );
+  const targetName = 'OEBPS/fonts/turnleaf-sample.woff2';
+  let offset = 0;
+  while (offset + 30 <= archive.length && archive.readUInt32LE(offset) === 0x04034b50) {
+    const method = archive.readUInt16LE(offset + 8);
+    const compressedSize = archive.readUInt32LE(offset + 18);
+    const nameLen = archive.readUInt16LE(offset + 26);
+    const extraLen = archive.readUInt16LE(offset + 28);
+    const name = archive.subarray(offset + 30, offset + 30 + nameLen).toString('utf8');
+    const dataStart = offset + 30 + nameLen + extraLen;
+    if (name === targetName && method === 0) {
+      cachedSampleFont = Buffer.from(archive.subarray(dataStart, dataStart + compressedSize));
+      return cachedSampleFont;
+    }
+    offset = dataStart + compressedSize;
+  }
+  throw new Error(`Could not locate stored ${targetName} in sample EPUB.`);
+}
+
 let deviceSerial;
 const adb = async (...args) =>
   (
@@ -25,6 +55,220 @@ const adb = async (...args) =>
       timeout: 20_000,
     })
   ).stdout.trim();
+
+function makeStoredZip(entries) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const [name, content] of entries) {
+    const nameBytes = Buffer.from(name, 'utf8');
+    const dataBytes = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+    const checksum = crc32(dataBytes);
+    const flags = name === 'mimetype' ? 0 : 0x0800;
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(dataBytes.length, 18);
+    local.writeUInt32LE(dataBytes.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    localParts.push(local, nameBytes, dataBytes);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(flags, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(dataBytes.length, 20);
+    central.writeUInt32LE(dataBytes.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, nameBytes);
+
+    offset += 30 + nameBytes.length + dataBytes.length;
+  }
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const endOfCentralDirectory = Buffer.alloc(22);
+  endOfCentralDirectory.writeUInt32LE(0x06054b50, 0);
+  endOfCentralDirectory.writeUInt16LE(entries.length, 8);
+  endOfCentralDirectory.writeUInt16LE(entries.length, 10);
+  endOfCentralDirectory.writeUInt32LE(centralDirectory.length, 12);
+  endOfCentralDirectory.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...localParts, centralDirectory, endOfCentralDirectory]);
+}
+
+export function createJourneyEpub(hostileBaseUrl) {
+  const sampleFont = readSampleWoff2Font();
+  const containerXml = `<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+`;
+  const contentOpf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id" xml:lang="en">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="pub-id">urn:uuid:8f14e45f-ceea-4c9a-b1a5-turnleaf-sample</dc:identifier>
+    <dc:title>Sample Lorem Ipsum</dc:title>
+    <dc:language>en</dc:language>
+    <dc:creator>Turnleaf</dc:creator>
+    <meta property="dcterms:modified">2026-09-01T00:00:00Z</meta>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="book-css" href="styles/book.css" media-type="text/css"/>
+    <item id="sample-font" href="fonts/turnleaf-sample.woff2" media-type="font/woff2"/>
+    <item id="local-png" href="images/local.png" media-type="image/png"/>
+    <item id="chapter1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="chapter2" href="text/chapter2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="chapter1"/>
+    <itemref idref="chapter2"/>
+  </spine>
+</package>
+`;
+  const navXhtml = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+  <head>
+    <title>Table of Contents</title>
+  </head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h1>Table of Contents</h1>
+      <ol>
+        <li><a href="text/chapter1.xhtml">Chapter 1</a></li>
+        <li><a href="text/chapter2.xhtml">Chapter 2</a></li>
+      </ol>
+    </nav>
+  </body>
+</html>
+`;
+  const tocNcx = `<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head>
+    <meta name="dtb:uid" content="urn:uuid:8f14e45f-ceea-4c9a-b1a5-turnleaf-sample"/>
+    <meta name="dtb:depth" content="1"/>
+    <meta name="dtb:totalPageCount" content="0"/>
+    <meta name="dtb:maxPageNumber" content="0"/>
+  </head>
+  <docTitle>
+    <text>Sample Lorem Ipsum</text>
+  </docTitle>
+  <navMap>
+    <navPoint id="navpoint-1" playOrder="1">
+      <navLabel><text>Chapter 1</text></navLabel>
+      <content src="text/chapter1.xhtml"/>
+    </navPoint>
+    <navPoint id="navpoint-2" playOrder="2">
+      <navLabel><text>Chapter 2</text></navLabel>
+      <content src="text/chapter2.xhtml"/>
+    </navPoint>
+  </navMap>
+</ncx>
+`;
+  const bookCss = `@import url('${hostileBaseUrl}/packaged-import.css');
+@\\69 mport '${hostileBaseUrl}/escaped-packaged-import.css';
+@font-face {
+  font-family: 'TurnleafSample';
+  src: url('../fonts/turnleaf-sample.woff2') format('woff2'), url('${hostileBaseUrl}/hostile-font.woff2') format('woff2');
+  font-weight: 400 700;
+  font-style: normal;
+}
+h1 {
+  font-family: 'TurnleafSample', Georgia, serif;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid rgb(180, 83, 9);
+}
+p.lead {
+  border-left: 3px solid rgb(180, 83, 9);
+  padding-left: 0.75em;
+}
+.packaged-local {
+  background-image: url('../images/local.png');
+}
+.packaged-hostile-bg {
+  background-image: url('${hostileBaseUrl}/packaged-bg.png');
+}
+.escaped-hostile-bg {
+  background-image: \\75 rl('${hostileBaseUrl}/escaped-bg.png');
+}
+`;
+  const chapter1Xhtml = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+  <head>
+    <title>Chapter 1</title>
+    <base href="${hostileBaseUrl}/base/" />
+    <link rel="stylesheet" href="${hostileBaseUrl}/remote.css" />
+    <link rel="stylesheet" href="../styles/book.css" />
+    <meta http-equiv="refresh" content="0;url=${hostileBaseUrl}/redirect" />
+    <style>
+      @import url('${hostileBaseUrl}/inline-import.css');
+      .inline-hostile-bg {
+        background-image: url('${hostileBaseUrl}/inline-bg.png');
+      }
+    </style>
+  </head>
+  <body onload="fetch('${hostileBaseUrl}/onload')">
+    <script>fetch('${hostileBaseUrl}/script');</script>
+    <iframe src="${hostileBaseUrl}/frame"></iframe>
+    <form action="${hostileBaseUrl}/form"></form>
+    <h1>Chapter 1</h1>
+    <p class="lead inline-hostile-bg packaged-hostile-bg escaped-hostile-bg packaged-local" style="font-style: italic">
+      Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+      <a id="internal-link" href="chapter2.xhtml">Next chapter</a>
+      <a id="remote-link" href="${hostileBaseUrl}/leave">Leave</a>
+      <img id="local-img" src="../images/local.png" alt="" width="1" height="1" />
+      <img id="embedded-img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==" alt="" width="1" height="1" />
+      <img id="hostile-img" src="${hostileBaseUrl}/img-src.png" alt="" width="1" height="1" />
+      <img id="hostile-srcset" srcset="${hostileBaseUrl}/img-srcset.png 1x, ../images/local.png 2x" alt="" width="1" height="1" />
+      <svg width="1" height="1"><image id="hostile-svg" href="${hostileBaseUrl}/svg-image.png" width="1" height="1" /></svg>
+      <video id="hostile-video" poster="${hostileBaseUrl}/video-poster.png" width="1" height="1"></video>
+    </p>
+    <p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p>
+  </body>
+</html>
+`;
+  const chapter2Xhtml = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+  <head>
+    <title>Chapter 2</title>
+    <link rel="stylesheet" href="../styles/book.css" />
+  </head>
+  <body>
+    <h1>Chapter 2</h1>
+    <p class="lead">At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium voluptatum deleniti atque corrupti quos dolores et quas molestias excepturi sint occaecati cupiditate non provident.</p>
+    <p>Ut aut reiciendis voluptatibus maiores alias consequatur aut perferendis doloribus asperiores repellat. The end.</p>
+  </body>
+</html>
+`;
+
+  return makeStoredZip([
+    ['mimetype', 'application/epub+zip'],
+    ['META-INF/container.xml', containerXml],
+    ['OEBPS/content.opf', contentOpf],
+    ['OEBPS/nav.xhtml', navXhtml],
+    ['OEBPS/toc.ncx', tocNcx],
+    ['OEBPS/styles/book.css', bookCss],
+    ['OEBPS/fonts/turnleaf-sample.woff2', sampleFont],
+    ['OEBPS/images/local.png', ONE_PIXEL_PNG],
+    ['OEBPS/text/chapter1.xhtml', chapter1Xhtml],
+    ['OEBPS/text/chapter2.xhtml', chapter2Xhtml],
+  ]);
+}
 
 async function waitFor(label, check) {
   const end = Date.now() + 30_000;
@@ -73,9 +317,6 @@ async function connectWebView() {
 }
 
 export async function startFixture({ crossOriginRedirects = false } = {}) {
-  const epub = await readFile(
-    new URL('../dev/kavita/data/Books/lorem-ipsum.epub', import.meta.url),
-  );
   const uploads = [];
   let downloads = 0;
   let covers = 0;
@@ -84,7 +325,9 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   let foreignAuthHeaders = 0;
   let offline = false;
   let redirectCrossOrigin = crossOriginRedirects;
+  let epub = Buffer.alloc(0);
   const offlineRequests = [];
+  const hostileRequests = [];
   const notFoundPaths = [];
   const foreignRequests = [];
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
@@ -102,12 +345,17 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   const foreignOrigin = `http://127.0.0.1:${foreignPort}`;
 
   const server = createServer(async (request, response) => {
+    const requestUrl = new URL(request.url, 'http://localhost');
+    const path = requestUrl.pathname;
+    if (path.startsWith('/hostile/')) {
+      hostileRequests.push(path);
+      response.writeHead(204).end();
+      return;
+    }
     if (request.headers['x-api-key'] !== key) {
       response.writeHead(401).end();
       return;
     }
-    const requestUrl = new URL(request.url, 'http://localhost');
-    const path = requestUrl.pathname;
     if (offline) {
       offlineRequests.push(path);
       response.writeHead(503).end();
@@ -207,8 +455,10 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   const titleName = title;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
+  const port = server.address().port;
+  epub = createJourneyEpub(`http://127.0.0.1:${port}/hostile`);
   return {
-    port: server.address().port,
+    port,
     foreignPort,
     uploads,
     get downloads() {
@@ -227,6 +477,7 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
       return foreignAuthHeaders;
     },
     offlineRequests,
+    hostileRequests,
     notFoundPaths,
     foreignRequests,
     setOffline(value) {
@@ -252,6 +503,92 @@ const click = (selector) => `(() => {
 const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).some(
   frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
 )`;
+
+export const chapterIsolated = (number) => `(() => {
+  const frame = Array.from(document.querySelectorAll('iframe')).find(
+    candidate => candidate.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
+  );
+  if (!frame || frame.getAttribute('sandbox') !== 'allow-same-origin') return false;
+  const doc = frame.contentDocument;
+  const csp = doc?.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute('content') ?? '';
+  if (
+    !csp.includes("connect-src 'none'") ||
+    !csp.includes("script-src 'none'") ||
+    !csp.includes("form-action 'none'") ||
+    !csp.includes("img-src 'self' data: blob:")
+  ) {
+    return false;
+  }
+  return !doc.documentElement.outerHTML.includes('/hostile/');
+})()`;
+
+function assertNoHostileRequests(fixture, stage) {
+  if (fixture.hostileRequests.length > 0) {
+    throw new Error(
+      `Turnleaf leaked hostile EPUB subresource requests while ${stage}: ${fixture.hostileRequests.join(', ')}.`,
+    );
+  }
+}
+
+export const installCspMonitor = `(() => {
+  if (!window.__turnleafCspViolations) {
+    window.__turnleafCspViolations = [];
+    window.__turnleafBlockedHostileCsp = [];
+    document.addEventListener('securitypolicyviolation', (event) => {
+      const directive = String(event.effectiveDirective ?? '');
+      const blocked = String(event.blockedURI ?? '');
+      const entry = \`\${directive}:\${blocked}\`;
+      if (blocked.includes('/hostile/') || entry === 'script-src-attr:inline') {
+        window.__turnleafBlockedHostileCsp.push(entry);
+        return;
+      }
+      window.__turnleafCspViolations.push(entry);
+    });
+  }
+  return true;
+})()`;
+
+export const styledChapter = (number) => `(async () => {
+  if ((window.__turnleafCspViolations?.length ?? 0) > 0) {
+    throw new Error('CSP violations: ' + window.__turnleafCspViolations.join(', '));
+  }
+  const matchesBorderPx = (value, expected, dpr) => {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return false;
+    const scale = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+    const candidates = [
+      expected,
+      Math.floor(expected * scale) / scale,
+      Math.round(expected * scale) / scale,
+    ];
+    return candidates.some((candidate) => Math.abs(parsed - candidate) <= 0.02);
+  };
+  for (const frame of document.querySelectorAll('iframe')) {
+    const doc = frame.contentDocument;
+    const win = frame.contentWindow;
+    const heading = doc?.querySelector('h1');
+    const lead = doc?.querySelector('p.lead');
+    if (!doc || !win || heading?.textContent !== 'Chapter ${number}' || !lead) continue;
+    const headingStyle = win.getComputedStyle(heading);
+    const leadStyle = win.getComputedStyle(lead);
+    if (
+      !matchesBorderPx(headingStyle.borderBottomWidth, 2, win.devicePixelRatio) ||
+      !matchesBorderPx(leadStyle.borderLeftWidth, 3, win.devicePixelRatio) ||
+      headingStyle.borderBottomColor !== 'rgb(180, 83, 9)' ||
+      leadStyle.borderLeftColor !== 'rgb(180, 83, 9)' ||
+      !headingStyle.fontFamily.includes('TurnleafSample')
+    ) {
+      return false;
+    }
+    await doc.fonts.ready;
+    await doc.fonts.load('16px TurnleafSample');
+    return Array.from(doc.fonts).some(
+      (face) =>
+        face.family.replace(/['"]/g, '') === 'TurnleafSample' && face.status === 'loaded',
+    );
+  }
+  return false;
+})()`;
 
 const renderedCover = `(() => {
   const image = document.querySelector('[data-book-open]')?.parentElement?.querySelector('img');
@@ -312,6 +649,7 @@ async function run() {
     });
     throwIfInterrupted();
     web = await connectWebView();
+    await web.evaluate(installCspMonitor);
     await waitFor('onboarding', () => web.evaluate("!!document.querySelector('input[type=url]')"));
     await web.evaluate(`(() => {
       const fill = (selector, value) => {
@@ -349,7 +687,10 @@ async function run() {
     if (fixture.covers !== 1) throw new Error('Expected one cached cover transfer.');
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
+    await waitFor('isolated first chapter markup', () => web.evaluate(chapterIsolated(1)));
+    await waitFor('manifest stylesheet and embedded font', () => web.evaluate(styledChapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
+    assertNoHostileRequests(fixture, 'opening Chapter 1');
 
     disabledNetwork = true;
     await adb('shell', 'svc', 'wifi', 'disable');
@@ -364,6 +705,9 @@ async function run() {
     const uploadCount = fixture.uploads.length;
     await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
     await waitFor('second chapter', () => web.evaluate(chapter(2)));
+    await waitFor('isolated second chapter markup', () => web.evaluate(chapterIsolated(2)));
+    await waitFor('styled second chapter offline', () => web.evaluate(styledChapter(2)));
+    assertNoHostileRequests(fixture, 'turning to Chapter 2');
     await waitFor('reader position in the second chapter', () =>
       web.evaluate(
         'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
@@ -394,9 +738,13 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
+    await web.evaluate(installCspMonitor);
     await waitFor('rendered offline cover after restart', () => web.evaluate(renderedCover));
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
+    await waitFor('isolated offline chapter after restart', () => web.evaluate(chapterIsolated(2)));
+    await waitFor('offline styles restored after restart', () => web.evaluate(styledChapter(2)));
+    assertNoHostileRequests(fixture, 'reopening offline after restart');
     if (fixture.offlineRequests.length > 0) {
       throw new Error(
         `Turnleaf sent authenticated requests offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
@@ -426,6 +774,7 @@ async function run() {
       ),
     );
     await waitFor('rendered cover after reconnect', () => web.evaluate(renderedCover));
+    assertNoHostileRequests(fixture, 'completing reconnect sync');
     assertRedirectIsolation(fixture);
     if (fixture.notFoundPaths.length > 0) {
       throw new Error(

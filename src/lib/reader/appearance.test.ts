@@ -34,6 +34,7 @@ describe('appearance serialization', () => {
     expect(defaultAppearance.publisherStyles).toBe(true);
     expect(parseAppearance('{}').publisherStyles).toBe(true);
     expect(parseAppearance('{"publisherStyles":true}').publisherStyles).toBe(true);
+    expect(parseAppearance('{"publisherStyles":null}').publisherStyles).toBe(true);
     expect(parseAppearance('{"publisherStyles":false}').publisherStyles).toBe(false);
   });
 
