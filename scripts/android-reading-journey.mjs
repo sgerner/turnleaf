@@ -82,8 +82,6 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   let coverRedirects = 0;
   let downloadRedirects = 0;
   let foreignAuthHeaders = 0;
-  let inFlightRequests = 0;
-  let requestCount = 0;
   let offline = false;
   let redirectCrossOrigin = crossOriginRedirects;
   const offlineRequests = [];
@@ -104,16 +102,6 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   const foreignOrigin = `http://127.0.0.1:${foreignPort}`;
 
   const server = createServer(async (request, response) => {
-    requestCount += 1;
-    inFlightRequests += 1;
-    let settled = false;
-    const finishRequest = () => {
-      if (settled) return;
-      settled = true;
-      inFlightRequests -= 1;
-    };
-    response.once('finish', finishRequest);
-    response.once('close', finishRequest);
     if (request.headers['x-api-key'] !== key) {
       response.writeHead(401).end();
       return;
@@ -238,12 +226,6 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     get foreignAuthHeaders() {
       return foreignAuthHeaders;
     },
-    get inFlightRequests() {
-      return inFlightRequests;
-    },
-    get requestCount() {
-      return requestCount;
-    },
     offlineRequests,
     notFoundPaths,
     foreignRequests,
@@ -292,34 +274,6 @@ function assertRedirectIsolation(fixture) {
       `Cross-origin redirect received ${fixture.foreignRequests.length} request(s) and ${fixture.foreignAuthHeaders} x-api-key header(s).`,
     );
   }
-}
-
-export async function enterOfflineMode({
-  adbCommand = adb,
-  webClient,
-  fixture,
-  settleMs = 150,
-  wait = waitFor,
-}) {
-  await adbCommand('shell', 'svc', 'data', 'disable');
-  await adbCommand('shell', 'svc', 'wifi', 'disable');
-  await wait('offline state', async () => {
-    const connected = await webClient.evaluate(
-      'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
-    );
-    if (connected !== false || fixture.inFlightRequests > 0) return false;
-    const countBeforeSettle = fixture.requestCount;
-    if (settleMs > 0) await delay(settleMs);
-    const rechecked = await webClient.evaluate(
-      'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
-    );
-    return (
-      rechecked === false &&
-      fixture.inFlightRequests === 0 &&
-      fixture.requestCount === countBeforeSettle
-    );
-  });
-  fixture.setOffline(true);
 }
 
 async function run() {
@@ -398,7 +352,15 @@ async function run() {
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await enterOfflineMode({ webClient: web, fixture });
+    await adb('shell', 'svc', 'wifi', 'disable');
+    await adb('shell', 'svc', 'data', 'disable');
+    await waitFor('offline state', async () => {
+      const connected = await web.evaluate(
+        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
+      );
+      return connected === false;
+    });
+    fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
     await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
     await waitFor('second chapter', () => web.evaluate(chapter(2)));
