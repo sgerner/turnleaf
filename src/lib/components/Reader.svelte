@@ -268,6 +268,10 @@
         updateDocumentTitle();
         const transientSearch = searchBarVisible || searchNavigationDepth > 0;
         if (origin === 'link') {
+          readerNavigationGeneration += 1;
+          if (!searchBarVisible && searchNavigationDepth > 0) {
+            searchStepGeneration += 1;
+          }
           linkReturnTarget = returnTarget ?? null;
         } else if (origin === 'navigation' && !transientSearch) {
           linkReturnTarget = null;
