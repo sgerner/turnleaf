@@ -1,71 +1,67 @@
 // @vitest-environment jsdom
 
 import type { Contents, Location } from 'epubjs';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
 
 type MockSection = { href: string; index: number; pageCount: number };
 
 const state = vi.hoisted(() => {
-  let sections: MockSection[] = [
-    { href: 'chapter-1.xhtml', index: 0, pageCount: 40 },
-    { href: 'chapter-2.xhtml', index: 1, pageCount: 100 },
-  ];
-  let currentSectionIndex = 0;
-  let currentPage = 1;
-  let useManagerMoveTo = true;
+  let sections: MockSection[] = [];
+  let sectionIndex = 0;
+  let page = 1;
+  let pageWidth = 400;
   const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
-  function currentLocationObject(): Location {
-    const section = sections[currentSectionIndex] ?? sections[0]!;
+  function locationObject(): Location {
+    const section = sections[sectionIndex] ?? sections[0]!;
+    const cfi = `epubcfi(/6/${(section.index + 1) * 2}!/4/2:${page})`;
     return {
       start: {
-        cfi: `epubcfi(/6/${(section.index + 1) * 2}!/4/2:${currentPage})`,
+        cfi,
         href: section.href,
         index: section.index,
-        location: currentPage,
-        percentage: (currentPage - 1) / Math.max(1, section.pageCount),
-        displayed: {
-          page: currentPage,
-          total: section.pageCount,
-        },
+        location: page,
+        percentage: (page - 1) / Math.max(1, section.pageCount),
+        displayed: { page, total: section.pageCount },
       },
       end: {
-        cfi: `epubcfi(/6/${(section.index + 1) * 2}!/4/2:${currentPage})`,
+        cfi,
         href: section.href,
         index: section.index,
-        location: currentPage,
-        percentage: currentPage / Math.max(1, section.pageCount),
-        displayed: {
-          page: currentPage,
-          total: section.pageCount,
-        },
+        location: page,
+        percentage: page / Math.max(1, section.pageCount),
+        displayed: { page, total: section.pageCount },
       },
-      atStart: currentSectionIndex === 0 && currentPage === 1,
-      atEnd:
-        currentSectionIndex === sections.length - 1 &&
-        currentPage >= (sections[currentSectionIndex]?.pageCount ?? 1),
+      atStart: sectionIndex === 0 && page === 1,
+      atEnd: sectionIndex === sections.length - 1 && page >= section.pageCount,
     } as Location;
   }
 
   function emit(event: string, ...args: unknown[]): void {
-    for (const handler of listeners.get(event) ?? []) {
-      handler(...args);
-    }
+    for (const handler of listeners.get(event) ?? []) handler(...args);
+  }
+
+  function syncLocation(): Location {
+    const loc = locationObject();
+    rendition.location = loc;
+    emit('relocated', loc);
+    return loc;
   }
 
   const manager = {
-    layout: { delta: 400 },
+    layout: {
+      get delta() {
+        return pageWidth;
+      },
+    },
     views: {
-      first: () => ({
-        width: () => (sections[currentSectionIndex]?.pageCount ?? 1) * 400,
-      }),
+      first: () => ({ width: () => (sections[sectionIndex]?.pageCount ?? 1) * pageWidth }),
     },
     moveTo: vi.fn((offset: { left: number; top: number }) => {
-      const total = sections[currentSectionIndex]?.pageCount ?? 1;
-      const pageIndex = Math.max(0, Math.min(total - 1, Math.floor(offset.left / 400)));
-      currentPage = pageIndex + 1;
-      rendition.location = currentLocationObject();
+      const total = sections[sectionIndex]?.pageCount ?? 1;
+      page = Math.max(0, Math.min(total - 1, Math.floor(offset.left / pageWidth))) + 1;
+      rendition.location = locationObject();
     }),
   };
 
@@ -82,57 +78,45 @@ const state = vi.hoisted(() => {
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     location: undefined as Location | undefined,
-    get manager() {
-      return useManagerMoveTo ? manager : undefined;
-    },
-    currentLocation: vi.fn(() => currentLocationObject()),
+    manager,
+    currentLocation: vi.fn(() => rendition.location),
     reportLocation: vi.fn(async () => {
-      const loc = currentLocationObject();
-      rendition.location = loc;
-      emit('relocated', loc);
+      syncLocation();
     }),
     display: vi.fn(async (target?: string) => {
       if (!target) {
-        currentSectionIndex = 0;
-        currentPage = 1;
+        sectionIndex = 0;
+        page = 1;
       } else if (target.startsWith('epubcfi(')) {
         const match = target.match(/\/6\/(\d+)!\/4\/2:(\d+)/);
         if (match) {
-          currentSectionIndex = Math.max(0, Number(match[1]) / 2 - 1);
-          currentPage = Number(match[2]);
+          sectionIndex = Math.max(0, Number(match[1]) / 2 - 1);
+          page = Number(match[2]);
         }
       } else {
         const found = sections.findIndex((item) => item.href === target);
         if (found < 0) throw new Error('No Section Found');
-        currentSectionIndex = found;
-        currentPage = 1;
+        sectionIndex = found;
+        page = 1;
       }
-      const loc = currentLocationObject();
-      rendition.location = loc;
-      emit('relocated', loc);
+      syncLocation();
     }),
     next: vi.fn(async () => {
-      const section = sections[currentSectionIndex]!;
-      if (currentPage < section.pageCount) {
-        currentPage += 1;
-      } else if (currentSectionIndex < sections.length - 1) {
-        currentSectionIndex += 1;
-        currentPage = 1;
+      const section = sections[sectionIndex]!;
+      if (page < section.pageCount) page += 1;
+      else if (sectionIndex < sections.length - 1) {
+        sectionIndex += 1;
+        page = 1;
       }
-      const loc = currentLocationObject();
-      rendition.location = loc;
-      emit('relocated', loc);
+      syncLocation();
     }),
     prev: vi.fn(async () => {
-      if (currentPage > 1) {
-        currentPage -= 1;
-      } else if (currentSectionIndex > 0) {
-        currentSectionIndex -= 1;
-        currentPage = sections[currentSectionIndex]!.pageCount;
+      if (page > 1) page -= 1;
+      else if (sectionIndex > 0) {
+        sectionIndex -= 1;
+        page = sections[sectionIndex]!.pageCount;
       }
-      const loc = currentLocationObject();
-      rendition.location = loc;
-      emit('relocated', loc);
+      syncLocation();
     }),
     resize: vi.fn(),
     destroy: vi.fn(),
@@ -143,9 +127,7 @@ const state = vi.hoisted(() => {
     destroy: vi.fn(),
     spine: {
       each: vi.fn((visit: (section: { href: string; index: number }) => void) => {
-        for (const section of sections) {
-          visit({ href: section.href, index: section.index });
-        }
+        for (const section of sections) visit({ href: section.href, index: section.index });
       }),
     },
     navigation: { toc: [] },
@@ -156,14 +138,20 @@ const state = vi.hoisted(() => {
     rendition,
     manager,
     emit,
-    reset(nextSections?: MockSection[], withManager = true) {
+    setPosition(nextSectionIndex: number, nextPage: number, nextWidth = pageWidth) {
+      sectionIndex = nextSectionIndex;
+      page = nextPage;
+      pageWidth = nextWidth;
+      return syncLocation();
+    },
+    reset(nextSections?: MockSection[]) {
       sections = nextSections ?? [
         { href: 'chapter-1.xhtml', index: 0, pageCount: 40 },
         { href: 'chapter-2.xhtml', index: 1, pageCount: 100 },
       ];
-      currentSectionIndex = 0;
-      currentPage = 1;
-      useManagerMoveTo = withManager;
+      sectionIndex = 0;
+      page = 1;
+      pageWidth = 400;
       listeners.clear();
       rendition.location = undefined;
     },
@@ -187,13 +175,42 @@ function makeContents(collapsed = true): Contents {
   } as unknown as Contents;
 }
 
+function touchGesture(
+  target: EventTarget,
+  contents: Contents,
+  id: number,
+  points: Array<[number, number]>,
+): void {
+  const [startX, startY] = points[0]!;
+  state.emit(
+    'touchstart',
+    { target, touches: [{ identifier: id, clientX: startX, clientY: startY }] },
+    contents,
+  );
+  for (const [x, y] of points.slice(1)) {
+    state.emit(
+      'touchmove',
+      { target, touches: [{ identifier: id, clientX: x, clientY: y }] },
+      contents,
+    );
+  }
+  const [endX, endY] = points.at(-1)!;
+  state.emit(
+    'touchend',
+    { target, touches: [], changedTouches: [{ identifier: id, clientX: endX, clientY: endY }] },
+    contents,
+  );
+}
+
 describe('ReaderSession swipe navigation and intra-chapter percentage targeting', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.reset();
   });
 
-  it('turns forward on left swipe and backward on right swipe inside the EPUB iframe without duplicate click turns', async () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('turns forward/backward on horizontal swipes, suppresses trailing clicks, and keeps stationary taps', async () => {
     const viewport = document.createElement('div');
     vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 640));
     const onLocation = vi.fn();
@@ -204,99 +221,34 @@ describe('ReaderSession swipe navigation and intra-chapter percentage targeting'
     const contents = makeContents(true);
     const paragraph = document.createElement('p');
 
-    // Left swipe: 280 -> 100 turns forward one page (page 1 -> page 2)
-    state.emit(
-      'touchstart',
-      {
-        target: paragraph,
-        touches: [{ identifier: 1, clientX: 280, clientY: 300 }],
-        changedTouches: [{ identifier: 1, clientX: 280, clientY: 300 }],
-      },
-      contents,
-    );
-    state.emit(
-      'touchmove',
-      {
-        target: paragraph,
-        touches: [{ identifier: 1, clientX: 100, clientY: 310 }],
-        changedTouches: [{ identifier: 1, clientX: 100, clientY: 310 }],
-      },
-      contents,
-    );
-    state.emit(
-      'touchend',
-      {
-        target: paragraph,
-        touches: [],
-        changedTouches: [{ identifier: 1, clientX: 100, clientY: 310 }],
-      },
-      contents,
-    );
+    touchGesture(paragraph, contents, 1, [
+      [280, 300],
+      [100, 310],
+    ]);
     await Promise.resolve();
     expect(state.rendition.next).toHaveBeenCalledOnce();
     expect(onLocation.mock.calls.at(-1)?.[0]).toMatchObject({ pageIndex: 1, pageCount: 40 });
 
-    // Trailing synthesized click immediately after swipe is suppressed
     state.emit('click', new MouseEvent('click', { clientX: 100, clientY: 310 }), contents);
     expect(onTap).not.toHaveBeenCalled();
 
-    // Subsequent stationary tap still works
-    state.emit(
-      'touchstart',
-      {
-        target: paragraph,
-        touches: [{ identifier: 2, clientX: 300, clientY: 300 }],
-        changedTouches: [{ identifier: 2, clientX: 300, clientY: 300 }],
-      },
-      contents,
-    );
-    state.emit(
-      'touchend',
-      {
-        target: paragraph,
-        touches: [],
-        changedTouches: [{ identifier: 2, clientX: 302, clientY: 301 }],
-      },
-      contents,
-    );
+    touchGesture(paragraph, contents, 2, [
+      [300, 300],
+      [302, 301],
+    ]);
     state.emit('click', new MouseEvent('click', { clientX: 302, clientY: 301 }), contents);
     expect(onTap).toHaveBeenCalledExactlyOnceWith('next');
 
-    // Right swipe: 80 -> 240 turns backward one page
-    state.emit(
-      'touchstart',
-      {
-        target: paragraph,
-        touches: [{ identifier: 3, clientX: 80, clientY: 300 }],
-        changedTouches: [{ identifier: 3, clientX: 80, clientY: 300 }],
-      },
-      contents,
-    );
-    state.emit(
-      'touchmove',
-      {
-        target: paragraph,
-        touches: [{ identifier: 3, clientX: 240, clientY: 292 }],
-        changedTouches: [{ identifier: 3, clientX: 240, clientY: 292 }],
-      },
-      contents,
-    );
-    state.emit(
-      'touchend',
-      {
-        target: paragraph,
-        touches: [],
-        changedTouches: [{ identifier: 3, clientX: 240, clientY: 292 }],
-      },
-      contents,
-    );
+    touchGesture(paragraph, contents, 3, [
+      [80, 300],
+      [240, 292],
+    ]);
     await Promise.resolve();
     expect(state.rendition.prev).toHaveBeenCalledOnce();
-
     session.destroy();
   });
 
-  it('turns pages when swiping horizontally across the outer viewport element', async () => {
+  it('supports outer viewport swipes and ignores multi-touch, vertical drift, links, and active selection', async () => {
     const viewport = document.createElement('div');
     const onSwipe = vi.fn();
     const session = new ReaderSession('book.epub');
@@ -313,50 +265,32 @@ describe('ReaderSession swipe navigation and intra-chapter percentage targeting'
       onSwipe,
     );
 
-    const start = new Event('pointerdown') as PointerEvent;
-    Object.assign(start, { pointerId: 7, pointerType: 'touch', clientX: 260, clientY: 200 });
-    const move = new Event('pointermove') as PointerEvent;
-    Object.assign(move, { pointerId: 7, pointerType: 'touch', clientX: 120, clientY: 205 });
-    const end = new Event('pointerup') as PointerEvent;
-    Object.assign(end, { pointerId: 7, pointerType: 'touch', clientX: 120, clientY: 205 });
-
-    viewport.dispatchEvent(start);
-    viewport.dispatchEvent(move);
-    viewport.dispatchEvent(end);
-
+    for (const [type, x, y] of [
+      ['pointerdown', 260, 200],
+      ['pointermove', 120, 205],
+      ['pointerup', 120, 205],
+    ] as const) {
+      viewport.dispatchEvent(
+        Object.assign(new Event(type), {
+          pointerId: 7,
+          pointerType: 'touch',
+          clientX: x,
+          clientY: y,
+        }),
+      );
+    }
     expect(onSwipe).toHaveBeenCalledExactlyOnceWith('next');
-    session.destroy();
-  });
-
-  it('ignores multi-touch gestures, vertical drift, interactive controls, and active text selection', async () => {
-    const viewport = document.createElement('div');
-    const onSwipe = vi.fn();
-    const session = new ReaderSession('book.epub');
-    await session.open(
-      viewport,
-      null,
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-      undefined,
-      undefined,
-      onSwipe,
-    );
+    onSwipe.mockClear();
 
     const paragraph = document.createElement('p');
     const link = document.createElement('a');
     link.setAttribute('href', '#note');
-
-    // 1. Multi-touch pinch/two-finger drag (second finger touches mid-gesture, then lifts first)
     const cleanContents = makeContents(true);
+
+    // Multi-touch gesture (second finger joins mid-swipe, lifts before first)
     state.emit(
       'touchstart',
-      {
-        target: paragraph,
-        touches: [{ identifier: 1, clientX: 260, clientY: 200 }],
-      },
+      { target: paragraph, touches: [{ identifier: 1, clientX: 260, clientY: 200 }] },
       cleanContents,
     );
     state.emit(
@@ -389,108 +323,34 @@ describe('ReaderSession swipe navigation and intra-chapter percentage targeting'
       cleanContents,
     );
 
-    // 2. Diagonal/vertical drift exceeds threshold
-    state.emit(
-      'touchstart',
-      {
-        target: paragraph,
-        touches: [{ identifier: 3, clientX: 240, clientY: 200 }],
-      },
-      cleanContents,
-    );
-    state.emit(
-      'touchmove',
-      {
-        target: paragraph,
-        touches: [{ identifier: 3, clientX: 140, clientY: 290 }],
-      },
-      cleanContents,
-    );
-    state.emit(
-      'touchend',
-      {
-        target: paragraph,
-        touches: [],
-        changedTouches: [{ identifier: 3, clientX: 140, clientY: 290 }],
-      },
-      cleanContents,
-    );
-
-    // 3. Swipe starting on an interactive link
-    state.emit(
-      'touchstart',
-      {
-        target: link,
-        touches: [{ identifier: 4, clientX: 260, clientY: 200 }],
-      },
-      cleanContents,
-    );
-    state.emit(
-      'touchend',
-      {
-        target: link,
-        touches: [],
-        changedTouches: [{ identifier: 4, clientX: 100, clientY: 200 }],
-      },
-      cleanContents,
-    );
-
-    // 4. Dragging across words to create a highlight (non-collapsed selection)
-    const selectedContents = makeContents(false);
-    state.emit(
-      'touchstart',
-      {
-        target: paragraph,
-        touches: [{ identifier: 5, clientX: 80, clientY: 200 }],
-      },
-      cleanContents,
-    );
-    state.emit(
-      'touchmove',
-      {
-        target: paragraph,
-        touches: [{ identifier: 5, clientX: 220, clientY: 200 }],
-      },
-      selectedContents,
-    );
-    state.emit(
-      'touchend',
-      {
-        target: paragraph,
-        touches: [],
-        changedTouches: [{ identifier: 5, clientX: 220, clientY: 200 }],
-      },
-      selectedContents,
-    );
+    // Excessive vertical drift, interactive link target, and non-collapsed selection
+    touchGesture(paragraph, cleanContents, 3, [
+      [240, 200],
+      [140, 290],
+    ]);
+    touchGesture(link, cleanContents, 4, [
+      [260, 200],
+      [100, 200],
+    ]);
+    touchGesture(paragraph, makeContents(false), 5, [
+      [80, 200],
+      [220, 200],
+    ]);
 
     expect(onSwipe).not.toHaveBeenCalled();
     session.destroy();
   });
 
-  it('inverts intra-chapter semantic percentage accurately across spine and page boundaries', () => {
-    // 49 sections: section 1, page 1 (0-based pageIndex 0)
-    const pct = (1 + 0 / 30) / 49;
-    const spineTarget = resolveSpinePercentageTarget(pct, 49);
-    expect(spineTarget?.sectionIndex).toBe(1);
-    expect(resolveSectionPageIndex(spineTarget!.sectionProgress, 30)).toBe(0);
+  it('inverts intra-chapter semantic percentage and lands on target intra-chapter pages', async () => {
+    expect(resolveSpinePercentageTarget((1 + 0 / 30) / 49, 49)?.sectionIndex).toBe(1);
+    const mid = resolveSpinePercentageTarget((1 + 3 / 7) / 3, 3)!;
+    expect([mid.sectionIndex, resolveSectionPageIndex(mid.sectionProgress, 7)]).toEqual([1, 3]);
+    expect(resolveSectionPageIndex(resolveSpinePercentageTarget(1, 4)!.sectionProgress, 25)).toBe(
+      24,
+    );
 
-    // 3 sections: section 1, pageIndex 3 of 7
-    const pctMid = (1 + 3 / 7) / 3;
-    const midTarget = resolveSpinePercentageTarget(pctMid, 3);
-    expect(midTarget?.sectionIndex).toBe(1);
-    expect(resolveSectionPageIndex(midTarget!.sectionProgress, 7)).toBe(3);
-
-    // 100% lands on final page of final section
-    const endTarget = resolveSpinePercentageTarget(1, 4);
-    expect(endTarget).toEqual({ sectionIndex: 3, sectionProgress: 1 });
-    expect(resolveSectionPageIndex(endTarget!.sectionProgress, 25)).toBe(24);
-  });
-
-  it('opens target intra-chapter pages for server percentage syncs and user jumps instead of truncating to page 1', async () => {
     const onLocation = vi.fn();
     const session = new ReaderSession('book.epub');
-
-    // Open at serverPercentage = 0.975 -> section 1 (index 1), sectionProgress = 0.95 -> pageIndex 95 (page 96 of 100)
     await session.open(
       document.createElement('div'),
       null,
@@ -509,70 +369,164 @@ describe('ReaderSession swipe navigation and intra-chapter percentage targeting'
       pageCount: 100,
     });
     expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
-
     const beforeScrubCfi = onLocation.mock.calls.at(-1)?.[0].cfi;
 
-    // User scrubs to 25% -> section 0 (40 pages), sectionProgress = 0.5 -> pageIndex 20 (page 21 of 40)
+    // Cross-chapter scrub to 25% -> chapter-1.xhtml pageIndex 20 (page 21 of 40)
     onLocation.mockClear();
-    const jumped = await session.jumpToPercentage(0.25);
-    expect(jumped).toBe(true);
-    expect(onLocation).toHaveBeenCalledOnce();
-    expect(onLocation.mock.calls[0]?.[0]).toMatchObject({
-      href: 'chapter-1.xhtml',
-      spineIndex: 0,
-      pageIndex: 20,
-      pageCount: 40,
-    });
-    expect(onLocation.mock.calls[0]?.[1]).toBe('jump');
-    expect(onLocation.mock.calls[0]?.[2]).toEqual({
-      cfi: beforeScrubCfi,
-      href: 'chapter-2.xhtml',
-    });
+    expect(await session.jumpToPercentage(0.25)).toBe(true);
+    const jumpCalls = onLocation.mock.calls.filter(([, origin]) => origin === 'jump');
+    expect(jumpCalls).toHaveLength(1);
+    expect(jumpCalls[0]).toEqual([
+      expect.objectContaining({ href: 'chapter-1.xhtml', pageIndex: 20, pageCount: 40 }),
+      'jump',
+      { cfi: beforeScrubCfi, href: 'chapter-2.xhtml' },
+    ]);
 
-    // User jumps to page 12 in current 40-page chapter -> pageIndex 11
-    const beforePageJumpCfi = onLocation.mock.calls[0]?.[0].cfi;
+    // Intra-chapter page jump to page 12 -> pageIndex 11 (single relocation, no section reload)
+    const beforePageJumpCfi = jumpCalls[0]![0].cfi;
     onLocation.mockClear();
-    const pageJumped = await session.jumpToPage(12);
-    expect(pageJumped).toBe(true);
-    expect(onLocation).toHaveBeenCalledOnce();
-    expect(onLocation.mock.calls[0]?.[0]).toMatchObject({
-      href: 'chapter-1.xhtml',
-      pageIndex: 11,
-      pageCount: 40,
-    });
-    expect(onLocation.mock.calls[0]?.[1]).toBe('jump');
-    expect(onLocation.mock.calls[0]?.[2]).toEqual({
-      cfi: beforePageJumpCfi,
-      href: 'chapter-1.xhtml',
-    });
+    expect(await session.jumpToPage(12)).toBe(true);
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ href: 'chapter-1.xhtml', pageIndex: 11, pageCount: 40 }),
+      'jump',
+      { cfi: beforePageJumpCfi, href: 'chapter-1.xhtml' },
+    );
+
+    // Server percentage sync within the open book
+    onLocation.mockClear();
+    expect(await session.displayServerPercentage(0.2)).toBe(true);
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ href: 'chapter-1.xhtml', pageIndex: 16, pageCount: 40 }),
+      'restore',
+    );
 
     session.destroy();
   });
 
-  it('resolves displayServerPercentage to the target intra-chapter page even without manager.moveTo', async () => {
-    state.reset([{ href: 'single-long-chapter.xhtml', index: 0, pageCount: 50 }], false);
+  it('aborts an in-flight display during a viewport resize and preserves the resized CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallbacks.push(callback);
+        }
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 400, 640));
     const onLocation = vi.fn();
     const session = new ReaderSession('book.epub');
     await session.open(
-      document.createElement('div'),
-      null,
+      viewport,
+      'epubcfi(/6/2!/4/2:6)',
       null,
       null,
       defaultAppearance,
       onLocation,
       vi.fn(),
     );
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/2:6)');
+
+    // 1. In-flight jumpToPercentage display rejected/aborted when ResizeObserver resizes viewport
+    let notifyDisplayStarted!: () => void;
+    const displayStarted = new Promise<void>((resolve) => {
+      notifyDisplayStarted = resolve;
+    });
+    let abortInFlightDisplay!: (reason?: unknown) => void;
+    state.rendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          abortInFlightDisplay = reject;
+          notifyDisplayStarted();
+        }),
+    );
+    state.rendition.resize.mockImplementationOnce((width: number) => {
+      abortInFlightDisplay(new DOMException('Display aborted by resize', 'AbortError'));
+      state.emit('resized', { width, height: 640 });
+      queueMicrotask(() => {
+        state.setPosition(0, 3, width);
+      });
+    });
+
+    state.manager.moveTo.mockClear();
+    onLocation.mockClear();
+    const abortedJump = session.jumpToPercentage(0.75);
+    await displayStarted;
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 800, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(await abortedJump).toBe(false);
+    await Promise.resolve();
+    expect(state.manager.moveTo).not.toHaveBeenCalled();
+    expect(onLocation.mock.calls.map(([, origin]) => origin)).toEqual(['restore']);
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/2:3)');
+    expect(state.rendition.location?.start.cfi).toBe('epubcfi(/6/2!/4/2:3)');
+
+    // 2. In-flight display superseded/aborted by epub.js early-resolve resize reflow + displayCfi abort
+    let notifyEarlyStarted!: () => void;
+    const earlyStarted = new Promise<void>((resolve) => {
+      notifyEarlyStarted = resolve;
+    });
+    let finishEarlyDisplay!: () => void;
+    state.rendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishEarlyDisplay = resolve;
+          notifyEarlyStarted();
+        }),
+    );
+    state.rendition.resize.mockImplementationOnce((width: number) => {
+      finishEarlyDisplay();
+      state.emit('resized', { width, height: 640 });
+      state.setPosition(0, 6, width);
+    });
+
+    const inFlightJump2 = session.jumpToPercentage(0.9);
+    await earlyStarted;
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 400, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(await inFlightJump2).toBe(false);
+    expect(state.manager.moveTo).not.toHaveBeenCalled();
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/2:6)');
+    expect(state.rendition.location?.start.cfi).toBe('epubcfi(/6/2!/4/2:6)');
+
+    // 3. In-flight displayCfi aborted during resize preserves resized CFI
+    let rejectCfiDisplay!: (reason?: unknown) => void;
+    state.rendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCfiDisplay = reject;
+        }),
+    );
+    state.rendition.resize.mockImplementationOnce((width: number) => {
+      rejectCfiDisplay(new DOMException('Display aborted by resize', 'AbortError'));
+      state.emit('resized', { width, height: 640 });
+      setTimeout(() => {
+        state.setPosition(0, 4, width);
+      }, 0);
+    });
 
     onLocation.mockClear();
-    const moved = await session.displayServerPercentage(0.8);
-    expect(moved).toBe(true);
-    expect(onLocation).toHaveBeenCalledOnce();
-    expect(onLocation.mock.calls[0]?.[0]).toMatchObject({
-      href: 'single-long-chapter.xhtml',
-      pageIndex: 40,
-      pageCount: 50,
-    });
-    expect(onLocation.mock.calls[0]?.[1]).toBe('restore');
+    const abortedCfiDisplay = session.displayCfi('epubcfi(/6/4!/4/2:50)');
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 600, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(await abortedCfiDisplay).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(onLocation.mock.calls.map(([, origin]) => origin)).toEqual(['restore']);
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/2:4)');
+    expect(state.rendition.location?.start.cfi).toBe('epubcfi(/6/2!/4/2:4)');
 
     session.destroy();
   });

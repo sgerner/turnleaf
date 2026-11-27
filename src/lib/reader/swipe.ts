@@ -29,10 +29,54 @@ const SWIPE_CLICK_SUPPRESSION_MS = 500;
 const INTERACTIVE_SWIPE_SELECTOR =
   'a, button, input, select, textarea, label, summary, [role="button"], [role="link"], [role="slider"], [contenteditable="true"]';
 
-function isInteractiveSwipeTarget(target: EventTarget | null | undefined): boolean {
-  const element =
-    target && typeof (target as Element).closest === 'function' ? (target as Element) : null;
-  return Boolean(element?.closest(INTERACTIVE_SWIPE_SELECTOR));
+type ActiveGesture = {
+  id: number | undefined;
+  x: number;
+  y: number;
+  lastX: number;
+  lastY: number;
+  maxDriftY: number;
+  blocked: boolean;
+};
+
+function isBlockedStart(
+  event: { defaultPrevented?: boolean; target?: EventTarget | null },
+  hasSelection?: () => boolean,
+): boolean {
+  const el =
+    event.target && typeof (event.target as Element).closest === 'function'
+      ? (event.target as Element)
+      : null;
+  return (
+    Boolean(event.defaultPrevented) ||
+    Boolean(el?.closest(INTERACTIVE_SWIPE_SELECTOR)) ||
+    Boolean(hasSelection?.())
+  );
+}
+
+function resolveDirection(
+  gesture: ActiveGesture,
+  endX: number,
+  endY: number,
+): ReaderSwipeDirection | null {
+  const deltaX = endX - gesture.x;
+  const absX = Math.abs(deltaX);
+  const absY = Math.max(Math.abs(endY - gesture.y), gesture.maxDriftY);
+  if (absX < SWIPE_MIN_DISTANCE_PX || absY > absX * SWIPE_MAX_DRIFT_RATIO) return null;
+  return deltaX < 0 ? 'next' : 'previous';
+}
+
+function findTouch(
+  list: ArrayLike<SwipeTouchPoint> | undefined,
+  id: number | undefined,
+): SwipeTouchPoint | null {
+  if (!list || list.length === 0) return null;
+  if (id !== undefined) {
+    for (let index = 0; index < list.length; index += 1) {
+      if (list[index]?.identifier === id) return list[index] ?? null;
+    }
+  }
+  return list[0] ?? null;
 }
 
 export interface SwipeGestureTracker {
@@ -52,95 +96,45 @@ export function createSwipeGestureTracker(
   onSwipe: (direction: ReaderSwipeDirection) => void,
   now: () => number = () => Date.now(),
 ): SwipeGestureTracker {
-  let touchStart: {
-    id: number | undefined;
-    x: number;
-    y: number;
-    lastX: number;
-    lastY: number;
-    maxDriftY: number;
-    blocked: boolean;
-  } | null = null;
+  let touchStart: ActiveGesture | null = null;
+  let pointerStart: ActiveGesture | null = null;
   let touchCompletedAt = -Infinity;
-  const activeTouchPointers = new Set<number>();
-  let pointerStart: {
-    id: number;
-    x: number;
-    y: number;
-    lastX: number;
-    lastY: number;
-    maxDriftY: number;
-    blocked: boolean;
-  } | null = null;
   let suppressClickUntil = 0;
+  const activeTouchPointers = new Set<number>();
 
-  function evaluateSwipe(
-    startX: number,
-    startY: number,
-    endX: number,
-    endY: number,
-    maxDriftY: number,
-  ): ReaderSwipeDirection | null {
-    const deltaX = endX - startX;
-    const absX = Math.abs(deltaX);
-    const absY = Math.max(Math.abs(endY - startY), maxDriftY);
-    if (absX < SWIPE_MIN_DISTANCE_PX) return null;
-    if (absY > absX * SWIPE_MAX_DRIFT_RATIO) return null;
-    return deltaX < 0 ? 'next' : 'previous';
-  }
-
-  function findTouch(
-    list: ArrayLike<SwipeTouchPoint> | undefined,
+  const makeGesture = (
     id: number | undefined,
-  ): SwipeTouchPoint | null {
-    if (!list || list.length === 0) return null;
-    if (id === undefined) return list[0] ?? null;
-    for (let index = 0; index < list.length; index += 1) {
-      const item = list[index];
-      if (item && item.identifier === id) return item;
-    }
-    return list[0] ?? null;
-  }
+    x: number,
+    y: number,
+    blocked: boolean,
+  ): ActiveGesture => ({ id, x, y, lastX: x, lastY: y, maxDriftY: 0, blocked });
+
+  const moveGesture = (gesture: ActiveGesture, x: number, y: number): void => {
+    gesture.lastX = x;
+    gesture.lastY = y;
+    gesture.maxDriftY = Math.max(gesture.maxDriftY, Math.abs(y - gesture.y));
+  };
 
   return {
     onTouchStart(event, hasSelection) {
       suppressClickUntil = 0;
       activeTouchPointers.clear();
       pointerStart = null;
-      const touches = event.touches;
-      const touchCount = touches?.length ?? 1;
-      if (touchCount !== 1) {
-        if (touchStart) touchStart.blocked = true;
-        else {
-          touchStart = {
-            id: undefined,
-            x: 0,
-            y: 0,
-            lastX: 0,
-            lastY: 0,
-            maxDriftY: 0,
-            blocked: true,
-          };
-        }
+      if ((event.touches?.length ?? 1) !== 1) {
+        touchStart = touchStart
+          ? { ...touchStart, blocked: true }
+          : makeGesture(undefined, 0, 0, true);
         return;
       }
-      const first = touches?.[0] ?? event.changedTouches?.[0];
+      const first = event.touches?.[0] ?? event.changedTouches?.[0];
       if (!first) return;
-      const blocked =
-        Boolean(event.defaultPrevented) ||
-        isInteractiveSwipeTarget(event.target) ||
-        Boolean(hasSelection?.());
-      touchStart = {
-        id: first.identifier,
-        x: first.clientX,
-        y: first.clientY,
-        lastX: first.clientX,
-        lastY: first.clientY,
-        maxDriftY: 0,
-        blocked,
-      };
+      touchStart = makeGesture(
+        first.identifier,
+        first.clientX,
+        first.clientY,
+        isBlockedStart(event, hasSelection),
+      );
     },
-
     onTouchMove(event, hasSelection) {
       if (!touchStart) return;
       if ((event.touches?.length ?? 1) > 1 || hasSelection?.()) {
@@ -148,85 +142,57 @@ export function createSwipeGestureTracker(
         return;
       }
       const point = findTouch(event.touches ?? event.changedTouches, touchStart.id);
-      if (!point) return;
-      touchStart.lastX = point.clientX;
-      touchStart.lastY = point.clientY;
-      touchStart.maxDriftY = Math.max(touchStart.maxDriftY, Math.abs(point.clientY - touchStart.y));
+      if (point) moveGesture(touchStart, point.clientX, point.clientY);
     },
-
     onTouchEnd(event, hasSelection) {
       touchCompletedAt = now();
       if (!touchStart) return;
       const remaining = event.touches?.length ?? 0;
-      if (touchStart.blocked || hasSelection?.()) {
-        if (remaining === 0) touchStart = null;
+      if (touchStart.blocked || hasSelection?.() || remaining > 0) {
+        touchStart = remaining > 0 ? { ...touchStart, blocked: true } : null;
         return;
       }
-      if (remaining > 0) {
-        touchStart.blocked = true;
-        return;
-      }
-      const endPoint = findTouch(event.changedTouches, touchStart.id) ?? {
-        clientX: touchStart.lastX,
-        clientY: touchStart.lastY,
-      };
+      const endPoint = findTouch(event.changedTouches, touchStart.id);
       const gesture = touchStart;
       touchStart = null;
-      const direction = evaluateSwipe(
-        gesture.x,
-        gesture.y,
-        endPoint.clientX,
-        endPoint.clientY,
-        gesture.maxDriftY,
+      const direction = resolveDirection(
+        gesture,
+        endPoint?.clientX ?? gesture.lastX,
+        endPoint?.clientY ?? gesture.lastY,
       );
       if (!direction) return;
       suppressClickUntil = touchCompletedAt + SWIPE_CLICK_SUPPRESSION_MS;
       onSwipe(direction);
     },
-
     onTouchCancel() {
       touchStart = null;
     },
-
     onPointerDown(event, hasSelection) {
-      if (event.pointerType !== 'touch') return;
-      if (touchStart !== null || now() - touchCompletedAt < 100) return;
+      if (event.pointerType !== 'touch' || touchStart !== null || now() - touchCompletedAt < 100) {
+        return;
+      }
       suppressClickUntil = 0;
       activeTouchPointers.add(event.pointerId);
       if (activeTouchPointers.size !== 1) {
         if (pointerStart) pointerStart.blocked = true;
         return;
       }
-      const blocked =
-        Boolean(event.defaultPrevented) ||
-        isInteractiveSwipeTarget(event.target) ||
-        Boolean(hasSelection?.());
-      pointerStart = {
-        id: event.pointerId,
-        x: event.clientX,
-        y: event.clientY,
-        lastX: event.clientX,
-        lastY: event.clientY,
-        maxDriftY: 0,
-        blocked,
-      };
+      pointerStart = makeGesture(
+        event.pointerId,
+        event.clientX,
+        event.clientY,
+        isBlockedStart(event, hasSelection),
+      );
     },
-
     onPointerMove(event, hasSelection) {
       if (event.pointerType !== 'touch' || !pointerStart || touchStart !== null) return;
       if (activeTouchPointers.size > 1 || hasSelection?.()) {
         pointerStart.blocked = true;
         return;
       }
-      if (event.pointerId !== pointerStart.id) return;
-      pointerStart.lastX = event.clientX;
-      pointerStart.lastY = event.clientY;
-      pointerStart.maxDriftY = Math.max(
-        pointerStart.maxDriftY,
-        Math.abs(event.clientY - pointerStart.y),
-      );
+      if (event.pointerId === pointerStart.id)
+        moveGesture(pointerStart, event.clientX, event.clientY);
     },
-
     onPointerUp(event, hasSelection) {
       if (event.pointerType !== 'touch') return;
       activeTouchPointers.delete(event.pointerId);
@@ -235,45 +201,85 @@ export function createSwipeGestureTracker(
         return;
       }
       if (pointerStart.blocked || hasSelection?.() || activeTouchPointers.size > 0) {
-        if (activeTouchPointers.size > 0) pointerStart.blocked = true;
-        else pointerStart = null;
+        pointerStart = activeTouchPointers.size > 0 ? { ...pointerStart, blocked: true } : null;
         return;
       }
       if (event.pointerId !== pointerStart.id) return;
       const gesture = pointerStart;
       pointerStart = null;
-      const direction = evaluateSwipe(
-        gesture.x,
-        gesture.y,
-        event.clientX,
-        event.clientY,
-        gesture.maxDriftY,
-      );
+      const direction = resolveDirection(gesture, event.clientX, event.clientY);
       if (!direction) return;
       suppressClickUntil = now() + SWIPE_CLICK_SUPPRESSION_MS;
       onSwipe(direction);
     },
-
     onPointerCancel(event) {
       activeTouchPointers.delete(event.pointerId);
-      if (activeTouchPointers.size === 0) pointerStart = null;
-      else if (pointerStart) pointerStart.blocked = true;
+      pointerStart =
+        activeTouchPointers.size === 0
+          ? null
+          : pointerStart
+            ? { ...pointerStart, blocked: true }
+            : null;
     },
-
     consumeSuppressedClick() {
-      if (suppressClickUntil > 0 && now() <= suppressClickUntil) {
-        suppressClickUntil = 0;
-        return true;
-      }
+      const suppressed = suppressClickUntil > 0 && now() <= suppressClickUntil;
       suppressClickUntil = 0;
-      return false;
+      return suppressed;
     },
-
     reset() {
       touchStart = null;
       pointerStart = null;
       activeTouchPointers.clear();
       suppressClickUntil = 0;
     },
+  };
+}
+
+export function attachSwipeGestureListeners(
+  target: Pick<EventTarget, 'addEventListener' | 'removeEventListener'>,
+  tracker: SwipeGestureTracker,
+  hasSelection?: () => boolean,
+  options?: { touchEvents?: boolean; suppressClick?: boolean },
+): () => void {
+  const cleanups: Array<() => void> = [];
+  const listen = (type: string, handler: EventListener, capture = false) => {
+    target.addEventListener(type, handler, capture ? true : { passive: true });
+    cleanups.push(() => target.removeEventListener?.(type, handler, capture));
+  };
+  if (options?.touchEvents ?? true) {
+    listen('touchstart', (e) =>
+      tracker.onTouchStart(e as unknown as SwipeTouchEventLike, hasSelection),
+    );
+    listen('touchmove', (e) =>
+      tracker.onTouchMove(e as unknown as SwipeTouchEventLike, hasSelection),
+    );
+    listen('touchend', (e) =>
+      tracker.onTouchEnd(e as unknown as SwipeTouchEventLike, hasSelection),
+    );
+  }
+  listen('touchcancel', () => tracker.onTouchCancel());
+  listen('pointerdown', (e) =>
+    tracker.onPointerDown(e as unknown as SwipePointerEventLike, hasSelection),
+  );
+  listen('pointermove', (e) =>
+    tracker.onPointerMove(e as unknown as SwipePointerEventLike, hasSelection),
+  );
+  listen('pointerup', (e) =>
+    tracker.onPointerUp(e as unknown as SwipePointerEventLike, hasSelection),
+  );
+  listen('pointercancel', (e) => tracker.onPointerCancel(e as unknown as SwipePointerEventLike));
+  if (options?.suppressClick ?? true) {
+    listen(
+      'click',
+      (event) => {
+        if (!tracker.consumeSuppressedClick()) return;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      true,
+    );
+  }
+  return () => {
+    for (const cleanup of cleanups) cleanup();
   };
 }

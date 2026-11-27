@@ -24,9 +24,9 @@
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
+    type ReaderSwipeDirection,
     type TocItem,
   } from '../reader/session';
-  import { createSwipeGestureTracker, type ReaderSwipeDirection } from '../reader/swipe';
   import type { ReaderSearchResult } from '../reader/search';
   import {
     MAX_ANNOTATIONS,
@@ -281,7 +281,7 @@
           localNavigationDuringSession = true;
           onRelocated(next);
           let nextHistory = locationHistory;
-          if ((origin === 'link' || origin === 'jump') && previous && previous.cfi !== next.cfi) {
+          if (origin === 'link' && previous && previous.cfi !== next.cfi) {
             nextHistory = recordLocation(nextHistory, readerLocation(previous));
           }
           locationHistory = recordLocation(nextHistory, readerLocation(next));
@@ -412,7 +412,6 @@
     if (tocVirtualizationFrame !== null) window.cancelAnimationFrame(tocVirtualizationFrame);
     flushPendingPreferences();
     searchController?.abort();
-    shellSwipeTracker.reset();
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
@@ -1351,58 +1350,6 @@
     void turn(direction);
   }
 
-  const shellSwipeTracker = createSwipeGestureTracker((direction) => {
-    handleSwipeTurn(direction);
-  });
-
-  function isInsideViewport(target: EventTarget | null | undefined): boolean {
-    return Boolean(viewport && target instanceof Node && viewport.contains(target));
-  }
-
-  function handleShellTouchStart(event: TouchEvent): void {
-    if (isInsideViewport(event.target)) return;
-    shellSwipeTracker.onTouchStart(event, hasReaderSelection);
-  }
-
-  function handleShellTouchMove(event: TouchEvent): void {
-    if (isInsideViewport(event.target)) return;
-    shellSwipeTracker.onTouchMove(event, hasReaderSelection);
-  }
-
-  function handleShellTouchEnd(event: TouchEvent): void {
-    if (isInsideViewport(event.target)) return;
-    shellSwipeTracker.onTouchEnd(event, hasReaderSelection);
-  }
-
-  function handleShellTouchCancel(): void {
-    shellSwipeTracker.onTouchCancel();
-  }
-
-  function handleShellPointerDown(event: PointerEvent): void {
-    if (isInsideViewport(event.target)) return;
-    shellSwipeTracker.onPointerDown(event, hasReaderSelection);
-  }
-
-  function handleShellPointerMove(event: PointerEvent): void {
-    if (isInsideViewport(event.target)) return;
-    shellSwipeTracker.onPointerMove(event, hasReaderSelection);
-  }
-
-  function handleShellPointerUp(event: PointerEvent): void {
-    if (isInsideViewport(event.target)) return;
-    shellSwipeTracker.onPointerUp(event, hasReaderSelection);
-  }
-
-  function handleShellPointerCancel(event: PointerEvent): void {
-    shellSwipeTracker.onPointerCancel(event);
-  }
-
-  function handleShellClickCapture(event: MouseEvent): void {
-    if (!shellSwipeTracker.consumeSuppressedClick()) return;
-    event.preventDefault();
-    event.stopPropagation();
-  }
-
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     if (!session || Boolean(error)) return;
     const opener = activeElement();
@@ -1664,20 +1611,7 @@
   });
 </script>
 
-<main
-  class="reader-shell"
-  data-mode={appearance.mode}
-  aria-describedby="reader-keyboard-help"
-  ontouchstart={handleShellTouchStart}
-  ontouchmove={handleShellTouchMove}
-  ontouchend={handleShellTouchEnd}
-  ontouchcancel={handleShellTouchCancel}
-  onpointerdown={handleShellPointerDown}
-  onpointermove={handleShellPointerMove}
-  onpointerup={handleShellPointerUp}
-  onpointercancel={handleShellPointerCancel}
-  onclickcapture={handleShellClickCapture}
->
+<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
@@ -1752,7 +1686,7 @@
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
       bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] {controlsVisible
+      class="reader-return-btn absolute right-[max(1rem,env(safe-area-inset-right))] {controlsVisible
         ? 'bottom-[calc(var(--reader-safe-bottom)+6.25rem)]'
         : 'bottom-[calc(var(--reader-safe-bottom)+3rem)]'} z-30 btn min-h-11 min-w-11 preset-filled-primary-700-300 shadow"
       type="button"
@@ -1941,6 +1875,52 @@
         </div>
       </header>
 
+      {#snippet progressScrubber(ariaLabel: string, closePanels: boolean, inputId?: string)}
+        <input
+          id={inputId}
+          class="range reader-scrubber-range"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value={displayedProgressPercent()}
+          aria-label={ariaLabel}
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={displayedProgressPercent()}
+          aria-valuetext={`${displayedProgressPercent()}% complete`}
+          disabled={!location}
+          onpointerdown={() => {
+            scrubbingPointerActive = true;
+            lastInputCommittedPercent = null;
+            if (!closePanels) pauseChromeHide();
+          }}
+          onpointercancel={() => {
+            scrubbingPointerActive = false;
+            scrubPreviewPercent = null;
+            if (!closePanels) resumeChromeHide();
+          }}
+          oninput={(event) => {
+            const nextPercent = Number(event.currentTarget.value);
+            scrubPreviewPercent = nextPercent;
+            percentJumpDraft = String(nextPercent);
+            if (!scrubbingPointerActive) {
+              lastInputCommittedPercent = nextPercent;
+              void jumpToBookPercentage(nextPercent, closePanels);
+            }
+          }}
+          onchange={(event) => {
+            const nextPercent = Number(event.currentTarget.value);
+            const shouldCommit =
+              scrubbingPointerActive || lastInputCommittedPercent !== nextPercent;
+            scrubbingPointerActive = false;
+            scrubPreviewPercent = null;
+            lastInputCommittedPercent = null;
+            if (shouldCommit) void jumpToBookPercentage(nextPercent, closePanels);
+          }}
+        />
+      {/snippet}
+
       <footer
         class="reader-bar reader-controls-bottom"
         inert={hasOpenReaderPanel()}
@@ -1969,51 +1949,7 @@
               {/if}
             </button>
           </div>
-          <input
-            class="range reader-scrubber-range"
-            type="range"
-            min="0"
-            max="100"
-            step="1"
-            value={displayedProgressPercent()}
-            aria-label="Scrub book reading progress"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            aria-valuenow={displayedProgressPercent()}
-            aria-valuetext={`${displayedProgressPercent()}% complete`}
-            disabled={!location}
-            onpointerdown={() => {
-              scrubbingPointerActive = true;
-              lastInputCommittedPercent = null;
-              pauseChromeHide();
-            }}
-            onpointercancel={() => {
-              scrubbingPointerActive = false;
-              scrubPreviewPercent = null;
-              resumeChromeHide();
-            }}
-            oninput={(event) => {
-              const nextPercent = Number(event.currentTarget.value);
-              scrubPreviewPercent = nextPercent;
-              percentJumpDraft = String(nextPercent);
-              if (!scrubbingPointerActive) {
-                lastInputCommittedPercent = nextPercent;
-                void jumpToBookPercentage(nextPercent, false);
-              }
-            }}
-            onchange={(event) => {
-              const nextPercent = Number(event.currentTarget.value);
-              const wasPointerScrubbing = scrubbingPointerActive;
-              scrubbingPointerActive = false;
-              scrubPreviewPercent = null;
-              if (wasPointerScrubbing || lastInputCommittedPercent !== nextPercent) {
-                lastInputCommittedPercent = null;
-                void jumpToBookPercentage(nextPercent, false);
-              } else {
-                lastInputCommittedPercent = null;
-              }
-            }}
-          />
+          {@render progressScrubber('Scrub book reading progress', false)}
         </div>
       </footer>
 
@@ -2028,50 +1964,7 @@
             <span class="label-text text-sm">
               Book progress: <span class="tabular-nums">{displayedProgressPercent()}%</span>
             </span>
-            <input
-              id={`${idPrefix}-scrub`}
-              class="range reader-scrubber-range"
-              type="range"
-              min="0"
-              max="100"
-              step="1"
-              value={displayedProgressPercent()}
-              aria-label="Book progress percentage"
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow={displayedProgressPercent()}
-              aria-valuetext={`${displayedProgressPercent()}% complete`}
-              disabled={!location}
-              onpointerdown={() => {
-                scrubbingPointerActive = true;
-                lastInputCommittedPercent = null;
-              }}
-              onpointercancel={() => {
-                scrubbingPointerActive = false;
-                scrubPreviewPercent = null;
-              }}
-              oninput={(event) => {
-                const nextPercent = Number(event.currentTarget.value);
-                scrubPreviewPercent = nextPercent;
-                percentJumpDraft = String(nextPercent);
-                if (!scrubbingPointerActive) {
-                  lastInputCommittedPercent = nextPercent;
-                  void jumpToBookPercentage(nextPercent, true);
-                }
-              }}
-              onchange={(event) => {
-                const nextPercent = Number(event.currentTarget.value);
-                const wasPointerScrubbing = scrubbingPointerActive;
-                scrubbingPointerActive = false;
-                scrubPreviewPercent = null;
-                if (wasPointerScrubbing || lastInputCommittedPercent !== nextPercent) {
-                  lastInputCommittedPercent = null;
-                  void jumpToBookPercentage(nextPercent, true);
-                } else {
-                  lastInputCommittedPercent = null;
-                }
-              }}
-            />
+            {@render progressScrubber('Book progress percentage', true, `${idPrefix}-scrub`)}
           </label>
           <form
             class="grid gap-1.5"
@@ -3239,6 +3132,12 @@
     align-items: center;
     justify-content: space-between;
     gap: 0.5rem;
+  }
+
+  .reader-scrubber-meta button,
+  .reader-return-btn {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
   }
 
   .reader-scrubber-range {

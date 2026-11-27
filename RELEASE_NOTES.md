@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Remove ReaderSession relocation deferral, trim swipe/scrubber diff, and test resize display abort
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

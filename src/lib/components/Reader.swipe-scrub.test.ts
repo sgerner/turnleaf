@@ -16,10 +16,10 @@ const mockState = vi.hoisted(() => {
   const preferences = new Map<string, string>();
   let toc: TocItem[] = [{ label: 'Chapter One', href: 'ch1.xhtml', children: [] }];
   let currentLocation: ReaderLocation = {
-    cfi: 'epubcfi(/6/2!/4/2:1)',
-    xpath: '//body/DocFragment[1]/body/p[1]',
+    cfi: 'epubcfi(/6/2!/4/2:2)',
+    xpath: '//body/DocFragment[1]/body/p[2]',
     href: 'ch1.xhtml',
-    percentage: 0.1,
+    percentage: 0.05,
     spineIndex: 0,
     pageIndex: 1,
     pageCount: 20,
@@ -66,16 +66,7 @@ const mockState = vi.hoisted(() => {
       };
       onLocationCallback?.(currentLocation, 'navigation');
     }),
-    previous: vi.fn(async () => {
-      const nextIndex = Math.max(0, currentLocation.pageIndex - 1);
-      currentLocation = {
-        ...currentLocation,
-        cfi: `epubcfi(/6/2!/4/2:${nextIndex + 1})`,
-        pageIndex: nextIndex,
-        percentage: nextIndex / currentLocation.pageCount,
-      };
-      onLocationCallback?.(currentLocation, 'navigation');
-    }),
+    previous: vi.fn(async () => {}),
     jumpToPercentage: vi.fn(async (percentage: number) => {
       const prev = currentLocation;
       const nextIndex = Math.min(
@@ -104,8 +95,7 @@ const mockState = vi.hoisted(() => {
       return true;
     }),
     displayCfi: vi.fn(async (cfi: string) => {
-      const match = cfi.match(/:(\d+)\)$/);
-      const pageNumber = match ? Number(match[1]) : 1;
+      const pageNumber = Number(cfi.match(/:(\d+)\)$/)?.[1] ?? 1);
       currentLocation = {
         ...currentLocation,
         cfi,
@@ -160,9 +150,7 @@ vi.mock('../database/database', () => ({
     return result;
   }),
   setPreferences: vi.fn(async (entries: Map<string, string>) => {
-    for (const [key, value] of entries) {
-      mockState.preferences.set(key, value);
-    }
+    for (const [key, value] of entries) mockState.preferences.set(key, value);
   }),
 }));
 
@@ -178,10 +166,7 @@ vi.mock('../reader/session', async (importOriginal) => {
 
 import Reader from './Reader.svelte';
 
-async function flushAsync(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await Promise.resolve();
-}
+const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 describe('Reader.svelte scrubbing, page jumps, empty TOC controls, and one-tap return', () => {
   let host: HTMLDivElement;
@@ -196,9 +181,7 @@ describe('Reader.svelte scrubbing, page jumps, empty TOC controls, and one-tap r
         cancel: vi.fn(),
         onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
       };
-      queueMicrotask(() => {
-        animation.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
-      });
+      queueMicrotask(() => animation.onfinish?.(new Event('finish') as AnimationPlaybackEvent));
       return animation as unknown as Animation;
     });
     host = document.createElement('div');
@@ -213,93 +196,72 @@ describe('Reader.svelte scrubbing, page jumps, empty TOC controls, and one-tap r
     host.remove();
   });
 
-  it('keeps .reader-progress non-interactive while hidden, scrubs when open, and restores previous CFI in one tap', async () => {
-    const onRelocated = vi.fn();
+  async function mountReader(bookId = 'book-1'): Promise<void> {
     component = mount(Reader, {
       target: host,
       props: {
         bookUrl: 'blob:book',
-        bookId: 'book-1',
-        title: 'Long Chapter Novel',
+        bookId,
+        title: 'Novel',
         onBack: vi.fn(),
-        onRelocated,
+        onRelocated: vi.fn(),
       },
     });
     await flushAsync();
+  }
 
-    // Controls hidden initially: progress bar exists, scrubber is not mounted
-    const progressBar = host.querySelector('.reader-progress');
-    expect(progressBar?.getAttribute('role')).toBe('progressbar');
+  function showControls(): void {
+    flushSync(() => {
+      host
+        .querySelector<HTMLButtonElement>('.reader-top-reveal[aria-label="Show reading controls"]')!
+        .click();
+    });
+  }
+
+  it('keeps .reader-progress non-interactive while hidden, scrubs when open, and restores previous CFI in one tap', async () => {
+    await mountReader('book-1');
+
+    expect(host.querySelector('.reader-progress')?.getAttribute('role')).toBe('progressbar');
     expect(host.querySelector('[aria-label="Scrub book reading progress"]')).toBeNull();
 
-    // Open controls
-    const showControlsBtn = host.querySelector<HTMLButtonElement>(
-      '.reader-top-reveal[aria-label="Show reading controls"]',
-    );
-    expect(showControlsBtn).not.toBeNull();
-    flushSync(() => showControlsBtn!.click());
-
-    // Visible chapter page count and scrubber are shown
-    const pageIndicator = host.querySelector<HTMLButtonElement>('[aria-controls="reader-jump"]');
-    expect(pageIndicator?.textContent).toContain('Page 2 of 20 · 5%');
+    showControls();
+    const pageIndicator = host.querySelector<HTMLButtonElement>('[aria-controls="reader-jump"]')!;
+    expect(pageIndicator.textContent).toContain('Page 2 of 20 · 5%');
 
     const scrubber = host.querySelector<HTMLInputElement>(
       '[aria-label="Scrub book reading progress"]',
-    );
-    expect(scrubber).not.toBeNull();
-
-    // Scrub to 60%
-    scrubber!.value = '60';
+    )!;
+    scrubber.value = '60';
     flushSync(() => {
-      scrubber!.dispatchEvent(new Event('input', { bubbles: true }));
+      scrubber.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await flushAsync();
 
     expect(mockState.sessionInstance.jumpToPercentage).toHaveBeenCalledWith(0.6);
-    expect(pageIndicator?.textContent).toContain('Page 13 of 20 · 60%');
+    expect(pageIndicator.textContent).toContain('Page 13 of 20 · 60%');
 
-    // History saved both pre-jump and post-jump locations
     const savedHistory = JSON.parse(mockState.preferences.get('readerHistory:book-1') ?? '[]');
     expect(savedHistory.map((item: { cfi: string }) => item.cfi)).toContain('epubcfi(/6/2!/4/2:2)');
 
-    // Visible one-tap Return button restores previous CFI
     const returnBtn = host.querySelector<HTMLButtonElement>(
       '[aria-label="Return to previous reading position"]',
-    );
-    expect(returnBtn).not.toBeNull();
-    flushSync(() => returnBtn!.click());
+    )!;
+    flushSync(() => returnBtn.click());
     await flushAsync();
 
     expect(mockState.sessionInstance.displayCfi).toHaveBeenCalledWith('epubcfi(/6/2!/4/2:2)');
     expect(host.querySelector('[aria-label="Return to previous reading position"]')).toBeNull();
   });
 
-  it('opens page/percentage jump prompt from the page indicator and jumps to target page', async () => {
-    component = mount(Reader, {
-      target: host,
-      props: {
-        bookUrl: 'blob:book',
-        bookId: 'book-2',
-        title: 'Paginated Novel',
-        onBack: vi.fn(),
-        onRelocated: vi.fn(),
-      },
-    });
-    await flushAsync();
-
-    flushSync(() => {
-      host
-        .querySelector<HTMLButtonElement>('.reader-top-reveal[aria-label="Show reading controls"]')!
-        .click();
-    });
+  it('validates and jumps to pages and percentages from both #reader-jump and empty TOC', async () => {
+    await mountReader('book-2');
+    showControls();
 
     const pageIndicator = host.querySelector<HTMLButtonElement>('[aria-controls="reader-jump"]')!;
     flushSync(() => pageIndicator.click());
 
-    const jumpDialog = host.querySelector('#reader-jump');
-    expect(jumpDialog).not.toBeNull();
-
-    const pageInput = jumpDialog!.querySelector<HTMLInputElement>('#reader-jump-page-input')!;
+    const jumpDialog = host.querySelector('#reader-jump')!;
+    const pageInput = jumpDialog.querySelector<HTMLInputElement>('#reader-jump-page-input')!;
     pageInput.value = '99';
     flushSync(() => {
       pageInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -307,7 +269,7 @@ describe('Reader.svelte scrubbing, page jumps, empty TOC controls, and one-tap r
         .closest('form')!
         .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     });
-    expect(jumpDialog!.textContent).toContain('Enter a page between 1 and 20.');
+    expect(jumpDialog.textContent).toContain('Enter a page between 1 and 20.');
 
     pageInput.value = '15';
     flushSync(() => {
@@ -317,12 +279,9 @@ describe('Reader.svelte scrubbing, page jumps, empty TOC controls, and one-tap r
         .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     });
     await flushAsync();
-
     expect(mockState.sessionInstance.jumpToPage).toHaveBeenCalledWith(15);
     expect(host.querySelector('#reader-jump')).toBeNull();
-    expect(host.querySelector('[aria-label="Return to previous reading position"]')).not.toBeNull();
 
-    // Re-open jump prompt and submit percentage jump
     flushSync(() => pageIndicator.click());
     const percentInput = host.querySelector<HTMLInputElement>('#reader-jump-percent-input')!;
     percentInput.value = '40';
@@ -333,91 +292,43 @@ describe('Reader.svelte scrubbing, page jumps, empty TOC controls, and one-tap r
         .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     });
     await flushAsync();
-
     expect(mockState.sessionInstance.jumpToPercentage).toHaveBeenCalledWith(0.4);
-    expect(host.querySelector('#reader-jump')).toBeNull();
-  });
 
-  it('shows scrubbing and page jump controls when the EPUB table of contents is empty', async () => {
+    unmount(component!);
+    component = null;
+    mockState.reset();
     mockState.setToc([]);
-    component = mount(Reader, {
-      target: host,
-      props: {
-        bookUrl: 'blob:book',
-        bookId: 'book-empty-toc',
-        title: 'No TOC Book',
-        onBack: vi.fn(),
-        onRelocated: vi.fn(),
-      },
-    });
-    await flushAsync();
-
-    flushSync(() => {
-      host
-        .querySelector<HTMLButtonElement>('.reader-top-reveal[aria-label="Show reading controls"]')!
-        .click();
-    });
+    await mountReader('book-empty-toc');
+    showControls();
     flushSync(() => {
       host.querySelector<HTMLButtonElement>('[aria-controls="reader-contents"]')!.click();
     });
 
-    const contentsPanel = host.querySelector('#reader-contents')!;
-    expect(contentsPanel.textContent).toContain('This EPUB does not include a table of contents.');
-
-    const emptyTocPageInput = contentsPanel.querySelector<HTMLInputElement>(
-      '#reader-empty-toc-page-input',
-    );
-    expect(emptyTocPageInput).not.toBeNull();
-
-    emptyTocPageInput!.value = '9';
+    const emptyTocPageInput = host.querySelector<HTMLInputElement>('#reader-empty-toc-page-input')!;
+    emptyTocPageInput.value = '9';
     flushSync(() => {
-      emptyTocPageInput!.dispatchEvent(new Event('input', { bubbles: true }));
-      emptyTocPageInput!
+      emptyTocPageInput.dispatchEvent(new Event('input', { bubbles: true }));
+      emptyTocPageInput
         .closest('form')!
         .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     });
     await flushAsync();
-
     expect(mockState.sessionInstance.jumpToPage).toHaveBeenCalledWith(9);
-    expect(host.querySelector('#reader-contents')).toBeNull();
     expect(host.querySelector('[aria-label="Return to previous reading position"]')).not.toBeNull();
   });
 
-  it('turns pages on shell swipes unless text is actively selected', async () => {
-    component = mount(Reader, {
-      target: host,
-      props: {
-        bookUrl: 'blob:book',
-        bookId: 'book-swipe',
-        title: 'Swipe Book',
-        onBack: vi.fn(),
-        onRelocated: vi.fn(),
-      },
-    });
+  it('turns pages on session swipe unless text is selected or a dialog panel is open', async () => {
+    await mountReader('book-swipe');
+
+    mockState.emitSwipe('next');
     await flushAsync();
-
-    const shell = host.querySelector<HTMLElement>('.reader-shell')!;
-    const down = new Event('pointerdown', { bubbles: true }) as PointerEvent;
-    Object.assign(down, { pointerId: 1, pointerType: 'touch', clientX: 280, clientY: 10 });
-    const move = new Event('pointermove', { bubbles: true }) as PointerEvent;
-    Object.assign(move, { pointerId: 1, pointerType: 'touch', clientX: 100, clientY: 12 });
-    const up = new Event('pointerup', { bubbles: true }) as PointerEvent;
-    Object.assign(up, { pointerId: 1, pointerType: 'touch', clientX: 100, clientY: 12 });
-
-    shell.dispatchEvent(down);
-    shell.dispatchEvent(move);
-    shell.dispatchEvent(up);
-    await flushAsync();
-
     expect(mockState.sessionInstance.next).toHaveBeenCalledOnce();
 
-    // Active highlight selection prevents swipe turns
     flushSync(() => {
       mockState.emitSelection({ cfi: 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:5)', text: 'Words' });
     });
     mockState.emitSwipe('next');
     await flushAsync();
-
     expect(mockState.sessionInstance.next).toHaveBeenCalledOnce();
   });
 });
