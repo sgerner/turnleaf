@@ -105,21 +105,4 @@ export const migrations = [
       );
     `,
   },
-  {
-    version: 8,
-    statements: `
-      UPDATE reading_state
-      SET
-        server_page_num = COALESCE(
-          (SELECT pages_read FROM books WHERE books.id = reading_state.book_id),
-          0
-        ),
-        server_xpath = COALESCE(server_xpath, kavita_xpath)
-      WHERE pending_sync = 0
-        AND NOT EXISTS (
-          SELECT 1 FROM sync_queue WHERE sync_queue.book_id = reading_state.book_id
-        )
-        AND server_page_num IS NULL;
-    `,
-  },
 ] as const;

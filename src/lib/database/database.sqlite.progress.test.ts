@@ -14,6 +14,7 @@ const native = vi.hoisted(() => ({
   isOpen: false,
   failTransactionAt: null as number | null,
   onTransactionTask: null as ((index: number) => void | Promise<void>) | null,
+  onDeleteDatabase: null as (() => void | Promise<void>) | null,
   createAdapter: null as (() => unknown) | null,
 }));
 
@@ -26,6 +27,7 @@ vi.mock('@capacitor/core', () => ({
 vi.mock('@capacitor-community/sqlite', () => ({
   CapacitorSQLite: {
     deleteDatabase: async () => {
+      await native.onDeleteDatabase?.();
       if (native.database) native.database.close();
       native.database = null;
       native.isOpen = false;
@@ -175,6 +177,7 @@ describe('native progress transactions against SQLite', () => {
     native.isOpen = false;
     native.failTransactionAt = null;
     native.onTransactionTask = null;
+    native.onDeleteDatabase = null;
   });
 
   afterEach(() => {
@@ -183,6 +186,7 @@ describe('native progress transactions against SQLite', () => {
     native.isOpen = false;
     native.failTransactionAt = null;
     native.onTransactionTask = null;
+    native.onDeleteDatabase = null;
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -984,7 +988,7 @@ describe('native progress transactions against SQLite', () => {
     expect(chooseOpenProgress(accepted, completedRemote, book.pages, true)).toBe('local');
   });
 
-  it('backfills missing baselines for synced version-7 books during migration without touching pending books', async () => {
+  it('backfills missing baselines for synced books on open without touching pending books or changing user_version', async () => {
     const updatedAt = '2026-01-01T00:00:00.000Z';
     native.database = new DatabaseSync(native.databasePath);
     native.database.exec(`
@@ -1047,6 +1051,184 @@ describe('native progress transactions against SQLite', () => {
       serverPageNum: null,
       serverXPath: null,
       pendingSync: true,
+    });
+    expect(native.database?.prepare('PRAGMA user_version').get()).toEqual({ user_version: 7 });
+  });
+
+  it('interleaves progress and baseline writes with removeServer and resetLocalDatabase so no stale row survives and nothing post-reset is lost', async () => {
+    const database = await importDatabase();
+    const { flushProgress } = await import('../sync/sync');
+    const staleBook = { ...book, id: 'server:1:10', chapterId: 10, title: 'Stale book' };
+    const rebornBook = { ...book, id: 'server:1:11', chapterId: 11, title: 'Reborn book' };
+    const freshBook = { ...book, id: 'server:1:12', chapterId: 12, title: 'Fresh book' };
+
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [staleBook, rebornBook]);
+    await database.saveLocalProgress(staleBook, 'stale-cfi-0', '//body/p[1]', 0.15);
+
+    // Interleave removeServer (server clear) with local, completion, and remote progress writes.
+    await Promise.all([
+      database.removeServer(server.id),
+      database.saveLocalProgress(staleBook, 'orphan-cfi', '//body/p[2]', 0.25),
+      database.markBookCompleted(staleBook),
+      database.saveRemoteProgress(
+        staleBook,
+        {
+          libraryId: 1,
+          seriesId: 1,
+          volumeId: 10,
+          chapterId: 10,
+          pageNum: 30,
+          bookScrollId: '//body/p[3]',
+        },
+        null,
+      ),
+    ]);
+
+    expect(await database.getServer()).toBeNull();
+    expect(await database.getBooks(server.id)).toEqual([]);
+    expect(await database.getReadingState(staleBook.id)).toBeNull();
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+
+    // Seed pre-reset state and hold an in-flight progress upload across resetLocalDatabase().
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [staleBook, rebornBook]);
+    await database.saveLocalProgress(rebornBook, 'pre-reset-cfi', '//body/p[1]', 0.1);
+    const preResetPending = (await database.getPendingSync(server.id))[0]!;
+
+    let notifyStaleUploadStarted!: () => void;
+    const staleUploadStarted = new Promise<void>((resolve) => {
+      notifyStaleUploadStarted = resolve;
+    });
+    let releaseStaleUpload!: () => void;
+    const staleUploadGate = new Promise<void>((resolve) => {
+      releaseStaleUpload = resolve;
+    });
+    const staleUpload = flushProgress(
+      {
+        saveProgress: vi.fn(async () => {
+          notifyStaleUploadStarted();
+          return staleUploadGate;
+        }),
+      } as never,
+      server.id,
+    );
+    await staleUploadStarted;
+
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    let notifyDeleting!: () => void;
+    const deletingStarted = new Promise<void>((resolve) => {
+      notifyDeleting = resolve;
+    });
+    native.onDeleteDatabase = async () => {
+      native.onDeleteDatabase = null;
+      notifyDeleting();
+      await deleteGate;
+    };
+
+    // Start pre-reset writes, trigger resetLocalDatabase(), and queue post-reset writes while deleteDatabase is in flight.
+    const preResetLocal = database.saveLocalProgress(
+      staleBook,
+      'stale-cfi-pre-reset',
+      '//body/p[9]',
+      0.9,
+    );
+    const preResetComplete = database.markBookCompleted(staleBook);
+    const resetTask = database.resetLocalDatabase();
+    await deletingStarted;
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const postResetServer = database.saveServer(server);
+    const postResetCatalog = database.reconcileBooks(server.id, [rebornBook, freshBook]);
+    const postResetReborn1 = database.saveLocalProgress(
+      rebornBook,
+      'reborn-cfi-1',
+      '//body/DocFragment[2]/body/p[2]',
+      0.3,
+    );
+    const postResetReborn2 = database.saveLocalProgress(
+      rebornBook,
+      'reborn-cfi-2',
+      '//body/DocFragment[2]/body/p[6]',
+      0.45,
+    );
+    const postResetFresh = database.saveLocalProgress(
+      freshBook,
+      'fresh-cfi-1',
+      '//body/DocFragment[4]/body/p[1]',
+      0.6,
+    );
+
+    releaseDelete();
+    await Promise.all([
+      preResetLocal,
+      preResetComplete,
+      resetTask,
+      postResetServer,
+      postResetCatalog,
+      postResetReborn1,
+      postResetReborn2,
+      postResetFresh,
+    ]);
+
+    // Release the pre-reset upload and also verify direct stale confirmSync cannot poison post-reset revision 2.
+    releaseStaleUpload();
+    await staleUpload;
+    await database.confirmSync(
+      rebornBook.id,
+      '2026-01-02T00:00:10.000Z',
+      preResetPending.revision,
+      preResetPending.updatedAt,
+      { pageNum: 10, bookScrollId: '//body/p[1]' },
+    );
+
+    expect(await database.getReadingState(staleBook.id)).toBeNull();
+    expect((await database.getBooks(server.id)).map((item) => item.id)).toEqual([
+      freshBook.id,
+      rebornBook.id,
+    ]);
+    expect(await database.getReadingState(rebornBook.id)).toMatchObject({
+      cfi: 'reborn-cfi-2',
+      xpath: '//body/DocFragment[2]/body/p[6]',
+      percentage: 0.45,
+      serverPageNum: null,
+      serverXPath: null,
+      pendingSync: true,
+      syncRevision: 2,
+    });
+    expect(await database.getReadingState(freshBook.id)).toMatchObject({
+      cfi: 'fresh-cfi-1',
+      xpath: '//body/DocFragment[4]/body/p[1]',
+      percentage: 0.6,
+      serverPageNum: null,
+      serverXPath: null,
+      pendingSync: true,
+      syncRevision: 1,
+    });
+    expect(
+      native.database?.prepare('SELECT book_id FROM reading_state ORDER BY book_id').all(),
+    ).toEqual([{ book_id: rebornBook.id }, { book_id: freshBook.id }]);
+    expect(
+      native.database?.prepare('SELECT book_id FROM sync_queue ORDER BY book_id').all(),
+    ).toEqual([{ book_id: rebornBook.id }, { book_id: freshBook.id }]);
+
+    // Flushing post-reset queue persists exact post-reset baselines without losing anything.
+    await flushProgress({ saveProgress: vi.fn().mockResolvedValue(undefined) } as never, server.id);
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+    expect(await database.getReadingState(rebornBook.id)).toMatchObject({
+      cfi: 'reborn-cfi-2',
+      serverPageNum: 45,
+      serverXPath: '//body/DocFragment[2]/body/p[6]',
+      pendingSync: false,
+    });
+    expect(await database.getReadingState(freshBook.id)).toMatchObject({
+      cfi: 'fresh-cfi-1',
+      serverPageNum: 60,
+      serverXPath: '//body/DocFragment[4]/body/p[1]',
+      pendingSync: false,
     });
   });
 

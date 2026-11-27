@@ -1308,3 +1308,131 @@ it('saves normalized browser remote progress and guards against concurrent local
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
 });
+
+it('interleaves browser progress and sync baseline writes with clear() and resetLocalDatabase() without leaving stale rows or losing post-reset data', async () => {
+  vi.useFakeTimers();
+  try {
+    const storage = new MemoryStorage();
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: storage,
+    });
+
+    const staleBook: BookRecord = { ...existingBook, id: 'server:1:10', chapterId: 10 };
+    const rebornBook: BookRecord = { ...existingBook, id: 'server:1:11', chapterId: 11 };
+    const freshBook: BookRecord = { ...existingBook, id: 'server:1:12', chapterId: 12 };
+    const serverConfig = {
+      id: 'server',
+      displayName: 'Test server',
+      baseUrl: 'https://books.example.com',
+      credentialRef: 'credential',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-09-07T00:00:00.000Z',
+    };
+
+    vi.setSystemTime(new Date('2026-09-07T00:00:01.000Z'));
+    await saveServer(serverConfig);
+    await reconcileBooks('server', [staleBook, rebornBook]);
+    await saveLocalProgress(rebornBook, 'pre-clear-cfi', '//body/p[1]', 0.15);
+    const preClearPending = (await getPendingSync('server'))[0]!;
+
+    // Clear underlying storage while stale reader/sync callbacks attempt to write.
+    storage.clear();
+    await saveLocalProgress(staleBook, 'orphan-cfi', '//body/p[2]', 0.25);
+    await markBookCompleted(staleBook);
+    await expect(
+      saveRemoteProgress(
+        staleBook,
+        {
+          libraryId: 1,
+          seriesId: 1,
+          volumeId: 10,
+          chapterId: 10,
+          pageNum: 30,
+          bookScrollId: '//body/p[3]',
+        },
+        null,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      acceptRemoteProgress(
+        rebornBook,
+        {
+          libraryId: 1,
+          seriesId: 1,
+          volumeId: 10,
+          chapterId: 11,
+          pageNum: 40,
+          bookScrollId: '//body/p[4]',
+        },
+        preClearPending.revision,
+        preClearPending.updatedAt,
+      ),
+    ).resolves.toBe(false);
+    await confirmSync(
+      rebornBook.id,
+      '2026-09-07T00:00:02.000Z',
+      preClearPending.revision,
+      preClearPending.updatedAt,
+      { pageNum: 15, bookScrollId: '//body/p[1]' },
+    );
+
+    expect(storage.getItem(BROWSER_STORAGE_KEY)).toBeNull();
+    await expect(getReadingState(staleBook.id)).resolves.toBeNull();
+    await expect(getReadingState(rebornBook.id)).resolves.toBeNull();
+
+    // Seed again, reset via resetLocalDatabase(), then write post-reset state and fire stale confirmSync.
+    vi.setSystemTime(new Date('2026-09-07T00:00:03.000Z'));
+    await saveServer(serverConfig);
+    await reconcileBooks('server', [staleBook, rebornBook]);
+    await saveLocalProgress(staleBook, 'stale-before-reset', '//body/p[5]', 0.5);
+
+    await resetLocalDatabase();
+    await saveLocalProgress(staleBook, 'stale-after-reset-unseeded', '//body/p[6]', 0.6);
+    await expect(getReadingState(staleBook.id)).resolves.toBeNull();
+
+    vi.setSystemTime(new Date('2026-09-07T00:00:05.000Z'));
+    await saveServer(serverConfig);
+    await reconcileBooks('server', [rebornBook, freshBook]);
+    await saveLocalProgress(rebornBook, 'reborn-cfi-1', '//body/DocFragment[2]/body/p[1]', 0.3);
+    vi.setSystemTime(new Date('2026-09-07T00:00:06.000Z'));
+    await saveLocalProgress(rebornBook, 'reborn-cfi-2', '//body/DocFragment[2]/body/p[4]', 0.45);
+    await saveLocalProgress(freshBook, 'fresh-cfi-1', '//body/DocFragment[3]/body/p[2]', 0.7);
+
+    // Pre-clear upload acknowledgement for revision 1 must not poison post-reset revision 2 baseline.
+    await confirmSync(
+      rebornBook.id,
+      '2026-09-07T00:00:07.000Z',
+      preClearPending.revision,
+      preClearPending.updatedAt,
+      { pageNum: 15, bookScrollId: '//body/p[1]' },
+    );
+
+    await expect(getReadingState(staleBook.id)).resolves.toBeNull();
+    await expect(getReadingState(rebornBook.id)).resolves.toMatchObject({
+      cfi: 'reborn-cfi-2',
+      serverPageNum: null,
+      serverXPath: null,
+      pendingSync: true,
+      syncRevision: 2,
+    });
+    const freshPending = (await getPendingSync('server')).find(
+      (item) => item.bookId === freshBook.id,
+    )!;
+    await confirmSync(
+      freshBook.id,
+      '2026-09-07T00:00:08.000Z',
+      freshPending.revision,
+      freshPending.updatedAt,
+      { pageNum: 70, bookScrollId: '//body/DocFragment[3]/body/p[2]' },
+    );
+    await expect(getReadingState(freshBook.id)).resolves.toMatchObject({
+      cfi: 'fresh-cfi-1',
+      serverPageNum: 70,
+      serverXPath: '//body/DocFragment[3]/body/p[2]',
+      pendingSync: false,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
