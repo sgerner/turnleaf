@@ -64,7 +64,6 @@ vi.mock('../database/database', () => ({
 
 vi.mock('../reader/session', async (importOriginal) => {
   const actual = await importOriginal<typeof SessionModule>();
-
   class MockReaderSession {
     onLocation:
       | ((
@@ -147,6 +146,29 @@ describe('Reader mount lifecycle', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionInstances.length = 0;
+    if (typeof Element.prototype.animate !== 'function') {
+      Element.prototype.animate = (() => {
+        const anim = {
+          currentTime: 0,
+          playState: 'running',
+          effect: null,
+          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+          cancel() {
+            anim.playState = 'idle';
+          },
+          finish() {
+            anim.playState = 'finished';
+          },
+        };
+        queueMicrotask(() => {
+          if (anim.playState !== 'idle') {
+            anim.playState = 'finished';
+            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+          }
+        });
+        return anim as unknown as Animation;
+      }) as typeof Element.prototype.animate;
+    }
     getPreferencesMock.mockResolvedValue(new Map());
     setPreferencesMock.mockResolvedValue(undefined);
     openSessionMock.mockResolvedValue(undefined);
@@ -213,7 +235,7 @@ describe('Reader mount lifecycle', () => {
     expect(onMountChange).toHaveBeenCalledWith(true);
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
         'This EPUB could not be opened.',
       );
     });
@@ -461,8 +483,13 @@ describe('Reader accessibility, sync confirmation, and edge insets', () => {
     syncButton.click();
     flushSync();
 
-    // Advance past the 5-second auto-hide timer before the network request finishes.
+    // Advance past the 5-second auto-hide timer while sync is in flight (paused by syncLatestLocation),
+    // then hide controls manually so [data-controls] unmounts before the network request finishes.
     vi.advanceTimersByTime(5_100);
+    flushSync();
+    expect(host.querySelector('[data-controls]')).not.toBeNull();
+
+    sessionInstances[0]?.onTap?.('center');
     flushSync();
     expect(host.querySelector('[data-controls]')).toBeNull();
 
@@ -478,7 +505,7 @@ describe('Reader accessibility, sync confirmation, and edge insets', () => {
     expect(alertDialog?.contains(document.activeElement)).toBe(true);
     expect((host.querySelector('.reader-viewport') as HTMLElement).inert).toBe(true);
 
-    // Dismissing the dialog clears inert and restores focus to the mounted Sync button.
+    // Dismissing the dialog clears inert and restores focus to the top reveal button when controls are hidden.
     const stayHere = Array.from(alertDialog!.querySelectorAll('button')).find((btn) =>
       btn.textContent?.includes('Stay here'),
     )!;
@@ -488,7 +515,7 @@ describe('Reader accessibility, sync confirmation, and edge insets', () => {
 
     expect(host.querySelector('[role="alertdialog"]')).toBeNull();
     expect((host.querySelector('.reader-viewport') as HTMLElement).inert).toBe(false);
-    expect(document.activeElement?.getAttribute('aria-label')).toBe('Sync latest reading position');
+    expect(document.activeElement).toBe(host.querySelector('.reader-top-reveal'));
   });
 
   it('does not let panel close focus restoration steal focus from a newly opened panel', async () => {
