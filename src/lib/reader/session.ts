@@ -154,7 +154,7 @@ const UNSAFE_CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 // eslint-disable-next-line no-control-regex
 const UNSAFE_CSS_CONTROL_CHARACTER = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 // eslint-disable-next-line no-control-regex
-const CSS_REQUIRES_TOKENIZATION = /[@(<\\\u0000-\u0008\u000b-\u001f\u007f]|\/\*|-->/;
+const CSS_REQUIRES_TOKENIZATION = /[@(<>\\\u0000-\u0008\u000b-\u001f\u007f]|\/\*/;
 const STYLESHEET_REL_TOKEN = /(?:^|\s)stylesheet(?:\s|$)/i;
 
 export const EPUB_CONTENT_SECURITY_POLICY = [
@@ -608,9 +608,11 @@ function tokenizeCss(rawInput: string): CssToken[] {
       cursor += 4;
       continue;
     }
-    if (ch === '-' && input.startsWith('-->', cursor)) {
-      tokens.push({ type: 'cdc', value: '-->', raw: '-->' });
-      cursor += 3;
+    if (ch === '-' && (input.startsWith('-->', cursor) || input.startsWith('--!>', cursor))) {
+      const length = input[cursor + 2] === '!' ? 4 : 3;
+      const raw = input.slice(cursor, cursor + length);
+      tokens.push({ type: 'cdc', value: raw, raw });
+      cursor += length;
       continue;
     }
     if (ch === '@' && wouldStartCssIdent(input, cursor + 1)) {

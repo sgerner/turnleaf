@@ -195,11 +195,14 @@ it('normalizes CSS hex escapes, comments, image-set, and legacy expression() tok
     }
     .legacy { width: expression(alert(1)); }
     .breakout::after { content: "</style><img src=x onerror=alert(1)>"; }
+    <!-- .cdo { color: inherit; } --!>
     /* https://attacker.example/comment */
   `);
 
   expect(obfuscated).not.toContain('attacker.example');
   expect(obfuscated).not.toContain('</style>');
+  expect(obfuscated).not.toContain('<!--');
+  expect(obfuscated).not.toContain('--!>');
   expect(obfuscated).toContain('\\3c /style>');
   expect(obfuscated).not.toContain('@import');
   expect(obfuscated).not.toContain('expression(');
