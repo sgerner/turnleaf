@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { KavitaError } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -228,17 +229,21 @@ it('allows a manual retry after an authorization failure', async () => {
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
 
-it('stops between queued uploads on disconnect or abort without sending offline requests or marking remaining items failed', async () => {
+it('stops between queued uploads when transport drops or signal aborts without marking remaining items failed', async () => {
   type PendingFixture = ReturnType<typeof pendingState>;
   type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
     readingState: Record<string, PendingFixture['readingState']['book-1']>;
     syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
   };
   const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
-  state.books.push({ ...book, id: 'book-2' });
+  state.books.push({ ...book, id: 'book-2' }, { ...book, id: 'book-3' });
   state.readingState['book-2'] = {
     ...state.readingState['book-1']!,
     localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.readingState['book-3'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:02.000Z',
   };
   state.syncQueue['book-2'] = {
     ...state.syncQueue['book-1']!,
@@ -249,22 +254,37 @@ it('stops between queued uploads on disconnect or abort without sending offline 
     updatedAt: '2026-09-07T00:00:01.000Z',
     revision: 1,
   };
+  state.syncQueue['book-3'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-3',
+    serverId: 'server',
+    payloadJson: '{"pageNum":3}',
+    createdAt: '2026-09-07T00:00:02.000Z',
+    updatedAt: '2026-09-07T00:00:02.000Z',
+    revision: 1,
+  };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
   let online = true;
   const controller = new AbortController();
-  const saveProgress = vi.fn().mockImplementationOnce(async () => {
+  const saveProgress = vi.fn(async () => {
+    if (!online) {
+      throw new KavitaError(
+        'Kavita could not be reached while offline.',
+        'network',
+        undefined,
+        true,
+      );
+    }
     online = false;
   });
 
   await expect(
-    flushProgress({ saveProgress } as never, 'server', {
-      signal: controller.signal,
-      canUpload: async () => online,
-    }),
+    flushProgress({ saveProgress } as never, 'server', controller.signal),
   ).resolves.toBeUndefined();
 
-  expect(saveProgress).toHaveBeenCalledTimes(1);
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  expect(saveProgress).toHaveBeenNthCalledWith(1, expect.objectContaining({ pageNum: 1 }));
   const afterDisconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
   expect(afterDisconnect.syncQueue['book-1']).toBeUndefined();
   expect(afterDisconnect.readingState['book-1']?.pendingSync).toBe(false);
@@ -273,5 +293,31 @@ it('stops between queued uploads on disconnect or abort without sending offline 
     attemptCount: 0,
     lastError: null,
   });
+  expect(afterDisconnect.syncQueue['book-3']).toMatchObject({
+    bookId: 'book-3',
+    attemptCount: 0,
+    lastError: null,
+  });
   expect(afterDisconnect.readingState['book-2']?.pendingSync).toBe(true);
+  expect(afterDisconnect.readingState['book-3']?.pendingSync).toBe(true);
+
+  online = true;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  const abortBetweenController = new AbortController();
+  saveProgress.mockClear();
+  saveProgress.mockImplementation(async () => {
+    abortBetweenController.abort();
+  });
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', abortBetweenController.signal),
+  ).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+  const afterAbort = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(afterAbort.syncQueue['book-1']).toBeUndefined();
+  expect(afterAbort.syncQueue['book-2']).toMatchObject({
+    bookId: 'book-2',
+    attemptCount: 0,
+    lastError: null,
+  });
 });

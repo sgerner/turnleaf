@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { CapacitorHttp } from '@capacitor/core';
+import type * as CapacitorCoreModule from '@capacitor/core';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as DatabaseModule from '../database/database';
 import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
@@ -18,6 +21,42 @@ const networkListeners = new Set<
 >();
 const appStateListeners = new Set<(state: { isActive: boolean }) => void>();
 let networkConnected = true;
+let nativePlatform = false;
+let inDatabaseCall = false;
+
+vi.mock('@capacitor/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof CapacitorCoreModule>();
+  return {
+    ...actual,
+    Capacitor: {
+      ...actual.Capacitor,
+      isNativePlatform: () => nativePlatform && !inDatabaseCall,
+    },
+    CapacitorHttp: {
+      get: vi.fn(),
+      request: vi.fn(),
+    },
+  };
+});
+
+vi.mock('../database/database', async (importOriginal) => {
+  const actual = await importOriginal<typeof DatabaseModule>();
+  const wrapped: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(actual)) {
+    wrapped[key] =
+      typeof value === 'function'
+        ? (...args: unknown[]) => {
+            inDatabaseCall = true;
+            try {
+              return (value as (...inner: unknown[]) => unknown)(...args);
+            } finally {
+              inDatabaseCall = false;
+            }
+          }
+        : value;
+  }
+  return wrapped;
+});
 
 vi.mock('@capacitor/network', () => ({
   Network: {
@@ -235,7 +274,9 @@ async function mountLibrary(
 }
 
 beforeEach(async () => {
+  nativePlatform = false;
   networkConnected = true;
+  vi.mocked(CapacitorHttp.request).mockReset();
   networkListeners.clear();
   appStateListeners.clear();
   verifyDownloadedEpubMock.mockClear();
@@ -268,6 +309,36 @@ afterEach(async () => {
 });
 
 describe('Library concurrent progress uploads and catalog refreshes', () => {
+  it('does not start another refresh for a connected event while already online', async () => {
+    let seriesRequests = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Series/v2') {
+        seriesRequests += 1;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Android can report a new connected network during a Wi-Fi-to-cellular handoff.
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(seriesRequests).toBe(1);
+  });
+
   it('starts saveProgress on online mount without awaiting catalog pagination and retains local progress', async () => {
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[4]', 0.4);
 
@@ -312,7 +383,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     expect(booksAfterReconcile[0]?.pagesRead).toBe(40);
   });
 
-  it('uploads queued progress during a brief reconnect window and cancels active catalog and progress work on disconnect', async () => {
+  it('uploads queued progress during a brief reconnect window and cancels only catalog refresh on disconnect', async () => {
     networkConnected = false;
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/8)', '//body/p[8]', 0.55, 2);
 
@@ -327,6 +398,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
 
     const catalogSignals: AbortSignal[] = [];
     const progressSignals: Array<AbortSignal | undefined> = [];
+    const secondUploadGate = deferred<void>();
     const secondUploadStarted = deferred<void>();
     let uploadCalls = 0;
 
@@ -337,13 +409,7 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
         progressSignals.push(init?.signal ?? undefined);
         if (uploadCalls === 2) {
           secondUploadStarted.resolve();
-          return new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener(
-              'abort',
-              () => reject(new DOMException('Aborted', 'AbortError')),
-              { once: true },
-            );
-          });
+          await secondUploadGate.promise;
         }
         return new Response(null, { status: 204 });
       }
@@ -377,16 +443,17 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     await waitForCondition(() => catalogSignals.length === 1);
     expect(uploadCalls).toBe(2);
 
-    // Network drops mid-sync/refresh: both catalog refresh and active progress upload abort
+    // Network drops mid-refresh (within 2-second window): catalog refresh aborts, in-flight upload does not
     networkConnected = false;
     for (const listener of networkListeners) {
       listener({ connected: false, connectionType: 'none' });
     }
 
     expect(catalogSignals[0]?.aborted).toBe(true);
-    expect(progressSignals[1]?.aborted).toBe(true);
-    await waitForCondition(async () => (await getPendingSync(server.id)).length === 1);
-    expect((await getPendingSync(server.id)).map((item) => item.bookId)).toEqual([secondBook.id]);
+    expect(progressSignals[1]?.aborted).toBe(false);
+
+    secondUploadGate.resolve();
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
   });
 
   it('awaits active syncWork in updateApiKey before switching keys, then runs syncProgress and refresh concurrently while preserving notice', async () => {
@@ -637,7 +704,8 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     expect(progressSaveCount).toBe(0);
   });
 
-  it('stops sending queued progress and catalog follow-up requests when transport disconnects between requests', async () => {
+  it('stops native queued progress and catalog follow-up requests when transport disconnects between requests', async () => {
+    nativePlatform = true;
     const secondBook: BookRecord = {
       ...seededBook,
       id: 'server-1:1:11',
@@ -652,33 +720,39 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     let progressUploads = 0;
     let seriesPages = 0;
 
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const url = new URL(String(input));
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      const url = new URL(options.url);
       if (!networkConnected) {
         offlineRequests.push(url.pathname);
-        return jsonResponse({}, 503);
+        return { status: 503, headers: {}, data: '{}', url: options.url };
       }
       if (url.pathname === '/api/Reader/progress') {
         progressUploads += 1;
         if (seriesPages >= 1) networkConnected = false;
-        return new Response(null, { status: 204 });
+        return { status: 204, headers: {}, data: '', url: options.url };
       }
       if (url.pathname === '/api/Series/v2') {
         seriesPages += 1;
-        // Disconnect immediately once the initial concurrent progress upload and
-        // series page have started, before any networkStatusChange event arrives,
-        // so both the second queued progress item and /api/Series/series-detail
-        // must be blocked by per-request transport checks.
+        // Disconnect once both initial concurrent requests have dispatched, before any
+        // networkStatusChange event arrives, so both the second queued progress item and
+        // /api/Series/series-detail must be blocked by beforeNativeRequest.
         if (progressUploads >= 1) networkConnected = false;
-        return jsonResponse([seriesListItem(0)]);
+        return {
+          status: 200,
+          headers: {},
+          data: JSON.stringify([seriesListItem(0)]),
+          url: options.url,
+        };
       }
       if (url.pathname === '/api/Series/series-detail') {
-        return jsonResponse(seriesDetailPayload(0));
+        return {
+          status: 200,
+          headers: {},
+          data: JSON.stringify(seriesDetailPayload(0)),
+          url: options.url,
+        };
       }
-      if (url.pathname === '/api/Image/series-cover') {
-        return new Response(new Blob(['cover']), { status: 200 });
-      }
-      return jsonResponse({});
+      return { status: 200, headers: {}, data: '{}', url: options.url };
     });
 
     const { target } = await mountLibrary();
@@ -692,14 +766,52 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     expect(target.textContent).toContain('No network connection. Showing your saved library.');
   });
 
-  it('ignores stale reconnect callbacks when live network status is already disconnected', async () => {
+  it('ignores stale native reconnect callbacks and retries remaining queued progress after an in-flight upload settles', async () => {
+    nativePlatform = true;
     networkConnected = false;
+    const secondBook: BookRecord = {
+      ...seededBook,
+      id: 'server-1:1:11',
+      chapterId: 11,
+      title: 'The Dispossessed',
+    };
+    await reconcileBooks(server.id, [seededBook, secondBook]);
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
+    await saveLocalProgress(secondBook, 'epubcfi(/6/6!/4/4)', '//body/p[4]', 0.45, 1);
 
     const requestedPaths: string[] = [];
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      requestedPaths.push(new URL(String(input)).pathname);
-      return jsonResponse({});
+    const firstUploadStarted = deferred<void>();
+    const releaseFirstUpload = deferred<void>();
+    let progressUploads = 0;
+
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      const url = new URL(options.url);
+      requestedPaths.push(url.pathname);
+      if (url.pathname === '/api/Reader/progress') {
+        progressUploads += 1;
+        if (progressUploads === 1) {
+          firstUploadStarted.resolve();
+          await releaseFirstUpload.promise;
+        }
+        return { status: 204, headers: {}, data: '', url: options.url };
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return {
+          status: 200,
+          headers: {},
+          data: JSON.stringify([seriesListItem(0)]),
+          url: options.url,
+        };
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return {
+          status: 200,
+          headers: {},
+          data: JSON.stringify(seriesDetailPayload(0)),
+          url: options.url,
+        };
+      }
+      return { status: 200, headers: {}, data: '{}', url: options.url };
     });
 
     const { target } = await mountLibrary();
@@ -711,8 +823,28 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
       listener({ connected: true, connectionType: 'cellular' });
     }
     await new Promise((resolve) => setTimeout(resolve, 30));
-
     expect(requestedPaths).toEqual([]);
     expect(target.textContent).toContain('No network connection. Showing your saved library.');
+
+    // Reconnect for real, hold the first progress upload in flight, then disconnect and reconnect
+    // before that held response settles; the flush stops after item 1 and retries item 2 once settled.
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await firstUploadStarted.promise;
+
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+
+    releaseFirstUpload.resolve();
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+    expect(progressUploads).toBe(2);
   });
 });
