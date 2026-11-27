@@ -6,6 +6,7 @@ import {
   activeElement,
   focusFirstElement,
   focusModal,
+  isFocusableElement,
   restoreFocus,
   restoreModalFocus,
   trapModalKeydown,
@@ -16,6 +17,7 @@ let first: HTMLButtonElement;
 let last: HTMLButtonElement;
 
 beforeEach(() => {
+  document.body.replaceChildren();
   dialog = document.createElement('div');
   dialog.tabIndex = -1;
   first = document.createElement('button');
@@ -77,6 +79,127 @@ it('closes on Escape and restores focus to a connected opener', () => {
   expect(document.activeElement).toBe(opener);
 });
 
+it('falls back when opener is disabled, disconnected, document.body, or inside an inert ancestor', () => {
+  const fallback = document.createElement('button');
+  document.body.append(fallback);
+
+  const disabledOpener = document.createElement('button');
+  disabledOpener.disabled = true;
+  document.body.append(disabledOpener);
+  first.focus();
+  restoreFocus(disabledOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const disconnectedOpener = document.createElement('button');
+  first.focus();
+  restoreFocus(disconnectedOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  first.focus();
+  restoreFocus(document.body, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const inertWrapper = document.createElement('div');
+  inertWrapper.setAttribute('inert', '');
+  const inertOpener = document.createElement('button');
+  inertWrapper.append(inertOpener);
+  document.body.append(inertWrapper);
+  first.focus();
+  restoreFocus(inertOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const propertyInertWrapper = document.createElement('div');
+  propertyInertWrapper.inert = true;
+  const propertyInertOpener = document.createElement('button');
+  propertyInertWrapper.append(propertyInertOpener);
+  document.body.append(propertyInertWrapper);
+  first.focus();
+  restoreFocus(propertyInertOpener, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const toolbarFallback = document.createElement('header');
+  const toolbarButton = document.createElement('button');
+  toolbarFallback.append(toolbarButton);
+  document.body.append(toolbarFallback);
+  first.focus();
+  restoreFocus(document.body, toolbarFallback);
+  expect(document.activeElement).toBe(toolbarButton);
+});
+
+it('short-circuits focus checks across 1,500 controls without filtering middle rows', () => {
+  const largeDialog = document.createElement('div');
+  largeDialog.tabIndex = -1;
+  const controls = Array.from({ length: 1_501 }, () => document.createElement('button'));
+  largeDialog.append(...controls);
+  document.body.append(largeDialog);
+
+  const middleSpy = vi.spyOn(controls[750]!, 'matches');
+
+  focusFirstElement(largeDialog);
+  expect(document.activeElement).toBe(controls[0]);
+  expect(middleSpy).not.toHaveBeenCalled();
+
+  controls[0]!.focus();
+  const backward = new KeyboardEvent('keydown', {
+    key: 'Tab',
+    shiftKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  trapModalKeydown(backward, largeDialog, vi.fn());
+  expect(document.activeElement).toBe(controls[1_500]);
+  expect(middleSpy).not.toHaveBeenCalled();
+
+  controls[1_500]!.focus();
+  const forward = new KeyboardEvent('keydown', {
+    key: 'Tab',
+    bubbles: true,
+    cancelable: true,
+  });
+  trapModalKeydown(forward, largeDialog, vi.fn());
+  expect(document.activeElement).toBe(controls[0]);
+  expect(middleSpy).not.toHaveBeenCalled();
+});
+
+it('respects disabled fieldset boundaries and falls back to the dialog container', () => {
+  const modal = document.createElement('div');
+  modal.tabIndex = -1;
+  const leadingFieldset = document.createElement('fieldset');
+  leadingFieldset.disabled = true;
+  const disabledLeadingButton = document.createElement('button');
+  leadingFieldset.append(disabledLeadingButton);
+
+  const activeButton = document.createElement('button');
+
+  const trailingFieldset = document.createElement('fieldset');
+  trailingFieldset.disabled = true;
+  const disabledTrailingButton = document.createElement('button');
+  trailingFieldset.append(disabledTrailingButton);
+
+  modal.append(leadingFieldset, activeButton, trailingFieldset);
+  document.body.append(modal);
+
+  expect(isFocusableElement(disabledLeadingButton)).toBe(false);
+  expect(isFocusableElement(activeButton)).toBe(true);
+
+  focusFirstElement(modal);
+  expect(document.activeElement).toBe(activeButton);
+
+  const forward = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+  trapModalKeydown(forward, modal, vi.fn());
+  expect(forward.defaultPrevented).toBe(true);
+  expect(document.activeElement).toBe(activeButton);
+
+  activeButton.disabled = true;
+  const emptyTab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+  trapModalKeydown(emptyTab, modal, vi.fn());
+  expect(emptyTab.defaultPrevented).toBe(true);
+  expect(document.activeElement).toBe(modal);
+
+  restoreFocus(disabledLeadingButton);
+  expect(document.activeElement).toBe(modal);
+});
+
 it('returns the focused HTMLElement and null for non-HTML targets or missing document', () => {
   first.focus();
   expect(activeElement()).toBe(first);
@@ -128,4 +251,10 @@ it('defers focus restoration to connected enabled openers and skips disconnected
   restoreModalFocus(opener);
   await tick();
   expect(document.activeElement).toBe(first);
+
+  const fallback = document.createElement('button');
+  document.body.append(fallback);
+  restoreModalFocus(opener, () => fallback);
+  await tick();
+  expect(document.activeElement).toBe(fallback);
 });
