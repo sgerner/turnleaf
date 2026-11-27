@@ -911,7 +911,9 @@
     if (destroyed) return false;
     const transition = applyNetworkStatusChange(reachability, status, transportOptions());
     if (transition.disconnected) {
-      applyDisconnectedState(transition.state);
+      // A newer network event superseded this probe; skip this request without
+      // reverting the newer state to offline.
+      if (networkStatusRevision === statusRevisionAtStart) applyDisconnectedState(transition.state);
       return false;
     }
     if (disconnectRevision !== disconnectAtStart && reachability.offline) {
