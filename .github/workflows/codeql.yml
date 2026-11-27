@@ -18,9 +18,14 @@ permissions:
   contents: read
   security-events: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.language == 'swift' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
@@ -30,13 +35,15 @@ jobs:
             build-mode: none
           - language: java-kotlin
             build-mode: manual
+          - language: swift
+            build-mode: manual
 
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        if: matrix.language == 'java-kotlin'
+        if: matrix.language == 'java-kotlin' || matrix.language == 'swift'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -67,6 +74,24 @@ jobs:
         if: matrix.language == 'java-kotlin'
         run: npx cap sync android
 
+      - name: Cache SwiftPM packages
+        if: matrix.language == 'swift'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/turnleaf-spm
+          key: spm-${{ runner.os }}-${{ hashFiles('ios/App/CapApp-SPM/Package.swift', 'package-lock.json') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Prepare iOS project and prebuild SwiftPM dependencies
+        if: matrix.language == 'swift'
+        run: |
+          npm ci
+          npm run ios:simulator
+          rm -rf ios/App/DerivedData/Build/Intermediates.noindex/App.build \
+            ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app
+          find ios/App/App -name '*.swift' -exec touch {} +
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
@@ -77,6 +102,12 @@ jobs:
         if: matrix.language == 'java-kotlin'
         working-directory: android
         run: ./gradlew :app:compileDebugJavaWithJavac --no-daemon
+
+      - name: Build iOS Simulator target for CodeQL
+        if: matrix.language == 'swift'
+        env:
+          TURNLEAF_SKIP_IOS_SYNC: 'true'
+        run: npm run ios:simulator
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
