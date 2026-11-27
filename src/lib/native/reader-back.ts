@@ -1,4 +1,5 @@
 export interface ReaderBackState {
+  hasError: boolean;
   pendingSyncLocation: boolean;
   settingsVisible: boolean;
   tocVisible: boolean;
@@ -11,6 +12,7 @@ export interface ReaderBackState {
 }
 
 export interface ReaderBackActions {
+  closeError: () => void;
   closeSyncConfirmation: () => void;
   closeSettings: () => void;
   closeToc: () => void;
@@ -26,9 +28,12 @@ export interface ReaderBackActions {
 }
 
 export function handleReaderBack(state: ReaderBackState, actions: ReaderBackActions): boolean {
+  if (state.hasError) {
+    actions.closeError();
+    return true;
+  }
   if (state.pendingSyncLocation) {
     actions.closeSyncConfirmation();
-    actions.showControls();
     return true;
   }
   if (state.settingsVisible) {
@@ -58,7 +63,6 @@ export function handleReaderBack(state: ReaderBackState, actions: ReaderBackActi
   }
   if (state.hasLinkReturnTarget) {
     actions.returnToLink();
-    actions.showControls();
     return true;
   }
   if (state.controlsVisible || state.footerVisible) {

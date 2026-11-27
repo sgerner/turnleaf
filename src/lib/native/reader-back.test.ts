@@ -41,6 +41,7 @@ import { handleReaderBack, type ReaderBackActions, type ReaderBackState } from '
 
 function createState(overrides: Partial<ReaderBackState> = {}): ReaderBackState {
   return {
+    hasError: false,
     pendingSyncLocation: false,
     settingsVisible: false,
     tocVisible: false,
@@ -56,6 +57,7 @@ function createState(overrides: Partial<ReaderBackState> = {}): ReaderBackState 
 
 function createActions(overrides: Partial<ReaderBackActions> = {}): ReaderBackActions {
   return {
+    closeError: vi.fn(),
     closeSyncConfirmation: vi.fn(),
     closeSettings: vi.fn(),
     closeToc: vi.fn(),
@@ -144,18 +146,19 @@ describe('reader back controller', () => {
     expect(actions.showControls).not.toHaveBeenCalled();
   });
 
-  it('dismisses open panels and link jumps in priority order while keeping controls visible', () => {
-    const layers: Array<[keyof ReaderBackState, keyof ReaderBackActions]> = [
-      ['pendingSyncLocation', 'closeSyncConfirmation'],
-      ['settingsVisible', 'closeSettings'],
-      ['tocVisible', 'closeToc'],
-      ['bookmarksVisible', 'closeBookmarks'],
-      ['annotationsVisible', 'closeAnnotations'],
-      ['searchVisible', 'closeSearch'],
-      ['hasLinkReturnTarget', 'returnToLink'],
+  it('dismisses error alerts, sync confirmations, subpanels, and link jumps in priority order', () => {
+    const layers: Array<[keyof ReaderBackState, keyof ReaderBackActions, boolean]> = [
+      ['hasError', 'closeError', false],
+      ['pendingSyncLocation', 'closeSyncConfirmation', false],
+      ['settingsVisible', 'closeSettings', true],
+      ['tocVisible', 'closeToc', true],
+      ['bookmarksVisible', 'closeBookmarks', true],
+      ['annotationsVisible', 'closeAnnotations', true],
+      ['searchVisible', 'closeSearch', true],
+      ['hasLinkReturnTarget', 'returnToLink', false],
     ];
 
-    for (const [stateKey, actionKey] of layers) {
+    for (const [stateKey, actionKey, expectsShowControls] of layers) {
       const actions = createActions();
       const consumed = handleReaderBack(
         createState({ [stateKey]: true, controlsVisible: true }),
@@ -164,7 +167,11 @@ describe('reader back controller', () => {
 
       expect(consumed).toBe(true);
       expect(actions[actionKey]).toHaveBeenCalledOnce();
-      expect(actions.showControls).toHaveBeenCalledOnce();
+      if (expectsShowControls) {
+        expect(actions.showControls).toHaveBeenCalledOnce();
+      } else {
+        expect(actions.showControls).not.toHaveBeenCalled();
+      }
       expect(actions.hideChrome).not.toHaveBeenCalled();
       expect(actions.onBack).not.toHaveBeenCalled();
     }

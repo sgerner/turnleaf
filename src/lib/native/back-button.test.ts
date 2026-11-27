@@ -4,6 +4,7 @@ import { mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as DatabaseModule from '../database/database';
 import type * as NativeDownloadModule from '../downloads/native-download';
+import type * as ThemesModule from '../themes/themes';
 
 if (typeof Element !== 'undefined' && !Element.prototype.animate) {
   Element.prototype.animate = () => {
@@ -89,10 +90,14 @@ vi.mock('../github/releases', () => ({
   fetchLatestGithubRelease: vi.fn(async () => null),
 }));
 
-vi.mock('../themes/themes', () => ({
-  loadTheme: vi.fn(async () => true),
-  skeletonThemes: ['fennec'],
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn(async () => true),
+    skeletonThemes: ['fennec'],
+  };
+});
 
 vi.mock('../kavita/client', () => ({
   KavitaError: class KavitaError extends Error {
