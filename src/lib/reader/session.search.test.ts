@@ -49,6 +49,7 @@ const { mockBook, mockRendition, setSections } = vi.hoisted(() => {
 
 vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 
+import { DEFAULT_SEARCH_CHAPTER_LIMIT } from './search';
 import { ReaderSession } from './session';
 
 function makeSection(
@@ -136,6 +137,129 @@ describe('ReaderSession search batches and transient highlights', () => {
     expect(batch.scannedChapters).toBe(2);
     expect(batch.skippedChapters).toBe(0);
     expect(batch.nextCursor).toBeNull();
+
+    session.destroy();
+  });
+
+  it('bounds long no-match EPUBs by chapterLimit per call, unloads scanned chapters, and finishes without a dead cursor', async () => {
+    const sections = Array.from({ length: 60 }, (_, index) =>
+      makeSection(index, [], { wasLoaded: index === 0 }),
+    );
+    setSections(sections);
+
+    const session = new ReaderSession('book.epub');
+
+    const first = await session.search('absent-term');
+    expect(first).toEqual({
+      results: [],
+      scannedChapters: DEFAULT_SEARCH_CHAPTER_LIMIT,
+      skippedChapters: 60 - DEFAULT_SEARCH_CHAPTER_LIMIT,
+      totalChapters: 60,
+      nextCursor: { sectionIndex: DEFAULT_SEARCH_CHAPTER_LIMIT, matchIndex: 0 },
+    });
+    expect(sections[0]!.unload).not.toHaveBeenCalled();
+    for (let i = 1; i < DEFAULT_SEARCH_CHAPTER_LIMIT; i += 1) {
+      expect(sections[i]!.load).toHaveBeenCalledOnce();
+      expect(sections[i]!.unload).toHaveBeenCalledOnce();
+    }
+    for (let i = DEFAULT_SEARCH_CHAPTER_LIMIT; i < 60; i += 1) {
+      expect(sections[i]!.load).not.toHaveBeenCalled();
+    }
+
+    const second = await session.search('absent-term', undefined, 100, first.nextCursor);
+    expect(second).toEqual({
+      results: [],
+      scannedChapters: DEFAULT_SEARCH_CHAPTER_LIMIT,
+      skippedChapters: 60 - DEFAULT_SEARCH_CHAPTER_LIMIT * 2,
+      totalChapters: 60,
+      nextCursor: { sectionIndex: DEFAULT_SEARCH_CHAPTER_LIMIT * 2, matchIndex: 0 },
+    });
+    expect(sections[DEFAULT_SEARCH_CHAPTER_LIMIT * 2]!.load).not.toHaveBeenCalled();
+
+    const third = await session.search('absent-term', undefined, 100, second.nextCursor);
+    expect(third).toEqual({
+      results: [],
+      scannedChapters: 60 - DEFAULT_SEARCH_CHAPTER_LIMIT * 2,
+      skippedChapters: 0,
+      totalChapters: 60,
+      nextCursor: null,
+    });
+    for (const section of sections) {
+      expect(section.load).toHaveBeenCalledOnce();
+    }
+
+    // Exact multiple of chapterLimit finishes cleanly on the final chapter with nextCursor = null.
+    session.destroy();
+    const exactMultiple = Array.from({ length: DEFAULT_SEARCH_CHAPTER_LIMIT * 2 }, (_, index) =>
+      makeSection(index, []),
+    );
+    setSections(exactMultiple);
+    const exactSession = new ReaderSession('exact-book.epub');
+    const batchOne = await exactSession.search('absent-term');
+    expect(batchOne.nextCursor).toEqual({
+      sectionIndex: DEFAULT_SEARCH_CHAPTER_LIMIT,
+      matchIndex: 0,
+    });
+    const batchTwo = await exactSession.search('absent-term', undefined, 100, batchOne.nextCursor);
+    expect(batchTwo.scannedChapters).toBe(DEFAULT_SEARCH_CHAPTER_LIMIT);
+    expect(batchTwo.skippedChapters).toBe(0);
+    expect(batchTwo.nextCursor).toBeNull();
+
+    exactSession.destroy();
+  });
+
+  it('resumes sparse and mixed mid-chapter batches across a long spine without duplicates or gaps', async () => {
+    const matchBySection = new Map<number, MockMatch[]>([
+      [
+        0,
+        [
+          { cfi: 'cfi-0-0', excerpt: 'Harbor alpha' },
+          { cfi: 'cfi-0-1', excerpt: 'Harbor beta' },
+          { cfi: 'cfi-0-2', excerpt: 'Harbor gamma' },
+          { cfi: 'cfi-0-3', excerpt: 'Harbor delta' },
+        ],
+      ],
+      [7, [{ cfi: 'cfi-7-0', excerpt: 'Harbor seven' }]],
+      [
+        14,
+        [
+          { cfi: 'cfi-14-0', excerpt: 'Harbor fourteen a' },
+          { cfi: 'cfi-14-1', excerpt: 'Harbor fourteen b' },
+        ],
+      ],
+      [29, [{ cfi: 'cfi-29-0', excerpt: 'Harbor twenty-nine' }]],
+      [41, [{ cfi: 'cfi-41-0', excerpt: 'Harbor final' }]],
+    ]);
+    const expectedCfis = [...matchBySection.values()].flat().map((match) => match.cfi);
+    const sections = Array.from({ length: 42 }, (_, index) =>
+      makeSection(index, matchBySection.get(index) ?? []),
+    );
+    setSections(sections);
+
+    const session = new ReaderSession('book.epub');
+    const collectedCfis: string[] = [];
+    const batchSizes: Array<{ matches: number; chapters: number }> = [];
+    let cursor = null;
+
+    do {
+      const batch = await session.search('harbor', undefined, 3, cursor, 8);
+      expect(batch.results.length).toBeLessThanOrEqual(3);
+      expect(batch.scannedChapters).toBeLessThanOrEqual(8);
+      batchSizes.push({ matches: batch.results.length, chapters: batch.scannedChapters });
+      collectedCfis.push(...batch.results.map((item) => item.cfi));
+      cursor = batch.nextCursor;
+    } while (cursor !== null);
+
+    expect(batchSizes.length).toBeGreaterThanOrEqual(6);
+    expect(collectedCfis).toEqual(expectedCfis);
+    expect(new Set(collectedCfis).size).toBe(expectedCfis.length);
+    for (let i = 1; i < sections.length; i += 1) {
+      expect(sections[i]!.load).toHaveBeenCalledOnce();
+      expect(sections[i]!.unload).toHaveBeenCalledOnce();
+    }
+    // Section 0 stopped mid-chapter after 3 matches and resumed at matchIndex 3 on batch 2.
+    expect(sections[0]!.load).toHaveBeenCalledTimes(2);
+    expect(sections[0]!.unload).toHaveBeenCalledTimes(2);
 
     session.destroy();
   });

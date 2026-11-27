@@ -380,6 +380,145 @@ describe('Reader search workflow and floating match bar', () => {
     expect(target.textContent).toContain('102 matches shown.');
   });
 
+  it('keeps continuation chapter counts cumulative across zero-match, sparse-match, and mid-chapter batches', async () => {
+    const cursorAfterFirst: ReaderSearchCursor = { sectionIndex: 25, matchIndex: 0 };
+    const cursorMidChapter: ReaderSearchCursor = { sectionIndex: 35, matchIndex: 2 };
+    const cursorAfterThird: ReaderSearchCursor = { sectionIndex: 50, matchIndex: 0 };
+
+    sessionMock.search
+      .mockResolvedValueOnce({
+        results: [],
+        scannedChapters: 25,
+        skippedChapters: 35,
+        totalChapters: 60,
+        nextCursor: cursorAfterFirst,
+      } satisfies ReaderSearchBatch)
+      .mockResolvedValueOnce({
+        results: [makeResult(0, 'Harbor', 35), makeResult(1, 'Harbor', 35)],
+        scannedChapters: 11,
+        skippedChapters: 24,
+        totalChapters: 60,
+        nextCursor: cursorMidChapter,
+      } satisfies ReaderSearchBatch)
+      .mockResolvedValueOnce({
+        results: [makeResult(2, 'Harbor', 35)],
+        scannedChapters: 15,
+        skippedChapters: 10,
+        totalChapters: 60,
+        nextCursor: cursorAfterThird,
+      } satisfies ReaderSearchBatch)
+      .mockResolvedValueOnce({
+        results: [],
+        scannedChapters: 10,
+        skippedChapters: 0,
+        totalChapters: 60,
+        nextCursor: null,
+      } satisfies ReaderSearchBatch);
+
+    component = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'book.epub',
+        bookId: 'book-cumulative',
+        title: 'Large Anthology',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    await flushAsync();
+    await openSearchPanel();
+
+    const input = target.querySelector<HTMLInputElement>('#reader-search-query')!;
+    input.value = 'Harbor';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    target
+      .querySelector<HTMLFormElement>('#reader-search form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushAsync();
+
+    // Zero-match chapter-bounded batch offers continuation instead of claiming the whole book has no matches.
+    expect(target.textContent).toContain(
+      'No matches found in 25 of 60 chapters (35 chapters skipped).',
+    );
+    expect(target.textContent).toContain(
+      'Search paused after 25 of 60 chapters. 35 chapters remain unsearched.',
+    );
+
+    const loadMoreBtn = target.querySelector<HTMLButtonElement>(
+      '[data-reader-focus="search-more"]',
+    )!;
+    loadMoreBtn.focus();
+    loadMoreBtn.click();
+    await flushAsync();
+
+    // Batch 2 scanned 11 new chapters (25 + 11 = 36) and stopped mid-chapter 35.
+    expect(target.textContent).toContain(
+      '2 matches shown across 36 of 60 chapters (24 chapters skipped).',
+    );
+    expect(target.textContent).toContain(
+      'Search paused after 2 matches (36 of 60 chapters). 24 chapters remain unsearched.',
+    );
+    expect(document.activeElement).toBe(
+      target.querySelector<HTMLButtonElement>('[data-reader-focus="search-more"]'),
+    );
+
+    // Batch 3 resumed mid-chapter 35 (cursor.matchIndex = 2) across 15 sections -> 14 newly scanned chapters (36 + 14 = 50).
+    target.querySelector<HTMLButtonElement>('[data-reader-focus="search-more"]')!.click();
+    await flushAsync();
+    expect(target.textContent).toContain(
+      '3 matches shown across 50 of 60 chapters (10 chapters skipped).',
+    );
+
+    // Batch 4 finishes final 10 chapters with 0 additional matches -> 3 total matches, banner gone, focus kept inside modal.
+    target.querySelector<HTMLButtonElement>('[data-reader-focus="search-more"]')!.click();
+    await flushAsync();
+    expect(target.querySelector('[data-reader-focus="search-more"]')).toBeNull();
+    expect(target.textContent).toContain('3 matches shown.');
+    expect(document.activeElement).toBe(
+      target.querySelector<HTMLButtonElement>(
+        '[data-reader-focus="search-result"][data-reader-focus-id="2"]',
+      ),
+    );
+
+    // Purely absent query across multiple batches shows "No matches found." only after final batch and returns focus to query input.
+    sessionMock.search
+      .mockResolvedValueOnce({
+        results: [],
+        scannedChapters: 25,
+        skippedChapters: 15,
+        totalChapters: 40,
+        nextCursor: { sectionIndex: 25, matchIndex: 0 },
+      } satisfies ReaderSearchBatch)
+      .mockResolvedValueOnce({
+        results: [],
+        scannedChapters: 15,
+        skippedChapters: 0,
+        totalChapters: 40,
+        nextCursor: null,
+      } satisfies ReaderSearchBatch);
+
+    input.value = 'NonexistentWord';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    target
+      .querySelector<HTMLFormElement>('#reader-search form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flushAsync();
+
+    expect(target.textContent).toContain(
+      'No matches found in 25 of 40 chapters (15 chapters skipped).',
+    );
+    const absentMoreBtn = target.querySelector<HTMLButtonElement>(
+      '[data-reader-focus="search-more"]',
+    )!;
+    absentMoreBtn.focus();
+    absentMoreBtn.click();
+    await flushAsync();
+
+    expect(target.querySelector('[data-reader-focus="search-more"]')).toBeNull();
+    expect(target.textContent).toContain('No matches found.');
+    expect(document.activeElement).toBe(input);
+  });
+
   it('supports Escape dismissal and Android Back pre-search return without syncing transient state', async () => {
     const onRelocated = vi.fn();
     const backHandlers: Array<() => boolean> = [];

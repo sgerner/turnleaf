@@ -1,6 +1,8 @@
 import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
 import {
+  DEFAULT_SEARCH_CHAPTER_LIMIT,
+  DEFAULT_SEARCH_MATCH_LIMIT,
   clipReaderSearchExcerpt,
   normalizeReaderSearchQuery,
   splitReaderSearchExcerpt,
@@ -903,14 +905,15 @@ export class ReaderSession {
   async search(
     query: string,
     signal?: AbortSignal,
-    limit = 100,
+    limit = DEFAULT_SEARCH_MATCH_LIMIT,
     cursor: ReaderSearchCursor | null = null,
+    chapterLimit = DEFAULT_SEARCH_CHAPTER_LIMIT,
   ): Promise<ReaderSearchBatch> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const normalizedQuery = normalizeReaderSearchQuery(query);
     const { sections } = this.getSpine();
     const totalChapters = sections.length;
-    if (!normalizedQuery || limit <= 0) {
+    if (!normalizedQuery || limit <= 0 || chapterLimit <= 0) {
       return {
         results: [],
         scannedChapters: 0,
@@ -983,6 +986,16 @@ export class ReaderSession {
               nextCursor,
             };
           }
+        }
+
+        if (scannedChapters >= chapterLimit && sectionPosition + 1 < totalChapters) {
+          return {
+            results,
+            scannedChapters,
+            skippedChapters: totalChapters - (sectionPosition + 1),
+            totalChapters,
+            nextCursor: { sectionIndex: sectionPosition + 1, matchIndex: 0 },
+          };
         }
       } finally {
         if (!wasLoaded) section.unload();

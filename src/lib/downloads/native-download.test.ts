@@ -401,6 +401,35 @@ describe('native cover cache', () => {
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
 
+  it('re-checks dynamic allowDownload before following a validated same-origin 3xx cover redirect', async () => {
+    let online = true;
+    vi.mocked(Filesystem.stat).mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      online = false;
+      throw {
+        code: 'OS-PLUG-FLTR-0010',
+        data: {
+          httpStatus: 302,
+          headers: { Location: '/kavita/api/Image/series-cover?seriesId=7' },
+        },
+      };
+    });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/api/Image/series-cover?seriesId=7',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        () => online,
+        'https://books.example.com',
+      ),
+    ).rejects.toThrow('Offline');
+
+    expect(FileTransfer.downloadFile).toHaveBeenCalledOnce();
+  });
+
   it('follows validated same-origin 3xx cover redirects with disableRedirects enabled', async () => {
     let downloaded = false;
     vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {

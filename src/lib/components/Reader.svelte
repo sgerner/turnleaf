@@ -26,7 +26,11 @@
     type ReaderSelection,
     type TocItem,
   } from '../reader/session';
-  import type { ReaderSearchCursor, ReaderSearchResult } from '../reader/search';
+  import {
+    DEFAULT_SEARCH_MATCH_LIMIT,
+    type ReaderSearchCursor,
+    type ReaderSearchResult,
+  } from '../reader/search';
   import {
     MAX_ANNOTATIONS,
     addAnnotation,
@@ -1231,18 +1235,35 @@
     searching = true;
     searchError = '';
     try {
-      const batch = await session.search(searchedQuery, controller.signal, 100, cursor);
+      const batch = await session.search(
+        searchedQuery,
+        controller.signal,
+        DEFAULT_SEARCH_MATCH_LIMIT,
+        cursor,
+      );
       if (searchController === controller) {
         searchResults = [...searchResults, ...batch.results];
-        searchScannedChapters = Math.max(
-          searchScannedChapters,
-          batch.totalChapters - batch.skippedChapters,
+        const newlyScannedChapters =
+          cursor.matchIndex > 0 ? Math.max(0, batch.scannedChapters - 1) : batch.scannedChapters;
+        searchScannedChapters = Math.min(
+          batch.totalChapters,
+          searchScannedChapters + newlyScannedChapters,
         );
         searchSkippedChapters = batch.skippedChapters;
         searchTotalChapters = batch.totalChapters;
         searchNextCursor = batch.nextCursor;
-        if (hadFocusOnMore && !batch.nextCursor && searchResults.length > previousCount) {
-          focusReaderTarget(searchPanel, 'search-result', String(previousCount));
+        if (hadFocusOnMore) {
+          if (batch.nextCursor) {
+            focusReaderTarget(searchPanel, 'search-more');
+          } else if (searchResults.length > previousCount) {
+            focusReaderTarget(searchPanel, 'search-result', String(previousCount));
+          } else if (searchResults.length > 0) {
+            focusReaderTarget(searchPanel, 'search-result', String(searchResults.length - 1));
+          } else {
+            void tick().then(() => {
+              searchPanel?.querySelector<HTMLElement>('#reader-search-query')?.focus();
+            });
+          }
         }
       }
     } catch (cause) {
@@ -2396,7 +2417,9 @@
           {/if}
           <p class="mt-3 text-sm text-surface-700-300" role="status">
             {#if searched && !searchError}
-              {#if searchResults.length === 0 && !searching}
+              {#if searchResults.length === 0 && searchNextCursor}
+                {`No matches found in ${searchScannedChapters} of ${searchTotalChapters} chapters (${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter' : 'chapters'} skipped).`}
+              {:else if searchResults.length === 0 && !searching}
                 No matches found.
               {:else if searchResults.length > 0 && searchNextCursor}
                 {searchSkippedChapters > 0
@@ -2412,9 +2435,11 @@
               class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg preset-tonal-warning p-3 text-sm"
             >
               <span>
-                {searchSkippedChapters > 0
-                  ? `Search paused after ${searchResults.length} matches. ${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter remains' : 'chapters remain'} unsearched.`
-                  : `Search paused after ${searchResults.length} matches in the final chapter.`}
+                {searchResults.length === 0
+                  ? `Search paused after ${searchScannedChapters} of ${searchTotalChapters} chapters. ${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter remains' : 'chapters remain'} unsearched.`
+                  : searchSkippedChapters > 0
+                    ? `Search paused after ${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} (${searchScannedChapters} of ${searchTotalChapters} chapters). ${searchSkippedChapters} ${searchSkippedChapters === 1 ? 'chapter remains' : 'chapters remain'} unsearched.`
+                    : `Search paused after ${searchResults.length} ${searchResults.length === 1 ? 'match' : 'matches'} in the final chapter.`}
               </span>
               <button
                 class="btn btn-sm min-h-11 preset-filled-primary-700-300"

@@ -1,3 +1,6 @@
+export const DEFAULT_SEARCH_MATCH_LIMIT = 100;
+export const DEFAULT_SEARCH_CHAPTER_LIMIT = 25;
+
 export interface ReaderSearchExcerptSegment {
   text: string;
   match: boolean;
