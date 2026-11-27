@@ -33,16 +33,22 @@ async function run(
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
   while (true) {
-    if (canSync && !(await canSync())) break;
+    if (canSync) {
+      const allowed = canSync();
+      if (allowed instanceof Promise ? !(await allowed) : !allowed) break;
+    }
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
     if (pending.length === 0) break;
     for (const item of pending) {
-      if (canSync && !(await canSync())) {
-        throwIfFailed(failures);
-        return;
+      if (canSync) {
+        const allowed = canSync();
+        if (allowed instanceof Promise ? !(await allowed) : !allowed) {
+          throwIfFailed(failures);
+          return;
+        }
       }
       attempted.set(item.bookId, item);
       try {
