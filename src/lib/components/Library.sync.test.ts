@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
   getPendingSync,
@@ -11,7 +12,6 @@ import {
   type BookRecord,
   type ServerConfig,
 } from '../database/database';
-import type * as ThemesModule from '../themes/themes';
 
 const networkListeners = new Set<
   (status: { connected: boolean; connectionType: string }) => void
