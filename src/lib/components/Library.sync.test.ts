@@ -3,7 +3,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import type * as ThemesModule from '../themes/themes';
-import type { ReaderLocation } from '../reader/session';
 import {
   getBooks,
   getPendingSync,
@@ -85,33 +84,6 @@ vi.mock('../themes/themes', async (importOriginal) => {
     loadTheme: vi.fn(async () => true),
   };
 });
-
-interface MockReaderProps {
-  onBack: () => void;
-  onRelocated: (location: ReaderLocation) => void;
-  onSyncLatest?: (manual: boolean) => Promise<{
-    xpath: string | null;
-    percentage: number | null;
-    accept?: () => Promise<void>;
-  } | null>;
-}
-
-let latestReaderProps: MockReaderProps | null = null;
-
-vi.mock('./Reader.svelte', () => ({
-  default: function MockReader(anchor: Comment, props: MockReaderProps) {
-    latestReaderProps = props;
-    const marker = document.createElement('div');
-    marker.dataset.mockReader = 'true';
-    anchor.before(marker);
-    return {
-      $destroy() {
-        if (latestReaderProps === props) latestReaderProps = null;
-        marker.remove();
-      },
-    };
-  },
-}));
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -264,7 +236,6 @@ async function mountLibrary(
 
 beforeEach(async () => {
   networkConnected = true;
-  latestReaderProps = null;
   networkListeners.clear();
   appStateListeners.clear();
   verifyDownloadedEpubMock.mockClear();
@@ -660,89 +631,5 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
-  });
-
-  it('serializes rapid reader navigations with manual reader sync and progress flushes without dropping or racing revisions', async () => {
-    const requestLog: Array<{ path: string; body?: Record<string, unknown> }> = [];
-    let latestUploadedScrollId: string | null = null;
-    let latestUploadedPageNum = 0;
-
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-      const url = new URL(String(input));
-      if (url.pathname === '/api/Reader/progress') {
-        const parsed = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-        latestUploadedScrollId =
-          typeof parsed.bookScrollId === 'string' ? parsed.bookScrollId : null;
-        latestUploadedPageNum = typeof parsed.pageNum === 'number' ? parsed.pageNum : 0;
-        requestLog.push({ path: url.pathname, body: parsed });
-        return new Response(null, { status: 204 });
-      }
-      if (url.pathname === '/api/Reader/get-progress') {
-        requestLog.push({ path: url.pathname });
-        return jsonResponse({
-          libraryId: 1,
-          seriesId: 1,
-          volumeId: 1,
-          chapterId: 10,
-          pageNum: latestUploadedPageNum,
-          bookScrollId: latestUploadedScrollId,
-          lastModifiedUtc: '2026-09-08T00:00:05.000Z',
-        });
-      }
-      if (url.pathname === '/api/Series/v2') {
-        return jsonResponse([seriesListItem(0)]);
-      }
-      if (url.pathname === '/api/Series/series-detail') {
-        return jsonResponse(seriesDetailPayload(0));
-      }
-      if (url.pathname === '/api/Image/series-cover') {
-        return new Response(new Blob(['cover']), { status: 200 });
-      }
-      return jsonResponse({});
-    });
-
-    const { target } = await mountLibrary();
-    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
-
-    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
-    flushSync();
-    await waitForCondition(() => latestReaderProps !== null);
-
-    requestLog.length = 0;
-
-    // Emit two rapid reader relocations and immediately trigger manual reader sync in the same turn
-    latestReaderProps!.onRelocated({
-      cfi: 'epubcfi(/6/4!/4/2)',
-      xpath: '//body/DocFragment[2]/body/p[2]',
-      href: 'ch2.xhtml',
-      percentage: 0.35,
-      spineIndex: 1,
-      pageIndex: 0,
-      pageCount: 4,
-    });
-    latestReaderProps!.onRelocated({
-      cfi: 'epubcfi(/6/4!/4/18)',
-      xpath: '//body/DocFragment[2]/body/p[9]',
-      href: 'ch2.xhtml',
-      percentage: 0.72,
-      spineIndex: 1,
-      pageIndex: 2,
-      pageCount: 4,
-    });
-
-    const synced = await latestReaderProps!.onSyncLatest!(true);
-
-    expect(requestLog.map((entry) => entry.path)).toEqual([
-      '/api/Reader/progress',
-      '/api/Reader/get-progress',
-    ]);
-    expect(requestLog[0]?.body).toMatchObject({
-      chapterId: 10,
-      bookScrollId: '//body/DocFragment[2]/body/p[9]',
-    });
-    expect(synced).toMatchObject({
-      xpath: '//body/DocFragment[2]/body/p[9]',
-    });
-    expect(await getPendingSync(server.id)).toEqual([]);
   });
 });

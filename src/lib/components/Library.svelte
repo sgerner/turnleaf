@@ -119,7 +119,7 @@
         seriesId,
         signal,
         server.id,
-        networkAvailable,
+        await networkAvailable(),
         serverOrigin,
       );
     }
@@ -241,8 +241,6 @@
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
-  let networkEventSequence = 0;
-  let reconnectTimer: number | null = null;
   let message = $state('');
   let messageRevision = 0;
   let syncStatus = $state<SyncStatus>({
@@ -253,7 +251,6 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
-  let relocationWork: Promise<void> | null = null;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -734,70 +731,26 @@
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', async ({ connected }) => {
+        await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
-          const eventId = ++networkEventSequence;
+          offline = !connected;
           if (!connected) {
-            if (reconnectTimer !== null) {
-              window.clearTimeout(reconnectTimer);
-              reconnectTimer = null;
-            }
-            if (syncTimer !== null) {
-              window.clearTimeout(syncTimer);
-              syncTimer = null;
-            }
-          }
-          let nextConnected = connected;
-          if (Capacitor.isNativePlatform()) {
-            const currentStatus = await Network.getStatus().catch(() => null);
-            if (destroyed || eventId !== networkEventSequence) return;
-            nextConnected = currentStatus?.connected === true;
-          }
-          if (destroyed || eventId !== networkEventSequence) return;
-          const wasOffline = offline;
-          offline = !nextConnected;
-          if (!nextConnected) {
-            if (reconnectTimer !== null) {
-              window.clearTimeout(reconnectTimer);
-              reconnectTimer = null;
-            }
-            if (syncTimer !== null) {
-              window.clearTimeout(syncTimer);
-              syncTimer = null;
-            }
             refreshController?.abort();
             openProgressProbe?.abort();
-            cancelCoverLoading();
-            sharedCoverLoader.cancel();
-            kavitaUnreachable = false;
-            offlineMessage = displayableBooks.length
+          }
+          coverReloadRequest += 1;
+          kavitaUnreachable = false;
+          offlineMessage = connected
+            ? ''
+            : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-            return;
-          }
-          const shouldReconnect = wasOffline || kavitaUnreachable;
-          if (!shouldReconnect) return;
-          kavitaUnreachable = false;
-          offlineMessage = '';
-          const triggerReconnectSyncAndRefresh = () => {
-            coverReloadRequest += 1;
+          if (connected) {
             const baselineRevision = activeSyncStartRevision ?? messageRevision;
             const baselineMessage = activeSyncStartRevision !== null ? '' : message;
             void syncProgress(false);
             void startRefresh(false, baselineRevision, baselineMessage);
-          };
-          if (!Capacitor.isNativePlatform()) {
-            triggerReconnectSyncAndRefresh();
-            return;
           }
-          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-          reconnectTimer = window.setTimeout(() => {
-            reconnectTimer = null;
-            void (async () => {
-              if (destroyed || offline || !(await networkAvailable())) return;
-              triggerReconnectSyncAndRefresh();
-            })().catch(() => {});
-          }, 150);
         }),
       ),
     );
@@ -858,35 +811,14 @@
   }
 
   function syncProgress(showFeedback = true): Promise<void> {
-    if (syncWork) {
-      if (!relocationWork) return syncWork;
-      return syncWork.then(() => syncProgress(showFeedback));
-    }
+    if (syncWork) return syncWork;
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
-    const work = runProgressSync(showFeedback).finally(() => {
-      if (syncWork === work) syncWork = null;
+    syncWork = runProgressSync(showFeedback).finally(() => {
+      syncWork = null;
     });
-    syncWork = work;
-    return work;
-  }
-
-  function trackSyncFlush(flush: () => Promise<void>): Promise<void> {
-    const previous = syncWork;
-    const activeFlush = flush();
-    const settled = (
-      previous
-        ? Promise.allSettled([previous, activeFlush]).then(() => undefined)
-        : activeFlush.then(
-            () => undefined,
-            () => undefined,
-          )
-    ).finally(() => {
-      if (syncWork === settled) syncWork = null;
-    });
-    syncWork = settled;
-    return activeFlush;
+    return syncWork;
   }
 
   function setMessage(next: string): void {
@@ -898,7 +830,6 @@
     syncing = true;
     activeSyncStartRevision = messageRevision;
     try {
-      while (relocationWork) await relocationWork;
       const available = Capacitor.isNativePlatform()
         ? await networkAvailable()
         : !offline && !destroyed;
@@ -907,11 +838,8 @@
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id, {
-        canContinue: () =>
-          Capacitor.isNativePlatform() ? networkAvailable() : !offline && !destroyed,
-      });
-      if (showFeedback && !offline) setMessage('Reading progress synced.');
+      await flushProgress(client, server.id);
+      if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
         error instanceof AggregateError &&
@@ -922,7 +850,7 @@
         setMessage(
           'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
         );
-      } else if (showFeedback && !offline) {
+      } else if (showFeedback) {
         setMessage('Some reading progress is waiting to sync. Retry when Kavita is available.');
       }
     } finally {
@@ -935,7 +863,6 @@
   onDestroy(() => {
     destroyed = true;
     onReaderOpenChange?.(false);
-    if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
@@ -998,7 +925,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted || !(await networkAvailable())) return;
+        if (controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -1013,7 +940,7 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted || !(await networkAvailable())) return;
+      if (controller.signal.aborted) return;
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -1298,7 +1225,6 @@
 
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
     try {
-      while (relocationWork) await relocationWork;
       let remote: KavitaProgress | null = null;
       if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
         const probe = new AbortController();
@@ -1451,7 +1377,7 @@
     return Math.max(0, Math.min(0.999, book.pagesRead / book.pages));
   }
 
-  async function persistRelocation(book: BookRecord, location: ReaderLocation): Promise<void> {
+  async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
     await saveLocalProgress(
       book,
       location.cfi,
@@ -1466,33 +1392,8 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    if (syncTimer !== null) {
-      window.clearTimeout(syncTimer);
-      syncTimer = null;
-    }
-    if (!destroyed && !offline) {
-      syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
-    }
-  }
-
-  function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
-    const previous = relocationWork;
-    const run = previous
-      ? previous.then(
-          () => persistRelocation(book, location),
-          () => persistRelocation(book, location),
-        )
-      : persistRelocation(book, location);
-    const settled = run
-      .then(
-        () => undefined,
-        () => undefined,
-      )
-      .finally(() => {
-        if (relocationWork === settled) relocationWork = null;
-      });
-    relocationWork = settled;
-    return run;
+    if (syncTimer !== null) window.clearTimeout(syncTimer);
+    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
   }
 
   async function syncLatestForReader(
@@ -1503,33 +1404,20 @@
     percentage: number | null;
     accept?: () => Promise<void>;
   } | null> {
-    while (relocationWork) await relocationWork;
     if (!manual && !pendingAutoSync) return null;
     if (book.remoteAvailable === false || !(await networkAvailable())) {
       if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
     }
     if (manual) {
-      if (syncTimer !== null) {
-        window.clearTimeout(syncTimer);
-        syncTimer = null;
-      }
       try {
-        await trackSyncFlush(() =>
-          flushProgress(client, server.id, {
-            canContinue: () =>
-              Capacitor.isNativePlatform() ? networkAvailable() : !offline && !destroyed,
-          }),
-        );
+        await flushProgress(client, server.id);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
         void refreshSyncStatus();
       }
-    } else {
-      while (syncWork) await syncWork;
     }
-    while (relocationWork) await relocationWork;
     const local = await getReadingState(book.id);
     if (local?.pendingSync) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
@@ -1543,9 +1431,8 @@
       accept: async () => {
         acceptingRemoteProgress = true;
         try {
-          while (relocationWork) await relocationWork;
           // An upload cannot race with deletion of the exact revision it is sending.
-          while (syncWork) await syncWork;
+          await syncWork;
           const accepted = await saveRemoteProgress(book, remote, local);
           if (!accepted)
             throw new Error('The saved reading position changed. Sync again to retry.');
@@ -1567,7 +1454,6 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    while (relocationWork) await relocationWork;
     await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {

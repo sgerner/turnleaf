@@ -79,15 +79,22 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         return String(rounded)
     }
 
+    private static func sanitizedCategoryIdentifier(for category: UIContentSizeCategory) -> String {
+        let resolved = category == .unspecified ? .large : category
+        let filtered = resolved.rawValue.filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+        return filtered.isEmpty ? "UICTContentSizeCategoryL" : filtered
+    }
+
     private static func dynamicTypeScript(for category: UIContentSizeCategory) -> String {
         let resolved = category == .unspecified ? .large : category
         let scale = formattedScale(for: resolved)
+        let safeCategory = sanitizedCategoryIdentifier(for: resolved)
         return """
         (() => {
           const root = document.documentElement;
           if (!root) return;
           root.style.setProperty('--turnleaf-text-scale', '\(scale)');
-          root.dataset.contentSizeCategory = '\(resolved.rawValue)';
+          root.dataset.contentSizeCategory = '\(safeCategory)';
         })();
         """
     }
@@ -96,10 +103,11 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         let category = resolvedContentSizeCategory()
         let resolved = category == .unspecified ? .large : category
         let scale = Self.formattedScale(for: resolved)
+        let safeCategory = Self.sanitizedCategoryIdentifier(for: resolved)
         webView?.evaluateJavaScript(Self.dynamicTypeScript(for: resolved), completionHandler: nil)
         bridge?.triggerWindowJSEvent(
             eventName: "turnleafDynamicType",
-            data: #"{"scale":\#(scale),"category":"\#(resolved.rawValue)"}"#
+            data: #"{"scale":\#(scale),"category":"\#(safeCategory)"}"#
         )
     }
 

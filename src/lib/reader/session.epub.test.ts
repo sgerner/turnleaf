@@ -644,7 +644,7 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
-  it('defers viewport resizes while initial display is in flight and re-displays when manager views clear before location settles', async () => {
+  it('aborts a display that is in flight during a resize and preserves the final CFI', async () => {
     const resizeCallbacks: ResizeObserverCallback[] = [];
     class TestResizeObserver {
       constructor(callback: ResizeObserverCallback) {
@@ -655,128 +655,111 @@ describe('ReaderSession', () => {
     }
     vi.stubGlobal('ResizeObserver', TestResizeObserver);
 
-    let resolveInitialDisplay!: () => void;
-    let displayCallCount = 0;
-    mockRendition.display.mockImplementation(
+    const onLocation = vi.fn();
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 560));
+
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 4 },
+      },
+    } as Location);
+
+    // 1. Start a display that remains in flight when a viewport resize occurs, then abort it as a newer CFI display completes.
+    let rejectInFlightDisplay!: (reason?: unknown) => void;
+    let resolveReplacementDisplay!: () => void;
+    mockRendition.display
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectInFlightDisplay = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveReplacementDisplay = resolve;
+          }),
+      );
+
+    const abortedDisplay = session.displayCfi('epubcfi(/6/4!/4/2/1:0)');
+    expect(mockRendition.display).toHaveBeenLastCalledWith('epubcfi(/6/4!/4/2/1:0)');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 640);
+
+    const replacementDisplay = session.displayCfi('epubcfi(/6/6!/4/2/1:0)');
+    rejectInFlightDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+    await expect(abortedDisplay).resolves.toBe(false);
+
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/6!/4/2/1:0)',
+        href: 'third.xhtml',
+        index: 2,
+        percentage: 0.5,
+        displayed: { page: 1, total: 4 },
+      },
+    } as Location);
+    resolveReplacementDisplay();
+    await expect(replacementDisplay).resolves.toBe(true);
+
+    expect(onLocation.mock.calls.at(-1)?.[0]).toMatchObject({
+      cfi: 'epubcfi(/6/6!/4/2/1:0)',
+      href: 'third.xhtml',
+    });
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+
+    // 2. Start another display that is aborted directly by a resize without a replacement navigation; verify the final CFI stays at /6/6.
+    let rejectResizeAbortedDisplay!: (reason?: unknown) => void;
+    mockRendition.display.mockImplementationOnce(
       () =>
-        new Promise<void>((resolve) => {
-          displayCallCount += 1;
-          if (displayCallCount === 1) {
-            resolveInitialDisplay = resolve;
-          } else {
-            resolve();
-          }
+        new Promise<void>((_resolve, reject) => {
+          rejectResizeAbortedDisplay = reject;
         }),
     );
-    const renditionWithManager = mockRendition as typeof mockRendition & {
-      manager?: Record<string, unknown> | undefined;
-    };
-    renditionWithManager.manager = {};
-    mockRendition.location = undefined;
 
-    try {
-      const viewport = document.createElement('div');
-      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 851));
+    const resizeAbortedDisplay = session.displayCfi('epubcfi(/6/8!/4/2/1:0)');
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 520, height: 700 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    rejectResizeAbortedDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+    await expect(resizeAbortedDisplay).resolves.toBe(false);
 
-      const session = new ReaderSession('book.epub');
-      const openPromise = session.open(
-        viewport,
-        'epubcfi(/6/4!/4/2)',
-        null,
-        null,
-        defaultAppearance,
-        vi.fn(),
-        vi.fn(),
-      );
-
-      await vi.waitFor(() => {
-        expect(mockRendition.display).toHaveBeenCalledTimes(1);
-      });
-
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
-      );
-      expect(mockRendition.resize).not.toHaveBeenCalled();
-
-      resolveInitialDisplay();
-      await openPromise;
-
-      expect(mockRendition.resize).toHaveBeenCalledWith(412, 915);
-      expect(mockRendition.display).toHaveBeenCalledTimes(2);
-      expect(mockRendition.display).toHaveBeenNthCalledWith(2, 'epubcfi(/6/4!/4/2)');
-      session.destroy();
-    } finally {
-      delete renditionWithManager.manager;
-      mockRendition.location = undefined;
-      mockRendition.display.mockImplementation(async () => {});
-    }
-  });
-
-  it('does not let a delayed initial restore relocation consume pending next-page user navigation', async () => {
-    const renditionWithNext = mockRendition as typeof mockRendition & {
-      next?: () => Promise<void>;
-    };
-    renditionWithNext.next = vi.fn(async () => {});
-    mockRendition.getContents.mockReturnValue([
-      {
-        document,
-        window: { getSelection: () => ({ isCollapsed: true }) },
-        sectionIndex: 0,
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/6!/4/2/1:0)',
+        href: 'third.xhtml',
+        index: 2,
+        percentage: 0.5,
+        displayed: { page: 2, total: 4 },
       },
-    ]);
+    } as Location);
 
-    try {
-      const onLocation = vi.fn();
-      const session = new ReaderSession('book.epub');
-      await session.open(
-        document.createElement('div'),
-        null,
-        null,
-        null,
-        defaultAppearance,
-        onLocation,
-        vi.fn(),
-      );
+    expect(onLocation.mock.calls.at(-1)?.[0]).toMatchObject({
+      cfi: 'epubcfi(/6/6!/4/2/1:0)',
+      href: 'third.xhtml',
+    });
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
 
-      const relocated = getRenditionListener('relocated');
-      await session.next();
+    mockRendition.display.mockReset();
+    mockRendition.display.mockResolvedValue(undefined);
+    session.applyAppearance({ ...defaultAppearance, fontSize: 22 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/6!/4/2/1:0)');
 
-      // Chapter 1's queued requestAnimationFrame relocation arrives before Chapter 2's relocation.
-      relocated({
-        start: {
-          cfi: 'epubcfi(/6/2!/4/2/1:0)',
-          href: 'first.xhtml',
-          index: 0,
-          percentage: 0,
-          displayed: { page: 1, total: 1 },
-        },
-      } as Location);
-      relocated({
-        start: {
-          cfi: 'epubcfi(/6/4!/4/2/1:0)',
-          href: 'second.xhtml',
-          index: 1,
-          percentage: 0.5,
-          displayed: { page: 1, total: 1 },
-        },
-      } as Location);
-
-      expect(onLocation).toHaveBeenCalledTimes(2);
-      expect(onLocation.mock.calls[0]?.[0]).toMatchObject({
-        cfi: 'epubcfi(/6/2!/4/2/1:0)',
-        spineIndex: 0,
-      });
-      expect(onLocation.mock.calls[0]?.[1]).toBe('restore');
-      expect(onLocation.mock.calls[1]?.[0]).toMatchObject({
-        cfi: 'epubcfi(/6/4!/4/2/1:0)',
-        spineIndex: 1,
-      });
-      expect(onLocation.mock.calls[1]?.[1]).toBe('navigation');
-      session.destroy();
-    } finally {
-      delete renditionWithNext.next;
-    }
+    session.destroy();
   });
 
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
@@ -1131,6 +1114,13 @@ describe('ReaderSession', () => {
       'text/html',
     );
 
+    for (const id of ['ext', 'mail', 'noteref', 'jump', 'chart', 'vector', 'wrapped-bitmap']) {
+      const element = doc.getElementById(id)!;
+      vi.spyOn(element, 'getClientRects').mockReturnValue([
+        new DOMRect(24, 40, 120, 24),
+      ] as unknown as DOMRectList);
+    }
+
     const contents = {
       document: doc,
       window: {
@@ -1366,37 +1356,29 @@ describe('ReaderSession', () => {
     expect(onHighlight).toHaveBeenCalledTimes(2);
     expect(onTap).not.toHaveBeenCalled();
 
-    // getVisiblePassages returns only visible prose blocks on the current page
-    const createRangeSpy = vi.spyOn(chapterDoc, 'createRange').mockImplementation(() => {
-      let selected: Node | null = null;
-      const fakeRange = {
-        selectNodeContents(node: Node) {
-          selected = node;
-        },
-        setStart(node: Node) {
-          expect(node.nodeType).toBe(3);
-          selected = node.parentElement ?? node;
-        },
-        setEnd() {},
-        getClientRects() {
-          const isFirst = (selected as Element | null)?.id === 'p1';
-          return [
-            isFirst ? new DOMRect(40, 80, 120, 20) : new DOMRect(380, 80, 120, 20),
-          ] as unknown as DOMRectList;
-        },
-        toString() {
-          return selected?.textContent ?? '';
-        },
-      };
-      return fakeRange as unknown as Range;
-    });
+    // getVisiblePassages returns only visible prose blocks on the current page and skips hidden footnotes
+    const hiddenFootnote = chapterDoc.createElement('aside');
+    hiddenFootnote.setAttribute('hidden', '');
+    const hiddenParagraph = chapterDoc.createElement('p');
+    hiddenParagraph.textContent = 'Hidden footnote body';
+    hiddenFootnote.append(hiddenParagraph);
+    chapterDoc.body.append(hiddenFootnote);
+    vi.spyOn(chapterDoc.getElementById('p1')!, 'getClientRects').mockReturnValue([
+      new DOMRect(40, 80, 120, 20),
+    ] as unknown as DOMRectList);
+    vi.spyOn(chapterDoc.getElementById('p2')!, 'getClientRects').mockReturnValue([
+      new DOMRect(380, 80, 120, 20),
+    ] as unknown as DOMRectList);
+    vi.spyOn(hiddenParagraph, 'getClientRects').mockReturnValue([
+      new DOMRect(40, 120, 120, 20),
+    ] as unknown as DOMRectList);
+
     expect(session.getVisiblePassages()).toEqual([
       {
         cfi: visibleCfi,
         text: 'Highlighted passage on current page.',
       },
     ]);
-    createRangeSpy.mockRestore();
 
     session.destroy();
   });
@@ -1636,92 +1618,74 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
-  it('detaches EPUB.js Stage window resize listeners so Android inset resizes cannot race next-page navigation', async () => {
-    const resizeCallbacks: ResizeObserverCallback[] = [];
-    class TestResizeObserver {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallbacks.push(callback);
-      }
-      observe(): void {}
-      disconnect(): void {}
-    }
-    vi.stubGlobal('ResizeObserver', TestResizeObserver);
-
-    const unserializedStageResize = Object.assign(
-      vi.fn(() => {
-        // Simulates EPUB.js Stage window resize firing mid-next() and snapping back to Chapter 1.
-        mockRendition.display('epubcfi(/6/2!/4/2/1:0)');
-      }),
-      { cancel: vi.fn() },
-    );
-    window.addEventListener('resize', unserializedStageResize, false);
-
-    let resolveNext!: () => void;
-    const renditionWithManager = mockRendition as typeof mockRendition & {
-      next?: () => Promise<void>;
-      manager?: { stage?: { resizeFunc?: typeof unserializedStageResize } };
-    };
-    renditionWithManager.next = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveNext = resolve;
-        }),
-    );
-    renditionWithManager.manager = {
-      stage: { resizeFunc: unserializedStageResize },
-    };
+  it('ignores stale cross-section footnote loads when navigation advances before section loading finishes', async () => {
+    let resolveLoad!: (doc: Document) => void;
+    const unload = vi.fn();
+    mockBook.spine.sections = [
+      { href: 'chapter-1.xhtml', index: 0 },
+      {
+        href: 'notes.xhtml',
+        index: 1,
+        load: vi.fn(
+          () =>
+            new Promise<Document>((resolve) => {
+              resolveLoad = resolve;
+            }),
+        ),
+        unload,
+      } as unknown as { href: string; index: number },
+    ];
+    (mockBook as typeof mockBook & { load?: () => Promise<Document> }).load = vi.fn();
 
     try {
-      const viewport = document.createElement('div');
-      vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 411, 850));
-
+      const onFootnote = vi.fn();
       const session = new ReaderSession('book.epub');
-      await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
-      expect(unserializedStageResize.cancel).toHaveBeenCalledOnce();
-
-      const relocated = getRenditionListener('relocated');
-      relocated({
-        start: {
-          cfi: 'epubcfi(/6/2!/4/2/1:0)',
-          href: 'first.xhtml',
-          index: 0,
-          percentage: 0,
-          displayed: { page: 1, total: 1 },
-        },
-      } as Location);
-      mockRendition.display.mockClear();
-
-      const nextPromise = session.next();
-      window.dispatchEvent(new Event('resize'));
-      resizeCallbacks[0]?.(
-        [{ contentRect: { width: 411, height: 914 } } as ResizeObserverEntry],
-        {} as ResizeObserver,
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+        undefined,
+        undefined,
+        { onFootnote },
       );
 
-      expect(unserializedStageResize).not.toHaveBeenCalled();
-      expect(mockRendition.resize).not.toHaveBeenCalled();
+      const hardenHook = mockRendition.hooks.content.register.mock.calls[0]?.[0] as (
+        contents: unknown,
+      ) => Promise<void>;
+      const doc = new DOMParser().parseFromString(
+        '<!doctype html><html><body><p><a id="xref" epub:type="noteref" href="notes.xhtml#n1">[1]</a></p></body></html>',
+        'text/html',
+      );
+      await hardenHook({
+        document: doc,
+        window: { getSelection: () => ({ isCollapsed: true }) },
+        sectionIndex: 0,
+      });
 
-      mockRendition.location = { start: { cfi: 'epubcfi(/6/4!/4/2/1:0)' } };
-      relocated({
-        start: {
-          cfi: 'epubcfi(/6/4!/4/2/1:0)',
-          href: 'second.xhtml',
-          index: 1,
-          percentage: 0.5,
-          displayed: { page: 1, total: 1 },
-        },
-      } as Location);
-      resolveNext();
-      await nextPromise;
+      doc
+        .getElementById('xref')!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
 
-      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(411, 914);
-      expect(mockRendition.display).not.toHaveBeenCalledWith('epubcfi(/6/2!/4/2/1:0)');
+      await session.display('chapter-1.xhtml');
+
+      resolveLoad(
+        new DOMParser().parseFromString(
+          '<!doctype html><html><body><aside id="n1" epub:type="footnote"><p>Cross-chapter note text.</p></aside></body></html>',
+          'text/html',
+        ),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(onFootnote).not.toHaveBeenCalled();
+      expect(unload).toHaveBeenCalledOnce();
       session.destroy();
     } finally {
-      window.removeEventListener('resize', unserializedStageResize, false);
-      delete renditionWithManager.next;
-      delete renditionWithManager.manager;
-      mockRendition.location = undefined;
+      delete (mockBook as typeof mockBook & { load?: unknown }).load;
     }
   });
 });
