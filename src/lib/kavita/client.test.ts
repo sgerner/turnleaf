@@ -314,6 +314,22 @@ it('blocks native requests when WebView is offline despite a stale connected plu
   expect(fetch).not.toHaveBeenCalled();
 });
 
+it('allows native authenticated requests on unvalidated local Wi-Fi when transport is active', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(Network.getStatus).mockResolvedValue({ connected: false, connectionType: 'wifi' });
+  vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
+    status: 200,
+    headers: {},
+    data: '[]',
+    url: '',
+  });
+
+  await expect(
+    new KavitaClient('http://192.168.1.20:5000', 'abc123').getBookSeries(),
+  ).resolves.toEqual([]);
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
+});
+
 it('preserves a Kavita base path in URLs used for covers and downloads', () => {
   const client = new KavitaClient('https://books.example.com/kavita/', 'abc123');
 

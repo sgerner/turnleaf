@@ -4,7 +4,7 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import type { KavitaClient } from '../kavita/client';
+import { KavitaError, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
 const flushing = new Map<string, Promise<void>>();
@@ -22,7 +22,8 @@ export function flushProgress(client: KavitaClient, serverId: string): Promise<v
 async function run(client: KavitaClient, serverId: string): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
-  while (true) {
+  let stoppedByTransport = false;
+  while (!stoppedByTransport) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
@@ -34,6 +35,10 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
         await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
         await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
       } catch (error) {
+        if (error instanceof KavitaError && error.transportDenied) {
+          stoppedByTransport = true;
+          break;
+        }
         await markSyncFailure(
           item.bookId,
           error instanceof Error ? error.message : 'Sync failed',

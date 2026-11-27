@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix: serialize download ownership, handover probes, and offline sync retries
+- fix: ignore superseded offline probe results in networkAvailable
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline
