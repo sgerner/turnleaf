@@ -2,7 +2,6 @@
 
 ## Unreleased
 
-- Harden OPDS diagnostic redaction, Back stack dispatch, and Settings server state
 - Edit Kavita server addresses inline from Settings and accept pasted OPDS URLs without exposing tokens in diagnostics.
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache

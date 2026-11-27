@@ -1,7 +1,18 @@
 export type BackButtonHandler = () => boolean;
+
 export type RegisterBackHandler = (handler: BackButtonHandler) => () => void;
 
-export function createBackButtonStack(options: { exitApp: () => void }) {
+export interface BackButtonStack {
+  register: RegisterBackHandler;
+  dispatch: () => boolean;
+  clear: () => void;
+}
+
+export function createBackButtonStack(
+  options: {
+    exitApp?: (() => void) | undefined;
+  } = {},
+): BackButtonStack {
   const entries: Array<{ handler: BackButtonHandler; active: boolean }> = [];
 
   return {
@@ -21,7 +32,7 @@ export function createBackButtonStack(options: { exitApp: () => void }) {
         const entry = snapshot[index];
         if (entry?.active && entry.handler()) return true;
       }
-      options.exitApp();
+      options.exitApp?.();
       return false;
     },
     clear(): void {
@@ -41,51 +52,62 @@ export function handleOnboardingBack(options: {
   return true;
 }
 
-export function handleLibraryBack(options: {
+export interface LibraryBackState {
   hasConflict: boolean;
   acceptingRemoteProgress: boolean;
   hasActionMenu: boolean;
   hasOpenReader: boolean;
+  resolvingOpenProgress?: boolean;
   editingServerAddress?: boolean;
   savingServerAddress?: boolean;
   confirmDeleteServer?: boolean;
   settingsBusy?: boolean;
   settingsVisible: boolean;
   filtersVisible: boolean;
+}
+
+export interface LibraryBackActions {
   closeConflict: () => void;
-  closeActionMenu: () => void;
+  closeMenu: () => void;
   closeReader: () => void;
+  cancelOpenProgress?: () => void;
   cancelServerAddressEdit?: () => void;
   cancelDeleteServer?: () => void;
   closeSettings: () => void;
-  closeFilters: () => void;
-}): boolean {
-  if (options.hasConflict) {
-    if (!options.acceptingRemoteProgress) options.closeConflict();
+  hideFilters: () => void;
+}
+
+export function handleLibraryBack(state: LibraryBackState, actions: LibraryBackActions): boolean {
+  if (state.hasConflict) {
+    if (!state.acceptingRemoteProgress) actions.closeConflict();
     return true;
   }
-  if (options.hasActionMenu) {
-    options.closeActionMenu();
+  if (state.hasActionMenu) {
+    actions.closeMenu();
     return true;
   }
-  if (options.hasOpenReader) {
-    options.closeReader();
+  if (state.hasOpenReader) {
+    actions.closeReader();
     return true;
   }
-  if (options.settingsVisible && options.editingServerAddress) {
-    if (!options.savingServerAddress) options.cancelServerAddressEdit?.();
+  if (state.resolvingOpenProgress) {
+    actions.cancelOpenProgress?.();
     return true;
   }
-  if (options.settingsVisible && options.confirmDeleteServer) {
-    if (!options.settingsBusy) options.cancelDeleteServer?.();
+  if (state.settingsVisible && state.editingServerAddress) {
+    if (!state.savingServerAddress) actions.cancelServerAddressEdit?.();
     return true;
   }
-  if (options.settingsVisible) {
-    if (!options.savingServerAddress && !options.settingsBusy) options.closeSettings();
+  if (state.settingsVisible && state.confirmDeleteServer) {
+    if (!state.settingsBusy) actions.cancelDeleteServer?.();
     return true;
   }
-  if (options.filtersVisible) {
-    options.closeFilters();
+  if (state.settingsVisible) {
+    if (!state.savingServerAddress && !state.settingsBusy) actions.closeSettings();
+    return true;
+  }
+  if (state.filtersVisible) {
+    actions.hideFilters();
     return true;
   }
   return false;

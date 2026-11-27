@@ -13,41 +13,72 @@ export function flushProgress(
   client: KavitaClient,
   serverId: string,
   canSync: () => boolean | Promise<boolean> = () => true,
+  signal?: AbortSignal,
 ): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId, canSync).finally(() => {
+  const current = run(client, serverId, canSync, signal).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
   return current;
 }
 
+function checkCanSync(
+  canSync: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
+): boolean | Promise<boolean> {
+  if (signal?.aborted) return false;
+  const allowed = canSync();
+  if (allowed instanceof Promise) {
+    return allowed.then((value) => value && !signal?.aborted);
+  }
+  return allowed;
+}
+
+function finishWithFailures(failures: unknown[]): void {
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `${failures.length} reading progress item${failures.length === 1 ? '' : 's'} failed to sync.`,
+    );
+  }
+}
+
 async function run(
   client: KavitaClient,
   serverId: string,
   canSync: () => boolean | Promise<boolean>,
+  signal?: AbortSignal,
 ): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
   while (true) {
+    const allowedBeforeRead = checkCanSync(canSync, signal);
+    if (allowedBeforeRead instanceof Promise ? !(await allowedBeforeRead) : !allowedBeforeRead) {
+      break;
+    }
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
     if (pending.length === 0) break;
-    let paused = false;
     for (const item of pending) {
-      const allowed = canSync();
-      if (!(allowed instanceof Promise ? await allowed : allowed)) {
-        paused = true;
-        break;
+      const allowedBeforeSend = checkCanSync(canSync, signal);
+      if (allowedBeforeSend instanceof Promise ? !(await allowedBeforeSend) : !allowedBeforeSend) {
+        return finishWithFailures(failures);
       }
       attempted.set(item.bookId, item);
       try {
-        await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
-        await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
+        const payload = JSON.parse(item.payload) as KavitaProgress;
+        await (signal ? client.saveProgress(payload, signal) : client.saveProgress(payload));
       } catch (error) {
+        const allowedAfterError = checkCanSync(canSync, signal);
+        if (
+          allowedAfterError instanceof Promise ? !(await allowedAfterError) : !allowedAfterError
+        ) {
+          return finishWithFailures(failures);
+        }
         await markSyncFailure(
           item.bookId,
           error instanceof Error ? error.message : 'Sync failed',
@@ -55,14 +86,11 @@ async function run(
           item.updatedAt,
         );
         failures.push(error);
+        continue;
       }
+      if (signal?.aborted) return finishWithFailures(failures);
+      await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
     }
-    if (paused) break;
   }
-  if (failures.length > 0) {
-    throw new AggregateError(
-      failures,
-      `${failures.length} reading progress item${failures.length === 1 ? '' : 's'} failed to sync.`,
-    );
-  }
+  finishWithFailures(failures);
 }

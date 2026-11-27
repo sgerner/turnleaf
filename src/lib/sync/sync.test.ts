@@ -246,3 +246,29 @@ it('stops without sending saveProgress if connectivity drops before upload start
   expect(stillQueued.syncQueue['book-1']).toBeDefined();
   expect(stillQueued.syncQueue['book-1']?.lastError).toBeNull();
 });
+
+it('preserves queued progress without recording failure when an in-flight upload is aborted offline', async () => {
+  localStorage.setItem(
+    STORAGE_KEY,
+    JSON.stringify(pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}')),
+  );
+  const controller = new AbortController();
+  let connected = true;
+  const saveProgress = vi.fn((_payload: unknown, signal?: AbortSignal) => {
+    expect(signal).toBe(controller.signal);
+    connected = false;
+    controller.abort();
+    return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  });
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', () => connected, controller.signal),
+  ).resolves.toBeUndefined();
+
+  const stillQueued = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(stillQueued.syncQueue['book-1']).toBeDefined();
+  expect(stillQueued.syncQueue['book-1']?.lastError).toBeNull();
+  expect(stillQueued.readingState['book-1']?.pendingSync).toBe(true);
+});

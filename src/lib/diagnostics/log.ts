@@ -66,17 +66,17 @@ function sanitizeEndpoint(value: string): string {
 
   // Endpoints may be passed as request URLs. Keep only the Kavita route, never the
   // origin, reverse proxy prefix, query string, or fragment.
-  const withoutQuery = (value.split(/[?#]/, 1)[0] ?? '').replace(
-    /\/api\/opds(?:\/.*)?$/i,
-    '/api/opds',
-  );
+  const withoutOrigin = (value.split(/[?#]/, 1)[0] ?? '')
+    .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '')
+    .replace(/^\/\/[^/]*/, '')
+    .replace(/\/api\/opds(?:\/.*)?$/i, '/api/opds');
   let apiIndex = -1;
-  for (const match of withoutQuery.matchAll(/\/api(?=\/|$)/gi)) {
+  for (const match of withoutOrigin.matchAll(/\/api(?=\/|$)/gi)) {
     apiIndex = match.index;
   }
   if (apiIndex < 0) return '[unknown endpoint]';
 
-  const route = withoutQuery.slice(apiIndex).replace(/\/(\d+)(?=\/|$)/g, '/:id');
+  const route = withoutOrigin.slice(apiIndex).replace(/\/(\d+)(?=\/|$)/g, '/:id');
   if (!/^\/api(?:\/[a-zA-Z0-9._:-]+)+$/.test(route) || route.includes('..')) {
     return '[unknown endpoint]';
   }

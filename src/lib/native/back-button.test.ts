@@ -67,102 +67,133 @@ describe('Android Back handler stack', () => {
   });
 
   it('closes library overlays in priority order and blocks dismiss while busy', () => {
-    const closeConflict = vi.fn();
-    const closeActionMenu = vi.fn();
-    const closeReader = vi.fn();
-    const cancelServerAddressEdit = vi.fn();
-    const cancelDeleteServer = vi.fn();
-    const closeSettings = vi.fn();
-    const closeFilters = vi.fn();
-    const base = {
+    const actions = {
+      closeConflict: vi.fn(),
+      closeMenu: vi.fn(),
+      closeReader: vi.fn(),
+      cancelOpenProgress: vi.fn(),
+      cancelServerAddressEdit: vi.fn(),
+      cancelDeleteServer: vi.fn(),
+      closeSettings: vi.fn(),
+      hideFilters: vi.fn(),
+    };
+    const baseState = {
       hasConflict: false,
       acceptingRemoteProgress: false,
       hasActionMenu: false,
       hasOpenReader: false,
+      resolvingOpenProgress: false,
       editingServerAddress: false,
       savingServerAddress: false,
       confirmDeleteServer: false,
       settingsBusy: false,
       settingsVisible: false,
       filtersVisible: false,
-      closeConflict,
-      closeActionMenu,
-      closeReader,
-      cancelServerAddressEdit,
-      cancelDeleteServer,
-      closeSettings,
-      closeFilters,
     };
 
-    expect(handleLibraryBack({ ...base, hasConflict: true, acceptingRemoteProgress: true })).toBe(
-      true,
-    );
-    expect(closeConflict).not.toHaveBeenCalled();
-
-    expect(handleLibraryBack({ ...base, hasConflict: true, hasActionMenu: true })).toBe(true);
-    expect(closeConflict).toHaveBeenCalledOnce();
-    expect(closeActionMenu).not.toHaveBeenCalled();
-
-    expect(handleLibraryBack({ ...base, hasActionMenu: true, settingsVisible: true })).toBe(true);
-    expect(closeActionMenu).toHaveBeenCalledOnce();
-    expect(closeSettings).not.toHaveBeenCalled();
-
-    expect(handleLibraryBack({ ...base, hasOpenReader: true, filtersVisible: true })).toBe(true);
-    expect(closeReader).toHaveBeenCalledOnce();
-    expect(closeFilters).not.toHaveBeenCalled();
+    expect(
+      handleLibraryBack(
+        { ...baseState, hasConflict: true, acceptingRemoteProgress: true },
+        actions,
+      ),
+    ).toBe(true);
+    expect(actions.closeConflict).not.toHaveBeenCalled();
 
     expect(
-      handleLibraryBack({
-        ...base,
-        settingsVisible: true,
-        editingServerAddress: true,
-        savingServerAddress: true,
-      }),
+      handleLibraryBack({ ...baseState, hasConflict: true, hasActionMenu: true }, actions),
     ).toBe(true);
-    expect(cancelServerAddressEdit).not.toHaveBeenCalled();
-    expect(closeSettings).not.toHaveBeenCalled();
+    expect(actions.closeConflict).toHaveBeenCalledOnce();
+    expect(actions.closeMenu).not.toHaveBeenCalled();
 
     expect(
-      handleLibraryBack({
-        ...base,
-        settingsVisible: true,
-        editingServerAddress: true,
-      }),
+      handleLibraryBack({ ...baseState, hasActionMenu: true, settingsVisible: true }, actions),
     ).toBe(true);
-    expect(cancelServerAddressEdit).toHaveBeenCalledOnce();
-    expect(closeSettings).not.toHaveBeenCalled();
+    expect(actions.closeMenu).toHaveBeenCalledOnce();
+    expect(actions.closeSettings).not.toHaveBeenCalled();
 
     expect(
-      handleLibraryBack({
-        ...base,
-        settingsVisible: true,
-        confirmDeleteServer: true,
-        settingsBusy: true,
-      }),
+      handleLibraryBack({ ...baseState, hasOpenReader: true, filtersVisible: true }, actions),
     ).toBe(true);
-    expect(cancelDeleteServer).not.toHaveBeenCalled();
-    expect(closeSettings).not.toHaveBeenCalled();
+    expect(actions.closeReader).toHaveBeenCalledOnce();
+    expect(actions.hideFilters).not.toHaveBeenCalled();
 
     expect(
-      handleLibraryBack({
-        ...base,
-        settingsVisible: true,
-        confirmDeleteServer: true,
-      }),
+      handleLibraryBack(
+        { ...baseState, resolvingOpenProgress: true, filtersVisible: true },
+        actions,
+      ),
     ).toBe(true);
-    expect(cancelDeleteServer).toHaveBeenCalledOnce();
-    expect(closeSettings).not.toHaveBeenCalled();
+    expect(actions.cancelOpenProgress).toHaveBeenCalledOnce();
+    expect(actions.hideFilters).not.toHaveBeenCalled();
 
-    expect(handleLibraryBack({ ...base, settingsVisible: true, settingsBusy: true })).toBe(true);
-    expect(closeSettings).not.toHaveBeenCalled();
+    expect(
+      handleLibraryBack(
+        {
+          ...baseState,
+          settingsVisible: true,
+          editingServerAddress: true,
+          savingServerAddress: true,
+        },
+        actions,
+      ),
+    ).toBe(true);
+    expect(actions.cancelServerAddressEdit).not.toHaveBeenCalled();
+    expect(actions.closeSettings).not.toHaveBeenCalled();
 
-    expect(handleLibraryBack({ ...base, settingsVisible: true, filtersVisible: true })).toBe(true);
-    expect(closeSettings).toHaveBeenCalledOnce();
-    expect(closeFilters).not.toHaveBeenCalled();
+    expect(
+      handleLibraryBack(
+        {
+          ...baseState,
+          settingsVisible: true,
+          editingServerAddress: true,
+        },
+        actions,
+      ),
+    ).toBe(true);
+    expect(actions.cancelServerAddressEdit).toHaveBeenCalledOnce();
+    expect(actions.closeSettings).not.toHaveBeenCalled();
 
-    expect(handleLibraryBack({ ...base, filtersVisible: true })).toBe(true);
-    expect(closeFilters).toHaveBeenCalledOnce();
+    expect(
+      handleLibraryBack(
+        {
+          ...baseState,
+          settingsVisible: true,
+          confirmDeleteServer: true,
+          settingsBusy: true,
+        },
+        actions,
+      ),
+    ).toBe(true);
+    expect(actions.cancelDeleteServer).not.toHaveBeenCalled();
+    expect(actions.closeSettings).not.toHaveBeenCalled();
 
-    expect(handleLibraryBack(base)).toBe(false);
+    expect(
+      handleLibraryBack(
+        {
+          ...baseState,
+          settingsVisible: true,
+          confirmDeleteServer: true,
+        },
+        actions,
+      ),
+    ).toBe(true);
+    expect(actions.cancelDeleteServer).toHaveBeenCalledOnce();
+    expect(actions.closeSettings).not.toHaveBeenCalled();
+
+    expect(
+      handleLibraryBack({ ...baseState, settingsVisible: true, settingsBusy: true }, actions),
+    ).toBe(true);
+    expect(actions.closeSettings).not.toHaveBeenCalled();
+
+    expect(
+      handleLibraryBack({ ...baseState, settingsVisible: true, filtersVisible: true }, actions),
+    ).toBe(true);
+    expect(actions.closeSettings).toHaveBeenCalledOnce();
+    expect(actions.hideFilters).not.toHaveBeenCalled();
+
+    expect(handleLibraryBack({ ...baseState, filtersVisible: true }, actions)).toBe(true);
+    expect(actions.hideFilters).toHaveBeenCalledOnce();
+
+    expect(handleLibraryBack(baseState, actions)).toBe(false);
   });
 });
