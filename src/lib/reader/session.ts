@@ -102,8 +102,6 @@ const RESOURCE_ATTRIBUTES = new Set([
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:gif|jpe?g|png|webp|avif);base64,[a-z0-9+/=\s]+$/i;
 const SAFE_DATA_STYLESHEET = /^data:text\/css(?:;charset=[^;,]+)?(?:;base64)?,/i;
-const RESIZE_FALLBACK_DELAY_MS = 1_000;
-const RELOCATION_SETTLE_TIMEOUT_MS = 1_500;
 const PASSAGE_BLOCK_SELECTOR = 'p, li, blockquote, pre, h1, h2, h3, h4, h5, h6, dt, dd, figcaption';
 const FOCUSABLE_LINK_SELECTOR = 'a[href], area[href]';
 const SAVED_TABINDEX_ATTR = 'data-turnleaf-tabindex';
@@ -392,16 +390,6 @@ export class ReaderSession {
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private viewportSize: { width: number; height: number } | null = null;
-  private pendingViewportSize: { width: number; height: number } | null = null;
-  private pendingResizeFallbackTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastDisplayTarget: { target: string | undefined } | null = null;
-  private opening = false;
-  private openPromise: Promise<void> | null = null;
-  private resizeRecoveryPromise: Promise<void> | null = null;
-  private resizeRelocationPending = false;
-  private relocationCount = 0;
-  private pendingNavigationCount = 0;
-  private relocationWaiters: Array<(didRelocate: boolean) => void> = [];
   private viewportTarget: HTMLElement | null = null;
   private epubContainer: HTMLElement | null = null;
   private lockedScrollLeft = 0;
@@ -453,230 +441,195 @@ export class ReaderSession {
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
     this.viewportTarget = target;
-    const initialBounds = target.getBoundingClientRect();
-    const initialWidth = Math.floor(initialBounds.width);
-    const initialHeight = Math.floor(initialBounds.height);
-    this.opening = true;
-    const openOperation = (async () => {
-      this.rendition = this.book.renderTo(target, {
-        width: initialWidth > 0 ? initialWidth : '100%',
-        height: initialHeight > 0 ? initialHeight : '100%',
-        manager: 'default',
-        flow: 'paginated',
-        spread: 'none',
-        resizeOnOrientationChange: false,
-        allowScriptedContent: false,
+    this.rendition = this.book.renderTo(target, {
+      width: '100%',
+      height: '100%',
+      manager: 'default',
+      flow: 'paginated',
+      spread: 'none',
+      resizeOnOrientationChange: true,
+      allowScriptedContent: false,
+    });
+    this.observeViewport(target);
+    this.bindEpubContainer();
+    this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
+    if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
+      this.unloadedHookRegistered = true;
+      this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
+        if (view?.contents) this.cleanupContents(view.contents);
       });
-      this.observeViewport(target, initialWidth, initialHeight);
-      this.bindEpubContainer();
-      this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
-      if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
-        this.unloadedHookRegistered = true;
-        this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
-          if (view?.contents) this.cleanupContents(view.contents);
-        });
-      }
-      if (onSelection) {
-        this.rendition.hooks.content.register((contents: Contents) => {
-          this.registerContentFocusAndLinks(contents);
-          let tabKeyActive = false;
-          let blurredByTab = false;
-          let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
+    }
+    if (onSelection) {
+      this.rendition.hooks.content.register((contents: Contents) => {
+        this.registerContentFocusAndLinks(contents);
+        let tabKeyActive = false;
+        let blurredByTab = false;
+        let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-          const clearTabTimer = () => {
-            if (tabResetTimer !== null) {
-              clearTimeout(tabResetTimer);
+        const clearTabTimer = () => {
+          if (tabResetTimer !== null) {
+            clearTimeout(tabResetTimer);
+            tabResetTimer = null;
+          }
+        };
+        const handleKeydown = (event: KeyboardEvent) => {
+          if (event.key === 'Tab') {
+            tabKeyActive = true;
+            clearTabTimer();
+            tabResetTimer = setTimeout(() => {
               tabResetTimer = null;
-            }
-          };
-          const handleKeydown = (event: KeyboardEvent) => {
-            if (event.key === 'Tab') {
-              tabKeyActive = true;
-              clearTabTimer();
-              tabResetTimer = setTimeout(() => {
-                tabResetTimer = null;
-                tabKeyActive = false;
-              }, 0);
-            } else {
-              clearTabTimer();
               tabKeyActive = false;
-              blurredByTab = false;
-            }
-          };
-          const handleWindowBlur = () => {
-            if (tabKeyActive) blurredByTab = true;
-          };
-          const handleFocusOut = (event: FocusEvent) => {
-            if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
-          };
-          const clearBlurGuard = () => {
+            }, 0);
+          } else {
             clearTabTimer();
             tabKeyActive = false;
             blurredByTab = false;
-          };
-          const handler = () => {
-            const selection = contents.window.getSelection();
-            const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
-            const text = hasRange ? normalizePassageText(selection!.toString()) : '';
-            if (!hasRange || !text) {
-              const frame = contents.window.frameElement as HTMLElement | null | undefined;
-              const frameLostFocus = frame
-                ? frame.ownerDocument.activeElement !== frame
-                : typeof contents.document.hasFocus === 'function'
-                  ? !contents.document.hasFocus()
-                  : false;
-              if (blurredByTab || (tabKeyActive && frameLostFocus)) {
-                return;
-              }
-              onSelection(null);
+          }
+        };
+        const handleWindowBlur = () => {
+          if (tabKeyActive) blurredByTab = true;
+        };
+        const handleFocusOut = (event: FocusEvent) => {
+          if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
+        };
+        const clearBlurGuard = () => {
+          clearTabTimer();
+          tabKeyActive = false;
+          blurredByTab = false;
+        };
+        const handler = () => {
+          const selection = contents.window.getSelection();
+          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+          if (!hasRange || !text) {
+            const frame = contents.window.frameElement as HTMLElement | null | undefined;
+            const frameLostFocus = frame
+              ? frame.ownerDocument.activeElement !== frame
+              : typeof contents.document.hasFocus === 'function'
+                ? !contents.document.hasFocus()
+                : false;
+            if (blurredByTab || (tabKeyActive && frameLostFocus)) {
               return;
             }
-            blurredByTab = false;
-            try {
-              onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
-            } catch {
-              // Selection can change while a section is being replaced.
-            }
-          };
-          contents.document.addEventListener('keydown', handleKeydown, true);
-          contents.document.addEventListener('focusout', handleFocusOut);
-          contents.document.addEventListener('focusin', clearBlurGuard);
-          contents.document.addEventListener('pointerdown', clearBlurGuard);
-          contents.document.addEventListener('mousedown', clearBlurGuard);
-          contents.document.addEventListener('selectionchange', handler);
-          contents.window.addEventListener?.('blur', handleWindowBlur);
-          contents.window.addEventListener?.('focus', clearBlurGuard);
-          this.addContentCleanup(contents, () => {
-            clearTabTimer();
-            contents.document.removeEventListener('keydown', handleKeydown, true);
-            contents.document.removeEventListener('focusout', handleFocusOut);
-            contents.document.removeEventListener('focusin', clearBlurGuard);
-            contents.document.removeEventListener('pointerdown', clearBlurGuard);
-            contents.document.removeEventListener('mousedown', clearBlurGuard);
-            contents.document.removeEventListener('selectionchange', handler);
-            contents.window.removeEventListener?.('blur', handleWindowBlur);
-            contents.window.removeEventListener?.('focus', clearBlurGuard);
-          });
+            onSelection(null);
+            return;
+          }
+          blurredByTab = false;
+          try {
+            onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
+          } catch {
+            // Selection can change while a section is being replaced.
+          }
+        };
+        contents.document.addEventListener('keydown', handleKeydown, true);
+        contents.document.addEventListener('focusout', handleFocusOut);
+        contents.document.addEventListener('focusin', clearBlurGuard);
+        contents.document.addEventListener('pointerdown', clearBlurGuard);
+        contents.document.addEventListener('mousedown', clearBlurGuard);
+        contents.document.addEventListener('selectionchange', handler);
+        contents.window.addEventListener?.('blur', handleWindowBlur);
+        contents.window.addEventListener?.('focus', clearBlurGuard);
+        this.addContentCleanup(contents, () => {
+          clearTabTimer();
+          contents.document.removeEventListener('keydown', handleKeydown, true);
+          contents.document.removeEventListener('focusout', handleFocusOut);
+          contents.document.removeEventListener('focusin', clearBlurGuard);
+          contents.document.removeEventListener('pointerdown', clearBlurGuard);
+          contents.document.removeEventListener('mousedown', clearBlurGuard);
+          contents.document.removeEventListener('selectionchange', handler);
+          contents.window.removeEventListener?.('blur', handleWindowBlur);
+          contents.window.removeEventListener?.('focus', clearBlurGuard);
         });
+      });
+    }
+    this.onLocation = onLocation;
+    this.relocated = (location) => {
+      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const isUserNavigation =
+        this.userNavigationPending &&
+        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
+      if (startCfi !== location.start.cfi) onSelection?.(null);
+      this.current = location;
+      if (isUserNavigation || this.userNavigationOrigin === 'link') {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
+        this.pendingLinkReturnTarget = null;
       }
-      this.onLocation = onLocation;
-      this.relocated = (location) => {
-        this.relocationCount += 1;
-        const wasResizeRelocation = this.resizeRelocationPending;
-        this.resizeRelocationPending = false;
-        const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-        const isUserNavigation =
-          !wasResizeRelocation &&
-          this.userNavigationPending &&
-          (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-        const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
-        const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-        if (startCfi !== location.start.cfi) onSelection?.(null);
-        this.current = location;
-        this.lastDisplayTarget = { target: location.start.cfi };
-        if (isUserNavigation || (!wasResizeRelocation && this.userNavigationOrigin === 'link')) {
-          this.userNavigationPending = false;
-          this.userNavigationStartCfi = null;
-          this.userNavigationOrigin = 'navigation';
-          this.pendingLinkReturnTarget = null;
-        }
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-        this.reportLocation(location, origin, returnTarget);
-        if (
-          this.reflowPending &&
-          !this.userNavigationPending &&
-          this.pendingNavigationCount === 0
-        ) {
-          this.reflowPending = false;
-          this.preserveCfi(location.start.cfi, this.locationGeneration);
-        }
-        this.flushPendingViewportResize();
-        this.resolveRelocationWaiters(true);
-      };
-      this.rendition.on('relocated', this.relocated);
-      this.renderedListener = () => {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-      };
-      this.resizedListener = () => {
-        if (this.rendition?.location?.start) {
-          this.resizeRelocationPending = true;
-        }
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-      };
-      this.rendition.on('rendered', this.renderedListener);
-      this.rendition.on('resized', this.resizedListener);
-      this.contentClick = (event, contents) => {
-        const eventTarget = event.target as Element | null;
-        const selection = contents.window.getSelection();
-        if (selection && !selection.isCollapsed) return;
-        const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
-        if (link) {
-          const href = link.getAttribute('href') ?? '';
-          if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
-          return;
-        }
-        if (
-          event.defaultPrevented ||
-          eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
-        ) {
-          return;
-        }
-        const frame = contents.window.frameElement;
-        const viewport = target.getBoundingClientRect();
-        if (!frame || viewport.width === 0) return;
-        // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
-        const position =
-          (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
-        onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
-      };
-      this.rendition.on('click', this.contentClick);
-      if (onKeyboardNavigation) {
-        this.keyboardNavigation = onKeyboardNavigation;
-        this.rendition.on('keydown', this.keyboardNavigation);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+      this.reportLocation(location, origin, returnTarget);
+      if (this.reflowPending) {
+        this.reflowPending = false;
+        this.preserveCfi(location.start.cfi, this.locationGeneration);
       }
-      this.applyAppearance(appearance);
-      const restoreGeneration = this.beginLocationOperation(false);
-      await this.rendition.started;
-      this.bindEpubContainer();
-      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-      if (cfi) {
-        try {
-          if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
-        } catch {
-          // A saved CFI can name a section removed in a newer copy of the EPUB.
-        }
+    };
+    this.rendition.on('relocated', this.relocated);
+    this.renderedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.resizedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.rendition.on('rendered', this.renderedListener);
+    this.rendition.on('resized', this.resizedListener);
+    this.contentClick = (event, contents) => {
+      const eventTarget = event.target as Element | null;
+      const selection = contents.window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
+      if (link) {
+        const href = link.getAttribute('href') ?? '';
+        if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
+        return;
       }
-      if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
       if (
-        serverPercentage &&
-        serverPercentage > 0 &&
-        (await this.displayPercentage(serverPercentage, restoreGeneration))
+        event.defaultPrevented ||
+        eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
       ) {
         return;
       }
-      await this.displayAtGeneration(undefined, restoreGeneration);
-    })();
-    this.openPromise = openOperation;
-    let opened = false;
-    try {
-      await openOperation;
-      opened = true;
-    } finally {
-      if (this.openPromise === openOperation) this.openPromise = null;
-      this.opening = false;
-      if (opened) {
-        this.flushPendingViewportResize();
-      } else {
-        this.pendingViewportSize = null;
-        this.clearPendingResizeFallback();
+      const frame = contents.window.frameElement;
+      const viewport = target.getBoundingClientRect();
+      if (!frame || viewport.width === 0) return;
+      // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
+      const position =
+        (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
+      onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
+    };
+    this.rendition.on('click', this.contentClick);
+    if (onKeyboardNavigation) {
+      this.keyboardNavigation = onKeyboardNavigation;
+      this.rendition.on('keydown', this.keyboardNavigation);
+    }
+    this.applyAppearance(appearance);
+    const restoreGeneration = this.beginLocationOperation(false);
+    await this.rendition.started;
+    this.bindEpubContainer();
+    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    if (cfi) {
+      try {
+        if (await this.displayAtGeneration(cfi, restoreGeneration)) return;
+      } catch {
+        // A saved CFI can name a section removed in a newer copy of the EPUB.
       }
     }
+    if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
+    if (
+      serverPercentage &&
+      serverPercentage > 0 &&
+      (await this.displayPercentage(serverPercentage, restoreGeneration))
+    ) {
+      return;
+    }
+    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -968,7 +921,7 @@ export class ReaderSession {
     this.syncVisibleColumnLinks();
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
-    if (this.userNavigationPending || this.pendingNavigationCount > 0) {
+    if (this.userNavigationPending) {
       this.reflowPending = true;
       return;
     }
@@ -996,16 +949,7 @@ export class ReaderSession {
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
-    this.clearPendingResizeFallback();
     this.viewportSize = null;
-    this.pendingViewportSize = null;
-    this.lastDisplayTarget = null;
-    this.opening = false;
-    this.openPromise = null;
-    this.resizeRecoveryPromise = null;
-    this.resizeRelocationPending = false;
-    this.relocationCount = 0;
-    this.pendingNavigationCount = 0;
     this.viewportTarget = null;
     this.lockedScrollLeft = 0;
     this.displayOperationCount = 0;
@@ -1015,15 +959,11 @@ export class ReaderSession {
     this.relocated = null;
     this.renderedListener = null;
     this.resizedListener = null;
-    this.resolveRelocationWaiters(false);
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
-    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
-    this.userNavigationOrigin = 'navigation';
-    this.pendingLinkReturnTarget = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1188,9 +1128,7 @@ export class ReaderSession {
   }
 
   private isProgrammaticScrollAllowed(): boolean {
-    return (
-      this.displayOperationCount > 0 || this.userNavigationPending || this.resizeRelocationPending
-    );
+    return this.displayOperationCount > 0 || this.userNavigationPending;
   }
 
   private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -1202,7 +1140,6 @@ export class ReaderSession {
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
       this.syncVisibleColumnLinks();
-      this.flushPendingViewportResize();
     }
   }
 
@@ -1370,8 +1307,9 @@ export class ReaderSession {
     return cfi && text ? [{ cfi, text }] : [];
   }
 
-  private observeViewport(target: HTMLElement, initialWidth: number, initialHeight: number): void {
-    this.viewportSize = { width: initialWidth, height: initialHeight };
+  private observeViewport(target: HTMLElement): void {
+    const initial = target.getBoundingClientRect();
+    this.viewportSize = { width: Math.floor(initial.width), height: Math.floor(initial.height) };
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -1380,170 +1318,19 @@ export class ReaderSession {
       const width = Math.floor(entry.contentRect.width);
       const height = Math.floor(entry.contentRect.height);
       if (!width || !height) return;
-      if (
-        !this.pendingViewportSize &&
-        this.viewportSize?.width === width &&
-        this.viewportSize.height === height
-      ) {
-        return;
+      if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+      this.viewportSize = { width, height };
+      this.displayOperationCount += 1;
+      try {
+        this.rendition.resize(width, height);
+      } finally {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+        this.syncVisibleColumnLinks();
       }
-      if (this.shouldDeferViewportResize()) {
-        if (this.viewportSize?.width === width && this.viewportSize.height === height) {
-          this.pendingViewportSize = null;
-          this.clearPendingResizeFallback();
-          return;
-        }
-        this.pendingViewportSize = { width, height };
-        this.schedulePendingResizeFallback();
-        return;
-      }
-      this.applyViewportResize(width, height);
     });
     this.resizeObserver.observe(target);
-  }
-
-  private hasUnlocatedRenderedView(): boolean {
-    const rendition = this.rendition as
-      (Rendition & { manager?: { views?: { length?: number } } }) | null;
-    if (!rendition) return false;
-    const viewCount = rendition.manager?.views?.length ?? 0;
-    return viewCount > 0 && !this.current && !rendition.location?.start;
-  }
-
-  private shouldDeferViewportResize(): boolean {
-    return (
-      this.opening ||
-      this.displayOperationCount > 0 ||
-      this.userNavigationPending ||
-      this.pendingNavigationCount > 0 ||
-      this.resizeRecoveryPromise !== null ||
-      this.resizeRelocationPending ||
-      this.hasUnlocatedRenderedView()
-    );
-  }
-
-  private clearPendingResizeFallback(): void {
-    if (this.pendingResizeFallbackTimer !== null) {
-      clearTimeout(this.pendingResizeFallbackTimer);
-      this.pendingResizeFallbackTimer = null;
-    }
-  }
-
-  private schedulePendingResizeFallback(): void {
-    if (this.pendingResizeFallbackTimer !== null) return;
-    this.pendingResizeFallbackTimer = setTimeout(() => {
-      this.pendingResizeFallbackTimer = null;
-      if (!this.pendingViewportSize) return;
-      if (
-        this.opening ||
-        this.displayOperationCount > 0 ||
-        this.userNavigationPending ||
-        this.pendingNavigationCount > 0 ||
-        this.resizeRecoveryPromise !== null
-      ) {
-        this.schedulePendingResizeFallback();
-        return;
-      }
-      this.resizeRelocationPending = false;
-      const pending = this.pendingViewportSize;
-      this.pendingViewportSize = null;
-      this.applyViewportResize(pending.width, pending.height);
-    }, RESIZE_FALLBACK_DELAY_MS);
-  }
-
-  private flushPendingViewportResize(): void {
-    if (this.shouldDeferViewportResize() || !this.pendingViewportSize) return;
-    this.clearPendingResizeFallback();
-    const pending = this.pendingViewportSize;
-    this.pendingViewportSize = null;
-    this.applyViewportResize(pending.width, pending.height);
-  }
-
-  private applyViewportResize(width: number, height: number): void {
-    const rendition = this.rendition;
-    if (!rendition) return;
-    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
-    this.viewportSize = { width, height };
-    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi;
-    this.displayOperationCount += 1;
-    try {
-      if (cfi) {
-        (
-          rendition as typeof rendition & {
-            resize: (width: number, height: number, epubcfi?: string) => void;
-          }
-        ).resize(width, height, cfi);
-      } else {
-        rendition.resize(width, height);
-      }
-    } finally {
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-      this.syncVisibleColumnLinks();
-    }
-    if (cfi) {
-      if (!rendition.location?.start) {
-        this.reopenAfterUnlocatedResize(cfi, this.locationGeneration);
-      }
-      return;
-    }
-    if (this.lastDisplayTarget !== null) {
-      this.reopenAfterUnlocatedResize(this.lastDisplayTarget.target, this.locationGeneration);
-    }
-  }
-
-  private reopenAfterUnlocatedResize(target: string | undefined, generation: number): void {
-    const relocationCountBefore = this.relocationCount;
-    const recovery = this.displayAtGeneration(target, generation)
-      .then((applied) => {
-        const rendition = this.rendition as
-          (Rendition & { manager?: { views?: { length?: number } } }) | null;
-        if (
-          applied &&
-          this.relocationCount === relocationCountBefore &&
-          (rendition?.manager?.views?.length ?? 0) > 0 &&
-          !rendition?.location?.start
-        ) {
-          this.resizeRelocationPending = true;
-        }
-      })
-      .catch(() => {
-        // Recovery display is best-effort if the reader closes during resize.
-      })
-      .finally(() => {
-        if (this.resizeRecoveryPromise === recovery) {
-          this.resizeRecoveryPromise = null;
-        }
-        this.flushPendingViewportResize();
-      });
-    this.resizeRecoveryPromise = recovery;
-  }
-
-  private waitForNextRelocation(timeoutMs = RELOCATION_SETTLE_TIMEOUT_MS): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      const finish = (didRelocate: boolean) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const index = this.relocationWaiters.indexOf(finish);
-        if (index >= 0) this.relocationWaiters.splice(index, 1);
-        resolve(didRelocate);
-      };
-      const timer = setTimeout(() => {
-        this.resizeRelocationPending = false;
-        finish(false);
-      }, timeoutMs);
-      this.relocationWaiters.push(finish);
-    });
-  }
-
-  private resolveRelocationWaiters(didRelocate: boolean): void {
-    const waiters = this.relocationWaiters.splice(0);
-    for (const resolve of waiters) {
-      resolve(didRelocate);
-    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -1581,10 +1368,10 @@ export class ReaderSession {
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    this.lastDisplayTarget = { target };
-    await this.runDisplayOperation(() =>
-      target === undefined ? rendition.display() : rendition.display(target),
-    );
+    await this.runDisplayOperation(async () => {
+      if (target === undefined) await rendition.display();
+      else await rendition.display(target);
+    });
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -1596,23 +1383,19 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      return await this.runDisplayOperation(async () => {
-        this.lastDisplayTarget = { target: section.href };
-        await rendition.display(section.href);
-        if (!this.isCurrentLocationOperation(generation)) return false;
-        if (target.contentXPath === '/html/body') return true;
-        const contents = (rendition.getContents() as unknown as Contents[]).find(
-          (item) => item.sectionIndex === target.spineIndex,
-        );
-        if (!contents) return false;
-        const node = resolveContentXPath(contents.document, target.contentXPath);
-        if (!node) return false;
-        const cfi = this.cfiFromXPathNode(contents, node);
-        if (!(contents.range(cfi) as Range | null)) return false;
-        this.lastDisplayTarget = { target: cfi };
-        await rendition.display(cfi);
-        return this.isCurrentLocationOperation(generation);
-      });
+      await this.runDisplayOperation(() => rendition.display(section.href));
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      if (target.contentXPath === '/html/body') return true;
+      const contents = (rendition.getContents() as unknown as Contents[]).find(
+        (item) => item.sectionIndex === target.spineIndex,
+      );
+      if (!contents) return false;
+      const node = resolveContentXPath(contents.document, target.contentXPath);
+      if (!node) return false;
+      const cfi = this.cfiFromXPathNode(contents, node);
+      if (!(contents.range(cfi) as Range | null)) return false;
+      await this.runDisplayOperation(() => rendition.display(cfi));
+      return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
       return false;
@@ -1649,35 +1432,15 @@ export class ReaderSession {
   }
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {
-    this.pendingNavigationCount += 1;
+    const generation = this.beginLocationOperation(true);
     try {
-      if (this.openPromise) {
-        await this.openPromise.catch(() => {});
+      await this.runDisplayOperation(display);
+    } catch (error) {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
       }
-      if (this.resizeRecoveryPromise) {
-        await this.resizeRecoveryPromise.catch(() => {});
-      }
-      while (this.rendition && (this.hasUnlocatedRenderedView() || this.resizeRelocationPending)) {
-        const didRelocate = await this.waitForNextRelocation();
-        if (!didRelocate) break;
-        if (this.resizeRecoveryPromise) {
-          await this.resizeRecoveryPromise.catch(() => {});
-        }
-      }
-      if (!this.rendition) return;
-      const generation = this.beginLocationOperation(true);
-      try {
-        await this.runDisplayOperation(display);
-      } catch (error) {
-        if (this.isCurrentLocationOperation(generation)) {
-          this.userNavigationPending = false;
-          this.userNavigationStartCfi = null;
-        }
-        throw error;
-      }
-    } finally {
-      this.pendingNavigationCount = Math.max(0, this.pendingNavigationCount - 1);
-      this.flushPendingViewportResize();
+      throw error;
     }
   }
 
@@ -1708,15 +1471,9 @@ export class ReaderSession {
 
   private preserveCfi(cfi: string, generation: number): void {
     const rendition = this.rendition;
-    if (
-      !rendition ||
-      !this.isCurrentLocationOperation(generation) ||
-      this.userNavigationPending ||
-      this.pendingNavigationCount > 0
-    ) {
+    if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    this.lastDisplayTarget = { target: cfi };
     void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
