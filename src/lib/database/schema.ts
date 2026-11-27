@@ -1,23 +1,5 @@
 export const BOOKS_SERVER_FILE_INDEX_NAME = 'books_server_file_idx';
 
-export const BOOKS_SERVER_FILE_INDEX_SQL =
-  'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);';
-
-export const COORDINATED_BOOK_COLUMNS = [
-  { name: 'file_id', definition: 'INTEGER', version: 8 },
-  { name: 'file_name', definition: 'TEXT', version: 8 },
-  { name: 'remote_file_size', definition: 'INTEGER', version: 8 },
-  { name: 'downloaded_bytes', definition: 'INTEGER', version: 8 },
-  { name: 'downloaded_pages', definition: 'INTEGER', version: 8 },
-  { name: 'chapter_key', definition: 'TEXT', version: 8 },
-  { name: 'chapter_epub_index', definition: 'INTEGER NOT NULL DEFAULT 0', version: 8 },
-  { name: 'multi_file_chapter', definition: 'INTEGER NOT NULL DEFAULT 0', version: 8 },
-  { name: 'sync_progress', definition: 'INTEGER NOT NULL DEFAULT 1', version: 8 },
-  { name: 'sort_order', definition: 'REAL', version: 9 },
-  { name: 'min_number', definition: 'REAL', version: 9 },
-  { name: 'volume_number', definition: 'REAL', version: 9 },
-] as const;
-
 export const migrations = [
   {
     version: 1,
@@ -128,12 +110,17 @@ export const migrations = [
   {
     version: 8,
     statements: `
-      ALTER TABLE books ADD COLUMN file_id INTEGER;
-      ALTER TABLE books ADD COLUMN file_name TEXT;
       ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
       ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
       ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
       ALTER TABLE books ADD COLUMN chapter_key TEXT;
+    `,
+  },
+  {
+    version: 9,
+    statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
       ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
@@ -141,7 +128,7 @@ export const migrations = [
     `,
   },
   {
-    version: 9,
+    version: 10,
     statements: `
       ALTER TABLE books ADD COLUMN sort_order REAL;
       ALTER TABLE books ADD COLUMN min_number REAL;

@@ -2,7 +2,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
-import { BOOKS_SERVER_FILE_INDEX_NAME, COORDINATED_BOOK_COLUMNS, migrations } from './schema';
+import { BOOKS_SERVER_FILE_INDEX_NAME, migrations } from './schema';
 
 describe('native library indexes', () => {
   let db: DatabaseSync;
@@ -30,18 +30,38 @@ describe('native library indexes', () => {
     expect(plan.some((row) => row.detail.includes('books_server_title_idx'))).toBe(true);
   });
 
-  it('defines coordinated v8 and v9 book columns without duplicates and indexes server file lookups', () => {
-    const addedBookColumns = migrations.flatMap((migration) =>
-      Array.from(
-        migration.statements.matchAll(/ALTER TABLE books ADD COLUMN (\w+)/g),
-        (match) => match[1]!,
-      ),
+  it('defines non-overlapping v8, v9, and v10 book migrations and indexes server file lookups', () => {
+    expect(migrations.map((migration) => migration.version)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    ]);
+
+    const columnsByVersion = new Map(
+      migrations.map((migration) => [
+        migration.version,
+        Array.from(
+          migration.statements.matchAll(/ALTER TABLE books ADD COLUMN (\w+)/g),
+          (match) => match[1]!,
+        ),
+      ]),
     );
+    expect(columnsByVersion.get(8)).toEqual([
+      'remote_file_size',
+      'downloaded_bytes',
+      'downloaded_pages',
+      'chapter_key',
+    ]);
+    expect(columnsByVersion.get(9)).toEqual([
+      'file_id',
+      'file_name',
+      'chapter_epub_index',
+      'multi_file_chapter',
+      'sync_progress',
+    ]);
+    expect(columnsByVersion.get(10)).toEqual(['sort_order', 'min_number', 'volume_number']);
+
+    const addedBookColumns = [...columnsByVersion.values()].flat();
     expect(new Set(addedBookColumns).size).toBe(addedBookColumns.length);
     expect(addedBookColumns.filter((column) => column === 'remote_file_size')).toHaveLength(1);
-    expect(addedBookColumns).toEqual(
-      expect.arrayContaining(COORDINATED_BOOK_COLUMNS.map((column) => column.name)),
-    );
 
     db = new DatabaseSync(':memory:');
     for (const migration of migrations) {

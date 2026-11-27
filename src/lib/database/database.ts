@@ -9,12 +9,7 @@ import {
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import {
-  BOOKS_SERVER_FILE_INDEX_NAME,
-  BOOKS_SERVER_FILE_INDEX_SQL,
-  COORDINATED_BOOK_COLUMNS,
-  migrations,
-} from './schema';
+import { migrations } from './schema';
 
 export interface ServerConfig {
   id: string;
@@ -267,67 +262,87 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
+const ALTER_ADD_COLUMN_PATTERN = /^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)\b/i;
+
+function splitSqlStatements(sql: string): string[] {
+  return sql
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0)
+    .map((statement) => `${statement};`);
+}
+
 export async function migrateDatabase(
-  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion' | 'query'>,
+  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion'> &
+    Partial<Pick<SQLiteDBConnection, 'query'>>,
 ): Promise<void> {
   const current = await db.getVersion();
   const currentVersion = current.version ?? 0;
-  let existingBookColumns: Set<string> | null = null;
-  let hasServerFileIndex = false;
+  const tableColumnsCache = new Map<string, Set<string>>();
 
-  if (currentVersion >= 8) {
-    const tableInfoRows = (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
-    if (tableInfoRows.length > 0) {
-      existingBookColumns = new Set(tableInfoRows.map((row) => String(row.name)));
-      const indexRows = (await executeNativeQuery(db, "PRAGMA index_list('books')")).values ?? [];
-      hasServerFileIndex = indexRows.some(
-        (row) => String(row.name) === BOOKS_SERVER_FILE_INDEX_NAME,
-      );
+  const getExistingColumns = async (table: string): Promise<Set<string>> => {
+    const normalizedTable = table.toLowerCase();
+    const cached = tableColumnsCache.get(normalizedTable);
+    if (cached) return cached;
+    if (typeof db.query !== 'function') {
+      const empty = new Set<string>();
+      tableColumnsCache.set(normalizedTable, empty);
+      return empty;
     }
-  }
+    const rows =
+      (await executeNativeQuery({ query: db.query.bind(db) }, `PRAGMA table_info('${table}')`))
+        .values ?? [];
+    const columns = new Set(rows.map((row) => String(row.name).toLowerCase()));
+    tableColumnsCache.set(normalizedTable, columns);
+    return columns;
+  };
 
   for (const migration of migrations) {
     if (migration.version <= currentVersion) continue;
 
-    if ((migration.version === 8 || migration.version === 9) && existingBookColumns) {
-      const missingColumns = COORDINATED_BOOK_COLUMNS.filter(
-        (column) => column.version <= migration.version && !existingBookColumns.has(column.name),
-      );
-      const statements: string[] = [
-        ...missingColumns.map(
-          (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
-        ),
-        ...(!hasServerFileIndex ? [BOOKS_SERVER_FILE_INDEX_SQL] : []),
-      ];
+    const rawStatements = splitSqlStatements(migration.statements);
+    const hasAlterAddColumn = rawStatements.some((statement) =>
+      ALTER_ADD_COLUMN_PATTERN.test(statement),
+    );
+
+    if (!hasAlterAddColumn) {
       await executeNativeTransaction(db, [
-        ...(statements.length > 0 ? [{ statement: `${statements.join('\n')}\n` }] : []),
+        { statement: migration.statements },
         { statement: `PRAGMA user_version = ${migration.version};` },
       ]);
-      for (const column of missingColumns) existingBookColumns.add(column.name);
-      hasServerFileIndex = true;
       continue;
     }
 
+    const filteredStatements: string[] = [];
+    const pendingAdditions: Array<{ columns: Set<string>; column: string }> = [];
+    const addedInMigration = new Set<string>();
+
+    for (const statement of rawStatements) {
+      const match = ALTER_ADD_COLUMN_PATTERN.exec(statement);
+      if (!match) {
+        filteredStatements.push(statement);
+        continue;
+      }
+      const table = match[1]!;
+      const column = match[2]!;
+      const normalizedColumn = column.toLowerCase();
+      const migrationKey = `${table.toLowerCase()}.${normalizedColumn}`;
+      const existingColumns = await getExistingColumns(table);
+      if (existingColumns.has(normalizedColumn) || addedInMigration.has(migrationKey)) continue;
+      filteredStatements.push(statement);
+      addedInMigration.add(migrationKey);
+      pendingAdditions.push({ columns: existingColumns, column: normalizedColumn });
+    }
+
     await executeNativeTransaction(db, [
-      { statement: migration.statements },
+      ...(filteredStatements.length > 0
+        ? [{ statement: `${filteredStatements.join('\n')}\n` }]
+        : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
-  }
 
-  if (existingBookColumns) {
-    const latestVersion = migrations[migrations.length - 1]?.version ?? currentVersion;
-    const maxTargetVersion = Math.min(currentVersion, latestVersion);
-    const missingColumns = COORDINATED_BOOK_COLUMNS.filter(
-      (column) => column.version <= maxTargetVersion && !existingBookColumns.has(column.name),
-    );
-    const statements: string[] = [
-      ...missingColumns.map(
-        (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
-      ),
-      ...(maxTargetVersion >= 8 && !hasServerFileIndex ? [BOOKS_SERVER_FILE_INDEX_SQL] : []),
-    ];
-    if (statements.length > 0) {
-      await executeNativeTransaction(db, [{ statement: `${statements.join('\n')}\n` }]);
+    for (const { columns, column } of pendingAdditions) {
+      columns.add(column);
     }
   }
 }
