@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix(database): coordinate idempotent v8 books schema across #328/#330 and v7-to-v10 upgrades
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache

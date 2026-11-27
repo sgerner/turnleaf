@@ -10,7 +10,7 @@ import { toKavitaPageNumber } from '../sync/conflict';
 import { sanitizeEpubFileName } from '../kavita/normalization';
 import type { KavitaProgress } from '../kavita/types';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import { migrations, V8_BOOK_COLUMNS, V8_BOOK_INDEX_SQL } from './schema';
 
 export interface ServerConfig {
   id: string;
@@ -343,7 +343,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -371,14 +371,97 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+export type MigrationConnection = Pick<
+  SQLiteDBConnection,
+  'executeTransaction' | 'getVersion' | 'query'
+> &
+  Partial<Pick<SQLiteDBConnection, 'execute'>>;
+
+function isMissingColumnError(error: unknown): boolean {
+  return String(error).toLowerCase().includes('no such column');
+}
+
+function isMissingTableError(error: unknown, tableName: string): boolean {
+  return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
+}
+
+async function queryExistingBookColumns(
+  db: Pick<SQLiteDBConnection, 'query'>,
+): Promise<Set<string> | null> {
+  const rows = (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
+  if (rows.length === 0) return null;
+  return new Set(rows.map((row) => String(row.name)));
+}
+
+async function hasBooksServerFileIndex(db: Pick<SQLiteDBConnection, 'query'>): Promise<boolean> {
+  const rows = (await executeNativeQuery(db, "PRAGMA index_list('books')")).values ?? [];
+  return rows.some((row) => String(row.name) === 'books_server_file_idx');
+}
+
+function buildV8ReconciliationTasks(
+  existingColumns: ReadonlySet<string>,
+  targetVersion: number,
+): capTask[] {
+  const missingColumns = V8_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
+  return [
+    ...(missingColumns.length > 0
+      ? [
+          {
+            statement: missingColumns
+              .map((column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`)
+              .join('\n'),
+          },
+        ]
+      : []),
+    { statement: V8_BOOK_INDEX_SQL },
+    { statement: `PRAGMA user_version = ${targetVersion};` },
+  ];
+}
+
+export async function migrateDatabase(db: MigrationConnection): Promise<void> {
   const current = await db.getVersion();
+  const currentVersion = current.version ?? 0;
   for (const migration of migrations) {
-    if (migration.version <= (current.version ?? 0)) continue;
+    if (migration.version <= currentVersion) continue;
+    if (migration.version === 8 && currentVersion >= 1) {
+      const existingColumns = await queryExistingBookColumns(db);
+      if (existingColumns) {
+        await executeNativeTransaction(db, buildV8ReconciliationTasks(existingColumns, 8));
+        continue;
+      }
+    }
     await executeNativeTransaction(db, [
       { statement: migration.statements },
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
+  }
+
+  if (currentVersion >= 8) {
+    if (typeof db.execute === 'function') {
+      const executeDb = { execute: db.execute.bind(db) };
+      const v8ProbeAssignments = V8_BOOK_COLUMNS.map(
+        (column) => `${column.name} = ${column.name}`,
+      ).join(', ');
+      try {
+        await executeNativeStatement(
+          executeDb,
+          `UPDATE books SET ${v8ProbeAssignments} WHERE 0;\n${V8_BOOK_INDEX_SQL}`,
+        );
+        return;
+      } catch (error) {
+        if (!isMissingColumnError(error)) {
+          if (isMissingTableError(error, 'books')) return;
+          throw error;
+        }
+      }
+    }
+
+    const existingColumns = await queryExistingBookColumns(db);
+    if (!existingColumns) return;
+    const missingColumns = V8_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
+    const hasIndex = await hasBooksServerFileIndex(db);
+    if (missingColumns.length === 0 && hasIndex) return;
+    await executeNativeTransaction(db, buildV8ReconciliationTasks(existingColumns, currentVersion));
   }
 }
 
@@ -633,15 +716,87 @@ const replaceBookStatement = `INSERT INTO books
    multi_file_chapter=excluded.multi_file_chapter,
    sync_progress=excluded.sync_progress`;
 
-const bookColumnsWithoutId = `server_id, library_id, series_id, volume_id, chapter_id, title,
-  author, series, description_html, cover_path, format, metadata_refreshed_at, download_path,
-  download_status, file_size, pages, pages_read, created_at, last_read_at, remote_available,
-  file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress`;
+const BASE_BOOK_COLUMNS_WITHOUT_ID = [
+  'server_id',
+  'library_id',
+  'series_id',
+  'volume_id',
+  'chapter_id',
+  'title',
+  'author',
+  'series',
+  'description_html',
+  'cover_path',
+  'format',
+  'metadata_refreshed_at',
+  'download_path',
+  'download_status',
+  'file_size',
+  'pages',
+  'pages_read',
+  'created_at',
+  'last_read_at',
+  'remote_available',
+  'file_id',
+  'file_name',
+  'remote_file_size',
+  'downloaded_bytes',
+  'downloaded_pages',
+  'chapter_key',
+  'chapter_epub_index',
+  'multi_file_chapter',
+  'sync_progress',
+] as const;
+
+const bookColumnsWithoutId = BASE_BOOK_COLUMNS_WITHOUT_ID.join(', ');
+
+const OPTIONAL_STUDY_TABLES = ['annotations', 'bookmarks', 'reading_history'] as const;
+
+interface IdentityMigrationSchema {
+  bookColumnsCsv: string;
+  studyTables: ReadonlySet<string>;
+}
+
+const DEFAULT_IDENTITY_MIGRATION_SCHEMA: IdentityMigrationSchema = {
+  bookColumnsCsv: bookColumnsWithoutId,
+  studyTables: new Set(),
+};
+
+const SAFE_SQL_IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
+
+async function queryIdentityMigrationSchema(
+  db: Pick<SQLiteDBConnection, 'query'>,
+): Promise<IdentityMigrationSchema> {
+  const [tableInfo, studyTableInfo] = await Promise.all([
+    db.query("PRAGMA table_info('books')"),
+    db.query(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('annotations', 'bookmarks', 'reading_history')",
+    ),
+  ]);
+  const knownColumns = new Set<string>(['id', ...BASE_BOOK_COLUMNS_WITHOUT_ID]);
+  const extraBookColumns = (tableInfo.values ?? [])
+    .map((row) => String(row.name))
+    .filter((name) => SAFE_SQL_IDENTIFIER.test(name) && !knownColumns.has(name));
+  const allColumns =
+    extraBookColumns.length > 0
+      ? [...BASE_BOOK_COLUMNS_WITHOUT_ID, ...extraBookColumns].join(', ')
+      : bookColumnsWithoutId;
+  const studyTables = new Set(
+    (studyTableInfo.values ?? [])
+      .map((row) => String(row.name))
+      .filter((name) => (OPTIONAL_STUDY_TABLES as readonly string[]).includes(name)),
+  );
+  return {
+    bookColumnsCsv: allColumns,
+    studyTables,
+  };
+}
 
 function moveBookIdentityTasks(
   sourceId: string,
   targetId: string,
   clearTargetPreferences: boolean,
+  schema: IdentityMigrationSchema = DEFAULT_IDENTITY_MIGRATION_SCHEMA,
 ): capTask[] {
   const tasks: capTask[] = [];
   if (clearTargetPreferences) {
@@ -653,8 +808,8 @@ function moveBookIdentityTasks(
   }
   tasks.push(
     {
-      statement: `INSERT INTO books (id, ${bookColumnsWithoutId})
-        SELECT ?, ${bookColumnsWithoutId} FROM books WHERE id = ?`,
+      statement: `INSERT INTO books (id, ${schema.bookColumnsCsv})
+        SELECT ?, ${schema.bookColumnsCsv} FROM books WHERE id = ?`,
       values: [targetId, sourceId],
     },
     {
@@ -671,11 +826,19 @@ function moveBookIdentityTasks(
         WHERE key IN (?, ?, ?)`,
       values: [targetId, ...readerPreferenceKeys(sourceId)],
     },
-    {
-      statement: 'DELETE FROM books WHERE id = ? AND EXISTS (SELECT 1 FROM books WHERE id = ?)',
-      values: [sourceId, targetId],
-    },
   );
+  for (const studyTable of OPTIONAL_STUDY_TABLES) {
+    if (schema.studyTables.has(studyTable)) {
+      tasks.push({
+        statement: `UPDATE ${studyTable} SET book_id = ? WHERE book_id = ?`,
+        values: [targetId, sourceId],
+      });
+    }
+  }
+  tasks.push({
+    statement: 'DELETE FROM books WHERE id = ? AND EXISTS (SELECT 1 FROM books WHERE id = ?)',
+    values: [sourceId, targetId],
+  });
   return tasks;
 }
 
@@ -693,16 +856,20 @@ function evictBookIdentityTasks(serverId: string, bookId: string): capTask[] {
   ];
 }
 
-function plannedNativeIdentityTasks(serverId: string, plan: BookReconciliationPlan): capTask[] {
+function plannedNativeIdentityTasks(
+  serverId: string,
+  plan: BookReconciliationPlan,
+  schema: IdentityMigrationSchema = DEFAULT_IDENTITY_MIGRATION_SCHEMA,
+): capTask[] {
   const tasks: capTask[] = [];
   plan.rekeys.forEach(({ oldId }, index) => {
-    tasks.push(...moveBookIdentityTasks(oldId, `${REKEY_TEMP_PREFIX}${index}`, false));
+    tasks.push(...moveBookIdentityTasks(oldId, `${REKEY_TEMP_PREFIX}${index}`, false, schema));
   });
   for (const evictedId of plan.evictedIds) {
     tasks.push(...evictBookIdentityTasks(serverId, evictedId));
   }
   plan.rekeys.forEach(({ newId }, index) => {
-    tasks.push(...moveBookIdentityTasks(`${REKEY_TEMP_PREFIX}${index}`, newId, true));
+    tasks.push(...moveBookIdentityTasks(`${REKEY_TEMP_PREFIX}${index}`, newId, true, schema));
   });
   return tasks;
 }
@@ -877,17 +1044,22 @@ export async function replaceBooksInTransaction(
     return;
   }
   await enqueueNativeWrite(async () => {
-    const identityTasks =
-      typeof db.query === 'function'
-        ? plannedNativeIdentityTasks(
-            serverId,
-            planBookFileReconciliation(
-              serverId,
-              await queryExistingBookIdentities({ query: db.query.bind(db) }, serverId),
-              books,
-            ),
-          )
-        : sqlOnlyIdentityTasks(serverId, books);
+    let identityTasks: capTask[];
+    if (typeof db.query === 'function') {
+      const queryDb = { query: db.query.bind(db) };
+      const plan = planBookFileReconciliation(
+        serverId,
+        await queryExistingBookIdentities(queryDb, serverId),
+        books,
+      );
+      const schema =
+        plan.rekeys.length > 0
+          ? await queryIdentityMigrationSchema(queryDb)
+          : DEFAULT_IDENTITY_MIGRATION_SCHEMA;
+      identityTasks = plannedNativeIdentityTasks(serverId, plan, schema);
+    } else {
+      identityTasks = sqlOnlyIdentityTasks(serverId, books);
+    }
     const tasks = [
       ...identityTasks,
       ...books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
@@ -911,18 +1083,24 @@ export async function reconcileBooksInTransaction(
 ): Promise<void> {
   const hasFileIds = books.some((book) => book.fileId != null);
   await enqueueNativeWrite(async () => {
-    const identityTasks = !hasFileIds
-      ? []
-      : typeof db.query === 'function'
-        ? plannedNativeIdentityTasks(
-            serverId,
-            planBookFileReconciliation(
-              serverId,
-              await queryExistingBookIdentities({ query: db.query.bind(db) }, serverId),
-              books,
-            ),
-          )
-        : sqlOnlyIdentityTasks(serverId, books);
+    let identityTasks: capTask[] = [];
+    if (hasFileIds) {
+      if (typeof db.query === 'function') {
+        const queryDb = { query: db.query.bind(db) };
+        const plan = planBookFileReconciliation(
+          serverId,
+          await queryExistingBookIdentities(queryDb, serverId),
+          books,
+        );
+        const schema =
+          plan.rekeys.length > 0
+            ? await queryIdentityMigrationSchema(queryDb)
+            : DEFAULT_IDENTITY_MIGRATION_SCHEMA;
+        identityTasks = plannedNativeIdentityTasks(serverId, plan, schema);
+      } else {
+        identityTasks = sqlOnlyIdentityTasks(serverId, books);
+      }
+    }
 
     const tasks: capTask[] = [];
     if (!preserveMissing) {

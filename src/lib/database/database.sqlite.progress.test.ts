@@ -1139,4 +1139,226 @@ describe('native progress transactions against SQLite', () => {
       pendingSync: true,
     });
   });
+
+  it('reconciles on-disk SQLite databases through openDatabase() across #328-only and #330-only v8 shapes up to v10 without downgrading user_version', async () => {
+    const updatedAt = '2026-09-05T12:00:00.000Z';
+    const { migrations, V8_BOOK_COLUMNS } = await import('./schema');
+
+    for (const mode of [
+      'pr330-v8-then-v10-then-pr328',
+      'pr328-only-v8-then-open-then-v10',
+    ] as const) {
+      const modePath = join(directory, `${mode}.sqlite`);
+      native.databasePath = modePath;
+      native.database = new DatabaseSync(modePath);
+      native.isOpen = false;
+      native.database.exec('PRAGMA foreign_keys = ON;');
+      for (const migration of migrations.slice(0, 7)) {
+        native.database.exec(migration.statements);
+      }
+
+      if (mode === 'pr330-v8-then-v10-then-pr328') {
+        native.database.exec(`
+          ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+          ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+          ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+          ALTER TABLE books ADD COLUMN chapter_key TEXT;
+          ALTER TABLE books ADD COLUMN sort_order REAL;
+          ALTER TABLE books ADD COLUMN min_number REAL;
+          ALTER TABLE books ADD COLUMN volume_number REAL;
+          CREATE TABLE annotations (
+            id TEXT PRIMARY KEY NOT NULL,
+            book_id TEXT NOT NULL,
+            cfi TEXT NOT NULL DEFAULT '',
+            xpath TEXT NOT NULL DEFAULT '',
+            excerpt TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sync_state TEXT NOT NULL DEFAULT 'synced',
+            sync_revision INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+          );
+          CREATE TABLE bookmarks (
+            id TEXT PRIMARY KEY NOT NULL,
+            book_id TEXT NOT NULL,
+            cfi TEXT NOT NULL DEFAULT '',
+            href TEXT NOT NULL DEFAULT '',
+            percentage REAL NOT NULL DEFAULT 0,
+            label TEXT NOT NULL,
+            saved_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sync_state TEXT NOT NULL DEFAULT 'synced',
+            sync_revision INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+          );
+          CREATE TABLE reading_history (
+            book_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            cfi TEXT NOT NULL,
+            href TEXT NOT NULL,
+            percentage REAL NOT NULL,
+            label TEXT NOT NULL,
+            saved_at TEXT NOT NULL,
+            PRIMARY KEY(book_id, id),
+            FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+          );
+          PRAGMA user_version = 10;
+        `);
+      } else {
+        native.database.exec(`
+          ALTER TABLE books ADD COLUMN file_id INTEGER;
+          ALTER TABLE books ADD COLUMN file_name TEXT;
+          ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+          ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+          ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+          CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+          PRAGMA user_version = 8;
+        `);
+      }
+
+      native.database
+        .prepare(
+          `INSERT INTO server_config
+            (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+            VALUES (?, ?, ?, ?, '0.8.8', ?)`,
+        )
+        .run(server.id, server.displayName, server.baseUrl, server.credentialRef, updatedAt);
+      native.database
+        .prepare(
+          `INSERT INTO books
+            (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+             format, metadata_refreshed_at, download_path, download_status, file_size,
+             remote_file_size, pages, pages_read, created_at, last_read_at, remote_available)
+            VALUES ('server:82:1406', ?, 1, 82, 188, 1406, 'Vol 3', 'Rawlinson', 'Ancient World',
+                    'epub', ?, 'books/legacy-vol3.epub', 'available', 1955734, 1955734, 9, 3, ?, ?, 1)`,
+        )
+        .run(server.id, updatedAt, updatedAt, updatedAt);
+      native.database
+        .prepare(
+          `INSERT INTO reading_state
+            (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+            VALUES ('server:82:1406', 'epubcfi(/6/2!/4/8)', '/body/p[8]', 0.6, ?, 1, 3)`,
+        )
+        .run(updatedAt);
+      native.database
+        .prepare(
+          `INSERT INTO sync_queue
+            (book_id, payload_json, created_at, updated_at, revision)
+            VALUES ('server:82:1406', '{"libraryId":1,"seriesId":82,"volumeId":188,"chapterId":1406,"pageNum":3}', ?, ?, 3)`,
+        )
+        .run(updatedAt, updatedAt);
+
+      if (mode === 'pr330-v8-then-v10-then-pr328') {
+        native.database
+          .prepare(
+            `UPDATE books SET downloaded_bytes = 1955734, downloaded_pages = 5,
+             chapter_key = 'number:3', sort_order = 3, min_number = 3, volume_number = 3
+             WHERE id = 'server:82:1406'`,
+          )
+          .run();
+        native.database
+          .prepare(
+            `INSERT INTO annotations (id, book_id, cfi, xpath, excerpt, note, created_at, updated_at)
+             VALUES ('ann-1', 'server:82:1406', 'epubcfi(/6/2!/4/8)', '/body/p[8]', 'Quote', 'Note', ?, ?)`,
+          )
+          .run(updatedAt, updatedAt);
+      }
+
+      native.database.close();
+      native.database = null;
+
+      const database = await importDatabase();
+      await database.openDatabase();
+
+      const columns = (
+        native.database!.prepare("PRAGMA table_info('books')").all() as Array<{ name: string }>
+      ).map((row) => row.name);
+      for (const column of V8_BOOK_COLUMNS) {
+        expect(columns).toContain(column.name);
+      }
+      expect(columns.filter((name) => name === 'remote_file_size')).toHaveLength(1);
+
+      if (mode === 'pr330-v8-then-v10-then-pr328') {
+        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+        await database.reconcileBooks(server.id, [
+          {
+            ...book,
+            id: 'server:82:1406:2114',
+            seriesId: 82,
+            volumeId: 188,
+            chapterId: 1406,
+            fileId: 2114,
+            fileName: 'pg16163-images-3.epub',
+            pages: 5,
+            pagesRead: 1,
+            fileSize: 1955734,
+            remoteFileSize: 1955734,
+            chapterEpubIndex: 0,
+            multiFileChapter: true,
+            syncProgress: true,
+          },
+          {
+            ...book,
+            id: 'server:82:1406:2115',
+            seriesId: 82,
+            volumeId: 188,
+            chapterId: 1406,
+            fileId: 2115,
+            fileName: 'vol3-secondary.epub',
+            pages: 4,
+            pagesRead: 0,
+            fileSize: 2169759,
+            remoteFileSize: 2169759,
+            chapterEpubIndex: 1,
+            multiFileChapter: true,
+            syncProgress: false,
+          },
+        ]);
+        expect(
+          native
+            .database!.prepare(
+              'SELECT downloaded_bytes, downloaded_pages, chapter_key, sort_order FROM books WHERE id = ?',
+            )
+            .get('server:82:1406:2114'),
+        ).toEqual({
+          downloaded_bytes: 1955734,
+          downloaded_pages: 5,
+          chapter_key: 'number:3',
+          sort_order: 3,
+        });
+        expect(
+          native
+            .database!.prepare('SELECT book_id, note FROM annotations WHERE id = ?')
+            .get('ann-1'),
+        ).toEqual({
+          book_id: 'server:82:1406:2114',
+          note: 'Note',
+        });
+      } else {
+        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
+        native.database!.exec(`
+          ALTER TABLE books ADD COLUMN sort_order REAL;
+          ALTER TABLE books ADD COLUMN min_number REAL;
+          ALTER TABLE books ADD COLUMN volume_number REAL;
+          PRAGMA user_version = 9;
+        `);
+        const reopened = await reopenDatabase(database);
+        await reopened.openDatabase();
+        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+        expect(await reopened.getBooks(server.id)).toMatchObject([
+          {
+            id: 'server:82:1406',
+            downloadPath: 'books/legacy-vol3.epub',
+            pagesRead: 3,
+          },
+        ]);
+      }
+
+      native.database!.close();
+      native.database = null;
+      native.isOpen = false;
+    }
+  });
 });

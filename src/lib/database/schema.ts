@@ -1,3 +1,18 @@
+export const V8_BOOK_COLUMNS = [
+  { name: 'file_id', definition: 'INTEGER' },
+  { name: 'file_name', definition: 'TEXT' },
+  { name: 'remote_file_size', definition: 'INTEGER' },
+  { name: 'downloaded_bytes', definition: 'INTEGER' },
+  { name: 'downloaded_pages', definition: 'INTEGER' },
+  { name: 'chapter_key', definition: 'TEXT' },
+  { name: 'chapter_epub_index', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'multi_file_chapter', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'sync_progress', definition: 'INTEGER NOT NULL DEFAULT 1' },
+] as const;
+
+export const V8_BOOK_INDEX_SQL =
+  'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);';
+
 export const migrations = [
   {
     version: 1,
@@ -111,6 +126,9 @@ export const migrations = [
       ALTER TABLE books ADD COLUMN file_id INTEGER;
       ALTER TABLE books ADD COLUMN file_name TEXT;
       ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
       ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
