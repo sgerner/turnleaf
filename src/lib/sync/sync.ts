@@ -4,7 +4,7 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import type { KavitaClient } from '../kavita/client';
+import { KavitaError, OFFLINE_KAVITA_MESSAGE, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
 const flushing = new Map<string, Promise<void>>();
@@ -12,50 +12,51 @@ const flushing = new Map<string, Promise<void>>();
 export function flushProgress(
   client: KavitaClient,
   serverId: string,
-  canSync: () => boolean | Promise<boolean> = () => true,
   signal?: AbortSignal,
 ): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId, canSync, signal).finally(() => {
+  const current = run(client, serverId, signal).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
   return current;
 }
 
-async function isSyncInterrupted(
-  canSync: () => boolean | Promise<boolean>,
-  signal?: AbortSignal,
-): Promise<boolean> {
+function isTransportStopped(error: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted) return true;
-  const allowed = await canSync();
-  return !allowed || Boolean(signal?.aborted);
+  if (error instanceof DOMException && error.name === 'AbortError') return true;
+  return (
+    error instanceof KavitaError &&
+    error.kind === 'network' &&
+    error.message === OFFLINE_KAVITA_MESSAGE
+  );
 }
 
-async function run(
-  client: KavitaClient,
-  serverId: string,
-  canSync: () => boolean | Promise<boolean>,
-  signal?: AbortSignal,
-): Promise<void> {
+async function run(client: KavitaClient, serverId: string, signal?: AbortSignal): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
-  while (true) {
-    if (await isSyncInterrupted(canSync, signal)) break;
+  let stopped = false;
+  while (!stopped && !signal?.aborted) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
-    if (pending.length === 0 || (await isSyncInterrupted(canSync, signal))) break;
+    if (pending.length === 0 || signal?.aborted) break;
     for (const item of pending) {
-      if (await isSyncInterrupted(canSync, signal)) break;
+      if (signal?.aborted) {
+        stopped = true;
+        break;
+      }
       attempted.set(item.bookId, item);
       try {
         const payload = JSON.parse(item.payload) as KavitaProgress;
-        await (signal ? client.saveProgress(payload, signal) : client.saveProgress(payload));
+        await client.saveProgress(payload);
       } catch (error) {
-        if (await isSyncInterrupted(canSync, signal)) break;
+        if (isTransportStopped(error, signal)) {
+          stopped = true;
+          break;
+        }
         await markSyncFailure(
           item.bookId,
           error instanceof Error ? error.message : 'Sync failed',
@@ -65,7 +66,6 @@ async function run(
         failures.push(error);
         continue;
       }
-      if (signal?.aborted) break;
       await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
     }
   }

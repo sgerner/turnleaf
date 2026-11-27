@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -11,6 +12,7 @@ import { recordDiagnostic } from '../diagnostics/log';
 import { advanceRedirect, createRedirectState, KavitaError, nativeHeader } from './redirects';
 
 export { KavitaError };
+export const OFFLINE_KAVITA_MESSAGE = 'Kavita could not be reached while offline.';
 
 const REQUEST_TIMEOUT_MS = 12_000;
 const BOOK_LIBRARY_TYPE = 2;
@@ -44,6 +46,8 @@ export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
+    private readonly beforeNativeRequest?:
+      ((signal?: AbortSignal) => Promise<boolean> | boolean) | undefined,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -153,6 +157,7 @@ export class KavitaClient {
     } catch (error) {
       const retryable =
         error instanceof KavitaError &&
+        error.message !== OFFLINE_KAVITA_MESSAGE &&
         (error.kind === 'network' ||
           (error.kind === 'server' &&
             error.status !== undefined &&
@@ -232,10 +237,15 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
-        response = await this.raceSignal(
-          init.signal,
-          CapacitorHttp.request({ ...options, url: redirects.currentUrl }),
-        );
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        const allowed = this.beforeNativeRequest
+          ? await this.beforeNativeRequest(init.signal ?? undefined)
+          : (await Network.getStatus().catch(() => null))?.connected === true;
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (!allowed || navigator.onLine === false) {
+          throw new KavitaError(OFFLINE_KAVITA_MESSAGE, 'network');
+        }
+        response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (
           !advanceRedirect(redirects, response.status, nativeHeader(response.headers, 'location'))
@@ -252,7 +262,9 @@ export class KavitaClient {
       return response.data as T;
     } catch (error) {
       if (error instanceof KavitaError || error instanceof DOMException) throw error;
-      recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+      if (!init.signal?.aborted) {
+        recordDiagnostic({ category: 'request', endpoint: path, detail: 'network-error' });
+      }
       throw new KavitaError(
         'Kavita could not be reached. Check the address and network.',
         'network',
@@ -275,19 +287,6 @@ export class KavitaClient {
         return response;
       }
     }
-  }
-
-  private raceSignal<T>(signal: AbortSignal | null | undefined, work: Promise<T>): Promise<T> {
-    if (!signal) return work;
-    if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
-    let onAbort: (() => void) | undefined;
-    const aborted = new Promise<never>((_resolve, reject) => {
-      onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
-      signal.addEventListener('abort', onAbort, { once: true });
-    });
-    return Promise.race([work, aborted]).finally(() => {
-      if (onAbort) signal.removeEventListener('abort', onAbort);
-    });
   }
 
   private async withBrowserTimeout<T>(

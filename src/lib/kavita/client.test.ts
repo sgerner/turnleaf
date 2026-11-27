@@ -2,10 +2,11 @@
 
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import { KavitaClient } from './client';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 
-const capacitorRuntime = vi.hoisted(() => ({ native: false }));
+const capacitorRuntime = vi.hoisted(() => ({ native: false, connected: true }));
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
@@ -18,11 +19,27 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: capacitorRuntime.connected,
+      connectionType: capacitorRuntime.connected ? 'wifi' : 'none',
+    })),
+  },
+}));
+
 beforeEach(() => {
   clearDiagnostics();
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   capacitorRuntime.native = false;
+  capacitorRuntime.connected = true;
   vi.mocked(CapacitorHttp.get).mockReset();
   vi.mocked(CapacitorHttp.request).mockReset();
+  vi.mocked(Network.getStatus).mockReset();
+  vi.mocked(Network.getStatus).mockImplementation(async () => ({
+    connected: capacitorRuntime.connected,
+    connectionType: capacitorRuntime.connected ? 'wifi' : 'none',
+  }));
   const fetchMock = vi.fn(async () => ({
     ok: true,
     status: 200,
@@ -262,6 +279,39 @@ it('follows native same-origin redirects with redirects disabled on each request
     url: 'https://books.example.com/api/Series/v2/?PageNumber=1&PageSize=500',
     disableRedirects: true,
   });
+});
+
+it('blocks native authenticated requests when the transport is offline', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(Network.getStatus)
+    .mockResolvedValueOnce({ connected: true, connectionType: 'wifi' })
+    .mockResolvedValueOnce({ connected: false, connectionType: 'none' });
+  await Network.getStatus(); // Library's earlier availability check sees the transient reconnect.
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'network',
+  });
+
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('blocks native requests when WebView is offline despite a stale connected plugin status', async () => {
+  capacitorRuntime.native = true;
+  vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
+  await Network.getStatus(); // Library's earlier availability check sees the connected status.
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: false });
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toMatchObject({
+    kind: 'network',
+  });
+
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
 });
 
 it('preserves a Kavita base path in URLs used for covers and downloads', () => {
@@ -846,25 +896,57 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
   );
 });
 
-it('rejects in-flight native requests immediately when signal aborts without recording diagnostics', async () => {
+it('gates each native request hop with beforeNativeRequest without recording network diagnostics', async () => {
   capacitorRuntime.native = true;
   clearDiagnostics();
-  const controller = new AbortController();
-  vi.mocked(CapacitorHttp.request).mockImplementationOnce(() => new Promise(() => {}));
-
-  const client = new KavitaClient('https://books.example.com', 'abc123');
-  const pending = client.saveProgress(
-    {
-      libraryId: 1,
-      seriesId: 2,
-      volumeId: 3,
-      chapterId: 4,
-      pageNum: 5,
-    },
-    controller.signal,
+  let transportOnline = false;
+  const client = new KavitaClient(
+    'https://books.example.com',
+    'abc123',
+    async (signal) => !signal?.aborted && transportOnline,
   );
-  controller.abort();
 
-  await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'Kavita could not be reached while offline.',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
+
+  const page = Array.from({ length: 500 }, (_, id) => ({
+    id,
+    name: `Book ${id}`,
+    libraryId: 1,
+    format: 3,
+    pages: 1,
+    pagesRead: 0,
+    created: '2026-01-01',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: '',
+  }));
+  transportOnline = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    transportOnline = false;
+    return {
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify(page),
+    };
+  });
+
+  const controller = new AbortController();
+  const gatedClient = new KavitaClient('https://books.example.com', 'abc123', async () => {
+    if (!transportOnline) {
+      controller.abort();
+      return false;
+    }
+    return true;
+  });
+
+  await expect(gatedClient.getBookSeries(controller.signal)).rejects.toMatchObject({
+    name: 'AbortError',
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
   expect(exportDiagnostics({ appVersion: 'test', platform: 'android' })).toContain('Events: 0');
 });

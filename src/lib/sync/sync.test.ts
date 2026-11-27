@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { KavitaError, OFFLINE_KAVITA_MESSAGE } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -228,7 +229,7 @@ it('allows a manual retry after an authorization failure', async () => {
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
 
-it('stops uploading queued items without losing them when canSync reports offline', async () => {
+it('stops between queued items without marking failure when signal aborts', async () => {
   type PendingFixture = ReturnType<typeof pendingState>;
   type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
     readingState: Record<string, PendingFixture['readingState']['book-1']>;
@@ -251,61 +252,48 @@ it('stops uploading queued items without losing them when canSync reports offlin
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
-  let online = true;
+  const controller = new AbortController();
   const saveProgress = vi.fn().mockImplementationOnce(async () => {
-    online = false;
+    controller.abort();
   });
 
   await expect(
-    flushProgress({ saveProgress } as never, 'server', () => online),
+    flushProgress({ saveProgress } as never, 'server', controller.signal),
   ).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledOnce();
   const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
   expect(saved.syncQueue['book-1']).toBeUndefined();
-  expect(saved.syncQueue['book-2']).toBeDefined();
-  expect(saved.syncQueue['book-2']?.lastError).toBeNull();
+  expect(saved.syncQueue['book-2']).toMatchObject({
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+    revision: 1,
+  });
   expect(saved.readingState['book-2']?.pendingSync).toBe(true);
 });
 
-it('cancels an in-flight upload on abort and preserves the queued item without failure for retry', async () => {
+it('preserves queued progress without marking failure when transport drops or beforeNativeRequest blocks', async () => {
   const initial = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":12}');
   localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
 
-  let online = true;
-  let observedSignal: AbortSignal | undefined;
-  let notifyStarted!: () => void;
-  const started = new Promise<void>((resolve) => {
-    notifyStarted = resolve;
-  });
-
+  const controller = new AbortController();
   const saveProgress = vi
     .fn()
-    .mockImplementationOnce((_payload: unknown, signal?: AbortSignal) => {
-      observedSignal = signal;
-      notifyStarted();
-      return new Promise<void>((_resolve, reject) => {
-        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {
-          once: true,
-        });
-      });
+    .mockImplementationOnce(async () => {
+      controller.abort();
+      throw new KavitaError(
+        'Kavita could not be reached. Check the address and network.',
+        'network',
+      );
     })
+    .mockRejectedValueOnce(new KavitaError(OFFLINE_KAVITA_MESSAGE, 'network'))
     .mockResolvedValueOnce(undefined);
 
-  const controller = new AbortController();
-  const disconnectedFlush = flushProgress(
-    { saveProgress } as never,
-    'server',
-    () => online,
-    controller.signal,
-  );
-  await started;
-
-  online = false;
-  controller.abort();
-
-  await expect(disconnectedFlush).resolves.toBeUndefined();
-  expect(observedSignal?.aborted).toBe(true);
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', controller.signal),
+  ).resolves.toBeUndefined();
+  await expect(flushProgress({ saveProgress } as never, 'server')).resolves.toBeUndefined();
 
   const afterDisconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
   expect(afterDisconnect.syncQueue['book-1']).toMatchObject({
@@ -316,37 +304,10 @@ it('cancels an in-flight upload on abort and preserves the queued item without f
   });
   expect(afterDisconnect.readingState['book-1']?.pendingSync).toBe(true);
 
-  online = true;
-  await expect(
-    flushProgress({ saveProgress } as never, 'server', () => online),
-  ).resolves.toBeUndefined();
-  expect(saveProgress).toHaveBeenCalledTimes(2);
+  await expect(flushProgress({ saveProgress } as never, 'server')).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(3);
 
   const afterReconnect = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
   expect(afterReconnect.syncQueue['book-1']).toBeUndefined();
   expect(afterReconnect.readingState['book-1']?.pendingSync).toBe(false);
-});
-
-it('preserves queued progress without marking failure when saveProgress rejects after connectivity drops', async () => {
-  const initial = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":15}');
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(initial));
-
-  let online = true;
-  const saveProgress = vi.fn().mockImplementationOnce(async () => {
-    online = false;
-    throw new Error('Network dropped mid-request');
-  });
-
-  await expect(
-    flushProgress({ saveProgress } as never, 'server', () => online),
-  ).resolves.toBeUndefined();
-
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof initial;
-  expect(saved.syncQueue['book-1']).toMatchObject({
-    attemptCount: 0,
-    lastAttemptAt: null,
-    lastError: null,
-    revision: 1,
-  });
-  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
 });

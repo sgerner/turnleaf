@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- fix(sync): cancel in-flight requests on disconnect and gate reconnects
-- fix(android): prevent cellular fallback flap and retry pending reconnect sync
-- fix(android): prevent offline request leaks and startup viewport resize races
+- Centralize Android Back handling across screens and scope native reader plugin state to MainActivity.
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

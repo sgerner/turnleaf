@@ -9,8 +9,6 @@ import {
   DEFAULT_FONT_SCALE,
   KEYCODE_BACK,
   KEYCODE_VOLUME_DOWN,
-  KEYCODE_VOLUME_UP,
-  areRadiosDisconnected,
   createAdbRunner,
   dumpWindowState,
   getFontScale,
@@ -95,8 +93,6 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
   const offlineRequests = [];
   const notFoundPaths = [];
   const foreignRequests = [];
-  const activeRequests = new Set();
-  const holds = new Map();
   const emptyProgress = { libraryId: 1, seriesId: 1, volumeId: 1, chapterId: 1, pageNum: 0 };
 
   const foreignServer = createServer((request, response) => {
@@ -123,66 +119,6 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
       response.writeHead(503).end();
       return;
     }
-
-    let abortedOffline = false;
-    let settleOfflineWait;
-    const offlineWait = new Promise((resolve) => {
-      settleOfflineWait = resolve;
-    });
-    const held = holds.get(path);
-    const active = {
-      path,
-      held: Boolean(held),
-      abortOffline() {
-        abortedOffline = true;
-        settleOfflineWait({ abort: true });
-        if (!response.headersSent && !response.writableEnded) {
-          response.writeHead(503).end();
-        }
-      },
-    };
-    activeRequests.add(active);
-    response.once('close', () => activeRequests.delete(active));
-
-    let parsedProgress;
-    if (path === '/api/Reader/progress') {
-      let json = '';
-      for await (const chunk of request) json += chunk;
-      if (abortedOffline) {
-        activeRequests.delete(active);
-        return;
-      }
-      try {
-        parsedProgress = JSON.parse(json);
-      } catch {
-        activeRequests.delete(active);
-        response.writeHead(400).end();
-        return;
-      }
-    }
-
-    if (held) {
-      held.inFlight += 1;
-      try {
-        const outcome = await Promise.race([held.gate, offlineWait]);
-        if (outcome?.abort || abortedOffline) {
-          if (!response.headersSent && !response.writableEnded) {
-            response.writeHead(503).end();
-          }
-          activeRequests.delete(active);
-          return;
-        }
-      } finally {
-        held.inFlight -= 1;
-      }
-    } else if (abortedOffline || offline) {
-      if (!response.headersSent && !response.writableEnded) {
-        response.writeHead(503).end();
-      }
-      activeRequests.delete(active);
-      return;
-    }
-
     const pagesRead = uploads.at(-1)?.pageNum ?? 0;
     let body;
     switch (path) {
@@ -256,8 +192,15 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
         body = uploads.at(-1) ?? emptyProgress;
         break;
       case '/api/Reader/progress': {
-        uploads.push(parsedProgress);
-        body = {};
+        let json = '';
+        for await (const chunk of request) json += chunk;
+        try {
+          uploads.push(JSON.parse(json));
+          body = {};
+        } catch {
+          response.writeHead(400).end();
+          return;
+        }
         break;
       }
       default:
@@ -292,50 +235,13 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     offlineRequests,
     notFoundPaths,
     foreignRequests,
-    get inFlightCount() {
-      return activeRequests.size;
-    },
-    hold(path) {
-      let settleHold;
-      const gate = new Promise((resolve) => {
-        settleHold = resolve;
-      });
-      const entry = {
-        inFlight: 0,
-        gate,
-        release() {
-          holds.delete(path);
-          settleHold({ abort: false });
-        },
-        abort() {
-          holds.delete(path);
-          settleHold({ abort: true });
-        },
-      };
-      holds.set(path, entry);
-      return entry;
-    },
     setOffline(value) {
       offline = value;
-      if (value) {
-        for (const active of [...activeRequests]) {
-          if (!active.held) {
-            active.abortOffline();
-            activeRequests.delete(active);
-          }
-        }
-      }
     },
     setCrossOriginRedirects(value) {
       redirectCrossOrigin = value;
     },
     close() {
-      for (const entry of [...holds.values()]) {
-        entry.abort();
-      }
-      for (const active of [...activeRequests]) {
-        active.abortOffline();
-      }
       server.close();
       foreignServer.close();
     },
@@ -541,60 +447,16 @@ async function run() {
       ),
     );
 
-    const heldCatalog = fixture.hold('/api/Series/v2');
-    const heldProgress = fixture.hold('/api/Reader/progress');
-    await sendKeyEvent(adb, KEYCODE_VOLUME_DOWN);
-    await waitFor('chapter advance before offline transition', () => web.evaluate(chapter(2)));
-    await sendKeyEvent(adb, KEYCODE_VOLUME_UP);
-    await waitFor('chapter return before offline transition', () => web.evaluate(chapter(1)));
-    await sendKeyEvent(adb, KEYCODE_BACK);
-    await waitFor('library visible before offline transition', () =>
-      web.evaluate("Boolean(document.querySelector('[data-book-open]'))"),
-    );
-    await waitFor('start catalog refresh before disconnect', () =>
-      web.evaluate(click('[aria-label="Refresh library"]')),
-    );
-    await waitFor(
-      'catalog refresh and progress upload in flight before disconnect',
-      () => heldCatalog.inFlight >= 1 && heldProgress.inFlight >= 1,
-    );
-
     disabledNetwork = true;
     await adb('shell', 'svc', 'data', 'disable');
     await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
       if ((await adb('shell', 'settings', 'get', 'global', 'mobile_data')) !== '0') return false;
-      if (!(await areRadiosDisconnected(adb))) return false;
-      return web.evaluate(`Capacitor.Plugins.Network.getStatus().then(status =>
-        status.connected === false &&
-        status.connectionType === 'none' &&
-        Boolean(document.body.textContent?.includes('No network connection. Showing your saved library.'))
-      )`);
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return status?.connected === false && status?.connectionType === 'none';
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
-    heldCatalog.release();
-    heldProgress.abort();
-    await waitFor('queued progress preserved without failure after in-flight disconnect', () =>
-      web.evaluate(`(() => {
-        const text = document.body.textContent ?? '';
-        return (
-          text.includes('1 reading progress update waiting to sync.') &&
-          !text.includes('failed and remain queued')
-        );
-      })()`),
-    );
-    await delay(300);
-    if (fixture.offlineRequests.length > 0) {
-      throw new Error(
-        `Turnleaf sent authenticated requests after in-flight disconnect: ${fixture.offlineRequests.join(', ')}.`,
-      );
-    }
-
-    await waitFor('reopen downloaded book while offline', () =>
-      web.evaluate(click('[data-book-open]')),
-    );
-    await waitFor('first chapter reopened offline', () => web.evaluate(chapter(1)));
     await sendKeyEvent(adb, KEYCODE_VOLUME_DOWN);
     await waitFor('second chapter via KEYCODE_VOLUME_DOWN', () => web.evaluate(chapter(2)));
     await waitFor('reader position in the second chapter', () =>
