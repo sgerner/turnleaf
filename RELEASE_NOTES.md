@@ -5,6 +5,7 @@
 - fix(sync): cancel in-flight requests on disconnect and gate reconnects
 - fix(android): prevent cellular fallback flap and retry pending reconnect sync
 - fix(android): prevent offline request leaks and startup viewport resize races
+- chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests
