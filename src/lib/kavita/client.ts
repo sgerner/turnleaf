@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type {
   ConnectedServer,
   KavitaAnnotation,
@@ -434,6 +435,11 @@ export class KavitaClient {
       while (true) {
         const guard = this.assertCanRequest(init.signal);
         if (guard) await guard;
+        const networkStatus = await Network.getStatus().catch(() => null);
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (networkStatus?.connected !== true || navigator.onLine === false) {
+          throw new KavitaError('Kavita could not be reached while offline.', 'network');
+        }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (

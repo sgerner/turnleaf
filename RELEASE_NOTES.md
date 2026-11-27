@@ -2,12 +2,14 @@
 
 ## Unreleased
 
-- Coordinate idempotent SQLite v8-v11 schema migrations and upgrade tests
 - Coordinate idempotent SQLite v8-v11 schema migrations across #330, #328, #339, and study storage transfer
 - Stop in-flight Kavita sync and transfer requests when connectivity drops
-- Stop in-flight Kavita study sync, cover, and download requests when connectivity drops
 - Replace regex HTML tag stripping in annotation comment normalization
 - Sync annotations and bookmarks with Kavita and isolate study data per server
+- fix: refresh only after reconnecting from offline
+- fix: gate native requests on WebView connectivity
+- fix: block native Kavita requests while offline
+- Block authenticated Kavita requests at the native transport boundary when offline.
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
