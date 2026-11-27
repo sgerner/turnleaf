@@ -421,7 +421,10 @@ export class ReaderSession {
     }
   };
 
-  constructor(private readonly bookUrl: string) {
+  constructor(
+    private readonly bookUrl: string,
+    private readonly title = 'Book content',
+  ) {
     this.book = ePub(bookUrl);
   }
 
@@ -984,7 +987,13 @@ export class ReaderSession {
     this.book.destroy();
   }
 
+  private frameTitle(): string {
+    return this.title.trim() || 'Book content';
+  }
+
   private async prepareContents(contents: Contents): Promise<void> {
+    const frame = contents.window?.frameElement;
+    if (frame) frame.setAttribute('title', this.frameTitle());
     await this.harden(contents);
     this.registerContentFocusAndLinks(contents);
     this.syncVisibleColumnLinks();

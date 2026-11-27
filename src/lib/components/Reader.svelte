@@ -50,6 +50,7 @@
     activeElement,
     focusFirstElement,
     focusModal,
+    isFocusableElement,
     restoreFocus,
     restoreModalFocus,
     trapModalKeydown,
@@ -235,7 +236,7 @@
   });
 
   async function openReaderSession(): Promise<void> {
-    const nextSession = new ReaderSession(bookUrl);
+    const nextSession = new ReaderSession(bookUrl, title);
     session = nextSession;
     await nextSession.open(
       viewport,
@@ -398,6 +399,16 @@
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
   }
 
+  function restorePanelFocus(opener: HTMLElement | null, fallbackSelector: string): void {
+    void tick().then(() => {
+      if (destroyed || hasOpenReaderPanel()) return;
+      const target =
+        opener?.isConnected && opener !== document.body && isFocusableElement(opener)
+          ? opener
+          : (readerToolbar?.querySelector<HTMLElement>(fallbackSelector) ?? null);
+      if (target && isFocusableElement(target)) restoreFocus(target);
+    });
+  }
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
     void tick().then(() => {
       const controls = panel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
@@ -432,6 +443,7 @@
 
   function errorFallbackTarget(): HTMLElement | null {
     if (errorRestoreReturnLink && returnToLinkButton) return returnToLinkButton;
+    if (pendingSyncLocation) return syncConfirmationPanel;
     if (settingsVisible) return settingsPanel;
     if (tocVisible) return tocPanel;
     if (bookmarksVisible) return bookmarksPanel;
@@ -492,10 +504,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     focusModal(() => settingsPanel);
   }
 
@@ -503,7 +517,7 @@
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restoreModalFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-appearance"]');
     resumeChromeHide();
   }
 
@@ -515,10 +529,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     focusedTocIndex = -1;
     void initializeTocDialog();
   }
@@ -532,7 +548,7 @@
     }
     const opener = tocOpener;
     tocOpener = null;
-    restoreModalFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-contents"]');
     resumeChromeHide();
   }
 
@@ -544,10 +560,12 @@
     tocVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     focusModal(() => bookmarksPanel);
   }
 
@@ -557,7 +575,7 @@
     bookmarkLimitMessage = '';
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restoreModalFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-bookmarks"]');
     resumeChromeHide();
   }
 
@@ -586,10 +604,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     searchVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     searchOpener = null;
+    syncConfirmationOpener = null;
     searchController?.abort();
     searchController = null;
     searching = false;
@@ -614,11 +634,7 @@
     exportMessage = '';
     const opener = annotationsOpener;
     annotationsOpener = null;
-    void tick().then(() => {
-      if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
-      else
-        readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-annotations"]')?.focus();
-    });
+    restorePanelFocus(opener, '[aria-controls="reader-annotations"]');
     resumeChromeHide();
   }
 
@@ -630,10 +646,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     annotationsVisible = false;
+    pendingSyncLocation = null;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
+    syncConfirmationOpener = null;
     searchError = '';
     focusModal(() => searchPanel);
   }
@@ -645,7 +663,7 @@
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
-    restoreModalFocus(opener);
+    restorePanelFocus(opener, '[aria-controls="reader-search"]');
     resumeChromeHide();
   }
 
@@ -690,7 +708,7 @@
     syncConfirmationOpener = opener;
     closeOpenSubpanels();
     pendingSyncLocation = progress;
-    focusModal(() => syncConfirmationPanel);
+    if (!error) focusModal(() => syncConfirmationPanel);
   }
 
   function closeSyncConfirmation(restore = true): void {
@@ -698,7 +716,17 @@
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
     if (restore) {
-      restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
+      void tick().then(() => {
+        if (destroyed || hasOpenReaderPanel()) return;
+        restoreFocus(
+          opener,
+          readerToolbar?.querySelector<HTMLElement>(
+            '[aria-label="Sync latest reading position"]',
+          ) ??
+            readerToolbar ??
+            topRevealButton,
+        );
+      });
     }
     resumeChromeHide();
   }
@@ -1398,7 +1426,7 @@
     else if (linkReturnTarget) {
       void returnToLink();
       return true;
-    } else if (controlsVisible) {
+    } else if (controlsVisible || footerVisible) {
       controlsVisible = false;
       footerVisible = false;
       pauseChromeHide();
@@ -1443,11 +1471,15 @@
   });
 </script>
 
-<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
-  <h1 class="sr-only">{title}</h1>
+<main
+  class="reader-shell"
+  data-mode={appearance.mode}
+  aria-describedby={hasOpenReaderPanel() ? undefined : 'reader-keyboard-help'}
+>
+  <h1 class="sr-only" inert={hasOpenReaderPanel()}>{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
-  <p class="sr-only" role="status">{selectionMessage}</p>
+  <p class="sr-only" role="status" inert={hasOpenReaderPanel()}>{selectionMessage}</p>
   {#if selectedText && !hasOpenReaderPanel()}
     <div
       bind:this={selectedTextGroup}
@@ -1482,14 +1514,14 @@
     </div>
   {/if}
 
-  <p class="sr-only" aria-live="polite" aria-atomic="true">
+  <p class="sr-only" aria-live="polite" aria-atomic="true" inert={hasOpenReaderPanel()}>
     {#if location}
       {activeSectionLabel}, page {location.pageIndex + 1} of {location.pageCount},
       {currentProgressLabel()} complete.
     {/if}
   </p>
 
-  <p id="reader-keyboard-help" class="sr-only">
+  <p id="reader-keyboard-help" class="sr-only" inert={hasOpenReaderPanel()}>
     Use Left or Page Up for the previous page. Use Right, Page Down, or Space for the next page.
     Press Escape to close an open reader panel or clear selected text.
   </p>
@@ -1531,6 +1563,7 @@
     <p
       class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
       role="status"
+      inert={hasOpenReaderPanel()}
     >
       {readerSyncMessage}
     </p>
@@ -1540,6 +1573,7 @@
     <div
       class="reader-progress"
       role="progressbar"
+      inert={hasOpenReaderPanel()}
       aria-label="Book reading progress"
       aria-valuemin="0"
       aria-valuemax="100"
@@ -1708,7 +1742,7 @@
           class="reader-panel-backdrop"
           type="button"
           tabindex="-1"
-          aria-label="Close reader panel"
+          aria-hidden="true"
           onclick={() =>
             settingsVisible
               ? closeSettings()
@@ -2507,6 +2541,7 @@
     <div
       class="fixed inset-0 z-40 grid place-items-center bg-black/55 p-4"
       role="presentation"
+      inert={Boolean(error)}
       transition:fade={{ duration: 120 }}
       onclick={(event) => event.target === event.currentTarget && closeSyncConfirmation()}
     >
@@ -2618,10 +2653,8 @@
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
     --reader-bar-text: var(--color-surface-950);
     --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
-    --reader-safe-bottom: max(
-      1rem,
-      env(safe-area-inset-bottom, 0px),
-      var(--safe-area-inset-bottom, 0px)
+    --reader-safe-bottom: calc(
+      3rem + max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px))
     );
     --reader-progress-height: 0.25rem;
   }
@@ -2687,10 +2720,17 @@
     top: 0;
     left: 0;
     right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    height: var(--reader-safe-top);
     border: 0;
     background: transparent;
+    pointer-events: none;
     -webkit-tap-highlight-color: transparent;
+  }
+
+  .reader-top-reveal:focus,
+  .reader-top-reveal:focus-visible {
+    height: max(var(--reader-safe-top), 2.75rem);
+    pointer-events: auto;
   }
 
   .reader-bottom-reveal {
@@ -2699,7 +2739,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: var(--reader-safe-bottom);
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
