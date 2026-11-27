@@ -24,7 +24,7 @@ const mocks = vi.hoisted(() => {
   };
 
   let latestHandlers: OpenHandlers | null = null;
-  const openImpl = vi.fn<() => Promise<void>>(() => Promise.resolve());
+  const openImpl = vi.fn<() => Promise<boolean>>(() => Promise.resolve(false));
   const nextImpl = vi.fn<() => Promise<void>>(() => Promise.resolve());
   const previousImpl = vi.fn<() => Promise<void>>(() => Promise.resolve());
   const displayImpl = vi.fn<(target?: string) => Promise<void>>(() => Promise.resolve());
@@ -56,7 +56,7 @@ const mocks = vi.hoisted(() => {
         onKeydown: OpenHandlers['onKeydown'],
       ) => {
         latestHandlers = { onRelocated, onZoneTap, onSelection, onKeydown };
-        await openImpl();
+        return openImpl();
       },
     );
     destroy = vi.fn();
@@ -159,7 +159,7 @@ describe('Reader alert modals and focus containment', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     mocks.resetHandlers();
-    mocks.openImpl.mockReset().mockResolvedValue(undefined);
+    mocks.openImpl.mockReset().mockResolvedValue(false);
     mocks.nextImpl.mockReset().mockResolvedValue(undefined);
     mocks.previousImpl.mockReset().mockResolvedValue(undefined);
     mocks.displayImpl.mockReset().mockResolvedValue(undefined);
@@ -576,7 +576,7 @@ describe('Reader alert modals and focus containment', () => {
     expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(false);
     expect(document.activeElement).toBe(bookmarkBtn);
 
-    // Close bookmarks, trigger link jump, and verify Return to link runtime error restores focus on Back
+    // Close bookmarks, trigger link jump, and verify excursion Return runtime error restores focus on Back
     target.querySelector<HTMLButtonElement>('[aria-label="Close bookmarks and history"]')!.click();
     await settle();
 
@@ -596,7 +596,7 @@ describe('Reader alert modals and focus containment', () => {
     await settle();
 
     const returnLinkBtn = target.querySelector<HTMLButtonElement>(
-      '[aria-label="Return to the location before this link"]',
+      '[aria-label="Reading excursion controls"] button',
     );
     expect(returnLinkBtn).not.toBeNull();
     mocks.displayCfiImpl.mockRejectedValueOnce(new Error('Link target gone'));
@@ -605,11 +605,9 @@ describe('Reader alert modals and focus containment', () => {
     await settle();
 
     expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
-      'The location before this link is no longer available in the current EPUB.',
+      'The previous reading location is no longer available in the current EPUB.',
     );
-    expect(
-      target.querySelector('[aria-label="Return to the location before this link"]'),
-    ).toBeNull();
+    expect(target.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
 
     backHandler?.();
     await settle();
@@ -617,7 +615,7 @@ describe('Reader alert modals and focus containment', () => {
     expect(target.querySelector('[role="alertdialog"]')).toBeNull();
     expect(onBack).not.toHaveBeenCalled();
     const remountedReturnLinkBtn = target.querySelector<HTMLButtonElement>(
-      '[aria-label="Return to the location before this link"]',
+      '[aria-label="Reading excursion controls"] button',
     );
     expect(remountedReturnLinkBtn).not.toBeNull();
     expect(document.activeElement).toBe(remountedReturnLinkBtn);

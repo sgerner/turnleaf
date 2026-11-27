@@ -1,9 +1,27 @@
 // @vitest-environment jsdom
 
 import type { Contents, Location } from 'epubjs';
+import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Reader from '../components/Reader.svelte';
 import { calculateVirtualWindow } from '../components/library-virtualization';
+import {
+  getPendingSync,
+  getPreferences,
+  getReadingState,
+  reconcileBooks,
+  saveLocalProgress,
+  setPreference,
+  type BookRecord,
+} from '../database/database';
+import { addAnnotation } from './annotations';
 import { defaultAppearance, type Appearance } from './appearance';
+import {
+  parseLocationHistory,
+  parseReturnStack,
+  returnStackPreferenceKey,
+  toggleBookmark,
+} from './bookmarks';
 import {
   TOC_OVERSCAN_ROWS,
   TOC_ROW_HEIGHT_PX,
@@ -13,7 +31,13 @@ import {
 } from './toc';
 
 type TestTocItem = { label: string; href: string; subitems?: TestTocItem[] };
-type TestSpineSection = { href: string; index: number };
+type TestSpineSection = {
+  href: string;
+  index: number;
+  load?: () => Promise<void>;
+  unload?: () => void;
+  search?: (query: string) => Array<{ cfi: string; excerpt: string }>;
+};
 
 const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
   const defaultSpineSections: TestSpineSection[] = [
@@ -28,7 +52,9 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     location: undefined as { start: { cfi: string } } | undefined,
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
-    display: vi.fn(async () => {}),
+    display: vi.fn(async (_target?: string) => {}),
+    next: vi.fn(async () => {}),
+    prev: vi.fn(async () => {}),
     getContents: vi.fn((): unknown[] => []),
     resize: vi.fn(),
     destroy: vi.fn(),
@@ -44,6 +70,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
   const book = {
     renderTo: vi.fn(() => rendition),
     destroy: vi.fn(),
+    load: vi.fn(async () => document.implementation.createHTMLDocument('section')),
     packaging: { navPath: '' as string | false, ncxPath: '' as string | false },
     spine,
     navigation: { toc: [] as TestTocItem[] },
@@ -65,14 +92,14 @@ function getRenditionListener(
   return listener;
 }
 
-function location(cfi: string): Location {
+function location(cfi: string, href = 'chapter.xhtml', index = 0, page = 2): Location {
   return {
     start: {
       cfi,
-      href: 'chapter.xhtml',
-      index: 0,
+      href,
+      index,
       percentage: 0.2,
-      displayed: { page: 2, total: 10 },
+      displayed: { page, total: 10 },
     },
   } as Location;
 }
@@ -80,6 +107,10 @@ function location(cfi: string): Location {
 describe('ReaderSession', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRendition.display.mockImplementation(async () => {});
+    mockRendition.next.mockImplementation(async () => {});
+    mockRendition.prev.mockImplementation(async () => {});
+    mockRendition.resize.mockImplementation(() => {});
     mockRendition.getContents.mockReturnValue([]);
     mockBook.packaging = { navPath: '', ncxPath: '' };
     mockBook.navigation.toc = [];
@@ -855,7 +886,7 @@ describe('ReaderSession', () => {
         pageCount: 4,
       }),
     );
-    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('page');
 
     session.destroy();
   });
@@ -1062,5 +1093,611 @@ describe('ReaderSession', () => {
     });
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
+  });
+
+  it('classifies restore, sequential page turn, explicit jump, internal link, and return origins', async () => {
+    mockBook.spine.sections = [
+      { href: 'chapter.xhtml', index: 0 },
+      { href: 'endnotes.xhtml', index: 2 },
+    ];
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    const restored = await session.open(
+      document.createElement('div'),
+      'epubcfi(/6/2!/4/4)',
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    expect(restored).toBe(true);
+
+    const relocated = getRenditionListener('relocated');
+    relocated(location('epubcfi(/6/2!/4/4)'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    await session.next();
+    relocated(location('epubcfi(/6/2!/4/6)'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('page');
+    expect(onLocation.mock.calls.at(-1)).toHaveLength(2);
+
+    await session.display('endnotes.xhtml');
+    relocated(location('epubcfi(/6/6!/4/2)', 'endnotes.xhtml', 2, 1));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('jump');
+    expect(onLocation.mock.calls.at(-1)?.[2]).toEqual({
+      cfi: 'epubcfi(/6/2!/4/6)',
+      href: 'chapter.xhtml',
+    });
+
+    await session.displayCfi('epubcfi(/6/2!/4/6)', 'return');
+    relocated(location('epubcfi(/6/2!/4/6)'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('return');
+    expect(onLocation.mock.calls.at(-1)).toHaveLength(2);
+    // Pre-settle same-CFI relocation while next() is in flight does not consume pending 'page'.
+    let resolveNext!: () => void;
+    mockRendition.next.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveNext = resolve;
+        }),
+    );
+    const nextPromise = session.next();
+    relocated(location('epubcfi(/6/2!/4/6)'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    resolveNext();
+    await nextPromise;
+    relocated(location('epubcfi(/6/2!/4/8)'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('page');
+
+    // Settled same-CFI jump clears pending state so later relocations stay 'restore'.
+    await session.displayCfi('epubcfi(/6/2!/4/8)', 'jump');
+    relocated(location('epubcfi(/6/2!/4/8)'));
+    relocated(location('epubcfi(/6/2!/4/10)'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    session.destroy();
+  });
+
+  it('aborts a display that is in flight during a resize and reports the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallbacks.push(callback);
+        }
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+
+    mockBook.spine.sections = [
+      { href: 'chapter-1.xhtml', index: 0 },
+      { href: 'endnotes.xhtml', index: 1 },
+    ];
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      'epubcfi(/6/2!/4/2)',
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = getRenditionListener('relocated');
+    relocated(location('epubcfi(/6/2!/4/2)', 'chapter-1.xhtml', 0, 1));
+    vi.clearAllMocks();
+
+    let abortDisplay!: (reason?: unknown) => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          abortDisplay = reject;
+        }),
+    );
+    mockRendition.resize.mockImplementationOnce(() => {
+      abortDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+      queueMicrotask(() => {
+        relocated(location('epubcfi(/6/2!/4/4)', 'chapter-1.xhtml', 0, 2));
+      });
+    });
+
+    const inFlightDisplay = session.display('endnotes.xhtml');
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    await expect(inFlightDisplay).rejects.toThrow('Display aborted during resize');
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 640);
+    await vi.waitFor(() => {
+      expect(onLocation).toHaveBeenCalledOnce();
+    });
+    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/4)', href: 'chapter-1.xhtml' }),
+    );
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    expect(onLocation.mock.calls.at(-1)).toHaveLength(2);
+
+    await session.next();
+    relocated(location('epubcfi(/6/2!/4/6)', 'chapter-1.xhtml', 0, 3));
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/6)');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('page');
+
+    // Also cover epub.js onResized resolving an in-flight displayCfi early and re-displaying start CFI.
+    let resolveAbortedJump!: () => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveAbortedJump = resolve;
+        }),
+    );
+    mockRendition.resize.mockImplementationOnce(() => {
+      resolveAbortedJump();
+      queueMicrotask(() => {
+        relocated(location('epubcfi(/6/2!/4/6)', 'chapter-1.xhtml', 0, 3));
+      });
+    });
+    const inFlightCfiJump = session.displayCfi('epubcfi(/6/6!/4/2)', 'jump');
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 600, height: 800 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    await inFlightCfiJump;
+    await vi.waitFor(() => {
+      expect(mockRendition.resize).toHaveBeenCalledWith(600, 800);
+    });
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/6)');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    relocated(location('epubcfi(/6/2!/4/8)', 'chapter-1.xhtml', 0, 4));
+    expect(onLocation.mock.calls.at(-1)?.[0].cfi).toBe('epubcfi(/6/2!/4/8)');
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+    session.destroy();
+  });
+});
+
+describe('Reader return stack and excursion gating integration', () => {
+  const testBook: BookRecord = {
+    id: 'server:1:10',
+    serverId: 'server',
+    libraryId: 1,
+    seriesId: 1,
+    volumeId: 10,
+    chapterId: 10,
+    title: 'Excursion Test Book',
+    author: 'Turnleaf Author',
+    series: null,
+    descriptionHtml: null,
+    format: 'epub',
+    pages: 120,
+    pagesRead: 40,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    lastReadAt: '2026-01-02T00:00:00.000Z',
+    downloadPath: 'books/server-1-10.epub',
+    downloadStatus: 'available',
+    fileSize: 2048,
+  };
+  const state = { sectionIndex: 0, page: 1, cfi: 'epubcfi(/6/2!/4/2)', href: 'chapter-1.xhtml' };
+  let host: HTMLDivElement;
+
+  async function settle(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    flushSync();
+  }
+
+  async function savedReturnStack() {
+    const prefs = await getPreferences([returnStackPreferenceKey(testBook.id)]);
+    return parseReturnStack(prefs.get(returnStackPreferenceKey(testBook.id)) ?? null);
+  }
+
+  function clickExcursion(action: 'Return' | 'Stay'): void {
+    const controls = host.querySelector('[aria-label="Reading excursion controls"]');
+    [...(controls?.querySelectorAll('button') ?? [])]
+      .find((btn) => btn.textContent?.includes(action))
+      ?.click();
+  }
+
+  function clickInternalLink(href: string): void {
+    const click = [...mockRendition.on.mock.calls]
+      .reverse()
+      .find(([name]) => name === 'click')?.[1] as
+      ((event: unknown, contents: unknown) => void) | undefined;
+    const anchor = document.createElement('a');
+    anchor.setAttribute('href', href);
+    click?.(
+      { target: anchor, clientX: 100 },
+      { window: { getSelection: () => ({ isCollapsed: true }) } },
+    );
+  }
+
+  function mountReader(
+    options: {
+      initialCfi?: string | null;
+      initialPercentage?: number | null;
+      onSyncLatest?: (manual: boolean) => Promise<{
+        xpath: string | null;
+        percentage: number | null;
+        accept?: () => Promise<void>;
+      } | null>;
+      registerBackHandler?: (handler: () => boolean) => () => void;
+    } = {},
+  ) {
+    return mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'book.epub',
+        bookId: testBook.id,
+        title: testBook.title,
+        initialCfi: options.initialCfi ?? null,
+        initialPercentage: options.initialPercentage ?? null,
+        onBack: vi.fn(),
+        onRelocated: (loc) => {
+          void saveLocalProgress(testBook, loc.cfi, loc.xpath, loc.percentage, loc.spineIndex);
+        },
+        ...(options.onSyncLatest ? { onSyncLatest: options.onSyncLatest } : {}),
+        ...(options.registerBackHandler
+          ? { registerBackHandler: options.registerBackHandler }
+          : {}),
+      },
+    });
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    if (!Element.prototype.animate) {
+      Element.prototype.animate = () => {
+        const anim = { onfinish: null as (() => void) | null, cancel: () => {}, finish: () => {} };
+        queueMicrotask(() => anim.onfinish?.());
+        return anim as unknown as Animation;
+      };
+    }
+    const sections: TestSpineSection[] = [
+      {
+        href: 'chapter-1.xhtml',
+        index: 0,
+        load: vi.fn(async () => {}),
+        unload: vi.fn(),
+        search: vi.fn(() => []),
+      },
+      {
+        href: 'chapter-2.xhtml',
+        index: 1,
+        load: vi.fn(async () => {}),
+        unload: vi.fn(),
+        search: vi.fn(() => [{ cfi: 'epubcfi(/6/4!/4/8)', excerpt: 'Search match in chapter 2' }]),
+      },
+      {
+        href: 'endnotes.xhtml',
+        index: 2,
+        load: vi.fn(async () => {}),
+        unload: vi.fn(),
+        search: vi.fn(() => []),
+      },
+    ];
+    mockBook.packaging = { navPath: '', ncxPath: '' };
+    mockBook.spine.sections = sections;
+    mockBook.navigation.toc = [
+      { label: 'Chapter 1', href: 'chapter-1.xhtml' },
+      { label: 'Chapter 2', href: 'chapter-2.xhtml' },
+      { label: 'Endnotes', href: 'endnotes.xhtml' },
+    ];
+    mockRendition.getContents.mockReturnValue([]);
+    mockRendition.resize.mockImplementation(() => {});
+
+    const emitCurrent = () => {
+      const relocated = [...mockRendition.on.mock.calls]
+        .reverse()
+        .find(([name]) => name === 'relocated')?.[1];
+      if (typeof relocated === 'function') {
+        relocated({
+          start: {
+            cfi: state.cfi,
+            href: state.href,
+            index: state.sectionIndex,
+            percentage: (state.sectionIndex + (state.page - 1) / 4) / sections.length,
+            displayed: { page: state.page, total: 4 },
+          },
+        } as Location);
+      }
+    };
+    mockRendition.display.mockImplementation(async (target?: string) => {
+      if (!target) {
+        Object.assign(state, {
+          sectionIndex: 0,
+          href: 'chapter-1.xhtml',
+          page: 1,
+          cfi: 'epubcfi(/6/2!/4/2)',
+        });
+      } else if (target.startsWith('epubcfi(')) {
+        const idx = target.includes('/6/6!') ? 2 : target.includes('/6/4!') ? 1 : 0;
+        Object.assign(state, {
+          cfi: target,
+          sectionIndex: idx,
+          href: sections[idx]!.href,
+          page: target.endsWith('/6)') ? 2 : 1,
+        });
+      } else {
+        const cleanHref = target.split('#')[0] ?? target;
+        const found = sections.find((s) => s.href === cleanHref) ?? sections[0]!;
+        Object.assign(state, {
+          sectionIndex: found.index,
+          href: found.href,
+          page: 1,
+          cfi: `epubcfi(/6/${(found.index + 1) * 2}!/4/2)`,
+        });
+      }
+      emitCurrent();
+    });
+    mockRendition.next.mockImplementation(async () => {
+      state.page += 1;
+      state.cfi = `epubcfi(/6/${(state.sectionIndex + 1) * 2}!/4/${state.page * 2 + 2})`;
+      emitCurrent();
+    });
+    mockRendition.prev.mockImplementation(async () => {
+      state.page = Math.max(1, state.page - 1);
+      state.cfi = `epubcfi(/6/${(state.sectionIndex + 1) * 2}!/4/${state.page * 2})`;
+      emitCurrent();
+    });
+
+    const values = new Map<string, string>();
+    const storage: Storage = {
+      get length() {
+        return values.size;
+      },
+      clear: () => values.clear(),
+      getItem: (key) => values.get(key) ?? null,
+      key: (index) => [...values.keys()][index] ?? null,
+      removeItem: (key) => values.delete(key),
+      setItem: (key, value) => values.set(key, value),
+    };
+    Object.defineProperty(window, 'localStorage', { value: storage, configurable: true });
+    host = document.createElement('div');
+    document.body.innerHTML = '';
+    document.body.append(host);
+    await reconcileBooks('server', [testBook]);
+  });
+
+  it('preserves restored CFI in the return stack and history across Contents, Search, Bookmark, and Highlight jumps', async () => {
+    const restoredCfi = 'epubcfi(/6/4!/4/2)';
+    await saveLocalProgress(testBook, restoredCfi, '//body/DocFragment[2]/body/p[1]', 0.35, 1);
+    const bookmarks = toggleBookmark(
+      [],
+      { cfi: 'epubcfi(/6/6!/4/2)', href: 'endnotes.xhtml', percentage: 0.7 },
+      '2026-01-01T00:00:00.000Z',
+    );
+    const annotations = addAnnotation(
+      [],
+      'epubcfi(/6/2!/4/2)',
+      'Opening paragraph highlight',
+      '',
+      '2026-01-01T00:00:00.000Z',
+    );
+    await setPreference(`readerBookmarks:${testBook.id}`, JSON.stringify(bookmarks));
+    await setPreference(`readerAnnotations:${testBook.id}`, JSON.stringify(annotations));
+
+    const reader = mountReader({ initialCfi: restoredCfi, initialPercentage: 0.35 });
+    await settle();
+
+    let prefs = await getPreferences([`readerHistory:${testBook.id}`]);
+    expect(parseLocationHistory(prefs.get(`readerHistory:${testBook.id}`) ?? null)[0]?.cfi).toBe(
+      restoredCfi,
+    );
+
+    // 1. Contents jump
+    host.querySelector<HTMLButtonElement>('[aria-label="Show reading controls"]')?.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>('[aria-label="Contents"]')?.click();
+    await settle();
+    [...host.querySelectorAll<HTMLButtonElement>('#reader-contents button')]
+      .find((btn) => btn.textContent?.trim() === 'Endnotes')
+      ?.click();
+    await settle();
+
+    expect((await getReadingState(testBook.id))?.cfi).toBe(restoredCfi);
+    expect(await savedReturnStack()).toEqual([{ cfi: restoredCfi, href: 'chapter-2.xhtml' }]);
+    prefs = await getPreferences([`readerHistory:${testBook.id}`]);
+    expect(
+      parseLocationHistory(prefs.get(`readerHistory:${testBook.id}`) ?? null).map((i) => i.cfi),
+    ).toContain(restoredCfi);
+
+    clickExcursion('Return');
+    await settle();
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
+
+    // 2. Search result jump
+    host.querySelector<HTMLButtonElement>('[aria-label="Search this book"]')?.click();
+    await settle();
+    const searchInput = host.querySelector<HTMLInputElement>('#reader-search-query')!;
+    searchInput.value = 'match';
+    searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    host
+      .querySelector<HTMLFormElement>('#reader-search form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+    host.querySelector<HTMLButtonElement>('[aria-label="Search results"] button')?.click();
+    await settle();
+
+    expect((await getReadingState(testBook.id))?.cfi).toBe(restoredCfi);
+    expect(await savedReturnStack()).toEqual([{ cfi: restoredCfi, href: 'chapter-2.xhtml' }]);
+    clickExcursion('Return');
+    await settle();
+
+    // 3. Bookmark jump
+    host.querySelector<HTMLButtonElement>('[aria-label="Marks, bookmarks and history"]')?.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>('[data-reader-focus="bookmark-location"]')?.click();
+    await settle();
+
+    expect((await getReadingState(testBook.id))?.cfi).toBe(restoredCfi);
+    expect(await savedReturnStack()).toEqual([{ cfi: restoredCfi, href: 'chapter-2.xhtml' }]);
+    clickExcursion('Return');
+    await settle();
+
+    // 4. Highlight jump
+    host
+      .querySelector<HTMLButtonElement>('[aria-label="Notes: highlights and annotations"]')
+      ?.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>('#reader-annotations article button')?.click();
+    await settle();
+
+    expect((await getReadingState(testBook.id))?.cfi).toBe(restoredCfi);
+    expect(await savedReturnStack()).toEqual([{ cfi: restoredCfi, href: 'chapter-2.xhtml' }]);
+    await unmount(reader);
+  });
+
+  it('keeps Return and Stay active across multi-page endnotes, unwinds nested links via Back/Return, and survives restarts', async () => {
+    const chapterCfi = 'epubcfi(/6/4!/4/2)';
+    await saveLocalProgress(testBook, chapterCfi, '//body/DocFragment[2]/body/p[1]', 0.35, 1);
+
+    const back = { current: null as (() => boolean) | null };
+    const registerBackHandler = (handler: () => boolean) => {
+      back.current = handler;
+      return () => {
+        back.current = null;
+      };
+    };
+    const reader = mountReader({
+      initialCfi: chapterCfi,
+      initialPercentage: 0.35,
+      registerBackHandler,
+    });
+    await settle();
+
+    clickInternalLink('endnotes.xhtml#fn1');
+    await mockRendition.display('epubcfi(/6/6!/4/2)');
+    await settle();
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
+    await settle();
+
+    const endnotePage2Cfi = state.cfi;
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).not.toBeNull();
+    expect((await getReadingState(testBook.id))?.cfi).toBe(chapterCfi);
+    const pendingBeforeRestart = await getPendingSync('server');
+    expect(pendingBeforeRestart).toHaveLength(1);
+    expect(JSON.parse(pendingBeforeRestart[0]!.payload).bookScrollId).toBe(
+      '//body/DocFragment[2]/body/p[1]',
+    );
+
+    clickInternalLink('chapter-1.xhtml#ref');
+    await mockRendition.display('epubcfi(/6/2!/4/2)');
+    await settle();
+
+    expect(await savedReturnStack()).toEqual([
+      { cfi: endnotePage2Cfi, href: 'endnotes.xhtml' },
+      { cfi: chapterCfi, href: 'chapter-2.xhtml' },
+    ]);
+
+    await unmount(reader);
+    const reopenedAtExcursion = mountReader({
+      initialCfi: 'epubcfi(/6/2!/4/2)',
+      registerBackHandler,
+    });
+    await settle();
+
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).not.toBeNull();
+    back.current?.();
+    await settle();
+    expect(state.cfi).toBe(endnotePage2Cfi);
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).not.toBeNull();
+
+    clickExcursion('Return');
+    await settle();
+    expect(state.cfi).toBe(chapterCfi);
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
+
+    clickInternalLink('endnotes.xhtml#fn2');
+    await mockRendition.display('epubcfi(/6/6!/4/2)');
+    await settle();
+
+    await unmount(reopenedAtExcursion);
+    const savedState = await getReadingState(testBook.id);
+    expect(savedState?.cfi).toBe(chapterCfi);
+
+    const reopenedFromCommitted = mountReader({
+      initialCfi: savedState?.cfi ?? null,
+      initialPercentage: savedState?.percentage ?? null,
+    });
+    await settle();
+
+    expect(state.cfi).toBe(chapterCfi);
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
+    const pendingAfterRestart = await getPendingSync('server');
+    expect(JSON.parse(pendingAfterRestart[0]!.payload).bookScrollId).toBe(
+      '//body/DocFragment[2]/body/p[1]',
+    );
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
+    await settle();
+    expect((await getReadingState(testBook.id))?.cfi).toBe(state.cfi);
+    await unmount(reopenedFromCommitted);
+  });
+
+  it('commits Stay confirmation in one tap, commits unread 0% jumps immediately, and clears stack on remote sync', async () => {
+    const unreadReader = mountReader({ initialCfi: null, initialPercentage: null });
+    await settle();
+    expect(state.cfi).toBe('epubcfi(/6/2!/4/2)');
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Show reading controls"]')?.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>('[aria-label="Contents"]')?.click();
+    await settle();
+    [...host.querySelectorAll<HTMLButtonElement>('#reader-contents button')]
+      .find((btn) => btn.textContent?.trim() === 'Chapter 2')
+      ?.click();
+    await settle();
+
+    const committedChapter2Cfi = 'epubcfi(/6/4!/4/2)';
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
+    expect((await getReadingState(testBook.id))?.cfi).toBe(committedChapter2Cfi);
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Contents"]')?.click();
+    await settle();
+    [...host.querySelectorAll<HTMLButtonElement>('#reader-contents button')]
+      .find((btn) => btn.textContent?.trim() === 'Endnotes')
+      ?.click();
+    await settle();
+
+    const endnotesCfi = 'epubcfi(/6/6!/4/2)';
+    expect((await getReadingState(testBook.id))?.cfi).toBe(committedChapter2Cfi);
+    clickExcursion('Stay');
+    await settle();
+
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
+    expect((await getReadingState(testBook.id))?.cfi).toBe(endnotesCfi);
+    expect(await getPendingSync('server')).toHaveLength(1);
+    expect(await savedReturnStack()).toEqual([]);
+
+    clickInternalLink('chapter-1.xhtml#back');
+    await mockRendition.display('epubcfi(/6/2!/4/2)');
+    await settle();
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).not.toBeNull();
+
+    await unmount(unreadReader);
+    const acceptRemote = vi.fn(async () => {});
+    const syncReader = mountReader({
+      initialCfi: 'epubcfi(/6/2!/4/2)',
+      onSyncLatest: async () => ({ xpath: null, percentage: 0.5, accept: acceptRemote }),
+    });
+    await settle();
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Show reading controls"]')?.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>('[aria-label="Sync latest reading position"]')?.click();
+    await settle();
+    [...host.querySelectorAll('button')]
+      .find((btn) => btn.textContent?.includes('Go to latest position'))
+      ?.click();
+    await settle();
+
+    expect(acceptRemote).toHaveBeenCalledOnce();
+    expect(host.querySelector('[aria-label="Reading excursion controls"]')).toBeNull();
+    expect(await savedReturnStack()).toEqual([]);
+    await unmount(syncReader);
   });
 });

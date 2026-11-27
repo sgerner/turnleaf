@@ -22,7 +22,6 @@
     ReaderSession,
     resolveReaderKeyboardAction,
     type ReaderLocation,
-    type ReaderLinkReturnTarget,
     type ReaderSelection,
     type TocItem,
   } from '../reader/session';
@@ -40,11 +39,17 @@
     MAX_BOOKMARKS,
     parseBookmarks,
     parseLocationHistory,
+    parseReturnStack,
+    popReturnLocation,
+    pushReturnLocation,
+    reconcileRestoredReturnStack,
     recordLocation,
     removeBookmark,
     renameBookmark,
+    returnStackPreferenceKey,
     toggleBookmark,
     type StoredReaderLocation,
+    type StoredReturnLocation,
   } from '../reader/bookmarks';
   import {
     activeElement,
@@ -105,7 +110,7 @@
   let viewport: HTMLDivElement;
   let readerToolbar = $state<HTMLElement | null>(null);
   let topRevealButton = $state<HTMLButtonElement | null>(null);
-  let returnToLinkButton = $state<HTMLButtonElement | null>(null);
+  let returnExcursionButton = $state<HTMLButtonElement | null>(null);
   let session: ReaderSession | null = null;
   let sessionReady = $state(false);
   let controlsVisible = $state(false);
@@ -129,7 +134,7 @@
   let searchOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
   let errorOpener: HTMLElement | null = null;
-  let errorRestoreReturnLink = false;
+  let errorRestoreReturnControl = false;
   let toc = $state<TocItem[]>([]);
   let tocVirtualWindow = $state<VirtualWindow>(
     calculateVirtualWindow(0, 1, TOC_ROW_HEIGHT_PX, 0, 0, TOC_OVERSCAN_ROWS),
@@ -173,7 +178,8 @@
   let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
-  let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
+  let returnStack = $state<StoredReturnLocation[]>([]);
+  let excursionControls = $state<HTMLElement | null>(null);
   let pendingSyncLocation = $state<SyncedLocation | null>(null);
   let error = $state('');
   let startupOpenFailed = $state(false);
@@ -187,6 +193,8 @@
   let syncingLatest = $state(false);
   let destroyed = false;
   let localNavigationDuringSession = false;
+  let hasCommittedPosition = false;
+  let returningFromExcursion = false;
   const nativeFeatures = Capacitor.isNativePlatform()
     ? createReaderNativeFeatures({
         hideStatusBar: () => StatusBar.hide({ animation: Animation.None }),
@@ -208,6 +216,7 @@
       `readerBookmarks:${bookId}`,
       `readerHistory:${bookId}`,
       `readerAnnotations:${bookId}`,
+      returnStackPreferenceKey(bookId),
     ]);
     if (destroyed) return;
     const saved = preferences.get('appearance');
@@ -215,6 +224,7 @@
     bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
+    returnStack = parseReturnStack(preferences.get(returnStackPreferenceKey(bookId)) ?? null);
     await enableNativeReaderChrome();
     try {
       await openReaderSession();
@@ -237,7 +247,10 @@
   async function openReaderSession(): Promise<void> {
     const nextSession = new ReaderSession(bookUrl);
     session = nextSession;
-    await nextSession.open(
+    let initialRestoreSettled = false;
+    let seedPendingOnRestore = false;
+    let restoredPosition = false;
+    const restored = await nextSession.open(
       viewport,
       initialCfi,
       initialXPath,
@@ -245,21 +258,51 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
-        if (location?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
+        const previous = location;
+        if (previous?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
-        if (origin === 'link') {
-          linkReturnTarget = returnTarget ?? null;
-        } else if (origin === 'navigation') {
-          linkReturnTarget = null;
+        if (origin === 'restore') {
+          if (initialRestoreSettled && seedPendingOnRestore) {
+            seedPendingOnRestore = false;
+            if (restoredPosition) {
+              recordHistoryLocation(next);
+            }
+            reconcileReturnStackWithLocation(next.cfi);
+          }
+          return;
         }
-        if (origin === 'navigation' || origin === 'link') {
-          localNavigationDuringSession = true;
-          onRelocated(next);
-          locationHistory = recordLocation(locationHistory, next);
-          queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+        if (origin === 'jump' || origin === 'link') {
+          const isUnreadAtStart =
+            !hasCommittedPosition &&
+            returnStack.length === 0 &&
+            previous !== null &&
+            previous.percentage <= 0;
+          const originTarget =
+            returnTarget ?? (previous ? { cfi: previous.cfi, href: previous.href } : null);
+          if (isUnreadAtStart || !originTarget?.cfi) {
+            commitLocationProgress(next);
+            recordHistoryLocation(next);
+          } else {
+            if (previous) {
+              locationHistory = recordLocation(locationHistory, readerLocation(previous));
+            }
+            setReturnStack(pushReturnLocation(returnStack, originTarget));
+            recordHistoryLocation(next);
+          }
           if (origin === 'link') showControls();
+          return;
+        }
+        if (origin === 'page') {
+          if (returnStack.length === 0) {
+            commitLocationProgress(next);
+          }
+          recordHistoryLocation(next);
+          return;
+        }
+        if (origin === 'return') {
+          recordHistoryLocation(next);
         }
       },
       (zone) => {
@@ -284,6 +327,20 @@
     );
     if (!destroyed) {
       sessionReady = true;
+      initialRestoreSettled = true;
+      restoredPosition = restored;
+      if (restored) {
+        hasCommittedPosition = true;
+      }
+      const currentLocation: ReaderLocation | null = location;
+      if (currentLocation) {
+        if (restored) {
+          recordHistoryLocation(currentLocation);
+        }
+        reconcileReturnStackWithLocation(currentLocation.cfi);
+      } else {
+        seedPendingOnRestore = true;
+      }
       toc = nextSession.tableOfContents();
       nextSession.updateHighlights(annotations);
       updateDocumentTitle();
@@ -431,7 +488,7 @@
   }
 
   function errorFallbackTarget(): HTMLElement | null {
-    if (errorRestoreReturnLink && returnToLinkButton) return returnToLinkButton;
+    if (errorRestoreReturnControl && returnExcursionButton) return returnExcursionButton;
     if (settingsVisible) return settingsPanel;
     if (tocVisible) return tocPanel;
     if (bookmarksVisible) return bookmarksPanel;
@@ -443,11 +500,11 @@
   function openReaderError(
     message: string,
     opener: HTMLElement | null = null,
-    restoreReturnLink = false,
+    restoreReturnControl = false,
   ): void {
     pauseChromeHide();
     errorOpener = opener;
-    errorRestoreReturnLink = restoreReturnLink;
+    errorRestoreReturnControl = restoreReturnControl;
     error = message;
     focusModal(() => errorPanel);
   }
@@ -459,7 +516,7 @@
     errorOpener = null;
     void tick().then(() => {
       const fallback = errorFallbackTarget();
-      errorRestoreReturnLink = false;
+      errorRestoreReturnControl = false;
       restoreFocus(opener, fallback);
     });
     resumeChromeHide();
@@ -919,6 +976,29 @@
     flushPreferences();
   }
 
+  function setReturnStack(next: StoredReturnLocation[]): void {
+    returnStack = next;
+    queuePreference(returnStackPreferenceKey(bookId), JSON.stringify(next));
+  }
+
+  function reconcileReturnStackWithLocation(restoredCfi: string): void {
+    const reconciled = reconcileRestoredReturnStack(returnStack, restoredCfi);
+    if (reconciled.length !== returnStack.length) {
+      setReturnStack(reconciled);
+    }
+  }
+
+  function recordHistoryLocation(next: ReaderLocation): void {
+    locationHistory = recordLocation(locationHistory, readerLocation(next));
+    queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+  }
+
+  function commitLocationProgress(next: ReaderLocation): void {
+    hasCommittedPosition = true;
+    localNavigationDuringSession = true;
+    onRelocated(next);
+  }
+
   function currentBookmark(): StoredReaderLocation | null {
     if (!location) return null;
     const id = `${location.cfi}|${location.href}`;
@@ -1144,7 +1224,11 @@
   async function openSearchResult(result: ReaderSearchResult): Promise<void> {
     if (!session) return;
     try {
-      await session.displayCfi(result.cfi);
+      const opened = await session.displayCfi(result.cfi, 'jump');
+      if (!opened) {
+        searchError = 'This search result is no longer available in the current EPUB.';
+        return;
+      }
       closeSearch();
       showControls();
     } catch {
@@ -1156,8 +1240,8 @@
     if (!session) return;
     const opener = activeElement();
     try {
-      const restored = await session.displayCfi(saved.cfi);
-      if (!restored && saved.href) await session.display(saved.href);
+      const restored = await session.displayCfi(saved.cfi, 'jump');
+      if (!restored && saved.href) await session.display(saved.href, 'jump');
       closeBookmarks();
       showControls();
     } catch {
@@ -1165,22 +1249,65 @@
     }
   }
 
-  async function returnToLink(): Promise<void> {
-    if (!session || !linkReturnTarget) return;
+  async function returnFromExcursion(): Promise<void> {
+    if (!session || returnStack.length === 0 || returningFromExcursion) return;
+    const { target, remaining } = popReturnLocation(returnStack);
+    if (!target) return;
     const opener = activeElement();
-    const restoreLink = opener === returnToLinkButton;
-    const target = linkReturnTarget;
+    const restoreReturnControl = opener === returnExcursionButton;
+    const restoreFocusAfterClear = Boolean(
+      remaining.length === 0 &&
+      excursionControls &&
+      document.activeElement &&
+      excursionControls.contains(document.activeElement),
+    );
+    returningFromExcursion = true;
     try {
-      const restored = await session.displayCfi(target.cfi);
-      if (!restored && target.href) await session.display(target.href);
-      linkReturnTarget = null;
+      const restored = await session.displayCfi(target.cfi, 'return');
+      if (!restored) {
+        if (!target.href) {
+          openReaderError(
+            'The previous reading location is no longer available in the current EPUB.',
+            opener,
+            restoreReturnControl,
+          );
+          return;
+        }
+        await session.display(target.href, 'return');
+      }
+      setReturnStack(remaining);
       showControls();
+      if (restoreFocusAfterClear) {
+        void tick().then(() => focusFirstElement(readerToolbar));
+      }
     } catch {
       openReaderError(
-        'The location before this link is no longer available in the current EPUB.',
+        'The previous reading location is no longer available in the current EPUB.',
         opener,
-        restoreLink,
+        restoreReturnControl,
       );
+    } finally {
+      returningFromExcursion = false;
+    }
+  }
+
+  function stayAtCurrentLocation(): void {
+    if (returnStack.length === 0) return;
+    const restoreFocusAfterClear = Boolean(
+      excursionControls &&
+      document.activeElement &&
+      excursionControls.contains(document.activeElement),
+    );
+    setReturnStack([]);
+    if (location) {
+      commitLocationProgress(location);
+      recordHistoryLocation(location);
+    }
+    if (restoreFocusAfterClear) {
+      void tick().then(() => {
+        if (controlsVisible) focusFirstElement(readerToolbar);
+        else topRevealButton?.focus();
+      });
     }
   }
 
@@ -1265,8 +1392,13 @@
     closeSyncConfirmation(false);
     try {
       await progress.accept?.();
+      setReturnStack([]);
       if (destroyed || session !== reader) return;
       await displaySyncedLocation(reader, progress);
+      if (hasSyncedLocation(progress)) {
+        hasCommittedPosition = true;
+        if (location) recordHistoryLocation(location);
+      }
       showControls();
       restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
     } catch (cause) {
@@ -1298,8 +1430,13 @@
       }
       if (progress && !showFeedback && hasDivergentSyncLocation(progress)) {
         await progress.accept?.();
+        setReturnStack([]);
         if (destroyed || session !== reader || localNavigationDuringSession) return;
         await displaySyncedLocation(reader, progress);
+        if (hasSyncedLocation(progress)) {
+          hasCommittedPosition = true;
+          if (location) recordHistoryLocation(location);
+        }
       }
       if (showFeedback) {
         readerSyncMessage = 'Reading progress synced.';
@@ -1395,8 +1532,8 @@
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
     else if (searchVisible) closeSearch();
-    else if (linkReturnTarget) {
-      void returnToLink();
+    else if (returnStack.length > 0) {
+      void returnFromExcursion();
       return true;
     } else if (controlsVisible) {
       controlsVisible = false;
@@ -1515,16 +1652,31 @@
     ></button>
   </nav>
 
-  {#if linkReturnTarget && !hasOpenReaderPanel()}
-    <button
-      bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
-      type="button"
-      aria-label="Return to the location before this link"
-      onclick={() => void returnToLink()}
+  {#if returnStack.length > 0 && !hasOpenReaderPanel() && !selectedText}
+    <div
+      bind:this={excursionControls}
+      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+2.5rem)] z-30 flex items-center gap-2 rounded-xl preset-filled-surface-50-950 p-1.5 shadow-lg"
+      role="group"
+      aria-label="Reading excursion controls"
     >
-      Return to link
-    </button>
+      <button
+        bind:this={returnExcursionButton}
+        class="btn min-h-11 min-w-11 preset-filled-primary-700-300"
+        type="button"
+        onclick={() => void returnFromExcursion()}
+      >
+        Return{#if returnStack.length > 1}&nbsp;({returnStack.length}){/if}
+        <span class="sr-only">to previous reading location</span>
+      </button>
+      <button
+        class="btn min-h-11 min-w-11 preset-tonal-surface"
+        type="button"
+        onclick={stayAtCurrentLocation}
+      >
+        Stay
+        <span class="sr-only">at this page and save reading position</span>
+      </button>
+    </div>
   {/if}
 
   {#if readerSyncMessage && controlsVisible}

@@ -44,6 +44,7 @@
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
+  import { returnStackPreferenceKey } from '../reader/bookmarks';
   import type { ReaderLocation } from '../reader/session';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, recordDiagnostic } from '../diagnostics/log';
@@ -1311,6 +1312,7 @@
           message = 'The saved reading position changed. Open the book again.';
           return;
         }
+        await setPreference(returnStackPreferenceKey(book.id), '[]');
         updateRemoteBookProgress(book, remote);
       } catch {
         message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
@@ -1455,6 +1457,7 @@
 
   async function markDone(book: BookRecord): Promise<void> {
     await markBookCompleted(book);
+    await setPreference(returnStackPreferenceKey(book.id), '[]');
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1552,6 +1555,7 @@
         await open(current.book);
         return;
       }
+      await setPreference(returnStackPreferenceKey(current.book.id), '[]');
 
       const lastReadAt = current.remote.lastModifiedUtc ?? new Date().toISOString();
       const pagesRead = Math.max(0, Math.min(current.book.pages, current.remote.pageNum));

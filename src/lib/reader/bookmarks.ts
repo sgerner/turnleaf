@@ -7,8 +7,18 @@ export interface StoredReaderLocation {
   savedAt: string;
 }
 
+export interface StoredReturnLocation {
+  cfi: string;
+  href: string;
+}
+
 export const MAX_BOOKMARKS = 100;
 const MAX_HISTORY = 12;
+export const MAX_RETURN_STACK = 12;
+
+export function returnStackPreferenceKey(bookId: string): string {
+  return `readerReturnStack:${bookId}`;
+}
 
 function validLocation(value: unknown): value is StoredReaderLocation {
   if (!value || typeof value !== 'object') return false;
@@ -100,4 +110,59 @@ export function recordLocation(
 ): StoredReaderLocation[] {
   const entry = bookmarkLocation(current, savedAt);
   return [entry, ...history.filter((item) => item.id !== entry.id)].slice(0, MAX_HISTORY);
+}
+
+function validReturnLocation(value: unknown): value is StoredReturnLocation {
+  if (!value || typeof value !== 'object') return false;
+  const location = value as Partial<StoredReturnLocation>;
+  return (
+    typeof location.cfi === 'string' &&
+    location.cfi.trim().length > 0 &&
+    typeof location.href === 'string'
+  );
+}
+
+export function parseReturnStack(value: string | null): StoredReturnLocation[] {
+  if (!value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(validReturnLocation)
+      .map((entry) => ({ cfi: entry.cfi, href: entry.href }))
+      .slice(0, MAX_RETURN_STACK);
+  } catch {
+    return [];
+  }
+}
+
+export function pushReturnLocation(
+  stack: readonly StoredReturnLocation[],
+  origin: StoredReturnLocation,
+): StoredReturnLocation[] {
+  if (!origin.cfi.trim()) return [...stack].slice(0, MAX_RETURN_STACK);
+  const entry: StoredReturnLocation = { cfi: origin.cfi, href: origin.href };
+  if (stack[0]?.cfi === entry.cfi) {
+    return [...stack].slice(0, MAX_RETURN_STACK);
+  }
+  return [entry, ...stack].slice(0, MAX_RETURN_STACK);
+}
+
+export function popReturnLocation(stack: readonly StoredReturnLocation[]): {
+  target: StoredReturnLocation | null;
+  remaining: StoredReturnLocation[];
+} {
+  if (stack.length === 0) return { target: null, remaining: [] };
+  const [target, ...remaining] = stack;
+  return { target: target ?? null, remaining };
+}
+
+export function reconcileRestoredReturnStack(
+  stack: readonly StoredReturnLocation[],
+  restoredCfi: string | null,
+): StoredReturnLocation[] {
+  if (!restoredCfi) return [...stack].slice(0, MAX_RETURN_STACK);
+  const matchIndex = stack.findIndex((entry) => entry.cfi === restoredCfi);
+  if (matchIndex < 0) return [...stack].slice(0, MAX_RETURN_STACK);
+  return stack.slice(matchIndex + 1, matchIndex + 1 + MAX_RETURN_STACK);
 }
