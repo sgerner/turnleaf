@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Coordinate idempotent SQLite v8/v9 migrations across #328 and #330
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
 - ci: cache Android AVD snapshots and prune unused Gradle cache

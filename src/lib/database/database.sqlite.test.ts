@@ -5,11 +5,12 @@ import type { SQLInputValue } from 'node:sqlite';
 import type { capTask } from '@capacitor-community/sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  migrateDatabase,
   reconcileBooksInTransaction,
   replaceBooksInTransaction,
   type BookRecord,
 } from './database';
-import { migrations } from './schema';
+import { BOOKS_SERVER_FILE_INDEX_NAME, COORDINATED_BOOK_COLUMNS, migrations } from './schema';
 
 const baseBook: BookRecord = {
   id: 'server:1:10',
@@ -51,16 +52,44 @@ function createDatabase(): DatabaseSync {
   return db;
 }
 
+function executePluginStatements(db: DatabaseSync, sqlBlock: string): void {
+  const statements = sqlBlock
+    .split(';\n')
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+  for (const statement of statements) {
+    db.exec(statement.endsWith(';') ? statement : `${statement};`);
+  }
+}
+
 function createAdapter(
   db: DatabaseSync,
-): Pick<Parameters<typeof replaceBooksInTransaction>[0], 'executeTransaction'> {
+  options: { onTransaction?: () => void } = {},
+): Pick<Parameters<typeof migrateDatabase>[0], 'executeTransaction' | 'getVersion' | 'query'> {
   return {
+    getVersion(): Promise<{ version: number }> {
+      const row = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
+      return Promise.resolve({ version: Number(row?.user_version ?? 0) });
+    },
+    query(
+      statement: string,
+      values: unknown[] = [],
+    ): Promise<{ values: Record<string, unknown>[] }> {
+      const rows = db.prepare(statement).all(...(values as SQLInputValue[])) as
+        Record<string, unknown>[] | undefined;
+      return Promise.resolve({ values: rows ?? [] });
+    },
     executeTransaction(tasks: capTask[]): Promise<{ changes: { changes: number } }> {
+      options.onTransaction?.();
       db.exec('BEGIN');
       try {
         for (const task of tasks) {
-          const statement = db.prepare(task.statement);
-          statement.run(...((task.values ?? []) as SQLInputValue[]));
+          if (task.values && task.values.length > 0) {
+            const statement = db.prepare(task.statement);
+            statement.run(...(task.values as SQLInputValue[]));
+          } else {
+            executePluginStatements(db, task.statement);
+          }
         }
         db.exec('COMMIT');
         return Promise.resolve({ changes: { changes: tasks.length } });
@@ -362,24 +391,31 @@ describe('native metadata transactions against SQLite', () => {
         VALUES (?, ?, 0, NULL, NULL, ?, ?, 1)`,
     ).run(baseBook.id, '{"pageNum":40}', baseBook.createdAt, baseBook.createdAt);
 
-    for (const migration of migrations.filter((item) => item.version > 7)) {
-      db.exec(migration.statements);
-      db.exec(`PRAGMA user_version = ${migration.version};`);
-    }
+    const adapter = createAdapter(db);
+    await migrateDatabase(adapter);
 
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
     expect(readBook(db, baseBook.id)).toMatchObject({
       download_path: baseBook.downloadPath,
       download_status: 'available',
       file_size: baseBook.fileSize,
+      file_id: null,
+      file_name: null,
       remote_file_size: null,
       downloaded_bytes: null,
       downloaded_pages: null,
       chapter_key: null,
+      chapter_epub_index: 0,
+      multi_file_chapter: 0,
+      sync_progress: 1,
       sort_order: null,
       min_number: null,
       volume_number: null,
     });
+    const indexes = (db.prepare("PRAGMA index_list('books')").all() as Array<{ name: string }>).map(
+      (row) => row.name,
+    );
+    expect(indexes).toContain(BOOKS_SERVER_FILE_INDEX_NAME);
     expect(
       db.prepare('SELECT cfi, pending_sync FROM reading_state WHERE book_id=?').get(baseBook.id),
     ).toEqual({
@@ -392,7 +428,6 @@ describe('native metadata transactions against SQLite', () => {
       payload_json: '{"pageNum":40}',
     });
 
-    const adapter = createAdapter(db);
     await replaceBooksInTransaction(adapter, 'server', [
       { ...baseBook, sortOrder: 2.5, minNumber: 2, volumeNumber: 2 },
     ]);
@@ -405,53 +440,16 @@ describe('native metadata transactions against SQLite', () => {
     });
   });
 
-  it('upgrades a v7 database with all accepted lineage and sequence columns regardless of merge order', async () => {
-    const pr330Migrations = [
-      ...migrations.filter((item) => item.version <= 7),
-      {
-        version: 8,
-        statements: `
-          ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
-          ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
-          ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
-          ALTER TABLE books ADD COLUMN chapter_key TEXT;
-        `,
-      },
-    ];
-    const expectedColumns = [
-      'remote_file_size',
-      'downloaded_bytes',
-      'downloaded_pages',
-      'chapter_key',
-      'sort_order',
-      'min_number',
-      'volume_number',
-    ];
+  it('upgrades populated v7 databases through #328 v8, #330 v8, legacy v8, or partial v9 idempotently without duplicate columns or lost state', async () => {
+    const expectedColumns = COORDINATED_BOOK_COLUMNS.map((column) => column.name);
 
-    function applyPendingMigrations(
-      target: DatabaseSync,
-      catalog: ReadonlyArray<{ version: number; statements: string }>,
-    ): void {
-      const current = Number(
-        (target.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)
-          ?.user_version ?? 0,
-      );
-      for (const migration of catalog) {
-        if (migration.version <= current) continue;
-        target.exec('BEGIN');
-        target.exec(migration.statements);
-        target.exec(`PRAGMA user_version = ${migration.version};`);
-        target.exec('COMMIT');
-      }
-    }
-
-    function seedV7Database(): DatabaseSync {
+    function seedPopulatedV7Database(): DatabaseSync {
       const seeded = new DatabaseSync(':memory:');
       seeded.exec('PRAGMA foreign_keys = ON;');
-      applyPendingMigrations(
-        seeded,
-        migrations.filter((item) => item.version <= 7),
-      );
+      for (const migration of migrations.filter((item) => item.version <= 7)) {
+        seeded.exec(migration.statements);
+        seeded.exec(`PRAGMA user_version = ${migration.version};`);
+      }
       seeded
         .prepare(
           `INSERT INTO server_config
@@ -496,62 +494,241 @@ describe('native metadata transactions against SQLite', () => {
           baseBook.createdAt,
         );
       seeded
+        .prepare(
+          `INSERT INTO reading_state
+            (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+            VALUES (?, ?, ?, ?, ?, 1, 3)`,
+        )
+        .run(baseBook.id, 'epubcfi(/6/2!/4/2/1:0)', '/body/div[1]/p[1]', 0.4, baseBook.createdAt);
+      seeded
+        .prepare(
+          `INSERT INTO sync_queue
+            (book_id, payload_json, attempt_count, created_at, updated_at, revision)
+            VALUES (?, ?, 0, ?, ?, 3)`,
+        )
+        .run(baseBook.id, '{"pageNum":40}', baseBook.createdAt, baseBook.createdAt);
+      seeded
         .prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)')
         .run('librarySort', 'title', baseBook.createdAt);
       return seeded;
     }
 
-    // Order 1: PR #330 lands first (v7 -> v8), then PR #339 lands second (v8 -> v9).
-    const lineageFirstDb = seedV7Database();
-    try {
-      applyPendingMigrations(lineageFirstDb, pr330Migrations);
-      expect(lineageFirstDb.prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
-      applyPendingMigrations(lineageFirstDb, migrations);
-      expect(lineageFirstDb.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
-
+    function assertCompleteSchema(target: DatabaseSync): void {
+      expect(target.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
       const columns = (
-        lineageFirstDb.prepare('PRAGMA table_info(books)').all() as Array<{ name: string }>
+        target.prepare("PRAGMA table_info('books')").all() as Array<{ name: string }>
       ).map((row) => row.name);
       expect(columns).toEqual(expect.arrayContaining(expectedColumns));
+      expect(columns.filter((name) => name === 'remote_file_size')).toHaveLength(1);
+      const indexes = (
+        target.prepare("PRAGMA index_list('books')").all() as Array<{ name: string }>
+      ).map((row) => row.name);
+      expect(indexes).toContain(BOOKS_SERVER_FILE_INDEX_NAME);
+      expect(
+        target
+          .prepare('SELECT cfi, pending_sync, sync_revision FROM reading_state WHERE book_id=?')
+          .get(baseBook.id),
+      ).toEqual({
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        pending_sync: 1,
+        sync_revision: 3,
+      });
+      expect(
+        target
+          .prepare('SELECT payload_json, revision FROM sync_queue WHERE book_id=?')
+          .get(baseBook.id),
+      ).toEqual({
+        payload_json: '{"pageNum":40}',
+        revision: 3,
+      });
+      expect(
+        target.prepare('SELECT value FROM preferences WHERE key=?').get('librarySort'),
+      ).toEqual({ value: 'title' });
+    }
 
-      const adapter = createAdapter(lineageFirstDb);
-      await replaceBooksInTransaction(adapter, 'server', [
-        { ...baseBook, sortOrder: 1, minNumber: 1, volumeNumber: 1 },
-      ]);
-      lineageFirstDb
+    // Case 1: Existing v8 database has PR #328's multi-EPUB columns + index and populated rows.
+    const pr328Db = seedPopulatedV7Database();
+    try {
+      pr328Db.exec(`
+        ALTER TABLE books ADD COLUMN file_id INTEGER;
+        ALTER TABLE books ADD COLUMN file_name TEXT;
+        ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+        ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+        CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+        PRAGMA user_version = 8;
+      `);
+      pr328Db
         .prepare(
-          `UPDATE books SET remote_file_size = ?, downloaded_bytes = ?, downloaded_pages = ?, chapter_key = ?
+          `UPDATE books
+           SET file_id = ?, file_name = ?, remote_file_size = ?, chapter_epub_index = ?,
+               multi_file_chapter = ?, sync_progress = ?
+           WHERE id = ?`,
+        )
+        .run(501, 'vol-1-part-1.epub', 4096, 1, 1, 0, baseBook.id);
+
+      const adapter = createAdapter(pr328Db);
+      await migrateDatabase(adapter);
+      assertCompleteSchema(pr328Db);
+
+      await replaceBooksInTransaction(adapter, 'server', [
+        { ...baseBook, sortOrder: 1.5, minNumber: 1, volumeNumber: 1 },
+      ]);
+      expect(readBook(pr328Db, baseBook.id)).toMatchObject({
+        download_path: baseBook.downloadPath,
+        download_status: 'available',
+        file_size: baseBook.fileSize,
+        file_id: 501,
+        file_name: 'vol-1-part-1.epub',
+        remote_file_size: 4096,
+        downloaded_bytes: null,
+        downloaded_pages: null,
+        chapter_key: null,
+        chapter_epub_index: 1,
+        multi_file_chapter: 1,
+        sync_progress: 0,
+        sort_order: 1.5,
+        min_number: 1,
+        volume_number: 1,
+      });
+
+      let secondPassTransactions = 0;
+      await migrateDatabase(
+        createAdapter(pr328Db, {
+          onTransaction: () => {
+            secondPassTransactions += 1;
+          },
+        }),
+      );
+      expect(secondPassTransactions).toBe(0);
+    } finally {
+      pr328Db.close();
+    }
+
+    // Case 2: Existing v8 database has PR #330's download-lineage columns and populated rows.
+    const pr330Db = seedPopulatedV7Database();
+    try {
+      pr330Db.exec(`
+        ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+        ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+        ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+        ALTER TABLE books ADD COLUMN chapter_key TEXT;
+        PRAGMA user_version = 8;
+      `);
+      pr330Db
+        .prepare(
+          `UPDATE books
+           SET remote_file_size = ?, downloaded_bytes = ?, downloaded_pages = ?, chapter_key = ?
            WHERE id = ?`,
         )
         .run(2048, 1234, 100, 'vol-1.epub', baseBook.id);
 
-      expect(readBook(lineageFirstDb, baseBook.id)).toMatchObject({
+      const adapter = createAdapter(pr330Db);
+      await migrateDatabase(adapter);
+      assertCompleteSchema(pr330Db);
+
+      await reconcileBooksInTransaction(adapter, 'server', [
+        { ...baseBook, sortOrder: 2, minNumber: 2, volumeNumber: 2 },
+      ]);
+      expect(readBook(pr330Db, baseBook.id)).toMatchObject({
         download_path: baseBook.downloadPath,
+        download_status: 'available',
+        file_size: baseBook.fileSize,
+        file_id: null,
+        file_name: null,
         remote_file_size: 2048,
         downloaded_bytes: 1234,
         downloaded_pages: 100,
         chapter_key: 'vol-1.epub',
-        sort_order: 1,
-        min_number: 1,
-        volume_number: 1,
+        chapter_epub_index: 0,
+        multi_file_chapter: 0,
+        sync_progress: 1,
+        sort_order: 2,
+        min_number: 2,
+        volume_number: 2,
       });
+
+      let secondPassTransactions = 0;
+      await migrateDatabase(
+        createAdapter(pr330Db, {
+          onTransaction: () => {
+            secondPassTransactions += 1;
+          },
+        }),
+      );
+      expect(secondPassTransactions).toBe(0);
     } finally {
-      lineageFirstDb.close();
+      pr330Db.close();
     }
 
-    // Order 2: PR #339 lands first (v7 -> v8 -> v9), then PR #330 rebases/lands second.
-    db = seedV7Database();
-    applyPendingMigrations(db, migrations);
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
-    applyPendingMigrations(db, pr330Migrations);
-    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+    // Case 3: Legacy #339 v8 (only series fields at v8) reconciles all #328 + #330 columns + index.
+    const legacySeriesV8Db = seedPopulatedV7Database();
+    try {
+      legacySeriesV8Db.exec(`
+        ALTER TABLE books ADD COLUMN sort_order REAL;
+        ALTER TABLE books ADD COLUMN min_number REAL;
+        ALTER TABLE books ADD COLUMN volume_number REAL;
+        PRAGMA user_version = 8;
+      `);
+      legacySeriesV8Db
+        .prepare('UPDATE books SET sort_order = ?, min_number = ?, volume_number = ? WHERE id = ?')
+        .run(3, 3, 3, baseBook.id);
 
-    const columns = (db.prepare('PRAGMA table_info(books)').all() as Array<{ name: string }>).map(
-      (row) => row.name,
-    );
-    expect(columns).toEqual(expect.arrayContaining(expectedColumns));
-    expect(db.prepare('SELECT value FROM preferences WHERE key = ?').get('librarySort')).toEqual({
-      value: 'title',
+      await migrateDatabase(createAdapter(legacySeriesV8Db));
+      assertCompleteSchema(legacySeriesV8Db);
+      expect(readBook(legacySeriesV8Db, baseBook.id)).toMatchObject({
+        sort_order: 3,
+        min_number: 3,
+        volume_number: 3,
+        chapter_epub_index: 0,
+        multi_file_chapter: 0,
+        sync_progress: 1,
+      });
+    } finally {
+      legacySeriesV8Db.close();
+    }
+
+    // Case 4: Partial v9 database (#330 + #339 before #328 coordination) heals missing #328 columns + index.
+    db = seedPopulatedV7Database();
+    db.exec(`
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+      ALTER TABLE books ADD COLUMN sort_order REAL;
+      ALTER TABLE books ADD COLUMN min_number REAL;
+      ALTER TABLE books ADD COLUMN volume_number REAL;
+      PRAGMA user_version = 9;
+    `);
+    db.prepare(
+      `UPDATE books
+       SET remote_file_size = ?, downloaded_bytes = ?, sort_order = ?, volume_number = ?
+       WHERE id = ?`,
+    ).run(4096, 1234, 4, 4, baseBook.id);
+
+    await migrateDatabase(createAdapter(db));
+    assertCompleteSchema(db);
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      remote_file_size: 4096,
+      downloaded_bytes: 1234,
+      file_id: null,
+      file_name: null,
+      chapter_epub_index: 0,
+      multi_file_chapter: 0,
+      sync_progress: 1,
+      sort_order: 4,
+      volume_number: 4,
     });
+
+    let healedTransactions = 0;
+    await migrateDatabase(
+      createAdapter(db, {
+        onTransaction: () => {
+          healedTransactions += 1;
+        },
+      }),
+    );
+    expect(healedTransactions).toBe(0);
   });
 });

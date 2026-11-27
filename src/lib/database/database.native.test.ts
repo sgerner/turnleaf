@@ -394,6 +394,13 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
     expect.stringContaining('ALTER TABLE books ADD COLUMN sort_order'),
   ]);
+  const v8Statement = migrationTasks[7]?.[0]?.statement ?? '';
+  expect(v8Statement.match(/ADD COLUMN remote_file_size/g)).toHaveLength(1);
+  expect(v8Statement).toContain('ALTER TABLE books ADD COLUMN file_id INTEGER;');
+  expect(v8Statement).toContain('ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;');
+  expect(v8Statement).toContain(
+    'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);',
+  );
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
     'PRAGMA user_version = 2;',
@@ -405,6 +412,86 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 8;',
     'PRAGMA user_version = 9;',
   ]);
+});
+
+it('reconciles missing v8 columns and index idempotently when upgrading from #328-only or #330-only v8', async () => {
+  const { migrateDatabase } = await import('./database');
+
+  mocks.setDatabaseVersion(8);
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    if (statement.includes('table_info')) {
+      return {
+        values: [
+          'id',
+          'file_id',
+          'file_name',
+          'remote_file_size',
+          'chapter_epub_index',
+          'multi_file_chapter',
+          'sync_progress',
+        ].map((name) => ({ name })),
+      };
+    }
+    return { values: [{ name: 'books_server_file_idx' }] };
+  });
+
+  await migrateDatabase(mocks.db);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const pr328UpgradeSql = mocks.executeTransaction.mock.calls[0]?.[0]?.[0]?.statement ?? '';
+  expect(pr328UpgradeSql).not.toContain('remote_file_size');
+  expect(pr328UpgradeSql).not.toContain('file_id');
+  expect(pr328UpgradeSql).not.toContain('books_server_file_idx');
+  expect(pr328UpgradeSql).toContain('ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;');
+  expect(pr328UpgradeSql).toContain('ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;');
+  expect(pr328UpgradeSql).toContain('ALTER TABLE books ADD COLUMN chapter_key TEXT;');
+  expect(pr328UpgradeSql).toContain('ALTER TABLE books ADD COLUMN sort_order REAL;');
+  expect(pr328UpgradeSql).toContain('ALTER TABLE books ADD COLUMN min_number REAL;');
+  expect(pr328UpgradeSql).toContain('ALTER TABLE books ADD COLUMN volume_number REAL;');
+  expect(mocks.executeTransaction.mock.calls[0]?.[0]?.[1]?.statement).toBe(
+    'PRAGMA user_version = 9;',
+  );
+
+  mocks.executeTransaction.mockClear();
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    if (statement.includes('table_info')) {
+      return {
+        values: [
+          'id',
+          'remote_file_size',
+          'downloaded_bytes',
+          'downloaded_pages',
+          'chapter_key',
+        ].map((name) => ({ name })),
+      };
+    }
+    return { values: [{ name: 'books_server_title_idx' }] };
+  });
+
+  await migrateDatabase(mocks.db);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const pr330UpgradeSql = mocks.executeTransaction.mock.calls[0]?.[0]?.[0]?.statement ?? '';
+  expect(pr330UpgradeSql).not.toContain('remote_file_size');
+  expect(pr330UpgradeSql).not.toContain('downloaded_bytes');
+  expect(pr330UpgradeSql).toContain('ALTER TABLE books ADD COLUMN file_id INTEGER;');
+  expect(pr330UpgradeSql).toContain('ALTER TABLE books ADD COLUMN file_name TEXT;');
+  expect(pr330UpgradeSql).toContain(
+    'ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(pr330UpgradeSql).toContain(
+    'ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(pr330UpgradeSql).toContain(
+    'ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;',
+  );
+  expect(pr330UpgradeSql).toContain('ALTER TABLE books ADD COLUMN sort_order REAL;');
+  expect(pr330UpgradeSql).toContain(
+    'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);',
+  );
+  expect(mocks.executeTransaction.mock.calls[0]?.[0]?.[1]?.statement).toBe(
+    'PRAGMA user_version = 9;',
+  );
 });
 
 it('mirrors native SQLite theme and mode preferences to browser localStorage and clears on reset', async () => {

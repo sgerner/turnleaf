@@ -947,15 +947,24 @@ describe('native progress transactions against SQLite', () => {
     ).map((row) => row.name);
     expect(columns).toEqual(
       expect.arrayContaining([
+        'file_id',
+        'file_name',
         'remote_file_size',
         'downloaded_bytes',
         'downloaded_pages',
         'chapter_key',
+        'chapter_epub_index',
+        'multi_file_chapter',
+        'sync_progress',
         'sort_order',
         'min_number',
         'volume_number',
       ]),
     );
+    const indexes = (
+      native.database?.prepare("PRAGMA index_list('books')").all() as Array<{ name: string }>
+    ).map((row) => row.name);
+    expect(indexes).toContain('books_server_file_idx');
     expect(native.database?.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
 
     await database.reconcileBooks(server.id, [
@@ -987,4 +996,221 @@ describe('native progress transactions against SQLite', () => {
     ]);
     expect(await database.getBookDescription(book.id)).toBe('<p>Refreshed synopsis</p>');
   });
+
+  it.each(['pr328-v8', 'pr330-v8'] as const)(
+    'upgrades a populated v7 database through %s via openDatabase without duplicating remote_file_size or losing state on rollback',
+    async (branchShape) => {
+      const { BOOKS_SERVER_FILE_INDEX_NAME, COORDINATED_BOOK_COLUMNS, migrations } =
+        await import('./schema');
+      const legacy = new DatabaseSync(native.databasePath);
+      try {
+        legacy.exec('PRAGMA foreign_keys = ON;');
+        for (const migration of migrations.filter((item) => item.version <= 7)) {
+          legacy.exec(migration.statements);
+          legacy.exec(`PRAGMA user_version = ${migration.version};`);
+        }
+        legacy
+          .prepare(
+            `INSERT INTO server_config
+              (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            server.id,
+            server.displayName,
+            server.baseUrl,
+            server.credentialRef,
+            server.kavitaVersion,
+            server.lastConnectedAt,
+          );
+        legacy
+          .prepare(
+            `INSERT INTO books
+              (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+               description_html, format, metadata_refreshed_at, download_path, download_status,
+               file_size, pages, pages_read, created_at, last_read_at, remote_available)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          )
+          .run(
+            book.id,
+            server.id,
+            book.libraryId,
+            book.seriesId,
+            book.volumeId,
+            book.chapterId,
+            'Volume One',
+            'Author',
+            'Series',
+            '<p>Legacy synopsis</p>',
+            book.format,
+            server.lastConnectedAt,
+            'books/vol-1.epub',
+            'available',
+            4096,
+            book.pages,
+            35,
+            book.createdAt,
+            '2026-01-03T00:00:00.000Z',
+          );
+        legacy
+          .prepare(
+            `INSERT INTO reading_state
+              (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+              VALUES (?, ?, ?, ?, ?, 1, 2)`,
+          )
+          .run(book.id, 'epubcfi(/6/4!/4/2)', '/body/p[2]', 0.35, '2026-01-03T00:00:00.000Z');
+        legacy
+          .prepare(
+            `INSERT INTO sync_queue
+              (book_id, payload_json, attempt_count, created_at, updated_at, revision)
+              VALUES (?, ?, 0, ?, ?, 2)`,
+          )
+          .run(book.id, '{"pageNum":35}', '2026-01-03T00:00:00.000Z', '2026-01-03T00:00:00.000Z');
+        legacy
+          .prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)')
+          .run('librarySort', 'series', server.lastConnectedAt);
+
+        if (branchShape === 'pr328-v8') {
+          legacy.exec(`
+            ALTER TABLE books ADD COLUMN file_id INTEGER;
+            ALTER TABLE books ADD COLUMN file_name TEXT;
+            ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+            ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+            CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+            PRAGMA user_version = 8;
+          `);
+          legacy
+            .prepare(
+              `UPDATE books
+               SET file_id = ?, file_name = ?, remote_file_size = ?, chapter_epub_index = ?,
+                   multi_file_chapter = ?, sync_progress = ?
+               WHERE id = ?`,
+            )
+            .run(77, 'vol-1-part-2.epub', 8192, 1, 1, 0, book.id);
+        } else {
+          legacy.exec(`
+            ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+            ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+            ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+            ALTER TABLE books ADD COLUMN chapter_key TEXT;
+            PRAGMA user_version = 8;
+          `);
+          legacy
+            .prepare(
+              `UPDATE books
+               SET remote_file_size = ?, downloaded_bytes = ?, downloaded_pages = ?, chapter_key = ?
+               WHERE id = ?`,
+            )
+            .run(8192, 4096, 100, 'vol-1.epub', book.id);
+        }
+      } finally {
+        legacy.close();
+      }
+
+      let database = await importDatabase();
+      native.failTransactionAt = 1;
+      await expect(database.openDatabase()).rejects.toThrow('injected transaction failure at 1');
+      expect(native.database?.prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
+      native.database?.close();
+      Object.assign(native, { database: null, isOpen: false });
+
+      database = await importDatabase();
+      await database.openDatabase();
+      expect(native.database?.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+
+      const columns = (
+        native.database?.prepare('PRAGMA table_info(books)').all() as Array<{ name: string }>
+      ).map((row) => row.name);
+      expect(columns).toEqual(
+        expect.arrayContaining(COORDINATED_BOOK_COLUMNS.map((column) => column.name)),
+      );
+      expect(columns.filter((name) => name === 'remote_file_size')).toHaveLength(1);
+      const indexes = (
+        native.database?.prepare("PRAGMA index_list('books')").all() as Array<{ name: string }>
+      ).map((row) => row.name);
+      expect(indexes).toContain(BOOKS_SERVER_FILE_INDEX_NAME);
+
+      expect(await database.getPreferences(['librarySort'])).toEqual(
+        new Map([['librarySort', 'series']]),
+      );
+      expect(await database.getPendingSync(server.id)).toHaveLength(1);
+      expect(await database.getReadingState(book.id)).toMatchObject({
+        cfi: 'epubcfi(/6/4!/4/2)',
+        xpath: '/body/p[2]',
+        percentage: 0.35,
+        pendingSync: true,
+        syncRevision: 2,
+      });
+
+      await database.reconcileBooks(server.id, [
+        {
+          ...book,
+          title: 'Volume One',
+          author: 'Author',
+          series: 'Series',
+          descriptionHtml: '<p>Refreshed synopsis</p>',
+          fileSize: 8192,
+          sortOrder: 2,
+          minNumber: 2,
+          volumeNumber: 2,
+        },
+      ]);
+
+      const upgradedRow = native.database
+        ?.prepare('SELECT * FROM books WHERE id = ?')
+        .get(book.id) as Record<string, unknown> | undefined;
+      if (branchShape === 'pr328-v8') {
+        expect(upgradedRow).toMatchObject({
+          download_path: 'books/vol-1.epub',
+          download_status: 'available',
+          file_size: 4096,
+          file_id: 77,
+          file_name: 'vol-1-part-2.epub',
+          remote_file_size: 8192,
+          downloaded_bytes: null,
+          downloaded_pages: null,
+          chapter_key: null,
+          chapter_epub_index: 1,
+          multi_file_chapter: 1,
+          sync_progress: 0,
+          sort_order: 2,
+          min_number: 2,
+          volume_number: 2,
+        });
+      } else {
+        expect(upgradedRow).toMatchObject({
+          download_path: 'books/vol-1.epub',
+          download_status: 'available',
+          file_size: 4096,
+          file_id: null,
+          file_name: null,
+          remote_file_size: 8192,
+          downloaded_bytes: 4096,
+          downloaded_pages: 100,
+          chapter_key: 'vol-1.epub',
+          chapter_epub_index: 0,
+          multi_file_chapter: 0,
+          sync_progress: 1,
+          sort_order: 2,
+          min_number: 2,
+          volume_number: 2,
+        });
+      }
+
+      database = await reopenDatabase(database);
+      expect(await database.getBooks(server.id, { includeDescription: false })).toEqual([
+        expect.objectContaining({
+          id: book.id,
+          downloadPath: 'books/vol-1.epub',
+          fileSize: 4096,
+          pagesRead: 35,
+          sortOrder: 2,
+          minNumber: 2,
+          volumeNumber: 2,
+        }),
+      ]);
+    },
+  );
 });

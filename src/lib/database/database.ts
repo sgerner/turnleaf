@@ -9,7 +9,12 @@ import {
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import {
+  BOOKS_SERVER_FILE_INDEX_NAME,
+  BOOKS_SERVER_FILE_INDEX_SQL,
+  COORDINATED_BOOK_COLUMNS,
+  migrations,
+} from './schema';
 
 export interface ServerConfig {
   id: string;
@@ -234,7 +239,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -262,14 +267,68 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+export async function migrateDatabase(
+  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion' | 'query'>,
+): Promise<void> {
   const current = await db.getVersion();
+  const currentVersion = current.version ?? 0;
+  let existingBookColumns: Set<string> | null = null;
+  let hasServerFileIndex = false;
+
+  if (currentVersion >= 8) {
+    const tableInfoRows = (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
+    if (tableInfoRows.length > 0) {
+      existingBookColumns = new Set(tableInfoRows.map((row) => String(row.name)));
+      const indexRows = (await executeNativeQuery(db, "PRAGMA index_list('books')")).values ?? [];
+      hasServerFileIndex = indexRows.some(
+        (row) => String(row.name) === BOOKS_SERVER_FILE_INDEX_NAME,
+      );
+    }
+  }
+
   for (const migration of migrations) {
-    if (migration.version <= (current.version ?? 0)) continue;
+    if (migration.version <= currentVersion) continue;
+
+    if ((migration.version === 8 || migration.version === 9) && existingBookColumns) {
+      const missingColumns = COORDINATED_BOOK_COLUMNS.filter(
+        (column) => column.version <= migration.version && !existingBookColumns.has(column.name),
+      );
+      const statements: string[] = [
+        ...missingColumns.map(
+          (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+        ),
+        ...(!hasServerFileIndex ? [BOOKS_SERVER_FILE_INDEX_SQL] : []),
+      ];
+      await executeNativeTransaction(db, [
+        ...(statements.length > 0 ? [{ statement: `${statements.join('\n')}\n` }] : []),
+        { statement: `PRAGMA user_version = ${migration.version};` },
+      ]);
+      for (const column of missingColumns) existingBookColumns.add(column.name);
+      hasServerFileIndex = true;
+      continue;
+    }
+
     await executeNativeTransaction(db, [
       { statement: migration.statements },
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
+  }
+
+  if (existingBookColumns) {
+    const latestVersion = migrations[migrations.length - 1]?.version ?? currentVersion;
+    const maxTargetVersion = Math.min(currentVersion, latestVersion);
+    const missingColumns = COORDINATED_BOOK_COLUMNS.filter(
+      (column) => column.version <= maxTargetVersion && !existingBookColumns.has(column.name),
+    );
+    const statements: string[] = [
+      ...missingColumns.map(
+        (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+      ),
+      ...(maxTargetVersion >= 8 && !hasServerFileIndex ? [BOOKS_SERVER_FILE_INDEX_SQL] : []),
+    ];
+    if (statements.length > 0) {
+      await executeNativeTransaction(db, [{ statement: `${statements.join('\n')}\n` }]);
+    }
   }
 }
 
