@@ -631,6 +631,25 @@ describe('Reader destructive action confirmations', () => {
     selectionNoteTextarea.dispatchEvent(new Event('input', { bubbles: true }));
     await flushUi();
 
+    // Changing or clearing EPUB text selection preserves the active selection draft
+    onSelectionCallback?.({ cfi: 'epubcfi(/6/2!/4/1000)', text: 'Replacement selection' });
+    onSelectionCallback?.(null);
+    await flushUi();
+    expect(annotationsPanel.textContent).toContain('Overflow passage');
+    expect(selectionNoteTextarea.value).toBe('Draft note to preserve');
+
+    // Start an in-place edit draft on Saved highlight 2 to ensure unrelated edit drafts also survive deletion dialogs
+    annotationsPanel
+      .querySelector<HTMLButtonElement>('[aria-label="Edit note for Saved highlight 2"]')!
+      .click();
+    await flushUi();
+    const editSecondTextarea = annotationsPanel.querySelector<HTMLTextAreaElement>(
+      'textarea[data-reader-focus="annotation-editor"]',
+    )!;
+    editSecondTextarea.value = 'In-progress edit on highlight 2';
+    editSecondTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+    await flushUi();
+
     annotationsPanel
       .querySelector<HTMLFormElement>('form')!
       .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
@@ -639,7 +658,7 @@ describe('Reader destructive action confirmations', () => {
       `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
     );
 
-    // Deleting an existing highlight keeps cap alert on cancel, clears cap alert on confirm, and preserves selectionNoteTextarea draft
+    // Deleting an existing highlight keeps cap alert on cancel, clears cap alert on confirm, and preserves both drafts
     const deleteFirstHighlight = annotationsPanel.querySelector<HTMLButtonElement>(
       '[aria-label="Delete highlight Saved highlight 1"]',
     )!;
@@ -651,6 +670,7 @@ describe('Reader destructive action confirmations', () => {
       `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
     );
     expect(selectionNoteTextarea.value).toBe('Draft note to preserve');
+    expect(editSecondTextarea.value).toBe('In-progress edit on highlight 2');
 
     deleteFirstHighlight.click();
     await flushUi();
@@ -662,5 +682,6 @@ describe('Reader destructive action confirmations', () => {
       `You can save up to ${MAX_ANNOTATIONS} highlights per book.`,
     );
     expect(selectionNoteTextarea.value).toBe('Draft note to preserve');
+    expect(editSecondTextarea.value).toBe('In-progress edit on highlight 2');
   });
 });
