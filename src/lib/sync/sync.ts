@@ -162,7 +162,8 @@ async function run(client: KavitaClient, serverId: string, signal: AbortSignal):
     for (const item of pending) {
       if (signal.aborted) break;
       attempted.set(item.bookId, item);
-      const cached = await getUnconfirmedUpload(serverId, item.bookId);
+      const cachedOrPromise = getUnconfirmedUpload(serverId, item.bookId);
+      const cached = cachedOrPromise instanceof Promise ? await cachedOrPromise : cachedOrPromise;
       const hasMatchingUpload =
         cached !== undefined &&
         cached.revision === item.revision &&

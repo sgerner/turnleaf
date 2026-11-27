@@ -112,10 +112,10 @@ async function persistNativeJournal(
   });
 }
 
-export async function getUnconfirmedUpload(
+export function getUnconfirmedUpload(
   serverId: string,
   bookId: string,
-): Promise<UnconfirmedUpload | undefined> {
+): UnconfirmedUpload | undefined | Promise<UnconfirmedUpload | undefined> {
   const key = unconfirmedKeyFor(serverId, bookId);
   if (!Capacitor.isNativePlatform()) {
     const fallback = getWebFallbackMap().get(key);
@@ -129,8 +129,10 @@ export async function getUnconfirmedUpload(
       return fallback;
     }
   }
-  const journal = await ensureNativeJournal();
-  return journal.get(key);
+  if (nativeJournal) {
+    return nativeJournal.get(key);
+  }
+  return ensureNativeJournal().then((journal) => journal.get(key));
 }
 
 export async function recordUnconfirmedUpload(

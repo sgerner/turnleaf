@@ -1,74 +1,38 @@
 // @vitest-environment jsdom
 
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import type { BookRecord, ServerConfig } from '../database/database';
-import type { ReaderLocation } from '../reader/session';
+import {
+  getBooks,
+  getPendingSync,
+  reconcileBooks,
+  saveLocalProgress,
+  saveServer,
+  type BookRecord,
+  type ServerConfig,
+} from '../database/database';
 
-const STORAGE_KEY = 'turnleaf_browser_database_v1';
-
-const mocks = vi.hoisted(() => {
-  let connected = true;
-  const networkListeners = new Set<(status: { connected: boolean }) => void>();
-  const readerState: {
-    onBack: (() => void) | null;
-    onRelocated: ((location: ReaderLocation) => void) | null;
-  } = {
-    onBack: null,
-    onRelocated: null,
-  };
-
-  return {
-    get connected() {
-      return connected;
-    },
-    setConnected(next: boolean, notify = false) {
-      connected = next;
-      if (notify) {
-        for (const listener of networkListeners) listener({ connected: next });
-      }
-    },
-    networkListeners,
-    readerState,
-    verifyDownloadedEpub: vi.fn(async (path: string) => ({
-      relativePath: path,
-      webViewUrl: `blob:${path}`,
-    })),
-    reset() {
-      connected = true;
-      networkListeners.clear();
-      readerState.onBack = null;
-      readerState.onRelocated = null;
-      this.verifyDownloadedEpub.mockReset();
-      this.verifyDownloadedEpub.mockImplementation(async (path: string) => ({
-        relativePath: path,
-        webViewUrl: `blob:${path}`,
-      }));
-    },
-  };
-});
-
-vi.mock('@capacitor/core', () => ({
-  Capacitor: {
-    isNativePlatform: () => false,
-    getPlatform: () => 'web',
-    convertFileSrc: (value: string) => value,
-  },
-  CapacitorHttp: {
-    get: vi.fn(),
-    request: vi.fn(),
-  },
-}));
+const networkListeners = new Set<
+  (status: { connected: boolean; connectionType: string }) => void
+>();
+const appStateListeners = new Set<(state: { isActive: boolean }) => void>();
+let networkConnected = true;
 
 vi.mock('@capacitor/network', () => ({
   Network: {
-    getStatus: vi.fn(async () => ({ connected: mocks.connected, connectionType: 'wifi' })),
+    getStatus: vi.fn(async () => ({
+      connected: networkConnected,
+      connectionType: networkConnected ? 'wifi' : 'none',
+    })),
     addListener: vi.fn(
-      async (_event: string, callback: (status: { connected: boolean }) => void) => {
-        mocks.networkListeners.add(callback);
+      async (
+        event: string,
+        listener: (status: { connected: boolean; connectionType: string }) => void,
+      ) => {
+        if (event === 'networkStatusChange') networkListeners.add(listener);
         return {
           remove: async () => {
-            mocks.networkListeners.delete(callback);
+            networkListeners.delete(listener);
           },
         };
       },
@@ -78,38 +42,42 @@ vi.mock('@capacitor/network', () => ({
 
 vi.mock('@capacitor/app', () => ({
   App: {
-    addListener: vi.fn(async () => ({ remove: async () => {} })),
+    addListener: vi.fn(async (event: string, listener: (state: { isActive: boolean }) => void) => {
+      if (event === 'appStateChange') appStateListeners.add(listener);
+      return {
+        remove: async () => {
+          appStateListeners.delete(listener);
+        },
+      };
+    }),
     exitApp: vi.fn(async () => {}),
   },
 }));
 
+const verifyDownloadedEpubMock = vi.fn(async (path: string) => ({
+  relativePath: path,
+  webViewUrl: `blob:${path}`,
+}));
+
 vi.mock('../downloads/native-download', () => ({
   EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
-  EpubTransferError: class extends Error {
-    constructor(
-      readonly status: number | undefined,
-      readonly connectionFailed: boolean,
-    ) {
-      super('The EPUB transfer failed.');
-    }
-  },
-  cacheCover: vi.fn(),
+  EpubTransferError: class EpubTransferError extends Error {},
+  cacheCover: vi.fn(async () => 'cover'),
   clearCoverCache: vi.fn(async () => {}),
   cleanupInterruptedEpubDownloads: vi.fn(async () => {}),
   deleteDownloadedEpub: vi.fn(async () => {}),
-  downloadEpub: vi.fn(),
-  verifyDownloadedEpub: (path: string) => mocks.verifyDownloadedEpub(path),
+  downloadEpub: vi.fn(async () => ({ relativePath: 'books/book-1.epub', size: 1024 })),
+  verifyDownloadedEpub: (path: string) => verifyDownloadedEpubMock(path),
 }));
 
-vi.mock('./Reader.svelte', () => ({
-  default: (
-    _anchor: unknown,
-    props: { onBack: () => void; onRelocated: (l: ReaderLocation) => void },
-  ) => {
-    mocks.readerState.onBack = props.onBack;
-    mocks.readerState.onRelocated = props.onRelocated;
-    return {};
-  },
+vi.mock('../native/credentials', () => ({
+  saveApiKey: vi.fn(async () => {}),
+  removeApiKey: vi.fn(async () => {}),
+}));
+
+vi.mock('../themes/themes', () => ({
+  skeletonThemes: ['fennec', 'vintage'],
+  loadTheme: vi.fn(async () => true),
 }));
 
 class MemoryStorage implements Storage {
@@ -141,706 +109,237 @@ class MemoryStorage implements Storage {
 }
 
 const server: ServerConfig = {
-  id: 'primary',
-  displayName: 'Books',
+  id: 'server-1',
+  displayName: 'Kavita',
   baseUrl: 'https://kavita.example',
-  credentialRef: 'server_primary_api_key',
+  credentialRef: 'cred-1',
   kavitaVersion: '0.8.0',
-  lastConnectedAt: '2026-09-07T00:00:00.000Z',
+  lastConnectedAt: '2026-09-01T00:00:00.000Z',
 };
 
-const bookOne: BookRecord = {
-  id: 'primary:1:10',
-  serverId: 'primary',
+const seededBook: BookRecord = {
+  id: 'server-1:1:10',
+  serverId: server.id,
   libraryId: 1,
   seriesId: 1,
   volumeId: 1,
   chapterId: 10,
-  title: 'First Book',
-  author: 'Author One',
-  series: null,
+  title: 'The Left Hand of Darkness',
+  author: 'Ursula K. Le Guin',
+  series: 'Hainish Cycle',
   descriptionHtml: null,
   format: 'epub',
   pages: 100,
-  pagesRead: 10,
-  createdAt: '2026-01-01T00:00:00.000Z',
+  pagesRead: 0,
+  createdAt: '2026-09-01T00:00:00.000Z',
   lastReadAt: null,
-  downloadPath: 'books/primary-1-10.epub',
+  downloadPath: 'books/book-1.epub',
   downloadStatus: 'available',
-  fileSize: 1024,
+  fileSize: 2048,
 };
 
-const bookTwo: BookRecord = {
-  ...bookOne,
-  id: 'primary:2:20',
-  seriesId: 2,
-  volumeId: 2,
-  chapterId: 20,
-  title: 'Second Book',
-  author: 'Author Two',
-  downloadPath: 'books/primary-2-20.epub',
-};
-
-type MockResponse = {
-  ok: boolean;
-  status: number;
-  headers: { get: (name: string) => string | null };
-  json?: () => Promise<unknown>;
-  blob?: () => Promise<Blob>;
-};
-
-let container: HTMLDivElement;
-let instance: Record<string, unknown> | null = null;
-
-async function settle(cycles = 100): Promise<void> {
-  const total = Math.max(100, cycles);
-  for (let index = 0; index < total; index += 1) {
-    flushSync();
-    await Promise.resolve();
-  }
-  flushSync();
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
-function seedLocalState(overrides: Record<string, unknown> = {}): void {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      serverConfig: server,
-      books: [bookOne, bookTwo],
-      readingState: {},
-      syncQueue: {},
-      preferences: { syncFurthest: 'false' },
-      ...overrides,
-    }),
-  );
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
-beforeEach(async () => {
-  await import('./Reader.svelte');
-  await import('./Library.svelte');
-  mocks.reset();
-  Object.defineProperty(Element.prototype, 'animate', {
-    configurable: true,
-    value: vi.fn(() => {
-      const animation = {
-        cancel: vi.fn(),
-        finish: vi.fn(),
-        onfinish: null as (() => void) | null,
-      };
-      queueMicrotask(() => animation.onfinish?.());
-      return animation;
-    }),
-  });
-  Object.defineProperty(window, 'localStorage', {
-    configurable: true,
-    value: new MemoryStorage(),
-  });
-  Object.defineProperty(URL, 'createObjectURL', {
-    configurable: true,
-    value: vi.fn(() => 'blob:cover'),
-  });
-  Object.defineProperty(URL, 'revokeObjectURL', {
-    configurable: true,
-    value: vi.fn(),
-  });
-  Object.defineProperty(window, 'innerHeight', {
-    configurable: true,
-    value: 900,
-  });
-  Object.defineProperty(window, 'scrollBy', {
-    configurable: true,
-    value: vi.fn(),
-  });
-  vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
-    queueMicrotask(() => callback(0));
-    return 1;
-  });
-  vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
-  container = document.createElement('div');
-  document.body.append(container);
-});
+function seriesListItem(pagesRead = 0) {
+  return {
+    id: 1,
+    libraryId: 1,
+    name: seededBook.title,
+    format: 3,
+    pages: 100,
+    pagesRead,
+  };
+}
 
-afterEach(() => {
-  if (instance) {
-    unmount(instance);
-    instance = null;
+function seriesDetailPayload(pagesRead = 0) {
+  return {
+    volumes: [
+      {
+        id: 1,
+        chapters: [
+          {
+            id: 10,
+            volumeId: 1,
+            title: seededBook.title,
+            titleName: seededBook.title,
+            pages: 100,
+            pagesRead,
+            format: 3,
+            files: [{ id: 1, format: 3, extension: '.epub', bytes: 2048 }],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+async function waitForCondition(check: () => boolean | Promise<boolean>, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  container.remove();
-  vi.restoreAllMocks();
-  vi.useRealTimers();
-});
+  expect(await check()).toBe(true);
+}
 
-async function mountLibrary() {
-  const { default: Library } = await import('./Library.svelte');
-  instance = mount(Library, {
-    target: container,
+const mountedInstances: Array<Record<string, unknown>> = [];
+const containers: HTMLElement[] = [];
+
+async function mountLibrary(
+  options: {
+    apiKey?: string;
+    onApiKeyChange?: (next: string) => void;
+  } = {},
+) {
+  const Library = (await import('./Library.svelte')).default;
+  const target = document.createElement('div');
+  target.className = 'app-stage';
+  document.body.appendChild(target);
+  containers.push(target);
+  const instance = mount(Library, {
+    target,
     props: {
       server,
-      apiKey: 'test-key',
+      apiKey: options.apiKey ?? 'initial-key',
       theme: 'fennec',
       mode: 'dark',
       onThemeChange: vi.fn(),
       onModeChange: vi.fn(),
-      onApiKeyChange: vi.fn(),
+      onApiKeyChange: options.onApiKeyChange ?? vi.fn(),
       onServerDeleted: vi.fn(),
       onChangeServerAddress: vi.fn(),
     },
   });
-  await settle(10);
+  mountedInstances.push(instance);
+  return { target, instance };
 }
 
-it('updates syncStatus.pendingCount on save and displays the retry banner while queued', async () => {
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  mocks.setConnected(false);
-  seedLocalState();
-  vi.stubGlobal('fetch', vi.fn() as unknown as typeof fetch);
-
-  await mountLibrary();
-
-  const openButtons = container.querySelectorAll<HTMLButtonElement>('[data-book-open]');
-  expect(openButtons.length).toBeGreaterThanOrEqual(2);
-  openButtons[0]!.click();
-  await settle(10);
-
-  expect(mocks.readerState.onRelocated).toBeTypeOf('function');
-  mocks.readerState.onRelocated!({
-    cfi: 'epubcfi(/6/2!/4/2)',
-    xpath: '//body/p[2]',
-    href: 'chapter1.xhtml',
-    percentage: 0.25,
-    spineIndex: 2,
-    pageIndex: 0,
-    pageCount: 4,
+beforeEach(async () => {
+  networkConnected = true;
+  networkListeners.clear();
+  appStateListeners.clear();
+  verifyDownloadedEpubMock.mockClear();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: new MemoryStorage(),
   });
-  await settle(10);
-
-  mocks.readerState.onBack!();
-  await settle(10);
-
-  expect(container.textContent).toContain('1 reading progress update waiting to sync.');
-  expect(container.textContent).toContain('Retry sync');
+  if (!Element.prototype.animate) {
+    Element.prototype.animate = () =>
+      ({
+        cancel: () => {},
+        finish: () => {},
+        onfinish: null,
+        finished: Promise.resolve(),
+      }) as unknown as Animation;
+  }
+  await saveServer(server);
+  await reconcileBooks(server.id, [seededBook]);
 });
 
-it('replays a deferred syncTimer flush after resolvingOpenProgress finishes', async () => {
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  mocks.setConnected(true);
-  seedLocalState();
-
-  let resolveSecondProbe!: (response: unknown) => void;
-  const uploadedChapters: number[] = [];
-  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.includes('/api/Series/v2')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => [
-          {
-            id: 1,
-            name: 'First Book',
-            libraryId: 1,
-            format: 3,
-            pages: 100,
-            pagesRead: 10,
-            created: '2026-01-01T00:00:00.000Z',
-            latestReadDate: '0001-01-01T00:00:00',
-          },
-          {
-            id: 2,
-            name: 'Second Book',
-            libraryId: 1,
-            format: 3,
-            pages: 100,
-            pagesRead: 0,
-            created: '2026-01-01T00:00:00.000Z',
-            latestReadDate: '0001-01-01T00:00:00',
-          },
-        ],
-      };
-    }
-    if (url.includes('/api/Series/series-detail?seriesId=1')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => ({
-          chapters: [
-            {
-              id: 10,
-              title: 'First Book',
-              titleName: 'First Book',
-              volumeId: 1,
-              pages: 100,
-              pagesRead: 10,
-              summary: '',
-              format: 3,
-              files: [{ id: 10, bytes: 1024, extension: '.epub', format: 3 }],
-              writers: [{ name: 'Author One' }],
-            },
-          ],
-          specials: [],
-          volumes: [],
-          storylineChapters: [],
-        }),
-      };
-    }
-    if (url.includes('/api/Series/series-detail?seriesId=2')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => ({
-          chapters: [
-            {
-              id: 20,
-              title: 'Second Book',
-              titleName: 'Second Book',
-              volumeId: 2,
-              pages: 100,
-              pagesRead: 0,
-              summary: '',
-              format: 3,
-              files: [{ id: 20, bytes: 1024, extension: '.epub', format: 3 }],
-              writers: [{ name: 'Author Two' }],
-            },
-          ],
-          specials: [],
-          volumes: [],
-          storylineChapters: [],
-        }),
-      };
-    }
-    if (url.includes('/api/Image/series-cover')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        blob: async () => new Blob(),
-      };
-    }
-    if (url.includes('/api/Reader/get-progress?chapterId=10')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => ({
-          libraryId: 1,
-          seriesId: 1,
-          volumeId: 1,
-          chapterId: 10,
-          pageNum: 10,
-          bookScrollId: null,
-        }),
-      };
-    }
-    if (url.includes('/api/Reader/get-progress?chapterId=20')) {
-      return new Promise((resolve) => {
-        resolveSecondProbe = resolve;
-      });
-    }
-    if (url.includes('/api/Reader/progress')) {
-      const body = JSON.parse(String(init?.body ?? '{}')) as { chapterId: number };
-      uploadedChapters.push(body.chapterId);
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => '0' },
-        json: async () => undefined,
-      };
-    }
-    throw new Error(`Unhandled fetch: ${url}`);
-  });
-  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
-
-  await mountLibrary();
-
-  // Open First Book, relocate, and return to Library before the 2.5s debounce expires.
-  const openButtons = container.querySelectorAll<HTMLButtonElement>('[data-book-open]');
-  openButtons[0]!.click();
-  await settle(10);
-
-  mocks.readerState.onRelocated!({
-    cfi: 'epubcfi(/6/2!/4/4)',
-    xpath: '//body/p[4]',
-    href: 'chapter1.xhtml',
-    percentage: 0.4,
-    spineIndex: 4,
-    pageIndex: 1,
-    pageCount: 4,
-  });
-  await settle(10);
-
-  mocks.readerState.onBack!();
-  await settle(10);
-  expect(container.textContent).toContain('1 reading progress update waiting to sync.');
-
-  // Advance 1,800 ms first so only 700 ms remain on syncTimer (< 1,500 ms openProgressProbe timeout).
-  await vi.advanceTimersByTimeAsync(1_800);
-
-  // Open Second Book so resolvingOpenProgress is active when the 2,500 ms timer fires.
-  const updatedButtons = container.querySelectorAll<HTMLButtonElement>('[data-book-open]');
-  const secondButton = [...updatedButtons].find((btn) =>
-    btn.getAttribute('aria-label')?.includes('Second Book'),
-  );
-  secondButton!.click();
-  await settle(6);
-
-  expect(container.textContent).toContain('Opening downloaded book');
-  await vi.advanceTimersByTimeAsync(700);
-  await settle(6);
-  expect(uploadedChapters).toEqual([]);
-
-  // Finish the probe for Second Book; deferred flush should immediately replay First Book's progress.
-  resolveSecondProbe({
-    ok: true,
-    status: 200,
-    headers: { get: () => null },
-    json: async () => ({
-      libraryId: 1,
-      seriesId: 2,
-      volumeId: 2,
-      chapterId: 20,
-      pageNum: 0,
-      bookScrollId: null,
-    }),
-  });
-  await settle(15);
-
-  expect(uploadedChapters).toEqual([10]);
+afterEach(async () => {
+  for (const instance of mountedInstances.splice(0)) {
+    await unmount(instance);
+  }
+  for (const container of containers.splice(0)) {
+    container.remove();
+  }
+  vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
-it('defers syncTimer during a conflict dialog and replays after cancelling the dialog', async () => {
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-  mocks.setConnected(true);
-  seedLocalState({
-    readingState: {
-      [bookTwo.id]: {
-        cfi: 'epubcfi(/6/2!/4/2)',
-        xpath: '//body/p[2]',
-        percentage: 0.2,
-        localUpdatedAt: '2026-09-07T00:00:00.000Z',
-        syncedLocalUpdatedAt: null,
-        serverUpdatedAt: null,
-        pendingSync: true,
-        syncRevision: 1,
-      },
-    },
-    syncQueue: {
-      [bookTwo.id]: {
-        bookId: bookTwo.id,
-        serverId: 'primary',
-        payloadJson: JSON.stringify({
-          libraryId: 1,
-          seriesId: 2,
-          volumeId: 2,
-          chapterId: 20,
-          pageNum: 20,
-          bookScrollId: '//body/p[2]',
-        }),
-        attemptCount: 0,
-        lastAttemptAt: null,
-        lastError: null,
-        createdAt: '2026-09-07T00:00:00.000Z',
-        updatedAt: '2026-09-07T00:00:00.000Z',
-        revision: 1,
-      },
-    },
+describe('Library concurrent progress uploads and catalog refreshes', () => {
+  it('starts saveProgress on online mount without awaiting catalog pagination and retains local progress', async () => {
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[4]', 0.4);
+
+    const requestOrder: string[] = [];
+    const releaseDetail = deferred<void>();
+    const progressUploaded = deferred<void>();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress' || url.pathname.startsWith('/api/Series/')) {
+        requestOrder.push(url.pathname);
+      }
+      if (url.pathname === '/api/Reader/progress') {
+        progressUploaded.resolve();
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        await releaseDetail.promise;
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    await mountLibrary();
+    await progressUploaded.promise;
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+
+    expect(requestOrder[0]).toBe('/api/Reader/progress');
+    expect(await getPendingSync(server.id)).toEqual([]);
+
+    releaseDetail.resolve();
+    await waitForCondition(() => requestOrder.includes('/api/Series/series-detail'));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const booksAfterReconcile = await getBooks(server.id);
+    expect(booksAfterReconcile[0]?.pagesRead).toBe(40);
   });
 
-  let rejectInitialMountUpload = true;
-  const uploadedChapters: number[] = [];
-  const fetchMock = vi.fn(
-    async (input: RequestInfo | URL, init?: RequestInit): Promise<MockResponse> => {
-      const url = String(input);
-      if (url.includes('/api/Series/v2')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => [
-            {
-              id: 1,
-              name: 'First Book',
-              libraryId: 1,
-              format: 3,
-              pages: 100,
-              pagesRead: 10,
-              created: '2026-01-01T00:00:00.000Z',
-              latestReadDate: '0001-01-01T00:00:00',
-            },
-            {
-              id: 2,
-              name: 'Second Book',
-              libraryId: 1,
-              format: 3,
-              pages: 100,
-              pagesRead: 20,
-              created: '2026-01-01T00:00:00.000Z',
-              latestReadDate: '0001-01-01T00:00:00',
-            },
-          ],
-        };
-      }
-      if (url.includes('/api/Series/series-detail?seriesId=1')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => ({
-            chapters: [
-              {
-                id: 10,
-                title: 'First Book',
-                titleName: 'First Book',
-                volumeId: 1,
-                pages: 100,
-                pagesRead: 10,
-                summary: '',
-                format: 3,
-                files: [{ id: 10, bytes: 1024, extension: '.epub', format: 3 }],
-                writers: [{ name: 'Author One' }],
-              },
-            ],
-            specials: [],
-            volumes: [],
-            storylineChapters: [],
-          }),
-        };
-      }
-      if (url.includes('/api/Series/series-detail?seriesId=2')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => ({
-            chapters: [
-              {
-                id: 20,
-                title: 'Second Book',
-                titleName: 'Second Book',
-                volumeId: 2,
-                pages: 100,
-                pagesRead: 20,
-                summary: '',
-                format: 3,
-                files: [{ id: 20, bytes: 1024, extension: '.epub', format: 3 }],
-                writers: [{ name: 'Author Two' }],
-              },
-            ],
-            specials: [],
-            volumes: [],
-            storylineChapters: [],
-          }),
-        };
-      }
-      if (url.includes('/api/Image/series-cover')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          blob: async () => new Blob(),
-        };
-      }
-      if (url.includes('/api/Reader/get-progress?chapterId=10')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => ({
-            libraryId: 1,
-            seriesId: 1,
-            volumeId: 1,
-            chapterId: 10,
-            pageNum: 0,
-            bookScrollId: null,
-          }),
-        };
-      }
-      if (url.includes('/api/Reader/get-progress?chapterId=20')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => null },
-          json: async () => ({
-            libraryId: 1,
-            seriesId: 2,
-            volumeId: 2,
-            chapterId: 20,
-            pageNum: 65,
-            bookScrollId: '//body/p[65]',
-          }),
-        };
-      }
-      if (url.includes('/api/Reader/progress')) {
-        if (rejectInitialMountUpload) {
-          rejectInitialMountUpload = false;
-          return {
-            ok: false,
-            status: 503,
-            headers: { get: () => null },
-            json: async () => undefined,
-          };
+  it('uploads queued progress during a brief reconnect window and cancels only catalog refresh on disconnect', async () => {
+    networkConnected = false;
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/8)', '//body/p[8]', 0.55, 2);
+
+    const secondBook: BookRecord = {
+      ...seededBook,
+      id: 'server-1:1:11',
+      chapterId: 11,
+      title: 'The Dispossessed',
+    };
+    await reconcileBooks(server.id, [seededBook, secondBook]);
+    await saveLocalProgress(secondBook, 'epubcfi(/6/6!/4/2)', '//body/p[2]', 0.3, 1);
+
+    const catalogSignals: AbortSignal[] = [];
+    const progressSignals: Array<AbortSignal | undefined> = [];
+    const secondUploadGate = deferred<void>();
+    const secondUploadStarted = deferred<void>();
+    let uploadCalls = 0;
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        uploadCalls += 1;
+        progressSignals.push(init?.signal ?? undefined);
+        if (uploadCalls === 2) {
+          secondUploadStarted.resolve();
+          await secondUploadGate.promise;
         }
-        const body = JSON.parse(String(init?.body ?? '{}')) as { chapterId: number };
-        uploadedChapters.push(body.chapterId);
-        return {
-          ok: true,
-          status: 200,
-          headers: { get: () => '0' },
-          json: async () => undefined,
-        };
+        return new Response(null, { status: 204 });
       }
-      throw new Error(`Unhandled fetch: ${url}`);
-    },
-  );
-  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
-
-  await mountLibrary();
-
-  // Open First Book, relocate to start the 2.5s syncTimer, then close reader.
-  const openButtons = container.querySelectorAll<HTMLButtonElement>('[data-book-open]');
-  openButtons[0]!.click();
-  await settle(10);
-  mocks.readerState.onRelocated!({
-    cfi: 'epubcfi(/6/2!/4/6)',
-    xpath: '//body/p[6]',
-    href: 'chapter1.xhtml',
-    percentage: 0.3,
-    spineIndex: 3,
-    pageIndex: 1,
-    pageCount: 4,
-  });
-  await settle(10);
-  mocks.readerState.onBack!();
-  await settle(10);
-
-  // Open Second Book so the conflict modal opens before the 2.5s timer expires.
-  const secondButton = [...container.querySelectorAll<HTMLButtonElement>('[data-book-open]')].find(
-    (btn) => btn.getAttribute('aria-label')?.includes('Second Book'),
-  );
-  secondButton!.click();
-  await settle(12);
-
-  expect(container.textContent).toContain('Choose where to continue');
-  expect(uploadedChapters).toEqual([]);
-
-  // Fire the 2.5s syncTimer while conflict modal is open: upload must remain deferred.
-  await vi.advanceTimersByTimeAsync(2_500);
-  await settle(8);
-  expect(uploadedChapters).toEqual([]);
-
-  // Cancel the conflict dialog: deferred flush replays!
-  const cancelBtn = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-    (btn) => btn.textContent?.trim() === 'Cancel',
-  );
-  expect(cancelBtn).toBeDefined();
-  cancelBtn!.click();
-  await settle(15);
-
-  expect(uploadedChapters).toContain(10);
-  expect(uploadedChapters).toContain(20);
-});
-
-it('aborts a stalled upload on disconnect or teardown and retries pending books on reconnect', async () => {
-  mocks.setConnected(true);
-  seedLocalState({
-    readingState: {
-      [bookOne.id]: {
-        cfi: 'epubcfi(/6/2!/4/2)',
-        xpath: '//body/p[2]',
-        percentage: 0.2,
-        localUpdatedAt: '2026-09-07T05:00:00.000Z',
-        syncedLocalUpdatedAt: null,
-        serverUpdatedAt: null,
-        pendingSync: true,
-        syncRevision: 1,
-      },
-    },
-    syncQueue: {
-      [bookOne.id]: {
-        bookId: bookOne.id,
-        serverId: 'primary',
-        payloadJson: JSON.stringify({
-          libraryId: 1,
-          seriesId: 1,
-          volumeId: 1,
-          chapterId: 10,
-          pageNum: 20,
-          bookScrollId: '//body/p[2]',
-        }),
-        attemptCount: 0,
-        lastAttemptAt: null,
-        lastError: null,
-        createdAt: '2026-09-07T05:00:00.000Z',
-        updatedAt: '2026-09-07T05:00:00.000Z',
-        revision: 1,
-      },
-    },
-  });
-
-  const uploadSignals: AbortSignal[] = [];
-  let stalledAttempt = true;
-  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.includes('/api/Series/v2')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => [
-          {
-            id: 1,
-            name: 'First Book',
-            libraryId: 1,
-            format: 3,
-            pages: 100,
-            pagesRead: 10,
-            created: '2026-01-01T00:00:00.000Z',
-            latestReadDate: '0001-01-01T00:00:00',
-          },
-        ],
-      };
-    }
-    if (url.includes('/api/Series/series-detail?seriesId=1')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => ({
-          chapters: [
-            {
-              id: 10,
-              title: 'First Book',
-              titleName: 'First Book',
-              volumeId: 1,
-              pages: 100,
-              pagesRead: 10,
-              summary: '',
-              format: 3,
-              files: [{ id: 10, bytes: 1024, extension: '.epub', format: 3 }],
-              writers: [{ name: 'Author One' }],
-            },
-          ],
-          specials: [],
-          volumes: [],
-          storylineChapters: [],
-        }),
-      };
-    }
-    if (url.includes('/api/Image/series-cover')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        blob: async () => new Blob(),
-      };
-    }
-    if (url.includes('/api/Reader/progress')) {
-      if (init?.signal) uploadSignals.push(init.signal);
-      if (stalledAttempt) {
-        stalledAttempt = false;
-        return new Promise((_resolve, reject) => {
+      if (url.pathname === '/api/Series/v2') {
+        if (init?.signal) catalogSignals.push(init.signal);
+        return new Promise<Response>((_resolve, reject) => {
           init?.signal?.addEventListener(
             'abort',
             () => reject(new DOMException('Aborted', 'AbortError')),
@@ -848,167 +347,284 @@ it('aborts a stalled upload on disconnect or teardown and retries pending books 
           );
         });
       }
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => '0' },
-        json: async () => undefined,
-      };
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    await mountLibrary();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Brief reconnection window begins
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
     }
-    throw new Error(`Unhandled fetch: ${url}`);
-  });
-  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
-  await mountLibrary();
-  expect(uploadSignals).toHaveLength(1);
-  expect(uploadSignals[0]?.aborted).toBe(false);
+    await secondUploadStarted.promise;
+    await waitForCondition(() => catalogSignals.length === 1);
+    expect(uploadCalls).toBe(2);
 
-  // Disconnect aborts the stalled upload without incrementing attemptCount.
-  mocks.setConnected(false, true);
-  await settle(10);
-  expect(uploadSignals[0]?.aborted).toBe(true);
+    // Network drops mid-refresh (within 2-second window): catalog refresh aborts, in-flight upload does not
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
 
-  const midState = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as {
-    syncQueue: Record<string, { attemptCount: number; lastError: string | null }>;
-  };
-  expect(midState.syncQueue[bookOne.id]).toMatchObject({
-    attemptCount: 0,
-    lastError: null,
+    expect(catalogSignals[0]?.aborted).toBe(true);
+    expect(progressSignals[1]?.aborted).toBe(false);
+
+    secondUploadGate.resolve();
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
   });
 
-  // Reconnect refreshes and retries all pending books.
-  mocks.setConnected(true, true);
-  await settle(15);
+  it('awaits active syncWork in updateApiKey before switching keys, then runs syncProgress and refresh concurrently while preserving notice', async () => {
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/6)', '//body/p[6]', 0.6, 1);
 
-  expect(uploadSignals).toHaveLength(2);
-  const finalState = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as {
-    syncQueue: Record<string, unknown>;
-    readingState: Record<string, { pendingSync: boolean }>;
-  };
-  expect(finalState.syncQueue[bookOne.id]).toBeUndefined();
-  expect(finalState.readingState[bookOne.id]?.pendingSync).toBe(false);
-});
+    const oldUploadStarted = deferred<void>();
+    const finishOldUpload = deferred<Response>();
+    const stalledNewKeyCatalogDetail = deferred<void>();
+    const newKeyUploadCompleted = deferred<void>();
+    const observedCalls: Array<{ path: string; apiKey: string | null }> = [];
 
-it('aborts an active stalled upload when Library unmounts for a server address change', async () => {
-  mocks.setConnected(true);
-  seedLocalState({
-    readingState: {
-      [bookOne.id]: {
-        cfi: 'epubcfi(/6/2!/4/2)',
-        xpath: '//body/p[2]',
-        percentage: 0.2,
-        localUpdatedAt: '2026-09-07T06:00:00.000Z',
-        syncedLocalUpdatedAt: null,
-        serverUpdatedAt: null,
-        pendingSync: true,
-        syncRevision: 1,
-      },
-    },
-    syncQueue: {
-      [bookOne.id]: {
-        bookId: bookOne.id,
-        serverId: 'primary',
-        payloadJson: JSON.stringify({
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      const key = headers.get('x-api-key');
+      observedCalls.push({ path: url.pathname, apiKey: key });
+
+      if (url.pathname === '/api/Reader/progress') {
+        if (key === 'expired-key') {
+          oldUploadStarted.resolve();
+          return finishOldUpload.promise;
+        }
+        if (key === 'valid-replacement-key') {
+          newKeyUploadCompleted.resolve();
+          return new Response(null, { status: 204 });
+        }
+      }
+      if (url.pathname === '/api/Library/libraries') {
+        return jsonResponse([{ id: 1, name: 'Books', type: 2 }]);
+      }
+      if (url.pathname === '/api/Health') {
+        return jsonResponse({ version: '0.8.4' });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        if (key === 'expired-key') {
+          return jsonResponse([], 401);
+        }
+        return jsonResponse([seriesListItem(60)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        await stalledNewKeyCatalogDetail.promise;
+        return jsonResponse(seriesDetailPayload(60));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const onApiKeyChange = vi.fn();
+    const { target } = await mountLibrary({
+      apiKey: 'expired-key',
+      onApiKeyChange,
+    });
+
+    await oldUploadStarted.promise;
+
+    // Open settings and submit replacement key while old upload is still in flight
+    const settingsButton = target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]');
+    expect(settingsButton).not.toBeNull();
+    settingsButton!.click();
+    flushSync();
+
+    const keyInput = target.querySelector<HTMLInputElement>('#replacement-api-key');
+    expect(keyInput).not.toBeNull();
+    keyInput!.value = 'valid-replacement-key';
+    keyInput!.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSync();
+
+    const form = keyInput!.closest('form');
+    expect(form).not.toBeNull();
+    form!.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+
+    await waitForCondition(() =>
+      observedCalls.some(
+        (call) => call.path === '/api/Library/libraries' && call.apiKey === 'valid-replacement-key',
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Neither new-key upload nor new-key catalog refresh may start before old syncWork settles
+    expect(onApiKeyChange).not.toHaveBeenCalled();
+    expect(
+      observedCalls.some(
+        (call) => call.path === '/api/Reader/progress' && call.apiKey === 'valid-replacement-key',
+      ),
+    ).toBe(false);
+
+    // Finish old upload with 401 auth rejection
+    finishOldUpload.resolve(jsonResponse({}, 401));
+
+    // New key takes effect and uploads progress immediately while catalog detail is still stalled
+    await newKeyUploadCompleted.promise;
+    await waitForCondition(async () => (await getPendingSync(server.id)).length === 0);
+
+    expect(onApiKeyChange).toHaveBeenCalledWith('valid-replacement-key');
+    expect(target.textContent).toContain('API key updated.');
+
+    stalledNewKeyCatalogDetail.resolve();
+    await waitForCondition(() =>
+      observedCalls.some(
+        (call) =>
+          call.path === '/api/Series/series-detail' && call.apiKey === 'valid-replacement-key',
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Catalog refresh preserved the newer 'API key updated.' status notice
+    expect(target.textContent).toContain('API key updated.');
+  });
+
+  it('preserves authentication failure notices from runProgressSync when refreshCatalog runs concurrently or after abort', async () => {
+    networkConnected = false;
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
+
+    let seriesAttempt = 0;
+    const releaseAbortedCleanup = deferred<void>();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        return jsonResponse({}, 401);
+      }
+      if (url.pathname === '/api/Series/v2') {
+        seriesAttempt += 1;
+        if (seriesAttempt === 1) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              'abort',
+              () => {
+                void releaseAbortedCleanup.promise.then(() =>
+                  reject(new DOMException('Aborted', 'AbortError')),
+                );
+              },
+              { once: true },
+            );
+          });
+        }
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary({ apiKey: 'revoked-key' });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+
+    // Connect, then disconnect while first catalog refresh is still unwinding
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await waitForCondition(() => seriesAttempt === 1);
+
+    networkConnected = false;
+    for (const listener of networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+
+    // Reconnect immediately: syncProgress fails with 401 before the second refreshCatalog begins
+    networkConnected = true;
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'wifi' });
+    }
+    await waitForCondition(() =>
+      Boolean(
+        target.textContent?.includes(
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+        ),
+      ),
+    );
+
+    // Let the aborted refresh finish unwinding so the queued second refreshCatalog starts and completes
+    releaseAbortedCleanup.resolve();
+    await waitForCondition(() => seriesAttempt === 2);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(target.textContent).toContain(
+      'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+    );
+  });
+
+  it('pauses automatic progress uploads while opening a book or resolving a reading conflict', async () => {
+    let progressSaveCount = 0;
+    const verifyGate = deferred<{ relativePath: string; webViewUrl: string }>();
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Reader/progress') {
+        progressSaveCount += 1;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/api/Reader/get-progress') {
+        return jsonResponse({
           libraryId: 1,
           seriesId: 1,
           volumeId: 1,
           chapterId: 10,
-          pageNum: 20,
-          bookScrollId: '//body/p[2]',
-        }),
-        attemptCount: 0,
-        lastAttemptAt: null,
-        lastError: null,
-        createdAt: '2026-09-07T06:00:00.000Z',
-        updatedAt: '2026-09-07T06:00:00.000Z',
-        revision: 1,
-      },
-    },
-  });
+          pageNum: 75,
+          bookScrollId: '//body/p[75]',
+          lastModifiedUtc: '2026-09-08T00:00:00.000Z',
+        });
+      }
+      if (url.pathname === '/api/Series/v2') {
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
 
-  let uploadSignal: AbortSignal | undefined;
-  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    if (url.includes('/api/Series/v2')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => [
-          {
-            id: 1,
-            name: 'First Book',
-            libraryId: 1,
-            format: 3,
-            pages: 100,
-            pagesRead: 10,
-            created: '2026-01-01T00:00:00.000Z',
-            latestReadDate: '0001-01-01T00:00:00',
-          },
-        ],
-      };
-    }
-    if (url.includes('/api/Series/series-detail?seriesId=1')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        json: async () => ({
-          chapters: [
-            {
-              id: 10,
-              title: 'First Book',
-              titleName: 'First Book',
-              volumeId: 1,
-              pages: 100,
-              pagesRead: 10,
-              summary: '',
-              format: 3,
-              files: [{ id: 10, bytes: 1024, extension: '.epub', format: 3 }],
-              writers: [{ name: 'Author One' }],
-            },
-          ],
-          specials: [],
-          volumes: [],
-          storylineChapters: [],
-        }),
-      };
-    }
-    if (url.includes('/api/Image/series-cover')) {
-      return {
-        ok: true,
-        status: 200,
-        headers: { get: () => null },
-        blob: async () => new Blob(),
-      };
-    }
-    if (url.includes('/api/Reader/progress')) {
-      uploadSignal = init?.signal ?? undefined;
-      return new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener(
-          'abort',
-          () => reject(new DOMException('Aborted', 'AbortError')),
-          { once: true },
-        );
-      });
-    }
-    throw new Error(`Unhandled fetch: ${url}`);
-  });
-  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
 
-  await mountLibrary();
-  expect(uploadSignal?.aborted).toBe(false);
+    // Queue a new local relocation while online right before opening the book
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
+    verifyDownloadedEpubMock.mockImplementationOnce(() => verifyGate.promise);
 
-  unmount(instance!);
-  instance = null;
-  await settle(6);
+    // Start opening the book while online (resolvingOpenProgress = true while verifyGate is pending)
+    const openButton = target.querySelector<HTMLButtonElement>('[data-book-open]');
+    expect(openButton).not.toBeNull();
+    openButton!.click();
+    flushSync();
 
-  expect(uploadSignal?.aborted).toBe(true);
-  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as {
-    syncQueue: Record<string, { attemptCount: number; lastError: string | null }>;
-  };
-  expect(saved.syncQueue[bookOne.id]).toMatchObject({
-    attemptCount: 0,
-    lastError: null,
+    // Trigger background & reconnect events while resolvingOpenProgress is active
+    for (const listener of appStateListeners) listener({ isActive: false });
+    for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(progressSaveCount).toBe(0);
+
+    // Complete verification -> conflict modal opens because pending local (//body/p[2]) and remote (//body/p[75]) diverged
+    verifyGate.resolve({ relativePath: 'books/book-1.epub', webViewUrl: 'blob:book-1' });
+    await waitForCondition(() => Boolean(target.textContent?.includes('Continue from Kavita')));
+
+    // Trigger background & reconnect events while conflict modal is open
+    for (const listener of appStateListeners) listener({ isActive: false });
+    for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(progressSaveCount).toBe(0);
   });
 });
