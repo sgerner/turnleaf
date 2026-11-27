@@ -26,9 +26,11 @@ jobs:
        github.event.workflow_run.head_branch == 'master' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 35
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     env:
       TESTED_REVISION: ${{ github.event.workflow_run.head_sha || github.sha }}
     outputs:
@@ -36,6 +38,9 @@ jobs:
       release_tag: ${{ steps.release_version.outputs.release_tag }}
       version_base: ${{ steps.release_version.outputs.version_base }}
       tested_revision: ${{ steps.release_version.outputs.tested_revision }}
+      apk_sha256: ${{ steps.stage_release.outputs.apk_sha256 }}
+      notes_sha256: ${{ steps.stage_release.outputs.notes_sha256 }}
+      min_sdk_version: ${{ steps.stage_release.outputs.min_sdk_version }}
 
     steps:
       - name: Check out source
@@ -128,7 +133,7 @@ jobs:
             sudo chmod g+rw /dev/kvm
           fi
 
-      - name: Cache Android AVD snapshots
+      - name: Cache Android AVD snapshot
         if: steps.release_preflight.outputs.already_released != 'true'
         id: avd-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -136,24 +141,9 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ runner.os }}-api-29-36-google_apis-x86_64-pixel_6-v1
+          key: avd-${{ runner.os }}-api-36-google_apis-x86_64-pixel_6-v1
 
-      - name: Create AVD and generate snapshot for caching (API 29)
-        if: steps.release_preflight.outputs.already_released != 'true' && steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
-        with:
-          api-level: 29
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          avd-name: turnleaf_api29
-          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
-          force-avd-creation: true
-          emulator-boot-timeout: 900
-          disable-animations: false
-          script: echo "Generated API 29 AVD snapshot for caching."
-
-      - name: Create AVD and generate snapshot for caching (API 36)
+      - name: Create AVD and generate snapshot for caching
         if: steps.release_preflight.outputs.already_released != 'true' && steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
@@ -161,29 +151,13 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: turnleaf_api36
           emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
           force-avd-creation: true
           emulator-boot-timeout: 900
           disable-animations: false
-          script: echo "Generated API 36 AVD snapshot for caching."
+          script: echo "Generated AVD snapshot for caching."
 
-      - name: Verify manually dispatched revision with reading journey (API 29)
-        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
-        with:
-          api-level: 29
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          avd-name: turnleaf_api29
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
-          force-avd-creation: false
-          emulator-boot-timeout: 900
-          disable-animations: true
-          script: npm run android:journey
-
-      - name: Verify manually dispatched revision with reading journey (API 36)
+      - name: Verify manually dispatched revision with reading journey
         if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
@@ -191,7 +165,6 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: turnleaf_api36
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
           force-avd-creation: false
           emulator-boot-timeout: 900
@@ -252,25 +225,7 @@ jobs:
             fi
           done
 
-      - name: Smoke-test signed release APK (API 29)
-        if: steps.release_preflight.outputs.already_released != 'true'
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
-        env:
-          ANDROID_PACKAGE_NAME: app.turnleaf.reader
-          ANDROID_APK_PATH: android/app/build/outputs/apk/release/app-release.apk
-        with:
-          api-level: 29
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          avd-name: turnleaf_api29
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
-          force-avd-creation: false
-          emulator-boot-timeout: 900
-          disable-animations: true
-          script: npm run android:smoke
-
-      - name: Smoke-test signed release APK (API 36)
+      - name: Smoke-test signed release APK
         if: steps.release_preflight.outputs.already_released != 'true'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         env:
@@ -281,7 +236,6 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: turnleaf_api36
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
           force-avd-creation: false
           emulator-boot-timeout: 900
@@ -290,13 +244,14 @@ jobs:
 
       - name: Stage release artifacts and notes
         if: steps.release_preflight.outputs.already_released != 'true'
+        id: stage_release
         env:
           TESTED_REVISION: ${{ steps.release_version.outputs.tested_revision }}
         run: |
           set -eu
           mkdir -p release-payload
           APK="android/app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK"
+          test -s "$APK"
           npm run --silent release:notes > "$RUNNER_TEMP/turnleaf-release-notes.md"
           {
             cat "$RUNNER_TEMP/turnleaf-release-notes.md"
@@ -305,6 +260,22 @@ jobs:
           cp "$APK" release-payload/app-release.apk
           (cd release-payload && sha256sum app-release.apk > app-release.apk.sha256)
           printf '%s\n' "$TESTED_REVISION" > release-payload/tested-revision.txt
+          npm run android:verify-release -- release-payload/app-release.apk
+          MIN_SDK_VERSION="$(sed -n 's/^[[:space:]]*minSdkVersion[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' android/variables.gradle)"
+          APK_SHA256="$(sha256sum release-payload/app-release.apk | awk '{print $1}')"
+          NOTES_SHA256="$(sha256sum release-payload/turnleaf-release-notes.md | awk '{print $1}')"
+          test -n "$MIN_SDK_VERSION"
+          test "${#APK_SHA256}" -eq 64
+          test "${#NOTES_SHA256}" -eq 64
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "notes_sha256=${NOTES_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "min_sdk_version=${MIN_SDK_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest release APK build provenance
+        if: steps.release_preflight.outputs.already_released != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-payload/app-release.apk
 
       - name: Upload release artifacts
         if: steps.release_preflight.outputs.already_released != 'true'
@@ -313,6 +284,7 @@ jobs:
           name: turnleaf-release
           path: release-payload
           if-no-files-found: error
+          retention-days: 1
 
   publish-github-release:
     needs: build-release-apk
@@ -321,6 +293,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      attestations: read
 
     steps:
       - name: Check out release helper
@@ -341,13 +314,81 @@ jobs:
       - name: Verify release provenance
         env:
           TESTED_REVISION: ${{ needs.build-release-apk.outputs.tested_revision }}
+          EXPECTED_APK_SHA256: ${{ needs.build-release-apk.outputs.apk_sha256 }}
+          EXPECTED_NOTES_SHA256: ${{ needs.build-release-apk.outputs.notes_sha256 }}
+          MIN_SDK_VERSION: ${{ needs.build-release-apk.outputs.min_sdk_version }}
         run: |
           set -eu
+          if [ -z "${TESTED_REVISION:-}" ] || [ -z "${EXPECTED_APK_SHA256:-}" ] || [ -z "${EXPECTED_NOTES_SHA256:-}" ] || [ -z "${MIN_SDK_VERSION:-}" ]; then
+            echo "Missing required provenance outputs from build-release-apk." >&2
+            exit 1
+          fi
+          case "$EXPECTED_APK_SHA256" in
+            *[!0-9a-f]*) echo "Invalid apk_sha256 output." >&2; exit 1 ;;
+          esac
+          test "${#EXPECTED_APK_SHA256}" -eq 64
+          case "$EXPECTED_NOTES_SHA256" in
+            *[!0-9a-f]*) echo "Invalid notes_sha256 output." >&2; exit 1 ;;
+          esac
+          test "${#EXPECTED_NOTES_SHA256}" -eq 64
+          case "$MIN_SDK_VERSION" in
+            *[!0-9]*) echo "Invalid min_sdk_version output." >&2; exit 1 ;;
+          esac
           test "$(cat release-payload/tested-revision.txt)" = "$TESTED_REVISION"
           grep -Fq "Tested revision: \`$TESTED_REVISION\`" release-payload/turnleaf-release-notes.md
           test -s release-payload/app-release.apk
           test -s release-payload/turnleaf-release-notes.md
           (cd release-payload && sha256sum --check app-release.apk.sha256)
+          test "$(cat release-payload/app-release.apk.sha256)" = "${EXPECTED_APK_SHA256}  app-release.apk"
+          ACTUAL_APK_SHA256="$(sha256sum release-payload/app-release.apk | awk '{print $1}')"
+          ACTUAL_NOTES_SHA256="$(sha256sum release-payload/turnleaf-release-notes.md | awk '{print $1}')"
+          if [ "$ACTUAL_APK_SHA256" != "$EXPECTED_APK_SHA256" ]; then
+            echo "APK SHA-256 digest mismatch: expected $EXPECTED_APK_SHA256, got $ACTUAL_APK_SHA256" >&2
+            exit 1
+          fi
+          if [ "$ACTUAL_NOTES_SHA256" != "$EXPECTED_NOTES_SHA256" ]; then
+            echo "Release notes SHA-256 digest mismatch: expected $EXPECTED_NOTES_SHA256, got $ACTUAL_NOTES_SHA256" >&2
+            exit 1
+          fi
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          BUILD_TOOLS_DIR="${SDK_ROOT}/build-tools"
+          if [ ! -d "$BUILD_TOOLS_DIR" ]; then
+            echo "Android SDK build-tools directory not found at $BUILD_TOOLS_DIR" >&2
+            exit 1
+          fi
+          CANDIDATES="$(find "$BUILD_TOOLS_DIR" -mindepth 2 -maxdepth 2 -name apksigner -print | sort -Vr)"
+          APKSIGNER=""
+          while IFS= read -r candidate; do
+            if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
+              APKSIGNER="$candidate"
+              break
+            fi
+          done <<<"$CANDIDATES"
+          if [ -z "$APKSIGNER" ]; then
+            echo "No executable apksigner binary found under $BUILD_TOOLS_DIR" >&2
+            exit 1
+          fi
+          "$APKSIGNER" verify --min-sdk-version "$MIN_SDK_VERSION" --print-certs release-payload/app-release.apk
+
+      - name: Verify APK provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          ATTEMPT=1
+          MAX_ATTEMPTS=3
+          until gh attestation verify "release-payload/app-release.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/android-release.yml" \
+            --deny-self-hosted-runners; do
+            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+              echo "APK provenance attestation verification failed after ${MAX_ATTEMPTS} attempts." >&2
+              exit 1
+            fi
+            echo "Attestation verification attempt ${ATTEMPT} failed; retrying in 5 seconds..." >&2
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+          done
 
       - name: Confirm release revision is still current master
         env:

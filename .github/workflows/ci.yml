@@ -114,7 +114,7 @@ jobs:
   android-emulator-smoke:
     needs: web-and-android-checks
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -152,39 +152,38 @@ jobs:
           fi
 
       - name: Cache Android AVD snapshot
+        if: matrix.api-level == 36
         id: avd-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ runner.os }}-api-${{ matrix.api-level }}-google_apis-x86_64-pixel_6-v1
+          key: avd-${{ runner.os }}-api-36-google_apis-x86_64-pixel_6-v1
 
-      - name: Create AVD and generate snapshot for caching (API ${{ matrix.api-level }})
-        if: steps.avd-cache.outputs.cache-hit != 'true'
+      - name: Create AVD and generate snapshot for caching
+        if: matrix.api-level == 36 && steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
-          api-level: ${{ matrix.api-level }}
+          api-level: 36
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: turnleaf_api${{ matrix.api-level }}
           emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim
           force-avd-creation: true
           emulator-boot-timeout: 900
           disable-animations: false
           script: echo "Generated AVD snapshot for caching."
 
-      - name: Verify the Android reading journey (API ${{ matrix.api-level }})
+      - name: Verify the Android reading journey
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: ${{ matrix.api-level }}
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          avd-name: turnleaf_api${{ matrix.api-level }}
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot-save -no-audio -no-boot-anim
-          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect ${{ matrix.api-level == 36 && '-no-snapshot-save' || '-no-snapshot' }} -no-audio -no-boot-anim
+          force-avd-creation: ${{ matrix.api-level != 36 }}
           emulator-boot-timeout: 900
           disable-animations: true
           script: npm run android:journey

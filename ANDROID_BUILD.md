@@ -45,6 +45,7 @@ For release readiness:
 ```bash
 keytool -genkeypair -v -keystore android/turnleaf-release.jks -alias turnleaf -keyalg RSA -keysize 4096 -validity 10000
 npm run android:release -- --no-daemon
+npm run android:verify-release
 ```
 
 Extra flags after `--` (such as `--no-daemon`) are forwarded to Gradle, and release builds stop the Gradle daemon after signing so credentials do not remain in background daemon memory.
@@ -65,7 +66,9 @@ GitHub Actions expects these repository secrets, decodes the keystore into an ow
 - `ANDROID_KEY_ALIAS`
 - `ANDROID_KEY_PASSWORD`
 
-The release script produces a signed APK when all four signing values are present and fails loudly if any release signing value is missing or empty.
+The release script produces a signed APK when all four signing values are present and fails loudly if any release signing value is missing or empty. `npm run android:verify-release` verifies `android/app/build/outputs/apk/release/app-release.apk` (or a custom APK path) with `apksigner` against `minSdkVersion` from `android/variables.gradle` and validates an adjacent `.sha256` file when staged.
+
+In `.github/workflows/android-release.yml`, `build-release-apk` signs an OIDC SLSA build provenance attestation for `app-release.apk` with [GitHub Artifact Attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations), exports immutable SHA-256 job outputs, and gates `publish-github-release` on digest matching, `apksigner verify`, and `gh attestation verify`. Artifact attestations are included on public repositories; private forks require GitHub Enterprise Cloud.
 
 Device commands used:
 
