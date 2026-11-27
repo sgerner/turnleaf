@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- test: handle empty SharedPreferences XML in Android journey flush check
 - fix: stabilize native connectivity handover and SecureStorage journey restarts
 - Centralize Kavita credential state, gate 401/403 requests, and stop queued syncs on disconnect.
 - fix: refresh only after reconnecting from offline

@@ -318,11 +318,11 @@ async function run() {
             'cat',
             'shared_prefs/WSSecureStorageSharedPreferences.xml',
           );
-          return (
-            xml.includes('</map>') && xml.includes(`name="${secureStorageKey}"`) === expectPresent
-          );
+          const completeXml = xml.includes('</map>') || /<map\s*\/>/.test(xml);
+          return completeXml && xml.includes(`name="${secureStorageKey}"`) === expectPresent;
         } catch (error) {
-          if (String(error?.stderr || error).includes('not debuggable')) {
+          const output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}\n${error?.message ?? ''}`;
+          if (output.includes('not debuggable')) {
             await delay(500);
             return true;
           }
@@ -612,6 +612,10 @@ async function run() {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await run().catch((error) => {
+    if (process.env.GITHUB_ACTIONS) {
+      const detail = [error?.message, error?.cause?.message].filter(Boolean).join(' | ');
+      console.error(`::error::${detail.replace(/\r?\n/g, ' ')}`);
+    }
     console.error(error);
     process.exitCode ??= 1;
   });
