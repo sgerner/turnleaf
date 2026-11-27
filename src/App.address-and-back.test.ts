@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as ThemesModule from './lib/themes/themes';
 
 const mocks = vi.hoisted(() => {
   const backListeners = new Set<() => void>();
@@ -109,10 +110,14 @@ vi.mock('./lib/github/releases', () => ({
   fetchLatestGithubRelease: mocks.fetchLatestGithubRelease,
 }));
 
-vi.mock('./lib/themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: mocks.loadTheme,
-}));
+vi.mock('./lib/themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: mocks.loadTheme,
+  };
+});
 
 vi.mock('./lib/downloads/native-download', () => ({
   EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
