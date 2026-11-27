@@ -1,6 +1,13 @@
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { installCspMonitor, startFixture, styledChapter } from './android-reading-journey.mjs';
+import { validateEpubArchive } from '../src/lib/downloads/epub-validation';
+import {
+  chapterIsolated,
+  createJourneyEpub,
+  installCspMonitor,
+  startFixture,
+  styledChapter,
+} from './android-reading-journey.mjs';
 
 const fixtures = [];
 
@@ -19,6 +26,8 @@ function createJourneyWindow({
   leadBorderWidth = '3px',
   leadBorderColor = 'rgb(180, 83, 9)',
   fontStatus = 'loaded',
+  csp = "default-src 'none'; script-src 'none'; connect-src 'none'; form-action 'none'; img-src 'self' data: blob:",
+  bodyHtml = '',
 } = {}) {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     runScripts: 'outside-only',
@@ -26,6 +35,7 @@ function createJourneyWindow({
   const { window } = dom;
   const heading = { textContent: `Chapter ${chapter}` };
   const lead = {};
+  const metaCsp = { getAttribute: (name) => (name === 'content' ? csp : null) };
   const load = vi.fn().mockResolvedValue([]);
   const fonts = Object.assign([{ family: "'TurnleafSample'", status: fontStatus }], {
     ready: Promise.resolve(),
@@ -33,9 +43,13 @@ function createJourneyWindow({
   });
   const contentDocument = {
     fonts,
+    documentElement: {
+      outerHTML: `<html><head></head><body><h1>Chapter ${chapter}</h1>${bodyHtml}</body></html>`,
+    },
     querySelector: (selector) => {
       if (selector === 'h1') return heading;
       if (selector === 'p.lead') return lead;
+      if (selector === 'meta[http-equiv="Content-Security-Policy"]') return metaCsp;
       return null;
     },
   };
@@ -56,6 +70,7 @@ function createJourneyWindow({
     },
   };
   const frame = window.document.createElement('iframe');
+  frame.setAttribute('sandbox', 'allow-same-origin');
   Object.defineProperty(frame, 'contentDocument', { value: contentDocument });
   Object.defineProperty(frame, 'contentWindow', { value: contentWindow });
   window.document.body.appendChild(frame);
@@ -128,10 +143,39 @@ describe('Android reading journey fixture', () => {
     expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
     expect(fixture.foreignAuthHeaders).toBe(1);
   });
+
+  it('builds a valid styled EPUB containing hostile subresource and escaped CSS vectors and records leaks', async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+
+    const epub = createJourneyEpub(`http://127.0.0.1:${fixture.port}/hostile`);
+    await expect(
+      validateEpubArchive(epub.length, async (offset, length) =>
+        epub.subarray(offset, offset + length),
+      ),
+    ).resolves.toBeUndefined();
+
+    const archiveText = epub.toString('utf8');
+    expect(archiveText).toContain('TurnleafSample');
+    expect(archiveText).toContain('/hostile/img-src.png');
+    expect(archiveText).toContain('/hostile/img-srcset.png');
+    expect(archiveText).toContain('/hostile/svg-image.png');
+    expect(archiveText).toContain('/hostile/video-poster.png');
+    expect(archiveText).toContain('/hostile/inline-bg.png');
+    expect(archiveText).toContain('/hostile/packaged-bg.png');
+    expect(archiveText).toContain('/hostile/packaged-import.css');
+    expect(archiveText).toContain('/hostile/escaped-packaged-import.css');
+    expect(archiveText).toContain('/hostile/escaped-bg.png');
+    expect(fixture.hostileRequests).toEqual([]);
+
+    const simulatedLeak = await fetch(`http://127.0.0.1:${fixture.port}/hostile/img-src.png`);
+    expect(simulatedLeak.status).toBe(204);
+    expect(fixture.hostileRequests).toEqual(['/hostile/img-src.png']);
+  });
 });
 
-describe('Android reading journey styledChapter probe', () => {
-  it('accepts integer-DPR and Pixel 6 fractional-DPR snapped border widths', async () => {
+describe('Android reading journey styledChapter and chapterIsolated probes', () => {
+  it('accepts integer-DPR and Pixel 6 fractional-DPR snapped border widths and isolated chapters', async () => {
     const pixel6Window = createJourneyWindow({
       chapter: 1,
       dpr: 2.625,
@@ -139,6 +183,7 @@ describe('Android reading journey styledChapter probe', () => {
       leadBorderWidth: '2.66667px',
     });
     expect(await pixel6Window.eval(styledChapter(1))).toBe(true);
+    expect(pixel6Window.eval(chapterIsolated(1))).toBe(true);
 
     const desktopWindow = createJourneyWindow({
       chapter: 2,
@@ -147,9 +192,10 @@ describe('Android reading journey styledChapter probe', () => {
       leadBorderWidth: '3px',
     });
     expect(await desktopWindow.eval(styledChapter(2))).toBe(true);
+    expect(desktopWindow.eval(chapterIsolated(2))).toBe(true);
   });
 
-  it('rejects unstyled or mismatched border widths and colors', async () => {
+  it('rejects unstyled borders, mismatched colors, or surviving /hostile/ references', async () => {
     const unstyledWindow = createJourneyWindow({
       chapter: 1,
       dpr: 2.625,
@@ -166,17 +212,38 @@ describe('Android reading journey styledChapter probe', () => {
       headingBorderColor: 'rgb(0, 0, 0)',
     });
     expect(await wrongColorWindow.eval(styledChapter(1))).toBe(false);
+
+    const leakedMarkupWindow = createJourneyWindow({
+      chapter: 1,
+      bodyHtml: '<img src="http://127.0.0.1:9999/hostile/img-src.png" />',
+    });
+    expect(leakedMarkupWindow.eval(chapterIsolated(1))).toBe(false);
   });
 
-  it('surfaces recorded CSP violations immediately', async () => {
+  it('surfaces unexpected CSP violations while recording blocked hostile base-uri probes separately', async () => {
     const window = createJourneyWindow();
     window.eval(installCspMonitor);
-    const violation = new window.Event('securitypolicyviolation');
-    Object.assign(violation, {
+
+    const hostileBlock = new window.Event('securitypolicyviolation');
+    Object.assign(hostileBlock, {
+      effectiveDirective: 'base-uri',
+      blockedURI: 'http://127.0.0.1:12345/hostile/base/',
+    });
+    window.document.dispatchEvent(hostileBlock);
+    const hostileInlineHandlerBlock = new window.Event('securitypolicyviolation');
+    Object.assign(hostileInlineHandlerBlock, {
+      effectiveDirective: 'script-src-attr',
+      blockedURI: 'inline',
+    });
+    window.document.dispatchEvent(hostileInlineHandlerBlock);
+    expect(await window.eval(styledChapter(1))).toBe(true);
+
+    const localViolation = new window.Event('securitypolicyviolation');
+    Object.assign(localViolation, {
       effectiveDirective: 'style-src-elem',
       blockedURI: 'blob',
     });
-    window.document.dispatchEvent(violation);
+    window.document.dispatchEvent(localViolation);
 
     await expect(window.eval(styledChapter(1))).rejects.toThrow(
       'CSP violations: style-src-elem:blob',
