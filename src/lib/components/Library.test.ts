@@ -95,7 +95,15 @@ const mocks = vi.hoisted(() => ({
   saveApiKey: vi.fn<(credentialRef: string, apiKey: string) => Promise<void>>(),
   flushProgress: vi.fn<() => Promise<void>>(),
   getBookSeries: vi.fn<() => Promise<unknown[]>>(),
-  getSeriesDetail: vi.fn<() => Promise<{ volumes: unknown[]; incomplete?: boolean }>>(),
+  getSeriesDetail: vi.fn<
+    () => Promise<{
+      volumes: unknown[];
+      chapters?: unknown[];
+      specials?: unknown[];
+      storylineChapters?: unknown[];
+      incomplete?: boolean;
+    }>
+  >(),
   getProgress: vi.fn<(chapterId: number) => Promise<KavitaProgress | null>>(),
   getCover: vi.fn<() => Promise<Blob>>(),
   connected: true,
@@ -869,5 +877,131 @@ describe('Library.svelte raw catalog state and batched cleanup', () => {
     expect(isInert(main)).toBe(false);
     expect(onOverlayActiveChange).toHaveBeenLastCalledWith(false);
     expect(document.activeElement).toBe(openSettingsBtn);
+  });
+
+  it('reloads covers on unchanged catalog refresh and updates card progress after reader close', async () => {
+    const initialBook: BookRecord = {
+      ...makeCatalog(1, 0)[0]!,
+      title: 'Turnleaf CI EPUB',
+      author: null,
+      series: 'Turnleaf CI EPUB',
+      pages: 2,
+      pagesRead: 0,
+    };
+    mocks.connected = true;
+    mocks.getBooks
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ ...initialBook }])
+      .mockResolvedValueOnce([{ ...initialBook }]);
+    mocks.getBookSeries.mockResolvedValue([
+      {
+        id: initialBook.seriesId,
+        libraryId: initialBook.libraryId,
+        name: initialBook.title,
+        format: 3,
+        pages: 2,
+        pagesRead: 0,
+        created: initialBook.createdAt,
+      },
+    ]);
+    mocks.getSeriesDetail.mockResolvedValue({
+      chapters: [],
+      specials: [],
+      storylineChapters: [],
+      volumes: [
+        {
+          id: initialBook.volumeId,
+          chapters: [
+            {
+              id: initialBook.chapterId,
+              volumeId: initialBook.volumeId,
+              title: initialBook.title,
+              titleName: initialBook.title,
+              pages: 2,
+              pagesRead: 0,
+              format: 3,
+              writers: [],
+              files: [{ id: 1, format: 3, extension: '.epub', bytes: 2048 }],
+            },
+          ],
+        },
+      ],
+    });
+    mocks.cacheCover
+      .mockRejectedValueOnce(new Error('Cross-origin redirect blocked'))
+      .mockResolvedValue('web://covers/series-1.png');
+    mocks.downloadEpub.mockResolvedValue({
+      relativePath: 'books/server-1-0.epub',
+      nativeUri: 'file:///data/books/server-1-0.epub',
+      webViewUrl: 'web://books/server-1-0.epub',
+      size: 2048,
+    });
+    mocks.verifyDownloadedEpub.mockResolvedValue({
+      relativePath: 'books/server-1-0.epub',
+      nativeUri: 'file:///data/books/server-1-0.epub',
+      webViewUrl: 'web://books/server-1-0.epub',
+      size: 2048,
+    });
+    mocks.getProgress.mockResolvedValue({
+      libraryId: 1,
+      seriesId: initialBook.seriesId,
+      volumeId: initialBook.volumeId,
+      chapterId: initialBook.chapterId,
+      pageNum: 0,
+    });
+
+    const { target } = renderLibrary();
+    await settle();
+    await settle();
+
+    expect(mocks.cacheCover).toHaveBeenCalledTimes(1);
+    expect(
+      target.querySelector('[data-book-open]')?.parentElement?.querySelector('img'),
+    ).toBeNull();
+
+    // Refreshing when getBooks returns identical records still increments coverReloadRequest.
+    target.querySelector<HTMLButtonElement>('[aria-label="Refresh library"]')!.click();
+    await settle();
+    await settle();
+
+    expect(mocks.cacheCover).toHaveBeenCalledTimes(2);
+    expect(
+      target
+        .querySelector('[data-book-open]')
+        ?.parentElement?.querySelector<HTMLImageElement>('img')?.src,
+    ).toBe('web://covers/series-1.png');
+
+    // Download and open reader, relocate to chapter 2 (50%), then return to library.
+    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
+    await settle();
+    await settle();
+
+    expect(mocks.readerProps?.bookId).toBe(initialBook.id);
+    mocks.readerProps!.onRelocated({
+      cfi: 'epubcfi(/6/4!/4/2:0)',
+      xpath: '//body/DocFragment[2]/body/h1',
+      href: 'chapter-2.xhtml',
+      percentage: 0.5,
+      spineIndex: 1,
+      pageIndex: 0,
+      pageCount: 1,
+    });
+    await settle();
+
+    mocks.readerProps!.onBack();
+    await settle();
+    await settle();
+
+    expect(
+      target.querySelector(
+        `[aria-label="Open ${initialBook.title}, downloaded for offline reading, 50% complete"]`,
+      ),
+    ).not.toBeNull();
+    expect(target.textContent).toContain('Continue reading');
+    expect(
+      target
+        .querySelector('[data-book-open]')
+        ?.parentElement?.querySelector<HTMLImageElement>('img')?.src,
+    ).toBe('web://covers/series-1.png');
   });
 });
