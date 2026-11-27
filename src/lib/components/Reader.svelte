@@ -1451,12 +1451,12 @@
   {#if selectedText && !hasOpenReaderPanel()}
     <div
       bind:this={selectedTextGroup}
-      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 preset-filled-surface-50-950 p-2 shadow-lg"
+      class="absolute inset-x-0 bottom-[max(2rem,env(safe-area-inset-bottom))] z-30 mx-auto flex w-fit max-w-full flex-wrap justify-center gap-1 rounded-lg preset-filled-surface-50-950 preset-outlined-surface-300-700 p-2 shadow-lg"
       role="group"
       aria-label="Selected text"
     >
       <button
-        class="btn btn-sm preset-filled-primary-700-300 min-h-11"
+        class="btn btn-sm preset-tonal-surface active-mode min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
         onclick={highlightSelection}
@@ -1464,7 +1464,7 @@
         Highlight
       </button>
       <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
+        class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700 min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
         onclick={startSelectionNote}
@@ -1472,7 +1472,7 @@
         Add note
       </button>
       <button
-        class="btn btn-sm preset-tonal-surface min-h-11"
+        class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700 min-h-11"
         type="button"
         onpointerdown={(event) => event.preventDefault()}
         onclick={() => void copySelection()}
@@ -1518,7 +1518,7 @@
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
       bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
+      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-surface-50-950 preset-outlined-surface-300-700 shadow"
       type="button"
       aria-label="Return to the location before this link"
       onclick={() => void returnToLink()}
@@ -1529,7 +1529,7 @@
 
   {#if readerSyncMessage && controlsVisible}
     <p
-      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 px-3 py-2 text-sm shadow"
+      class="absolute inset-x-4 bottom-[max(3rem,env(safe-area-inset-bottom))] z-30 mx-auto w-fit rounded-md preset-filled-surface-50-950 preset-outlined-surface-300-700 px-3 py-2 text-sm shadow"
       role="status"
     >
       {readerSyncMessage}
@@ -1697,7 +1697,7 @@
               <span class="reader-toolbar-label">Sync</span>
             </button>
           </div>
-          <p class="reader-toolbar-title">
+          <p class="reader-toolbar-title rounded-md preset-filled-surface-50-950 px-3 py-1.5">
             {title}
           </p>
         </div>
@@ -1767,7 +1767,7 @@
             {#each ['light', 'dark'] as mode (mode)}
               <button
                 class:active-mode={appearance.mode === mode}
-                class="btn preset-outlined-surface-300-700 capitalize"
+                class="btn preset-tonal-surface preset-outlined-surface-300-700 capitalize"
                 type="button"
                 aria-pressed={appearance.mode === mode}
                 onclick={() => updateAppearance({ mode: mode as ReadingMode })}
@@ -1965,9 +1965,8 @@
                   activeSectionHref !== '' && itemSectionHref === activeSectionHref}
                 <li>
                   <button
-                    class="btn w-full justify-start text-left {isCurrent
-                      ? 'preset-filled-primary-700-300'
-                      : ''}"
+                    class:active-mode={isCurrent}
+                    class="btn preset-tonal-surface w-full justify-start text-left whitespace-normal"
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
                     onclick={() => {
@@ -2017,9 +2016,8 @@
                         style:margin-left={row.depth > 0 ? `${row.depth}rem` : undefined}
                       >
                         <button
-                          class="btn w-full justify-start text-left {isCurrent
-                            ? 'preset-filled-primary-700-300'
-                            : ''}"
+                          class:active-mode={isCurrent}
+                          class="btn preset-tonal-surface w-full justify-start text-left"
                           aria-current={isCurrent ? 'location' : undefined}
                           data-toc-index={row.index}
                           type="button"
@@ -2039,9 +2037,7 @@
                 {@render contentsList(toc)}
               {/if}
             {:else}
-              <p class="py-3 text-sm text-surface-700-300">
-                This EPUB does not include a table of contents.
-              </p>
+              <p class="py-3 text-sm">This EPUB does not include a table of contents.</p>
             {/if}
           </div>
         </div>
@@ -2081,14 +2077,19 @@
               placeholder="Find a word or phrase"
               autocomplete="off"
             />
-            <button class="btn preset-filled-primary-700-300" type="submit" disabled={searching}>
+            <button class="btn preset-tonal-surface active-mode" type="submit" disabled={searching}>
               {searching ? 'Searching…' : 'Search'}
             </button>
           </form>
           {#if searchError}
-            <p class="mt-3 text-sm text-error-700-300" role="alert">{searchError}</p>
+            <p
+              class="mt-3 rounded-md preset-tonal-surface preset-outlined-surface-300-700 px-3 py-2 text-sm font-medium"
+              role="alert"
+            >
+              {searchError}
+            </p>
           {/if}
-          <p class="mt-3 text-sm text-surface-700-300" role="status">
+          <p class="mt-3 text-sm" role="status">
             {#if searched && !searching && !searchError}
               {searchResults.length === 0
                 ? 'No matches found.'
@@ -2100,13 +2101,13 @@
               {#each searchResults as result, index (result.cfi)}
                 <li>
                   <button
-                    class="btn w-full justify-start text-left"
+                    class="btn preset-tonal-surface preset-outlined-surface-300-700 w-full justify-start text-left whitespace-normal"
                     type="button"
                     onclick={() => void openSearchResult(result)}
                   >
-                    <span class="mr-2 text-xs text-surface-700-300">{index + 1}</span>
+                    <span class="mr-2 text-xs">{index + 1}</span>
                     <span class="min-w-0">
-                      <span class="mb-1 block text-xs text-surface-700-300">
+                      <span class="mb-1 block text-xs">
                         {searchResultSectionLabel(result)}
                       </span>
                       <span class="line-clamp-3">{result.excerpt}</span>
@@ -2137,12 +2138,12 @@
             'Close bookmarks and history',
             closeBookmarks,
           )}
-          <p class="mt-2 text-sm text-surface-700-300">
+          <p class="mt-2 text-sm">
             Saved on this device with EPUB locations. They are not sent to Kavita.
           </p>
           {#if location}
             <button
-              class="btn mt-4 w-full preset-tonal-primary"
+              class="btn mt-4 w-full preset-tonal-surface active-mode"
               type="button"
               data-reader-focus="bookmark-current"
               onclick={toggleCurrentBookmark}
@@ -2151,7 +2152,12 @@
             </button>
           {/if}
           {#if bookmarkLimitMessage}
-            <p class="mt-3 text-sm text-error-700-300" role="alert">{bookmarkLimitMessage}</p>
+            <p
+              class="mt-3 rounded-md preset-tonal-surface preset-outlined-surface-300-700 px-3 py-2 text-sm font-medium"
+              role="alert"
+            >
+              {bookmarkLimitMessage}
+            </p>
           {/if}
 
           <section class="mt-5" aria-labelledby="reader-bookmark-list-title">
@@ -2162,11 +2168,11 @@
               Bookmarks
             </h3>
             {#if bookmarks.length === 0}
-              <p class="mt-2 text-sm text-surface-700-300">No bookmarks yet.</p>
+              <p class="mt-2 text-sm">No bookmarks yet.</p>
             {:else}
               <ul class="mt-2 grid list-none gap-2 p-0">
                 {#each bookmarks as bookmark (bookmark.id)}
-                  <li class="rounded-lg preset-tonal-surface p-2">
+                  <li class="rounded-lg preset-tonal-surface preset-outlined-surface-300-700 p-2">
                     {#if editingBookmarkId === bookmark.id}
                       <form
                         class="flex gap-2"
@@ -2182,14 +2188,14 @@
                           data-reader-focus-id={bookmark.id}
                           bind:value={bookmarkDraft}
                         />
-                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
+                        <button class="btn btn-sm preset-tonal-surface active-mode" type="submit">
                           Save
                         </button>
                       </form>
                     {:else}
                       <div class="flex items-center gap-2">
                         <button
-                          class="min-w-0 flex-1 truncate text-left text-sm font-medium"
+                          class="btn preset-tonal-surface min-w-0 flex-1 justify-start truncate text-left text-sm font-medium"
                           type="button"
                           data-reader-focus="bookmark-location"
                           data-reader-focus-id={bookmark.id}
@@ -2198,7 +2204,7 @@
                           {bookmark.label}
                         </button>
                         <button
-                          class="btn btn-sm preset-tonal-surface h-11 w-11 p-0"
+                          class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700 h-11 w-11 p-0"
                           type="button"
                           aria-label={`Rename ${bookmark.label}`}
                           data-reader-focus="bookmark-rename"
@@ -2208,7 +2214,7 @@
                           <span aria-hidden="true">✎</span>
                         </button>
                         <button
-                          class="btn btn-sm preset-tonal-error h-11 w-11 p-0"
+                          class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700 h-11 w-11 p-0"
                           type="button"
                           aria-label={`Delete ${bookmark.label}`}
                           data-reader-focus="bookmark-delete"
@@ -2233,13 +2239,13 @@
               Recent locations
             </h3>
             {#if locationHistory.length === 0}
-              <p class="mt-2 text-sm text-surface-700-300">Recent page turns will appear here.</p>
+              <p class="mt-2 text-sm">Recent page turns will appear here.</p>
             {:else}
               <ul class="mt-2 grid list-none gap-1 p-0">
                 {#each locationHistory as entry (entry.id + entry.savedAt)}
                   <li>
                     <button
-                      class="btn w-full justify-start text-left text-sm"
+                      class="btn preset-tonal-surface w-full justify-start text-left text-sm whitespace-normal"
                       type="button"
                       onclick={() => void returnToLocation(entry)}
                     >
@@ -2271,17 +2277,22 @@
             'Close highlights and notes',
             closeAnnotations,
           )}
-          <p class="mt-2 text-sm text-surface-700-300">
+          <p class="mt-2 text-sm">
             Saved on this device. Choose a passage on this page or select text in the book to add a
             highlight and an optional note.
           </p>
           {#if annotationLimitMessage}
-            <p class="mt-3 text-sm text-error-700-300" role="alert">{annotationLimitMessage}</p>
+            <p
+              class="mt-3 rounded-md preset-tonal-surface preset-outlined-surface-300-700 px-3 py-2 text-sm font-medium"
+              role="alert"
+            >
+              {annotationLimitMessage}
+            </p>
           {/if}
 
           {#if selectedText}
             <form
-              class="mt-4 rounded-lg preset-tonal-primary p-3"
+              class="mt-4 rounded-lg preset-tonal-surface preset-outlined-surface-300-700 p-3"
               onsubmit={(event) => {
                 event.preventDefault();
                 if (saveAnnotation()) {
@@ -2295,11 +2306,11 @@
                 <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
               </label>
               <div class="mt-3 flex gap-2">
-                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                <button class="btn preset-tonal-surface active-mode flex-1" type="submit">
                   Save highlight
                 </button>
                 <button
-                  class="btn preset-tonal-surface"
+                  class="btn preset-tonal-surface preset-outlined-surface-300-700"
                   type="button"
                   onclick={() => {
                     selectedText = null;
@@ -2315,7 +2326,7 @@
             {@const activePassage =
               visiblePassages[selectedPassageIndex] ?? visiblePassages[0] ?? null}
             <form
-              class="mt-4 rounded-lg preset-tonal-primary p-3"
+              class="mt-4 rounded-lg preset-tonal-surface preset-outlined-surface-300-700 p-3"
               onsubmit={(event) => {
                 event.preventDefault();
                 saveAnnotation(activePassage);
@@ -2348,13 +2359,13 @@
                 <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
               </label>
               <div class="mt-3 flex gap-2">
-                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                <button class="btn preset-tonal-surface active-mode flex-1" type="submit">
                   Save highlight
                 </button>
               </div>
             </form>
           {/if}
-          <p class="mt-2 text-sm text-surface-700-300" role="status">{annotationMessage}</p>
+          <p class="mt-2 text-sm" role="status">{annotationMessage}</p>
 
           <div class="mt-4 flex flex-wrap items-center gap-2">
             <h3
@@ -2365,7 +2376,7 @@
               Saved highlights
             </h3>
             <button
-              class="btn btn-sm preset-tonal-surface"
+              class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700"
               type="button"
               onclick={() => void exportAnnotations()}
               disabled={annotations.length === 0 || exporting}
@@ -2373,7 +2384,7 @@
               Export Markdown
             </button>
             <button
-              class="btn btn-sm preset-tonal-surface"
+              class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700"
               type="button"
               onclick={() => void exportAnnotations(true)}
               disabled={annotations.length === 0 || exporting}
@@ -2389,13 +2400,15 @@
             </label>
           {/if}
           {#if annotations.length === 0}
-            <p class="mt-2 text-sm text-surface-700-300">No highlights yet.</p>
+            <p class="mt-2 text-sm">No highlights yet.</p>
           {:else}
             <div class="mt-2 grid gap-2">
               {#each annotations as annotation (annotation.id)}
-                <article class="rounded-lg preset-tonal-surface p-3">
+                <article
+                  class="rounded-lg preset-tonal-surface preset-outlined-surface-300-700 p-3"
+                >
                   <button
-                    class="w-full text-left text-sm italic"
+                    class="btn preset-tonal-surface w-full justify-start text-left text-sm italic whitespace-normal"
                     type="button"
                     onclick={() => {
                       void session?.displayCfi(annotation.cfi);
@@ -2424,11 +2437,11 @@
                         ></textarea>
                       </label>
                       <div class="flex gap-2">
-                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
+                        <button class="btn btn-sm preset-tonal-surface active-mode" type="submit">
                           Save
                         </button>
                         <button
-                          class="btn btn-sm preset-tonal-surface"
+                          class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700"
                           type="button"
                           onclick={() => cancelAnnotationEdit(annotation)}
                         >
@@ -2442,7 +2455,7 @@
                     {/if}
                     <div class="mt-2 flex justify-end gap-2">
                       <button
-                        class="btn btn-sm preset-tonal-surface"
+                        class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700"
                         type="button"
                         aria-label={`Edit note for ${annotation.excerpt}`}
                         data-reader-focus="annotation-edit"
@@ -2452,7 +2465,7 @@
                         Edit note
                       </button>
                       <button
-                        class="btn btn-sm preset-tonal-error"
+                        class="btn btn-sm preset-tonal-surface preset-outlined-surface-300-700"
                         type="button"
                         aria-label={`Delete highlight ${annotation.excerpt}`}
                         onclick={() => deleteAnnotation(annotation)}
@@ -2476,8 +2489,12 @@
       inert={hasOpenReaderPanel()}
       transition:fly={{ y: 8, duration: 140 }}
     >
-      <span class="truncate text-xs">{activeSectionLabel}</span>
-      <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
+      <span class="truncate rounded-md preset-filled-surface-50-950 px-2.5 py-1 text-xs">
+        {activeSectionLabel}
+      </span>
+      <span class="rounded-md preset-filled-surface-50-950 px-2.5 py-1 text-xs tabular-nums">
+        {currentProgressLabel()}
+      </span>
     </footer>
   {/if}
 
@@ -2616,7 +2633,6 @@
     --reader-text: var(--color-surface-950);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
-    --reader-bar-text: var(--color-surface-950);
     --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
     --reader-safe-bottom: max(
       1rem,
@@ -2656,7 +2672,6 @@
     --reader-text: var(--color-surface-50);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 38%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 32%, transparent);
-    --reader-bar-text: var(--color-surface-50);
   }
 
   .reader-overlay {
@@ -2712,6 +2727,12 @@
     -webkit-tap-highlight-color: transparent;
   }
 
+  .tap-zones button:focus-visible,
+  .reader-top-reveal:focus-visible {
+    outline-offset: -5px;
+    box-shadow: inset 0 0 0 2px var(--focus-ring-inner, transparent);
+  }
+
   .reader-overlay {
     z-index: 20;
   }
@@ -2739,7 +2760,6 @@
     align-items: center;
     gap: 0.75rem;
     padding-inline: max(1rem, env(safe-area-inset-left));
-    color: var(--reader-bar-text);
   }
 
   .reader-top {
@@ -2797,7 +2817,6 @@
     text-align: center;
     font-size: 0.875rem;
     font-weight: 700;
-    color: var(--color-primary-500);
   }
 
   @media (max-width: 40rem) {
@@ -2866,7 +2885,6 @@
     z-index: 19;
     min-width: 3rem;
     min-height: 2.75rem;
-    color: var(--reader-bar-text);
   }
 
   .reader-settings {
@@ -2892,6 +2910,7 @@
   }
 
   .active-mode {
-    box-shadow: inset 0 0 0 2px currentColor;
+    border: 2px solid currentColor;
+    font-weight: 600;
   }
 </style>
