@@ -1279,4 +1279,135 @@ describe('native progress transactions against SQLite', () => {
     });
     expect(native.database?.prepare('PRAGMA foreign_key_check').all() ?? []).toEqual([]);
   });
+
+  it('reconciles missing #330 v8 columns on a populated #328-only v8 SQLite file during openDatabase and syncs remapped progress', async () => {
+    const { migrations } = await import('./schema');
+    const seeded = new DatabaseSync(native.databasePath);
+    seeded.exec('PRAGMA foreign_keys = ON;');
+    for (const migration of migrations.slice(0, 7)) {
+      seeded.exec(migration.statements);
+      seeded.exec(`PRAGMA user_version = ${migration.version};`);
+    }
+    seeded.exec(`
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+      PRAGMA user_version = 8;
+    `);
+    const ts = '2026-08-15T00:00:00.000Z';
+    seeded
+      .prepare(
+        `INSERT INTO server_config
+          (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(server.id, server.displayName, server.baseUrl, server.credentialRef, null, ts);
+    seeded
+      .prepare(
+        `INSERT INTO books
+          (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+           description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
+           pages, pages_read, created_at, last_read_at, remote_available,
+           file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress)
+          VALUES ('server:42:100', ?, 1, 42, 10, 100, 'Earthsea', 'Ursula K. Le Guin', 'Earthsea Cycle',
+           NULL, 'epub', ?, 'books/earthsea-1.epub', 'available', 220000,
+           200, 90, ?, ?, 1,
+           2114, 'earthsea-1.epub', 220000, 0, 1, 1)`,
+      )
+      .run(server.id, ts, ts, ts);
+    seeded
+      .prepare(
+        `INSERT INTO reading_state
+          (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+          VALUES ('server:42:100', 'epubcfi(/6/4)', '/body/p[9]', 0.45, ?, 1, 2)`,
+      )
+      .run(ts);
+    seeded
+      .prepare(
+        `INSERT INTO sync_queue
+          (book_id, payload_json, created_at, updated_at, revision)
+          VALUES ('server:42:100', ?, ?, ?, 2)`,
+      )
+      .run(
+        JSON.stringify({
+          libraryId: 1,
+          seriesId: 42,
+          volumeId: 10,
+          chapterId: 100,
+          pageNum: 90,
+          bookScrollId: '/body/p[9]',
+        }),
+        ts,
+        ts,
+      );
+    seeded.close();
+
+    const database = await importDatabase();
+    const { flushProgress } = await import('../sync/sync');
+    const remapped = await database.reconcileBooks(server.id, [
+      {
+        ...book,
+        id: 'server:42:101',
+        seriesId: 42,
+        volumeId: 10,
+        chapterId: 101,
+        title: 'Earthsea',
+        author: 'Ursula K. Le Guin',
+        series: 'Earthsea Cycle',
+        pages: 240,
+        pagesRead: 0,
+        lastReadAt: null,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: 260000,
+        remoteFileSize: 260000,
+        chapterKey: 'isbn:9780547773742',
+      },
+    ]);
+    expect(remapped).toEqual(new Map([['server:42:100', 'server:42:101']]));
+
+    const uploaded: unknown[] = [];
+    const client = {
+      saveProgress: vi.fn(async (payload: unknown) => {
+        uploaded.push(payload);
+      }),
+    } as unknown as KavitaClient;
+    await flushProgress(client, server.id);
+
+    expect(uploaded).toEqual([
+      expect.objectContaining({
+        seriesId: 42,
+        chapterId: 101,
+        pageNum: 90,
+        bookScrollId: '/body/p[9]',
+      }),
+    ]);
+
+    const rawRow = native.database
+      ?.prepare(
+        `SELECT file_id, file_name, remote_file_size, downloaded_bytes, downloaded_pages,
+          chapter_key, multi_file_chapter, sync_progress
+         FROM books WHERE id='server:42:101'`,
+      )
+      .get();
+    expect(rawRow).toEqual({
+      file_id: 2114,
+      file_name: 'earthsea-1.epub',
+      remote_file_size: 260000,
+      downloaded_bytes: 220000,
+      downloaded_pages: 200,
+      chapter_key: 'isbn:9780547773742',
+      multi_file_chapter: 1,
+      sync_progress: 1,
+    });
+    const versionRow = native.database?.prepare('PRAGMA user_version').get() as {
+      user_version: number;
+    };
+    expect(versionRow.user_version).toBe(8);
+    expect(native.database?.prepare('PRAGMA foreign_key_check').all() ?? []).toEqual([]);
+  });
 });

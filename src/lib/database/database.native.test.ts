@@ -86,7 +86,9 @@ const readingState = {
   pendingSync: false,
 };
 
-beforeEach(() => {
+beforeEach(async () => {
+  mocks.reset();
+  await openAndClearMocks();
   mocks.reset();
 });
 
@@ -438,4 +440,79 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+it('reconciles missing #330 v8 columns on a #328-only v8 database without duplicating remote_file_size', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(8);
+  mocks.executeTransaction.mockClear();
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      { kind: 'column', name: 'id' },
+      { kind: 'column', name: 'file_id' },
+      { kind: 'column', name: 'file_name' },
+      { kind: 'column', name: 'remote_file_size' },
+      { kind: 'column', name: 'chapter_epub_index' },
+      { kind: 'column', name: 'multi_file_chapter' },
+      { kind: 'column', name: 'sync_progress' },
+      { kind: 'index', name: 'books_server_file_idx' },
+    ],
+  });
+
+  await openDatabase();
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks).toHaveLength(1);
+  const statement = tasks?.[0]?.statement ?? '';
+  expect(statement).toContain('ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;');
+  expect(statement).toContain('ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;');
+  expect(statement).toContain('ALTER TABLE books ADD COLUMN chapter_key TEXT;');
+  expect(statement).not.toContain('remote_file_size');
+  expect(statement).not.toContain('ADD COLUMN file_id');
+  expect(JSON.stringify(tasks)).not.toContain('PRAGMA user_version');
+});
+
+it('reconciles missing #328 v8 columns and index on a #330-only database already at v10 without downgrading user_version', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(10);
+  mocks.executeTransaction.mockClear();
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      { kind: 'column', name: 'id' },
+      { kind: 'column', name: 'remote_file_size' },
+      { kind: 'column', name: 'downloaded_bytes' },
+      { kind: 'column', name: 'downloaded_pages' },
+      { kind: 'column', name: 'chapter_key' },
+      { kind: 'column', name: 'sort_order' },
+      { kind: 'column', name: 'min_number' },
+      { kind: 'column', name: 'volume_number' },
+    ],
+  });
+
+  await openDatabase();
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks).toHaveLength(1);
+  const statement = tasks?.[0]?.statement ?? '';
+  expect(statement).toContain('ALTER TABLE books ADD COLUMN file_id INTEGER;');
+  expect(statement).toContain('ALTER TABLE books ADD COLUMN file_name TEXT;');
+  expect(statement).toContain(
+    'ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(statement).toContain(
+    'ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(statement).toContain(
+    'ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;',
+  );
+  expect(statement).toContain(
+    'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);',
+  );
+  expect(statement).not.toContain('remote_file_size');
+  expect(statement).not.toContain('downloaded_bytes');
+  expect(JSON.stringify(tasks)).not.toContain('PRAGMA user_version');
 });

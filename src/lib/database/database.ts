@@ -15,7 +15,13 @@ import {
   type ReaderPreferencePrefix,
 } from '../reader/bookmarks';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import {
+  migrations,
+  V8_BOOK_COLUMNS,
+  V8_BOOK_INDEX_NAME,
+  V8_BOOK_INDEX_SQL,
+  V8_MIGRATION_VERSION,
+} from './schema';
 
 export { mergeReaderPreferenceValue, READER_PREFERENCE_PREFIXES, type ReaderPreferencePrefix };
 
@@ -35,6 +41,8 @@ export interface BookRecord {
   seriesId: number;
   volumeId: number;
   chapterId: number;
+  fileId?: number | null;
+  fileName?: string | null;
   title: string;
   author: string | null;
   series: string | null;
@@ -53,6 +61,10 @@ export interface BookRecord {
   downloadOutdated?: boolean;
   hasLocalData?: boolean;
   chapterKey?: string | null;
+  chapterEpubIndex?: number;
+  multiFileChapter?: boolean;
+  /** False keeps progress local when Kavita shares chapter progress with another primary file. */
+  syncProgress?: boolean;
   /** False means Kavita no longer advertises the book; local retention may keep it. */
   remoteAvailable?: boolean;
   /** False means Kavita omitted usable progress fields from this metadata snapshot. */
@@ -93,6 +105,7 @@ interface LineageCandidate {
   author: string | null;
   series: string | null;
   chapterKey?: string | null;
+  syncProgress?: boolean;
 }
 
 function normalizeLineageText(value: string | null | undefined): string {
@@ -121,6 +134,7 @@ function extractNormalizedIsbn(book: Pick<LineageCandidate, 'chapterKey'>): stri
 }
 
 function hasConflictingChapterIdentity(a: LineageCandidate, b: LineageCandidate): boolean {
+  if ((a.syncProgress === false) !== (b.syncProgress === false)) return true;
   const isbnA = extractNormalizedIsbn(a);
   const isbnB = extractNormalizedIsbn(b);
   if (isbnA !== null && isbnB !== null && isbnA !== isbnB) return true;
@@ -474,7 +488,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -504,14 +518,83 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+const INSPECT_BOOKS_V8_SCHEMA_SQL = `
+  SELECT 'column' AS kind, name FROM pragma_table_info('books')
+  UNION ALL
+  SELECT 'index' AS kind, name FROM pragma_index_list('books')
+`;
+
+const FULL_V8_MIGRATION_STATEMENTS = [
+  ...V8_BOOK_COLUMNS.map(
+    (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+  ),
+  V8_BOOK_INDEX_SQL,
+].join('\n');
+
+async function buildV8ReconciliationStatements(
+  db: Partial<Pick<SQLiteDBConnection, 'query'>>,
+  currentVersion: number,
+): Promise<string | null> {
+  if (typeof db.query !== 'function') {
+    return currentVersion < V8_MIGRATION_VERSION ? FULL_V8_MIGRATION_STATEMENTS : null;
+  }
+  const result = await executeNativeQuery(
+    { query: db.query.bind(db) },
+    INSPECT_BOOKS_V8_SCHEMA_SQL,
+  );
+  const existingColumns = new Set<string>();
+  const existingIndexes = new Set<string>();
+  for (const row of result.values ?? []) {
+    const name = typeof row.name === 'string' ? row.name : '';
+    if (!name) continue;
+    if (row.kind === 'index') {
+      existingIndexes.add(name);
+    } else {
+      existingColumns.add(name);
+    }
+  }
+  if (existingColumns.size === 0) {
+    return currentVersion < V8_MIGRATION_VERSION ? FULL_V8_MIGRATION_STATEMENTS : null;
+  }
+  const missingColumns = V8_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
+  const missingIndex = !existingIndexes.has(V8_BOOK_INDEX_NAME);
+  if (missingColumns.length === 0 && !missingIndex) {
+    return null;
+  }
+  return [
+    ...missingColumns.map(
+      (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+    ),
+    V8_BOOK_INDEX_SQL,
+  ].join('\n');
+}
+
+export async function migrateDatabase(
+  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion'> &
+    Partial<Pick<SQLiteDBConnection, 'query'>>,
+): Promise<void> {
   const current = await db.getVersion();
+  const currentVersion = current.version ?? 0;
   for (const migration of migrations) {
-    if (migration.version <= (current.version ?? 0)) continue;
+    if (migration.version <= currentVersion) continue;
+    if (migration.version === V8_MIGRATION_VERSION && currentVersion > 0) {
+      const statements = await buildV8ReconciliationStatements(db, currentVersion);
+      await executeNativeTransaction(db, [
+        ...(statements ? [{ statement: statements }] : []),
+        { statement: `PRAGMA user_version = ${migration.version};` },
+      ]);
+      continue;
+    }
     await executeNativeTransaction(db, [
       { statement: migration.statements },
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
+  }
+  if (currentVersion >= V8_MIGRATION_VERSION) {
+    const statements = await buildV8ReconciliationStatements(db, currentVersion);
+    if (statements) {
+      await executeNativeTransaction(db, [{ statement: statements }]);
+    }
   }
 }
 
@@ -792,8 +875,9 @@ const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
    description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
    pages, pages_read, created_at, last_read_at, remote_available,
-   remote_file_size, downloaded_bytes, downloaded_pages, chapter_key)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   remote_file_size, downloaded_bytes, downloaded_pages, chapter_key,
+   file_id, file_name, chapter_epub_index, multi_file_chapter, sync_progress)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
    library_id=excluded.library_id, series_id=excluded.series_id,
    volume_id=excluded.volume_id, chapter_id=excluded.chapter_id,
@@ -815,6 +899,11 @@ const replaceBookStatement = `INSERT INTO books
      CASE WHEN (books.download_path IS NOT NULL OR books.download_status='available') AND books.pages>0 THEN books.pages ELSE NULL END
    ),
    chapter_key=COALESCE(excluded.chapter_key, books.chapter_key),
+   file_id=COALESCE(excluded.file_id, books.file_id),
+   file_name=COALESCE(excluded.file_name, books.file_name),
+   chapter_epub_index=CASE WHEN ?=1 THEN excluded.chapter_epub_index ELSE books.chapter_epub_index END,
+   multi_file_chapter=CASE WHEN ?=1 THEN excluded.multi_file_chapter ELSE books.multi_file_chapter END,
+   sync_progress=CASE WHEN ?=1 THEN excluded.sync_progress ELSE books.sync_progress END,
    pages=excluded.pages,
    pages_read=CASE
      WHEN ?=0 OR ${preserveReadingProgress} THEN
@@ -875,6 +964,14 @@ function replaceBookTask(
       downloadedBytes,
       downloadedPages,
       book.chapterKey ?? null,
+      book.fileId ?? null,
+      book.fileName ?? null,
+      book.chapterEpubIndex ?? 0,
+      book.multiFileChapter ? 1 : 0,
+      book.syncProgress === false ? 0 : 1,
+      book.chapterEpubIndex !== undefined ? 1 : 0,
+      book.multiFileChapter !== undefined ? 1 : 0,
+      book.syncProgress !== undefined ? 1 : 0,
       book.remoteProgressKnown === false ? 0 : 1,
       snapshotStartedAt,
       snapshotStartedAt,
@@ -920,6 +1017,8 @@ const retainedBookCondition = `(download_path IS NOT NULL OR download_status='av
 interface ExistingBookSnapshot extends LineageCandidate {
   libraryId: number;
   volumeId: number;
+  fileId: number | null;
+  fileName: string | null;
   pages: number;
   pagesRead: number;
   createdAt: string;
@@ -930,6 +1029,23 @@ interface ExistingBookSnapshot extends LineageCandidate {
   remoteFileSize: number | null;
   downloadedBytes: number | null;
   downloadedPages: number | null;
+  chapterEpubIndex: number;
+  multiFileChapter: boolean;
+  syncProgress: boolean;
+  hasSequenceColumns: boolean;
+  sortOrder: number | null;
+  minNumber: number | null;
+  volumeNumber: number | null;
+}
+
+const STUDY_TABLE_NAMES = ['annotations', 'bookmarks', 'reading_history'] as const;
+
+function buildRetainedBookCondition(presentStudyTables: ReadonlySet<string>): string {
+  const studyClauses = STUDY_TABLE_NAMES.filter((table) => presentStudyTables.has(table)).map(
+    (table) => `OR EXISTS (SELECT 1 FROM ${table} WHERE ${table}.book_id=books.id)`,
+  );
+  if (studyClauses.length === 0) return retainedBookCondition;
+  return `${retainedBookCondition.slice(0, -1)}\n  ${studyClauses.join('\n  ')})`;
 }
 
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
@@ -945,6 +1061,7 @@ export async function reconcileBooksInTransaction(
   return enqueueNativeWrite(async () => {
     let remapped = new Map<string, string>();
     const existingById = new Map<string, ExistingBookSnapshot>();
+    const presentStudyTables = new Set<string>();
     const readingByBookId = new Map<
       string,
       { localUpdatedAt: string; serverUpdatedAt: string | null; pendingSync: boolean }
@@ -953,23 +1070,30 @@ export async function reconcileBooksInTransaction(
     const readerPreferences = new Map<string, string>();
 
     if (!preserveMissing && typeof db.query === 'function') {
-      const existingRows =
-        (
-          await db.query(
-            `SELECT id, library_id, series_id, volume_id, chapter_id, title, author, series,
-              pages, pages_read, created_at, last_read_at, download_path, download_status,
-              file_size, remote_file_size, downloaded_bytes, downloaded_pages, chapter_key
-            FROM books WHERE server_id=?`,
-            [serverId],
-          )
-        ).values ?? [];
+      const [existingResult, studyTableResult] = await Promise.all([
+        db.query('SELECT * FROM books WHERE server_id=?', [serverId]),
+        db.query(
+          `SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN ('annotations', 'bookmarks', 'reading_history')`,
+        ),
+      ]);
+      for (const row of studyTableResult.values ?? []) {
+        if (typeof row.name === 'string') presentStudyTables.add(row.name);
+      }
+      const existingRows = existingResult.values ?? [];
       for (const row of existingRows) {
+        const hasSequenceColumns =
+          Object.prototype.hasOwnProperty.call(row, 'sort_order') &&
+          Object.prototype.hasOwnProperty.call(row, 'min_number') &&
+          Object.prototype.hasOwnProperty.call(row, 'volume_number');
         const snapshot: ExistingBookSnapshot = {
           id: String(row.id),
           libraryId: Number(row.library_id),
           seriesId: Number(row.series_id),
           volumeId: Number(row.volume_id),
           chapterId: Number(row.chapter_id),
+          fileId: row.file_id == null || row.file_id === '' ? null : Number(row.file_id),
+          fileName: row.file_name ? String(row.file_name) : null,
           title: String(row.title),
           author: row.author ? String(row.author) : null,
           series: row.series ? String(row.series) : null,
@@ -984,6 +1108,13 @@ export async function reconcileBooksInTransaction(
           downloadedBytes: row.downloaded_bytes == null ? null : Number(row.downloaded_bytes),
           downloadedPages: row.downloaded_pages == null ? null : Number(row.downloaded_pages),
           chapterKey: row.chapter_key ? String(row.chapter_key) : null,
+          chapterEpubIndex: Number(row.chapter_epub_index ?? 0),
+          multiFileChapter: Number(row.multi_file_chapter ?? 0) !== 0,
+          syncProgress: Number(row.sync_progress ?? 1) !== 0,
+          hasSequenceColumns,
+          sortOrder: row.sort_order == null ? null : Number(row.sort_order),
+          minNumber: row.min_number == null ? null : Number(row.min_number),
+          volumeNumber: row.volume_number == null ? null : Number(row.volume_number),
         };
         existingById.set(snapshot.id, snapshot);
       }
@@ -1105,6 +1236,13 @@ export async function reconcileBooksInTransaction(
             downloadedBytes,
             downloadedPages,
             chapterKey: book.chapterKey ?? oldRow.chapterKey ?? null,
+            fileId: book.fileId !== undefined ? book.fileId : oldRow.fileId,
+            fileName: book.fileName !== undefined ? book.fileName : oldRow.fileName,
+            chapterEpubIndex:
+              book.chapterEpubIndex !== undefined ? book.chapterEpubIndex : oldRow.chapterEpubIndex,
+            multiFileChapter:
+              book.multiFileChapter !== undefined ? book.multiFileChapter : oldRow.multiFileChapter,
+            syncProgress: book.syncProgress !== undefined ? book.syncProgress : oldRow.syncProgress,
             pagesRead: nextPagesRead,
             lastReadAt: preserveReadDate ? oldRow.lastReadAt : book.lastReadAt,
           },
@@ -1112,6 +1250,19 @@ export async function reconcileBooksInTransaction(
           snapshotStartedAt,
         ),
       );
+      if (
+        oldRow.hasSequenceColumns &&
+        (oldRow.sortOrder !== null || oldRow.minNumber !== null || oldRow.volumeNumber !== null)
+      ) {
+        tasks.push({
+          statement: `UPDATE books
+            SET sort_order=COALESCE(sort_order, ?),
+                min_number=COALESCE(min_number, ?),
+                volume_number=COALESCE(volume_number, ?)
+            WHERE id=?`,
+          values: [oldRow.sortOrder, oldRow.minNumber, oldRow.volumeNumber, book.id],
+        });
+      }
     }
 
     for (const [oldId, newId] of remapped) {
@@ -1138,6 +1289,30 @@ export async function reconcileBooksInTransaction(
             SET book_id=?, payload_json=?, attempt_count=0, last_attempt_at=NULL, last_error=NULL
             WHERE book_id=?`,
           values: [newId, rewrittenPayload, oldId],
+        });
+      }
+      if (presentStudyTables.has('annotations')) {
+        tasks.push({
+          statement: `UPDATE OR IGNORE annotations
+            SET id = CASE WHEN id LIKE ? THEN ? || substr(id, ?) ELSE id END,
+                book_id = ?
+            WHERE book_id = ?`,
+          values: [`${oldId}:%`, `${newId}:`, oldId.length + 2, newId, oldId],
+        });
+      }
+      if (presentStudyTables.has('bookmarks')) {
+        tasks.push({
+          statement: `UPDATE OR IGNORE bookmarks
+            SET id = CASE WHEN id LIKE ? THEN ? || substr(id, ?) ELSE id END,
+                book_id = ?
+            WHERE book_id = ?`,
+          values: [`${oldId}:%`, `${newId}:`, oldId.length + 2, newId, oldId],
+        });
+      }
+      if (presentStudyTables.has('reading_history')) {
+        tasks.push({
+          statement: 'UPDATE OR IGNORE reading_history SET book_id = ? WHERE book_id = ?',
+          values: [newId, oldId],
         });
       }
       let hadOldPreference = false;
@@ -1176,22 +1351,23 @@ export async function reconcileBooksInTransaction(
     }
 
     if (!preserveMissing) {
+      const activeRetainedCondition = buildRetainedBookCondition(presentStudyTables);
       tasks.push({
         statement: `DELETE FROM preferences WHERE key IN (
           SELECT 'readerBookmarks:' || id FROM books
-            WHERE server_id=? AND remote_available=0 AND NOT ${retainedBookCondition}
+            WHERE server_id=? AND remote_available=0 AND NOT ${activeRetainedCondition}
           UNION ALL
           SELECT 'readerAnnotations:' || id FROM books
-            WHERE server_id=? AND remote_available=0 AND NOT ${retainedBookCondition}
+            WHERE server_id=? AND remote_available=0 AND NOT ${activeRetainedCondition}
           UNION ALL
           SELECT 'readerHistory:' || id FROM books
-            WHERE server_id=? AND remote_available=0 AND NOT ${retainedBookCondition}
+            WHERE server_id=? AND remote_available=0 AND NOT ${activeRetainedCondition}
         )`,
         values: [serverId, serverId, serverId],
       });
       tasks.push({
         statement: `DELETE FROM books WHERE server_id=? AND remote_available=0
-          AND NOT ${retainedBookCondition}`,
+          AND NOT ${activeRetainedCondition}`,
         values: [serverId],
       });
     }

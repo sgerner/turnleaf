@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Coordinate idempotent SQLite v8 migration across open PRs
 - test: preserve database exports in reader alert mock
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
