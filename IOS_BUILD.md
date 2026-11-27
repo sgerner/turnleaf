@@ -34,7 +34,7 @@ In Xcode:
 4. Select an iPhone simulator or connected device and use Product > Build.
 5. Use Product > Archive for a distribution build, then validate signing in Organizer.
 
-Filesystem, app-private transfers, system note export, SQLite, secure Keychain storage, app lifecycle, ATS behavior, and native EPUB file loading still require macOS/device verification. `NSAllowsArbitraryLoads` exists solely for user-approved HTTP Kavita servers; remove it if HTTP support is dropped or replace it with known-host exceptions for a managed deployment.
+Filesystem, app-private transfers, system note export (`UIDocumentPickerViewController` copy export and `UIActivityViewController` share sheet from private `Caches/shared/`), SQLite, secure Keychain storage, app lifecycle, ATS behavior, and native EPUB file loading still require macOS/device verification. `NSAllowsArbitraryLoads` exists solely for user-approved HTTP Kavita servers; remove it if HTTP support is dropped or replace it with known-host exceptions for a managed deployment.
 
 ## Readiness matrix
 

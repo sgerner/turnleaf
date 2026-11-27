@@ -393,7 +393,7 @@ export class ReaderSession {
   private pendingViewportSize: { width: number; height: number } | null = null;
   private pendingResizeDrain: Promise<void> | null = null;
   private viewportOperationQueue: Promise<void> = Promise.resolve();
-  private restoreTarget: { cfi?: string; href?: string } | null = null;
+  private initialRestoreCfi: string | null = null;
   private viewportTarget: HTMLElement | null = null;
   private epubContainer: HTMLElement | null = null;
   private lockedScrollLeft = 0;
@@ -560,7 +560,7 @@ export class ReaderSession {
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== null && startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
-      this.restoreTarget = null;
+      this.initialRestoreCfi = null;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -620,42 +620,33 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
+    this.initialRestoreCfi = cfi;
     await this.rendition.started;
     this.detachStageWindowListeners();
     this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    let opened = false;
     if (cfi) {
       try {
-        if (await this.displayAtGeneration(cfi, restoreGeneration)) {
-          await this.finishOpen(target, restoreGeneration, { cfi });
-          return;
-        }
+        opened = await this.displayAtGeneration(cfi, restoreGeneration);
       } catch {
         // A saved CFI can name a section removed in a newer copy of the EPUB.
       }
     }
-    if (serverXPath) {
-      const restoredTarget = await this.displayXPath(serverXPath, restoreGeneration);
-      if (restoredTarget) {
-        await this.finishOpen(
-          target,
-          restoreGeneration,
-          restoredTarget.startsWith('epubcfi(')
-            ? { cfi: restoredTarget }
-            : { href: restoredTarget },
-        );
-        return;
-      }
+    if (!opened && serverXPath) {
+      opened = await this.displayXPath(serverXPath, restoreGeneration);
     }
-    if (serverPercentage && serverPercentage > 0) {
-      const restoredHref = await this.displayPercentage(serverPercentage, restoreGeneration);
-      if (restoredHref) {
-        await this.finishOpen(target, restoreGeneration, { href: restoredHref });
-        return;
-      }
+    if (!opened && serverPercentage && serverPercentage > 0) {
+      opened = await this.displayPercentage(serverPercentage, restoreGeneration);
     }
-    if (await this.displayAtGeneration(undefined, restoreGeneration)) {
-      await this.finishOpen(target, restoreGeneration, {});
+    if (!opened) {
+      opened = await this.displayAtGeneration(undefined, restoreGeneration);
+    }
+    if (opened && this.isCurrentLocationOperation(restoreGeneration)) {
+      this.detachStageWindowListeners();
+      this.observeViewport(target);
+      const currentRect = target.getBoundingClientRect();
+      await this.resizeViewport(Math.floor(currentRect.width), Math.floor(currentRect.height));
     }
   }
 
@@ -868,12 +859,12 @@ export class ReaderSession {
     }
   }
 
-  async displayServerLocation(xpath: string): Promise<boolean> {
-    return (await this.displayXPath(xpath, this.beginLocationOperation(false))) !== null;
+  displayServerLocation(xpath: string): Promise<boolean> {
+    return this.displayXPath(xpath, this.beginLocationOperation(false));
   }
 
-  async displayServerPercentage(percentage: number): Promise<boolean> {
-    return (await this.displayPercentage(percentage, this.beginLocationOperation(false))) !== null;
+  displayServerPercentage(percentage: number): Promise<boolean> {
+    return this.displayPercentage(percentage, this.beginLocationOperation(false));
   }
 
   applyAppearance(value: Appearance): void {
@@ -980,7 +971,7 @@ export class ReaderSession {
     this.pendingViewportSize = null;
     this.pendingResizeDrain = null;
     this.viewportOperationQueue = Promise.resolve();
-    this.restoreTarget = null;
+    this.initialRestoreCfi = null;
     this.viewportTarget = null;
     this.lockedScrollLeft = 0;
     this.displayOperationCount = 0;
@@ -1364,59 +1355,16 @@ export class ReaderSession {
     return next;
   }
 
-  private async awaitRenditionSettled(rendition: Rendition): Promise<void> {
-    const runtime = rendition as Rendition & {
-      q?: { enqueue: (task: () => void) => Promise<unknown> };
-    };
-    if (!runtime.q?.enqueue) return;
-    let relocatedSettled = false;
-    let resolveRelocated: (() => void) | null = null;
-    const onRelocated = () => {
-      relocatedSettled = true;
-      resolveRelocated?.();
-    };
-    try {
-      await runtime.q.enqueue(() => {});
-      rendition.on('relocated', onRelocated);
-      await runtime.q.enqueue(() => {});
-      if (!relocatedSettled && typeof requestAnimationFrame === 'function') {
-        await new Promise<void>((resolve) => {
-          resolveRelocated = resolve;
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => resolve());
-          });
-        });
-      }
-      await Promise.resolve();
-    } finally {
-      rendition.off('relocated', onRelocated);
-    }
-  }
-
-  private async finishOpen(
-    target: HTMLElement,
-    generation: number,
-    restoreTarget: { cfi?: string; href?: string },
-  ): Promise<void> {
-    if (!this.isCurrentLocationOperation(generation) || !this.rendition) return;
-    this.restoreTarget = restoreTarget;
-    this.detachStageWindowListeners();
-    await this.awaitRenditionSettled(this.rendition);
-    if (!this.isCurrentLocationOperation(generation)) return;
-    this.observeViewport(target);
-    const currentRect = target.getBoundingClientRect();
-    await this.resizeViewport(Math.floor(currentRect.width), Math.floor(currentRect.height));
-  }
-
   private observeViewport(target: HTMLElement): void {
     if (typeof ResizeObserver === 'undefined') return;
 
     this.resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry || !this.rendition) return;
-      const width = Math.floor(entry.contentRect.width);
-      const height = Math.floor(entry.contentRect.height);
-      void this.resizeViewport(width, height);
+      void this.resizeViewport(
+        Math.floor(entry.contentRect.width),
+        Math.floor(entry.contentRect.height),
+      );
     });
     this.resizeObserver.observe(target);
   }
@@ -1432,7 +1380,7 @@ export class ReaderSession {
       return Promise.resolve();
     }
     const runtimeRendition = rendition as Rendition & {
-      manager?: { stage?: unknown; views?: { length?: number } };
+      manager?: { stage?: unknown };
       q?: { enqueue: (task: () => void) => Promise<unknown> };
       resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
     };
@@ -1449,66 +1397,51 @@ export class ReaderSession {
       return Promise.resolve();
     }
     this.pendingViewportSize = { width, height };
-    if (!this.pendingResizeDrain) {
-      const drain = this.enqueueViewportOperation(async () => {
-        try {
-          while (this.pendingViewportSize && this.rendition === runtimeRendition) {
-            const next = this.pendingViewportSize;
-            this.pendingViewportSize = null;
-            let resized = false;
-            await this.runDisplayOperation(async () => {
-              await runtimeRendition.q!.enqueue(() => {
-                if (this.rendition !== runtimeRendition) return;
-                resized = this.applyViewportResize(runtimeRendition, next.width, next.height);
-              });
-              if (resized && this.rendition === runtimeRendition) {
-                await this.awaitRenditionSettled(runtimeRendition);
+    this.pendingResizeDrain ??= this.enqueueViewportOperation(async () => {
+      try {
+        while (this.pendingViewportSize && this.rendition === runtimeRendition) {
+          const next = this.pendingViewportSize;
+          this.pendingViewportSize = null;
+          await this.runDisplayOperation(async () => {
+            await runtimeRendition.q!.enqueue(() => {
+              if (this.rendition === runtimeRendition) {
+                this.applyViewportResize(runtimeRendition, next.width, next.height);
               }
             });
-          }
-        } finally {
-          if (this.pendingResizeDrain === drain) this.pendingResizeDrain = null;
+            await runtimeRendition.q!.enqueue(() => {});
+          });
         }
-      });
-      this.pendingResizeDrain = drain;
-    }
+      } finally {
+        this.pendingResizeDrain = null;
+      }
+    });
     return this.pendingResizeDrain;
   }
 
   private applyViewportResize(
     runtimeRendition: Rendition & {
-      manager?: { stage?: unknown; views?: { length?: number } };
+      manager?: { stage?: unknown };
       resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
     },
     width: number,
     height: number,
-  ): boolean {
-    if (this.viewportSize?.width === width && this.viewportSize.height === height) {
-      return false;
-    }
-    if (runtimeRendition.manager && !runtimeRendition.manager.stage) {
-      return false;
-    }
+  ): void {
+    if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    if (runtimeRendition.manager && !runtimeRendition.manager.stage) return;
     this.viewportSize = { width, height };
     const target =
       this.current?.start.cfi ??
       runtimeRendition.location?.start.cfi ??
-      this.restoreTarget?.cfi ??
-      this.restoreTarget?.href;
+      this.initialRestoreCfi ??
+      undefined;
     const hadRenditionLocation = Boolean(runtimeRendition.location?.start);
-    if (target !== undefined) {
-      runtimeRendition.resize(width, height, target);
-    } else {
-      runtimeRendition.resize(width, height);
-    }
+    if (target !== undefined) runtimeRendition.resize(width, height, target);
+    else runtimeRendition.resize(width, height);
     if (runtimeRendition.manager && !hadRenditionLocation && !this.userNavigationPending) {
       void this.runDisplayOperation(() =>
         target === undefined ? runtimeRendition.display() : runtimeRendition.display(target),
-      ).catch(() => {
-        // A concurrent navigation or destroy can supersede the post-resize display.
-      });
+      ).catch(() => {});
     }
-    return true;
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -1553,30 +1486,30 @@ export class ReaderSession {
     return this.isCurrentLocationOperation(generation);
   }
 
-  private async displayXPath(xpath: string, generation: number): Promise<string | null> {
+  private async displayXPath(xpath: string, generation: number): Promise<boolean> {
     const rendition = this.rendition;
-    if (!rendition || !this.isCurrentLocationOperation(generation)) return null;
+    if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
     const target = parseKavitaXPath(xpath);
-    if (!target) return null;
+    if (!target) return false;
     const section = this.getSpine().sections[target.spineIndex];
-    if (!section) return null;
+    if (!section) return false;
     try {
       await this.runDisplayOperation(() => rendition.display(section.href));
-      if (!this.isCurrentLocationOperation(generation)) return null;
-      if (target.contentXPath === '/html/body') return section.href;
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
         (item) => item.sectionIndex === target.spineIndex,
       );
-      if (!contents) return null;
+      if (!contents) return false;
       const node = resolveContentXPath(contents.document, target.contentXPath);
-      if (!node) return null;
+      if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
-      if (!(contents.range(cfi) as Range | null)) return null;
+      if (!(contents.range(cfi) as Range | null)) return false;
       await this.runDisplayOperation(() => rendition.display(cfi));
-      return this.isCurrentLocationOperation(generation) ? cfi : null;
+      return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
-      return null;
+      return false;
     }
   }
 
@@ -1595,17 +1528,17 @@ export class ReaderSession {
     return contents.cfiFromNode(node);
   }
 
-  private async displayPercentage(percentage: number, generation: number): Promise<string | null> {
-    if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return null;
+  private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
+    if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
     const { sections } = this.getSpine();
-    if (!sections.length) return null;
+    if (!sections.length) return false;
     const position = Math.max(0, Math.min(0.999, percentage));
     const section = sections[Math.floor(position * sections.length)];
-    if (!section) return null;
+    if (!section) return false;
     try {
-      return (await this.displayAtGeneration(section.href, generation)) ? section.href : null;
+      return await this.displayAtGeneration(section.href, generation);
     } catch {
-      return null;
+      return false;
     }
   }
 
@@ -1613,10 +1546,13 @@ export class ReaderSession {
     await this.enqueueViewportOperation(async () => {
       if (!this.rendition) throw new Error('Reader is not open.');
       const generation = this.beginLocationOperation(true);
+      const runtime = this.rendition as Rendition & {
+        q?: { enqueue: (task: () => void) => Promise<unknown> };
+      };
       try {
         await this.runDisplayOperation(display);
-        if (this.rendition && this.isCurrentLocationOperation(generation)) {
-          await this.awaitRenditionSettled(this.rendition);
+        if (this.isCurrentLocationOperation(generation) && runtime.q?.enqueue) {
+          await runtime.q.enqueue(() => {});
         }
       } catch (error) {
         if (this.isCurrentLocationOperation(generation)) {
@@ -1630,7 +1566,7 @@ export class ReaderSession {
 
   private beginLocationOperation(userNavigation: boolean): number {
     this.locationGeneration += 1;
-    this.restoreTarget = null;
+    this.initialRestoreCfi = null;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
@@ -1644,7 +1580,7 @@ export class ReaderSession {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
     this.locationGeneration += 1;
-    this.restoreTarget = null;
+    this.initialRestoreCfi = null;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
     this.userNavigationOrigin = 'link';

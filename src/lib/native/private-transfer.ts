@@ -20,7 +20,7 @@ export interface PrivateDownloadResult {
 
 export interface PrivateDownloadProgressEvent {
   transferId?: string;
-  url: string;
+  url?: string;
   bytes: number;
   contentLength: number;
   lengthComputable: boolean;
@@ -28,6 +28,7 @@ export interface PrivateDownloadProgressEvent {
 
 export interface PrivateTransferPlugin {
   downloadFile(options: PrivateDownloadOptions): Promise<PrivateDownloadResult>;
+  abortTransfer(options: { transferId: string }): Promise<void>;
   addListener(
     eventName: 'progress',
     listenerFunc: (event: PrivateDownloadProgressEvent) => void,
@@ -46,6 +47,9 @@ function getPrivateTransfer(): PrivateTransferPlugin {
 export const PrivateTransfer: PrivateTransferPlugin = {
   get downloadFile() {
     return getPrivateTransfer().downloadFile;
+  },
+  get abortTransfer() {
+    return getPrivateTransfer().abortTransfer;
   },
   get addListener() {
     return getPrivateTransfer().addListener;

@@ -13,6 +13,14 @@ export class KavitaError extends Error {
   }
 }
 
+function hasControlChars(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
 export function hasSensitiveAuthQuery(url: URL): boolean {
   return [...url.searchParams.keys()].some((key) => SENSITIVE_AUTH_QUERY.test(key));
 }
@@ -34,6 +42,9 @@ export function assertSafeTransferTarget(
   serverOrigin?: string,
   invalidAddressMessage = 'Invalid Kavita download address.',
 ): { url: string; normalizedUrl: string; serverOrigin: string } {
+  if (hasControlChars(rawUrl)) {
+    throw new Error(invalidAddressMessage);
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -72,9 +83,12 @@ export function assertSafeTransferTarget(
     throw new KavitaError(message, 'server');
   }
 
+  const hadFragment = rawUrl.includes('#');
+  parsed.hash = '';
+  const normalizedUrl = parsed.toString();
   return {
-    url: rawUrl,
-    normalizedUrl: parsed.toString(),
+    url: hadFragment ? normalizedUrl : rawUrl,
+    normalizedUrl,
     serverOrigin: resolvedOrigin,
   };
 }
@@ -104,6 +118,9 @@ export function redirectTarget(
   if (!location) {
     throw new KavitaError('Kavita redirected without a destination address.', 'server', status);
   }
+  if (hasControlChars(location)) {
+    throw new KavitaError('Kavita returned an invalid redirect address.', 'server', status);
+  }
 
   let destination: URL;
   try {
@@ -111,6 +128,7 @@ export function redirectTarget(
   } catch {
     throw new KavitaError('Kavita returned an invalid redirect address.', 'server', status);
   }
+  destination.hash = '';
 
   let current: URL | null;
   try {

@@ -53,7 +53,12 @@ async function readNativeRange(path: string, offset: number, length: number): Pr
 }
 
 function assertSafeBookId(bookId: string): void {
-  if (!bookId || bookId === '.' || bookId === '..' || /[\\/\0]/.test(bookId)) {
+  if (
+    !bookId ||
+    bookId.startsWith('.') ||
+    bookId.endsWith('.') ||
+    !/^[A-Za-z0-9._-]+$/.test(bookId)
+  ) {
     throw new Error('Invalid EPUB file name.');
   }
 }
@@ -104,7 +109,7 @@ async function downloadWithSafeRedirects(options: {
   progress?: boolean;
   transferId?: string;
   signal?: AbortSignal | undefined;
-  onHopUrl?: ((url: string) => void) | undefined;
+  onHopTransferId?: ((hopTransferId: string) => void) | undefined;
 }): Promise<PrivateDownloadResult> {
   const redirects = createRedirectState(
     options.initialUrl,
@@ -112,23 +117,34 @@ async function downloadWithSafeRedirects(options: {
     'GET',
     options.normalizedInitialUrl,
   );
+  const baseTransferId = options.transferId ?? `transfer-${++nextTransferSequence}`;
+  let activeHopTransferId = baseTransferId;
+  const handleAbort = () => {
+    void PrivateTransfer.abortTransfer?.({ transferId: activeHopTransferId })?.catch(() => {});
+  };
+  options.signal?.addEventListener('abort', handleAbort, { once: true });
 
-  while (true) {
-    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    options.onHopUrl?.(redirects.currentUrl);
-    const response = await PrivateTransfer.downloadFile({
-      url: redirects.currentUrl,
-      relativePath: options.relativePath,
-      headers: { 'x-api-key': options.apiKey },
-      ...(options.connectTimeout !== undefined ? { connectTimeout: options.connectTimeout } : {}),
-      ...(options.readTimeout !== undefined ? { readTimeout: options.readTimeout } : {}),
-      ...(options.progress ? { progress: true } : {}),
-      ...(options.transferId ? { transferId: options.transferId } : {}),
-    });
-    if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  try {
+    while (true) {
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      activeHopTransferId = `${baseTransferId}-hop-${redirects.redirectCount}`;
+      options.onHopTransferId?.(activeHopTransferId);
+      const response = await PrivateTransfer.downloadFile({
+        url: redirects.currentUrl,
+        relativePath: options.relativePath,
+        headers: { 'x-api-key': options.apiKey },
+        transferId: activeHopTransferId,
+        ...(options.connectTimeout !== undefined ? { connectTimeout: options.connectTimeout } : {}),
+        ...(options.readTimeout !== undefined ? { readTimeout: options.readTimeout } : {}),
+        ...(options.progress ? { progress: true } : {}),
+      });
+      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-    const nextUrl = advanceRedirect(redirects, response.status, response.location ?? null);
-    if (!nextUrl) return response;
+      const nextUrl = advanceRedirect(redirects, response.status, response.location ?? null);
+      if (!nextUrl) return response;
+    }
+  } finally {
+    options.signal?.removeEventListener('abort', handleAbort);
   }
 }
 
@@ -173,14 +189,11 @@ export async function downloadEpub(
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}${PARTIAL_SUFFIX}`;
   const transferId = `epub-${++nextTransferSequence}`;
-  let activeHopUrl = target.url;
+  let activeHopTransferId = `${transferId}-hop-0`;
   const listener = onProgress
     ? await PrivateTransfer.addListener('progress', (event) => {
-        const matchesTransfer =
-          (event.transferId === undefined || event.transferId === transferId) &&
-          event.url === activeHopUrl;
         if (
-          matchesTransfer &&
+          event.transferId === activeHopTransferId &&
           event.lengthComputable &&
           event.contentLength > 0 &&
           Number.isFinite(event.bytes)
@@ -201,10 +214,11 @@ export async function downloadEpub(
           serverOrigin: target.serverOrigin,
           relativePath: temporaryPath,
           apiKey,
-          onHopUrl: (url) => {
-            activeHopUrl = url;
+          transferId,
+          onHopTransferId: (hopTransferId) => {
+            activeHopTransferId = hopTransferId;
           },
-          ...(listener ? { progress: true, transferId } : {}),
+          ...(listener ? { progress: true } : {}),
         });
         const status =
           Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
@@ -325,6 +339,9 @@ export async function cacheCover(
   serverOrigin?: string,
 ): Promise<string> {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  if (!Number.isInteger(seriesId) || seriesId <= 0) {
+    throw new Error('Invalid Kavita series identifier.');
+  }
   const target = assertSafeTransferTarget(
     downloadUrl,
     serverOrigin,

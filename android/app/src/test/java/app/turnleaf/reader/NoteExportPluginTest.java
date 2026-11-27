@@ -3,6 +3,7 @@ package app.turnleaf.reader;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.ByteArrayOutputStream;
@@ -11,6 +12,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -40,7 +42,7 @@ public class NoteExportPluginTest {
     }
 
     @Test
-    public void stagesTemporaryFilesStrictlyInsideSharedCacheSubdirectoryAndCleansUp()
+    public void stagesTemporaryFilesStrictlyInsideSharedCacheAndRejectsSymlinks()
         throws IOException {
         File cacheDir = tempFolder.newFolder("cache");
         File unrelatedCacheFile = new File(cacheDir, "keep.tmp");
@@ -69,6 +71,29 @@ public class NoteExportPluginTest {
         NoteExportPlugin.cleanupSharedCache(cacheDir);
         assertFalse(secondStaged.exists());
         assertTrue(unrelatedCacheFile.exists());
+
+        File symlinkCache = tempFolder.newFolder("symlink-cache");
+        File outside = tempFolder.newFolder("outside");
+        Files.createSymbolicLink(new File(symlinkCache, "shared").toPath(), outside.toPath());
+        try {
+            NoteExportPlugin.stageSharedMarkdownFile(symlinkCache, "notes.md", "# Escape");
+            fail("Expected symlink shared directory rejection.");
+        } catch (IllegalArgumentException expected) {
+            // Expected symlink rejection.
+        }
+    }
+
+    @Test
+    public void correlatesShareChoicesPerTokenWithoutCrossTalk() {
+        String firstToken = NoteExportPlugin.registerShareToken();
+        String secondToken = NoteExportPlugin.registerShareToken();
+
+        NoteExportPlugin.recordShareTargetChoice("forged-token");
+        NoteExportPlugin.recordShareTargetChoice(firstToken);
+
+        assertTrue(NoteExportPlugin.consumeShareToken(firstToken));
+        assertFalse(NoteExportPlugin.consumeShareToken(firstToken));
+        assertFalse(NoteExportPlugin.consumeShareToken(secondToken));
     }
 
     private static String readUtf8(File file) throws IOException {

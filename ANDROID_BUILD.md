@@ -9,7 +9,7 @@
 
 The generated project supports Android 7 through 16 (API 24 through 36), declares only `INTERNET` and `ACCESS_NETWORK_STATE` in merged debug and release manifests (zero external storage permissions), streams EPUBs and covers directly to app-private storage, exports Markdown notes through the Android system picker or unexported `FileProvider` `shared/` cache directory, and contains adaptive icon and splash placeholders from Capacitor.
 
-Automated CI and release workflows run the Android reading journey and APK checks on both API 29 (`turnleaf_api29`) and API 36 (`turnleaf_api36`) Google APIs `x86_64` emulators: install, manifest permission bounds, secure credential persistence, live library browsing, cached covers, native EPUB download, system note export, paginated reading, force-stop persistence, offline reopen, and progress sync.
+Automated CI and release workflows run the Android reading journey and APK checks on both API 29 and API 36 Google APIs `x86_64` emulators: install, manifest permission bounds, secure credential persistence, live library browsing, cached covers, native EPUB download, system note export, paginated reading, force-stop persistence, offline reopen, and progress sync.
 
 ## Commands
 

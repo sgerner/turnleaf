@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { registerPluginSpy, downloadFileMock, addListenerMock } = vi.hoisted(() => ({
-  registerPluginSpy: vi.fn(),
-  downloadFileMock: vi.fn(),
-  addListenerMock: vi.fn(),
-}));
+const { registerPluginSpy, downloadFileMock, abortTransferMock, addListenerMock } = vi.hoisted(
+  () => ({
+    registerPluginSpy: vi.fn(),
+    downloadFileMock: vi.fn(),
+    abortTransferMock: vi.fn(),
+    addListenerMock: vi.fn(),
+  }),
+);
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
@@ -20,9 +23,11 @@ describe('PrivateTransfer lazy plugin registration', () => {
     vi.resetModules();
     registerPluginSpy.mockReset();
     downloadFileMock.mockReset();
+    abortTransferMock.mockReset();
     addListenerMock.mockReset();
     registerPluginSpy.mockReturnValue({
       downloadFile: downloadFileMock,
+      abortTransfer: abortTransferMock,
       addListener: addListenerMock,
     });
   });
@@ -40,6 +45,8 @@ describe('PrivateTransfer lazy plugin registration', () => {
     expect(result).toEqual({ status: 200, bytesWritten: 42 });
     expect(registerPluginSpy).toHaveBeenCalledExactlyOnceWith('PrivateTransfer');
 
+    abortTransferMock.mockResolvedValueOnce(undefined);
+    await PrivateTransfer.abortTransfer({ transferId: 'epub-1' });
     addListenerMock.mockResolvedValueOnce({ remove: async () => undefined });
     await PrivateTransfer.addListener('progress', () => undefined);
     expect(registerPluginSpy).toHaveBeenCalledTimes(1);

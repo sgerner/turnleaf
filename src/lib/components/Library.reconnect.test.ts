@@ -128,46 +128,37 @@ describe('Library native network reconnect sync', () => {
         return { remove: async () => undefined };
       },
     );
-    if (!window.matchMedia) {
-      Object.defineProperty(window, 'matchMedia', {
-        configurable: true,
-        value: vi.fn(() => ({
-          matches: false,
-          media: '',
-          onchange: null,
-          addListener: vi.fn(),
-          removeListener: vi.fn(),
-          addEventListener: vi.fn(),
-          removeEventListener: vi.fn(),
-          dispatchEvent: vi.fn(),
-        })),
+    window.matchMedia ??= vi.fn(() => ({
+      matches: false,
+      media: '',
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })) as unknown as typeof window.matchMedia;
+    Element.prototype.animate ??= vi.fn(() => {
+      const animation = {
+        currentTime: 0,
+        effect: null,
+        playState: 'finished' as AnimationPlayState,
+        onfinish: null as ((this: Animation, ev: AnimationPlaybackEvent) => unknown) | null,
+        cancel: () => {
+          animation.playState = 'idle';
+        },
+        finish: () => undefined,
+      };
+      queueMicrotask(() => {
+        if (animation.playState !== 'idle') {
+          animation.onfinish?.call(
+            animation as unknown as Animation,
+            new Event('finish') as AnimationPlaybackEvent,
+          );
+        }
       });
-    }
-    if (!Element.prototype.animate) {
-      Element.prototype.animate = vi.fn(() => {
-        let cancelled = false;
-        const animation = {
-          currentTime: 0,
-          effect: null,
-          playState: 'finished' as AnimationPlayState,
-          onfinish: null as ((this: Animation, ev: AnimationPlaybackEvent) => unknown) | null,
-          cancel: () => {
-            cancelled = true;
-            animation.playState = 'idle';
-          },
-          finish: () => undefined,
-        };
-        queueMicrotask(() => {
-          if (!cancelled) {
-            animation.onfinish?.call(
-              animation as unknown as Animation,
-              new Event('finish') as AnimationPlaybackEvent,
-            );
-          }
-        });
-        return animation as unknown as Animation;
-      });
-    }
+      return animation as unknown as Animation;
+    });
     target = document.createElement('div');
     document.body.appendChild(target);
   });
