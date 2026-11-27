@@ -1141,6 +1141,164 @@ it('opens a zipped EPUB in ReaderSession with zero outbound requests, aligned se
   tracker.restore();
 });
 
+it('blocks XHTML-to-srcdoc parser differentials, noscript/SMIL vectors, style tag breakouts, and encoded data:text/css imports', async () => {
+  const embeddedHostile = Buffer.from(
+    "@import url('https://attacker.example/embedded-import.css'); .embedded-ok { color: rgb(9, 8, 7); } .embedded-bad { background: url('https://attacker.example/embedded-bg.png'); }",
+    'utf8',
+  ).toString('base64');
+  const cssWithBreakoutAndDataImport = [
+    `@import "data:text/css;base64,${embeddedHostile}" screen;`,
+    '@import "data:text/css;base64,%%%invalid%%%";',
+    '.quote-breakout::after { content: "</style><script id=\'escaped-script\'>window.__xss=1</script>"; }',
+    'a </style><img id="escaped-img" src="/escaped.png"> { font-weight: 600; }',
+  ].join('\n');
+
+  const sanitizedCssText = sanitizeCss(
+    cssWithBreakoutAndDataImport,
+    'http://localhost/OEBPS/styles/book.css',
+  );
+  expect(sanitizedCssText).toContain('@media screen');
+  expect(sanitizedCssText).toContain('.embedded-ok { color: rgb(9, 8, 7); }');
+  expect(sanitizedCssText).not.toContain('attacker.example');
+  expect(sanitizedCssText.toLowerCase()).not.toContain('</style');
+
+  const xhtml = [
+    "<!DOCTYPE html [ <!ENTITY x \">&#60;img id='doctype-breakout' src='https://attacker.example/doctype.png'>\"> ]>",
+    '<?pi ><img id="pi-breakout" src="https://attacker.example/pi.png" ?>',
+    '<html xmlns="http://www.w3.org/1999/xhtml" xml:base="https://attacker.example/xml-base/">',
+    '<head>',
+    '<TITLE><!-- </TITLE><img id="title-comment-breakout" src="https://attacker.example/title-comment.png" /> --></TITLE>',
+    '<BASE HREF="https://attacker.example/xhtml-base/" />',
+    '<META HTTP-EQUIV="refresh" CONTENT="0;url=https://attacker.example/xhtml-refresh" />',
+    '<META name="referrer" content="unsafe-url" />',
+    '<LINK REL="preload" AS="style" HREF="styles/untrusted.css" />',
+    '<LINK REL="dns-prefetch" HREF="//attacker.example" />',
+    '<style>@import "https://attacker.example/empty-after-sanitize.css";</style>',
+    `<STYLE><![CDATA[${cssWithBreakoutAndDataImport}]]></STYLE>`,
+    '</head>',
+    '<body>',
+    '<!-- ><img id="comment-breakout" src="https://attacker.example/comment.png" /> -->',
+    '<p id="cdata-paragraph">Safe <![CDATA[><img id="cdata-breakout" src="/cdata-probe.png" />]]> text</p>',
+    '<SCRIPT>fetch("https://attacker.example/upper-script")</SCRIPT>',
+    '<IFRAME SRC="https://attacker.example/upper-frame"></IFRAME>',
+    '<noscript><img src="https://attacker.example/noscript.png" /></noscript>',
+    '<template><img src="https://attacker.example/template.png" /></template>',
+    '<xmp><img src="https://attacker.example/xmp.png" /></xmp>',
+    '<textarea><img src="https://attacker.example/textarea.png" /></textarea>',
+    '<svg xmlns="http://www.w3.org/2000/svg"><a id="svg-link" href="#safe"><set attributeName="href" to="https://attacker.example/smil" /><animate attributeName="href" values="https://attacker.example/anim" /></a></svg>',
+    '<A id="upper-internal" HREF="chapter-2.xhtml#section">Internal</A>',
+    '<A id="upper-remote" HREF="https://attacker.example/upper-link">Remote</A>',
+    '</body>',
+    '</html>',
+  ].join('');
+  const xhtmlDoc = new DOMParser().parseFromString(xhtml, 'application/xhtml+xml');
+  expect(xhtmlDoc.querySelector('parsererror')).toBeNull();
+  await sanitizeEpubDocument(xhtmlDoc);
+
+  // Reparse serialized XHTML as text/html just like iframe.srcdoc does in browsers.
+  const serialized = new XMLSerializer().serializeToString(xhtmlDoc);
+  const srcdocParsed = new DOMParser().parseFromString(serialized, 'text/html');
+  expect(srcdocParsed.documentElement.outerHTML).not.toContain('attacker.example');
+  expect(srcdocParsed.documentElement.hasAttribute('xml:base')).toBe(false);
+  expect(
+    srcdocParsed.querySelector(
+      'base, script, iframe, img, noscript, template, xmp, textarea, set, animate, link, meta[http-equiv="refresh"], meta[name="referrer"]',
+    ),
+  ).toBeNull();
+  expect(srcdocParsed.querySelectorAll('meta[http-equiv="Content-Security-Policy"]')).toHaveLength(
+    1,
+  );
+  // Empty-after-sanitization <style> and empty <TITLE> must not emit self-closing <style/> or <title/> that swallow <body>.
+  expect(srcdocParsed.querySelectorAll('style')).toHaveLength(1);
+  expect(srcdocParsed.querySelector('#cdata-paragraph')?.textContent).toContain('Safe >');
+  expect(srcdocParsed.querySelector('#upper-internal')?.getAttribute('href')).toBe(
+    'chapter-2.xhtml#section',
+  );
+  expect(srcdocParsed.querySelector('#upper-remote')?.getAttribute('href')).toBeNull();
+  expect(srcdocParsed.querySelector('style')?.textContent).toContain('.embedded-ok');
+
+  // Malformed XML producing a <parsererror> document is replaced with a clean CSP-protected shell.
+  const malformedXmlDoc = new DOMParser().parseFromString(
+    '<html xmlns="http://www.w3.org/1999/xhtml"><body><!-- --!><img src="https://attacker.example/malformed.png"/></body></html>',
+    'application/xhtml+xml',
+  );
+  await sanitizeEpubDocument(malformedXmlDoc);
+  const malformedSerialized = new XMLSerializer().serializeToString(malformedXmlDoc);
+  expect(malformedSerialized).not.toContain('attacker.example');
+  expect(malformedSerialized).not.toContain('parsererror');
+  expect(malformedSerialized).toContain('http-equiv="Content-Security-Policy"');
+});
+
+it('throws from registerEpubSpineSanitizer when the epub.js pre-serialization content hook is absent or invalid', () => {
+  const reportedErrors: string[] = [];
+  const recordError = (error: Error) => reportedErrors.push(error.message);
+
+  expect(() =>
+    registerEpubSpineSanitizer({} as never, new Map(), { onError: recordError }),
+  ).toThrow(/spine content sanitizer hook is unavailable/i);
+  expect(() =>
+    registerEpubSpineSanitizer({ spine: {} }, new Map(), { onError: recordError }),
+  ).toThrow(/spine content sanitizer hook is unavailable/i);
+  expect(() =>
+    registerEpubSpineSanitizer({ spine: { hooks: {} } }, new Map(), { onError: recordError }),
+  ).toThrow(/spine content sanitizer hook is unavailable/i);
+  expect(() =>
+    registerEpubSpineSanitizer({ spine: { hooks: { content: {} } } }, new Map(), {
+      onError: recordError,
+    }),
+  ).toThrow(/spine content sanitizer hook is unavailable/i);
+  expect(() =>
+    registerEpubSpineSanitizer(
+      {
+        spine: {
+          hooks: {
+            content: {
+              register: () => {},
+              trigger: 'invalid' as unknown as () => Promise<unknown>,
+            },
+          },
+        },
+      },
+      new Map(),
+      { onError: recordError },
+    ),
+  ).toThrow(/trigger hook is invalid/i);
+  expect(() =>
+    registerEpubSpineSanitizer(
+      {
+        spine: {
+          hooks: {
+            content: {
+              register: () => {
+                throw new Error('direct register failure');
+              },
+            },
+          },
+        },
+      },
+      new Map(),
+      { onError: recordError },
+    ),
+  ).toThrow('direct register failure');
+  expect(() =>
+    registerEpubSpineSanitizer(
+      {
+        spine: {
+          hooks: {
+            content: {
+              register: () => {},
+              list: () => [],
+            },
+          },
+        },
+      },
+      new Map(),
+      { onError: recordError },
+    ),
+  ).toThrow(/failed to register/i);
+  expect(reportedErrors).toHaveLength(7);
+});
+
 it('aborts EPUB open before chapter serialization when the pre-serialization spine content hook is missing or throws', async () => {
   const tracker = installObjectUrlTracker();
   const outboundRequests: string[] = [];
@@ -1188,54 +1346,6 @@ it('aborts EPUB open before chapter serialization when the pre-serialization spi
     }
     return element;
   }) as typeof document.createElement);
-
-  // Direct unit checks on registerEpubSpineSanitizer return value & error reporting.
-  const reportedErrors: string[] = [];
-  expect(
-    registerEpubSpineSanitizer({}, new Map(), {
-      onError: (error) => reportedErrors.push(error.message),
-    }),
-  ).toBe(false);
-  expect(
-    registerEpubSpineSanitizer({ spine: { hooks: {} } }, new Map(), {
-      onError: (error) => reportedErrors.push(error.message),
-    }),
-  ).toBe(false);
-  expect(
-    registerEpubSpineSanitizer(
-      {
-        spine: {
-          hooks: {
-            content: {
-              register: () => {
-                throw new Error('direct register failure');
-              },
-            },
-          },
-        },
-      },
-      new Map(),
-      { onError: (error) => reportedErrors.push(error.message) },
-    ),
-  ).toBe(false);
-  expect(
-    registerEpubSpineSanitizer(
-      {
-        spine: {
-          hooks: {
-            content: {
-              register: () => {},
-              list: () => [],
-            },
-          },
-        },
-      },
-      new Map(),
-      { onError: (error) => reportedErrors.push(error.message) },
-    ),
-  ).toBe(false);
-  expect(reportedErrors).toContain('direct register failure');
-  expect(reportedErrors).toHaveLength(4);
 
   const archive = buildHostileEpubArchive();
   const viewport = document.createElement('div');

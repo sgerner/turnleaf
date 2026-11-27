@@ -725,6 +725,8 @@ function escapeCssString(value: string): string {
     const code = character.charCodeAt(0);
     if (character === '\\' || character === '"') {
       escaped += `\\${character}`;
+    } else if (character === '<') {
+      escaped += '\\3c ';
     } else if (code <= 0x1f || code === 0x7f) {
       escaped += `\\${code.toString(16)} `;
     } else {
@@ -853,6 +855,7 @@ function sanitizeImageSetTokens(
   innerTokens: readonly CssToken[],
   baseURI: string | undefined,
   resolveResource: CssResourceResolver,
+  importDepth: number,
 ): string {
   const groups: CssToken[][] = [];
   let current: CssToken[] = [];
@@ -878,12 +881,22 @@ function sanitizeImageSetTokens(
     if (head.type === 'string') {
       const resolved = resolveResource(head.value);
       if (!resolved) continue;
-      const rest = sanitizeCssTokens(group.slice(idx + 1), baseURI, resolveResource).trim();
+      const rest = sanitizeCssTokens(
+        group.slice(idx + 1),
+        baseURI,
+        resolveResource,
+        importDepth,
+      ).trim();
       const normalizedUrl = `url("${escapeCssString(resolved)}")`;
       safeCandidates.push(rest ? `${normalizedUrl} ${rest}` : normalizedUrl);
       continue;
     }
-    const sanitizedGroup = sanitizeCssTokens(group.slice(idx), baseURI, resolveResource).trim();
+    const sanitizedGroup = sanitizeCssTokens(
+      group.slice(idx),
+      baseURI,
+      resolveResource,
+      importDepth,
+    ).trim();
     if (!sanitizedGroup || /^none(?:\s|$)/i.test(sanitizedGroup)) continue;
     safeCandidates.push(sanitizedGroup);
   }
@@ -895,6 +908,7 @@ function sanitizeCssTokens(
   tokens: readonly CssToken[],
   baseURI: string | undefined,
   resolveResource: CssResourceResolver,
+  importDepth = 0,
 ): string {
   let output = '';
   let index = 0;
@@ -935,8 +949,29 @@ function sanitizeCssTokens(
           ? decodedReference(parsed.target)
           : null;
       if (safeImport) {
-        const media = sanitizeCssTokens(parsed.mediaTokens, baseURI, resolveResource).trim();
-        output += `@import "${escapeCssString(safeImport)}"${media ? ` ${media}` : ''};`;
+        const media = sanitizeCssTokens(
+          parsed.mediaTokens,
+          baseURI,
+          resolveResource,
+          importDepth + 1,
+        ).trim();
+        if (safeImport.toLowerCase().startsWith('data:')) {
+          const embedded =
+            importDepth < MAX_STYLESHEET_IMPORT_DEPTH ? decodeDataStylesheet(safeImport) : null;
+          const sanitizedEmbedded = embedded
+            ? sanitizeCssTokens(
+                tokenizeCss(embedded),
+                baseURI,
+                resolveResource,
+                importDepth + 1,
+              ).trim()
+            : '';
+          if (sanitizedEmbedded) {
+            output += media ? `@media ${media} {\n${sanitizedEmbedded}\n}` : sanitizedEmbedded;
+          }
+        } else {
+          output += `@import "${escapeCssString(safeImport)}"${media ? ` ${media}` : ''};`;
+        }
       }
       continue;
     }
@@ -955,21 +990,92 @@ function sanitizeCssTokens(
         continue;
       }
       if (fnName === 'image-set' || fnName === '-webkit-image-set') {
-        output += sanitizeImageSetTokens(fnName, balanced.inner, baseURI, resolveResource);
+        output += sanitizeImageSetTokens(
+          fnName,
+          balanced.inner,
+          baseURI,
+          resolveResource,
+          importDepth,
+        );
         continue;
       }
       if (fnName === 'expression') {
         output += 'none';
         continue;
       }
-      const sanitizedInner = sanitizeCssTokens(balanced.inner, baseURI, resolveResource);
+      const sanitizedInner = sanitizeCssTokens(
+        balanced.inner,
+        baseURI,
+        resolveResource,
+        importDepth,
+      );
       output += `${token.raw}${sanitizedInner})`;
+      continue;
+    }
+    if (token.type === 'other' && token.value === '<' && tokens[index + 1]?.value === '/') {
+      output += '< ';
+      index += 1;
       continue;
     }
     output += token.raw;
     index += 1;
   }
 
+  return output;
+}
+
+async function sanitizeCssWithImports(
+  rawCss: string,
+  baseURI: string | undefined,
+  resolveResource: CssResourceResolver,
+  resolveImport: (safeTarget: string) => Promise<string | null>,
+  isAborted?: (() => boolean) | undefined,
+): Promise<string | null> {
+  const tokens = tokenizeCss(rawCss);
+  if (
+    !tokens.some((token) => token.type === 'at-keyword' && token.value.toLowerCase() === 'import')
+  ) {
+    return sanitizeCssTokens(tokens, baseURI, resolveResource);
+  }
+  let output = '';
+  let chunkStart = 0;
+  let index = 0;
+  while (index < tokens.length) {
+    const token = tokens[index]!;
+    if (token.type === 'at-keyword' && token.value.toLowerCase() === 'import') {
+      if (index > chunkStart) {
+        output += sanitizeCssTokens(tokens.slice(chunkStart, index), baseURI, resolveResource);
+      }
+      const parsed = consumeCssImportStatement(tokens, index);
+      index = parsed.next;
+      chunkStart = index;
+      const safeTarget =
+        parsed.target !== null && isSafeEpubReference(parsed.target, 'stylesheet', baseURI)
+          ? decodedReference(parsed.target)
+          : null;
+      if (safeTarget && !isAborted?.()) {
+        const embedded = safeTarget.toLowerCase().startsWith('data:')
+          ? decodeDataStylesheet(safeTarget)
+          : null;
+        const importedCss =
+          embedded !== null
+            ? sanitizeCssTokens(tokenizeCss(embedded), baseURI, resolveResource, 1)
+            : safeTarget.toLowerCase().startsWith('data:')
+              ? null
+              : await resolveImport(safeTarget);
+        if (isAborted?.()) return null;
+        if (importedCss) {
+          const media = sanitizeCssTokens(parsed.mediaTokens, baseURI, resolveResource).trim();
+          output += media ? `@media ${media} {\n${importedCss}\n}` : importedCss;
+        }
+      }
+      continue;
+    }
+    index += 1;
+  }
+  if (chunkStart < tokens.length) {
+    output += sanitizeCssTokens(tokens.slice(chunkStart), baseURI, resolveResource);
+  }
   return output;
 }
 
@@ -1125,60 +1231,29 @@ async function resolveArchivedStylesheet(
   }
   if (typeof raw !== 'string' || options?.isAborted?.()) return null;
 
-  const baseURI = options?.baseURI;
-  const resolveResource: CssResourceResolver = (reference) =>
-    rewriteArchivedCssResource(reference, archive, stylesheetPath, sectionPath, options);
-  const tokens = tokenizeCss(raw);
-  let output = '';
-  let chunkStart = 0;
-  let index = 0;
-
-  while (index < tokens.length) {
-    const token = tokens[index]!;
-    if (token.type === 'at-keyword' && token.value.toLowerCase() === 'import') {
-      if (index > chunkStart) {
-        output += sanitizeCssTokens(tokens.slice(chunkStart, index), baseURI, resolveResource);
+  return sanitizeCssWithImports(
+    raw,
+    options?.baseURI,
+    (reference) =>
+      rewriteArchivedCssResource(reference, archive, stylesheetPath, sectionPath, options),
+    async (safeTarget) => {
+      const importedUrl = resolveArchiveUrl(safeTarget, stylesheetPath);
+      if (!importedUrl || visited.has(importedUrl.pathname) || budget.remaining <= 0) {
+        return null;
       }
-      const parsed = consumeCssImportStatement(tokens, index);
-      index = parsed.next;
-      chunkStart = index;
-
-      const safeTarget =
-        parsed.target !== null && isSafeEpubReference(parsed.target, 'stylesheet', baseURI)
-          ? decodedReference(parsed.target)
-          : null;
-      const importedUrl = safeTarget ? resolveArchiveUrl(safeTarget, stylesheetPath) : null;
-      if (
-        importedUrl &&
-        !visited.has(importedUrl.pathname) &&
-        budget.remaining > 0 &&
-        !options?.isAborted?.()
-      ) {
-        budget.remaining -= 1;
-        const importedCss = await resolveArchivedStylesheet(
-          archive,
-          importedUrl.pathname,
-          sectionPath,
-          new Set([...visited, importedUrl.pathname]),
-          depth + 1,
-          budget,
-          options,
-        );
-        if (options?.isAborted?.()) return null;
-        if (importedCss) {
-          const media = sanitizeCssTokens(parsed.mediaTokens, baseURI, resolveResource).trim();
-          output += media ? `@media ${media} {\n${importedCss}\n}` : importedCss;
-        }
-      }
-      continue;
-    }
-    index += 1;
-  }
-
-  if (chunkStart < tokens.length) {
-    output += sanitizeCssTokens(tokens.slice(chunkStart), baseURI, resolveResource);
-  }
-  return output;
+      budget.remaining -= 1;
+      return resolveArchivedStylesheet(
+        archive,
+        importedUrl.pathname,
+        sectionPath,
+        new Set([...visited, importedUrl.pathname]),
+        depth + 1,
+        budget,
+        options,
+      );
+    },
+    options?.isAborted,
+  );
 }
 
 async function loadArchivedStylesheet(
@@ -1207,10 +1282,90 @@ async function loadArchivedStylesheet(
   );
 }
 
+const FORBIDDEN_EPUB_ELEMENTS = new Set([
+  'animate',
+  'animatemotion',
+  'animatetransform',
+  'applet',
+  'embed',
+  'foreignobject',
+  'form',
+  'frame',
+  'frameset',
+  'handler',
+  'iframe',
+  'noembed',
+  'noframes',
+  'noscript',
+  'object',
+  'parsererror',
+  'plaintext',
+  'portal',
+  'script',
+  'set',
+  'sourcetext',
+  'template',
+  'textarea',
+  'xmp',
+]);
+
+function sanitizeXmlToHtmlHazards(document: Document): void {
+  if (document.documentElement?.localName.toLowerCase() === 'parsererror') {
+    const cleanHtml = document.createElementNS('http://www.w3.org/1999/xhtml', 'html');
+    cleanHtml.appendChild(document.createElementNS('http://www.w3.org/1999/xhtml', 'head'));
+    cleanHtml.appendChild(document.createElementNS('http://www.w3.org/1999/xhtml', 'body'));
+    document.replaceChild(cleanHtml, document.documentElement);
+  }
+  const doctype = document.doctype;
+  if (doctype && new XMLSerializer().serializeToString(doctype) !== '<!DOCTYPE html>') {
+    doctype.parentNode?.replaceChild(
+      document.implementation.createDocumentType('html', '', ''),
+      doctype,
+    );
+  }
+
+  const walker = document.createTreeWalker(
+    document,
+    NodeFilter.SHOW_COMMENT |
+      NodeFilter.SHOW_PROCESSING_INSTRUCTION |
+      NodeFilter.SHOW_CDATA_SECTION,
+  );
+  const unsafeNodes: Node[] = [];
+  let current = walker.nextNode();
+  while (current) {
+    unsafeNodes.push(current);
+    current = walker.nextNode();
+  }
+  for (const node of unsafeNodes) {
+    if (node.nodeType === Node.CDATA_SECTION_NODE) {
+      node.parentNode?.replaceChild(document.createTextNode(node.nodeValue ?? ''), node);
+    } else {
+      node.parentNode?.removeChild(node);
+    }
+  }
+}
+
+function getAttributeCaseInsensitive(element: Element, targetName: string): string | null {
+  const direct = element.getAttribute(targetName);
+  if (direct !== null) return direct;
+  for (const attribute of element.attributes) {
+    if (
+      attribute.name.toLowerCase() === targetName ||
+      attribute.localName.toLowerCase() === targetName
+    ) {
+      return attribute.value;
+    }
+  }
+  return null;
+}
+
 function isStylesheetLink(element: Element): element is HTMLLinkElement {
   return (
-    element.localName === 'link' &&
-    (element.getAttribute('rel') ?? '').toLowerCase().split(/\s+/).includes('stylesheet')
+    element.localName.toLowerCase() === 'link' &&
+    (getAttributeCaseInsensitive(element, 'rel') ?? '')
+      .toLowerCase()
+      .split(/\s+/)
+      .includes('stylesheet')
   );
 }
 
@@ -1219,10 +1374,10 @@ async function sanitizeStylesheets(
   cache: StylesheetCache,
   resolveStylesheet?: StylesheetResolver | undefined,
 ): Promise<void> {
-  const links = [...document.querySelectorAll<HTMLLinkElement>('link')].filter(isStylesheetLink);
+  const links = [...document.querySelectorAll('*')].filter(isStylesheetLink);
   await Promise.all(
     links.map(async (link) => {
-      const href = link.getAttribute('href') ?? '';
+      const href = getAttributeCaseInsensitive(link, 'href') ?? '';
       if (!href) {
         link.remove();
         return;
@@ -1237,7 +1392,7 @@ async function sanitizeStylesheets(
           : isLocalContentUrl(href, document)
             ? await loadLocalStylesheet(new URL(href, document.baseURI), cache)
             : null;
-      if (stylesheet) {
+      if (stylesheet?.trim()) {
         const style = createEpubElement(document, 'style');
         style.textContent = stylesheet;
         placeholder.replaceWith(style);
@@ -1251,16 +1406,19 @@ async function sanitizeStylesheets(
 function installEpubContentPolicy(document: Document): void {
   const head =
     document.head ??
-    document.querySelector('head') ??
+    [...document.documentElement.children].find(
+      (element) => element.localName.toLowerCase() === 'head',
+    ) ??
     document.documentElement.insertBefore(
       createEpubElement(document, 'head'),
       document.documentElement.firstChild,
     );
   const existing = [...head.children].find(
     (element) =>
-      element.localName === 'meta' &&
-      element.getAttribute('http-equiv')?.toLowerCase() === 'content-security-policy' &&
-      element.getAttribute('content') === EPUB_CONTENT_SECURITY_POLICY,
+      element.localName.toLowerCase() === 'meta' &&
+      getAttributeCaseInsensitive(element, 'http-equiv')?.toLowerCase() ===
+        'content-security-policy' &&
+      getAttributeCaseInsensitive(element, 'content') === EPUB_CONTENT_SECURITY_POLICY,
   );
   if (existing) {
     if (head.firstElementChild !== existing) head.prepend(existing);
@@ -1282,71 +1440,16 @@ function isSafeBaseReference(value: string, document: Document): boolean {
 }
 
 function stripReservedEpubStyleIds(document: Document): void {
-  document.querySelectorAll<HTMLElement>('[id]').forEach((element) => {
-    if (element.id.startsWith(EPUBJS_THEME_STYLE_PREFIX)) {
-      element.removeAttribute('id');
+  document.querySelectorAll<HTMLElement>('*').forEach((element) => {
+    for (const attribute of [...element.attributes]) {
+      if (
+        (attribute.name.toLowerCase() === 'id' || attribute.localName.toLowerCase() === 'id') &&
+        attribute.value.startsWith(EPUBJS_THEME_STYLE_PREFIX)
+      ) {
+        element.removeAttribute(attribute.name);
+      }
     }
   });
-}
-
-async function sanitizeStyleBlockCss(
-  value: string,
-  document: Document,
-  resolveStylesheet?: StylesheetResolver | undefined,
-): Promise<string> {
-  if (!resolveStylesheet) {
-    return sanitizeCss(value, document.baseURI);
-  }
-  const tokens = tokenizeCss(value);
-  const resolveResource: CssResourceResolver = (reference) =>
-    defaultCssResourceResolver(reference, document.baseURI);
-  if (
-    !tokens.some((token) => token.type === 'at-keyword' && token.value.toLowerCase() === 'import')
-  ) {
-    return sanitizeCssTokens(tokens, document.baseURI, resolveResource);
-  }
-  let output = '';
-  let chunkStart = 0;
-  let index = 0;
-  while (index < tokens.length) {
-    const token = tokens[index]!;
-    if (token.type === 'at-keyword' && token.value.toLowerCase() === 'import') {
-      if (index > chunkStart) {
-        output += sanitizeCssTokens(
-          tokens.slice(chunkStart, index),
-          document.baseURI,
-          resolveResource,
-        );
-      }
-      const parsed = consumeCssImportStatement(tokens, index);
-      index = parsed.next;
-      chunkStart = index;
-      const safeTarget =
-        parsed.target !== null && isSafeEpubReference(parsed.target, 'stylesheet', document.baseURI)
-          ? decodedReference(parsed.target)
-          : null;
-      if (safeTarget) {
-        const embedded = decodeDataStylesheet(safeTarget);
-        const importedCss = embedded
-          ? sanitizeCss(embedded, document.baseURI)
-          : await resolveStylesheet(safeTarget, document);
-        if (importedCss) {
-          const media = sanitizeCssTokens(
-            parsed.mediaTokens,
-            document.baseURI,
-            resolveResource,
-          ).trim();
-          output += media ? `@media ${media} {\n${importedCss}\n}` : importedCss;
-        }
-      }
-      continue;
-    }
-    index += 1;
-  }
-  if (chunkStart < tokens.length) {
-    output += sanitizeCssTokens(tokens.slice(chunkStart), document.baseURI, resolveResource);
-  }
-  return output;
 }
 
 export async function sanitizeEpubDocument(
@@ -1354,33 +1457,69 @@ export async function sanitizeEpubDocument(
   stylesheetCache: StylesheetCache = new Map(),
   resolveStylesheet?: StylesheetResolver | undefined,
 ): Promise<void> {
+  sanitizeXmlToHtmlHazards(document);
   let seenSafeBase = false;
-  document.querySelectorAll('base').forEach((base) => {
-    const href = base.getAttribute('href') ?? '';
-    if (seenSafeBase || !isSafeBaseReference(href, document)) {
-      base.remove();
+  let seenPolicy = false;
+  document.querySelectorAll<HTMLElement>('*').forEach((element) => {
+    if (!element.isConnected) return;
+    const tag = element.localName.toLowerCase();
+    if (FORBIDDEN_EPUB_ELEMENTS.has(tag)) {
+      element.remove();
       return;
     }
-    seenSafeBase = true;
-  });
-  let seenPolicy = false;
-  document
-    .querySelectorAll('script, iframe, object, embed, form, meta[http-equiv]')
-    .forEach((node) => {
-      if (
-        !seenPolicy &&
-        node.localName === 'meta' &&
-        node.parentElement?.localName === 'head' &&
-        node.getAttribute('http-equiv')?.toLowerCase() === 'content-security-policy' &&
-        node.getAttribute('content') === EPUB_CONTENT_SECURITY_POLICY
+    if (tag === 'title') {
+      const titleText = element.textContent ?? '';
+      if (!titleText) {
+        element.remove();
+      } else if (element.localName !== 'title') {
+        const ns = element.namespaceURI;
+        const normalizedTitle = ns
+          ? document.createElementNS(ns, 'title')
+          : document.createElement('title');
+        normalizedTitle.textContent = titleText;
+        element.replaceWith(normalizedTitle);
+      } else if (
+        element.childNodes.length !== 1 ||
+        element.firstChild?.nodeType !== Node.TEXT_NODE
       ) {
-        seenPolicy = true;
+        element.textContent = titleText;
+      }
+      return;
+    }
+    if (tag === 'base') {
+      const href = getAttributeCaseInsensitive(element, 'href') ?? '';
+      if (seenSafeBase || !isSafeBaseReference(href, document)) {
+        element.remove();
+      } else {
+        seenSafeBase = true;
+      }
+      return;
+    }
+    if (tag === 'meta') {
+      const httpEquiv = getAttributeCaseInsensitive(element, 'http-equiv');
+      if (httpEquiv !== null) {
+        if (
+          !seenPolicy &&
+          element.parentElement?.localName.toLowerCase() === 'head' &&
+          httpEquiv.toLowerCase() === 'content-security-policy' &&
+          getAttributeCaseInsensitive(element, 'content') === EPUB_CONTENT_SECURITY_POLICY
+        ) {
+          seenPolicy = true;
+          return;
+        }
+        element.remove();
         return;
       }
-      node.remove();
-    });
+      if (getAttributeCaseInsensitive(element, 'name')?.toLowerCase() === 'referrer') {
+        element.remove();
+        return;
+      }
+    }
+    if (tag === 'link' && !isStylesheetLink(element)) {
+      element.remove();
+      return;
+    }
 
-  document.querySelectorAll<HTMLElement>('*').forEach((element) => {
     for (const attribute of [...element.attributes]) {
       const name = attribute.name.toLowerCase();
       const localName = attribute.localName.toLowerCase();
@@ -1388,7 +1527,10 @@ export async function sanitizeEpubDocument(
         name.startsWith('on') ||
         localName.startsWith('on') ||
         name === 'ping' ||
-        localName === 'ping'
+        localName === 'ping' ||
+        name === 'srcdoc' ||
+        localName === 'srcdoc' ||
+        name === 'xml:base'
       ) {
         element.removeAttribute(attribute.name);
         continue;
@@ -1410,12 +1552,11 @@ export async function sanitizeEpubDocument(
         else element.removeAttribute(attribute.name);
         continue;
       }
-      if (element.localName === 'base' && (name === 'href' || localName === 'href')) continue;
       if (!RESOURCE_ATTRIBUTES.has(name) && !RESOURCE_ATTRIBUTES.has(localName)) continue;
       const isHref = name === 'href' || localName === 'href';
-      const isStylesheet = isHref && isStylesheetLink(element);
+      const isStylesheet = isHref && tag === 'link';
       const kind =
-        isHref && ['a', 'area'].includes(element.localName)
+        isHref && (tag === 'a' || tag === 'area')
           ? 'link'
           : isStylesheet
             ? 'stylesheet'
@@ -1427,15 +1568,41 @@ export async function sanitizeEpubDocument(
     }
   });
 
-  const inlineStyles = [...document.querySelectorAll('style')];
+  const inlineStyles = [...document.querySelectorAll('*')].filter(
+    (element): element is HTMLElement => element.localName.toLowerCase() === 'style',
+  );
   await Promise.all(
     inlineStyles.map(async (style) => {
       const currentStyle = style.textContent ?? '';
-      if (style.id.startsWith(EPUBJS_THEME_STYLE_PREFIX) && !currentStyle.trim()) {
+      const styleId = getAttributeCaseInsensitive(style, 'id') ?? '';
+      if (styleId.startsWith(EPUBJS_THEME_STYLE_PREFIX) && !currentStyle.trim()) {
+        if (style.childNodes.length === 0) style.textContent = ' ';
         return;
       }
-      const safeStyle = await sanitizeStyleBlockCss(currentStyle, document, resolveStylesheet);
-      if (safeStyle !== currentStyle) {
+      const safeStyle = resolveStylesheet
+        ? ((await sanitizeCssWithImports(
+            currentStyle,
+            document.baseURI,
+            (reference) => defaultCssResourceResolver(reference, document.baseURI),
+            (safeTarget) => resolveStylesheet(safeTarget, document),
+          )) ?? '')
+        : sanitizeCss(currentStyle, document.baseURI);
+      if (!safeStyle.trim()) {
+        style.remove();
+      } else if (style.localName !== 'style') {
+        const ns = style.namespaceURI;
+        const normalizedStyle = ns
+          ? document.createElementNS(ns, 'style')
+          : createEpubElement(document, 'style');
+        const media = getAttributeCaseInsensitive(style, 'media');
+        if (media) normalizedStyle.setAttribute('media', media);
+        normalizedStyle.textContent = safeStyle;
+        style.replaceWith(normalizedStyle);
+      } else if (
+        safeStyle !== currentStyle ||
+        style.childNodes.length !== 1 ||
+        style.firstChild?.nodeType !== Node.TEXT_NODE
+      ) {
         style.textContent = safeStyle;
       }
     }),
@@ -1473,29 +1640,39 @@ function toAsyncSafeSpineHookFn(
 export interface EpubSpineSanitizerOptions {
   isAborted?: (() => boolean) | undefined;
   onError?: ((error: Error) => void) | undefined;
-  onInstalled?:
-    | ((installation: { contentHook: EpubSpineContentHook; hookTask: AnySpineHookFn }) => void)
-    | undefined;
   sanitizedDocuments?: WeakSet<Document> | undefined;
+}
+
+export interface InstalledEpubSpineSanitizer {
+  contentHook: EpubSpineContentHook;
+  hookTask: AnySpineHookFn;
 }
 
 export function registerEpubSpineSanitizer(
   book: EpubBookLike,
   stylesheetCache: StylesheetCache = new Map(),
   options?: EpubSpineSanitizerOptions | undefined,
-): boolean {
-  const contentHook = book.spine?.hooks?.content;
+): InstalledEpubSpineSanitizer {
+  const toRegistrationError = (error: unknown, fallbackMessage: string): Error => {
+    const normalized = normalizeError(error, fallbackMessage);
+    options?.onError?.(normalized);
+    return normalized;
+  };
+
+  if (!book || typeof book !== 'object' || !book.spine || typeof book.spine !== 'object') {
+    throw toRegistrationError(null, 'EPUB spine content sanitizer hook is unavailable.');
+  }
+  const hooks = book.spine.hooks;
+  const contentHook = hooks && typeof hooks === 'object' ? hooks.content : undefined;
   if (
     !contentHook ||
     typeof contentHook !== 'object' ||
     typeof contentHook.register !== 'function'
   ) {
-    options?.onError?.(new Error('EPUB spine content sanitizer hook is unavailable.'));
-    return false;
+    throw toRegistrationError(null, 'EPUB spine content sanitizer hook is unavailable.');
   }
   if (contentHook.trigger !== undefined && typeof contentHook.trigger !== 'function') {
-    options?.onError?.(new Error('EPUB spine content trigger hook is invalid.'));
-    return false;
+    throw toRegistrationError(null, 'EPUB spine content trigger hook is invalid.');
   }
 
   const sanitizedDocuments = options?.sanitizedDocuments ?? new WeakSet<Document>();
@@ -1561,15 +1738,11 @@ export function registerEpubSpineSanitizer(
     if (typeof contentHook.list === 'function') {
       const registered = contentHook.list();
       if (!Array.isArray(registered) || !registered.includes(wrappedSanitize)) {
-        options?.onError?.(new Error('EPUB spine content sanitizer hook failed to register.'));
-        return false;
+        throw new Error('EPUB spine content sanitizer hook failed to register.');
       }
     }
   } catch (error) {
-    options?.onError?.(
-      normalizeError(error, 'EPUB spine content sanitizer hook registration failed.'),
-    );
-    return false;
+    throw toRegistrationError(error, 'EPUB spine content sanitizer hook registration failed.');
   }
 
   contentHook.register = function (this: unknown, ...entries: unknown[]): void {
@@ -1628,8 +1801,7 @@ export function registerEpubSpineSanitizer(
     };
   }
 
-  options?.onInstalled?.({ contentHook, hookTask: wrappedSanitize });
-  return true;
+  return { contentHook, hookTask: wrappedSanitize };
 }
 
 const interceptedBookProperties = new WeakMap<object, Map<string, (value: unknown) => void>>();
@@ -1830,10 +2002,9 @@ export class ReaderSession {
     return this.spineSanitizerError;
   }
 
-  private installSpineSanitizerOnBookTarget(targetBook: EpubBookLike): {
-    contentHook: EpubSpineContentHook;
-    hookTask: AnySpineHookFn;
-  } | null {
+  private installSpineSanitizerOnBookTarget(
+    targetBook: EpubBookLike,
+  ): InstalledEpubSpineSanitizer | null {
     const contentHook = targetBook.spine?.hooks?.content;
     if (contentHook && typeof contentHook === 'object') {
       const existingTask = this.patchedSpineHooks.get(contentHook);
@@ -1852,27 +2023,20 @@ export class ReaderSession {
       }
     }
 
-    let installed: { contentHook: EpubSpineContentHook; hookTask: AnySpineHookFn } | null = null;
-    const registered = registerEpubSpineSanitizer(targetBook, this.stylesheetCache, {
-      isAborted: () => this.destroyed && this.spineSanitizerError === null,
-      sanitizedDocuments: this.sanitizedDocuments,
-      onError: (error) => {
-        this.recordSpineSanitizerFailure(error, false);
-      },
-      onInstalled: (record) => {
-        installed = record;
-        this.patchedSpineHooks.set(record.contentHook, record.hookTask);
-      },
-    });
-    if (!registered || !installed) {
-      this.recordSpineSanitizerFailure(
-        this.spineSanitizerError ??
-          new Error('EPUB spine content sanitizer hook could not be installed.'),
-        true,
-      );
+    try {
+      const installed = registerEpubSpineSanitizer(targetBook, this.stylesheetCache, {
+        isAborted: () => this.destroyed && this.spineSanitizerError === null,
+        sanitizedDocuments: this.sanitizedDocuments,
+        onError: (error) => {
+          this.recordSpineSanitizerFailure(error, false);
+        },
+      });
+      this.patchedSpineHooks.set(installed.contentHook, installed.hookTask);
+      return installed;
+    } catch (error) {
+      this.recordSpineSanitizerFailure(error, true);
       return null;
     }
-    return installed;
   }
 
   private installSpineSanitizer(book: EpubBookLike): void {
@@ -2009,172 +2173,177 @@ export class ReaderSession {
       });
       this.observeViewport(target);
       this.bindEpubContainer();
-      this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
-      if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
-        this.unloadedHookRegistered = true;
-        this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
-          if (view?.contents) this.cleanupContents(view.contents);
-        });
-      }
-      if (onSelection) {
-        this.rendition.hooks.content.register((contents: Contents) => {
-          this.registerContentFocusAndLinks(contents);
-          let tabKeyActive = false;
-          let blurredByTab = false;
-          let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
+    } catch (error) {
+      this.destroy();
+      throw error;
+    }
+    this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
+    if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
+      this.unloadedHookRegistered = true;
+      this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
+        if (view?.contents) this.cleanupContents(view.contents);
+      });
+    }
+    if (onSelection) {
+      this.rendition.hooks.content.register((contents: Contents) => {
+        this.registerContentFocusAndLinks(contents);
+        let tabKeyActive = false;
+        let blurredByTab = false;
+        let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-          const clearTabTimer = () => {
-            if (tabResetTimer !== null) {
-              clearTimeout(tabResetTimer);
+        const clearTabTimer = () => {
+          if (tabResetTimer !== null) {
+            clearTimeout(tabResetTimer);
+            tabResetTimer = null;
+          }
+        };
+        const handleKeydown = (event: KeyboardEvent) => {
+          if (event.key === 'Tab') {
+            tabKeyActive = true;
+            clearTabTimer();
+            tabResetTimer = setTimeout(() => {
               tabResetTimer = null;
-            }
-          };
-          const handleKeydown = (event: KeyboardEvent) => {
-            if (event.key === 'Tab') {
-              tabKeyActive = true;
-              clearTabTimer();
-              tabResetTimer = setTimeout(() => {
-                tabResetTimer = null;
-                tabKeyActive = false;
-              }, 0);
-            } else {
-              clearTabTimer();
               tabKeyActive = false;
-              blurredByTab = false;
-            }
-          };
-          const handleWindowBlur = () => {
-            if (tabKeyActive) blurredByTab = true;
-          };
-          const handleFocusOut = (event: FocusEvent) => {
-            if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
-          };
-          const clearBlurGuard = () => {
+            }, 0);
+          } else {
             clearTabTimer();
             tabKeyActive = false;
             blurredByTab = false;
-          };
-          const handler = () => {
-            const selection = contents.window.getSelection();
-            const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
-            const text = hasRange ? normalizePassageText(selection!.toString()) : '';
-            if (!hasRange || !text) {
-              const frame = contents.window.frameElement as HTMLElement | null | undefined;
-              const frameLostFocus = frame
-                ? frame.ownerDocument.activeElement !== frame
-                : typeof contents.document.hasFocus === 'function'
-                  ? !contents.document.hasFocus()
-                  : false;
-              if (blurredByTab || (tabKeyActive && frameLostFocus)) {
-                return;
-              }
-              onSelection(null);
+          }
+        };
+        const handleWindowBlur = () => {
+          if (tabKeyActive) blurredByTab = true;
+        };
+        const handleFocusOut = (event: FocusEvent) => {
+          if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
+        };
+        const clearBlurGuard = () => {
+          clearTabTimer();
+          tabKeyActive = false;
+          blurredByTab = false;
+        };
+        const handler = () => {
+          const selection = contents.window.getSelection();
+          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+          if (!hasRange || !text) {
+            const frame = contents.window.frameElement as HTMLElement | null | undefined;
+            const frameLostFocus = frame
+              ? frame.ownerDocument.activeElement !== frame
+              : typeof contents.document.hasFocus === 'function'
+                ? !contents.document.hasFocus()
+                : false;
+            if (blurredByTab || (tabKeyActive && frameLostFocus)) {
               return;
             }
-            blurredByTab = false;
-            try {
-              onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
-            } catch {
-              // Selection can change while a section is being replaced.
-            }
-          };
-          contents.document.addEventListener('keydown', handleKeydown, true);
-          contents.document.addEventListener('focusout', handleFocusOut);
-          contents.document.addEventListener('focusin', clearBlurGuard);
-          contents.document.addEventListener('pointerdown', clearBlurGuard);
-          contents.document.addEventListener('mousedown', clearBlurGuard);
-          contents.document.addEventListener('selectionchange', handler);
-          contents.window.addEventListener?.('blur', handleWindowBlur);
-          contents.window.addEventListener?.('focus', clearBlurGuard);
-          this.addContentCleanup(contents, () => {
-            clearTabTimer();
-            contents.document.removeEventListener('keydown', handleKeydown, true);
-            contents.document.removeEventListener('focusout', handleFocusOut);
-            contents.document.removeEventListener('focusin', clearBlurGuard);
-            contents.document.removeEventListener('pointerdown', clearBlurGuard);
-            contents.document.removeEventListener('mousedown', clearBlurGuard);
-            contents.document.removeEventListener('selectionchange', handler);
-            contents.window.removeEventListener?.('blur', handleWindowBlur);
-            contents.window.removeEventListener?.('focus', clearBlurGuard);
-          });
+            onSelection(null);
+            return;
+          }
+          blurredByTab = false;
+          try {
+            onSelection({ cfi: contents.cfiFromRange(selection!.getRangeAt(0)), text });
+          } catch {
+            // Selection can change while a section is being replaced.
+          }
+        };
+        contents.document.addEventListener('keydown', handleKeydown, true);
+        contents.document.addEventListener('focusout', handleFocusOut);
+        contents.document.addEventListener('focusin', clearBlurGuard);
+        contents.document.addEventListener('pointerdown', clearBlurGuard);
+        contents.document.addEventListener('mousedown', clearBlurGuard);
+        contents.document.addEventListener('selectionchange', handler);
+        contents.window.addEventListener?.('blur', handleWindowBlur);
+        contents.window.addEventListener?.('focus', clearBlurGuard);
+        this.addContentCleanup(contents, () => {
+          clearTabTimer();
+          contents.document.removeEventListener('keydown', handleKeydown, true);
+          contents.document.removeEventListener('focusout', handleFocusOut);
+          contents.document.removeEventListener('focusin', clearBlurGuard);
+          contents.document.removeEventListener('pointerdown', clearBlurGuard);
+          contents.document.removeEventListener('mousedown', clearBlurGuard);
+          contents.document.removeEventListener('selectionchange', handler);
+          contents.window.removeEventListener?.('blur', handleWindowBlur);
+          contents.window.removeEventListener?.('focus', clearBlurGuard);
         });
+      });
+    }
+    this.onLocation = onLocation;
+    this.relocated = (location) => {
+      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const isUserNavigation =
+        this.userNavigationPending &&
+        this.userNavigationDispatched &&
+        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
+      if (startCfi !== location.start.cfi) onSelection?.(null);
+      this.current = location;
+      if (this.rendition && 'manager' in this.rendition) {
+        (this.rendition as { location?: Location }).location = location;
       }
-      this.onLocation = onLocation;
-      this.relocated = (location) => {
-        const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-        const isUserNavigation =
-          this.userNavigationPending &&
-          this.userNavigationDispatched &&
-          (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-        const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
-        const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-        if (startCfi !== location.start.cfi) onSelection?.(null);
-        this.current = location;
-        if (this.rendition && 'manager' in this.rendition) {
-          (this.rendition as { location?: Location }).location = location;
-        }
-        if (
-          isUserNavigation ||
-          (this.userNavigationDispatched &&
-            (this.userNavigationOrigin === 'link' || !this.reflowPending))
-        ) {
-          this.userNavigationPending = false;
-          this.userNavigationDispatched = false;
-          this.userNavigationStartCfi = null;
-          this.userNavigationOrigin = 'navigation';
-          this.pendingLinkReturnTarget = null;
-        }
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-        this.reportLocation(location, origin, returnTarget);
-        if (this.reflowPending) {
-          this.reflowPending = false;
-          this.preserveCfi(location.start.cfi, this.locationGeneration);
-        }
-      };
-      this.rendition.on('relocated', this.relocated);
-      this.renderedListener = () => {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-      };
-      this.resizedListener = () => {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-      };
-      this.rendition.on('rendered', this.renderedListener);
-      this.rendition.on('resized', this.resizedListener);
-      this.contentClick = (event, contents) => {
-        const eventTarget = event.target as Element | null;
-        const selection = contents.window.getSelection();
-        if (selection && !selection.isCollapsed) return;
-        const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
-        if (link) {
-          const href = link.getAttribute('href') ?? '';
-          if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
-          return;
-        }
-        if (
-          event.defaultPrevented ||
-          eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
-        ) {
-          return;
-        }
-        const frame = contents.window.frameElement;
-        const viewport = target.getBoundingClientRect();
-        if (!frame || viewport.width === 0) return;
-        // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
-        const position =
-          (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
-        onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
-      };
-      this.rendition.on('click', this.contentClick);
-      if (onKeyboardNavigation) {
-        this.keyboardNavigation = onKeyboardNavigation;
-        this.rendition.on('keydown', this.keyboardNavigation);
+      if (
+        isUserNavigation ||
+        (this.userNavigationDispatched &&
+          (this.userNavigationOrigin === 'link' || !this.reflowPending))
+      ) {
+        this.userNavigationPending = false;
+        this.userNavigationDispatched = false;
+        this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
+        this.pendingLinkReturnTarget = null;
       }
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+      this.reportLocation(location, origin, returnTarget);
+      if (this.reflowPending) {
+        this.reflowPending = false;
+        this.preserveCfi(location.start.cfi, this.locationGeneration);
+      }
+    };
+    this.rendition.on('relocated', this.relocated);
+    this.renderedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.resizedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.rendition.on('rendered', this.renderedListener);
+    this.rendition.on('resized', this.resizedListener);
+    this.contentClick = (event, contents) => {
+      const eventTarget = event.target as Element | null;
+      const selection = contents.window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
+      if (link) {
+        const href = link.getAttribute('href') ?? '';
+        if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
+        return;
+      }
+      if (
+        event.defaultPrevented ||
+        eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
+      ) {
+        return;
+      }
+      const frame = contents.window.frameElement;
+      const viewport = target.getBoundingClientRect();
+      if (!frame || viewport.width === 0) return;
+      // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
+      const position =
+        (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
+      onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
+    };
+    this.rendition.on('click', this.contentClick);
+    if (onKeyboardNavigation) {
+      this.keyboardNavigation = onKeyboardNavigation;
+      this.rendition.on('keydown', this.keyboardNavigation);
+    }
+    try {
       this.applyAppearance(appearance);
       const restoreGeneration = this.beginLocationOperation(false);
       await Promise.race([
@@ -2627,26 +2796,22 @@ export class ReaderSession {
         reject: () => {},
         promise: Promise.resolve(),
       };
-      destroyedBook.loaded ??= {
-        manifest: Promise.resolve(),
-        spine: Promise.resolve(),
-        metadata: Promise.resolve(),
-        cover: Promise.resolve(),
-        navigation: Promise.resolve(),
-        pageList: Promise.resolve(),
-        resources: Promise.resolve(),
-        displayOptions: Promise.resolve(),
-      };
-      destroyedBook.loading ??= {
-        manifest: noopDeferred,
-        spine: noopDeferred,
-        metadata: noopDeferred,
-        cover: noopDeferred,
-        navigation: noopDeferred,
-        pageList: noopDeferred,
-        resources: noopDeferred,
-        displayOptions: noopDeferred,
-      };
+      const bookStageKeys = [
+        'manifest',
+        'spine',
+        'metadata',
+        'cover',
+        'navigation',
+        'pageList',
+        'resources',
+        'displayOptions',
+      ] as const;
+      destroyedBook.loaded ??= Object.fromEntries(
+        bookStageKeys.map((stage) => [stage, Promise.resolve()]),
+      );
+      destroyedBook.loading ??= Object.fromEntries(
+        bookStageKeys.map((stage) => [stage, noopDeferred]),
+      );
       destroyedBook.opening = noopDeferred;
     }
   }
@@ -2932,7 +3097,7 @@ export class ReaderSession {
   private syncPublisherStyles(document: Document, enabled: boolean): void {
     document.querySelectorAll<HTMLElement>('style, link').forEach((node) => {
       const isAuthorStyle =
-        node.localName === 'style'
+        node.localName.toLowerCase() === 'style'
           ? !node.id.startsWith(EPUBJS_THEME_STYLE_PREFIX)
           : isStylesheetLink(node);
       if (!isAuthorStyle) return;

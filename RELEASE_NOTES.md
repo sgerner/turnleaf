@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-- Fix EPUB relocation and viewport resize races during reader open
-- Abort EPUB open when pre-serialization spine sanitizer hook fails
-- Harden EPUB CSS token sanitization, fail-closed hooks, and scoped CSP
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
