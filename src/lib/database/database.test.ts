@@ -1107,6 +1107,158 @@ it('remaps browser lineage across chapter and series replacements and flags outd
   expect(rawPrefs['readerAnnotations:primary:43:102']).toContain('"note":"note"');
 });
 
+it('keeps same-title browser editions with different nonempty ISBNs separate without transferring local data', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  const oldEdition: BookRecord = {
+    ...existingBook,
+    id: 'primary:42:100',
+    serverId: 'primary',
+    seriesId: 42,
+    chapterId: 100,
+    title: 'Dune',
+    author: 'Frank Herbert',
+    series: 'Dune Chronicles',
+    pages: 412,
+    pagesRead: 150,
+    lastReadAt: updatedAt,
+    downloadPath: 'epubs/dune-first-edition.epub',
+    downloadStatus: 'available',
+    fileSize: 180_000,
+    remoteFileSize: 180_000,
+    downloadedBytes: 180_000,
+    downloadedPages: 412,
+    chapterKey: 'isbn:978-0-441-17271-9',
+  };
+  const oldBookmarkJson =
+    '[{"id":"bm-1","cfi":"epubcfi(/6/6)","href":"ch3.xhtml","percentage":0.36,"label":"Arrakis","savedAt":"2026-09-07T00:00:00.000Z"}]';
+  const oldAnnotationJson =
+    '[{"id":"an-1","cfi":"epubcfi(/6/6)","excerpt":"Fear is the mind-killer","note":"Litany","createdAt":"2026-09-07T00:00:00.000Z"}]';
+
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'primary' },
+      books: [oldEdition],
+      readingState: {
+        [oldEdition.id]: {
+          cfi: 'epubcfi(/6/6)',
+          xpath: '//body/DocFragment[3]/body/p[1]',
+          percentage: 0.36,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+          syncRevision: 2,
+        },
+      },
+      syncQueue: {
+        [oldEdition.id]: {
+          bookId: oldEdition.id,
+          serverId: 'primary',
+          payloadJson: JSON.stringify({
+            libraryId: 1,
+            seriesId: 42,
+            volumeId: 10,
+            chapterId: 100,
+            pageNum: 150,
+          }),
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 2,
+        },
+      },
+      preferences: {
+        [`readerBookmarks:${oldEdition.id}`]: oldBookmarkJson,
+        [`readerAnnotations:${oldEdition.id}`]: oldAnnotationJson,
+      },
+    }),
+  );
+
+  const newEdition: BookRecord = {
+    ...oldEdition,
+    id: 'primary:42:101',
+    chapterId: 101,
+    pages: 688,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 260_000,
+    remoteFileSize: 260_000,
+    downloadedBytes: null,
+    downloadedPages: null,
+    chapterKey: 'isbn:9780441013593',
+  };
+
+  const remapped = await reconcileBooks('primary', [newEdition]);
+  expect(remapped.size).toBe(0);
+
+  const books = await getBooks('primary');
+  expect(books).toHaveLength(2);
+  expect(books.find((item) => item.id === newEdition.id)).toMatchObject({
+    id: 'primary:42:101',
+    remoteAvailable: true,
+    pages: 688,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    downloadOutdated: false,
+    hasLocalData: false,
+    chapterKey: 'isbn:9780441013593',
+  });
+  expect(books.find((item) => item.id === oldEdition.id)).toMatchObject({
+    id: 'primary:42:100',
+    remoteAvailable: false,
+    pages: 412,
+    pagesRead: 150,
+    lastReadAt: updatedAt,
+    downloadPath: 'epubs/dune-first-edition.epub',
+    downloadStatus: 'available',
+    hasLocalData: true,
+    chapterKey: 'isbn:978-0-441-17271-9',
+  });
+
+  await expect(getReadingState(newEdition.id)).resolves.toBeNull();
+  await expect(getReadingState(oldEdition.id)).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/6)',
+    pendingSync: true,
+  });
+  await expect(getPendingSync('primary')).resolves.toEqual([]);
+
+  const saved = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    syncQueue: Record<string, unknown>;
+    preferences: Record<string, string>;
+  };
+  expect(saved.syncQueue[oldEdition.id]).toBeDefined();
+  expect(saved.syncQueue[newEdition.id]).toBeUndefined();
+  expect(saved.preferences[`readerBookmarks:${oldEdition.id}`]).toBe(oldBookmarkJson);
+  expect(saved.preferences[`readerAnnotations:${oldEdition.id}`]).toBe(oldAnnotationJson);
+  expect(saved.preferences[`readerBookmarks:${newEdition.id}`]).toBeUndefined();
+  expect(saved.preferences[`readerAnnotations:${newEdition.id}`]).toBeUndefined();
+
+  // Preserve title fallback when only one edition exists and the incoming replacement lacks an ISBN
+  await reconcileBooks('primary', []);
+  expect((await getBooks('primary')).map((item) => item.id)).toEqual([oldEdition.id]);
+  const fallbackRemap = await reconcileBooks('primary', [
+    {
+      ...newEdition,
+      id: 'primary:42:102',
+      chapterId: 102,
+      chapterKey: null,
+    },
+  ]);
+  expect(fallbackRemap).toEqual(new Map([['primary:42:100', 'primary:42:102']]));
+});
+
 it('retains vanished non-downloaded browser books that hold bookmarks or annotations', async () => {
   const storage = new MemoryStorage();
   Object.defineProperty(window, 'localStorage', {

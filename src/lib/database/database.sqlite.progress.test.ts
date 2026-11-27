@@ -1124,4 +1124,75 @@ describe('native progress transactions against SQLite', () => {
       pendingSync: true,
     });
   });
+
+  it('redirects concurrent saveLocalProgress calls queued with a stale book.id during reconcileBooks to the remapped row', async () => {
+    const database = await importDatabase();
+    const primaryServer = { ...server, id: 'primary' };
+    const initialBook = {
+      ...book,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      libraryId: 3,
+      seriesId: 42,
+      volumeId: 420,
+      chapterId: 100,
+      title: 'The Tombs of Atuan',
+      author: 'Ursula K. Le Guin',
+      series: 'Earthsea Cycle',
+      pages: 200,
+      chapterKey: 'isbn:9780689845369',
+    };
+    await database.saveServer(primaryServer);
+    await database.reconcileBooks('primary', [initialBook]);
+    await database.saveLocalProgress(initialBook, 'epubcfi(/6/4)', '/body/p[1]', 0.2);
+
+    let concurrentSave: Promise<void> | undefined;
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      // Reader turns a page with the pre-remap BookRecord while reconcileBooks is mid-transaction
+      concurrentSave = database.saveLocalProgress(
+        initialBook,
+        'epubcfi(/6/14)',
+        '//body/DocFragment[7]/body/p[3]',
+        0.75,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    const remapped = await database.reconcileBooks('primary', [
+      {
+        ...initialBook,
+        id: 'primary:43:102',
+        libraryId: 5,
+        seriesId: 43,
+        volumeId: 430,
+        chapterId: 102,
+      },
+    ]);
+    expect(remapped).toEqual(new Map([['primary:42:100', 'primary:43:102']]));
+    expect(concurrentSave).toBeDefined();
+    await concurrentSave;
+
+    expect(await database.getReadingState('primary:42:100')).toBeNull();
+    expect(await database.getReadingState('primary:43:102')).toMatchObject({
+      cfi: 'epubcfi(/6/14)',
+      xpath: '//body/DocFragment[7]/body/p[3]',
+      percentage: 0.75,
+      pendingSync: true,
+      syncRevision: 2,
+    });
+    const pending = await database.getPendingSync('primary');
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.bookId).toBe('primary:43:102');
+    expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+      libraryId: 5,
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      pageNum: 150,
+      bookScrollId: '//body/DocFragment[7]/body/p[3]',
+    });
+    expect(native.database?.prepare('PRAGMA foreign_key_check').all() ?? []).toEqual([]);
+  });
 });

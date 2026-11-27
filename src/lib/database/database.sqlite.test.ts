@@ -615,6 +615,177 @@ describe('native metadata transactions against SQLite', () => {
     expect(readBook(db, 'primary:42:101')).toBeUndefined();
   });
 
+  it('disqualifies title-and-author lineage matches when both SQLite rows have different nonempty ISBNs', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const updatedAt = '2026-09-08T12:00:00.000Z';
+    const oldEdition: BookRecord = {
+      ...baseBook,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      libraryId: 1,
+      seriesId: 42,
+      volumeId: 420,
+      chapterId: 100,
+      title: 'Dune',
+      author: 'Frank Herbert',
+      series: 'Dune Chronicles',
+      pages: 412,
+      pagesRead: 165,
+      lastReadAt: updatedAt,
+      downloadPath: 'epubs/dune-first-edition.epub',
+      downloadStatus: 'available',
+      fileSize: 180_000,
+      remoteFileSize: 180_000,
+      downloadedBytes: 180_000,
+      downloadedPages: 412,
+      chapterKey: 'isbn:978-0-441-17271-9',
+    };
+    await replaceBooksInTransaction(adapter, 'primary', [oldEdition], updatedAt);
+
+    db.prepare(
+      `INSERT INTO reading_state
+        (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+        VALUES (?, 'epubcfi(/6/8!/4/2/1:0)', '//body/DocFragment[4]/body/p[2]', 0.4, ?, 1, 2)`,
+    ).run(oldEdition.id, updatedAt);
+    db.prepare(
+      `INSERT INTO sync_queue
+        (book_id, payload_json, attempt_count, created_at, updated_at, revision)
+        VALUES (?, '{"libraryId":1,"seriesId":42,"volumeId":420,"chapterId":100,"pageNum":165}', 0, ?, ?, 2)`,
+    ).run(oldEdition.id, updatedAt, updatedAt);
+
+    const bookmarkJson =
+      '[{"id":"bm-1","cfi":"epubcfi(/6/8)","href":"ch4.xhtml","percentage":0.4,"label":"40%","savedAt":"2026-09-08T12:00:00.000Z"}]';
+    const annotationJson =
+      '[{"id":"an-1","cfi":"epubcfi(/6/8)","excerpt":"Arrakis","note":"Desert planet","createdAt":"2026-09-08T12:00:00.000Z"}]';
+    const historyJson =
+      '[{"id":"hist-1","cfi":"epubcfi(/6/8)","href":"ch4.xhtml","percentage":0.4,"label":"40%","savedAt":"2026-09-08T12:00:00.000Z"}]';
+    const insertPref = db.prepare(
+      'INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)',
+    );
+    insertPref.run(`readerBookmarks:${oldEdition.id}`, bookmarkJson, updatedAt);
+    insertPref.run(`readerAnnotations:${oldEdition.id}`, annotationJson, updatedAt);
+    insertPref.run(`readerHistory:${oldEdition.id}`, historyJson, updatedAt);
+
+    // Same-series replacement with same title & author, but a different nonempty ISBN
+    const sameSeriesNewEdition: BookRecord = {
+      ...oldEdition,
+      id: 'primary:42:101',
+      chapterId: 101,
+      volumeId: 421,
+      pages: 688,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 260_000,
+      remoteFileSize: 260_000,
+      downloadedBytes: null,
+      downloadedPages: null,
+      chapterKey: 'isbn:9780441013593',
+    };
+
+    const sameSeriesRemap = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [sameSeriesNewEdition],
+      '2026-09-09T00:00:00.000Z',
+    );
+    expect(sameSeriesRemap.size).toBe(0);
+
+    // Cross-series replacement with same title, author & series name, but a third distinct ISBN
+    const crossSeriesNewEdition: BookRecord = {
+      ...sameSeriesNewEdition,
+      id: 'primary:43:102',
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      chapterKey: 'isbn:9780593099322',
+    };
+    const crossSeriesRemap = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [crossSeriesNewEdition],
+      '2026-09-10T00:00:00.000Z',
+    );
+    expect(crossSeriesRemap.size).toBe(0);
+
+    expect(readBook(db, sameSeriesNewEdition.id)).toBeUndefined();
+    expect(readBook(db, oldEdition.id)).toMatchObject({
+      remote_available: 0,
+      pages: 412,
+      pages_read: 165,
+      download_path: 'epubs/dune-first-edition.epub',
+      download_status: 'available',
+      downloaded_bytes: 180_000,
+      downloaded_pages: 412,
+      chapter_key: 'isbn:978-0-441-17271-9',
+    });
+    expect(readBook(db, crossSeriesNewEdition.id)).toMatchObject({
+      remote_available: 1,
+      pages: 688,
+      pages_read: 0,
+      last_read_at: null,
+      download_path: null,
+      download_status: 'none',
+      downloaded_bytes: null,
+      downloaded_pages: null,
+      chapter_key: 'isbn:9780593099322',
+    });
+    expect(
+      db.prepare('SELECT * FROM reading_state WHERE book_id=?').get(oldEdition.id),
+    ).toBeDefined();
+    expect(
+      db.prepare('SELECT * FROM reading_state WHERE book_id=?').get(crossSeriesNewEdition.id),
+    ).toBeUndefined();
+    expect(db.prepare('SELECT * FROM sync_queue WHERE book_id=?').get(oldEdition.id)).toBeDefined();
+    expect(
+      db.prepare('SELECT * FROM sync_queue WHERE book_id=?').get(crossSeriesNewEdition.id),
+    ).toBeUndefined();
+    expect(
+      db
+        .prepare('SELECT value FROM preferences WHERE key=?')
+        .get(`readerBookmarks:${oldEdition.id}`),
+    ).toEqual({ value: bookmarkJson });
+    expect(
+      db
+        .prepare('SELECT value FROM preferences WHERE key=?')
+        .get(`readerAnnotations:${oldEdition.id}`),
+    ).toEqual({ value: annotationJson });
+    expect(
+      db.prepare('SELECT value FROM preferences WHERE key=?').get(`readerHistory:${oldEdition.id}`),
+    ).toEqual({ value: historyJson });
+    expect(
+      db
+        .prepare('SELECT key FROM preferences WHERE key LIKE ?')
+        .all(`%${crossSeriesNewEdition.id}%`),
+    ).toEqual([]);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+
+    // Title fallback remains active when only one edition exists and the incoming replacement lacks an ISBN
+    await reconcileBooksInTransaction(adapter, 'primary', [], '2026-09-11T00:00:00.000Z');
+    expect(readBook(db, crossSeriesNewEdition.id)).toBeUndefined();
+    expect(readBook(db, oldEdition.id)).toBeDefined();
+
+    const singleEditionFallback = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [
+        {
+          ...crossSeriesNewEdition,
+          id: 'primary:45:104',
+          seriesId: 45,
+          volumeId: 450,
+          chapterId: 104,
+          chapterKey: null,
+        },
+      ],
+      '2026-09-12T00:00:00.000Z',
+    );
+    expect(singleEditionFallback).toEqual(new Map([['primary:42:100', 'primary:45:104']]));
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
+
   it('retains non-downloaded unmapped books that hold only bookmarks or annotations', async () => {
     db = createDatabase();
     const adapter = createAdapter(db);
