@@ -10,7 +10,12 @@ type ExpectedPanelSpec = {
   heading: string;
   closeLabel: string;
   closeHandler:
-    'closeSettings' | 'closeToc' | 'closeSearch' | 'closeBookmarks' | 'closeAnnotations';
+    | 'closeSettings'
+    | 'closeToc'
+    | 'closeJump'
+    | 'closeSearch'
+    | 'closeBookmarks'
+    | 'closeAnnotations';
 };
 
 const EXPECTED_PANELS: readonly ExpectedPanelSpec[] = [
@@ -27,6 +32,13 @@ const EXPECTED_PANELS: readonly ExpectedPanelSpec[] = [
     heading: 'Contents',
     closeLabel: 'Close table of contents',
     closeHandler: 'closeToc',
+  },
+  {
+    panelId: 'reader-jump',
+    titleId: 'reader-jump-title',
+    heading: 'Go to page or percentage',
+    closeLabel: 'Close go to page or percentage',
+    closeHandler: 'closeJump',
   },
   {
     panelId: 'reader-search',

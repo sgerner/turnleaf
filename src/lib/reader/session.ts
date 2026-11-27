@@ -7,6 +7,16 @@ import {
 } from './search';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
 import {
+  createSwipeGestureTracker,
+  SWIPE_MAX_DRIFT_RATIO,
+  SWIPE_MIN_DISTANCE_PX,
+  type ReaderSwipeDirection,
+  type SwipeGestureTracker,
+  type SwipePointerEventLike,
+  type SwipeTouchEventLike,
+  type SwipeTouchPoint,
+} from './swipe';
+import {
   createSpineHrefLookup,
   matchSpineHref,
   resolveDisplayHref,
@@ -14,6 +24,16 @@ import {
   type TocItem,
 } from './toc';
 
+export {
+  createSwipeGestureTracker,
+  SWIPE_MAX_DRIFT_RATIO,
+  SWIPE_MIN_DISTANCE_PX,
+  type ReaderSwipeDirection,
+  type SwipeGestureTracker,
+  type SwipePointerEventLike,
+  type SwipeTouchEventLike,
+  type SwipeTouchPoint,
+};
 export type { TocItem } from './toc';
 
 export interface ReaderLocation {
@@ -28,7 +48,29 @@ export interface ReaderLocation {
 
 export type ReaderLinkReturnTarget = Pick<ReaderLocation, 'cfi' | 'href'>;
 
-export type ReaderLocationOrigin = 'link' | 'navigation' | 'restore';
+export type ReaderLocationOrigin = 'jump' | 'link' | 'navigation' | 'restore';
+
+export function resolveSpinePercentageTarget(
+  percentage: number,
+  sectionCount: number,
+): { sectionIndex: number; sectionProgress: number } | null {
+  if (!Number.isFinite(percentage) || sectionCount <= 0) return null;
+  const clamped = Math.max(0, Math.min(1, percentage));
+  if (clamped >= 1) {
+    return { sectionIndex: sectionCount - 1, sectionProgress: 1 };
+  }
+  const scaled = Math.max(0, Math.min(sectionCount - 1e-7, clamped * sectionCount + 1e-9));
+  const sectionIndex = Math.floor(scaled);
+  const sectionProgress = Math.max(0, Math.min(1, scaled - sectionIndex));
+  return { sectionIndex, sectionProgress };
+}
+
+export function resolveSectionPageIndex(sectionProgress: number, totalPages: number): number {
+  const safeTotal = Math.max(1, Math.floor(totalPages));
+  if (!Number.isFinite(sectionProgress) || sectionProgress <= 0) return 0;
+  if (sectionProgress >= 1) return safeTotal - 1;
+  return Math.max(0, Math.min(safeTotal - 1, Math.floor(sectionProgress * safeTotal + 1e-6)));
+}
 
 export interface ReaderSelection {
   cfi: string;
@@ -374,8 +416,15 @@ export class ReaderSession {
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
+  private contentTouchStart: ((event: TouchEvent, contents: Contents) => void) | null = null;
+  private contentTouchMove: ((event: TouchEvent, contents: Contents) => void) | null = null;
+  private contentTouchEnd: ((event: TouchEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
+  private cleanupViewportGestures: (() => void) | null = null;
+  private swipeTracker: SwipeGestureTracker | null = null;
   private current: Location | null = null;
+  private deferringRelocation = false;
+  private deferredRelocation: Location | null = null;
   private spine: {
     sections: SpineSection[];
     indexes: Map<string, number>;
@@ -408,6 +457,7 @@ export class ReaderSession {
         returnTarget?: ReaderLinkReturnTarget,
       ) => void)
     | null = null;
+  private onSelection: ((selection: ReaderSelection | null) => void) | undefined = undefined;
 
   private readonly handleContainerScroll = (): void => {
     const container = this.epubContainer;
@@ -439,6 +489,7 @@ export class ReaderSession {
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
+    onSwipe?: (direction: ReaderSwipeDirection) => void,
   ): Promise<void> {
     this.viewportTarget = target;
     this.rendition = this.book.renderTo(target, {
@@ -452,6 +503,23 @@ export class ReaderSession {
     });
     this.observeViewport(target);
     this.bindEpubContainer();
+    const swipeTracker = createSwipeGestureTracker((direction) => {
+      if (onSwipe) {
+        onSwipe(direction);
+        return;
+      }
+      if (direction === 'next') void this.next().catch(() => {});
+      else void this.previous().catch(() => {});
+    });
+    this.swipeTracker = swipeTracker;
+    const hasContentSelection = (contents?: Contents): boolean => {
+      const selection = contents?.window?.getSelection?.();
+      return Boolean(selection && !selection.isCollapsed);
+    };
+    const hasWindowSelection = (): boolean => {
+      const selection = typeof window !== 'undefined' ? window.getSelection?.() : null;
+      return Boolean(selection && !selection.isCollapsed);
+    };
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
     if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
       this.unloadedHookRegistered = true;
@@ -542,30 +610,41 @@ export class ReaderSession {
         });
       });
     }
+    this.rendition.hooks.content.register((contents: Contents) => {
+      const doc = contents?.document;
+      if (!doc?.addEventListener) return;
+      const onTouchCancel = () => swipeTracker.onTouchCancel();
+      const onPointerDown = (event: PointerEvent) =>
+        swipeTracker.onPointerDown(event, () => hasContentSelection(contents));
+      const onPointerMove = (event: PointerEvent) =>
+        swipeTracker.onPointerMove(event, () => hasContentSelection(contents));
+      const onPointerUp = (event: PointerEvent) =>
+        swipeTracker.onPointerUp(event, () => hasContentSelection(contents));
+      const onPointerCancel = (event: PointerEvent) => swipeTracker.onPointerCancel(event);
+      doc.addEventListener('touchcancel', onTouchCancel, { passive: true });
+      doc.addEventListener('pointerdown', onPointerDown, { passive: true });
+      doc.addEventListener('pointermove', onPointerMove, { passive: true });
+      doc.addEventListener('pointerup', onPointerUp, { passive: true });
+      doc.addEventListener('pointercancel', onPointerCancel, { passive: true });
+      this.addContentCleanup(contents, () => {
+        doc.removeEventListener?.('touchcancel', onTouchCancel);
+        doc.removeEventListener?.('pointerdown', onPointerDown);
+        doc.removeEventListener?.('pointermove', onPointerMove);
+        doc.removeEventListener?.('pointerup', onPointerUp);
+        doc.removeEventListener?.('pointercancel', onPointerCancel);
+      });
+    });
     this.onLocation = onLocation;
+    this.onSelection = onSelection;
     this.relocated = (location) => {
-      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-      const isUserNavigation =
-        this.userNavigationPending &&
-        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
-      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
-      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (startCfi !== location.start.cfi) onSelection?.(null);
-      this.current = location;
-      if (isUserNavigation || this.userNavigationOrigin === 'link') {
-        this.userNavigationPending = false;
-        this.userNavigationStartCfi = null;
-        this.userNavigationOrigin = 'navigation';
-        this.pendingLinkReturnTarget = null;
+      if (this.deferringRelocation) {
+        this.current = location;
+        this.deferredRelocation = location;
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        return;
       }
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.syncVisibleColumnLinks();
-      this.reportLocation(location, origin, returnTarget);
-      if (this.reflowPending) {
-        this.reflowPending = false;
-        this.preserveCfi(location.start.cfi, this.locationGeneration);
-      }
+      this.handleRelocated(location);
     };
     this.rendition.on('relocated', this.relocated);
     this.renderedListener = () => {
@@ -580,7 +659,24 @@ export class ReaderSession {
     };
     this.rendition.on('rendered', this.renderedListener);
     this.rendition.on('resized', this.resizedListener);
+    this.contentTouchStart = (event, contents) => {
+      swipeTracker.onTouchStart(event, () => hasContentSelection(contents));
+    };
+    this.contentTouchMove = (event, contents) => {
+      swipeTracker.onTouchMove(event, () => hasContentSelection(contents));
+    };
+    this.contentTouchEnd = (event, contents) => {
+      swipeTracker.onTouchEnd(event, () => hasContentSelection(contents));
+    };
+    this.rendition.on('touchstart', this.contentTouchStart);
+    this.rendition.on('touchmove', this.contentTouchMove);
+    this.rendition.on('touchend', this.contentTouchEnd);
+    this.attachViewportGestures(target, swipeTracker, hasWindowSelection);
     this.contentClick = (event, contents) => {
+      if (swipeTracker.consumeSuppressedClick()) {
+        event.preventDefault?.();
+        return;
+      }
       const eventTarget = event.target as Element | null;
       const selection = contents.window.getSelection();
       if (selection && !selection.isCollapsed) return;
@@ -849,6 +945,35 @@ export class ReaderSession {
     return this.displayPercentage(percentage, this.beginLocationOperation(false));
   }
 
+  async jumpToPercentage(percentage: number): Promise<boolean> {
+    if (!this.rendition || !Number.isFinite(percentage)) return false;
+    const generation = this.beginJumpOperation();
+    const moved = await this.displayPercentage(percentage, generation);
+    if (!moved && this.isCurrentLocationOperation(generation)) {
+      this.clearPendingUserNavigation();
+    }
+    return moved;
+  }
+
+  async jumpToPage(pageNumber: number): Promise<boolean> {
+    const rendition = this.rendition;
+    if (!rendition || !Number.isFinite(pageNumber) || pageNumber < 1) return false;
+    const generation = this.beginJumpOperation();
+    try {
+      const currentLocation = await this.resolveRenderedLocation();
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      const totalPages = Math.max(1, currentLocation?.start?.displayed?.total ?? 1);
+      const targetPageIndex = Math.max(0, Math.min(totalPages - 1, Math.floor(pageNumber) - 1));
+      await this.moveToSectionPage(targetPageIndex, totalPages, generation, true);
+      return this.isCurrentLocationOperation(generation);
+    } catch {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.clearPendingUserNavigation();
+      }
+      return false;
+    }
+  }
+
   applyAppearance(value: Appearance): void {
     const previous = this.appearance;
     this.appearance = { ...value };
@@ -944,8 +1069,18 @@ export class ReaderSession {
       this.rendition.off('rendered', this.renderedListener);
     if (this.rendition && this.resizedListener) this.rendition.off('resized', this.resizedListener);
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
+    if (this.rendition && this.contentTouchStart)
+      this.rendition.off('touchstart', this.contentTouchStart);
+    if (this.rendition && this.contentTouchMove)
+      this.rendition.off('touchmove', this.contentTouchMove);
+    if (this.rendition && this.contentTouchEnd)
+      this.rendition.off('touchend', this.contentTouchEnd);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
+    this.cleanupViewportGestures?.();
+    this.cleanupViewportGestures = null;
+    this.swipeTracker?.reset();
+    this.swipeTracker = null;
     this.rendition?.destroy();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -960,9 +1095,15 @@ export class ReaderSession {
     this.renderedListener = null;
     this.resizedListener = null;
     this.contentClick = null;
+    this.contentTouchStart = null;
+    this.contentTouchMove = null;
+    this.contentTouchEnd = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
+    this.onSelection = undefined;
     this.current = null;
+    this.deferringRelocation = false;
+    this.deferredRelocation = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
     this.highlightCfis.clear();
@@ -1420,15 +1561,218 @@ export class ReaderSession {
   private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
     if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
     const { sections } = this.getSpine();
-    if (!sections.length) return false;
-    const position = Math.max(0, Math.min(0.999, percentage));
-    const section = sections[Math.floor(position * sections.length)];
+    const target = resolveSpinePercentageTarget(percentage, sections.length);
+    if (!target) return false;
+    const section = sections[target.sectionIndex];
     if (!section) return false;
+
+    this.deferringRelocation = true;
+    this.deferredRelocation = null;
     try {
-      return await this.displayAtGeneration(section.href, generation);
+      if (!(await this.displayAtGeneration(section.href, generation))) return false;
+      const rendered = await this.resolveRenderedLocation(section.href);
+      if (!this.isCurrentLocationOperation(generation)) return false;
+      const totalPages = Math.max(1, rendered?.start?.displayed?.total ?? 1);
+      const targetPageIndex = resolveSectionPageIndex(target.sectionProgress, totalPages);
+      if (targetPageIndex > 0) {
+        const needsReportLocation =
+          this.deferredRelocation !== null || !(this.rendition && '_display' in this.rendition);
+        this.deferredRelocation = null;
+        this.deferringRelocation = false;
+        await this.moveToSectionPage(targetPageIndex, totalPages, generation, needsReportLocation);
+      }
+      return this.isCurrentLocationOperation(generation);
     } catch {
       return false;
+    } finally {
+      const pending = this.deferredRelocation;
+      this.deferringRelocation = false;
+      this.deferredRelocation = null;
+      if (pending && this.isCurrentLocationOperation(generation)) {
+        this.handleRelocated(pending);
+      }
     }
+  }
+
+  private async resolveRenderedLocation(expectedHref?: string): Promise<Location | null> {
+    const rendition = this.rendition as
+      | (Omit<Rendition, 'currentLocation'> & {
+          currentLocation?: () => Location | Promise<Location> | undefined;
+        })
+      | null;
+    if (!rendition) return null;
+    const matchesExpectedHref = (href: string): boolean => {
+      if (!expectedHref || href === expectedHref) return true;
+      const { hrefs } = this.getSpine();
+      return (
+        (matchSpineHref(href, hrefs) ?? href) ===
+        (matchSpineHref(expectedHref, hrefs) ?? expectedHref)
+      );
+    };
+    try {
+      const located = await Promise.resolve(rendition.currentLocation?.());
+      if (located?.start && matchesExpectedHref(located.start.href)) {
+        return located;
+      }
+    } catch {
+      // Fall back to the rendition's cached location if currentLocation fails.
+    }
+    if (rendition.location?.start && matchesExpectedHref(rendition.location.start.href)) {
+      return rendition.location;
+    }
+    if (this.current?.start && matchesExpectedHref(this.current.start.href)) {
+      return this.current;
+    }
+    return null;
+  }
+
+  private async moveToSectionPage(
+    targetPageIndex: number,
+    totalPages: number,
+    generation: number,
+    needsReportLocation: boolean,
+  ): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition || !this.isCurrentLocationOperation(generation)) return;
+
+    const current = await this.resolveRenderedLocation();
+    const currentPageIndex = current?.start ? this.pageIndex(current.start.displayed.page) : 0;
+    if (targetPageIndex === currentPageIndex) {
+      if (current && this.userNavigationPending) {
+        this.handleRelocated(current);
+      }
+      return;
+    }
+
+    const manager = (
+      rendition as unknown as {
+        manager?: {
+          layout?: { delta?: number };
+          views?: { first?: () => { width?: () => number } | undefined };
+          moveTo?: (offset: { left: number; top: number }, width?: number) => void;
+        };
+      }
+    ).manager;
+
+    const delta = manager?.layout?.delta ?? 0;
+    const moveTo = manager?.moveTo;
+    if (delta > 0 && typeof moveTo === 'function') {
+      await this.runDisplayOperation(async () => {
+        const viewWidth = manager?.views?.first?.()?.width?.() ?? totalPages * delta;
+        moveTo.call(manager, { left: targetPageIndex * delta, top: 0 }, viewWidth);
+        if (needsReportLocation) {
+          await rendition.reportLocation?.();
+        }
+      });
+      return;
+    }
+
+    const steps = targetPageIndex - currentPageIndex;
+    const stepFn = steps > 0 ? rendition.next?.bind(rendition) : rendition.prev?.bind(rendition);
+    if (!stepFn) return;
+
+    const stepCount = Math.abs(steps);
+    await this.runDisplayOperation(async () => {
+      for (let step = 0; step < stepCount; step += 1) {
+        if (!this.isCurrentLocationOperation(generation)) return;
+        const isLastStep = step === stepCount - 1;
+        this.deferringRelocation = !isLastStep;
+        this.deferredRelocation = null;
+        try {
+          await stepFn();
+        } finally {
+          this.deferringRelocation = false;
+          this.deferredRelocation = null;
+        }
+      }
+    });
+  }
+
+  private handleRelocated(location: Location): void {
+    const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+    const isUserNavigation =
+      this.userNavigationPending &&
+      (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+    const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+    const returnTarget =
+      origin === 'link' || origin === 'jump' ? this.pendingLinkReturnTarget : null;
+    if (startCfi !== location.start.cfi) this.onSelection?.(null);
+    this.current = location;
+    if (
+      isUserNavigation ||
+      this.userNavigationOrigin === 'link' ||
+      this.userNavigationOrigin === 'jump'
+    ) {
+      this.clearPendingUserNavigation();
+    }
+    const container = this.bindEpubContainer();
+    if (container) this.lockedScrollLeft = container.scrollLeft;
+    this.syncVisibleColumnLinks();
+    this.reportLocation(location, origin, returnTarget);
+    if (this.reflowPending) {
+      this.reflowPending = false;
+      this.preserveCfi(location.start.cfi, this.locationGeneration);
+    }
+  }
+
+  private attachViewportGestures(
+    target: HTMLElement,
+    swipeTracker: SwipeGestureTracker,
+    hasSelection: () => boolean,
+  ): void {
+    this.cleanupViewportGestures?.();
+    const onTouchStart = (event: TouchEvent) => swipeTracker.onTouchStart(event, hasSelection);
+    const onTouchMove = (event: TouchEvent) => swipeTracker.onTouchMove(event, hasSelection);
+    const onTouchEnd = (event: TouchEvent) => swipeTracker.onTouchEnd(event, hasSelection);
+    const onTouchCancel = () => swipeTracker.onTouchCancel();
+    const onPointerDown = (event: PointerEvent) => swipeTracker.onPointerDown(event, hasSelection);
+    const onPointerMove = (event: PointerEvent) => swipeTracker.onPointerMove(event, hasSelection);
+    const onPointerUp = (event: PointerEvent) => swipeTracker.onPointerUp(event, hasSelection);
+    const onPointerCancel = (event: PointerEvent) => swipeTracker.onPointerCancel(event);
+    const onClickCapture = (event: MouseEvent) => {
+      if (!swipeTracker.consumeSuppressedClick()) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    target.addEventListener('touchstart', onTouchStart, { passive: true });
+    target.addEventListener('touchmove', onTouchMove, { passive: true });
+    target.addEventListener('touchend', onTouchEnd, { passive: true });
+    target.addEventListener('touchcancel', onTouchCancel, { passive: true });
+    target.addEventListener('pointerdown', onPointerDown, { passive: true });
+    target.addEventListener('pointermove', onPointerMove, { passive: true });
+    target.addEventListener('pointerup', onPointerUp, { passive: true });
+    target.addEventListener('pointercancel', onPointerCancel, { passive: true });
+    target.addEventListener('click', onClickCapture, true);
+
+    this.cleanupViewportGestures = () => {
+      target.removeEventListener('touchstart', onTouchStart);
+      target.removeEventListener('touchmove', onTouchMove);
+      target.removeEventListener('touchend', onTouchEnd);
+      target.removeEventListener('touchcancel', onTouchCancel);
+      target.removeEventListener('pointerdown', onPointerDown);
+      target.removeEventListener('pointermove', onPointerMove);
+      target.removeEventListener('pointerup', onPointerUp);
+      target.removeEventListener('pointercancel', onPointerCancel);
+      target.removeEventListener('click', onClickCapture, true);
+    };
+  }
+
+  private clearPendingUserNavigation(): void {
+    this.userNavigationPending = false;
+    this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
+  }
+
+  private beginJumpOperation(): number {
+    const start = this.current?.start ?? this.rendition?.location?.start ?? null;
+    this.locationGeneration += 1;
+    this.userNavigationPending = true;
+    this.userNavigationOrigin = 'jump';
+    this.userNavigationStartCfi = start?.cfi ?? null;
+    this.pendingLinkReturnTarget = start ? { cfi: start.cfi, href: start.href } : null;
+    return this.locationGeneration;
   }
 
   private async navigate(display: () => Promise<unknown>): Promise<void> {

@@ -26,6 +26,7 @@
     type ReaderSelection,
     type TocItem,
   } from '../reader/session';
+  import { createSwipeGestureTracker, type ReaderSwipeDirection } from '../reader/swipe';
   import type { ReaderSearchResult } from '../reader/search';
   import {
     MAX_ANNOTATIONS,
@@ -72,6 +73,10 @@
     accept?: () => Promise<void>;
   };
 
+  type ActiveReturnTarget = ReaderLinkReturnTarget & {
+    origin: 'link' | 'jump';
+  };
+
   let {
     bookUrl,
     bookId,
@@ -114,12 +119,14 @@
   let bookmarksVisible = $state(false);
   let annotationsVisible = $state(false);
   let searchVisible = $state(false);
+  let jumpVisible = $state(false);
   let settingsPanel = $state<HTMLElement | null>(null);
   let tocPanel = $state<HTMLElement | null>(null);
   let tocScrollContainer = $state<HTMLElement | null>(null);
   let bookmarksPanel = $state<HTMLElement | null>(null);
   let annotationsPanel = $state<HTMLElement | null>(null);
   let searchPanel = $state<HTMLElement | null>(null);
+  let jumpPanel = $state<HTMLElement | null>(null);
   let syncConfirmationPanel = $state<HTMLElement | null>(null);
   let errorPanel = $state<HTMLElement | null>(null);
   let settingsOpener: HTMLElement | null = null;
@@ -127,6 +134,7 @@
   let bookmarksOpener: HTMLElement | null = null;
   let annotationsOpener: HTMLElement | null = null;
   let searchOpener: HTMLElement | null = null;
+  let jumpOpener: HTMLElement | null = null;
   let syncConfirmationOpener: HTMLElement | null = null;
   let errorOpener: HTMLElement | null = null;
   let errorRestoreReturnLink = false;
@@ -173,7 +181,13 @@
   let searchController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
-  let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
+  let linkReturnTarget = $state<ActiveReturnTarget | null>(null);
+  let pageJumpDraft = $state<string | number | null>(1);
+  let percentJumpDraft = $state<string | number | null>(0);
+  let jumpError = $state('');
+  let scrubPreviewPercent = $state<number | null>(null);
+  let scrubbingPointerActive = $state(false);
+  let lastInputCommittedPercent: number | null = null;
   let pendingSyncLocation = $state<SyncedLocation | null>(null);
   let error = $state('');
   let startupOpenFailed = $state(false);
@@ -245,21 +259,34 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
-        if (location?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
+        const previous = location;
+        if (previous?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
         location = next;
+        if (!scrubbingPointerActive) {
+          scrubPreviewPercent = null;
+        }
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
-        if (origin === 'link') {
-          linkReturnTarget = returnTarget ?? null;
+        if (origin === 'link' || origin === 'jump') {
+          const fallbackTarget =
+            previous && previous.cfi !== next.cfi
+              ? { cfi: previous.cfi, href: previous.href }
+              : null;
+          const resolvedTarget = returnTarget ?? fallbackTarget;
+          linkReturnTarget = resolvedTarget ? { ...resolvedTarget, origin } : null;
         } else if (origin === 'navigation') {
           linkReturnTarget = null;
         }
-        if (origin === 'navigation' || origin === 'link') {
+        if (origin === 'navigation' || origin === 'link' || origin === 'jump') {
           localNavigationDuringSession = true;
           onRelocated(next);
-          locationHistory = recordLocation(locationHistory, next);
+          let nextHistory = locationHistory;
+          if ((origin === 'link' || origin === 'jump') && previous && previous.cfi !== next.cfi) {
+            nextHistory = recordLocation(nextHistory, readerLocation(previous));
+          }
+          locationHistory = recordLocation(nextHistory, readerLocation(next));
           queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
-          if (origin === 'link') showControls();
+          if (origin === 'link' || origin === 'jump') showControls();
         }
       },
       (zone) => {
@@ -281,6 +308,7 @@
         }
       },
       handleKeyboardNavigation,
+      handleSwipeTurn,
     );
     if (!destroyed) {
       sessionReady = true;
@@ -384,6 +412,7 @@
     if (tocVirtualizationFrame !== null) window.cancelAnimationFrame(tocVirtualizationFrame);
     flushPendingPreferences();
     searchController?.abort();
+    shellSwipeTracker.reset();
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
@@ -417,9 +446,16 @@
       bookmarksVisible ||
       annotationsVisible ||
       searchVisible ||
+      jumpVisible ||
       pendingSyncLocation !== null ||
       Boolean(error)
     );
+  }
+
+  function syncJumpDrafts(): void {
+    pageJumpDraft = String((location?.pageIndex ?? 0) + 1);
+    percentJumpDraft = String(Math.round((location?.percentage ?? 0) * 100));
+    jumpError = '';
   }
 
   function hasTopLevelAlert(): boolean {
@@ -437,6 +473,7 @@
     if (bookmarksVisible) return bookmarksPanel;
     if (annotationsVisible) return annotationsPanel;
     if (searchVisible) return searchPanel;
+    if (jumpVisible) return jumpPanel;
     return readerToolbar ?? topRevealButton;
   }
 
@@ -492,10 +529,12 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    jumpVisible = false;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    jumpOpener = null;
     focusModal(() => settingsPanel);
   }
 
@@ -510,21 +549,25 @@
   function openToc(): void {
     pauseChromeHide();
     tocOpener = activeElement();
+    syncJumpDrafts();
     tocVisible = true;
     settingsVisible = false;
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    jumpVisible = false;
     settingsOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    jumpOpener = null;
     focusedTocIndex = -1;
     void initializeTocDialog();
   }
 
   function closeToc(): void {
     tocVisible = false;
+    jumpError = '';
     focusedTocIndex = -1;
     if (tocVirtualizationFrame !== null) {
       window.cancelAnimationFrame(tocVirtualizationFrame);
@@ -544,10 +587,12 @@
     tocVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    jumpVisible = false;
     settingsOpener = null;
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    jumpOpener = null;
     focusModal(() => bookmarksPanel);
   }
 
@@ -586,10 +631,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     searchVisible = false;
+    jumpVisible = false;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     searchOpener = null;
+    jumpOpener = null;
     searchController?.abort();
     searchController = null;
     searching = false;
@@ -630,10 +677,12 @@
     tocVisible = false;
     bookmarksVisible = false;
     annotationsVisible = false;
+    jumpVisible = false;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
+    jumpOpener = null;
     searchError = '';
     focusModal(() => searchPanel);
   }
@@ -649,6 +698,34 @@
     resumeChromeHide();
   }
 
+  function openJump(): void {
+    controlsVisible = true;
+    pauseChromeHide();
+    jumpOpener = activeElement();
+    syncJumpDrafts();
+    jumpVisible = true;
+    settingsVisible = false;
+    tocVisible = false;
+    bookmarksVisible = false;
+    annotationsVisible = false;
+    searchVisible = false;
+    settingsOpener = null;
+    tocOpener = null;
+    bookmarksOpener = null;
+    annotationsOpener = null;
+    searchOpener = null;
+    focusModal(() => jumpPanel);
+  }
+
+  function closeJump(): void {
+    jumpVisible = false;
+    jumpError = '';
+    const opener = jumpOpener;
+    jumpOpener = null;
+    restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
+    resumeChromeHide();
+  }
+
   function closeOpenSubpanels(): void {
     settingsVisible = false;
     tocVisible = false;
@@ -660,11 +737,14 @@
     bookmarksVisible = false;
     annotationsVisible = false;
     searchVisible = false;
+    jumpVisible = false;
     settingsOpener = null;
     tocOpener = null;
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
+    jumpOpener = null;
+    jumpError = '';
     editingBookmarkId = null;
     bookmarkLimitMessage = '';
     if (!hasSelectionDraft()) {
@@ -851,6 +931,10 @@
 
   function currentProgressLabel(): string {
     return `${Math.round((location?.percentage ?? 0) * 100)}%`;
+  }
+
+  function displayedProgressPercent(): number {
+    return scrubPreviewPercent ?? Math.round((location?.percentage ?? 0) * 100);
   }
 
   function scheduleChromeHide(): void {
@@ -1177,11 +1261,146 @@
       showControls();
     } catch {
       openReaderError(
-        'The location before this link is no longer available in the current EPUB.',
+        target.origin === 'link'
+          ? 'The location before this link is no longer available in the current EPUB.'
+          : 'The previous reading position is no longer available in the current EPUB.',
         opener,
         restoreLink,
       );
     }
+  }
+
+  function savePreJumpPosition(): void {
+    if (!location) return;
+    locationHistory = recordLocation(locationHistory, readerLocation(location));
+    queuePreference(`readerHistory:${bookId}`, JSON.stringify(locationHistory));
+  }
+
+  async function jumpToBookPercentage(percentValue: number, closePanels = false): Promise<void> {
+    if (!session || !Number.isFinite(percentValue)) return;
+    const clamped = Math.max(0, Math.min(100, percentValue));
+    const previous = location;
+    savePreJumpPosition();
+    try {
+      const moved = await session.jumpToPercentage(clamped / 100);
+      if (!moved) {
+        jumpError = 'That book position could not be opened.';
+        return;
+      }
+      if (previous && location && previous.cfi !== location.cfi && !linkReturnTarget) {
+        linkReturnTarget = { cfi: previous.cfi, href: previous.href, origin: 'jump' };
+      }
+      jumpError = '';
+      if (closePanels) {
+        if (jumpVisible) closeJump();
+        if (tocVisible) closeToc();
+      }
+      showControls();
+    } catch {
+      jumpError = 'That book position could not be opened.';
+    }
+  }
+
+  async function submitPageJump(): Promise<void> {
+    if (!session || !location) return;
+    const maxPage = Math.max(1, location.pageCount);
+    const trimmed = String(pageJumpDraft ?? '').trim();
+    const parsed = Number(trimmed);
+    if (!trimmed || !Number.isInteger(parsed) || parsed < 1 || parsed > maxPage) {
+      jumpError = `Enter a page between 1 and ${maxPage}.`;
+      return;
+    }
+    const previous = location;
+    savePreJumpPosition();
+    try {
+      const moved = await session.jumpToPage(parsed);
+      if (!moved) {
+        jumpError = 'That page could not be opened.';
+        return;
+      }
+      if (previous && location && previous.cfi !== location.cfi && !linkReturnTarget) {
+        linkReturnTarget = { cfi: previous.cfi, href: previous.href, origin: 'jump' };
+      }
+      jumpError = '';
+      if (jumpVisible) closeJump();
+      if (tocVisible) closeToc();
+      showControls();
+    } catch {
+      jumpError = 'That page could not be opened.';
+    }
+  }
+
+  async function submitPercentageJump(): Promise<void> {
+    const trimmed = String(percentJumpDraft ?? '').trim();
+    const parsed = Number(trimmed);
+    if (!trimmed || !Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
+      jumpError = 'Enter a percentage between 0 and 100.';
+      return;
+    }
+    await jumpToBookPercentage(parsed, true);
+  }
+
+  function hasReaderSelection(): boolean {
+    if (selectedText) return true;
+    const selection = typeof window !== 'undefined' ? window.getSelection?.() : null;
+    return Boolean(selection && !selection.isCollapsed);
+  }
+
+  function handleSwipeTurn(direction: ReaderSwipeDirection): void {
+    if (destroyed || hasOpenReaderPanel() || hasReaderSelection()) return;
+    void turn(direction);
+  }
+
+  const shellSwipeTracker = createSwipeGestureTracker((direction) => {
+    handleSwipeTurn(direction);
+  });
+
+  function isInsideViewport(target: EventTarget | null | undefined): boolean {
+    return Boolean(viewport && target instanceof Node && viewport.contains(target));
+  }
+
+  function handleShellTouchStart(event: TouchEvent): void {
+    if (isInsideViewport(event.target)) return;
+    shellSwipeTracker.onTouchStart(event, hasReaderSelection);
+  }
+
+  function handleShellTouchMove(event: TouchEvent): void {
+    if (isInsideViewport(event.target)) return;
+    shellSwipeTracker.onTouchMove(event, hasReaderSelection);
+  }
+
+  function handleShellTouchEnd(event: TouchEvent): void {
+    if (isInsideViewport(event.target)) return;
+    shellSwipeTracker.onTouchEnd(event, hasReaderSelection);
+  }
+
+  function handleShellTouchCancel(): void {
+    shellSwipeTracker.onTouchCancel();
+  }
+
+  function handleShellPointerDown(event: PointerEvent): void {
+    if (isInsideViewport(event.target)) return;
+    shellSwipeTracker.onPointerDown(event, hasReaderSelection);
+  }
+
+  function handleShellPointerMove(event: PointerEvent): void {
+    if (isInsideViewport(event.target)) return;
+    shellSwipeTracker.onPointerMove(event, hasReaderSelection);
+  }
+
+  function handleShellPointerUp(event: PointerEvent): void {
+    if (isInsideViewport(event.target)) return;
+    shellSwipeTracker.onPointerUp(event, hasReaderSelection);
+  }
+
+  function handleShellPointerCancel(event: PointerEvent): void {
+    shellSwipeTracker.onPointerCancel(event);
+  }
+
+  function handleShellClickCapture(event: MouseEvent): void {
+    if (!shellSwipeTracker.consumeSuppressedClick()) return;
+    event.preventDefault();
+    event.stopPropagation();
   }
 
   async function turn(direction: 'next' | 'previous'): Promise<void> {
@@ -1358,6 +1577,7 @@
       else if (bookmarksVisible) closeBookmarks();
       else if (annotationsVisible) closeAnnotations();
       else if (searchVisible) closeSearch();
+      else if (jumpVisible) closeJump();
       showControls();
       return;
     }
@@ -1395,6 +1615,7 @@
     else if (bookmarksVisible) closeBookmarks();
     else if (annotationsVisible) closeAnnotations();
     else if (searchVisible) closeSearch();
+    else if (jumpVisible) closeJump();
     else if (linkReturnTarget) {
       void returnToLink();
       return true;
@@ -1443,7 +1664,20 @@
   });
 </script>
 
-<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+<main
+  class="reader-shell"
+  data-mode={appearance.mode}
+  aria-describedby="reader-keyboard-help"
+  ontouchstart={handleShellTouchStart}
+  ontouchmove={handleShellTouchMove}
+  ontouchend={handleShellTouchEnd}
+  ontouchcancel={handleShellTouchCancel}
+  onpointerdown={handleShellPointerDown}
+  onpointermove={handleShellPointerMove}
+  onpointerup={handleShellPointerUp}
+  onpointercancel={handleShellPointerCancel}
+  onclickcapture={handleShellClickCapture}
+>
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
@@ -1518,12 +1752,16 @@
   {#if linkReturnTarget && !hasOpenReaderPanel()}
     <button
       bind:this={returnToLinkButton}
-      class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
+      class="absolute right-[max(1rem,env(safe-area-inset-right))] {controlsVisible
+        ? 'bottom-[calc(var(--reader-safe-bottom)+6.25rem)]'
+        : 'bottom-[calc(var(--reader-safe-bottom)+3rem)]'} z-30 btn min-h-11 min-w-11 preset-filled-primary-700-300 shadow"
       type="button"
-      aria-label="Return to the location before this link"
+      aria-label={linkReturnTarget.origin === 'link'
+        ? 'Return to the location before this link'
+        : 'Return to previous reading position'}
       onclick={() => void returnToLink()}
     >
-      Return to link
+      {linkReturnTarget.origin === 'link' ? 'Return to link' : 'Return to previous page'}
     </button>
   {/if}
 
@@ -1703,7 +1941,207 @@
         </div>
       </header>
 
-      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible}
+      <footer
+        class="reader-bar reader-controls-bottom"
+        inert={hasOpenReaderPanel()}
+        transition:fly={{ y: 8, duration: 140 }}
+      >
+        <div class="reader-scrubber-panel">
+          <div class="reader-scrubber-meta">
+            <span class="min-w-0 flex-1 truncate text-xs font-medium">
+              {activeSectionLabel}
+            </span>
+            <button
+              class="btn btn-sm preset-tonal-surface min-h-11 min-w-11 shrink-0 px-3 text-xs tabular-nums"
+              type="button"
+              onclick={() => (jumpVisible ? closeJump() : openJump())}
+              aria-label={location
+                ? `Go to page or percentage, page ${location.pageIndex + 1} of ${location.pageCount}, ${displayedProgressPercent()}% complete`
+                : 'Go to page or percentage'}
+              aria-expanded={jumpVisible}
+              aria-controls="reader-jump"
+              disabled={!location}
+            >
+              {#if location}
+                Page {location.pageIndex + 1} of {location.pageCount} · {displayedProgressPercent()}%
+              {:else}
+                {displayedProgressPercent()}%
+              {/if}
+            </button>
+          </div>
+          <input
+            class="range reader-scrubber-range"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={displayedProgressPercent()}
+            aria-label="Scrub book reading progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow={displayedProgressPercent()}
+            aria-valuetext={`${displayedProgressPercent()}% complete`}
+            disabled={!location}
+            onpointerdown={() => {
+              scrubbingPointerActive = true;
+              lastInputCommittedPercent = null;
+              pauseChromeHide();
+            }}
+            onpointercancel={() => {
+              scrubbingPointerActive = false;
+              scrubPreviewPercent = null;
+              resumeChromeHide();
+            }}
+            oninput={(event) => {
+              const nextPercent = Number(event.currentTarget.value);
+              scrubPreviewPercent = nextPercent;
+              percentJumpDraft = String(nextPercent);
+              if (!scrubbingPointerActive) {
+                lastInputCommittedPercent = nextPercent;
+                void jumpToBookPercentage(nextPercent, false);
+              }
+            }}
+            onchange={(event) => {
+              const nextPercent = Number(event.currentTarget.value);
+              const wasPointerScrubbing = scrubbingPointerActive;
+              scrubbingPointerActive = false;
+              scrubPreviewPercent = null;
+              if (wasPointerScrubbing || lastInputCommittedPercent !== nextPercent) {
+                lastInputCommittedPercent = null;
+                void jumpToBookPercentage(nextPercent, false);
+              } else {
+                lastInputCommittedPercent = null;
+              }
+            }}
+          />
+        </div>
+      </footer>
+
+      {#snippet jumpPromptControls(idPrefix: string)}
+        <div class="mt-3 grid gap-3">
+          {#if location}
+            <p class="text-xs text-surface-700-300 tabular-nums">
+              {activeSectionLabel} · Page {location.pageIndex + 1} of {location.pageCount} · {displayedProgressPercent()}%
+            </p>
+          {/if}
+          <label class="label">
+            <span class="label-text text-sm">
+              Book progress: <span class="tabular-nums">{displayedProgressPercent()}%</span>
+            </span>
+            <input
+              id={`${idPrefix}-scrub`}
+              class="range reader-scrubber-range"
+              type="range"
+              min="0"
+              max="100"
+              step="1"
+              value={displayedProgressPercent()}
+              aria-label="Book progress percentage"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={displayedProgressPercent()}
+              aria-valuetext={`${displayedProgressPercent()}% complete`}
+              disabled={!location}
+              onpointerdown={() => {
+                scrubbingPointerActive = true;
+                lastInputCommittedPercent = null;
+              }}
+              onpointercancel={() => {
+                scrubbingPointerActive = false;
+                scrubPreviewPercent = null;
+              }}
+              oninput={(event) => {
+                const nextPercent = Number(event.currentTarget.value);
+                scrubPreviewPercent = nextPercent;
+                percentJumpDraft = String(nextPercent);
+                if (!scrubbingPointerActive) {
+                  lastInputCommittedPercent = nextPercent;
+                  void jumpToBookPercentage(nextPercent, true);
+                }
+              }}
+              onchange={(event) => {
+                const nextPercent = Number(event.currentTarget.value);
+                const wasPointerScrubbing = scrubbingPointerActive;
+                scrubbingPointerActive = false;
+                scrubPreviewPercent = null;
+                if (wasPointerScrubbing || lastInputCommittedPercent !== nextPercent) {
+                  lastInputCommittedPercent = null;
+                  void jumpToBookPercentage(nextPercent, true);
+                } else {
+                  lastInputCommittedPercent = null;
+                }
+              }}
+            />
+          </label>
+          <form
+            class="grid gap-1.5"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void submitPageJump();
+            }}
+          >
+            <label class="label-text text-sm" for={`${idPrefix}-page-input`}>
+              Chapter page (1–{Math.max(1, location?.pageCount ?? 1)})
+            </label>
+            <div class="flex gap-2">
+              <input
+                id={`${idPrefix}-page-input`}
+                class="input min-h-11 min-w-11 flex-1 tabular-nums"
+                type="number"
+                min="1"
+                max={Math.max(1, location?.pageCount ?? 1)}
+                step="1"
+                inputmode="numeric"
+                bind:value={pageJumpDraft}
+                disabled={!location}
+              />
+              <button
+                class="btn preset-filled-primary-700-300 min-h-11 min-w-11 shrink-0"
+                type="submit"
+                disabled={!location}
+              >
+                Go to page
+              </button>
+            </div>
+          </form>
+          <form
+            class="grid gap-1.5"
+            onsubmit={(event) => {
+              event.preventDefault();
+              void submitPercentageJump();
+            }}
+          >
+            <label class="label-text text-sm" for={`${idPrefix}-percent-input`}>
+              Book percentage (0–100%)
+            </label>
+            <div class="flex gap-2">
+              <input
+                id={`${idPrefix}-percent-input`}
+                class="input min-h-11 min-w-11 flex-1 tabular-nums"
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                inputmode="numeric"
+                bind:value={percentJumpDraft}
+                disabled={!location}
+              />
+              <button
+                class="btn preset-tonal-primary min-h-11 min-w-11 shrink-0"
+                type="submit"
+                disabled={!location}
+              >
+                Go to %
+              </button>
+            </div>
+          </form>
+          {#if jumpError}
+            <p class="text-sm text-error-700-300" role="alert">{jumpError}</p>
+          {/if}
+        </div>
+      {/snippet}
+
+      {#if settingsVisible || tocVisible || bookmarksVisible || annotationsVisible || searchVisible || jumpVisible}
         <button
           class="reader-panel-backdrop"
           type="button"
@@ -1718,7 +2156,9 @@
                   ? closeBookmarks()
                   : annotationsVisible
                     ? closeAnnotations()
-                    : closeSearch()}
+                    : jumpVisible
+                      ? closeJump()
+                      : closeSearch()}
         ></button>
       {/if}
 
@@ -2039,11 +2479,34 @@
                 {@render contentsList(toc)}
               {/if}
             {:else}
-              <p class="py-3 text-sm text-surface-700-300">
+              <p class="py-2 text-sm text-surface-700-300">
                 This EPUB does not include a table of contents.
               </p>
+              {@render jumpPromptControls('reader-empty-toc')}
             {/if}
           </div>
+        </div>
+      {/if}
+
+      {#if jumpVisible}
+        <div
+          bind:this={jumpPanel}
+          class="reader-settings card preset-filled-surface-50-950 relative"
+          id="reader-jump"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reader-jump-title"
+          tabindex="-1"
+          onkeydown={(event) => trapModalKeydown(event, jumpPanel!, closeJump)}
+          transition:fly={{ y: 12, duration: 150 }}
+        >
+          {@render readerPanelHeader(
+            'reader-jump-title',
+            'Go to page or percentage',
+            'Close go to page or percentage',
+            closeJump,
+          )}
+          {@render jumpPromptControls('reader-jump')}
         </div>
       {/if}
 
@@ -2470,21 +2933,29 @@
     </div>
   {/if}
 
-  {#if footerVisible}
+  {#if footerVisible && !controlsVisible}
     <footer
       class="reader-bar reader-bottom"
       inert={hasOpenReaderPanel()}
       transition:fly={{ y: 8, duration: 140 }}
     >
       <span class="truncate text-xs">{activeSectionLabel}</span>
-      <span class="text-xs tabular-nums">{currentProgressLabel()}</span>
+      <span class="text-xs tabular-nums">
+        {#if location}
+          Page {location.pageIndex + 1} of {location.pageCount} · {currentProgressLabel()}
+        {:else}
+          {currentProgressLabel()}
+        {/if}
+      </span>
     </footer>
   {/if}
 
   <button
     class="reader-progress-reveal btn btn-sm preset-tonal-surface"
+    class:opacity-0={controlsVisible}
+    class:pointer-events-none={controlsVisible}
     type="button"
-    inert={hasOpenReaderPanel()}
+    inert={controlsVisible || hasOpenReaderPanel()}
     aria-label={`${footerVisible ? 'Hide' : 'Show'} reading details, ${currentProgressLabel()} complete`}
     aria-pressed={footerVisible}
     title={footerVisible ? 'Hide reading details' : 'Show reading details'}
@@ -2735,6 +3206,7 @@
     position: absolute;
     left: 0;
     right: 0;
+    z-index: 1;
     display: flex;
     align-items: center;
     gap: 0.75rem;
@@ -2745,6 +3217,36 @@
   .reader-top {
     top: 0;
     padding-top: env(safe-area-inset-top);
+  }
+
+  .reader-controls-bottom {
+    bottom: calc(var(--reader-progress-height) + max(0.375rem, env(safe-area-inset-bottom)));
+    padding-block: 0.5rem;
+    background: color-mix(in oklab, var(--reader-background) 92%, transparent);
+    border-top: 1px solid color-mix(in oklab, var(--reader-text) 16%, transparent);
+  }
+
+  .reader-scrubber-panel {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    gap: 0.25rem;
+  }
+
+  .reader-scrubber-meta {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .reader-scrubber-range {
+    width: 100%;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    touch-action: pan-x;
+    cursor: pointer;
   }
 
   .reader-toolbar {
@@ -2879,12 +3381,12 @@
     max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
     overflow: auto;
     padding: 1.25rem;
-    z-index: 1;
+    z-index: 3;
   }
 
   .reader-panel-backdrop {
     position: absolute;
-    z-index: 0;
+    z-index: 2;
     inset: 0;
     border: 0;
     background: hsl(0 0% 0% / 0.24);
