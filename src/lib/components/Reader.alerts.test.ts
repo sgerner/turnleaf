@@ -708,9 +708,16 @@ describe('Reader alert modals and focus containment', () => {
     const stayBtn = Array.from(syncDialog!.querySelectorAll<HTMLButtonElement>('button')).find(
       (btn) => btn.textContent?.includes('Stay here'),
     )!;
+    const goToLatestBtn = Array.from(
+      syncDialog!.querySelectorAll<HTMLButtonElement>('button'),
+    ).find((btn) => btn.textContent?.includes('Go to latest position'))!;
     expect(document.activeElement).toBe(stayBtn);
     expect(isMarkedInert(viewport)).toBe(true);
     expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(true);
+
+    // Move keyboard focus to the second button inside the z-40 sync alertdialog
+    goToLatestBtn.focus();
+    expect(document.activeElement).toBe(goToLatestBtn);
 
     // 1. Open and close an inspector (#reader-footnote) WHILE the sync alert remains raised
     mocks.getHandlers()?.inspectors.onFootnote?.(
@@ -726,9 +733,9 @@ describe('Reader alert modals and focus containment', () => {
     expect(footnoteDialog).not.toBeNull();
     expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(true);
     expect(isMarkedInert(viewport)).toBe(true);
-    expect(document.activeElement).toBe(stayBtn);
+    expect(document.activeElement).toBe(goToLatestBtn);
 
-    // Close the inspector while the sync alert is still raised
+    // Close the inspector while the sync alert is still raised; active button focus in z-40 alert is preserved
     target.querySelector<HTMLButtonElement>('[aria-label="Close footnote"]')!.click();
     await settle();
 
@@ -736,8 +743,22 @@ describe('Reader alert modals and focus containment', () => {
     expect(target.querySelector('.z-40 [role="alertdialog"]')).toBe(syncDialog);
     expect(isMarkedInert(viewport)).toBe(true);
     expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(true);
-    expect(document.activeElement).toBe(stayBtn);
+    expect(document.activeElement).toBe(goToLatestBtn);
     expect(childDoc.activeElement).not.toBe(footnoteLink);
+
+    // If focus somehow left the alert before closing an inspector, fallback returns focus into the z-40 alert
+    mocks.getHandlers()?.inspectors.onFootnote?.(
+      {
+        title: 'Footnote 1b',
+        paragraphs: ['Inspector closed after focus blurred outside alert.'],
+      },
+      footnoteLink,
+    );
+    await settle();
+    goToLatestBtn.blur();
+    target.querySelector<HTMLButtonElement>('[aria-label="Close footnote"]')!.click();
+    await settle();
+    expect(document.activeElement).toBe(stayBtn);
 
     // 2. Open an inspector again while sync alert is raised, dismiss sync alert first, then close inspector
     mocks.getHandlers()?.inspectors.onFootnote?.(

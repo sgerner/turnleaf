@@ -555,13 +555,27 @@
     return activeElement();
   }
 
+  function topLevelAlertPanel(): HTMLElement | null {
+    if (error) return errorPanel;
+    if (pendingSyncLocation) return syncConfirmationPanel;
+    return null;
+  }
+
   function restoreOverlayFocus(
     opener: HTMLElement | null,
     preferredFallback: HTMLElement | null = null,
   ): void {
-    restoreModalFocus(hasTopLevelAlert() ? null : opener, () =>
-      readerFocusFallback(preferredFallback),
-    );
+    if (hasTopLevelAlert()) {
+      void tick().then(() => {
+        const alertPanel = topLevelAlertPanel();
+        if (alertPanel && document.activeElement && alertPanel.contains(document.activeElement)) {
+          return;
+        }
+        restoreFocus(null, readerFocusFallback(preferredFallback));
+      });
+      return;
+    }
+    restoreModalFocus(opener, () => readerFocusFallback(preferredFallback));
   }
 
   function errorFallbackTarget(): HTMLElement | null {

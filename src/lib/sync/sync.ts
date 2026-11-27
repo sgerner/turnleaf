@@ -19,9 +19,15 @@ export function flushProgress(
   serverId: string,
   options?: FlushProgressOptions,
 ): Promise<void> {
-  const pending = flushing.get(serverId);
-  if (pending) return pending;
-  const current = run(client, serverId, options).finally(() => {
+  const previous = flushing.get(serverId);
+  const current = (
+    previous
+      ? previous.then(
+          () => run(client, serverId, options),
+          () => run(client, serverId, options),
+        )
+      : run(client, serverId, options)
+  ).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);

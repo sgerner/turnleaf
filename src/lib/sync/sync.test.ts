@@ -293,3 +293,61 @@ it('halts in-flight progress flush on network handover without dropping concurre
   expect(finalState.readingState['book-1']?.pendingSync).toBe(false);
   expect(finalState.syncQueue['book-1']).toBeUndefined();
 });
+
+it('serializes a follow-up flushProgress pass behind an in-flight halted run so concurrent reader relocations still upload', async () => {
+  vi.useFakeTimers();
+  const t0 = '2026-09-07T00:00:00.000Z';
+  vi.setSystemTime(new Date(t0));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(pendingState(t0, '{"pageNum":10}')));
+
+  let firstAllowed = true;
+  let releaseFirstSave!: () => void;
+  const firstSaveBlocked = new Promise<void>((resolve) => {
+    releaseFirstSave = resolve;
+  });
+  let notifyFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    notifyFirstStarted = resolve;
+  });
+
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      notifyFirstStarted();
+      return firstSaveBlocked;
+    })
+    .mockResolvedValue(undefined);
+  const client = { saveProgress } as never;
+
+  const firstFlush = flushProgress(client, 'server', {
+    canContinue: () => firstAllowed,
+  });
+  await firstStarted;
+
+  // Reader navigates to a new passage while first save is in flight and first run is halted
+  vi.setSystemTime(new Date('2026-09-07T00:00:03.000Z'));
+  await saveLocalProgress(book, 'cfi-ch3', '/body/DocFragment[3]/body/p[2]', 0.65, 2);
+  firstAllowed = false;
+
+  // A follow-up flush arrives before the first save settles; it must wait for the first save and then upload the queued relocation
+  const secondFlush = flushProgress(client, 'server', {
+    canContinue: () => true,
+  });
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+
+  releaseFirstSave();
+  await Promise.all([firstFlush, secondFlush]);
+
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  expect(saveProgress).toHaveBeenNthCalledWith(
+    2,
+    expect.objectContaining({
+      bookScrollId: '/body/DocFragment[3]/body/p[2]',
+    }),
+  );
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(saved.readingState['book-1']?.pendingSync).toBe(false);
+  expect(saved.syncQueue['book-1']).toBeUndefined();
+});
