@@ -2,10 +2,17 @@ import './compat';
 import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
+import { bootstrapBootTheme } from './lib/themes/themes';
 
-mount(App, { target: document.getElementById('app')! });
-
-const themeColorMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
-if (themeColorMeta) {
-  themeColorMeta.content = getComputedStyle(document.body).backgroundColor;
+async function start(): Promise<void> {
+  const boot = await bootstrapBootTheme();
+  mount(App, {
+    target: document.getElementById('app')!,
+    props: {
+      initialTheme: boot.theme,
+      initialMode: boot.mode,
+    },
+  });
 }
+
+void start();
