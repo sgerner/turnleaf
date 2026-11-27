@@ -60,6 +60,12 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+    lint {
+        abortOnError = true
+        warningsAsErrors = true
+        baseline = file('lint-baseline.xml')
+        informational += ['AndroidGradlePluginVersion', 'GradleDependency', 'NewerVersionAvailable']
+    }
 }
 
 gradle.taskGraph.whenReady { graph ->

@@ -54,7 +54,25 @@ const mocks = vi.hoisted(() => {
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
     isNativePlatform: () => mocks.isNative,
+    getPlatform: () => (mocks.isNative ? 'android' : 'web'),
     convertFileSrc: (uri: string) => uri,
+  },
+}));
+
+vi.mock('@capacitor/filesystem', () => ({
+  Directory: {
+    Data: 'DATA',
+    Documents: 'DOCUMENTS',
+  },
+  Encoding: {
+    UTF8: 'utf8',
+  },
+  Filesystem: {
+    readFile: vi.fn(async () => {
+      throw new Error('File not found');
+    }),
+    writeFile: vi.fn(async () => ({ uri: 'file://DATA/diagnostics.json' })),
+    deleteFile: vi.fn(async () => undefined),
   },
 }));
 
@@ -117,6 +135,7 @@ vi.mock('./lib/downloads/native-download', async (importOriginal) => {
 });
 
 import App from './App.svelte';
+import { clearDiagnostics, exportDiagnostics } from './lib/diagnostics/log';
 
 const savedServer: ServerConfig = {
   id: 'primary',
@@ -159,7 +178,8 @@ async function flushMicrotasks(turns = 8): Promise<void> {
   flushSync();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await clearDiagnostics();
   if (typeof Element.prototype.animate !== 'function') {
     Element.prototype.animate = (() => {
       const animation = {
@@ -319,7 +339,11 @@ describe('App cold-launch parallel hydration', () => {
     const buttons = Array.from(alert?.querySelectorAll('button') ?? []).map((btn) =>
       btn.textContent?.trim(),
     );
-    expect(buttons).toEqual(['Retry', 'Enter auth key']);
+    expect(buttons.slice(0, 2)).toEqual(['Retry', 'Enter auth key']);
+    expect(alert?.textContent).toContain('Diagnostics (1)');
+    expect(exportDiagnostics({ appVersion: '0.3.5', platform: 'android' })).toContain(
+      'startup endpoint=local/credentials detail=credential-read-failed',
+    );
     await vi.waitFor(() => expect(mocks.fetchLatestGithubRelease).toHaveBeenCalledOnce());
 
     // Clicking Enter auth key opens reconnect Onboarding with savedServer preserved.
@@ -376,5 +400,25 @@ describe('App cold-launch parallel hydration', () => {
       expect(container.textContent).not.toContain('Turnleaf could not open its local data.');
       expect(container.textContent).toContain('Your books,');
     });
+  });
+
+  it('discards stale startup generations and post-unmount completions without recording stale diagnostics', async () => {
+    const staleBooks = deferred<BookRecord[]>();
+    mocks.getBooks.mockReturnValueOnce(staleBooks.promise);
+
+    mounted = mount(App, { target: container });
+    await flushMicrotasks(4);
+    expect(mocks.getBooks).toHaveBeenCalledOnce();
+
+    unmount(mounted);
+    mounted = null;
+
+    staleBooks.reject(new Error('late sqlite failure after unmount'));
+    await flushMicrotasks(4);
+
+    expect(exportDiagnostics({ appVersion: '0.3.5', platform: 'android' })).not.toContain(
+      'database-open-failed',
+    );
+    expect(mocks.fetchLatestGithubRelease).not.toHaveBeenCalled();
   });
 });

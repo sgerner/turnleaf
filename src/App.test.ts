@@ -207,6 +207,37 @@ describe('App shell releaseBanner layout', () => {
       expect(host.querySelector('.release-banner')).toBeNull();
     });
   });
+
+  it('marks .release-banner inert while Library overlays are open via onOverlayActiveChange and restores it on close', async () => {
+    getServerMock.mockResolvedValue(savedServer);
+    getApiKeyMock.mockResolvedValue('secret-api-key');
+    getBooksMock.mockResolvedValue([downloadedBook]);
+    getSyncStatusMock.mockResolvedValue({ pendingCount: 0, failedCount: 0 });
+    cleanupInterruptedEpubDownloadsMock.mockResolvedValue(undefined);
+
+    instance = mount(App, { target: host });
+    await vi.waitFor(() => {
+      expect(host.querySelector('.release-banner')).not.toBeNull();
+      expect(host.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+
+    const banner = host.querySelector<HTMLElement>('.release-banner')!;
+    expect(banner.inert).toBe(false);
+
+    flushSync(() => {
+      host.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
+    });
+    await tick();
+    expect(host.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(banner.inert).toBe(true);
+
+    flushSync(() => {
+      host.querySelector<HTMLButtonElement>('button[aria-label="Close settings"]')?.click();
+    });
+    await tick();
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+    expect(banner.inert).toBe(false);
+  });
 });
 
 const savedServer: ServerConfig = {
@@ -429,5 +460,51 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     });
     flushSync();
     expect(target.querySelector('.app-ambient')).not.toBeNull();
+  });
+
+  it('hydrates Library from a single concurrent startup pass and discards stale loadLocalData generations', async () => {
+    let resolveSlowBooks!: (books: BookRecord[]) => void;
+    const slowBooksPromise = new Promise<BookRecord[]>((res) => {
+      resolveSlowBooks = res;
+    });
+
+    getApiKeyMock
+      .mockRejectedValueOnce(new Error('keystore locked'))
+      .mockResolvedValueOnce('secret-api-key');
+    getBooksMock
+      .mockResolvedValueOnce([downloadedBook])
+      .mockReturnValueOnce(slowBooksPromise)
+      .mockResolvedValueOnce([downloadedBook]);
+
+    mounted = mount(App, { target });
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+        'Turnleaf could not read the saved Kavita key.',
+      );
+    });
+    expect(getPreferencesMock).toHaveBeenCalledTimes(1);
+    expect(getBooksMock).toHaveBeenCalledTimes(1);
+
+    const retryButton = [
+      ...target.querySelectorAll<HTMLButtonElement>('[role="alert"] button'),
+    ].find((btn) => btn.textContent?.trim() === 'Retry');
+    retryButton?.click();
+    await tick();
+
+    // Start a third generation via unmount + remount check or overlapping Retry:
+    // here, unmounting while generation 2 is still awaiting slowBooksPromise ensures
+    // resolving slowBooksPromise afterwards does not mutate DOM or throw.
+    await unmount(mounted);
+    mounted = null;
+    resolveSlowBooks([
+      {
+        ...downloadedBook,
+        id: 'stale-book',
+        title: 'Stale Generation Book',
+      },
+    ]);
+    await tick();
+    expect(target.textContent).not.toContain('Stale Generation Book');
   });
 });

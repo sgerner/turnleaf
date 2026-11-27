@@ -55,6 +55,10 @@ describe('native vector splash assets and launch configuration', () => {
       'utf8',
     );
     expect(vectorDrawable).toContain('<vector');
+    expect(vectorDrawable).toContain('android:width="108dp"');
+    expect(vectorDrawable).toContain('android:height="108dp"');
+    expect(vectorDrawable).toContain('android:viewportWidth="288"');
+    expect(vectorDrawable).toContain('android:viewportHeight="288"');
     expect(vectorDrawable).toContain('<path');
 
     const mainActivity = readFileSync(

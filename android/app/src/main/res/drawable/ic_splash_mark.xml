@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="288dp"
-    android:height="288dp"
+    android:width="108dp"
+    android:height="108dp"
     android:viewportWidth="288"
     android:viewportHeight="288">
     <!-- Sage right leaf blade (within [72, 216] safe zone for 192dp circular SplashScreen mask) -->
