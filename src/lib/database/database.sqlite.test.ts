@@ -573,12 +573,135 @@ function seedV7StudyPreferencesFixture(db: DatabaseSync): void {
   );
 }
 
-describe('coordinated schema v8-v10 migrations and legacy study-data rollback against SQLite', () => {
+describe('coordinated schema v8-v11 migrations and legacy study-data rollback against SQLite', () => {
   let db: DatabaseSync | undefined;
 
   afterEach(() => db?.close());
 
-  const pr328V8Migration = {
+  const expectedFinalBookColumns = [
+    'id',
+    'server_id',
+    'library_id',
+    'series_id',
+    'volume_id',
+    'chapter_id',
+    'title',
+    'author',
+    'series',
+    'description_html',
+    'cover_path',
+    'format',
+    'metadata_refreshed_at',
+    'download_path',
+    'download_status',
+    'file_size',
+    'pages',
+    'pages_read',
+    'created_at',
+    'last_read_at',
+    'remote_available',
+    'remote_file_size',
+    'downloaded_bytes',
+    'downloaded_pages',
+    'chapter_key',
+    'file_id',
+    'file_name',
+    'chapter_epub_index',
+    'multi_file_chapter',
+    'sync_progress',
+    'sort_order',
+    'min_number',
+    'volume_number',
+  ] as const;
+
+  const expectedAnnotationColumns = [
+    'id',
+    'book_id',
+    'remote_id',
+    'cfi',
+    'xpath',
+    'ending_xpath',
+    'page_number',
+    'slot_index',
+    'contains_spoiler',
+    'context',
+    'chapter_title',
+    'excerpt',
+    'note',
+    'created_at',
+    'updated_at',
+    'remote_updated_at',
+    'sync_state',
+    'sync_revision',
+    'attempt_count',
+    'last_attempt_at',
+    'last_error',
+  ] as const;
+
+  const expectedBookmarkColumns = [
+    'id',
+    'book_id',
+    'remote_id',
+    'cfi',
+    'xpath',
+    'href',
+    'percentage',
+    'page_number',
+    'label',
+    'excerpt',
+    'remote_title',
+    'remote_page_number',
+    'saved_at',
+    'updated_at',
+    'sync_state',
+    'sync_revision',
+    'attempt_count',
+    'last_attempt_at',
+    'last_error',
+  ] as const;
+
+  const expectedReadingHistoryColumns = [
+    'book_id',
+    'id',
+    'cfi',
+    'href',
+    'percentage',
+    'label',
+    'saved_at',
+  ] as const;
+
+  const pr330V8Migration = {
+    version: 8,
+    statements: `
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+    `,
+  } as const;
+
+  const pr328V9Migration = {
+    version: 9,
+    statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+    `,
+  } as const;
+
+  const pr339V10Migration = {
+    version: 10,
+    statements: `
+      ALTER TABLE books ADD COLUMN sort_order REAL;
+      ALTER TABLE books ADD COLUMN min_number REAL;
+      ALTER TABLE books ADD COLUMN volume_number REAL;
+    `,
+  } as const;
+
+  const pr328LegacyV8Migration = {
     version: 8,
     statements: `
       ALTER TABLE books ADD COLUMN file_id INTEGER;
@@ -588,16 +711,6 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
       ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
       CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
-    `,
-  } as const;
-
-  const pr330V8Migration = {
-    version: 8,
-    statements: `
-      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
-      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
-      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
-      ALTER TABLE books ADD COLUMN chapter_key TEXT;
     `,
   } as const;
 
@@ -617,35 +730,43 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     `,
   } as const;
 
-  const pr339V9Migration = {
+  const pr339LegacyV9Migration = {
     version: 9,
-    statements: `
-      ALTER TABLE books ADD COLUMN sort_order REAL;
-      ALTER TABLE books ADD COLUMN min_number REAL;
-      ALTER TABLE books ADD COLUMN volume_number REAL;
-    `,
+    statements: pr339V10Migration.statements,
   } as const;
 
-  const pr328OnlyMigrations = [...migrations.slice(0, 7), pr328V8Migration] as const;
   const pr330OnlyMigrations = [...migrations.slice(0, 7), pr330V8Migration] as const;
+  const pr330And328OrderedMigrations = [
+    ...migrations.slice(0, 7),
+    pr330V8Migration,
+    pr328V9Migration,
+  ] as const;
+  const pr330And328And339OrderedMigrations = [
+    ...migrations.slice(0, 7),
+    pr330V8Migration,
+    pr328V9Migration,
+    pr339V10Migration,
+  ] as const;
+
+  const pr328OnlyMigrations = [...migrations.slice(0, 7), pr328LegacyV8Migration] as const;
   const pr328And330CombinedV8Migrations = [
     ...migrations.slice(0, 7),
     pr328And330CombinedV8Migration,
   ] as const;
   const pr328And339SequentialMigrations = [
     ...migrations.slice(0, 7),
-    pr328V8Migration,
-    pr339V9Migration,
+    pr328LegacyV8Migration,
+    pr339LegacyV9Migration,
   ] as const;
   const pr330And339SequentialMigrations = [
     ...migrations.slice(0, 7),
     pr330V8Migration,
-    pr339V9Migration,
+    pr339LegacyV9Migration,
   ] as const;
-  const pr328And330And339SequentialMigrations = [
+  const pr328And330And339CombinedMigrations = [
     ...migrations.slice(0, 7),
     pr328And330CombinedV8Migration,
-    pr339V9Migration,
+    pr339LegacyV9Migration,
   ] as const;
 
   const pr330And339CombinedV8Migrations = [
@@ -668,20 +789,20 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     ...migrations.slice(0, 7),
     {
       version: 8,
-      statements: pr339V9Migration.statements,
+      statements: pr339V10Migration.statements,
     },
   ] as const;
 
   const expectedCoordinatedBookColumns = [
-    'file_id',
-    'file_name',
     'remote_file_size',
-    'chapter_epub_index',
-    'multi_file_chapter',
-    'sync_progress',
     'downloaded_bytes',
     'downloaded_pages',
     'chapter_key',
+    'file_id',
+    'file_name',
+    'chapter_epub_index',
+    'multi_file_chapter',
+    'sync_progress',
     'sort_order',
     'min_number',
     'volume_number',
@@ -901,28 +1022,162 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     }
   }
 
-  it('upgrades populated v7 databases cleanly when #328-only, #330-only, combined v8, or #339 v9 migrations land first and #345 reconciles before copying/deleting legacy study preferences', async () => {
+  it('upgrades a database from every earlier version (v7 through v11, and v1 through v6) and asserts the final column set and idempotent PRAGMA table_info checks', async () => {
+    for (let startVersion = 1; startVersion <= STUDY_STORAGE_MIGRATION_VERSION; startVersion += 1) {
+      const candidateDb = new DatabaseSync(':memory:');
+      try {
+        candidateDb.exec('PRAGMA foreign_keys = ON;');
+        for (const migration of migrations.slice(0, startVersion)) {
+          candidateDb.exec(migration.statements);
+          candidateDb.exec(`PRAGMA user_version = ${migration.version};`);
+        }
+
+        if (startVersion >= 7 && startVersion < STUDY_STORAGE_MIGRATION_VERSION) {
+          seedV7StudyPreferencesFixture(candidateDb);
+          seedPopulatedPredecessorFields(candidateDb, {
+            has330: startVersion >= 8,
+            has328: startVersion >= 9,
+            has339: startVersion >= 10,
+          });
+        }
+
+        const adapter = createMigrationAdapter(candidateDb);
+        await migrateDatabase(adapter);
+        // Re-running migrateDatabase at v11 is an idempotent no-op.
+        await migrateDatabase(adapter);
+
+        expect(await adapter.getVersion(), `startVersion=v${startVersion}`).toEqual({
+          version: STUDY_STORAGE_MIGRATION_VERSION,
+        });
+        expect(
+          listColumnNames(candidateDb, 'books'),
+          `books columns from v${startVersion}`,
+        ).toEqual([...expectedFinalBookColumns]);
+        expect(
+          listColumnNames(candidateDb, 'annotations'),
+          `annotations columns from v${startVersion}`,
+        ).toEqual([...expectedAnnotationColumns]);
+        expect(
+          listColumnNames(candidateDb, 'bookmarks'),
+          `bookmarks columns from v${startVersion}`,
+        ).toEqual([...expectedBookmarkColumns]);
+        expect(
+          listColumnNames(candidateDb, 'reading_history'),
+          `reading_history columns from v${startVersion}`,
+        ).toEqual([...expectedReadingHistoryColumns]);
+        expect(listIndexNames(candidateDb, 'books')).toEqual(
+          expect.arrayContaining(['books_server_title_idx', 'books_server_file_idx']),
+        );
+
+        if (startVersion >= 7 && startVersion < STUDY_STORAGE_MIGRATION_VERSION) {
+          assertV7StatePreserved(candidateDb);
+          const has328 = startVersion >= 9;
+          expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({
+            total: has328 ? 3 : 2,
+          });
+          expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM bookmarks').get()).toEqual({
+            total: has328 ? 4 : 3,
+          });
+          expect(
+            candidateDb.prepare('SELECT COUNT(*) AS total FROM reading_history').get(),
+          ).toEqual({
+            total: has328 ? 13 : 12,
+          });
+          expect(
+            candidateDb.prepare('SELECT key, value FROM preferences ORDER BY key ASC').all(),
+          ).toEqual([
+            { key: 'readerFontScale', value: '1.15' },
+            { key: 'uiTheme', value: 'eink' },
+          ]);
+        }
+      } finally {
+        candidateDb.close();
+      }
+    }
+
+    // Verify idempotent PRAGMA table_info checks when target columns ALREADY exist before v2..v10 run.
+    for (const startVersion of [1, 7, 8, 9, 10] as const) {
+      const preAddedDb = new DatabaseSync(':memory:');
+      try {
+        preAddedDb.exec('PRAGMA foreign_keys = ON;');
+        for (const migration of migrations.slice(0, startVersion)) {
+          preAddedDb.exec(migration.statements);
+          preAddedDb.exec(`PRAGMA user_version = ${migration.version};`);
+        }
+        if (startVersion === 1) {
+          preAddedDb.exec('ALTER TABLE books ADD COLUMN pages INTEGER NOT NULL DEFAULT 0;');
+          preAddedDb.exec('ALTER TABLE sync_queue ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;');
+          preAddedDb.exec(
+            'ALTER TABLE reading_state ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;',
+          );
+        }
+        if (startVersion <= 8) {
+          if (!listColumnNames(preAddedDb, 'books').includes('remote_file_size')) {
+            preAddedDb.exec('ALTER TABLE books ADD COLUMN remote_file_size INTEGER;');
+          }
+          if (!listColumnNames(preAddedDb, 'books').includes('downloaded_bytes')) {
+            preAddedDb.exec('ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;');
+          }
+        }
+        if (startVersion <= 9 && !listColumnNames(preAddedDb, 'books').includes('file_id')) {
+          preAddedDb.exec('ALTER TABLE books ADD COLUMN file_id INTEGER;');
+        }
+        if (startVersion <= 10 && !listColumnNames(preAddedDb, 'books').includes('sort_order')) {
+          preAddedDb.exec('ALTER TABLE books ADD COLUMN sort_order REAL;');
+        }
+
+        const adapter = createMigrationAdapter(preAddedDb);
+        await migrateDatabase(adapter);
+        expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
+        expect(new Set(listColumnNames(preAddedDb, 'books'))).toEqual(
+          new Set(expectedFinalBookColumns),
+        );
+        expect(listColumnNames(preAddedDb, 'books')).toHaveLength(expectedFinalBookColumns.length);
+      } finally {
+        preAddedDb.close();
+      }
+    }
+    db = undefined;
+  });
+
+  it('upgrades populated v7 databases cleanly across the #330 v8 -> #328 v9 -> #339 v10 -> #345 v11 merge sequence and compatibility matrix, reconciling before copying/deleting legacy study preferences', async () => {
     const scenarios = [
       {
-        label: '#328-only v8',
-        priorMigrations: pr328OnlyMigrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
-        has328: true,
-        has330: false,
-        has339: false,
-      },
-      {
-        label: '#330-only v8',
+        label: 'ordered #330 v8',
         priorMigrations: pr330OnlyMigrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
         has328: false,
         has330: true,
         has339: false,
       },
       {
+        label: 'ordered #330 v8 + #328 v9',
+        priorMigrations: pr330And328OrderedMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
+        has328: true,
+        has330: true,
+        has339: false,
+      },
+      {
+        label: 'ordered #330 v8 + #328 v9 + #339 v10',
+        priorMigrations: pr330And328And339OrderedMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
+        has328: true,
+        has330: true,
+        has339: true,
+      },
+      {
+        label: '#328-only v8',
+        priorMigrations: pr328OnlyMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
+        has328: true,
+        has330: false,
+        has339: false,
+      },
+      {
         label: 'combined #328+#330 v8',
         priorMigrations: pr328And330CombinedV8Migrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
         has328: true,
         has330: true,
         has339: false,
@@ -930,7 +1185,7 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
       {
         label: '#328 v8 + #339 v9',
         priorMigrations: pr328And339SequentialMigrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
         has328: true,
         has330: false,
         has339: true,
@@ -938,15 +1193,15 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
       {
         label: '#330 v8 + #339 v9',
         priorMigrations: pr330And339SequentialMigrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
         has328: false,
         has330: true,
         has339: true,
       },
       {
         label: 'combined #328+#330 v8 + #339 v9',
-        priorMigrations: pr328And330And339SequentialMigrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
+        priorMigrations: pr328And330And339CombinedMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
         has328: true,
         has330: true,
         has339: true,
@@ -954,7 +1209,7 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
       {
         label: 'uncoordinated #330+#339 combined v8',
         priorMigrations: pr330And339CombinedV8Migrations,
-        followupMigrations: pr328And330And339SequentialMigrations,
+        followupMigrations: pr330And328And339OrderedMigrations,
         has328: false,
         has330: true,
         has339: true,
@@ -1093,12 +1348,14 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     assertReconciliationPrecededStudyCopyAndDelete(executedStatements);
 
     for (const subsequentMigrations of [
-      pr328OnlyMigrations,
       pr330OnlyMigrations,
+      pr330And328OrderedMigrations,
+      pr330And328And339OrderedMigrations,
+      pr328OnlyMigrations,
       pr328And330CombinedV8Migrations,
       pr328And339SequentialMigrations,
       pr330And339SequentialMigrations,
-      pr328And330And339SequentialMigrations,
+      pr328And330And339CombinedMigrations,
     ]) {
       await runSimpleMigrations(baseAdapter, subsequentMigrations);
     }
@@ -1290,12 +1547,17 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     ]);
   });
 
-  it('rolls back the v10 migration and leaves all source preferences intact if any query or study insert fails across #328/#330/#339 v8 and v9 predecessors, then succeeds on retry', async () => {
+  it('rolls back the v11 migration and leaves all source preferences intact if any query or study insert fails across #330/#328/#339 v8-v10 predecessors, then succeeds on retry', async () => {
     for (const priorCase of [
-      { migrations: pr328OnlyMigrations, has328: true, has330: false, has339: false },
       { migrations: pr330OnlyMigrations, has328: false, has330: true, has339: false },
-      { migrations: pr328And339SequentialMigrations, has328: true, has330: false, has339: true },
-      { migrations: pr330And339SequentialMigrations, has328: false, has330: true, has339: true },
+      { migrations: pr330And328OrderedMigrations, has328: true, has330: true, has339: false },
+      {
+        migrations: pr330And328And339OrderedMigrations,
+        has328: true,
+        has330: true,
+        has339: true,
+      },
+      { migrations: pr328OnlyMigrations, has328: true, has330: false, has339: false },
     ] as const) {
       const candidateDb = createV7Database();
       try {
@@ -1330,7 +1592,7 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
             .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
             .all(),
         ).toEqual(preferencesBefore);
-        expect(await adapter.getVersion()).toEqual({ version: 9 });
+        expect(await adapter.getVersion()).toEqual({ version: 10 });
 
         // 2. Inject NOT NULL violations on annotations, bookmarks, and reading_history inserts in turn.
         for (const targetInsert of [
@@ -1369,7 +1631,7 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
             .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
             .all();
           expect(preferencesAfterRollback).toEqual(preferencesBefore);
-          expect(await adapter.getVersion()).toEqual({ version: 9 });
+          expect(await adapter.getVersion()).toEqual({ version: 10 });
           expect(listTableNames(candidateDb)).not.toContain('annotations');
           expect(listTableNames(candidateDb)).not.toContain('bookmarks');
           expect(listTableNames(candidateDb)).not.toContain('reading_history');
@@ -1399,7 +1661,7 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
             .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
             .all(),
         ).toEqual(preferencesBefore);
-        expect(await adapter.getVersion()).toEqual({ version: 9 });
+        expect(await adapter.getVersion()).toEqual({ version: 10 });
         expect(listTableNames(candidateDb)).not.toContain('annotations');
         expect(listTableNames(candidateDb)).not.toContain('bookmarks');
         expect(listTableNames(candidateDb)).not.toContain('reading_history');

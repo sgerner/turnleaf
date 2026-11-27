@@ -12,9 +12,13 @@ import { MAX_BOOKMARKS, recordLocation, type StoredReaderLocation } from '../rea
 import { MAX_ANNOTATIONS, type StoredAnnotation, type StudySyncState } from '../reader/annotations';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 import {
+  BOOKS_SERVER_FILE_INDEX_SQL,
   DELETE_LEGACY_STUDY_PREFERENCES_SQL,
   migrations,
   STUDY_STORAGE_MIGRATION_VERSION,
+  V8_BOOK_COLUMNS,
+  V9_BOOK_COLUMNS,
+  V10_BOOK_COLUMNS,
 } from './schema';
 import {
   cfiFallbackLocator,
@@ -348,27 +352,63 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-const COORDINATED_BOOK_COLUMNS: ReadonlyArray<{
-  name: string;
-  definition: string;
-  version: 8 | 9;
-}> = [
-  { name: 'file_id', definition: 'INTEGER', version: 8 },
-  { name: 'file_name', definition: 'TEXT', version: 8 },
-  { name: 'remote_file_size', definition: 'INTEGER', version: 8 },
-  { name: 'chapter_epub_index', definition: 'INTEGER NOT NULL DEFAULT 0', version: 8 },
-  { name: 'multi_file_chapter', definition: 'INTEGER NOT NULL DEFAULT 0', version: 8 },
-  { name: 'sync_progress', definition: 'INTEGER NOT NULL DEFAULT 1', version: 8 },
-  { name: 'downloaded_bytes', definition: 'INTEGER', version: 8 },
-  { name: 'downloaded_pages', definition: 'INTEGER', version: 8 },
-  { name: 'chapter_key', definition: 'TEXT', version: 8 },
-  { name: 'sort_order', definition: 'REAL', version: 9 },
-  { name: 'min_number', definition: 'REAL', version: 9 },
-  { name: 'volume_number', definition: 'REAL', version: 9 },
-];
+const COORDINATED_BOOK_COLUMNS = [
+  ...V8_BOOK_COLUMNS,
+  ...V9_BOOK_COLUMNS,
+  ...V10_BOOK_COLUMNS,
+] as const;
 
-const COORDINATED_BOOKS_SERVER_FILE_INDEX_SQL =
-  'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);';
+const ALTER_ADD_COLUMN_PATTERN =
+  /^ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)\b/i;
+
+function splitSqlStatements(sql: string): string[] {
+  return sql
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0)
+    .map((statement) => `${statement};`);
+}
+
+async function buildIdempotentMigrationStatements(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  sql: string,
+): Promise<string | null> {
+  const statements = splitSqlStatements(sql);
+  if (!statements.some((statement) => ALTER_ADD_COLUMN_PATTERN.test(statement))) {
+    return sql;
+  }
+
+  const columnsByTable = new Map<string, Set<string>>();
+  const keptStatements: string[] = [];
+  let skippedAnyColumn = false;
+
+  for (const statement of statements) {
+    const match = statement.match(ALTER_ADD_COLUMN_PATTERN);
+    if (!match) {
+      keptStatements.push(statement);
+      continue;
+    }
+    const tableName = match[1]!;
+    const columnName = match[2]!;
+    let existingColumns = columnsByTable.get(tableName);
+    if (!existingColumns) {
+      const rows = (await executeNativeQuery(db, `PRAGMA table_info('${tableName}')`)).values ?? [];
+      existingColumns = new Set(rows.map((row) => String(row.name)));
+      columnsByTable.set(tableName, existingColumns);
+    }
+    if (existingColumns.has(columnName)) {
+      skippedAnyColumn = true;
+      continue;
+    }
+    existingColumns.add(columnName);
+    keptStatements.push(statement);
+  }
+
+  if (!skippedAnyColumn) {
+    return sql;
+  }
+  return keptStatements.length > 0 ? keptStatements.join('\n') : null;
+}
 
 function isMissingTableError(error: unknown, tableName: string): boolean {
   return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
@@ -447,44 +487,25 @@ export async function migrateDatabase(
 ): Promise<void> {
   const current = await db.getVersion();
   const currentVersion = current.version ?? 0;
-  let existingBookColumns: Set<string> | null = null;
-  if (currentVersion >= 8 && currentVersion < STUDY_STORAGE_MIGRATION_VERSION) {
-    const tableInfoRows = (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
-    if (tableInfoRows.length > 0) {
-      existingBookColumns = new Set(tableInfoRows.map((row) => String(row.name)));
-    }
-  }
 
   for (const migration of migrations) {
     if (migration.version <= currentVersion) continue;
 
-    if ((migration.version === 8 || migration.version === 9) && existingBookColumns) {
-      const missingColumns = COORDINATED_BOOK_COLUMNS.filter(
-        (column) => column.version <= migration.version && !existingBookColumns.has(column.name),
-      );
-      await executeNativeTransaction(db, [
-        ...(missingColumns.length > 0
-          ? [
-              {
-                statement: missingColumns
-                  .map(
-                    (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
-                  )
-                  .join('\n'),
-              },
-            ]
-          : []),
-        { statement: COORDINATED_BOOKS_SERVER_FILE_INDEX_SQL },
-        { statement: `PRAGMA user_version = ${migration.version};` },
-      ]);
-      for (const column of missingColumns) existingBookColumns.add(column.name);
-      continue;
-    }
-
     if (migration.version === STUDY_STORAGE_MIGRATION_VERSION) {
-      const missingBookColumns = existingBookColumns
-        ? COORDINATED_BOOK_COLUMNS.filter((column) => !existingBookColumns.has(column.name))
-        : [];
+      const bookInfoRows =
+        (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
+      let missingBookColumns: Array<{ name: string; definition: string }> = [];
+      let missingBooksServerFileIndex = false;
+      if (bookInfoRows.length > 0) {
+        const existingBookColumns = new Set(bookInfoRows.map((row) => String(row.name)));
+        missingBookColumns = COORDINATED_BOOK_COLUMNS.filter(
+          (column) => !existingBookColumns.has(column.name),
+        );
+        const bookIndexRows =
+          (await executeNativeQuery(db, "PRAGMA index_list('books')")).values ?? [];
+        const existingBookIndexes = new Set(bookIndexRows.map((row) => String(row.name)));
+        missingBooksServerFileIndex = !existingBookIndexes.has('books_server_file_idx');
+      }
       const legacyTasks = currentVersion >= 3 ? await buildLegacyStudyMigrationTasks(db) : [];
       await executeNativeTransaction(db, [
         ...(missingBookColumns.length > 0
@@ -498,18 +519,18 @@ export async function migrateDatabase(
               },
             ]
           : []),
-        ...(existingBookColumns ? [{ statement: COORDINATED_BOOKS_SERVER_FILE_INDEX_SQL }] : []),
+        ...(missingBooksServerFileIndex ? [{ statement: BOOKS_SERVER_FILE_INDEX_SQL }] : []),
         { statement: migration.statements },
         ...legacyTasks,
         ...(currentVersion >= 3 ? [{ statement: DELETE_LEGACY_STUDY_PREFERENCES_SQL }] : []),
         { statement: `PRAGMA user_version = ${migration.version};` },
       ]);
-      for (const column of missingBookColumns) existingBookColumns?.add(column.name);
       continue;
     }
 
+    const statementsToRun = await buildIdempotentMigrationStatements(db, migration.statements);
     await executeNativeTransaction(db, [
-      { statement: migration.statements },
+      ...(statementsToRun !== null ? [{ statement: statementsToRun }] : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
   }

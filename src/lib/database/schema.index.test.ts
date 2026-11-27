@@ -2,12 +2,60 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
-import { migrations } from './schema';
+import {
+  migrations,
+  STUDY_STORAGE_MIGRATION_VERSION,
+  V8_BOOK_COLUMNS,
+  V8_MIGRATION_VERSION,
+  V9_BOOK_COLUMNS,
+  V9_MIGRATION_VERSION,
+  V10_BOOK_COLUMNS,
+  V10_MIGRATION_VERSION,
+} from './schema';
 
 describe('native library indexes', () => {
   let db: DatabaseSync;
 
-  afterEach(() => db.close());
+  afterEach(() => db?.close());
+
+  it('defines sequential v1-v11 migrations without duplicate ALTER TABLE ADD COLUMN definitions', () => {
+    expect(STUDY_STORAGE_MIGRATION_VERSION).toBe(11);
+    expect(migrations.map((migration) => migration.version)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    ]);
+
+    const addedColumnsByTable = new Map<string, string[]>();
+    for (const migration of migrations) {
+      const matches = migration.statements.matchAll(
+        /ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)\b/gi,
+      );
+      for (const match of matches) {
+        const table = match[1]!;
+        const column = match[2]!;
+        const list = addedColumnsByTable.get(table) ?? [];
+        expect(list, `duplicate column ${table}.${column} in v${migration.version}`).not.toContain(
+          column,
+        );
+        list.push(column);
+        addedColumnsByTable.set(table, list);
+      }
+    }
+
+    const v8 = migrations.find((migration) => migration.version === V8_MIGRATION_VERSION)!;
+    const v9 = migrations.find((migration) => migration.version === V9_MIGRATION_VERSION)!;
+    const v10 = migrations.find((migration) => migration.version === V10_MIGRATION_VERSION)!;
+    for (const col of V8_BOOK_COLUMNS) {
+      expect(v8.statements).toContain(`ADD COLUMN ${col.name}`);
+    }
+    expect(v9.statements).not.toContain('remote_file_size');
+    for (const col of V9_BOOK_COLUMNS) {
+      expect(v9.statements).toContain(`ADD COLUMN ${col.name}`);
+    }
+    expect(v9.statements).toContain('books_server_file_idx');
+    for (const col of V10_BOOK_COLUMNS) {
+      expect(v10.statements).toContain(`ADD COLUMN ${col.name}`);
+    }
+  });
 
   it('adds a server-scoped title index for ordered library reads', () => {
     db = new DatabaseSync(':memory:');

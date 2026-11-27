@@ -1,4 +1,34 @@
-export const STUDY_STORAGE_MIGRATION_VERSION = 10;
+export const V8_MIGRATION_VERSION = 8;
+
+export const V8_BOOK_COLUMNS = [
+  { name: 'remote_file_size', definition: 'INTEGER' },
+  { name: 'downloaded_bytes', definition: 'INTEGER' },
+  { name: 'downloaded_pages', definition: 'INTEGER' },
+  { name: 'chapter_key', definition: 'TEXT' },
+] as const;
+
+export const V9_MIGRATION_VERSION = 9;
+
+export const V9_BOOK_COLUMNS = [
+  { name: 'file_id', definition: 'INTEGER' },
+  { name: 'file_name', definition: 'TEXT' },
+  { name: 'chapter_epub_index', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'multi_file_chapter', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'sync_progress', definition: 'INTEGER NOT NULL DEFAULT 1' },
+] as const;
+
+export const BOOKS_SERVER_FILE_INDEX_SQL =
+  'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);';
+
+export const V10_MIGRATION_VERSION = 10;
+
+export const V10_BOOK_COLUMNS = [
+  { name: 'sort_order', definition: 'REAL' },
+  { name: 'min_number', definition: 'REAL' },
+  { name: 'volume_number', definition: 'REAL' },
+] as const;
+
+export const STUDY_STORAGE_MIGRATION_VERSION = 11;
 
 export const DELETE_LEGACY_STUDY_PREFERENCES_SQL = `
   DELETE FROM preferences
@@ -115,22 +145,27 @@ export const migrations = [
     `,
   },
   {
-    version: 8,
+    version: V8_MIGRATION_VERSION,
     statements: `
-      ALTER TABLE books ADD COLUMN file_id INTEGER;
-      ALTER TABLE books ADD COLUMN file_name TEXT;
       ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
-      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
-      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
-      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
       ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
       ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
       ALTER TABLE books ADD COLUMN chapter_key TEXT;
-      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
     `,
   },
   {
-    version: 9,
+    version: V9_MIGRATION_VERSION,
+    statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      ${BOOKS_SERVER_FILE_INDEX_SQL}
+    `,
+  },
+  {
+    version: V10_MIGRATION_VERSION,
     statements: `
       ALTER TABLE books ADD COLUMN sort_order REAL;
       ALTER TABLE books ADD COLUMN min_number REAL;
