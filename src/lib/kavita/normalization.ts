@@ -1,9 +1,11 @@
 import { recordDiagnostic } from '../diagnostics/log';
 import type {
+  KavitaAnnotation,
   KavitaChapter,
   KavitaFile,
   KavitaLibrary,
   KavitaPerson,
+  KavitaPersonalTocItem,
   KavitaSeries,
   KavitaSeriesDetail,
   KavitaVolume,
@@ -76,7 +78,12 @@ function integer(value: unknown): number | undefined {
   return undefined;
 }
 
-function id(value: unknown, base: CollectionPath, index: number, field: string): number {
+function id(
+  value: unknown,
+  base: CollectionPath,
+  index: number | undefined,
+  field: string,
+): number {
   const n = integer(value);
   if (n === undefined)
     throw new KavitaPayloadError(formatPath(base, index, field), 'integer', value);
@@ -116,7 +123,7 @@ function date(
   value: unknown,
   endpoint: string,
   base: CollectionPath,
-  index: number,
+  index: number | undefined,
   field: string,
   optional = false,
   onFallback?: () => void,
@@ -132,7 +139,7 @@ function count(
   value: unknown,
   endpoint: string,
   base: CollectionPath,
-  index: number,
+  index: number | undefined,
   field: string,
   onFallback?: () => void,
 ): number {
@@ -522,4 +529,285 @@ export function normalizeSeriesDetail(payload: unknown): KavitaSeriesDetail {
   };
   if (incomplete) detail.incomplete = true;
   return detail;
+}
+
+function escapeHtmlText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function decodeHtmlEntities(text: string): string {
+  if (!text.includes('&')) return text;
+  return text.replace(
+    /&(?:#(\d+)|#x([0-9a-f]+)|([a-z0-9]+));/gi,
+    (match, dec: string | undefined, hex: string | undefined, named: string | undefined) => {
+      if (dec !== undefined) {
+        const codePoint = Number.parseInt(dec, 10);
+        return codePoint > 0 && codePoint <= 0x10ffff && (codePoint < 0xd800 || codePoint > 0xdfff)
+          ? String.fromCodePoint(codePoint)
+          : match;
+      }
+      if (hex !== undefined) {
+        const codePoint = Number.parseInt(hex, 16);
+        return codePoint > 0 && codePoint <= 0x10ffff && (codePoint < 0xd800 || codePoint > 0xdfff)
+          ? String.fromCodePoint(codePoint)
+          : match;
+      }
+      switch (named?.toLowerCase()) {
+        case 'nbsp':
+          return ' ';
+        case 'quot':
+          return '"';
+        case 'apos':
+          return "'";
+        case 'lt':
+          return '<';
+        case 'gt':
+          return '>';
+        case 'amp':
+          return '&';
+        default:
+          return match;
+      }
+    },
+  );
+}
+
+function isHtmlWhitespace(char: string): boolean {
+  return char === ' ' || char === '\t' || char === '\n' || char === '\r' || char === '\f';
+}
+
+function findRawTextElementEnd(
+  lowerHtml: string,
+  tagName: 'script' | 'style',
+  from: number,
+): number {
+  const closePrefix = `</${tagName}`;
+  let searchFrom = from;
+  while (searchFrom < lowerHtml.length) {
+    const candidate = lowerHtml.indexOf(closePrefix, searchFrom);
+    if (candidate === -1) return lowerHtml.length;
+    const afterName = candidate + closePrefix.length;
+    const boundary = lowerHtml[afterName];
+    if (boundary === undefined) return lowerHtml.length;
+    if (boundary === '>' || boundary === '/' || isHtmlWhitespace(boundary)) {
+      const endBracket = lowerHtml.indexOf('>', afterName);
+      return endBracket === -1 ? lowerHtml.length : endBracket + 1;
+    }
+    searchFrom = afterName;
+  }
+  return lowerHtml.length;
+}
+
+function stripSimpleHtml(html: string): string {
+  const lowerHtml = html.toLowerCase();
+  const chunks: string[] = [];
+  let cursor = 0;
+
+  while (cursor < html.length) {
+    const tagStart = html.indexOf('<', cursor);
+    if (tagStart === -1) {
+      chunks.push(decodeHtmlEntities(html.slice(cursor)));
+      break;
+    }
+    if (tagStart > cursor) {
+      chunks.push(decodeHtmlEntities(html.slice(cursor, tagStart)));
+    }
+
+    if (lowerHtml.startsWith('<!--', tagStart)) {
+      const commentEnd = lowerHtml.indexOf('-->', tagStart + 4);
+      if (commentEnd === -1) break;
+      cursor = commentEnd + 3;
+      continue;
+    }
+
+    const tagEnd = html.indexOf('>', tagStart + 1);
+    if (tagEnd === -1) break;
+
+    const rawTag = lowerHtml.slice(tagStart + 1, tagEnd).trim();
+    cursor = tagEnd + 1;
+
+    let nameEnd = 0;
+    while (nameEnd < rawTag.length) {
+      const ch = rawTag[nameEnd]!;
+      if (isHtmlWhitespace(ch) || (ch === '/' && nameEnd > 0)) break;
+      nameEnd += 1;
+    }
+    const tagName = rawTag.slice(0, nameEnd);
+    const selfClosing = rawTag.endsWith('/');
+
+    if ((tagName === 'script' || tagName === 'style') && !selfClosing) {
+      cursor = findRawTextElementEnd(lowerHtml, tagName, cursor);
+      continue;
+    }
+
+    if (tagName === 'br') {
+      chunks.push('\n');
+      continue;
+    }
+
+    if (
+      tagName === '/p' ||
+      tagName === '/div' ||
+      tagName === '/li' ||
+      tagName === '/blockquote' ||
+      (tagName.length === 3 && tagName.startsWith('/h') && tagName[2]! >= '1' && tagName[2]! <= '6')
+    ) {
+      chunks.push('\n');
+      let next = cursor;
+      while (next < html.length && isHtmlWhitespace(html[next]!)) {
+        next += 1;
+      }
+      if (next < html.length && html[next] === '<') {
+        cursor = next;
+      }
+    }
+  }
+
+  return chunks.join('').trim();
+}
+
+function extractProseMirrorText(node: unknown): string | null {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+  const record = node as Row;
+  if (typeof record.text === 'string') return record.text;
+  if (Array.isArray(record.content)) {
+    const parts = record.content
+      .map((child) => extractProseMirrorText(child))
+      .filter((item): item is string => item !== null);
+    if (record.type === 'doc') return parts.join('\n').trim();
+    return parts.join('');
+  }
+  if (Object.keys(record).length === 0) return '';
+  return null;
+}
+
+export function extractAnnotationNote(
+  commentPlainText: unknown,
+  commentHtml: unknown,
+  comment: unknown,
+): string {
+  if (typeof commentPlainText === 'string' && commentPlainText.trim()) {
+    return commentPlainText.trim();
+  }
+  if (typeof commentHtml === 'string' && commentHtml.trim()) {
+    const stripped = stripSimpleHtml(commentHtml);
+    if (stripped) return stripped;
+  }
+  if (typeof comment === 'string' && comment.trim()) {
+    const trimmed = comment.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = extractProseMirrorText(JSON.parse(trimmed));
+        if (parsed !== null) return parsed;
+      } catch {
+        // Fall through to plain-text comment.
+      }
+    }
+    return trimmed;
+  }
+  return '';
+}
+
+export function formatAnnotationCommentFields(note: string): {
+  comment: string;
+  commentHtml: string;
+} {
+  const trimmed = note.trim();
+  if (!trimmed) return { comment: '', commentHtml: '' };
+  const lines = trimmed.split(/\r?\n/);
+  return {
+    comment: JSON.stringify({
+      type: 'doc',
+      content: lines.map((line) =>
+        line
+          ? { type: 'paragraph', content: [{ type: 'text', text: line }] }
+          : { type: 'paragraph' },
+      ),
+    }),
+    commentHtml: lines.map((line) => `<p>${escapeHtmlText(line)}</p>`).join(''),
+  };
+}
+
+export function normalizeAnnotation(
+  payload: unknown,
+  endpoint = '/api/Annotation',
+  index?: number,
+): KavitaAnnotation {
+  const row = object(payload, '$', index);
+  const selectedText = typeof row.selectedText === 'string' ? row.selectedText : '';
+  const xPath = typeof row.xPath === 'string' ? row.xPath : '';
+  const comment = typeof row.comment === 'string' ? row.comment : '';
+  const commentHtml = typeof row.commentHtml === 'string' ? row.commentHtml : '';
+  const commentPlainText = extractAnnotationNote(row.commentPlainText, commentHtml, comment);
+  return {
+    id: id(row.id, '$', index, 'id'),
+    chapterId: id(row.chapterId, '$', index, 'chapterId'),
+    volumeId: count(row.volumeId, endpoint, '$', index, 'volumeId'),
+    seriesId: count(row.seriesId, endpoint, '$', index, 'seriesId'),
+    libraryId: count(row.libraryId, endpoint, '$', index, 'libraryId'),
+    ownerUserId: count(row.ownerUserId, endpoint, '$', index, 'ownerUserId'),
+    xPath,
+    endingXPath: typeof row.endingXPath === 'string' && row.endingXPath ? row.endingXPath : null,
+    selectedText,
+    comment,
+    commentHtml,
+    commentPlainText,
+    chapterTitle:
+      typeof row.chapterTitle === 'string' && row.chapterTitle ? row.chapterTitle : null,
+    context: typeof row.context === 'string' && row.context ? row.context : null,
+    highlightCount: count(
+      row.highlightCount ?? selectedText.length,
+      endpoint,
+      '$',
+      index,
+      'highlightCount',
+    ),
+    containsSpoiler: row.containsSpoiler === true,
+    pageNumber: count(row.pageNumber, endpoint, '$', index, 'pageNumber'),
+    selectedSlotIndex: count(row.selectedSlotIndex, endpoint, '$', index, 'selectedSlotIndex'),
+    createdUtc: date(row.createdUtc, endpoint, '$', index, 'createdUtc', true),
+    lastModifiedUtc: date(row.lastModifiedUtc, endpoint, '$', index, 'lastModifiedUtc', true),
+  };
+}
+
+export function normalizeAnnotations(
+  payload: unknown,
+  endpoint = '/api/Annotation/all',
+): KavitaAnnotation[] {
+  if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
+  return payload.map((value, index) => normalizeAnnotation(value, endpoint, index));
+}
+
+export function normalizePersonalToc(
+  payload: unknown,
+  endpoint = '/api/Reader/ptoc',
+): KavitaPersonalTocItem[] {
+  if (!Array.isArray(payload)) throw new KavitaPayloadError('$', 'array', payload);
+  return payload.flatMap((value, index) => {
+    const row = object(value, '$', index);
+    const title = typeof row.title === 'string' ? row.title.trim() : '';
+    if (!title) {
+      fallback(endpoint, formatPath('$', index, 'title'), row.title, 'nonempty string');
+      return [];
+    }
+    return [
+      {
+        id: id(row.id, '$', index, 'id'),
+        chapterId: id(row.chapterId, '$', index, 'chapterId'),
+        pageNumber: count(row.pageNumber, endpoint, '$', index, 'pageNumber'),
+        title,
+        bookScrollId:
+          typeof row.bookScrollId === 'string' && row.bookScrollId ? row.bookScrollId : null,
+        selectedText:
+          typeof row.selectedText === 'string' && row.selectedText ? row.selectedText : null,
+        chapterTitle:
+          typeof row.chapterTitle === 'string' && row.chapterTitle ? row.chapterTitle : null,
+      },
+    ];
+  });
 }

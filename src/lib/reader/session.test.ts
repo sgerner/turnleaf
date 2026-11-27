@@ -4,6 +4,12 @@ import type { Contents as EpubContents } from 'epubjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance } from './appearance';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
+import {
+  domRangeToKavitaXPaths,
+  fallbackKavitaXPathFromCfi,
+  parseKavitaLocator,
+  resolveKavitaAnnotationDomRange,
+} from './kavita-xpath-range';
 
 const PAGE_WIDTH = 300;
 
@@ -144,6 +150,65 @@ describe('Kavita EPUB locations', () => {
     );
     expect(resolveContentXPath(document, '/html/body/p[2]')?.textContent).toBe('second');
     expect(resolveContentXPath(document, '/html/body/h2[1]')?.textContent).toBe('heading');
+  });
+
+  it('parses DocFragment, page-scoped Angular reader, and id() Kavita locators', () => {
+    expect(parseKavitaLocator('//body/DocFragment[4]/body/section[1]/p[2]', 0)).toEqual({
+      spineIndex: 3,
+      contentXPath: '/html/body/section[1]/p[2]',
+    });
+    expect(
+      parseKavitaLocator(
+        '//body/app-root[1]/div[1]/app-book-reader[1]/div[2]/div[1]/section[2]/p[5]',
+        2,
+      ),
+    ).toEqual({
+      spineIndex: 2,
+      contentXPath: '/html/body/section[2]/p[5]',
+    });
+    expect(parseKavitaLocator('id("fn-42")', 1)).toEqual({
+      spineIndex: 1,
+      contentXPath: 'id("fn-42")',
+    });
+
+    const document = new DOMParser().parseFromString(
+      '<html><body><p id="fn-42">Footnote text</p></body></html>',
+      'text/html',
+    );
+    expect(resolveContentXPath(document, 'id("fn-42")')?.textContent).toBe('Footnote text');
+  });
+
+  it('derives fallback DocFragment XPaths from EPUB CFIs and round-trips multi-node DOM ranges', () => {
+    expect(fallbackKavitaXPathFromCfi('epubcfi(/6/6!/4/2/1:0)')).toEqual({
+      spineIndex: 2,
+      xPath: '//body/DocFragment[3]/body',
+    });
+
+    const document = new DOMParser().parseFromString(
+      '<html><body><section><p>Start of a <em>highlighted</em></p><p>passage across paragraphs.</p></section></body></html>',
+      'text/html',
+    );
+    const emphasis = document.querySelector('em')!;
+    const secondParagraph = document.querySelectorAll('p')[1]!;
+    const selectionRange = document.createRange();
+    selectionRange.setStart(emphasis.firstChild!, 0);
+    selectionRange.setEnd(secondParagraph.firstChild!, 14);
+
+    const kavitaLocators = domRangeToKavitaXPaths(selectionRange, 1);
+    expect(kavitaLocators).toMatchObject({
+      xPath: '//body/DocFragment[2]/body/section[1]/p[1]/em[1]',
+      endingXPath: '//body/DocFragment[2]/body/section[1]/p[2]',
+    });
+    const resolved = resolveKavitaAnnotationDomRange(
+      document,
+      '/html/body/section[1]/p[1]',
+      '/html/body/section[1]/p[2]',
+      'highlighted   passage across',
+    );
+    expect(resolved?.startContainer).toBe(emphasis.firstChild);
+    expect(resolved?.startOffset).toBe(0);
+    expect(resolved?.endContainer).toBe(secondParagraph.firstChild);
+    expect(resolved?.endOffset).toBe(14);
   });
 });
 

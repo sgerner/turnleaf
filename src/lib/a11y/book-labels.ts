@@ -14,6 +14,7 @@ export interface BookStatusOptions {
 
 export interface OpenBookLabelOptions extends BookStatusOptions {
   includeProgress?: boolean;
+  annotationCount?: number;
 }
 
 function progressPercent(book: Pick<BookRecord, 'pages' | 'pagesRead'>): number {
@@ -61,6 +62,14 @@ export function openBookLabel(
   const resolved: OpenBookLabelOptions =
     typeof options === 'boolean' ? { includeProgress: options } : options;
   const includeProgress = resolved.includeProgress ?? true;
+  const notes = Math.max(0, Math.floor(resolved.annotationCount ?? 0));
+  if (!book.downloadPath && book.remoteAvailable === false && notes > 0) {
+    return [
+      `View ${notes} saved highlight${notes === 1 ? '' : 's'} for ${book.title}`,
+      ...metadataParts(book),
+      ...statusParts(book, resolved),
+    ].join(', ');
+  }
   const parts = [`Open ${book.title}`, ...metadataParts(book)];
 
   if (book.downloadPath) {
@@ -71,6 +80,9 @@ export function openBookLabel(
   const progress = progressPercent(book);
   if (includeProgress && progress > 0) {
     parts.push(`${Math.round(progress)}% complete`);
+  }
+  if (notes > 0) {
+    parts.push(`${notes} saved highlight${notes === 1 ? '' : 's'}`);
   }
 
   return parts.join(', ');

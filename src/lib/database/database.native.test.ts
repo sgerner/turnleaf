@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 7;
+  let databaseVersion = 11;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 7;
+      databaseVersion = 11;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -373,15 +373,16 @@ it('groups completion and acknowledgement writes separately', async () => {
   ]);
 });
 
-it('records each migration and its user version in one transaction', async () => {
+it('records each migration and its user version in one transaction and checks PRAGMA table_info before ALTER TABLE ADD COLUMN', async () => {
   const { openDatabase, resetLocalDatabase } = await import('./database');
   await resetLocalDatabase();
   mocks.setDatabaseVersion(0);
   mocks.executeTransaction.mockClear();
+  mocks.db.query.mockClear();
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(7);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(11);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -391,6 +392,10 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN file_id'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN sort_order'),
+    expect.stringContaining('CREATE TABLE IF NOT EXISTS annotations'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -400,7 +405,284 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 5;',
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
+    'PRAGMA user_version = 8;',
+    'PRAGMA user_version = 9;',
+    'PRAGMA user_version = 10;',
+    'PRAGMA user_version = 11;',
   ]);
+  expect(mocks.db.query.mock.calls.map(([statement]) => statement)).toEqual([
+    "PRAGMA table_info('books')",
+    "PRAGMA table_info('books')",
+    "PRAGMA table_info('sync_queue')",
+    "PRAGMA table_info('reading_state')",
+    "PRAGMA table_info('books')",
+    "PRAGMA table_info('books')",
+    "PRAGMA table_info('books')",
+    "PRAGMA table_info('books')",
+  ]);
+});
+
+it('migrates active-server legacy study preferences during v11 upgrade before deleting legacy keys and skips already-existing columns idempotently', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(7);
+  mocks.executeTransaction.mockClear();
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    if (statement === "PRAGMA table_info('books')") {
+      return {
+        values: [{ name: 'id' }, { name: 'remote_file_size' }, { name: 'file_id' }],
+      };
+    }
+    if (statement === "PRAGMA index_list('books')") {
+      return { values: [{ name: 'books_server_file_idx' }] };
+    }
+    if (statement.includes('FROM preferences')) {
+      return {
+        values: [
+          {
+            key: 'readerAnnotations:active:1:10',
+            value: JSON.stringify([
+              {
+                id: 'a1',
+                cfi: 'epubcfi(/6/4!/4/2/1:0)',
+                excerpt: 'Active highlight',
+                note: 'Active note',
+                createdAt: '2026-01-01T00:00:00.000Z',
+              },
+            ]),
+          },
+          {
+            key: 'readerAnnotations:deleted:1:10',
+            value: JSON.stringify([
+              {
+                id: 'orphan',
+                cfi: 'epubcfi(/6/2!/4/2)',
+                excerpt: 'Orphaned highlight',
+                note: 'Should be dropped',
+                createdAt: '2026-01-01T00:00:00.000Z',
+              },
+            ]),
+          },
+          {
+            key: 'readerBookmarks:active:1:10',
+            value: JSON.stringify([
+              {
+                id: 'b1',
+                cfi: 'epubcfi(/6/4!/4/2)',
+                href: 'ch2.xhtml',
+                percentage: 0.3,
+                label: 'Saved spot',
+                savedAt: '2026-01-01T00:00:00.000Z',
+              },
+            ]),
+          },
+          {
+            key: 'readerHistory:active:1:10',
+            value: JSON.stringify([
+              {
+                id: 'h1',
+                cfi: 'epubcfi(/6/4!/4/2)',
+                href: 'ch2.xhtml',
+                percentage: 0.3,
+                label: '30%',
+                savedAt: '2026-01-01T00:00:00.000Z',
+              },
+            ]),
+          },
+        ],
+      };
+    }
+    if (statement.includes('FROM books')) {
+      return { values: [{ id: 'active:1:10' }] };
+    }
+    return { values: [] };
+  });
+
+  await openDatabase();
+
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(4);
+  const [v8Tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  const [v9Tasks] = mocks.executeTransaction.mock.calls[1] ?? [];
+  const [v10Tasks] = mocks.executeTransaction.mock.calls[2] ?? [];
+  const [tasks] = mocks.executeTransaction.mock.calls[3] ?? [];
+  expect(v8Tasks?.[0]?.statement).not.toContain('remote_file_size');
+  expect(v8Tasks?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('ALTER TABLE books ADD COLUMN downloaded_bytes'),
+    'PRAGMA user_version = 8;',
+  ]);
+  expect(v9Tasks?.[0]?.statement).not.toContain('ADD COLUMN file_id');
+  expect(v9Tasks?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('ALTER TABLE books ADD COLUMN file_name'),
+    'PRAGMA user_version = 9;',
+  ]);
+  expect(v10Tasks?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('ALTER TABLE books ADD COLUMN sort_order'),
+    'PRAGMA user_version = 10;',
+  ]);
+  const statements = tasks?.map((task) => task.statement) ?? [];
+  expect(statements).toEqual([
+    expect.stringContaining('ALTER TABLE books ADD COLUMN downloaded_bytes'),
+    expect.stringContaining('CREATE TABLE IF NOT EXISTS annotations'),
+    expect.stringContaining('INSERT INTO annotations'),
+    expect.stringContaining('INSERT INTO bookmarks'),
+    expect.stringContaining('INSERT INTO reading_history'),
+    expect.stringContaining('DELETE FROM preferences'),
+    'PRAGMA user_version = 11;',
+  ]);
+  const annotationInsert = tasks?.find((task) => task.statement.includes('INTO annotations'));
+  expect(annotationInsert?.values).toContain('active:1:10:a1');
+  expect(JSON.stringify(tasks)).not.toContain('deleted:1:10');
+});
+
+it('removes books, server config, and any legacy study preferences atomically on native removeServer', async () => {
+  const { openDatabase, removeServer, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(11);
+  await openDatabase();
+  mocks.executeTransaction.mockClear();
+
+  await removeServer('srv_123');
+
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks?.map((task) => task.statement)).toEqual([
+    'DELETE FROM books WHERE server_id=?',
+    'DELETE FROM server_config WHERE id=?',
+    expect.stringContaining('DELETE FROM preferences'),
+  ]);
+});
+
+it('serializes public native study reads and enforces note preservation and caps without deadlocking writes', async () => {
+  const {
+    getBookAnnotationCounts,
+    getBookAnnotations,
+    getBookBookmarkCounts,
+    getBookBookmarks,
+    getBookHistory,
+    getPendingAnnotationSync,
+    getPendingBookmarkSync,
+    getServerAnnotations,
+    saveBookAnnotation,
+    saveBookBookmark,
+    saveLocalProgress,
+  } = await import('./database');
+  const { MAX_ANNOTATIONS } = await import('../reader/annotations');
+  const { MAX_BOOKMARKS } = await import('../reader/bookmarks');
+  await openAndClearMocks();
+
+  let activeOperations = 0;
+  let peakOperations = 0;
+  const track = async <T>(result: T): Promise<T> => {
+    activeOperations += 1;
+    peakOperations = Math.max(peakOperations, activeOperations);
+    await new Promise((resolve) => setTimeout(resolve, 3));
+    activeOperations -= 1;
+    return result;
+  };
+  mocks.executeTransaction.mockImplementation(async () => track({ changes: { changes: 0 } }));
+  mocks.db.query.mockImplementation(async () => track({ values: [] as Record<string, unknown>[] }));
+
+  await Promise.all([
+    saveLocalProgress(book, readingState.cfi, readingState.xpath, 0.4),
+    getBookAnnotations(book.id),
+    getServerAnnotations(book.serverId),
+    getBookAnnotationCounts(book.serverId),
+    getBookBookmarks(book.id),
+    getBookBookmarkCounts(book.serverId),
+    getBookHistory(book.id),
+    getPendingAnnotationSync(book.serverId),
+    getPendingBookmarkSync(book.serverId),
+  ]);
+  expect(peakOperations).toBe(1);
+
+  vi.clearAllMocks();
+  const fullBookmarkRows = Array.from({ length: MAX_BOOKMARKS }, (_, index) => ({
+    id: `${book.id}:b${index}`,
+    book_id: book.id,
+    remote_id: index + 1,
+    cfi: `epubcfi(/6/4!/4/2/1:${index})`,
+    xpath: `//body/DocFragment[2]/body/p[${index + 1}]`,
+    href: 'ch2.xhtml',
+    percentage: 0.1,
+    page_number: index,
+    label: `Bookmark ${index}`,
+    excerpt: '',
+    remote_title: `Bookmark ${index}`,
+    remote_page_number: index,
+    saved_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+    sync_state: 'synced',
+    sync_revision: 1,
+    attempt_count: 0,
+    last_attempt_at: null,
+    last_error: null,
+  }));
+  mocks.db.query
+    .mockResolvedValueOnce({
+      values: [
+        {
+          id: `${book.id}:a1`,
+          book_id: book.id,
+          remote_id: 42,
+          cfi: 'epubcfi(/6/4!/4/2/1:0)',
+          xpath: '//body/DocFragment[2]/body/p[1]',
+          ending_xpath: '//body/DocFragment[2]/body/p[1]',
+          selected_slot_index: 0,
+          page_number: 1,
+          contains_spoiler: 0,
+          chapter_title: 'Chapter 1',
+          context: 'Passage',
+          excerpt: 'Passage',
+          note: 'Saved note',
+          created_at: '2026-01-01T00:00:00.000Z',
+          updated_at: '2026-01-01T00:00:00.000Z',
+          sync_state: 'synced',
+          sync_revision: 1,
+          attempt_count: 0,
+          last_attempt_at: null,
+          last_error: null,
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ values: [] })
+    .mockResolvedValueOnce({ values: [{ total: MAX_ANNOTATIONS }] })
+    .mockResolvedValueOnce({ values: fullBookmarkRows });
+
+  const preserved = await saveBookAnnotation(book.id, {
+    cfi: 'epubcfi(/6/4!/4/2/1:0)',
+    xpath: '//body/DocFragment[2]/body/p[1]',
+    endingXPath: '//body/DocFragment[2]/body/p[1]',
+    pageNumber: 1,
+    excerpt: 'Passage',
+    note: '   ',
+  });
+  expect(preserved?.note).toBe('Saved note');
+  expect(mocks.db.run).toHaveBeenCalledOnce();
+
+  mocks.db.run.mockClear();
+  await expect(
+    saveBookAnnotation(book.id, {
+      cfi: 'epubcfi(/6/4!/4/2/1:8)',
+      xpath: '//body/DocFragment[2]/body/p[2]',
+      endingXPath: '//body/DocFragment[2]/body/p[2]',
+      pageNumber: 1,
+      excerpt: 'Overflow highlight',
+      note: '',
+    }),
+  ).resolves.toBeNull();
+  expect(mocks.db.run).not.toHaveBeenCalled();
+
+  await expect(
+    saveBookBookmark(book.id, {
+      cfi: 'epubcfi(/6/4!/4/8)',
+      xpath: '//body/DocFragment[2]/body/p[4]',
+      href: 'ch2.xhtml',
+      percentage: 0.5,
+      pageNumber: 5,
+      label: 'Overflow bookmark',
+    }),
+  ).resolves.toBeNull();
+  expect(mocks.db.run).not.toHaveBeenCalled();
 });
 
 it('mirrors native SQLite theme and mode preferences to browser localStorage and clears on reset', async () => {

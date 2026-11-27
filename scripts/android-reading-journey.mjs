@@ -185,6 +185,11 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
       case '/api/Reader/get-progress':
         body = uploads.at(-1) ?? emptyProgress;
         break;
+      case '/api/Annotation/all':
+      case '/api/Annotation/all-for-series':
+      case '/api/Reader/ptoc':
+        body = [];
+        break;
       case '/api/Reader/progress': {
         let json = '';
         for await (const chunk of request) json += chunk;

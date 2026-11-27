@@ -5,6 +5,9 @@ import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, tick, unmount } from 'svelte';
 import type { BookRecord, ServerConfig } from './lib/database/database';
+import type * as DatabaseModule from './lib/database/database';
+import type * as NativeDownloadModule from './lib/downloads/native-download';
+import type * as SessionModule from './lib/reader/session';
 import type * as ThemesModule from './lib/themes/themes';
 
 const {
@@ -14,6 +17,9 @@ const {
   setPreferenceMock,
   setPreferencesMock,
   getBooksMock,
+  getBookAnnotationCountsMock,
+  getBookBookmarkCountsMock,
+  getServerAnnotationsMock,
   getReadingStateMock,
   getSyncStatusMock,
   removeServerMock,
@@ -33,6 +39,9 @@ const {
   setPreferenceMock: vi.fn(),
   setPreferencesMock: vi.fn(),
   getBooksMock: vi.fn(),
+  getBookAnnotationCountsMock: vi.fn(),
+  getBookBookmarkCountsMock: vi.fn(),
+  getServerAnnotationsMock: vi.fn(),
   getReadingStateMock: vi.fn(),
   getSyncStatusMock: vi.fn(),
   removeServerMock: vi.fn(),
@@ -66,36 +75,60 @@ vi.mock('./lib/native/credentials', () => ({
   saveApiKey: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('./lib/database/database', () => ({
-  getServer: getServerMock,
-  getPreferences: getPreferencesMock,
-  setPreference: setPreferenceMock,
-  setPreferences: setPreferencesMock,
-  getBooks: getBooksMock,
-  getReadingState: getReadingStateMock,
-  getSyncStatus: getSyncStatusMock,
-  removeServer: removeServerMock,
-  resetLocalDatabase: resetLocalDatabaseMock,
-  acceptRemoteProgress: vi.fn(),
-  markDownloaded: vi.fn(),
-  markBookCompleted: vi.fn(),
-  removeDownload: vi.fn(),
-  reconcileBooks: vi.fn(),
-  saveLocalProgress: vi.fn(),
-  saveRemoteProgress: vi.fn(),
-  saveServer: vi.fn(),
-}));
+vi.mock('./lib/database/database', async (importOriginal) => {
+  const actual = await importOriginal<typeof DatabaseModule>();
+  return {
+    ...actual,
+    createServerId: vi.fn(() => 'server-new'),
+    getServer: getServerMock,
+    getPreferences: getPreferencesMock,
+    setPreference: setPreferenceMock,
+    setPreferences: setPreferencesMock,
+    getBooks: getBooksMock,
+    getBookAnnotationCounts: getBookAnnotationCountsMock,
+    getBookBookmarkCounts: getBookBookmarkCountsMock,
+    getServerAnnotations: getServerAnnotationsMock,
+    getBookAnnotations: vi.fn().mockResolvedValue([]),
+    getBookBookmarks: vi.fn().mockResolvedValue([]),
+    getBookHistory: vi.fn().mockResolvedValue([]),
+    deleteBookAnnotation: vi.fn(),
+    deleteBookBookmark: vi.fn(),
+    recordBookHistory: vi.fn().mockResolvedValue([]),
+    renameBookBookmark: vi.fn(),
+    saveBookAnnotation: vi.fn(),
+    saveBookBookmark: vi.fn(),
+    saveResolvedBookAnnotations: vi.fn(),
+    saveResolvedBookBookmarks: vi.fn(),
+    updateBookAnnotationNote: vi.fn(),
+    getReadingState: getReadingStateMock,
+    getSyncStatus: getSyncStatusMock,
+    removeServer: removeServerMock,
+    resetLocalDatabase: resetLocalDatabaseMock,
+    acceptRemoteProgress: vi.fn(),
+    markDownloaded: vi.fn(),
+    markBookCompleted: vi.fn(),
+    removeDownload: vi.fn(),
+    reconcileBooks: vi.fn(),
+    saveLocalProgress: vi.fn(),
+    saveRemoteProgress: vi.fn(),
+    saveServer: vi.fn(),
+  };
+});
 
-vi.mock('./lib/downloads/native-download', () => ({
-  cacheCover: vi.fn(),
-  clearCoverCache: clearCoverCacheMock,
-  cleanupInterruptedEpubDownloads: cleanupInterruptedEpubDownloadsMock,
-  deleteDownloadedEpub: vi.fn().mockResolvedValue(undefined),
-  downloadEpub: vi.fn(),
-  EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
-  EpubTransferError: class EpubTransferError extends Error {},
-  verifyDownloadedEpub: verifyDownloadedEpubMock,
-}));
+vi.mock('./lib/downloads/native-download', async (importOriginal) => {
+  const actual = await importOriginal<typeof NativeDownloadModule>();
+  return {
+    ...actual,
+    cacheCover: vi.fn(),
+    clearCoverCache: clearCoverCacheMock,
+    cleanupInterruptedEpubDownloads: cleanupInterruptedEpubDownloadsMock,
+    deleteDownloadedEpub: vi.fn().mockResolvedValue(undefined),
+    downloadEpub: vi.fn(),
+    EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',
+    EpubTransferError: class EpubTransferError extends Error {},
+    verifyDownloadedEpub: verifyDownloadedEpubMock,
+  };
+});
 
 vi.mock('@capacitor/network', () => ({
   Network: {
@@ -111,17 +144,23 @@ vi.mock('@capacitor/app', () => ({
   },
 }));
 
-vi.mock('./lib/reader/session', () => ({
-  resolveReaderKeyboardAction: vi.fn(() => null),
-  ReaderSession: class MockReaderSession {
-    open = openSessionMock;
-    tableOfContents = () => [];
-    getVisiblePassages = () => [];
-    clearTextSelection = vi.fn();
-    updateHighlights = vi.fn();
-    destroy = destroySessionMock;
-  },
-}));
+vi.mock('./lib/reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    resolveReaderKeyboardAction: vi.fn(() => null),
+    ReaderSession: class MockReaderSession {
+      open = openSessionMock;
+      tableOfContents = () => [];
+      getVisiblePassages = () => [];
+      clearTextSelection = vi.fn();
+      updateHighlights = vi.fn();
+      resolveAnnotationLocations = vi.fn(async (items: unknown[]) => items);
+      resolveBookmarkLocations = vi.fn(async (items: unknown[]) => items);
+      destroy = destroySessionMock;
+    },
+  };
+});
 
 import App from './App.svelte';
 
@@ -166,6 +205,9 @@ describe('App shell releaseBanner layout', () => {
     });
     getServerMock.mockResolvedValue(null);
     getPreferencesMock.mockResolvedValue(new Map());
+    getBookAnnotationCountsMock.mockResolvedValue(new Map());
+    getBookBookmarkCountsMock.mockResolvedValue(new Map());
+    getServerAnnotationsMock.mockResolvedValue([]);
     resetLocalDatabaseMock.mockResolvedValue(undefined);
     getApiKeyMock.mockResolvedValue(null);
     removeApiKeyMock.mockResolvedValue(undefined);
@@ -268,6 +310,9 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     setPreferenceMock.mockResolvedValue(undefined);
     setPreferencesMock.mockResolvedValue(undefined);
     getBooksMock.mockResolvedValue([downloadedBook]);
+    getBookAnnotationCountsMock.mockResolvedValue(new Map());
+    getBookBookmarkCountsMock.mockResolvedValue(new Map());
+    getServerAnnotationsMock.mockResolvedValue([]);
     getReadingStateMock.mockResolvedValue({
       bookId: downloadedBook.id,
       cfi: 'epubcfi(/6/2!/4/2)',
@@ -437,5 +482,44 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     });
     flushSync();
     expect(target.querySelector('.app-ambient')).not.toBeNull();
+  });
+
+  it('scopes library study-data counts to the active server ID and clears the library view on server deletion', async () => {
+    getBookAnnotationCountsMock.mockImplementation(async (serverId: string) =>
+      serverId === 'server-1' ? new Map([[downloadedBook.id, 2]]) : new Map(),
+    );
+    getBookBookmarkCountsMock.mockImplementation(async (serverId: string) =>
+      serverId === 'server-1' ? new Map([[downloadedBook.id, 1]]) : new Map(),
+    );
+
+    mounted = mount(App, { target });
+
+    await vi.waitFor(() => {
+      expect(getBookAnnotationCountsMock).toHaveBeenCalledWith('server-1');
+      expect(getBookBookmarkCountsMock).toHaveBeenCalledWith('server-1');
+      expect(target.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+
+    target.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')?.click();
+    flushSync();
+
+    const deleteServerButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Delete server',
+    );
+    deleteServerButton?.click();
+    flushSync();
+
+    const confirmDeleteButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Delete now',
+    );
+    confirmDeleteButton?.click();
+
+    await vi.waitFor(() => {
+      expect(removeServerMock).toHaveBeenCalledWith('server-1');
+      expect(removeApiKeyMock).toHaveBeenCalledWith('cred-1');
+    });
+    flushSync();
+
+    expect(target.textContent).not.toContain('Static Glows Handbook');
   });
 });

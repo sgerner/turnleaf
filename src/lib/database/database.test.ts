@@ -5,24 +5,38 @@ import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 import {
   acceptRemoteProgress,
   confirmSync,
+  deleteBookAnnotation,
+  deleteBookBookmark,
+  getBookAnnotations,
+  getBookBookmarks,
+  getBookHistory,
   getBooks,
+  getPendingAnnotationSync,
+  getPendingBookmarkSync,
   getPendingSync,
   getPreferences,
   getReadingState,
   getServer,
+  getServerAnnotations,
   getSyncStatus,
+  markAnnotationSyncFailure,
   markBookCompleted,
   markDownloaded,
   reconcileBooks,
+  recordBookHistory,
   removeDownload,
   removeServer,
+  renameBookBookmark,
   replaceBooksInTransaction,
   resetLocalDatabase,
+  saveBookAnnotation,
+  saveBookBookmark,
   saveLocalProgress,
   saveRemoteProgress,
   saveServer,
   setPreference,
   setPreferences,
+  updateBookAnnotationNote,
   type BookRecord,
 } from './database';
 import { BOOT_THEME_STORAGE_KEY, themeTokens } from '../themes/themes';
@@ -990,6 +1004,328 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
 
+it('isolates study data per server and purges all annotations, bookmarks, history, and queued items on removeServer', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  await saveServer({
+    id: 'srv_one',
+    displayName: 'First Server',
+    baseUrl: 'https://one.example.com',
+    credentialRef: 'srv_one_api_key',
+    kavitaVersion: '0.8.8',
+    lastConnectedAt: '2026-09-01T00:00:00.000Z',
+  });
+  const bookOne: BookRecord = {
+    ...existingBook,
+    id: 'srv_one:1:10',
+    serverId: 'srv_one',
+  };
+  await reconcileBooks('srv_one', [bookOne]);
+  await saveLocalProgress(bookOne, 'epubcfi(/6/2!/4/2)', '//body/DocFragment[1]/body/p[1]', 0.25);
+  await saveBookAnnotation(bookOne.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Server one quote',
+    note: 'Server one note',
+  });
+  await saveBookBookmark(bookOne.id, {
+    cfi: 'epubcfi(/6/2!/4/2)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    href: 'ch1.xhtml',
+    percentage: 0.25,
+    pageNumber: 0,
+    label: 'Server one bookmark',
+  });
+  await recordBookHistory(bookOne.id, {
+    cfi: 'epubcfi(/6/2!/4/2)',
+    href: 'ch1.xhtml',
+    percentage: 0.25,
+    label: '25%',
+  });
+
+  await removeServer('srv_one');
+
+  const afterRemove = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    serverConfig: unknown;
+    books: BookRecord[];
+    readingState: Record<string, unknown>;
+    syncQueue: Record<string, unknown>;
+    annotations: Record<string, unknown>;
+    bookmarks: Record<string, unknown>;
+    readingHistory: Record<string, unknown>;
+  };
+  expect(afterRemove.serverConfig).toBeNull();
+  expect(afterRemove.books).toEqual([]);
+  expect(afterRemove.readingState).toEqual({});
+  expect(afterRemove.syncQueue).toEqual({});
+  expect(afterRemove.annotations).toEqual({});
+  expect(afterRemove.bookmarks).toEqual({});
+  expect(afterRemove.readingHistory).toEqual({});
+
+  // Connecting a second server with identical Kavita seriesId/chapterId starts completely clean.
+  await saveServer({
+    id: 'srv_two',
+    displayName: 'Second Server',
+    baseUrl: 'https://two.example.com',
+    credentialRef: 'srv_two_api_key',
+    kavitaVersion: '0.8.8',
+    lastConnectedAt: '2026-09-02T00:00:00.000Z',
+  });
+  const bookTwo: BookRecord = {
+    ...existingBook,
+    id: 'srv_two:1:10',
+    serverId: 'srv_two',
+  };
+  await reconcileBooks('srv_two', [bookTwo]);
+  await expect(getBookAnnotations(bookTwo.id)).resolves.toEqual([]);
+  await expect(getBookBookmarks(bookTwo.id)).resolves.toEqual([]);
+  await expect(getBookHistory(bookTwo.id)).resolves.toEqual([]);
+  await expect(getPendingAnnotationSync('srv_two')).resolves.toEqual([]);
+  await expect(getPendingBookmarkSync('srv_two')).resolves.toEqual([]);
+});
+
+it('migrates legacy reader preference rows for the active server and purges orphaned deleted-server entries', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const activeBook: BookRecord = {
+    ...existingBook,
+    id: 'active:1:10',
+    serverId: 'active',
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: {
+        id: 'active',
+        displayName: 'Active',
+        baseUrl: 'https://active.example',
+        credentialRef: 'active_key',
+        kavitaVersion: '0.8.8',
+        lastConnectedAt: '2026-09-01T00:00:00.000Z',
+      },
+      books: [activeBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {
+        uiTheme: 'vintage',
+        'readerAnnotations:active:1:10': JSON.stringify([
+          {
+            id: 'leg-a1',
+            cfi: 'epubcfi(/6/4!/4/2/1:0)',
+            excerpt: 'Migrated highlight',
+            note: 'Migrated note',
+            createdAt: '2026-08-01T00:00:00.000Z',
+          },
+        ]),
+        'readerAnnotations:primary:1:10': JSON.stringify([
+          {
+            id: 'orphan-a1',
+            cfi: 'epubcfi(/6/2!/4/2/1:0)',
+            excerpt: 'Deleted server highlight',
+            note: 'Must be purged',
+            createdAt: '2026-08-01T00:00:00.000Z',
+          },
+        ]),
+        'readerBookmarks:active:1:10': JSON.stringify([
+          {
+            id: 'leg-b1',
+            cfi: 'epubcfi(/6/4!/4/2)',
+            href: 'ch2.xhtml',
+            percentage: 0.4,
+            label: 'Duplicate Name',
+            savedAt: '2026-08-01T00:00:00.000Z',
+          },
+          {
+            id: 'leg-b2',
+            cfi: 'epubcfi(/6/4!/4/6)',
+            href: 'ch2.xhtml',
+            percentage: 0.45,
+            label: 'Duplicate Name',
+            savedAt: '2026-08-01T00:01:00.000Z',
+          },
+        ]),
+        'readerHistory:active:1:10': JSON.stringify([
+          {
+            id: 'leg-h1',
+            cfi: 'epubcfi(/6/4!/4/2)',
+            href: 'ch2.xhtml',
+            percentage: 0.4,
+            label: '40%',
+            savedAt: '2026-08-01T00:00:00.000Z',
+          },
+        ]),
+      },
+    }),
+  );
+
+  const rawBefore = storage.getItem(BROWSER_STORAGE_KEY);
+  expect(rawBefore).not.toBeNull();
+
+  // If browser storage fails while persisting migrated study records, source preferences stay intact.
+  storage.failWrites = true;
+  await getBookAnnotations(activeBook.id);
+  expect(storage.getItem(BROWSER_STORAGE_KEY)).toBe(rawBefore);
+  storage.failWrites = false;
+
+  const annotations = await getBookAnnotations(activeBook.id);
+  const bookmarks = await getBookBookmarks(activeBook.id);
+  const history = await getBookHistory(activeBook.id);
+
+  expect(annotations).toMatchObject([
+    {
+      excerpt: 'Migrated highlight',
+      note: 'Migrated note',
+      syncState: 'pending_create',
+      xpath: '//body/DocFragment[2]/body',
+      pageNumber: 1,
+    },
+  ]);
+  expect(bookmarks.map((item) => item.label).sort()).toEqual([
+    'Duplicate Name',
+    'Duplicate Name (2)',
+  ]);
+  expect(history).toHaveLength(1);
+
+  const raw = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    preferences: Record<string, string>;
+    annotations: Record<string, unknown>;
+  };
+  expect(raw.preferences).toEqual({ uiTheme: 'vintage' });
+  expect(raw.annotations['primary:1:10']).toBeUndefined();
+});
+
+it('retains undownloaded books with saved annotations or bookmarks when they leave Kavita', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const annotatedBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:20',
+    chapterId: 20,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  const bookmarkedBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:21',
+    chapterId: 21,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  const emptyBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:22',
+    chapterId: 22,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  await reconcileBooks('server', [annotatedBook, bookmarkedBook, emptyBook]);
+  await saveBookAnnotation(annotatedBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    excerpt: 'Keep this quote',
+    note: 'My note',
+  });
+  await saveBookBookmark(bookmarkedBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2)',
+    href: 'ch1.xhtml',
+    percentage: 0.1,
+    label: 'Keep this bookmark',
+  });
+
+  await reconcileBooks('server', []);
+
+  const remaining = await getBooks('server');
+  expect(remaining.map((book) => ({ id: book.id, remoteAvailable: book.remoteAvailable }))).toEqual(
+    [
+      { id: annotatedBook.id, remoteAvailable: false },
+      { id: bookmarkedBook.id, remoteAvailable: false },
+    ],
+  );
+  const serverGroups = await getServerAnnotations('server');
+  expect(serverGroups).toHaveLength(1);
+  expect(serverGroups[0]?.annotations[0]?.excerpt).toBe('Keep this quote');
+});
+
+it('deduplicates same-CFI annotations, disambiguates bookmark labels, and tracks study sync status', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  await reconcileBooks('server', [existingBook]);
+
+  const first = await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    excerpt: 'Highlighted passage',
+    note: 'Initial note',
+  });
+  const second = await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    excerpt: 'Highlighted passage',
+    note: 'Refined note',
+  });
+  expect(second?.id).toBe(first?.id);
+  expect(await getBookAnnotations(existingBook.id)).toHaveLength(1);
+  expect((await getBookAnnotations(existingBook.id))[0]?.note).toBe('Refined note');
+
+  await updateBookAnnotationNote(existingBook.id, first!.id, 'Third note');
+  const pendingAnnotations = await getPendingAnnotationSync('server');
+  expect(pendingAnnotations).toHaveLength(1);
+  await markAnnotationSyncFailure(
+    first!.id,
+    existingBook.id,
+    'Network timeout',
+    pendingAnnotations[0]!.syncRevision,
+  );
+
+  const b1 = await saveBookBookmark(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2)',
+    href: 'ch1.xhtml',
+    percentage: 0.2,
+    pageNumber: 0,
+    label: 'Chapter 1',
+  });
+  const b2 = await saveBookBookmark(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/8)',
+    href: 'ch1.xhtml',
+    percentage: 0.3,
+    pageNumber: 0,
+    label: 'Chapter 1',
+  });
+  expect(b1?.label).toBe('Chapter 1');
+  expect(b2?.label).toBe('Chapter 1 (2)');
+  const renamed = await renameBookBookmark(existingBook.id, b2!.id, 'Chapter 1');
+  expect(renamed?.label).toBe('Chapter 1 (2)');
+
+  await expect(getSyncStatus('server')).resolves.toMatchObject({
+    pendingCount: 3,
+    failedCount: 1,
+    lastError: 'Network timeout',
+  });
+
+  await deleteBookAnnotation(existingBook.id, first!.id);
+  await deleteBookBookmark(existingBook.id, b1!.id);
+  await deleteBookBookmark(existingBook.id, b2!.id);
+  await expect(getSyncStatus('server')).resolves.toMatchObject({
+    pendingCount: 0,
+    failedCount: 0,
+  });
+});
+
 it('mirrors browser theme, mode, and surface colors to localStorage and clears them on reset', async () => {
   const storage = new MemoryStorage();
   Object.defineProperty(window, 'localStorage', {
@@ -1211,4 +1547,101 @@ it('saves normalized browser remote progress and guards against concurrent local
   const setItemSpy = vi.spyOn(storage, 'setItem');
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
+});
+
+it('preserves existing notes on duplicate highlights and stops adding annotations or bookmarks at their caps', async () => {
+  const { MAX_ANNOTATIONS } = await import('../reader/annotations');
+  const { MAX_BOOKMARKS } = await import('../reader/bookmarks');
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  await saveServer({
+    id: 'server',
+    displayName: 'Server',
+    baseUrl: 'https://server.example',
+    credentialRef: 'server_key',
+    kavitaVersion: '0.8.8',
+    lastConnectedAt: '2026-09-01T00:00:00.000Z',
+  });
+  await reconcileBooks('server', [existingBook]);
+
+  const initial = await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Passage 0',
+    note: 'Keep this note',
+  });
+  const rehighlighted = await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    endingXPath: '//body/DocFragment[1]/body/p[1]',
+    pageNumber: 0,
+    excerpt: 'Passage 0',
+    note: '   ',
+  });
+  expect(initial).not.toBeNull();
+  expect(rehighlighted).toMatchObject({
+    id: initial?.id,
+    note: 'Keep this note',
+  });
+
+  for (let i = 1; i < MAX_ANNOTATIONS; i += 1) {
+    await saveBookAnnotation(existingBook.id, {
+      cfi: `epubcfi(/6/2!/4/2/1:${i})`,
+      xpath: `//body/DocFragment[1]/body/p[${i + 1}]`,
+      endingXPath: `//body/DocFragment[1]/body/p[${i + 1}]`,
+      pageNumber: i,
+      excerpt: `Passage ${i}`,
+      note: '',
+    });
+  }
+  await saveBookAnnotation(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:999)',
+    xpath: '//body/DocFragment[1]/body/p[999]',
+    endingXPath: '//body/DocFragment[1]/body/p[999]',
+    pageNumber: 99,
+    excerpt: 'Overflow highlight',
+    note: 'Ignored',
+  });
+  const annotations = await getBookAnnotations(existingBook.id);
+  expect(annotations).toHaveLength(MAX_ANNOTATIONS);
+  expect(
+    annotations.some((item) => item.id === initial?.id && item.note === 'Keep this note'),
+  ).toBe(true);
+  expect(annotations.some((item) => item.cfi === 'epubcfi(/6/2!/4/2/1:999)')).toBe(false);
+
+  const firstBookmark = await saveBookBookmark(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:0)',
+    xpath: '//body/DocFragment[1]/body/p[1]',
+    href: 'ch1.xhtml',
+    percentage: 0.01,
+    pageNumber: 0,
+    label: 'Bookmark 0',
+  });
+  for (let i = 1; i < MAX_BOOKMARKS; i += 1) {
+    await saveBookBookmark(existingBook.id, {
+      cfi: `epubcfi(/6/2!/4/2/1:${i})`,
+      xpath: `//body/DocFragment[1]/body/p[${i + 1}]`,
+      href: 'ch1.xhtml',
+      percentage: i / 100,
+      pageNumber: i,
+      label: `Bookmark ${i}`,
+    });
+  }
+  await saveBookBookmark(existingBook.id, {
+    cfi: 'epubcfi(/6/2!/4/2/1:999)',
+    xpath: '//body/DocFragment[1]/body/p[999]',
+    href: 'ch1.xhtml',
+    percentage: 0.99,
+    pageNumber: 99,
+    label: 'Overflow bookmark',
+  });
+  const bookmarks = await getBookBookmarks(existingBook.id);
+  expect(bookmarks).toHaveLength(MAX_BOOKMARKS);
+  expect(bookmarks.some((item) => item.id === firstBookmark?.id)).toBe(true);
+  expect(bookmarks.some((item) => item.cfi === 'epubcfi(/6/2!/4/2/1:999)')).toBe(false);
 });

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { saveServer, type ServerConfig } from '../database/database';
+  import { createServerId, saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
   import { removeApiKey, saveApiKey } from '../native/credentials';
@@ -155,8 +155,8 @@
         return;
       }
 
-      const id = 'primary';
-      const credentialRef = `server_${id}_api_key`;
+      const id = createServerId();
+      const credentialRef = `${id}_api_key`;
       const server: ServerConfig = {
         id,
         displayName: displayName.trim() || 'Books',

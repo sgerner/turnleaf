@@ -131,4 +131,26 @@ describe('book accessibility labels', () => {
       'Open Seascraper, by Benjamin Wood',
     );
   });
+
+  it('announces saved highlight counts and view-highlights action for retained undownloaded books', () => {
+    const activeBook = makeBook({
+      title: 'Seascraper',
+      author: 'Benjamin Wood',
+      series: null,
+    });
+    const retainedUndownloaded = makeBook({
+      title: 'Seascraper',
+      author: 'Benjamin Wood',
+      series: null,
+      downloadPath: null,
+      remoteAvailable: false,
+    });
+
+    expect(openBookLabel(activeBook, { annotationCount: 2 })).toBe(
+      'Open Seascraper, by Benjamin Wood, 2 saved highlights',
+    );
+    expect(openBookLabel(retainedUndownloaded, { annotationCount: 1 })).toBe(
+      'View 1 saved highlight for Seascraper, by Benjamin Wood, removed from server',
+    );
+  });
 });

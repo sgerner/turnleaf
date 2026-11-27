@@ -5,6 +5,14 @@ export interface StoredReaderLocation {
   percentage: number;
   label: string;
   savedAt: string;
+  updatedAt?: string;
+  remoteId?: number | null;
+  xpath?: string | null;
+  pageNumber?: number;
+  excerpt?: string;
+  remoteTitle?: string | null;
+  remotePageNumber?: number | null;
+  syncState?: 'synced' | 'pending_create' | 'pending_update' | 'pending_delete';
 }
 
 export const MAX_BOOKMARKS = 100;
@@ -51,25 +59,40 @@ function locationLabel(percentage: number, href: string): string {
 }
 
 function bookmarkLocation(
-  current: Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'>,
+  current: Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'> & { label?: string },
   savedAt = new Date().toISOString(),
 ): StoredReaderLocation {
+  const label = current.label?.trim() || locationLabel(current.percentage, current.href);
   return {
     ...current,
     id: `${current.cfi}|${current.href}`,
-    label: locationLabel(current.percentage, current.href),
+    label,
     savedAt,
   };
 }
 
+export function findMatchingBookmark(
+  bookmarks: readonly StoredReaderLocation[],
+  current: { cfi: string; href: string; xpath?: string | null | undefined },
+): StoredReaderLocation | null {
+  const id = `${current.cfi}|${current.href}`;
+  return (
+    bookmarks.find(
+      (bookmark) =>
+        bookmark.id === id ||
+        (Boolean(current.cfi) && bookmark.cfi === current.cfi) ||
+        (Boolean(current.xpath) && bookmark.xpath === current.xpath),
+    ) ?? null
+  );
+}
+
 export function toggleBookmark(
   bookmarks: readonly StoredReaderLocation[],
-  current: Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'>,
+  current: Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'> & { label?: string },
   savedAt = new Date().toISOString(),
 ): StoredReaderLocation[] {
-  const id = `${current.cfi}|${current.href}`;
-  const existing = bookmarks.findIndex((bookmark) => bookmark.id === id);
-  if (existing >= 0) return bookmarks.filter((_, index) => index !== existing);
+  const match = findMatchingBookmark(bookmarks, current);
+  if (match) return bookmarks.filter((bookmark) => bookmark.id !== match.id);
   if (bookmarks.length >= MAX_BOOKMARKS) return [...bookmarks];
   return [bookmarkLocation(current, savedAt), ...bookmarks];
 }

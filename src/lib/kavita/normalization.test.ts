@@ -2,8 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from '../diagnostics/log';
 import { issue51VolumeDetail } from './fixtures/issue-51-volume-detail';
 import {
+  extractAnnotationNote,
+  formatAnnotationCommentFields,
   KavitaPayloadError,
+  normalizeAnnotation,
+  normalizeAnnotations,
   normalizeLibraries,
+  normalizePersonalToc,
   normalizeSeriesDetail,
   normalizeSeriesPage,
 } from './normalization';
@@ -569,5 +574,146 @@ describe('normalizeSeriesDetail', () => {
     );
     expect(normalizedDetail.specials[0]!.lastReadingProgressUtc).toBe('0001-01-01T00:00:00Z');
     expect(normalizedSeries[0]!.latestReadDate).toBe('0001-01-01T00:00:00Z');
+  });
+});
+
+describe('Kavita annotations and personal ToC normalization', () => {
+  it('round-trips multi-line notes through ProseMirror JSON and HTML comment fields', () => {
+    const formatted = formatAnnotationCommentFields('First line\n<Second & "quoted">');
+    expect(formatted.commentHtml).toBe(
+      '<p>First line</p><p>&lt;Second &amp; &quot;quoted&quot;&gt;</p>',
+    );
+    expect(extractAnnotationNote(null, null, formatted.comment)).toBe(
+      'First line\n<Second & "quoted">',
+    );
+    expect(extractAnnotationNote(null, formatted.commentHtml, null)).toBe(
+      'First line\n<Second & "quoted">',
+    );
+    expect(formatAnnotationCommentFields('   ')).toEqual({ comment: '', commentHtml: '' });
+  });
+
+  it('safely extracts plain text from HTML comments without incomplete multi-character tag stripping or double unescaping', () => {
+    expect(
+      extractAnnotationNote(
+        null,
+        '<p>Line one<br>Line two<br />Line three</p>\n  <p></p>\n  <p>After blank</p>',
+        null,
+      ),
+    ).toBe('Line one\nLine two\nLine three\n\nAfter blank');
+    expect(
+      extractAnnotationNote(
+        null,
+        '<!-- <p>hidden</p> --><script>alert(1)</script><style>body{display:none}</style><p>Visible&#39;s &nbsp;note</p>',
+        null,
+      ),
+    ).toBe("Visible's  note");
+    expect(extractAnnotationNote(null, '<<br>script>alert(1)</script>', null)).not.toContain(
+      '<script',
+    );
+    expect(
+      extractAnnotationNote(null, '<scr<script>ipt>alert(1)</script>Note', null),
+    ).not.toContain('<script');
+    expect(
+      extractAnnotationNote(null, '<p>Keep</p><script src="https://evil.example/x.js"', null),
+    ).toBe('Keep');
+    expect(extractAnnotationNote(null, '<p>&amp;lt;script&amp;gt; &#x41; &#55296;</p>', null)).toBe(
+      '&lt;script&gt; A &#55296;',
+    );
+  });
+
+  it('normalizes AnnotationDto payloads and falls back across comment fields', () => {
+    const items = normalizeAnnotations([
+      {
+        id: 77,
+        chapterId: 20,
+        volumeId: 10,
+        seriesId: 5,
+        libraryId: 2,
+        ownerUserId: 1,
+        xPath: '//body/DocFragment[2]/body/p[3]',
+        endingXPath: '//body/DocFragment[2]/body/p[4]',
+        selectedText: 'Highlighted text',
+        comment:
+          '{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"From ProseMirror"}]}]}',
+        commentHtml: '',
+        commentPlainText: null,
+        chapterTitle: 'Chapter Two',
+        context: 'Surrounding paragraph',
+        highlightCount: 16,
+        containsSpoiler: true,
+        pageNumber: 1,
+        selectedSlotIndex: 2,
+        createdUtc: '2026-05-01T12:00:00Z',
+        lastModifiedUtc: '2026-05-01T12:05:00Z',
+      },
+    ]);
+    expect(items).toEqual([
+      {
+        id: 77,
+        chapterId: 20,
+        volumeId: 10,
+        seriesId: 5,
+        libraryId: 2,
+        ownerUserId: 1,
+        xPath: '//body/DocFragment[2]/body/p[3]',
+        endingXPath: '//body/DocFragment[2]/body/p[4]',
+        selectedText: 'Highlighted text',
+        comment:
+          '{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"From ProseMirror"}]}]}',
+        commentHtml: '',
+        commentPlainText: 'From ProseMirror',
+        chapterTitle: 'Chapter Two',
+        context: 'Surrounding paragraph',
+        highlightCount: 16,
+        containsSpoiler: true,
+        pageNumber: 1,
+        selectedSlotIndex: 2,
+        createdUtc: '2026-05-01T12:00:00Z',
+        lastModifiedUtc: '2026-05-01T12:05:00Z',
+      },
+    ]);
+    expect(
+      normalizeAnnotation({
+        id: '8',
+        chapterId: '20',
+        selectedText: 'Quote',
+        xPath: '//body/DocFragment[1]/body/p[1]',
+      }).highlightCount,
+    ).toBe(5);
+    expectPayloadError(() => normalizeAnnotation({ chapterId: 20 }), '$.id', 'missing');
+    expectPayloadError(() => normalizeAnnotations([{ id: 8 }]), '$[0].chapterId', 'missing');
+  });
+
+  it('normalizes PersonalToCDto payloads and drops entries missing titles without leaking text', () => {
+    clearDiagnostics();
+    const items = normalizePersonalToc([
+      {
+        id: 3,
+        chapterId: 20,
+        pageNumber: 2,
+        title: '  Key Passage  ',
+        bookScrollId: '//body/DocFragment[3]/body/p[5]',
+        selectedText: 'Snippet',
+        chapterTitle: 'Part I',
+      },
+      {
+        id: 4,
+        chapterId: 20,
+        pageNumber: 3,
+        title: '   ',
+      },
+    ]);
+    expect(items).toEqual([
+      {
+        id: 3,
+        chapterId: 20,
+        pageNumber: 2,
+        title: 'Key Passage',
+        bookScrollId: '//body/DocFragment[3]/body/p[5]',
+        selectedText: 'Snippet',
+        chapterTitle: 'Part I',
+      },
+    ]);
+    expect(exportDiagnostics({ appVersion: 'test', platform: 'web' })).toContain('path=$[1].title');
   });
 });

@@ -65,6 +65,7 @@ vi.mock('@capacitor/filesystem', () => ({
 }));
 
 vi.mock('../database/database', () => ({
+  createServerId: vi.fn(() => 'server_test_id'),
   getServer: vi.fn(async () => {
     if (env.failGetServer) throw new Error('SQLite open error');
     return env.savedServer;

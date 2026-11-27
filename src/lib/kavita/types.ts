@@ -69,3 +69,69 @@ export interface KavitaSeriesDetail {
   volumes?: KavitaVolume[];
   storylineChapters: KavitaChapter[];
 }
+
+export interface KavitaAnnotation {
+  id: number;
+  chapterId: number;
+  volumeId: number;
+  seriesId: number;
+  libraryId: number;
+  ownerUserId: number;
+  xPath: string;
+  endingXPath: string | null;
+  selectedText: string;
+  comment: string;
+  commentHtml: string;
+  commentPlainText: string;
+  chapterTitle: string | null;
+  context: string | null;
+  highlightCount: number;
+  containsSpoiler: boolean;
+  pageNumber: number;
+  selectedSlotIndex: number;
+  createdUtc: string;
+  lastModifiedUtc: string;
+}
+
+export interface KavitaAnnotationWrite {
+  id?: number;
+  chapterId: number;
+  volumeId: number;
+  seriesId: number;
+  libraryId: number;
+  ownerUserId?: number;
+  xPath: string;
+  endingXPath?: string | null;
+  selectedText: string;
+  comment?: string;
+  commentHtml?: string;
+  chapterTitle?: string | null | undefined;
+  context?: string | null | undefined;
+  highlightCount?: number;
+  containsSpoiler?: boolean;
+  pageNumber: number;
+  selectedSlotIndex?: number;
+  createdUtc?: string;
+  lastModifiedUtc?: string;
+}
+
+export interface KavitaPersonalTocItem {
+  id: number;
+  chapterId: number;
+  pageNumber: number;
+  title: string;
+  bookScrollId: string | null;
+  selectedText: string | null;
+  chapterTitle: string | null;
+}
+
+export interface KavitaCreatePersonalTocRequest {
+  libraryId: number;
+  seriesId: number;
+  volumeId: number;
+  chapterId: number;
+  pageNumber: number;
+  title: string;
+  bookScrollId?: string | null;
+  selectedText?: string | null;
+}

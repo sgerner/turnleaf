@@ -7,9 +7,38 @@ import {
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
-import type { KavitaProgress } from '../kavita/types';
+import type { KavitaAnnotation, KavitaPersonalTocItem, KavitaProgress } from '../kavita/types';
+import { MAX_BOOKMARKS, recordLocation, type StoredReaderLocation } from '../reader/bookmarks';
+import { MAX_ANNOTATIONS, type StoredAnnotation, type StudySyncState } from '../reader/annotations';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import {
+  BOOKS_SERVER_FILE_INDEX_SQL,
+  DELETE_LEGACY_STUDY_PREFERENCES_SQL,
+  migrations,
+  STUDY_STORAGE_MIGRATION_VERSION,
+  V8_BOOK_COLUMNS,
+  V9_BOOK_COLUMNS,
+  V10_BOOK_COLUMNS,
+} from './schema';
+import {
+  cfiFallbackLocator,
+  disambiguateBookmarkLabel,
+  isLegacyStudyPreferenceKey,
+  migrateLegacyPreferenceEntries,
+  reconcileAnnotationRecords,
+  reconcileBookmarkRecords,
+  toStoredAnnotation,
+  toStoredBookmark,
+  type StoredAnnotationRecord,
+  type StoredBookmarkRecord,
+} from './study-records';
+
+export function createServerId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `server_${crypto.randomUUID()}`;
+  }
+  return `server_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
 
 export interface ServerConfig {
   id: string;
@@ -63,6 +92,9 @@ interface BrowserDatabaseState {
   books: BookRecord[];
   readingState: Record<string, StoredReadingState>;
   syncQueue: Record<string, BrowserSyncQueueRow>;
+  annotations: Record<string, StoredAnnotationRecord[]>;
+  bookmarks: Record<string, StoredBookmarkRecord[]>;
+  readingHistory: Record<string, StoredReaderLocation[]>;
   preferences: Record<string, string>;
 }
 
@@ -149,6 +181,9 @@ function createBrowserState(): BrowserDatabaseState {
     books: [],
     readingState: {},
     syncQueue: {},
+    annotations: {},
+    bookmarks: {},
+    readingHistory: {},
     preferences: {},
   };
 }
@@ -159,6 +194,7 @@ function readBrowserState(): BrowserDatabaseState {
   if (!raw) return createBrowserState();
   try {
     const parsed = JSON.parse(raw) as Partial<BrowserDatabaseState>;
+    const serverConfig = parsed.serverConfig ?? null;
     const books = Array.isArray(parsed.books)
       ? (parsed.books as BookRecord[]).map((book) => ({
           ...book,
@@ -166,8 +202,21 @@ function readBrowserState(): BrowserDatabaseState {
         }))
       : [];
     const booksById = new Map(books.map((book) => [book.id, book]));
-    return {
-      serverConfig: parsed.serverConfig ?? null,
+    const annotations: Record<string, StoredAnnotationRecord[]> = {};
+    for (const [bookId, list] of Object.entries(parsed.annotations ?? {})) {
+      if (Array.isArray(list)) annotations[bookId] = list.map((item) => ({ ...item }));
+    }
+    const bookmarks: Record<string, StoredBookmarkRecord[]> = {};
+    for (const [bookId, list] of Object.entries(parsed.bookmarks ?? {})) {
+      if (Array.isArray(list)) bookmarks[bookId] = list.map((item) => ({ ...item }));
+    }
+    const readingHistory: Record<string, StoredReaderLocation[]> = {};
+    for (const [bookId, list] of Object.entries(parsed.readingHistory ?? {})) {
+      if (Array.isArray(list)) readingHistory[bookId] = list.map((item) => ({ ...item }));
+    }
+    const preferences: Record<string, string> = { ...(parsed.preferences ?? {}) };
+    const state: BrowserDatabaseState = {
+      serverConfig,
       books,
       readingState: parsed.readingState ?? {},
       syncQueue: Object.fromEntries(
@@ -180,8 +229,52 @@ function readBrowserState(): BrowserDatabaseState {
           },
         ]),
       ),
-      preferences: parsed.preferences ?? {},
+      annotations,
+      bookmarks,
+      readingHistory,
+      preferences,
     };
+
+    if (Object.keys(preferences).some(isLegacyStudyPreferenceKey)) {
+      const activeBookIds = new Set(
+        serverConfig
+          ? books.filter((book) => book.serverId === serverConfig.id).map((book) => book.id)
+          : [],
+      );
+      const migrated = migrateLegacyPreferenceEntries(Object.entries(preferences), activeBookIds);
+      for (const record of migrated.annotations) {
+        const list = state.annotations[record.bookId] ?? [];
+        if (!list.some((existing) => existing.id === record.id)) {
+          list.push(record);
+          state.annotations[record.bookId] = list;
+        }
+      }
+      for (const record of migrated.bookmarks) {
+        const list = state.bookmarks[record.bookId] ?? [];
+        if (!list.some((existing) => existing.id === record.id)) {
+          list.push(record);
+          state.bookmarks[record.bookId] = list;
+        }
+      }
+      for (const { bookId, entry } of migrated.history) {
+        const list = state.readingHistory[bookId] ?? [];
+        if (!list.some((existing) => existing.id === entry.id)) {
+          list.push(entry);
+          list.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+          state.readingHistory[bookId] = list.slice(0, 15);
+        }
+      }
+      for (const key of migrated.keysToRemove) {
+        delete state.preferences[key];
+      }
+      try {
+        writeBrowserState(state);
+      } catch {
+        // Best-effort persistence on read; callers writing state will retry.
+      }
+    }
+
+    return state;
   } catch {
     return createBrowserState();
   }
@@ -231,7 +324,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -259,12 +352,185 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+const COORDINATED_BOOK_COLUMNS = [
+  ...V8_BOOK_COLUMNS,
+  ...V9_BOOK_COLUMNS,
+  ...V10_BOOK_COLUMNS,
+] as const;
+
+const ALTER_ADD_COLUMN_PATTERN =
+  /^ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)\b/i;
+
+function splitSqlStatements(sql: string): string[] {
+  return sql
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0)
+    .map((statement) => `${statement};`);
+}
+
+async function buildIdempotentMigrationStatements(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  sql: string,
+): Promise<string | null> {
+  const statements = splitSqlStatements(sql);
+  if (!statements.some((statement) => ALTER_ADD_COLUMN_PATTERN.test(statement))) {
+    return sql;
+  }
+
+  const columnsByTable = new Map<string, Set<string>>();
+  const keptStatements: string[] = [];
+  let skippedAnyColumn = false;
+
+  for (const statement of statements) {
+    const match = statement.match(ALTER_ADD_COLUMN_PATTERN);
+    if (!match) {
+      keptStatements.push(statement);
+      continue;
+    }
+    const tableName = match[1]!;
+    const columnName = match[2]!;
+    let existingColumns = columnsByTable.get(tableName);
+    if (!existingColumns) {
+      const rows = (await executeNativeQuery(db, `PRAGMA table_info('${tableName}')`)).values ?? [];
+      existingColumns = new Set(rows.map((row) => String(row.name)));
+      columnsByTable.set(tableName, existingColumns);
+    }
+    if (existingColumns.has(columnName)) {
+      skippedAnyColumn = true;
+      continue;
+    }
+    existingColumns.add(columnName);
+    keptStatements.push(statement);
+  }
+
+  if (!skippedAnyColumn) {
+    return sql;
+  }
+  return keptStatements.length > 0 ? keptStatements.join('\n') : null;
+}
+
+function isMissingTableError(error: unknown, tableName: string): boolean {
+  return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
+}
+
+async function buildLegacyStudyMigrationTasks(
+  db: Pick<SQLiteDBConnection, 'query'>,
+): Promise<capTask[]> {
+  let preferencesRows: Record<string, unknown>[];
+  try {
+    preferencesRows =
+      (
+        await executeNativeQuery(
+          db,
+          `SELECT key, value FROM preferences
+           WHERE key LIKE 'readerAnnotations:%'
+              OR key LIKE 'readerBookmarks:%'
+              OR key LIKE 'readerHistory:%'`,
+        )
+      ).values ?? [];
+  } catch (error) {
+    if (isMissingTableError(error, 'preferences')) return [];
+    throw error;
+  }
+  if (preferencesRows.length === 0) return [];
+
+  let bookRows: Record<string, unknown>[];
+  try {
+    bookRows =
+      (
+        await executeNativeQuery(
+          db,
+          `SELECT books.id FROM books
+           WHERE EXISTS (SELECT 1 FROM server_config WHERE server_config.id = books.server_id)`,
+        )
+      ).values ?? [];
+  } catch (error) {
+    if (!isMissingTableError(error, 'server_config')) throw error;
+    bookRows = (await executeNativeQuery(db, 'SELECT id FROM books')).values ?? [];
+  }
+  const activeBookIds = new Set(bookRows.map((row) => String(row.id)));
+  if (activeBookIds.size === 0) return [];
+
+  const entries = preferencesRows.map(
+    (row) => [String(row.key), String(row.value)] as [string, string],
+  );
+  const migrated = migrateLegacyPreferenceEntries(entries, activeBookIds);
+  const tasks: capTask[] = [];
+  for (const record of migrated.annotations) {
+    tasks.push(insertAnnotationRecordTask(record, 'abort'));
+  }
+  for (const record of migrated.bookmarks) {
+    tasks.push(insertBookmarkRecordTask(record, 'abort'));
+  }
+  for (const { bookId, entry } of migrated.history) {
+    tasks.push({
+      statement: `INSERT INTO reading_history
+        (book_id, id, cfi, href, percentage, label, saved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      values: [
+        bookId,
+        entry.id,
+        entry.cfi,
+        entry.href,
+        entry.percentage,
+        entry.label,
+        entry.savedAt,
+      ],
+    });
+  }
+  return tasks;
+}
+
+export async function migrateDatabase(
+  db: Pick<SQLiteDBConnection, 'executeTransaction' | 'getVersion' | 'query'>,
+): Promise<void> {
   const current = await db.getVersion();
+  const currentVersion = current.version ?? 0;
+
   for (const migration of migrations) {
-    if (migration.version <= (current.version ?? 0)) continue;
+    if (migration.version <= currentVersion) continue;
+
+    if (migration.version === STUDY_STORAGE_MIGRATION_VERSION) {
+      const bookInfoRows =
+        (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
+      let missingBookColumns: Array<{ name: string; definition: string }> = [];
+      let missingBooksServerFileIndex = false;
+      if (bookInfoRows.length > 0) {
+        const existingBookColumns = new Set(bookInfoRows.map((row) => String(row.name)));
+        missingBookColumns = COORDINATED_BOOK_COLUMNS.filter(
+          (column) => !existingBookColumns.has(column.name),
+        );
+        const bookIndexRows =
+          (await executeNativeQuery(db, "PRAGMA index_list('books')")).values ?? [];
+        const existingBookIndexes = new Set(bookIndexRows.map((row) => String(row.name)));
+        missingBooksServerFileIndex = !existingBookIndexes.has('books_server_file_idx');
+      }
+      const legacyTasks = currentVersion >= 3 ? await buildLegacyStudyMigrationTasks(db) : [];
+      await executeNativeTransaction(db, [
+        ...(missingBookColumns.length > 0
+          ? [
+              {
+                statement: missingBookColumns
+                  .map(
+                    (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+                  )
+                  .join('\n'),
+              },
+            ]
+          : []),
+        ...(missingBooksServerFileIndex ? [{ statement: BOOKS_SERVER_FILE_INDEX_SQL }] : []),
+        { statement: migration.statements },
+        ...legacyTasks,
+        ...(currentVersion >= 3 ? [{ statement: DELETE_LEGACY_STUDY_PREFERENCES_SQL }] : []),
+        { statement: `PRAGMA user_version = ${migration.version};` },
+      ]);
+      continue;
+    }
+
+    const statementsToRun = await buildIdempotentMigrationStatements(db, migration.statements);
     await executeNativeTransaction(db, [
-      { statement: migration.statements },
+      ...(statementsToRun !== null ? [{ statement: statementsToRun }] : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
   }
@@ -303,16 +569,72 @@ export async function saveServer(config: ServerConfig): Promise<void> {
 export async function removeServer(serverId: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
-      if (state.serverConfig?.id !== serverId) return false;
-      state.serverConfig = null;
-      state.books = [];
-      state.readingState = {};
-      state.syncQueue = {};
+      const matchedServer = state.serverConfig?.id === serverId;
+      const hasServerBooks = state.books.some((book) => book.serverId === serverId);
+      const hasServerQueue = Object.values(state.syncQueue).some(
+        (row) => row.serverId === serverId,
+      );
+      const serverPrefix = `${serverId}:`;
+      const hasPrefixedRecords =
+        Object.keys(state.annotations).some((id) => id.startsWith(serverPrefix)) ||
+        Object.keys(state.bookmarks).some((id) => id.startsWith(serverPrefix)) ||
+        Object.keys(state.readingHistory).some((id) => id.startsWith(serverPrefix)) ||
+        Object.keys(state.readingState).some((id) => id.startsWith(serverPrefix));
+      if (!matchedServer && !hasServerBooks && !hasServerQueue && !hasPrefixedRecords) {
+        return false;
+      }
+
+      if (matchedServer) {
+        state.serverConfig = null;
+      }
+      state.books = state.books.filter((book) => book.serverId !== serverId);
+      const remainingBookIds = new Set(state.books.map((book) => book.id));
+      for (const bookId of Object.keys(state.readingState)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.readingState[bookId];
+        }
+      }
+      for (const [bookId, row] of Object.entries(state.syncQueue)) {
+        if (
+          !remainingBookIds.has(bookId) ||
+          row.serverId === serverId ||
+          bookId.startsWith(serverPrefix)
+        ) {
+          delete state.syncQueue[bookId];
+        }
+      }
+      for (const bookId of Object.keys(state.annotations)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.annotations[bookId];
+        }
+      }
+      for (const bookId of Object.keys(state.bookmarks)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.bookmarks[bookId];
+        }
+      }
+      for (const bookId of Object.keys(state.readingHistory)) {
+        if (!remainingBookIds.has(bookId) || bookId.startsWith(serverPrefix)) {
+          delete state.readingHistory[bookId];
+        }
+      }
+      for (const key of Object.keys(state.preferences)) {
+        if (isLegacyStudyPreferenceKey(key)) delete state.preferences[key];
+      }
     });
     return;
   }
   const db = await openDatabase();
-  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
+  await executeNativeTransaction(db, [
+    { statement: 'DELETE FROM books WHERE server_id=?', values: [serverId] },
+    { statement: 'DELETE FROM server_config WHERE id=?', values: [serverId] },
+    {
+      statement: `DELETE FROM preferences
+        WHERE key LIKE 'readerAnnotations:%'
+           OR key LIKE 'readerBookmarks:%'
+           OR key LIKE 'readerHistory:%'`,
+    },
+  ]);
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
@@ -371,7 +693,13 @@ export async function reconcileBooks(
                 Boolean(book.downloadPath) ||
                 book.downloadStatus === 'available' ||
                 Boolean(state.syncQueue[book.id]) ||
-                Boolean(state.readingState[book.id]),
+                Boolean(state.readingState[book.id]) ||
+                (state.annotations[book.id] ?? []).some(
+                  (item) => item.syncState !== 'pending_delete',
+                ) ||
+                (state.bookmarks[book.id] ?? []).some(
+                  (item) => item.syncState !== 'pending_delete',
+                ),
             )
             .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
       const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
@@ -500,7 +828,9 @@ export async function replaceBooksInTransaction(
 
 const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
   OR EXISTS (SELECT 1 FROM reading_state WHERE reading_state.book_id=books.id)
-  OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id))`;
+  OR EXISTS (SELECT 1 FROM sync_queue WHERE sync_queue.book_id=books.id)
+  OR EXISTS (SELECT 1 FROM annotations WHERE annotations.book_id=books.id AND annotations.sync_state!='pending_delete')
+  OR EXISTS (SELECT 1 FROM bookmarks WHERE bookmarks.book_id=books.id AND bookmarks.sync_state!='pending_delete'))`;
 
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
 export async function reconcileBooksInTransaction(
@@ -914,22 +1244,49 @@ function summarizeSyncRows(
 export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
   if (!Capacitor.isNativePlatform()) {
     const state = readBrowserState();
-    return summarizeSyncRows(
-      getBrowserSyncRows(state, serverId)
-        .sort((a, b) => b.row.updatedAt.localeCompare(a.row.updatedAt))
-        .map(({ row }) => ({
-          updatedAt: row.updatedAt,
-          lastError: row.lastError || null,
-        })),
+    const activeBookIds = new Set(
+      state.books
+        .filter((book) => book.serverId === serverId && book.remoteAvailable !== false)
+        .map((book) => book.id),
     );
+    const entries: Array<{ updatedAt: string; lastError: string | null }> = [
+      ...getBrowserSyncRows(state, serverId).map(({ row }) => ({
+        updatedAt: row.updatedAt,
+        lastError: row.lastError || null,
+      })),
+    ];
+    for (const bookId of activeBookIds) {
+      for (const item of state.annotations[bookId] ?? []) {
+        if (item.syncState !== 'synced') {
+          entries.push({ updatedAt: item.updatedAt, lastError: item.lastError || null });
+        }
+      }
+      for (const item of state.bookmarks[bookId] ?? []) {
+        if (item.syncState !== 'synced') {
+          entries.push({ updatedAt: item.updatedAt, lastError: item.lastError || null });
+        }
+      }
+    }
+    entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return summarizeSyncRows(entries);
   }
   const db = await openDatabase();
   const result = await executeNativeQuery(
     db,
-    `SELECT sync_queue.updated_at,sync_queue.last_error
-    FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
-    [serverId],
+    `SELECT updated_at, last_error FROM (
+      SELECT sync_queue.updated_at AS updated_at, sync_queue.last_error AS last_error
+        FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
+        WHERE books.server_id=? AND books.remote_available=1
+      UNION ALL
+      SELECT annotations.updated_at AS updated_at, annotations.last_error AS last_error
+        FROM annotations CROSS JOIN books ON books.id=annotations.book_id
+        WHERE books.server_id=? AND books.remote_available=1 AND annotations.sync_state!='synced'
+      UNION ALL
+      SELECT bookmarks.updated_at AS updated_at, bookmarks.last_error AS last_error
+        FROM bookmarks CROSS JOIN books ON books.id=bookmarks.book_id
+        WHERE books.server_id=? AND books.remote_available=1 AND bookmarks.sync_state!='synced'
+    ) ORDER BY updated_at DESC`,
+    [serverId, serverId, serverId],
   );
   return summarizeSyncRows(
     (result.values ?? []).map((row) => ({
@@ -1269,4 +1626,1578 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
   mirrorBootThemePreferences(preferences);
+}
+
+function createStudyId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function mapAnnotationRow(row: Record<string, unknown>): StoredAnnotationRecord {
+  const syncState = String(row.sync_state ?? 'synced');
+  return {
+    id: String(row.id),
+    bookId: String(row.book_id),
+    remoteId: row.remote_id == null ? null : Number(row.remote_id),
+    cfi: String(row.cfi ?? ''),
+    xpath: String(row.xpath ?? ''),
+    endingXPath: row.ending_xpath == null ? null : String(row.ending_xpath),
+    pageNumber: Number(row.page_number ?? 0),
+    slotIndex: Number(row.slot_index ?? 0),
+    containsSpoiler: Number(row.contains_spoiler ?? 0) !== 0,
+    context: row.context == null ? null : String(row.context),
+    chapterTitle: row.chapter_title == null ? null : String(row.chapter_title),
+    excerpt: String(row.excerpt ?? ''),
+    note: String(row.note ?? ''),
+    createdAt: String(row.created_at ?? ''),
+    updatedAt: String(row.updated_at ?? ''),
+    remoteUpdatedAt: row.remote_updated_at == null ? null : String(row.remote_updated_at),
+    syncState:
+      syncState === 'pending_create' ||
+      syncState === 'pending_update' ||
+      syncState === 'pending_delete'
+        ? syncState
+        : 'synced',
+    syncRevision: Number(row.sync_revision ?? 0),
+    attemptCount: Number(row.attempt_count ?? 0),
+    lastAttemptAt: row.last_attempt_at == null ? null : String(row.last_attempt_at),
+    lastError: row.last_error == null ? null : String(row.last_error),
+  };
+}
+
+function mapBookmarkRow(row: Record<string, unknown>): StoredBookmarkRecord {
+  const syncState = String(row.sync_state ?? 'synced');
+  return {
+    id: String(row.id),
+    bookId: String(row.book_id),
+    remoteId: row.remote_id == null ? null : Number(row.remote_id),
+    cfi: String(row.cfi ?? ''),
+    xpath: row.xpath == null ? null : String(row.xpath),
+    href: String(row.href ?? ''),
+    percentage: Number(row.percentage ?? 0),
+    pageNumber: Number(row.page_number ?? 0),
+    label: String(row.label ?? 'Bookmark'),
+    excerpt: String(row.excerpt ?? ''),
+    remoteTitle: row.remote_title == null ? null : String(row.remote_title),
+    remotePageNumber: row.remote_page_number == null ? null : Number(row.remote_page_number),
+    savedAt: String(row.saved_at ?? ''),
+    updatedAt: String(row.updated_at ?? ''),
+    syncState:
+      syncState === 'pending_create' ||
+      syncState === 'pending_update' ||
+      syncState === 'pending_delete'
+        ? syncState
+        : 'synced',
+    syncRevision: Number(row.sync_revision ?? 0),
+    attemptCount: Number(row.attempt_count ?? 0),
+    lastAttemptAt: row.last_attempt_at == null ? null : String(row.last_attempt_at),
+    lastError: row.last_error == null ? null : String(row.last_error),
+  };
+}
+
+function insertAnnotationRecordTask(
+  record: StoredAnnotationRecord,
+  conflictMode: 'replace' | 'abort' = 'replace',
+): capTask {
+  return {
+    statement: `INSERT ${conflictMode === 'replace' ? 'OR REPLACE ' : ''}INTO annotations
+      (id, book_id, remote_id, cfi, xpath, ending_xpath, page_number, slot_index,
+       contains_spoiler, context, chapter_title, excerpt, note, created_at, updated_at,
+       remote_updated_at, sync_state, sync_revision, attempt_count, last_attempt_at, last_error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    values: [
+      record.id,
+      record.bookId,
+      record.remoteId,
+      record.cfi,
+      record.xpath,
+      record.endingXPath,
+      record.pageNumber,
+      record.slotIndex,
+      record.containsSpoiler ? 1 : 0,
+      record.context,
+      record.chapterTitle,
+      record.excerpt,
+      record.note,
+      record.createdAt,
+      record.updatedAt,
+      record.remoteUpdatedAt,
+      record.syncState,
+      record.syncRevision,
+      record.attemptCount,
+      record.lastAttemptAt,
+      record.lastError,
+    ],
+  };
+}
+
+function insertBookmarkRecordTask(
+  record: StoredBookmarkRecord,
+  conflictMode: 'replace' | 'abort' = 'replace',
+): capTask {
+  return {
+    statement: `INSERT ${conflictMode === 'replace' ? 'OR REPLACE ' : ''}INTO bookmarks
+      (id, book_id, remote_id, cfi, xpath, href, percentage, page_number, label, excerpt,
+       remote_title, remote_page_number, saved_at, updated_at, sync_state, sync_revision,
+       attempt_count, last_attempt_at, last_error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    values: [
+      record.id,
+      record.bookId,
+      record.remoteId,
+      record.cfi,
+      record.xpath,
+      record.href,
+      record.percentage,
+      record.pageNumber,
+      record.label,
+      record.excerpt,
+      record.remoteTitle,
+      record.remotePageNumber,
+      record.savedAt,
+      record.updatedAt,
+      record.syncState,
+      record.syncRevision,
+      record.attemptCount,
+      record.lastAttemptAt,
+      record.lastError,
+    ],
+  };
+}
+
+export interface BookAnnotationsGroup {
+  book: BookRecord;
+  annotations: StoredAnnotation[];
+}
+
+export interface SaveAnnotationInput {
+  cfi: string;
+  excerpt: string;
+  note: string;
+  xpath?: string | null | undefined;
+  endingXPath?: string | null | undefined;
+  pageNumber?: number | undefined;
+  context?: string | null | undefined;
+  chapterTitle?: string | null | undefined;
+  slotIndex?: number | undefined;
+  containsSpoiler?: boolean | undefined;
+}
+
+export interface SaveBookmarkInput {
+  cfi: string;
+  href: string;
+  percentage: number;
+  label: string;
+  xpath?: string | null | undefined;
+  pageNumber?: number | undefined;
+  excerpt?: string | undefined;
+}
+
+export interface PendingAnnotationSyncItem {
+  id: string;
+  bookId: string;
+  libraryId: number;
+  seriesId: number;
+  volumeId: number;
+  chapterId: number;
+  remoteId: number | null;
+  xpath: string;
+  endingXPath: string | null;
+  pageNumber: number;
+  slotIndex: number;
+  containsSpoiler: boolean;
+  context: string | null;
+  chapterTitle: string | null;
+  excerpt: string;
+  note: string;
+  syncState: Exclude<StudySyncState, 'synced'>;
+  syncRevision: number;
+  updatedAt: string;
+}
+
+export interface PendingBookmarkSyncItem {
+  id: string;
+  bookId: string;
+  libraryId: number;
+  seriesId: number;
+  volumeId: number;
+  chapterId: number;
+  remoteId: number | null;
+  xpath: string | null;
+  pageNumber: number;
+  label: string;
+  excerpt: string;
+  remoteTitle: string | null;
+  remotePageNumber: number | null;
+  syncState: Exclude<StudySyncState, 'synced'>;
+  syncRevision: number;
+  updatedAt: string;
+}
+
+export async function getBookAnnotations(bookId: string): Promise<StoredAnnotation[]> {
+  if (!Capacitor.isNativePlatform()) {
+    const records = readBrowserState().annotations[bookId] ?? [];
+    return records
+      .filter((record) => record.syncState !== 'pending_delete')
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(toStoredAnnotation);
+  }
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    `SELECT * FROM annotations
+     WHERE book_id=? AND sync_state!='pending_delete'
+     ORDER BY created_at ASC, id ASC`,
+    [bookId],
+  );
+  return (result.values ?? []).map((row) =>
+    toStoredAnnotation(mapAnnotationRow(row as Record<string, unknown>)),
+  );
+}
+
+export async function getServerAnnotations(serverId: string): Promise<BookAnnotationsGroup[]> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const books = state.books
+      .filter((book) => book.serverId === serverId)
+      .sort((a, b) => a.title.localeCompare(b.title));
+    const groups: BookAnnotationsGroup[] = [];
+    for (const book of books) {
+      const annotations = (state.annotations[book.id] ?? [])
+        .filter((record) => record.syncState !== 'pending_delete')
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+        .map(toStoredAnnotation);
+      if (annotations.length > 0) {
+        groups.push({ book: { ...book, descriptionHtml: null }, annotations });
+      }
+    }
+    return groups;
+  }
+  const db = await openDatabase();
+  const [books, rowsResult] = await Promise.all([
+    getBooks(serverId, { includeDescription: false }),
+    executeNativeQuery(
+      db,
+      `SELECT annotations.* FROM annotations
+       CROSS JOIN books ON books.id = annotations.book_id
+       WHERE books.server_id = ? AND annotations.sync_state != 'pending_delete'
+       ORDER BY annotations.created_at ASC, annotations.id ASC`,
+      [serverId],
+    ),
+  ]);
+  const byBook = new Map<string, StoredAnnotation[]>();
+  for (const raw of rowsResult.values ?? []) {
+    const record = mapAnnotationRow(raw as Record<string, unknown>);
+    const list = byBook.get(record.bookId) ?? [];
+    list.push(toStoredAnnotation(record));
+    byBook.set(record.bookId, list);
+  }
+  return books.flatMap((book) => {
+    const annotations = byBook.get(book.id);
+    return annotations && annotations.length > 0 ? [{ book, annotations }] : [];
+  });
+}
+
+export async function getBookAnnotationCounts(serverId: string): Promise<Map<string, number>> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const counts = new Map<string, number>();
+    for (const book of state.books) {
+      if (book.serverId !== serverId) continue;
+      const count = (state.annotations[book.id] ?? []).filter(
+        (item) => item.syncState !== 'pending_delete',
+      ).length;
+      if (count > 0) counts.set(book.id, count);
+    }
+    return counts;
+  }
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    `SELECT annotations.book_id AS book_id, COUNT(*) AS total
+     FROM annotations CROSS JOIN books ON books.id = annotations.book_id
+     WHERE books.server_id = ? AND annotations.sync_state != 'pending_delete'
+     GROUP BY annotations.book_id`,
+    [serverId],
+  );
+  return new Map((result.values ?? []).map((row) => [String(row.book_id), Number(row.total ?? 0)]));
+}
+
+export async function saveBookAnnotation(
+  bookId: string,
+  input: SaveAnnotationInput,
+): Promise<StoredAnnotation | null> {
+  const excerpt = input.excerpt.trim().slice(0, 500);
+  if (!excerpt) return null;
+  const now = new Date().toISOString();
+  const fallback = cfiFallbackLocator(input.cfi);
+  const xpath = input.xpath?.trim() || fallback.xpath;
+  const endingXPath = input.endingXPath?.trim() || xpath;
+  const pageNumber =
+    typeof input.pageNumber === 'number' &&
+    Number.isFinite(input.pageNumber) &&
+    input.pageNumber >= 0
+      ? Math.floor(input.pageNumber)
+      : fallback.pageNumber;
+  const record: StoredAnnotationRecord = {
+    id: createStudyId(),
+    bookId,
+    remoteId: null,
+    cfi: input.cfi,
+    xpath,
+    endingXPath,
+    pageNumber,
+    slotIndex:
+      typeof input.slotIndex === 'number' && Number.isFinite(input.slotIndex)
+        ? Math.max(0, Math.floor(input.slotIndex))
+        : 0,
+    containsSpoiler: Boolean(input.containsSpoiler),
+    context: input.context?.trim().slice(0, 500) || excerpt,
+    chapterTitle: input.chapterTitle?.trim().slice(0, 240) || null,
+    excerpt,
+    note: input.note.trim().slice(0, 2000),
+    createdAt: now,
+    updatedAt: now,
+    remoteUpdatedAt: null,
+    syncState: 'pending_create',
+    syncRevision: 1,
+    attemptCount: 0,
+    lastAttemptAt: null,
+    lastError: null,
+  };
+
+  if (!Capacitor.isNativePlatform()) {
+    let savedRecord: StoredAnnotationRecord | null = null;
+    const trimmedCfi = input.cfi.trim();
+    const saved = updateBrowserState((state) => {
+      if (!state.books.some((book) => book.id === bookId)) return false;
+      const list = state.annotations[bookId] ?? [];
+      const existingIndex = trimmedCfi
+        ? list.findIndex(
+            (item) => item.syncState !== 'pending_delete' && item.cfi.trim() === trimmedCfi,
+          )
+        : -1;
+      if (existingIndex >= 0) {
+        const current = list[existingIndex]!;
+        const updated: StoredAnnotationRecord = {
+          ...current,
+          xpath: input.xpath?.trim() || current.xpath,
+          endingXPath: input.endingXPath?.trim() || current.endingXPath,
+          pageNumber: input.pageNumber !== undefined ? pageNumber : current.pageNumber,
+          context: input.context?.trim().slice(0, 500) || current.context,
+          chapterTitle: input.chapterTitle?.trim().slice(0, 240) || current.chapterTitle,
+          note: record.note || current.note,
+          updatedAt: now,
+          syncState:
+            current.remoteId !== null && current.syncState !== 'pending_create'
+              ? 'pending_update'
+              : 'pending_create',
+          syncRevision: current.syncRevision + 1,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        };
+        list[existingIndex] = updated;
+        savedRecord = updated;
+        return;
+      }
+      const activeCount = list.filter((item) => item.syncState !== 'pending_delete').length;
+      if (activeCount >= MAX_ANNOTATIONS) return false;
+      list.push(record);
+      state.annotations[bookId] = list;
+      savedRecord = record;
+    });
+    return saved && savedRecord ? toStoredAnnotation(savedRecord) : null;
+  }
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const trimmedCfi = input.cfi.trim();
+    if (trimmedCfi) {
+      const existingRow = (
+        await db.query(
+          "SELECT * FROM annotations WHERE book_id=? AND cfi=? AND sync_state!='pending_delete' LIMIT 1",
+          [bookId, trimmedCfi],
+        )
+      ).values?.[0];
+      if (existingRow) {
+        const current = mapAnnotationRow(existingRow as Record<string, unknown>);
+        const nextState: StudySyncState =
+          current.remoteId !== null && current.syncState !== 'pending_create'
+            ? 'pending_update'
+            : 'pending_create';
+        const nextRevision = current.syncRevision + 1;
+        const nextXpath = input.xpath?.trim() || current.xpath;
+        const nextEndingXPath = input.endingXPath?.trim() || current.endingXPath;
+        const nextPageNumber = input.pageNumber !== undefined ? pageNumber : current.pageNumber;
+        const nextContext = input.context?.trim().slice(0, 500) || current.context;
+        const nextChapterTitle = input.chapterTitle?.trim().slice(0, 240) || current.chapterTitle;
+        const nextNote = record.note || current.note;
+        await db.run(
+          `UPDATE annotations SET xpath=?, ending_xpath=?, page_number=?, context=?,
+           chapter_title=?, note=?, updated_at=?, sync_state=?, sync_revision=?,
+           attempt_count=0, last_attempt_at=NULL, last_error=NULL
+           WHERE id=? AND book_id=?`,
+          [
+            nextXpath,
+            nextEndingXPath,
+            nextPageNumber,
+            nextContext,
+            nextChapterTitle,
+            nextNote,
+            now,
+            nextState,
+            nextRevision,
+            current.id,
+            bookId,
+          ],
+        );
+        return toStoredAnnotation({
+          ...current,
+          xpath: nextXpath,
+          endingXPath: nextEndingXPath,
+          pageNumber: nextPageNumber,
+          context: nextContext,
+          chapterTitle: nextChapterTitle,
+          note: nextNote,
+          updatedAt: now,
+          syncState: nextState,
+          syncRevision: nextRevision,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        });
+      }
+    }
+    const countRow = (
+      await db.query(
+        "SELECT COUNT(*) AS total FROM annotations WHERE book_id=? AND sync_state!='pending_delete'",
+        [bookId],
+      )
+    ).values?.[0];
+    if (Number(countRow?.total ?? 0) >= MAX_ANNOTATIONS) return null;
+    const task = insertAnnotationRecordTask(record);
+    await db.run(task.statement, task.values);
+    return toStoredAnnotation(record);
+  });
+}
+
+export async function updateBookAnnotationNote(
+  bookId: string,
+  annotationId: string,
+  note: string,
+): Promise<StoredAnnotation | null> {
+  const cleaned = note.trim().slice(0, 2000);
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    let updated: StoredAnnotationRecord | null = null;
+    updateBrowserState((state) => {
+      const list = state.annotations[bookId];
+      if (!list) return false;
+      const index = list.findIndex(
+        (item) => item.id === annotationId && item.syncState !== 'pending_delete',
+      );
+      if (index < 0) return false;
+      const current = list[index]!;
+      const next: StoredAnnotationRecord = {
+        ...current,
+        note: cleaned,
+        updatedAt: now,
+        syncState:
+          current.remoteId !== null && current.syncState !== 'pending_create'
+            ? 'pending_update'
+            : 'pending_create',
+        syncRevision: current.syncRevision + 1,
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
+      };
+      list[index] = next;
+      updated = next;
+    });
+    return updated ? toStoredAnnotation(updated) : null;
+  }
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const existing = (
+      await db.query(
+        "SELECT * FROM annotations WHERE id=? AND book_id=? AND sync_state!='pending_delete'",
+        [annotationId, bookId],
+      )
+    ).values?.[0];
+    if (!existing) return null;
+    const current = mapAnnotationRow(existing as Record<string, unknown>);
+    const nextState: StudySyncState =
+      current.remoteId !== null && current.syncState !== 'pending_create'
+        ? 'pending_update'
+        : 'pending_create';
+    const nextRevision = current.syncRevision + 1;
+    await db.run(
+      `UPDATE annotations SET note=?, updated_at=?, sync_state=?, sync_revision=?,
+       attempt_count=0, last_attempt_at=NULL, last_error=NULL
+       WHERE id=? AND book_id=?`,
+      [cleaned, now, nextState, nextRevision, annotationId, bookId],
+    );
+    return toStoredAnnotation({
+      ...current,
+      note: cleaned,
+      updatedAt: now,
+      syncState: nextState,
+      syncRevision: nextRevision,
+      attemptCount: 0,
+      lastAttemptAt: null,
+      lastError: null,
+    });
+  });
+}
+
+export async function deleteBookAnnotation(bookId: string, annotationId: string): Promise<void> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    updateBrowserState((state) => {
+      const list = state.annotations[bookId];
+      if (!list) return false;
+      const index = list.findIndex((item) => item.id === annotationId);
+      if (index < 0) return false;
+      const current = list[index]!;
+      if (current.remoteId === null) {
+        list.splice(index, 1);
+        if (list.length === 0) delete state.annotations[bookId];
+      } else {
+        list[index] = {
+          ...current,
+          updatedAt: now,
+          syncState: 'pending_delete',
+          syncRevision: current.syncRevision + 1,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        };
+      }
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await executeNativeTransaction(db, [
+    {
+      statement: 'DELETE FROM annotations WHERE id=? AND book_id=? AND remote_id IS NULL',
+      values: [annotationId, bookId],
+    },
+    {
+      statement: `UPDATE annotations SET updated_at=?, sync_state='pending_delete',
+        sync_revision=sync_revision+1, attempt_count=0, last_attempt_at=NULL, last_error=NULL
+        WHERE id=? AND book_id=? AND remote_id IS NOT NULL`,
+      values: [now, annotationId, bookId],
+    },
+  ]);
+}
+
+export async function saveResolvedBookAnnotations(
+  bookId: string,
+  resolved: ReadonlyArray<{ id: string; cfi: string }>,
+): Promise<void> {
+  const valid = resolved.filter((item) => item.cfi.trim());
+  if (valid.length === 0) return;
+  if (!Capacitor.isNativePlatform()) {
+    const byId = new Map(valid.map((item) => [item.id, item.cfi]));
+    updateBrowserState((state) => {
+      const list = state.annotations[bookId];
+      if (!list) return false;
+      let changed = false;
+      for (const item of list) {
+        const cfi = byId.get(item.id);
+        if (cfi && item.cfi !== cfi) {
+          item.cfi = cfi;
+          changed = true;
+        }
+      }
+      return changed;
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await executeNativeTransaction(
+    db,
+    valid.map((item) => ({
+      statement: 'UPDATE annotations SET cfi=? WHERE id=? AND book_id=?',
+      values: [item.cfi, item.id, bookId],
+    })),
+  );
+}
+
+export async function reconcileBookAnnotations(
+  bookId: string,
+  remote: readonly KavitaAnnotation[],
+): Promise<StoredAnnotation[]> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    let visible: StoredAnnotation[] = [];
+    updateBrowserState((state) => {
+      if (!state.books.some((book) => book.id === bookId)) return false;
+      const next = reconcileAnnotationRecords(bookId, state.annotations[bookId] ?? [], remote, now);
+      if (next.length > 0) state.annotations[bookId] = next;
+      else delete state.annotations[bookId];
+      visible = next
+        .filter((record) => record.syncState !== 'pending_delete')
+        .map(toStoredAnnotation);
+    });
+    return visible;
+  }
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const bookRow = (await db.query('SELECT 1 FROM books WHERE id=?', [bookId])).values?.[0];
+    if (!bookRow) return [];
+    const currentRows =
+      (
+        await db.query(
+          'SELECT * FROM annotations WHERE book_id=? ORDER BY created_at ASC, id ASC',
+          [bookId],
+        )
+      ).values ?? [];
+    const current = currentRows.map((row) => mapAnnotationRow(row as Record<string, unknown>));
+    const next = reconcileAnnotationRecords(bookId, current, remote, now);
+    await db.executeTransaction([
+      { statement: 'DELETE FROM annotations WHERE book_id=?', values: [bookId] },
+      ...next.map((record) => insertAnnotationRecordTask(record)),
+    ]);
+    return next.filter((record) => record.syncState !== 'pending_delete').map(toStoredAnnotation);
+  });
+}
+
+export async function reconcileSeriesAnnotations(
+  serverId: string,
+  seriesId: number,
+  remote: readonly KavitaAnnotation[],
+): Promise<void> {
+  const byChapter = new Map<number, KavitaAnnotation[]>();
+  for (const item of remote) {
+    const list = byChapter.get(item.chapterId) ?? [];
+    list.push(item);
+    byChapter.set(item.chapterId, list);
+  }
+  const now = new Date().toISOString();
+
+  if (!Capacitor.isNativePlatform()) {
+    updateBrowserState((state) => {
+      const seriesBooks = state.books.filter(
+        (book) =>
+          book.serverId === serverId &&
+          book.seriesId === seriesId &&
+          book.remoteAvailable !== false,
+      );
+      if (seriesBooks.length === 0) return false;
+      for (const book of seriesBooks) {
+        const next = reconcileAnnotationRecords(
+          book.id,
+          state.annotations[book.id] ?? [],
+          byChapter.get(book.chapterId) ?? [],
+          now,
+        );
+        if (next.length > 0) state.annotations[book.id] = next;
+        else delete state.annotations[book.id];
+      }
+    });
+    return;
+  }
+
+  const db = await openDatabase();
+  await enqueueNativeWrite(async () => {
+    const booksResult = await db.query(
+      'SELECT id, chapter_id FROM books WHERE server_id=? AND series_id=? AND remote_available=1',
+      [serverId, seriesId],
+    );
+    const seriesBooks = (booksResult.values ?? []).map((row) => ({
+      id: String(row.id),
+      chapterId: Number(row.chapter_id),
+    }));
+    if (seriesBooks.length === 0) return;
+    const placeholders = seriesBooks.map(() => '?').join(', ');
+    const currentResult = await db.query(
+      `SELECT * FROM annotations WHERE book_id IN (${placeholders}) ORDER BY created_at ASC, id ASC`,
+      seriesBooks.map((book) => book.id),
+    );
+    const currentByBook = new Map<string, StoredAnnotationRecord[]>();
+    for (const raw of currentResult.values ?? []) {
+      const record = mapAnnotationRow(raw as Record<string, unknown>);
+      const list = currentByBook.get(record.bookId) ?? [];
+      list.push(record);
+      currentByBook.set(record.bookId, list);
+    }
+    const tasks: capTask[] = [];
+    for (const book of seriesBooks) {
+      tasks.push({ statement: 'DELETE FROM annotations WHERE book_id=?', values: [book.id] });
+      const next = reconcileAnnotationRecords(
+        book.id,
+        currentByBook.get(book.id) ?? [],
+        byChapter.get(book.chapterId) ?? [],
+        now,
+      );
+      for (const record of next) {
+        tasks.push(insertAnnotationRecordTask(record));
+      }
+    }
+    if (tasks.length > 0) await db.executeTransaction(tasks);
+  });
+}
+
+export async function getBookBookmarks(bookId: string): Promise<StoredReaderLocation[]> {
+  if (!Capacitor.isNativePlatform()) {
+    const records = readBrowserState().bookmarks[bookId] ?? [];
+    return records
+      .filter((record) => record.syncState !== 'pending_delete')
+      .sort((a, b) => b.savedAt.localeCompare(a.savedAt) || a.id.localeCompare(b.id))
+      .map(toStoredBookmark);
+  }
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    `SELECT * FROM bookmarks
+     WHERE book_id=? AND sync_state!='pending_delete'
+     ORDER BY saved_at DESC, id ASC`,
+    [bookId],
+  );
+  return (result.values ?? []).map((row) =>
+    toStoredBookmark(mapBookmarkRow(row as Record<string, unknown>)),
+  );
+}
+
+export async function getBookBookmarkCounts(serverId: string): Promise<Map<string, number>> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const counts = new Map<string, number>();
+    for (const book of state.books) {
+      if (book.serverId !== serverId) continue;
+      const count = (state.bookmarks[book.id] ?? []).filter(
+        (item) => item.syncState !== 'pending_delete',
+      ).length;
+      if (count > 0) counts.set(book.id, count);
+    }
+    return counts;
+  }
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    `SELECT bookmarks.book_id AS book_id, COUNT(*) AS total
+     FROM bookmarks CROSS JOIN books ON books.id = bookmarks.book_id
+     WHERE books.server_id = ? AND bookmarks.sync_state != 'pending_delete'
+     GROUP BY bookmarks.book_id`,
+    [serverId],
+  );
+  return new Map((result.values ?? []).map((row) => [String(row.book_id), Number(row.total ?? 0)]));
+}
+
+export async function saveBookBookmark(
+  bookId: string,
+  input: SaveBookmarkInput,
+): Promise<StoredReaderLocation | null> {
+  const now = new Date().toISOString();
+  const fallback = cfiFallbackLocator(input.cfi);
+  const xpath = input.xpath?.trim() || fallback.xpath;
+  const pageNumber =
+    typeof input.pageNumber === 'number' &&
+    Number.isFinite(input.pageNumber) &&
+    input.pageNumber >= 0
+      ? Math.floor(input.pageNumber)
+      : fallback.pageNumber;
+
+  if (!Capacitor.isNativePlatform()) {
+    let created: StoredBookmarkRecord | null = null;
+    updateBrowserState((state) => {
+      if (!state.books.some((book) => book.id === bookId)) return false;
+      const existing = state.bookmarks[bookId] ?? [];
+      if (existing.filter((item) => item.syncState !== 'pending_delete').length >= MAX_BOOKMARKS) {
+        return false;
+      }
+      const label = disambiguateBookmarkLabel(existing, pageNumber, input.label);
+      const record: StoredBookmarkRecord = {
+        id: createStudyId(),
+        bookId,
+        remoteId: null,
+        cfi: input.cfi,
+        xpath,
+        href: input.href,
+        percentage: Math.max(0, Math.min(1, input.percentage)),
+        pageNumber,
+        label,
+        excerpt: input.excerpt?.trim().slice(0, 500) ?? '',
+        remoteTitle: null,
+        remotePageNumber: null,
+        savedAt: now,
+        updatedAt: now,
+        syncState: 'pending_create',
+        syncRevision: 1,
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
+      };
+      state.bookmarks[bookId] = [record, ...existing];
+      created = record;
+    });
+    return created ? toStoredBookmark(created) : null;
+  }
+
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const existingRows =
+      (await db.query('SELECT * FROM bookmarks WHERE book_id=?', [bookId])).values ?? [];
+    const existing = existingRows.map((row) => mapBookmarkRow(row as Record<string, unknown>));
+    if (existing.filter((item) => item.syncState !== 'pending_delete').length >= MAX_BOOKMARKS) {
+      return null;
+    }
+    const label = disambiguateBookmarkLabel(existing, pageNumber, input.label);
+    const record: StoredBookmarkRecord = {
+      id: createStudyId(),
+      bookId,
+      remoteId: null,
+      cfi: input.cfi,
+      xpath,
+      href: input.href,
+      percentage: Math.max(0, Math.min(1, input.percentage)),
+      pageNumber,
+      label,
+      excerpt: input.excerpt?.trim().slice(0, 500) ?? '',
+      remoteTitle: null,
+      remotePageNumber: null,
+      savedAt: now,
+      updatedAt: now,
+      syncState: 'pending_create',
+      syncRevision: 1,
+      attemptCount: 0,
+      lastAttemptAt: null,
+      lastError: null,
+    };
+    const task = insertBookmarkRecordTask(record);
+    await db.run(task.statement, task.values);
+    return toStoredBookmark(record);
+  });
+}
+
+export async function renameBookBookmark(
+  bookId: string,
+  bookmarkId: string,
+  desiredLabel: string,
+): Promise<StoredReaderLocation | null> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    let result: StoredBookmarkRecord | null = null;
+    updateBrowserState((state) => {
+      const list = state.bookmarks[bookId];
+      if (!list) return false;
+      const index = list.findIndex(
+        (item) => item.id === bookmarkId && item.syncState !== 'pending_delete',
+      );
+      if (index < 0) return false;
+      const current = list[index]!;
+      const label = disambiguateBookmarkLabel(list, current.pageNumber, desiredLabel, bookmarkId);
+      if (label === current.label) {
+        result = current;
+        return false;
+      }
+      const next: StoredBookmarkRecord = {
+        ...current,
+        label,
+        updatedAt: now,
+        syncState:
+          (current.remoteTitle !== null || current.remoteId !== null) &&
+          current.syncState !== 'pending_create'
+            ? 'pending_update'
+            : 'pending_create',
+        syncRevision: current.syncRevision + 1,
+        attemptCount: 0,
+        lastAttemptAt: null,
+        lastError: null,
+      };
+      list[index] = next;
+      result = next;
+    });
+    return result ? toStoredBookmark(result) : null;
+  }
+
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const rows = (await db.query('SELECT * FROM bookmarks WHERE book_id=?', [bookId])).values ?? [];
+    const list = rows.map((row) => mapBookmarkRow(row as Record<string, unknown>));
+    const current = list.find(
+      (item) => item.id === bookmarkId && item.syncState !== 'pending_delete',
+    );
+    if (!current) return null;
+    const label = disambiguateBookmarkLabel(list, current.pageNumber, desiredLabel, bookmarkId);
+    if (label === current.label) return toStoredBookmark(current);
+    const nextState: StudySyncState =
+      (current.remoteTitle !== null || current.remoteId !== null) &&
+      current.syncState !== 'pending_create'
+        ? 'pending_update'
+        : 'pending_create';
+    const nextRevision = current.syncRevision + 1;
+    await db.run(
+      `UPDATE bookmarks SET label=?, updated_at=?, sync_state=?, sync_revision=?,
+       attempt_count=0, last_attempt_at=NULL, last_error=NULL
+       WHERE id=? AND book_id=?`,
+      [label, now, nextState, nextRevision, bookmarkId, bookId],
+    );
+    return toStoredBookmark({
+      ...current,
+      label,
+      updatedAt: now,
+      syncState: nextState,
+      syncRevision: nextRevision,
+      attemptCount: 0,
+      lastAttemptAt: null,
+      lastError: null,
+    });
+  });
+}
+
+export async function deleteBookBookmark(bookId: string, bookmarkId: string): Promise<void> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    updateBrowserState((state) => {
+      const list = state.bookmarks[bookId];
+      if (!list) return false;
+      const index = list.findIndex((item) => item.id === bookmarkId);
+      if (index < 0) return false;
+      const current = list[index]!;
+      if (current.remoteTitle === null && current.remoteId === null) {
+        list.splice(index, 1);
+        if (list.length === 0) delete state.bookmarks[bookId];
+      } else {
+        list[index] = {
+          ...current,
+          updatedAt: now,
+          syncState: 'pending_delete',
+          syncRevision: current.syncRevision + 1,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        };
+      }
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await executeNativeTransaction(db, [
+    {
+      statement:
+        'DELETE FROM bookmarks WHERE id=? AND book_id=? AND remote_title IS NULL AND remote_id IS NULL',
+      values: [bookmarkId, bookId],
+    },
+    {
+      statement: `UPDATE bookmarks SET updated_at=?, sync_state='pending_delete',
+        sync_revision=sync_revision+1, attempt_count=0, last_attempt_at=NULL, last_error=NULL
+        WHERE id=? AND book_id=? AND (remote_title IS NOT NULL OR remote_id IS NOT NULL)`,
+      values: [now, bookmarkId, bookId],
+    },
+  ]);
+}
+
+export async function saveResolvedBookBookmarks(
+  bookId: string,
+  resolved: ReadonlyArray<{ id: string; cfi: string; href: string; percentage: number }>,
+): Promise<void> {
+  const valid = resolved.filter((item) => item.cfi.trim());
+  if (valid.length === 0) return;
+  if (!Capacitor.isNativePlatform()) {
+    const byId = new Map(valid.map((item) => [item.id, item]));
+    updateBrowserState((state) => {
+      const list = state.bookmarks[bookId];
+      if (!list) return false;
+      let changed = false;
+      for (const item of list) {
+        const next = byId.get(item.id);
+        if (next && (item.cfi !== next.cfi || item.href !== next.href)) {
+          item.cfi = next.cfi;
+          item.href = next.href;
+          item.percentage = next.percentage;
+          changed = true;
+        }
+      }
+      return changed;
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await executeNativeTransaction(
+    db,
+    valid.map((item) => ({
+      statement: 'UPDATE bookmarks SET cfi=?, href=?, percentage=? WHERE id=? AND book_id=?',
+      values: [item.cfi, item.href, item.percentage, item.id, bookId],
+    })),
+  );
+}
+
+export async function reconcileBookBookmarks(
+  bookId: string,
+  remote: readonly KavitaPersonalTocItem[],
+): Promise<StoredReaderLocation[]> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    let visible: StoredReaderLocation[] = [];
+    updateBrowserState((state) => {
+      if (!state.books.some((book) => book.id === bookId)) return false;
+      const next = reconcileBookmarkRecords(bookId, state.bookmarks[bookId] ?? [], remote, now);
+      if (next.length > 0) state.bookmarks[bookId] = next;
+      else delete state.bookmarks[bookId];
+      visible = next
+        .filter((record) => record.syncState !== 'pending_delete')
+        .map(toStoredBookmark);
+    });
+    return visible;
+  }
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const bookRow = (await db.query('SELECT 1 FROM books WHERE id=?', [bookId])).values?.[0];
+    if (!bookRow) return [];
+    const currentRows =
+      (
+        await db.query('SELECT * FROM bookmarks WHERE book_id=? ORDER BY saved_at DESC, id ASC', [
+          bookId,
+        ])
+      ).values ?? [];
+    const current = currentRows.map((row) => mapBookmarkRow(row as Record<string, unknown>));
+    const next = reconcileBookmarkRecords(bookId, current, remote, now);
+    await db.executeTransaction([
+      { statement: 'DELETE FROM bookmarks WHERE book_id=?', values: [bookId] },
+      ...next.map((record) => insertBookmarkRecordTask(record)),
+    ]);
+    return next.filter((record) => record.syncState !== 'pending_delete').map(toStoredBookmark);
+  });
+}
+
+export async function getBookHistory(bookId: string): Promise<StoredReaderLocation[]> {
+  if (!Capacitor.isNativePlatform()) {
+    return [...(readBrowserState().readingHistory[bookId] ?? [])]
+      .sort((a, b) => b.savedAt.localeCompare(a.savedAt))
+      .slice(0, 15);
+  }
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    'SELECT id, cfi, href, percentage, label, saved_at FROM reading_history WHERE book_id=? ORDER BY saved_at DESC LIMIT 15',
+    [bookId],
+  );
+  return (result.values ?? []).map((row) => ({
+    id: String(row.id),
+    cfi: String(row.cfi),
+    href: String(row.href),
+    percentage: Number(row.percentage ?? 0),
+    label: String(row.label),
+    savedAt: String(row.saved_at),
+  }));
+}
+
+export async function recordBookHistory(
+  bookId: string,
+  location: Omit<StoredReaderLocation, 'id' | 'savedAt' | 'label'> & { label?: string },
+): Promise<StoredReaderLocation[]> {
+  if (!Capacitor.isNativePlatform()) {
+    let updated: StoredReaderLocation[] = [];
+    updateBrowserState((state) => {
+      if (!state.books.some((book) => book.id === bookId)) return false;
+      updated = recordLocation(state.readingHistory[bookId] ?? [], location);
+      state.readingHistory[bookId] = updated;
+    });
+    return updated;
+  }
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const existingResult = await db.query(
+      'SELECT id, cfi, href, percentage, label, saved_at FROM reading_history WHERE book_id=? ORDER BY saved_at DESC LIMIT 15',
+      [bookId],
+    );
+    const existing: StoredReaderLocation[] = (existingResult.values ?? []).map((row) => ({
+      id: String(row.id),
+      cfi: String(row.cfi),
+      href: String(row.href),
+      percentage: Number(row.percentage ?? 0),
+      label: String(row.label),
+      savedAt: String(row.saved_at),
+    }));
+    const updated = recordLocation(existing, location);
+    await db.executeTransaction([
+      { statement: 'DELETE FROM reading_history WHERE book_id=?', values: [bookId] },
+      ...updated.map((entry) => ({
+        statement: `INSERT INTO reading_history
+          (book_id, id, cfi, href, percentage, label, saved_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        values: [
+          bookId,
+          entry.id,
+          entry.cfi,
+          entry.href,
+          entry.percentage,
+          entry.label,
+          entry.savedAt,
+        ],
+      })),
+    ]);
+    return updated;
+  });
+}
+
+export async function getPendingAnnotationSync(
+  serverId: string,
+): Promise<PendingAnnotationSyncItem[]> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const booksById = new Map(
+      state.books
+        .filter((book) => book.serverId === serverId && book.remoteAvailable !== false)
+        .map((book) => [book.id, book]),
+    );
+    const items: PendingAnnotationSyncItem[] = [];
+    for (const [bookId, list] of Object.entries(state.annotations)) {
+      const book = booksById.get(bookId);
+      if (!book) continue;
+      for (const record of list) {
+        if (record.syncState === 'synced') continue;
+        items.push({
+          id: record.id,
+          bookId: record.bookId,
+          libraryId: book.libraryId,
+          seriesId: book.seriesId,
+          volumeId: book.volumeId,
+          chapterId: book.chapterId,
+          remoteId: record.remoteId,
+          xpath: record.xpath,
+          endingXPath: record.endingXPath,
+          pageNumber: record.pageNumber,
+          slotIndex: record.slotIndex,
+          containsSpoiler: record.containsSpoiler,
+          context: record.context,
+          chapterTitle: record.chapterTitle,
+          excerpt: record.excerpt,
+          note: record.note,
+          syncState: record.syncState,
+          syncRevision: record.syncRevision,
+          updatedAt: record.updatedAt,
+        });
+      }
+    }
+    return items.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
+  }
+
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    `SELECT annotations.*, books.library_id, books.series_id, books.volume_id, books.chapter_id
+     FROM annotations CROSS JOIN books ON books.id = annotations.book_id
+     WHERE books.server_id = ? AND books.remote_available = 1 AND annotations.sync_state != 'synced'
+     ORDER BY annotations.updated_at ASC, annotations.id ASC`,
+    [serverId],
+  );
+  return (result.values ?? []).flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const record = mapAnnotationRow(row);
+    if (record.syncState === 'synced') return [];
+    return [
+      {
+        id: record.id,
+        bookId: record.bookId,
+        libraryId: Number(row.library_id),
+        seriesId: Number(row.series_id),
+        volumeId: Number(row.volume_id),
+        chapterId: Number(row.chapter_id),
+        remoteId: record.remoteId,
+        xpath: record.xpath,
+        endingXPath: record.endingXPath,
+        pageNumber: record.pageNumber,
+        slotIndex: record.slotIndex,
+        containsSpoiler: record.containsSpoiler,
+        context: record.context,
+        chapterTitle: record.chapterTitle,
+        excerpt: record.excerpt,
+        note: record.note,
+        syncState: record.syncState,
+        syncRevision: record.syncRevision,
+        updatedAt: record.updatedAt,
+      },
+    ];
+  });
+}
+
+export async function confirmAnnotationSync(params: {
+  id: string;
+  bookId: string;
+  expectedState: Exclude<StudySyncState, 'synced'>;
+  expectedRevision: number;
+  remote?: KavitaAnnotation | null;
+}): Promise<{ deletedDuringCreate: boolean }> {
+  const now = new Date().toISOString();
+  if (!Capacitor.isNativePlatform()) {
+    let deletedDuringCreate = false;
+    updateBrowserState((state) => {
+      const list = state.annotations[params.bookId];
+      if (!list) {
+        if (params.expectedState === 'pending_create' && params.remote?.id) {
+          deletedDuringCreate = true;
+        }
+        return false;
+      }
+      const index = list.findIndex((item) => item.id === params.id);
+      if (index < 0) {
+        if (params.expectedState === 'pending_create' && params.remote?.id) {
+          deletedDuringCreate = true;
+        }
+        return false;
+      }
+      const current = list[index]!;
+      if (params.expectedState === 'pending_delete') {
+        if (
+          current.syncState !== 'pending_delete' ||
+          current.syncRevision !== params.expectedRevision
+        ) {
+          return false;
+        }
+        list.splice(index, 1);
+        if (list.length === 0) delete state.annotations[params.bookId];
+        return;
+      }
+
+      if (current.syncState === 'pending_delete') {
+        if (params.expectedState === 'pending_create' && params.remote?.id) {
+          list.splice(index, 1);
+          if (list.length === 0) delete state.annotations[params.bookId];
+          deletedDuringCreate = true;
+          return;
+        }
+        return false;
+      }
+
+      const remoteId = params.remote?.id ?? current.remoteId;
+      const remoteUpdatedAt = params.remote?.lastModifiedUtc ?? current.remoteUpdatedAt ?? now;
+      if (current.syncRevision === params.expectedRevision) {
+        list[index] = {
+          ...current,
+          remoteId,
+          remoteUpdatedAt,
+          syncState: 'synced',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        };
+        return;
+      }
+
+      if (params.expectedState === 'pending_create' && remoteId !== null) {
+        list[index] = {
+          ...current,
+          remoteId,
+          remoteUpdatedAt,
+          syncState: 'pending_update',
+        };
+        return;
+      }
+      return false;
+    });
+    return { deletedDuringCreate };
+  }
+
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const existing = (
+      await db.query('SELECT * FROM annotations WHERE id=? AND book_id=?', [
+        params.id,
+        params.bookId,
+      ])
+    ).values?.[0];
+    if (!existing) {
+      return {
+        deletedDuringCreate: Boolean(
+          params.expectedState === 'pending_create' && params.remote?.id,
+        ),
+      };
+    }
+    const current = mapAnnotationRow(existing as Record<string, unknown>);
+    if (params.expectedState === 'pending_delete') {
+      if (
+        current.syncState === 'pending_delete' &&
+        current.syncRevision === params.expectedRevision
+      ) {
+        await db.run('DELETE FROM annotations WHERE id=? AND book_id=?', [
+          params.id,
+          params.bookId,
+        ]);
+      }
+      return { deletedDuringCreate: false };
+    }
+
+    if (current.syncState === 'pending_delete') {
+      if (params.expectedState === 'pending_create' && params.remote?.id) {
+        await db.run('DELETE FROM annotations WHERE id=? AND book_id=?', [
+          params.id,
+          params.bookId,
+        ]);
+        return { deletedDuringCreate: true };
+      }
+      return { deletedDuringCreate: false };
+    }
+
+    const remoteId = params.remote?.id ?? current.remoteId;
+    const remoteUpdatedAt = params.remote?.lastModifiedUtc ?? current.remoteUpdatedAt ?? now;
+    if (current.syncRevision === params.expectedRevision) {
+      await db.run(
+        `UPDATE annotations SET remote_id=?, remote_updated_at=?, sync_state='synced',
+         attempt_count=0, last_attempt_at=NULL, last_error=NULL
+         WHERE id=? AND book_id=?`,
+        [remoteId, remoteUpdatedAt, params.id, params.bookId],
+      );
+    } else if (params.expectedState === 'pending_create' && remoteId !== null) {
+      await db.run(
+        `UPDATE annotations SET remote_id=?, remote_updated_at=?, sync_state='pending_update'
+         WHERE id=? AND book_id=?`,
+        [remoteId, remoteUpdatedAt, params.id, params.bookId],
+      );
+    }
+    return { deletedDuringCreate: false };
+  });
+}
+
+export async function markAnnotationSyncFailure(
+  id: string,
+  bookId: string,
+  error: string,
+  expectedRevision: number,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const message = error.slice(0, 240);
+  if (!Capacitor.isNativePlatform()) {
+    updateBrowserState((state) => {
+      const item = state.annotations[bookId]?.find((entry) => entry.id === id);
+      if (!item || item.syncRevision !== expectedRevision) return false;
+      item.attemptCount += 1;
+      item.lastAttemptAt = now;
+      item.lastError = message;
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await executeNativeRun(
+    db,
+    `UPDATE annotations SET attempt_count=attempt_count+1, last_attempt_at=?, last_error=?
+     WHERE id=? AND book_id=? AND sync_revision=?`,
+    [now, message, id, bookId, expectedRevision],
+  );
+}
+
+export async function getPendingBookmarkSync(serverId: string): Promise<PendingBookmarkSyncItem[]> {
+  if (!Capacitor.isNativePlatform()) {
+    const state = readBrowserState();
+    const booksById = new Map(
+      state.books
+        .filter((book) => book.serverId === serverId && book.remoteAvailable !== false)
+        .map((book) => [book.id, book]),
+    );
+    const items: PendingBookmarkSyncItem[] = [];
+    for (const [bookId, list] of Object.entries(state.bookmarks)) {
+      const book = booksById.get(bookId);
+      if (!book) continue;
+      for (const record of list) {
+        if (record.syncState === 'synced') continue;
+        items.push({
+          id: record.id,
+          bookId: record.bookId,
+          libraryId: book.libraryId,
+          seriesId: book.seriesId,
+          volumeId: book.volumeId,
+          chapterId: book.chapterId,
+          remoteId: record.remoteId,
+          xpath: record.xpath,
+          pageNumber: record.pageNumber,
+          label: record.label,
+          excerpt: record.excerpt,
+          remoteTitle: record.remoteTitle,
+          remotePageNumber: record.remotePageNumber,
+          syncState: record.syncState,
+          syncRevision: record.syncRevision,
+          updatedAt: record.updatedAt,
+        });
+      }
+    }
+    return items.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
+  }
+
+  const db = await openDatabase();
+  const result = await executeNativeQuery(
+    db,
+    `SELECT bookmarks.*, books.library_id, books.series_id, books.volume_id, books.chapter_id
+     FROM bookmarks CROSS JOIN books ON books.id = bookmarks.book_id
+     WHERE books.server_id = ? AND books.remote_available = 1 AND bookmarks.sync_state != 'synced'
+     ORDER BY bookmarks.updated_at ASC, bookmarks.id ASC`,
+    [serverId],
+  );
+  return (result.values ?? []).flatMap((raw) => {
+    const row = raw as Record<string, unknown>;
+    const record = mapBookmarkRow(row);
+    if (record.syncState === 'synced') return [];
+    return [
+      {
+        id: record.id,
+        bookId: record.bookId,
+        libraryId: Number(row.library_id),
+        seriesId: Number(row.series_id),
+        volumeId: Number(row.volume_id),
+        chapterId: Number(row.chapter_id),
+        remoteId: record.remoteId,
+        xpath: record.xpath,
+        pageNumber: record.pageNumber,
+        label: record.label,
+        excerpt: record.excerpt,
+        remoteTitle: record.remoteTitle,
+        remotePageNumber: record.remotePageNumber,
+        syncState: record.syncState,
+        syncRevision: record.syncRevision,
+        updatedAt: record.updatedAt,
+      },
+    ];
+  });
+}
+
+export async function confirmBookmarkSync(params: {
+  id: string;
+  bookId: string;
+  expectedState: Exclude<StudySyncState, 'synced'>;
+  expectedRevision: number;
+  syncedTitle?: string;
+  syncedPageNumber?: number;
+  remoteId?: number | null;
+}): Promise<{ deletedDuringSync: boolean }> {
+  if (!Capacitor.isNativePlatform()) {
+    let deletedDuringSync = false;
+    updateBrowserState((state) => {
+      const list = state.bookmarks[params.bookId];
+      if (!list) {
+        if (params.expectedState !== 'pending_delete' && params.syncedTitle) {
+          deletedDuringSync = true;
+        }
+        return false;
+      }
+      const index = list.findIndex((item) => item.id === params.id);
+      if (index < 0) {
+        if (params.expectedState !== 'pending_delete' && params.syncedTitle) {
+          deletedDuringSync = true;
+        }
+        return false;
+      }
+      const current = list[index]!;
+      if (params.expectedState === 'pending_delete') {
+        if (
+          current.syncState !== 'pending_delete' ||
+          current.syncRevision !== params.expectedRevision
+        ) {
+          return false;
+        }
+        list.splice(index, 1);
+        if (list.length === 0) delete state.bookmarks[params.bookId];
+        return;
+      }
+
+      if (current.syncState === 'pending_delete') {
+        list.splice(index, 1);
+        if (list.length === 0) delete state.bookmarks[params.bookId];
+        deletedDuringSync = Boolean(params.syncedTitle);
+        return;
+      }
+
+      const remoteTitle = params.syncedTitle ?? current.label;
+      const remotePageNumber = params.syncedPageNumber ?? current.pageNumber;
+      const remoteId = params.remoteId !== undefined ? params.remoteId : current.remoteId;
+      if (current.syncRevision === params.expectedRevision) {
+        list[index] = {
+          ...current,
+          remoteId,
+          remoteTitle,
+          remotePageNumber,
+          syncState: 'synced',
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+        };
+        return;
+      }
+
+      list[index] = {
+        ...current,
+        remoteId,
+        remoteTitle,
+        remotePageNumber,
+        syncState: 'pending_update',
+      };
+    });
+    return { deletedDuringSync };
+  }
+
+  const db = await openDatabase();
+  return enqueueNativeWrite(async () => {
+    const existing = (
+      await db.query('SELECT * FROM bookmarks WHERE id=? AND book_id=?', [params.id, params.bookId])
+    ).values?.[0];
+    if (!existing) {
+      return {
+        deletedDuringSync: Boolean(params.expectedState !== 'pending_delete' && params.syncedTitle),
+      };
+    }
+    const current = mapBookmarkRow(existing as Record<string, unknown>);
+    if (params.expectedState === 'pending_delete') {
+      if (
+        current.syncState === 'pending_delete' &&
+        current.syncRevision === params.expectedRevision
+      ) {
+        await db.run('DELETE FROM bookmarks WHERE id=? AND book_id=?', [params.id, params.bookId]);
+      }
+      return { deletedDuringSync: false };
+    }
+
+    if (current.syncState === 'pending_delete') {
+      await db.run('DELETE FROM bookmarks WHERE id=? AND book_id=?', [params.id, params.bookId]);
+      return { deletedDuringSync: Boolean(params.syncedTitle) };
+    }
+
+    const remoteTitle = params.syncedTitle ?? current.label;
+    const remotePageNumber = params.syncedPageNumber ?? current.pageNumber;
+    const remoteId = params.remoteId !== undefined ? params.remoteId : current.remoteId;
+    if (current.syncRevision === params.expectedRevision) {
+      await db.run(
+        `UPDATE bookmarks SET remote_id=?, remote_title=?, remote_page_number=?,
+         sync_state='synced', attempt_count=0, last_attempt_at=NULL, last_error=NULL
+         WHERE id=? AND book_id=?`,
+        [remoteId, remoteTitle, remotePageNumber, params.id, params.bookId],
+      );
+    } else {
+      await db.run(
+        `UPDATE bookmarks SET remote_id=?, remote_title=?, remote_page_number=?,
+         sync_state='pending_update'
+         WHERE id=? AND book_id=?`,
+        [remoteId, remoteTitle, remotePageNumber, params.id, params.bookId],
+      );
+    }
+    return { deletedDuringSync: false };
+  });
+}
+
+export async function markBookmarkSyncFailure(
+  id: string,
+  bookId: string,
+  error: string,
+  expectedRevision: number,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const message = error.slice(0, 240);
+  if (!Capacitor.isNativePlatform()) {
+    updateBrowserState((state) => {
+      const item = state.bookmarks[bookId]?.find((entry) => entry.id === id);
+      if (!item || item.syncRevision !== expectedRevision) return false;
+      item.attemptCount += 1;
+      item.lastAttemptAt = now;
+      item.lastError = message;
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await executeNativeRun(
+    db,
+    `UPDATE bookmarks SET attempt_count=attempt_count+1, last_attempt_at=?, last_error=?
+     WHERE id=? AND book_id=? AND sync_revision=?`,
+    [now, message, id, bookId, expectedRevision],
+  );
 }

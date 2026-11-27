@@ -2,21 +2,51 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as DatabaseModule from '../database/database';
 import type * as SessionModule from '../reader/session';
 
-const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
-  () => ({
-    getPreferencesMock: vi.fn(),
-    setPreferencesMock: vi.fn(),
-    openSessionMock: vi.fn(),
-    destroySessionMock: vi.fn(),
-  }),
-);
-
-vi.mock('../database/database', () => ({
-  getPreferences: getPreferencesMock,
-  setPreferences: setPreferencesMock,
+const {
+  getBookAnnotationsMock,
+  getBookBookmarksMock,
+  getBookHistoryMock,
+  getPreferencesMock,
+  setPreferencesMock,
+  openSessionMock,
+  resolveAnnotationLocationsMock,
+  resolveBookmarkLocationsMock,
+  destroySessionMock,
+} = vi.hoisted(() => ({
+  getBookAnnotationsMock: vi.fn(),
+  getBookBookmarksMock: vi.fn(),
+  getBookHistoryMock: vi.fn(),
+  getPreferencesMock: vi.fn(),
+  setPreferencesMock: vi.fn(),
+  openSessionMock: vi.fn(),
+  resolveAnnotationLocationsMock: vi.fn(async (items: unknown[]) => items),
+  resolveBookmarkLocationsMock: vi.fn(async (items: unknown[]) => items),
+  destroySessionMock: vi.fn(),
 }));
+
+vi.mock('../database/database', async (importOriginal) => {
+  const actual = await importOriginal<typeof DatabaseModule>();
+  return {
+    ...actual,
+    deleteBookAnnotation: vi.fn(),
+    deleteBookBookmark: vi.fn(),
+    getBookAnnotations: getBookAnnotationsMock,
+    getBookBookmarks: getBookBookmarksMock,
+    getBookHistory: getBookHistoryMock,
+    getPreferences: getPreferencesMock,
+    recordBookHistory: vi.fn().mockResolvedValue([]),
+    renameBookBookmark: vi.fn(),
+    saveBookAnnotation: vi.fn(),
+    saveBookBookmark: vi.fn(),
+    saveResolvedBookAnnotations: vi.fn(),
+    saveResolvedBookBookmarks: vi.fn(),
+    setPreferences: setPreferencesMock,
+    updateBookAnnotationNote: vi.fn(),
+  };
+});
 
 vi.mock('../reader/session', async (importOriginal) => {
   const actual = await importOriginal<typeof SessionModule>();
@@ -28,6 +58,8 @@ vi.mock('../reader/session', async (importOriginal) => {
       getVisiblePassages = () => [];
       clearTextSelection = vi.fn();
       updateHighlights = vi.fn();
+      resolveAnnotationLocations = resolveAnnotationLocationsMock;
+      resolveBookmarkLocations = resolveBookmarkLocationsMock;
       destroy = destroySessionMock;
     },
   };
@@ -64,6 +96,9 @@ describe('Reader mount lifecycle', () => {
         return anim as unknown as Animation;
       }) as typeof Element.prototype.animate;
     }
+    getBookAnnotationsMock.mockResolvedValue([]);
+    getBookBookmarksMock.mockResolvedValue([]);
+    getBookHistoryMock.mockResolvedValue([]);
     getPreferencesMock.mockResolvedValue(new Map());
     setPreferencesMock.mockResolvedValue(undefined);
     openSessionMock.mockResolvedValue(undefined);
@@ -163,5 +198,61 @@ describe('Reader mount lifecycle', () => {
     await unmount(mounted);
     mounted = null;
     expect(destroySessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('loads server-scoped study data by bookId without querying legacy study preference keys', async () => {
+    const serverScopedBookId = 'server_alpha:2:44';
+    getBookAnnotationsMock.mockResolvedValueOnce([
+      {
+        id: `${serverScopedBookId}:ann-1`,
+        cfi: '',
+        xpath: '//body/DocFragment[1]/body/p[2]',
+        excerpt: 'Server-scoped highlight',
+        note: 'Server-scoped note',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        syncState: 'synced',
+      },
+    ]);
+    getBookBookmarksMock.mockResolvedValueOnce([
+      {
+        id: `${serverScopedBookId}:bm-1`,
+        cfi: '',
+        xpath: '//body/DocFragment[1]/body/p[2]',
+        href: 'ch1.xhtml',
+        percentage: 0.2,
+        pageNumber: 0,
+        label: 'Chapter 1',
+        savedAt: '2026-01-01T00:00:00.000Z',
+        syncState: 'synced',
+      },
+    ]);
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:server-book',
+        bookId: serverScopedBookId,
+        title: 'Server Scoped Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    flushSync();
+
+    await vi.waitFor(() => {
+      expect(openSessionMock).toHaveBeenCalledOnce();
+      expect(getBookAnnotationsMock).toHaveBeenCalledWith(serverScopedBookId);
+      expect(getBookBookmarksMock).toHaveBeenCalledWith(serverScopedBookId);
+      expect(getBookHistoryMock).toHaveBeenCalledWith(serverScopedBookId);
+      expect(resolveAnnotationLocationsMock).toHaveBeenCalledOnce();
+      expect(resolveBookmarkLocationsMock).toHaveBeenCalledOnce();
+    });
+
+    const requestedPrefKeys = getPreferencesMock.mock.calls.flatMap(
+      ([keys]) => (keys as string[]) ?? [],
+    );
+    expect(requestedPrefKeys.some((key) => key.startsWith('readerAnnotations:'))).toBe(false);
+    expect(requestedPrefKeys.some((key) => key.startsWith('readerBookmarks:'))).toBe(false);
+    expect(requestedPrefKeys.some((key) => key.startsWith('readerHistory:'))).toBe(false);
   });
 });

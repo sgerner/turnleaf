@@ -378,6 +378,52 @@ describe('native cover cache', () => {
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
 
+  it('does not start a cover transfer when connectivity drops during filesystem preparation', async () => {
+    let online = true;
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
+      online = false;
+      return { uri: `file://${path}` };
+    });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        () => online,
+        'https://books.example.com',
+      ),
+    ).rejects.toThrow('Offline');
+
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it('does not retry an EPUB download after connectivity drops', async () => {
+    vi.useFakeTimers();
+    let online = true;
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      online = false;
+      throw { code: 'OS-PLUG-FLTR-0008' };
+    });
+
+    const outcome = expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'secret',
+        'server-book',
+        undefined,
+        'https://books.example.com',
+        () => online,
+      ),
+    ).rejects.toMatchObject({ connectionFailed: true });
+    await Promise.all([outcome, vi.runAllTimersAsync()]);
+
+    expect(FileTransfer.downloadFile).toHaveBeenCalledOnce();
+  });
+
   it('follows validated same-origin 3xx cover redirects with disableRedirects enabled', async () => {
     let downloaded = false;
     vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {

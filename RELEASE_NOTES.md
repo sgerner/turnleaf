@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- test: avoid timestamp collision in log redaction test and align v11 test labels
+- Coordinate idempotent SQLite v8-v11 schema migrations across #330, #328, #339, and study storage transfer
+- Stop in-flight Kavita sync and transfer requests when connectivity drops
+- Replace regex HTML tag stripping in annotation comment normalization
+- Sync annotations and bookmarks with Kavita and isolate study data per server
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

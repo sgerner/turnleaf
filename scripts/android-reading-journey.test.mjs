@@ -75,4 +75,32 @@ describe('Android reading journey fixture', () => {
     expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
     expect(fixture.foreignAuthHeaders).toBe(1);
   });
+
+  it('serves annotation and personal ToC sync endpoints online without 404s and tracks offline requests', async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+
+    for (const path of [
+      '/api/Annotation/all?chapterId=1',
+      '/api/Annotation/all-for-series?seriesId=1',
+      '/api/Reader/ptoc?chapterId=1',
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${fixture.port}${path}`, {
+        headers: { 'x-api-key': 'turnleaf-ci-only' },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual([]);
+    }
+    expect(fixture.notFoundPaths).toEqual([]);
+
+    fixture.setOffline(true);
+    const offlineResponse = await fetch(
+      `http://127.0.0.1:${fixture.port}/api/Annotation/all?chapterId=1`,
+      {
+        headers: { 'x-api-key': 'turnleaf-ci-only' },
+      },
+    );
+    expect(offlineResponse.status).toBe(503);
+    expect(fixture.offlineRequests).toEqual(['/api/Annotation/all']);
+  });
 });

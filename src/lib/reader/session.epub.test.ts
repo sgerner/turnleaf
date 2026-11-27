@@ -1063,4 +1063,49 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('describes Kavita XPath locators for visible passages selected via keyboard', async () => {
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 600));
+    const container = document.createElement('div');
+    container.className = 'epub-container';
+    vi.spyOn(container, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 600));
+    const frame = document.createElement('iframe');
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 600));
+    container.append(frame);
+    viewport.append(container);
+
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, vi.fn(), vi.fn());
+    const prepareContents = mockRendition.hooks.content.register.mock.calls[0]?.[0];
+    const doc = document.implementation.createHTMLDocument('chapter');
+    const quote = doc.createElement('blockquote');
+    const paragraph = doc.createElement('p');
+    paragraph.textContent = 'Keyboard highlighted passage';
+    vi.spyOn(paragraph, 'getClientRects').mockReturnValue([
+      new DOMRect(24, 20, 240, 40),
+    ] as unknown as DOMRectList);
+    quote.append(paragraph);
+    doc.body.append(quote);
+
+    await prepareContents({
+      window: { frameElement: frame },
+      document: doc,
+      sectionIndex: 1,
+      cfiFromRange: (range: Range) => `cfi:${range.toString().trim()}`,
+    });
+
+    const passages = session.getVisiblePassages();
+    expect(passages).toEqual([
+      { cfi: 'cfi:Keyboard highlighted passage', text: 'Keyboard highlighted passage' },
+    ]);
+    expect(session.describeSelection(passages[0]!)).toEqual({
+      xpath: '//body/DocFragment[2]/body/blockquote[1]/p[1]',
+      endingXPath: '//body/DocFragment[2]/body/blockquote[1]/p[1]',
+      spineIndex: 1,
+      context: 'Keyboard highlighted passage',
+    });
+
+    session.destroy();
+  });
 });

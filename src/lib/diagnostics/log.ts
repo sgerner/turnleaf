@@ -136,6 +136,7 @@ const ALLOWED = new Set([
   'invalid-json',
   'invalid-response',
   'invalid-server-url',
+  'library-annotations-sync-failed',
   'library-refresh-failed',
   'missing-auth-key',
   'missing-field',
@@ -431,7 +432,7 @@ export function exportDiagnostics(context: DiagnosticContext): string {
     `App version: ${sanitizeContextValue(context.appVersion, 32)}`,
     `Platform: ${sanitizeContextValue(context.platform, 24)}`,
     `Kavita version: ${sanitizeContextValue(context.kavitaVersion, 32)}`,
-    'Server address, API key, book titles, and response bodies are not included.',
+    'Server address, API key, book titles, bookmark titles, highlights, notes, and response bodies are not included.',
     `Events: ${diagnostics.length}`,
     '',
   ];

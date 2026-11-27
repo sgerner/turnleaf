@@ -3,6 +3,7 @@ import {
   MAX_ANNOTATIONS,
   addAnnotation,
   annotationsMarkdown,
+  libraryAnnotationsMarkdown,
   parseAnnotations,
   removeAnnotation,
   updateAnnotation,
@@ -129,5 +130,20 @@ describe('reader annotations', () => {
     const annotations = addAnnotation([], 'epubcfi(/6/2)', 'A quote', 'A note', '2026');
     expect(annotationsMarkdown('Book', annotations)).toContain('# Notes for Book');
     expect(annotationsMarkdown('Book', annotations)).toContain('> A quote');
+  });
+
+  it('exports library-wide highlights and notes grouped by book', () => {
+    const first = addAnnotation([], 'epubcfi(/6/2)', 'First quote', 'First note', '2026');
+    const second = addAnnotation([], 'epubcfi(/6/4)', 'Second quote', '', '2026');
+    const markdown = libraryAnnotationsMarkdown([
+      { title: 'Book Alpha', author: 'Author A', annotations: first },
+      { title: 'Book Beta', author: null, annotations: second },
+    ]);
+    expect(markdown).toContain('# Highlights and notes');
+    expect(markdown).toContain('## Book Alpha — Author A');
+    expect(markdown).toContain('> First quote');
+    expect(markdown).toContain('First note');
+    expect(markdown).toContain('## Book Beta');
+    expect(markdown).toContain('> Second quote');
   });
 });

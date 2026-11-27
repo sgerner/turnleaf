@@ -2,6 +2,8 @@
 
 import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { StoredAnnotation } from '../reader/annotations';
+import type { StoredReaderLocation } from '../reader/bookmarks';
 import type * as SessionModule from '../reader/session';
 import type {
   ReaderLinkReturnTarget,
@@ -41,6 +43,18 @@ const mocks = vi.hoisted(() => {
   const setPreferencesMock = vi.fn<(entries: ReadonlyMap<string, string>) => Promise<void>>(() =>
     Promise.resolve(),
   );
+  const getBookAnnotationsMock = vi.fn<(bookId: string) => Promise<StoredAnnotation[]>>(() =>
+    Promise.resolve([]),
+  );
+  const getBookBookmarksMock = vi.fn<(bookId: string) => Promise<StoredReaderLocation[]>>(() =>
+    Promise.resolve([]),
+  );
+  const getBookHistoryMock = vi.fn<(bookId: string) => Promise<StoredReaderLocation[]>>(() =>
+    Promise.resolve([]),
+  );
+  const recordBookHistoryMock = vi.fn<
+    (bookId: string, location: ReaderLocation) => Promise<StoredReaderLocation[]>
+  >(() => Promise.resolve([]));
 
   class MockReaderSession {
     open = vi.fn(
@@ -64,11 +78,27 @@ const mocks = vi.hoisted(() => {
     previous = () => previousImpl();
     display = (target?: string) => displayImpl(target);
     displayCfi = (cfi: string) => displayCfiImpl(cfi);
+    displayStudyLocation = async (target: {
+      cfi?: string | null | undefined;
+      href?: string | null | undefined;
+    }) => {
+      if (target.cfi?.trim() && (await this.displayCfi(target.cfi.trim()))) {
+        return true;
+      }
+      if (target.href?.trim()) {
+        await this.display(target.href.trim());
+        return true;
+      }
+      return false;
+    };
     displayServerLocation = (xpath: string) => displayServerLocationImpl(xpath);
     displayServerPercentage = (pct: number) => displayServerPercentageImpl(pct);
     applyAppearance = vi.fn();
     updateHighlights = vi.fn();
     clearTextSelection = vi.fn();
+    describeSelection = vi.fn(() => null);
+    resolveAnnotationLocations = vi.fn(async (items: StoredAnnotation[]) => items);
+    resolveBookmarkLocations = vi.fn(async (items: StoredReaderLocation[]) => items);
     getVisiblePassages = vi.fn<() => ReaderSelection[]>(() => []);
     tableOfContents = vi.fn<() => TocItem[]>(() => [
       { label: 'Chapter 1', href: 'ch1.xhtml', children: [] },
@@ -87,6 +117,10 @@ const mocks = vi.hoisted(() => {
     displayServerPercentageImpl,
     getPreferencesMock,
     setPreferencesMock,
+    getBookAnnotationsMock,
+    getBookBookmarksMock,
+    getBookHistoryMock,
+    recordBookHistoryMock,
     getHandlers: () => latestHandlers,
     resetHandlers: () => {
       latestHandlers = null;
@@ -103,8 +137,20 @@ vi.mock('../reader/session', async (importOriginal) => {
 });
 
 vi.mock('../database/database', () => ({
+  deleteBookAnnotation: vi.fn(),
+  deleteBookBookmark: vi.fn(),
+  getBookAnnotations: mocks.getBookAnnotationsMock,
+  getBookBookmarks: mocks.getBookBookmarksMock,
+  getBookHistory: mocks.getBookHistoryMock,
   getPreferences: mocks.getPreferencesMock,
+  recordBookHistory: mocks.recordBookHistoryMock,
+  renameBookBookmark: vi.fn(),
+  saveBookAnnotation: vi.fn(),
+  saveBookBookmark: vi.fn(),
+  saveResolvedBookAnnotations: vi.fn(),
+  saveResolvedBookBookmarks: vi.fn(),
   setPreferences: mocks.setPreferencesMock,
+  updateBookAnnotationNote: vi.fn(),
 }));
 
 import Reader from './Reader.svelte';
@@ -168,6 +214,10 @@ describe('Reader alert modals and focus containment', () => {
     mocks.displayServerPercentageImpl.mockReset().mockResolvedValue(undefined);
     mocks.getPreferencesMock.mockReset().mockResolvedValue(new Map());
     mocks.setPreferencesMock.mockReset().mockResolvedValue(undefined);
+    mocks.getBookAnnotationsMock.mockReset().mockResolvedValue([]);
+    mocks.getBookBookmarksMock.mockReset().mockResolvedValue([]);
+    mocks.getBookHistoryMock.mockReset().mockResolvedValue([]);
+    mocks.recordBookHistoryMock.mockReset().mockResolvedValue([]);
 
     document.body.innerHTML = '';
     target = document.createElement('div');
@@ -482,7 +532,7 @@ describe('Reader alert modals and focus containment', () => {
       value: 256,
     });
 
-    const savedBookmarks = JSON.stringify([
+    mocks.getBookBookmarksMock.mockResolvedValue([
       {
         id: 'epubcfi(/6/8!/4/2)|missing.xhtml',
         cfi: 'epubcfi(/6/8!/4/2)',
@@ -492,9 +542,6 @@ describe('Reader alert modals and focus containment', () => {
         savedAt: '2026-11-20T00:00:00.000Z',
       },
     ]);
-    mocks.getPreferencesMock.mockResolvedValue(
-      new Map([['readerBookmarks:book-runtime', savedBookmarks]]),
-    );
 
     const onBack = vi.fn();
     let backHandler = null as (() => boolean) | null;
