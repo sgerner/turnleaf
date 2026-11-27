@@ -219,6 +219,8 @@
     bookmarks = parseBookmarks(preferences.get(`readerBookmarks:${bookId}`) ?? null);
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
+    await enableNativeReaderChrome();
+    if (destroyed) return;
     try {
       await openReaderSession();
     } catch {
@@ -233,8 +235,6 @@
       await restoreNativeReaderChrome();
       return;
     }
-    if (destroyed) return;
-    await enableNativeReaderChrome();
     if (destroyed) return;
     await listenForReaderResume();
   });
@@ -354,12 +354,12 @@
       await tick();
       if (destroyed) return;
       error = '';
+      await enableNativeReaderChrome();
+      if (destroyed) return;
       await openReaderSession();
       if (destroyed) return;
       startupOpenFailed = false;
       restoreModalFocus(null, () => readerToolbar ?? topRevealButton);
-      await enableNativeReaderChrome();
-      if (destroyed) return;
       await listenForReaderResume();
     } catch (cause) {
       if (destroyed) return;

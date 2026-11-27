@@ -2,16 +2,51 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as CapacitorCoreModule from '@capacitor/core';
 import type * as SessionModule from '../reader/session';
 
-const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
-  () => ({
-    getPreferencesMock: vi.fn(),
-    setPreferencesMock: vi.fn(),
-    openSessionMock: vi.fn(),
-    destroySessionMock: vi.fn(),
+const {
+  getPreferencesMock,
+  setPreferencesMock,
+  openSessionMock,
+  destroySessionMock,
+  constructedBookUrls,
+  isNativePlatformMock,
+  nativeEnableMock,
+  nativeRestoreMock,
+  nativeDisableMock,
+} = vi.hoisted(() => ({
+  getPreferencesMock: vi.fn(),
+  setPreferencesMock: vi.fn(),
+  openSessionMock: vi.fn(),
+  destroySessionMock: vi.fn(),
+  constructedBookUrls: [] as string[],
+  isNativePlatformMock: vi.fn(() => false),
+  nativeEnableMock: vi.fn(async () => {}),
+  nativeRestoreMock: vi.fn(async () => {}),
+  nativeDisableMock: vi.fn(async () => {}),
+}));
+
+vi.mock('@capacitor/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof CapacitorCoreModule>();
+  return {
+    ...actual,
+    Capacitor: {
+      ...actual.Capacitor,
+      isNativePlatform: isNativePlatformMock,
+    },
+  };
+});
+
+vi.mock('../native/reader-native-features', () => ({
+  createReaderNativeFeatures: () => ({
+    enable: nativeEnableMock,
+    restore: nativeRestoreMock,
+    disable: nativeDisableMock,
+    setKeepAwake: vi.fn(async () => {}),
+    setVolumeButtons: vi.fn(async () => {}),
   }),
-);
+}));
 
 vi.mock('../database/database', () => ({
   getPreferences: getPreferencesMock,
@@ -23,6 +58,9 @@ vi.mock('../reader/session', async (importOriginal) => {
   return {
     ...actual,
     ReaderSession: class MockReaderSession {
+      constructor(bookUrl: string) {
+        constructedBookUrls.push(bookUrl);
+      }
       open = openSessionMock;
       tableOfContents = () => [];
       getVisiblePassages = () => [];
@@ -41,6 +79,11 @@ describe('Reader mount lifecycle', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    constructedBookUrls.length = 0;
+    isNativePlatformMock.mockReturnValue(false);
+    nativeEnableMock.mockResolvedValue(undefined);
+    nativeRestoreMock.mockResolvedValue(undefined);
+    nativeDisableMock.mockResolvedValue(undefined);
     if (typeof Element.prototype.animate !== 'function') {
       Element.prototype.animate = (() => {
         const anim = {
@@ -163,5 +206,73 @@ describe('Reader mount lifecycle', () => {
     await unmount(mounted);
     mounted = null;
     expect(destroySessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('enables native reader chrome before opening the session, restores it on failure, and re-enables with updated bookUrl on retry', async () => {
+    isNativePlatformMock.mockReturnValue(true);
+    const callOrder: string[] = [];
+    nativeEnableMock.mockImplementation(async () => {
+      callOrder.push('native:enable');
+    });
+    nativeRestoreMock.mockImplementation(async () => {
+      callOrder.push('native:restore');
+    });
+    openSessionMock
+      .mockImplementationOnce(async () => {
+        callOrder.push('session:open:fail');
+        throw new Error('corrupt epub');
+      })
+      .mockImplementationOnce(async () => {
+        callOrder.push('session:open:retry');
+      });
+
+    let currentBookUrl = 'https://localhost/_capacitor_file_/books/42.epub';
+    const props = {
+      get bookUrl() {
+        return currentBookUrl;
+      },
+      bookId: 'book-42',
+      title: 'Retryable Book',
+      androidReader: true,
+      onBack: vi.fn(),
+      onRelocated: vi.fn(),
+      onRetryDownload: async () => {
+        callOrder.push('retry:download');
+        currentBookUrl = 'https://localhost/_capacitor_file_/books/42.epub?retry=1';
+      },
+    };
+
+    mounted = mount(Reader, { target, props });
+    flushSync();
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
+        'This EPUB could not be opened.',
+      );
+    });
+    expect(callOrder).toEqual(['native:enable', 'session:open:fail', 'native:restore']);
+    expect(constructedBookUrls).toEqual(['https://localhost/_capacitor_file_/books/42.epub']);
+
+    const retryButton = [...target.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Retry download'),
+    );
+    expect(retryButton).toBeDefined();
+    retryButton!.click();
+
+    await vi.waitFor(() => {
+      expect(openSessionMock).toHaveBeenCalledTimes(2);
+    });
+    expect(callOrder).toEqual([
+      'native:enable',
+      'session:open:fail',
+      'native:restore',
+      'retry:download',
+      'native:enable',
+      'session:open:retry',
+    ]);
+    expect(constructedBookUrls).toEqual([
+      'https://localhost/_capacitor_file_/books/42.epub',
+      'https://localhost/_capacitor_file_/books/42.epub?retry=1',
+    ]);
   });
 });
