@@ -80,6 +80,8 @@
     initialCfi = null,
     initialXPath = null,
     initialPercentage = null,
+    offline = false,
+    remoteAvailable = true,
     onBack,
     onRelocated,
     onSyncLatest,
@@ -94,6 +96,8 @@
     initialCfi?: string | null;
     initialXPath?: string | null;
     initialPercentage?: number | null;
+    offline?: boolean;
+    remoteAvailable?: boolean;
     onBack: () => void;
     onRelocated: (location: ReaderLocation) => void;
     onSyncLatest?: (manual: boolean) => Promise<SyncedLocation | null>;
@@ -216,6 +220,7 @@
     locationHistory = parseLocationHistory(preferences.get(`readerHistory:${bookId}`) ?? null);
     annotations = parseAnnotations(preferences.get(`readerAnnotations:${bookId}`) ?? null);
     await enableNativeReaderChrome();
+    if (destroyed) return;
     try {
       await openReaderSession();
     } catch {
@@ -230,7 +235,7 @@
       await restoreNativeReaderChrome();
       return;
     }
-
+    if (destroyed) return;
     await listenForReaderResume();
   });
 
@@ -346,9 +351,11 @@
     retryingReader = true;
     try {
       await onRetryDownload();
+      await tick();
       if (destroyed) return;
       error = '';
       await enableNativeReaderChrome();
+      if (destroyed) return;
       await openReaderSession();
       if (destroyed) return;
       startupOpenFailed = false;
@@ -1149,6 +1156,22 @@
       showControls();
     } catch {
       searchError = 'This search result is no longer available in the current EPUB.';
+    }
+  }
+
+  async function openTocSection(href: string): Promise<void> {
+    if (!session) return;
+    const opener = activeElement();
+    try {
+      await session.display(href);
+      closeToc();
+    } catch (cause) {
+      openReaderError(
+        cause instanceof Error
+          ? cause.message
+          : 'This section could not be displayed. Try reopening the book.',
+        opener,
+      );
     }
   }
 
@@ -1970,10 +1993,7 @@
                       : ''}"
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
-                    onclick={() => {
-                      void session?.display(item.href);
-                      closeToc();
-                    }}
+                    onclick={() => void openTocSection(item.href)}
                   >
                     {item.label}
                   </button>
@@ -2024,10 +2044,7 @@
                           data-toc-index={row.index}
                           type="button"
                           onkeydown={(event) => void continueTocTabbing(event, row.index)}
-                          onclick={() => {
-                            void session?.display(row.href);
-                            closeToc();
-                          }}
+                          onclick={() => void openTocSection(row.href)}
                         >
                           <span class="truncate">{row.label}</span>
                         </button>
@@ -2571,9 +2588,20 @@
         <h2 id="reader-error-title" class="font-serif text-xl">
           {startupOpenFailed ? 'Unable to open book' : 'Reader problem'}
         </h2>
-        <p id="reader-error-description" class="mt-3 text-sm" aria-live="polite" aria-atomic="true">
-          {error}
-        </p>
+        <div id="reader-error-description" aria-live="polite" aria-atomic="true">
+          <p class="mt-3 text-sm">{error}</p>
+          {#if startupOpenFailed && !onRetryDownload}
+            {#if !remoteAvailable}
+              <p class="mt-3 text-sm">
+                This book is no longer available on Kavita, so a fresh copy cannot be downloaded.
+              </p>
+            {:else if offline}
+              <p class="mt-3 text-sm">
+                No network connection. Reconnect to Kavita to download a fresh copy of this book.
+              </p>
+            {/if}
+          {/if}
+        </div>
         <div class="mt-5 flex flex-wrap justify-center gap-3">
           {#if canDismissError()}
             <button

@@ -368,10 +368,77 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
+export const READER_OPEN_TIMEOUT_MS = 15_000;
+export const READER_DISPLAY_TIMEOUT_MS = 10_000;
+
+export interface ReaderSessionOptions {
+  openTimeoutMs?: number;
+  displayTimeoutMs?: number;
+}
+
+export function withEpubRetryParam(bookUrl: string, retry: number): string {
+  const normalizedRetry = Math.max(1, Math.trunc(Math.abs(retry)) || 1);
+  const retryValue = BigInt(normalizedRetry).toString();
+  const hashIndex = bookUrl.indexOf('#');
+  const withoutHash = hashIndex >= 0 ? bookUrl.slice(0, hashIndex) : bookUrl;
+  const hash = hashIndex >= 0 ? bookUrl.slice(hashIndex) : '';
+  const queryIndex = withoutHash.indexOf('?');
+  const basePath = queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
+  const params = new URLSearchParams(queryIndex >= 0 ? withoutHash.slice(queryIndex + 1) : '');
+  params.set('retry', retryValue);
+  return `${basePath}?${params.toString()}${hash}`;
+}
+
+function toReaderError(cause: unknown, fallbackMessage: string): Error {
+  if (cause instanceof Error) return cause;
+  if (typeof cause === 'string' && cause.trim()) return new Error(cause);
+  return new Error(fallbackMessage);
+}
+
+type EpubDisplayingDefer = {
+  promise?: Promise<unknown>;
+  resolve?: (value?: unknown) => void;
+};
+
+type EpubRenditionInternals = Rendition & {
+  displaying?: EpubDisplayingDefer | undefined;
+  q?: {
+    stop?: () => void;
+  };
+  manager?: {
+    currentLocation?: () => unknown;
+  };
+};
+
+interface PendingDisplay {
+  readonly armTimer: () => void;
+  readonly rejectFromEvent: (error: Error) => void;
+  preempted: boolean;
+}
+
+function settleRenditionDisplaying(rendition: Rendition): void {
+  const internal = rendition as EpubRenditionInternals;
+  const displaying = internal.displaying;
+  if (!displaying) return;
+  internal.displaying = undefined;
+  displaying.resolve?.();
+}
+
 export class ReaderSession {
   private readonly book;
+  private readonly openTimeoutMs: number;
+  private readonly displayTimeoutMs: number;
+  private readonly openFailed: (cause: unknown) => void;
+  private readonly startupRejectors = new Set<(error: Error) => void>();
+  private readonly pendingDisplays: PendingDisplay[] = [];
+  private readonly preemptedDisplayings = new WeakSet<object>();
+  private readonly destroyCancelers = new Set<() => void>();
+  private readonly pendingTimers = new Set<ReturnType<typeof setTimeout>>();
   private readonly stylesheetCache: StylesheetCache = new Map();
+  private startupError: Error | null = null;
+  private destroyed = false;
   private rendition: Rendition | null = null;
+  private displayFailed: ((cause: unknown) => void) | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
@@ -421,8 +488,21 @@ export class ReaderSession {
     }
   };
 
-  constructor(private readonly bookUrl: string) {
+  constructor(
+    private readonly bookUrl: string,
+    options: ReaderSessionOptions = {},
+  ) {
+    this.openTimeoutMs = options.openTimeoutMs ?? READER_OPEN_TIMEOUT_MS;
+    this.displayTimeoutMs = options.displayTimeoutMs ?? READER_DISPLAY_TIMEOUT_MS;
+    this.openFailed = (cause: unknown) => {
+      const error = toReaderError(cause, 'This EPUB could not be opened.');
+      this.startupError ??= error;
+      for (const reject of [...this.startupRejectors]) {
+        reject(this.startupError);
+      }
+    };
     this.book = ePub(bookUrl);
+    this.book.on?.('openFailed', this.openFailed);
   }
 
   async open(
@@ -440,6 +520,8 @@ export class ReaderSession {
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
   ): Promise<void> {
+    if (this.destroyed) return;
+    if (this.startupError) throw this.startupError;
     this.viewportTarget = target;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -568,6 +650,17 @@ export class ReaderSession {
       }
     };
     this.rendition.on('relocated', this.relocated);
+    this.displayFailed = (cause: unknown) => {
+      const currentDisplaying = (this.rendition as EpubRenditionInternals | null)?.displaying;
+      if (currentDisplaying && this.preemptedDisplayings.has(currentDisplaying)) {
+        return;
+      }
+      const active = this.pendingDisplays.find((entry) => !entry.preempted);
+      if (!active) return;
+      active.rejectFromEvent(toReaderError(cause, 'This section could not be displayed.'));
+    };
+    this.rendition.on?.('displayerror', this.displayFailed);
+    this.rendition.on?.('displayError', this.displayFailed);
     this.renderedListener = () => {
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
@@ -577,6 +670,21 @@ export class ReaderSession {
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
+      if (this.pendingDisplays.length > 0 && this.rendition?.location?.start) {
+        const displaying = (this.rendition as EpubRenditionInternals).displaying;
+        if (displaying) {
+          this.preemptedDisplayings.add(displaying);
+          for (const pending of this.pendingDisplays) {
+            pending.preempted = true;
+          }
+        }
+        if (this.userNavigationPending) {
+          this.userNavigationPending = false;
+          this.userNavigationStartCfi = null;
+          this.userNavigationOrigin = 'navigation';
+          this.pendingLinkReturnTarget = null;
+        }
+      }
     };
     this.rendition.on('rendered', this.renderedListener);
     this.rendition.on('resized', this.resizedListener);
@@ -611,7 +719,7 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
+    await this.waitForStartup(this.rendition);
     this.bindEpubContainer();
     if (!this.isCurrentLocationOperation(restoreGeneration)) return;
     if (cfi) {
@@ -665,12 +773,12 @@ export class ReaderSession {
 
   async next(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.next());
+    await this.navigate(() => this.rendition!.next(), false);
   }
 
   async previous(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.prev());
+    await this.navigate(() => this.rendition!.prev(), false);
   }
 
   tableOfContents(): TocItem[] {
@@ -835,7 +943,7 @@ export class ReaderSession {
     if (!this.rendition) return false;
     try {
       await this.navigate(() => this.rendition!.display(cfi));
-      return true;
+      return this.rendition !== null;
     } catch {
       return false;
     }
@@ -929,7 +1037,25 @@ export class ReaderSession {
   }
 
   destroy(): void {
+    this.destroyed = true;
     this.locationGeneration += 1;
+    for (const timer of this.pendingTimers) {
+      clearTimeout(timer);
+    }
+    this.pendingTimers.clear();
+    this.startupRejectors.clear();
+    this.pendingDisplays.length = 0;
+    for (const cancel of [...this.destroyCancelers]) {
+      cancel();
+    }
+    this.destroyCancelers.clear();
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    this.book.off?.('openFailed', this.openFailed);
+    if (this.rendition && this.displayFailed) {
+      this.rendition.off?.('displayerror', this.displayFailed);
+      this.rendition.off?.('displayError', this.displayFailed);
+    }
     for (const contents of [...this.trackedContents]) {
       this.cleanupContents(contents);
     }
@@ -946,9 +1072,16 @@ export class ReaderSession {
     if (this.rendition && this.contentClick) this.rendition.off('click', this.contentClick);
     if (this.rendition && this.keyboardNavigation)
       this.rendition.off('keydown', this.keyboardNavigation);
-    this.rendition?.destroy();
-    this.resizeObserver?.disconnect();
-    this.resizeObserver = null;
+    if (this.rendition) {
+      const internal = this.rendition as EpubRenditionInternals;
+      const manager = internal.manager;
+      settleRenditionDisplaying(this.rendition);
+      internal.q?.stop?.();
+      this.rendition.destroy();
+      if (manager) {
+        manager.currentLocation = () => undefined;
+      }
+    }
     this.viewportSize = null;
     this.viewportTarget = null;
     this.lockedScrollLeft = 0;
@@ -956,6 +1089,7 @@ export class ReaderSession {
     this.aligningFocusTarget = null;
     this.unloadedHookRegistered = false;
     this.rendition = null;
+    this.displayFailed = null;
     this.relocated = null;
     this.renderedListener = null;
     this.resizedListener = null;
@@ -963,7 +1097,10 @@ export class ReaderSession {
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1136,10 +1273,12 @@ export class ReaderSession {
     try {
       return await operation();
     } finally {
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-      this.syncVisibleColumnLinks();
+      if (!this.destroyed) {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.syncVisibleColumnLinks();
+      }
     }
   }
 
@@ -1362,16 +1501,133 @@ export class ReaderSession {
     }
   }
 
+  private waitForStartup(rendition: Rendition): Promise<void> {
+    if (this.destroyed) return Promise.resolve();
+    if (this.startupError) return Promise.reject(this.startupError);
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        this.pendingTimers.delete(timer);
+        clearTimeout(timer);
+        this.startupRejectors.delete(onError);
+        this.destroyCancelers.delete(onDestroy);
+      };
+      const finishResolve = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const finishReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const onError = (error: Error) => finishReject(error);
+      const onDestroy = () => finishResolve();
+      const timer = setTimeout(() => {
+        const timeoutError = new Error('Timed out while opening this EPUB.');
+        this.startupError ??= timeoutError;
+        finishReject(timeoutError);
+      }, this.openTimeoutMs);
+      this.pendingTimers.add(timer);
+      this.startupRejectors.add(onError);
+      this.destroyCancelers.add(onDestroy);
+      Promise.resolve(rendition.started).then(finishResolve, (cause) =>
+        finishReject(toReaderError(cause, 'This EPUB could not be opened.')),
+      );
+    });
+  }
+
+  private async runDisplay(
+    rendition: Rendition,
+    operation: () => Promise<unknown>,
+    preemptsDisplay = true,
+  ): Promise<void> {
+    if (this.destroyed || this.rendition !== rendition) return;
+    await this.runDisplayOperation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          let settled = false;
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const clearTimer = () => {
+            if (timer !== null) {
+              this.pendingTimers.delete(timer);
+              clearTimeout(timer);
+              timer = null;
+            }
+          };
+          const cleanup = () => {
+            clearTimer();
+            const index = this.pendingDisplays.indexOf(entry);
+            if (index >= 0) this.pendingDisplays.splice(index, 1);
+            this.destroyCancelers.delete(onDestroy);
+            this.pendingDisplays[0]?.armTimer();
+          };
+          const finishResolve = () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve();
+          };
+          const finishReject = (error: Error, unblockQueue: boolean) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (unblockQueue && !entry.preempted && !this.destroyed) {
+              settleRenditionDisplaying(rendition);
+            }
+            reject(error);
+          };
+          const entry: PendingDisplay = {
+            preempted: false,
+            armTimer: () => {
+              if (settled || timer !== null) return;
+              timer = setTimeout(() => {
+                finishReject(new Error('Timed out while displaying this section.'), true);
+              }, this.displayTimeoutMs);
+              this.pendingTimers.add(timer);
+            },
+            rejectFromEvent: (error: Error) => {
+              finishReject(error, true);
+            },
+          };
+          const onDestroy = () => finishResolve();
+          if (preemptsDisplay && this.pendingDisplays.length > 0) {
+            const displaying = (rendition as EpubRenditionInternals).displaying;
+            if (displaying) {
+              this.preemptedDisplayings.add(displaying);
+              for (const pending of this.pendingDisplays) {
+                pending.preempted = true;
+              }
+            }
+          }
+          this.pendingDisplays.push(entry);
+          if (this.pendingDisplays[0] === entry) {
+            entry.armTimer();
+          }
+          this.destroyCancelers.add(onDestroy);
+          try {
+            Promise.resolve(operation()).then(finishResolve, (cause) =>
+              finishReject(toReaderError(cause, 'This section could not be displayed.'), false),
+            );
+          } catch (cause) {
+            finishReject(toReaderError(cause, 'This section could not be displayed.'), false);
+          }
+        }),
+    );
+  }
+
   private async displayAtGeneration(
     target: string | undefined,
     generation: number,
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    await this.runDisplayOperation(async () => {
-      if (target === undefined) await rendition.display();
-      else await rendition.display(target);
-    });
+    await this.runDisplay(rendition, () =>
+      target === undefined ? rendition.display() : rendition.display(target),
+    );
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -1383,7 +1639,7 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      await this.runDisplayOperation(() => rendition.display(section.href));
+      await this.runDisplay(rendition, () => rendition.display(section.href));
       if (!this.isCurrentLocationOperation(generation)) return false;
       if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
@@ -1394,7 +1650,7 @@ export class ReaderSession {
       if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
-      await this.runDisplayOperation(() => rendition.display(cfi));
+      await this.runDisplay(rendition, () => rendition.display(cfi));
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -1431,14 +1687,19 @@ export class ReaderSession {
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
+  private async navigate(display: () => Promise<unknown>, preemptsDisplay = true): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition) throw new Error('Reader is not open.');
     const generation = this.beginLocationOperation(true);
     try {
-      await this.runDisplayOperation(display);
+      await this.runDisplay(rendition, display, preemptsDisplay);
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
+        this.pendingLinkReturnTarget = null;
+        this.reflowPending = false;
       }
       throw error;
     }
@@ -1474,7 +1735,7 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
+    void this.runDisplay(rendition, () => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
     });
   }
