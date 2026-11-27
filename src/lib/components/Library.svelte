@@ -1129,6 +1129,26 @@
       if (previousPath && previousPath !== file.relativePath) {
         await deleteDownloadedEpub(previousPath).catch(() => {});
       }
+      if (!books.some((item) => item.id === book.id)) {
+        const savedBooks = await getBooks(server.id, { includeDescription: false }).catch(
+          () => null,
+        );
+        if (Array.isArray(savedBooks)) {
+          books = savedBooks;
+          const persisted =
+            savedBooks.find((item) => item.downloadPath === file.relativePath) ?? null;
+          if (persisted) {
+            if (actionMenuBook?.id === book.id || actionMenuBook?.id === persisted.id) {
+              actionMenuBook = persisted;
+            }
+            if (reading?.book.id === book.id || reading?.book.id === persisted.id) {
+              reading = { ...reading, book: persisted };
+            }
+            message = `${persisted.title} is ready offline.`;
+            return persisted;
+          }
+        }
+      }
       const refreshed: BookRecord = {
         ...book,
         downloadPath: file.relativePath,
@@ -1255,19 +1275,28 @@
         : `Could not remove ${book.title}: ${detail}`;
       return false;
     }
-    books = books.map((item) =>
-      item.id === book.id
-        ? {
-            ...item,
-            downloadPath: null,
-            downloadStatus: 'none',
-            fileSize: item.remoteFileSize ?? null,
-            downloadedBytes: null,
-            downloadedPages: null,
-            downloadOutdated: false,
-          }
-        : item,
-    );
+    if (book.remoteAvailable === false) {
+      const savedBooks = await getBooks(server.id, { includeDescription: false }).catch(() => null);
+      if (Array.isArray(savedBooks)) {
+        books = savedBooks;
+        return true;
+      }
+    }
+    books = books.flatMap((item) => {
+      if (item.id !== book.id) return [item];
+      if (item.remoteAvailable === false) return [];
+      return [
+        {
+          ...item,
+          downloadPath: null,
+          downloadStatus: 'none',
+          fileSize: item.remoteFileSize ?? null,
+          downloadedBytes: null,
+          downloadedPages: null,
+          downloadOutdated: false,
+        },
+      ];
+    });
     return true;
   }
 

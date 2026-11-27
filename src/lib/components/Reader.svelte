@@ -6,12 +6,7 @@
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import { Animation, StatusBar } from '@capacitor/status-bar';
-  import {
-    getPreferences,
-    mergeReaderPreferenceValue,
-    READER_PREFERENCE_PREFIXES,
-    setPreferences,
-  } from '../database/database';
+  import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
@@ -43,8 +38,10 @@
   } from '../reader/annotations';
   import {
     MAX_BOOKMARKS,
+    mergeReaderPreferenceValue,
     parseBookmarks,
     parseLocationHistory,
+    READER_PREFERENCE_PREFIXES,
     recordLocation,
     removeBookmark,
     renameBookmark,

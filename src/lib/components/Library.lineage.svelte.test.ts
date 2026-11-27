@@ -216,6 +216,36 @@ const baseBook: BookRecord = {
   remoteAvailable: true,
 };
 
+if (typeof Element.prototype.animate !== 'function') {
+  Element.prototype.animate = function animateStub() {
+    let canceled = false;
+    let finishHandler: ((event: AnimationPlaybackEvent) => void) | null = null;
+    const animation = {
+      currentTime: 0,
+      cancel() {
+        canceled = true;
+      },
+      finish() {
+        if (!canceled) finishHandler?.(new Event('finish') as AnimationPlaybackEvent);
+      },
+      get onfinish() {
+        return finishHandler;
+      },
+      set onfinish(handler: ((event: AnimationPlaybackEvent) => void) | null) {
+        finishHandler = handler;
+        if (handler) {
+          queueMicrotask(() => {
+            if (!canceled && finishHandler === handler) {
+              handler(new Event('finish') as AnimationPlaybackEvent);
+            }
+          });
+        }
+      },
+    };
+    return animation as unknown as Animation;
+  };
+}
+
 async function settle(): Promise<void> {
   for (let index = 0; index < 8; index += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -397,5 +427,66 @@ describe('Library and Reader lineage UX', () => {
 
     expect(mocks.preferences.has('readerBookmarks:primary:42:100')).toBe(false);
     expect(mocks.preferences.get('readerBookmarks:primary:43:102')).toContain('Chapter 1');
+  });
+
+  it('hides a removed-from-server book after deleting its download when no notes or progress remain', async () => {
+    const vanishedDownloadOnly: BookRecord = {
+      ...baseBook,
+      id: 'primary:88:800',
+      seriesId: 88,
+      chapterId: 800,
+      title: 'Vanished Download Only Book',
+      remoteAvailable: false,
+      downloadPath: 'epubs/vanished-only.epub',
+      downloadStatus: 'available',
+      fileSize: 120_000,
+      remoteFileSize: 120_000,
+      downloadedBytes: 120_000,
+      downloadedPages: 120,
+      hasLocalData: true,
+    };
+    mocks.books = [vanishedDownloadOnly];
+    mocks.reconcileBooks.mockImplementation(async () => new Map());
+    const { default: Library } = await import('./Library.svelte');
+
+    instance = mount(Library, {
+      target,
+      props: {
+        server,
+        apiKey: 'secret-key',
+        theme: 'turnleaf',
+        mode: 'dark',
+        onThemeChange: () => undefined,
+        onModeChange: () => undefined,
+        onApiKeyChange: () => undefined,
+        onServerDeleted: () => undefined,
+        onChangeServerAddress: () => undefined,
+      },
+    });
+    await settle();
+
+    expect(target.textContent).toContain('Vanished Download Only Book');
+    expect(target.textContent).toContain('Unavailable on Kavita · Saved offline');
+
+    const actionsBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Book actions for Vanished Download Only Book, by Ursula K. Le Guin, Hainish Cycle, removed from server"]',
+    );
+    expect(actionsBtn).not.toBeNull();
+    actionsBtn!.click();
+    flushSync();
+
+    // Simulate removeDownload pruning the unretained vanished row in storage
+    mocks.books = [];
+
+    const removeBtn = [...target.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Remove download'),
+    );
+    expect(removeBtn).toBeDefined();
+    removeBtn!.click();
+    await settle();
+
+    expect(mocks.deleteDownloadedEpub).toHaveBeenCalledWith('epubs/vanished-only.epub');
+    expect(target.textContent).not.toContain('Vanished Download Only Book');
+    expect(target.textContent).not.toContain('Unavailable on Kavita · Notes saved');
   });
 });

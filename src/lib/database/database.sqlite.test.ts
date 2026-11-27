@@ -945,4 +945,77 @@ describe('native metadata transactions against SQLite', () => {
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     },
   );
+
+  it('keeps same-title chapters with different explicit chapter numbers separate in SQLite', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const updatedAt = '2026-09-08T12:00:00.000Z';
+    const chapterOne: BookRecord = {
+      ...baseBook,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      seriesId: 42,
+      chapterId: 100,
+      title: 'The Expanse',
+      author: 'James S. A. Corey',
+      series: null,
+      pages: 300,
+      pagesRead: 150,
+      downloadPath: '/books/expanse-1.epub',
+      downloadStatus: 'available',
+      fileSize: 400_000,
+      remoteFileSize: 400_000,
+      downloadedBytes: 400_000,
+      downloadedPages: 300,
+      chapterKey: 'number:1',
+    };
+    await reconcileBooksInTransaction(adapter, 'primary', [chapterOne], updatedAt);
+    db.prepare(
+      `INSERT INTO reading_state
+        (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+        VALUES (?, 'epubcfi(/6/8)', '/p[2]', 0.5, ?, 1, 1)`,
+    ).run(chapterOne.id, updatedAt);
+
+    const chapterTwo: BookRecord = {
+      ...chapterOne,
+      id: 'primary:42:101',
+      chapterId: 101,
+      pages: 340,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 450_000,
+      remoteFileSize: 450_000,
+      chapterKey: 'number:2',
+    };
+    delete chapterTwo.downloadedBytes;
+    delete chapterTwo.downloadedPages;
+
+    const remapped = await reconcileBooksInTransaction(
+      adapter,
+      'primary',
+      [chapterTwo],
+      '2026-09-09T00:00:00.000Z',
+    );
+    expect(remapped.size).toBe(0);
+    const rows = db
+      .prepare('SELECT id, pages_read, download_path, remote_available FROM books ORDER BY id')
+      .all();
+    expect(rows).toEqual([
+      {
+        id: 'primary:42:100',
+        pages_read: 150,
+        download_path: '/books/expanse-1.epub',
+        remote_available: 0,
+      },
+      {
+        id: 'primary:42:101',
+        pages_read: 0,
+        download_path: null,
+        remote_available: 1,
+      },
+    ]);
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  });
 });

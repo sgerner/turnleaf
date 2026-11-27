@@ -1195,4 +1195,88 @@ describe('native progress transactions against SQLite', () => {
     });
     expect(native.database?.prepare('PRAGMA foreign_key_check').all() ?? []).toEqual([]);
   });
+
+  it('redirects stale-ID markDownloaded to remapped rows and prunes only unretained removed books on removeDownload', async () => {
+    const database = await importDatabase();
+    const primaryServer = { ...server, id: 'primary' };
+    const downloadable = {
+      ...book,
+      id: 'primary:42:100',
+      serverId: 'primary',
+      seriesId: 42,
+      chapterId: 100,
+      title: 'A Wizard of Earthsea',
+      author: 'Ursula K. Le Guin',
+      pages: 180,
+      fileSize: 200_000,
+      remoteFileSize: 200_000,
+      chapterKey: 'isbn:9780547773742',
+    };
+    const annotatedVanished = {
+      ...book,
+      id: 'primary:77:700',
+      serverId: 'primary',
+      seriesId: 77,
+      chapterId: 700,
+      title: 'Tehanu',
+      author: 'Ursula K. Le Guin',
+      pages: 250,
+      downloadPath: 'books/tehanu.epub',
+      downloadStatus: 'available',
+      fileSize: 300_000,
+      remoteFileSize: 300_000,
+      downloadedBytes: 300_000,
+      downloadedPages: 250,
+      chapterKey: 'isbn:9780689845376',
+    };
+    await database.saveServer(primaryServer);
+    await database.reconcileBooks('primary', [downloadable, annotatedVanished]);
+    await database.setPreference(
+      `readerAnnotations:${annotatedVanished.id}`,
+      '[{"id":"ann-1","cfi":"epubcfi(/6/4)","text":"Tenar","note":"Saved","createdAt":"2026-09-01T00:00:00.000Z"}]',
+    );
+
+    // Remap primary:42:100 -> primary:42:101 and drop primary:77:700 from remote catalog
+    const remapped = await database.reconcileBooks('primary', [
+      {
+        ...downloadable,
+        id: 'primary:42:101',
+        chapterId: 101,
+        pages: 210,
+        fileSize: 240_000,
+        remoteFileSize: 240_000,
+      },
+    ]);
+    expect(remapped).toEqual(new Map([['primary:42:100', 'primary:42:101']]));
+
+    // Stale-ID markDownloaded from an in-flight download updates primary:42:101
+    await database.markDownloaded('primary:42:100', 'books/earthsea.epub', 200_000, {
+      downloadedBytes: 200_000,
+      downloadedPages: 180,
+    });
+    const afterMark = await database.getBooks('primary');
+    expect(afterMark.find((b) => b.id === 'primary:42:101')).toMatchObject({
+      downloadPath: 'books/earthsea.epub',
+      downloadStatus: 'available',
+      downloadedBytes: 200_000,
+      downloadedPages: 180,
+      downloadOutdated: true,
+    });
+
+    // Make primary:42:101 vanish remotely as well (retained only by its download), then remove both downloads
+    await database.reconcileBooks('primary', []);
+    await database.removeDownload('primary:42:101');
+    await database.removeDownload(annotatedVanished.id);
+
+    const remaining = await database.getBooks('primary');
+    expect(remaining.map((b) => b.id)).toEqual([annotatedVanished.id]);
+    expect(remaining[0]).toMatchObject({
+      id: annotatedVanished.id,
+      remoteAvailable: false,
+      downloadPath: null,
+      downloadStatus: 'none',
+      hasLocalData: true,
+    });
+    expect(native.database?.prepare('PRAGMA foreign_key_check').all() ?? []).toEqual([]);
+  });
 });

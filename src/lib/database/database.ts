@@ -8,8 +8,16 @@ import {
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
+import {
+  hasNonEmptyReaderPreferenceValue,
+  mergeReaderPreferenceValue,
+  READER_PREFERENCE_PREFIXES,
+  type ReaderPreferencePrefix,
+} from '../reader/bookmarks';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 import { migrations } from './schema';
+
+export { mergeReaderPreferenceValue, READER_PREFERENCE_PREFIXES, type ReaderPreferencePrefix };
 
 export interface ServerConfig {
   id: string;
@@ -51,91 +59,6 @@ export interface BookRecord {
   remoteProgressKnown?: boolean;
   /** False means Kavita omitted a usable last-read date from this metadata snapshot. */
   remoteReadDateKnown?: boolean;
-}
-
-export const READER_PREFERENCE_PREFIXES = [
-  'readerBookmarks:',
-  'readerAnnotations:',
-  'readerHistory:',
-] as const;
-
-export type ReaderPreferencePrefix = (typeof READER_PREFERENCE_PREFIXES)[number];
-
-function hasNonEmptyPreferenceValue(value: string | undefined | null): boolean {
-  return typeof value === 'string' && value.trim() !== '' && value.trim() !== '[]';
-}
-
-export function mergeReaderPreferenceValue(
-  prefix: ReaderPreferencePrefix,
-  oldRaw: string | undefined,
-  newRaw: string | undefined,
-): string | undefined {
-  if (oldRaw === undefined) return newRaw;
-  if (newRaw === undefined) return oldRaw;
-  if (!hasNonEmptyPreferenceValue(oldRaw)) return newRaw;
-  if (!hasNonEmptyPreferenceValue(newRaw)) return oldRaw;
-  try {
-    const oldParsed: unknown = JSON.parse(oldRaw);
-    const newParsed: unknown = JSON.parse(newRaw);
-    if (!Array.isArray(oldParsed) || !Array.isArray(newParsed)) return newRaw;
-    if (prefix === 'readerAnnotations:') {
-      const merged = new Map<string, Record<string, unknown>>();
-      const keyOf = (entry: unknown, index: number): string => {
-        if (!entry || typeof entry !== 'object') return `idx:${index}`;
-        const record = entry as Record<string, unknown>;
-        if (typeof record.cfi === 'string' && record.cfi.trim()) return `cfi:${record.cfi.trim()}`;
-        if (typeof record.id === 'string' && record.id) return `id:${record.id}`;
-        return `json:${JSON.stringify(record)}`;
-      };
-      oldParsed.forEach((entry, index) => {
-        if (entry && typeof entry === 'object') {
-          merged.set(keyOf(entry, index), entry as Record<string, unknown>);
-        }
-      });
-      newParsed.forEach((entry, index) => {
-        if (!entry || typeof entry !== 'object') return;
-        const next = entry as Record<string, unknown>;
-        const key = keyOf(entry, oldParsed.length + index);
-        const existing = merged.get(key);
-        if (!existing) {
-          merged.set(key, next);
-          return;
-        }
-        const existingDate = typeof existing.createdAt === 'string' ? existing.createdAt : '';
-        const nextDate = typeof next.createdAt === 'string' ? next.createdAt : '';
-        const existingNote = typeof existing.note === 'string' ? existing.note.trim() : '';
-        const nextNote = typeof next.note === 'string' ? next.note.trim() : '';
-        if (nextDate >= existingDate || nextNote) {
-          merged.set(key, nextNote ? next : { ...next, note: existingNote || next.note });
-        }
-      });
-      return JSON.stringify([...merged.values()]);
-    }
-    const merged = new Map<string, Record<string, unknown>>();
-    const keyOf = (entry: unknown, index: number): string => {
-      if (!entry || typeof entry !== 'object') return `idx:${index}`;
-      const record = entry as Record<string, unknown>;
-      if (typeof record.id === 'string' && record.id) return record.id;
-      return `${String(record.cfi ?? '')}|${String(record.href ?? '')}`;
-    };
-    for (const [index, entry] of [...newParsed, ...oldParsed].entries()) {
-      if (!entry || typeof entry !== 'object') continue;
-      const record = entry as Record<string, unknown>;
-      const key = keyOf(entry, index);
-      const existing = merged.get(key);
-      if (!existing) {
-        merged.set(key, record);
-        continue;
-      }
-      const existingSaved = typeof existing.savedAt === 'string' ? existing.savedAt : '';
-      const nextSaved = typeof record.savedAt === 'string' ? record.savedAt : '';
-      if (nextSaved > existingSaved) merged.set(key, record);
-    }
-    const values = [...merged.values()];
-    return JSON.stringify(prefix === 'readerHistory:' ? values.slice(0, 12) : values);
-  } catch {
-    return newRaw;
-  }
 }
 
 export function isBookDownloadOutdated(book: {
@@ -197,10 +120,25 @@ function extractNormalizedIsbn(book: Pick<LineageCandidate, 'chapterKey'>): stri
   return marker?.startsWith('isbn:') ? marker.slice('isbn:'.length) : null;
 }
 
-function hasConflictingIsbn(a: LineageCandidate, b: LineageCandidate): boolean {
+function hasConflictingChapterIdentity(a: LineageCandidate, b: LineageCandidate): boolean {
   const isbnA = extractNormalizedIsbn(a);
   const isbnB = extractNormalizedIsbn(b);
-  return isbnA !== null && isbnB !== null && isbnA !== isbnB;
+  if (isbnA !== null && isbnB !== null && isbnA !== isbnB) return true;
+  const markerA = normalizedChapterMarker(a);
+  const markerB = normalizedChapterMarker(b);
+  if (
+    markerA?.startsWith('number:') &&
+    markerB?.startsWith('number:') &&
+    markerA !== 'number:0' &&
+    markerB !== 'number:0' &&
+    markerA !== markerB
+  ) {
+    return true;
+  }
+  if (markerA?.startsWith('range:') && markerB?.startsWith('range:') && markerA !== markerB) {
+    return true;
+  }
+  return false;
 }
 
 const LINEAGE_KEY_TIERS: ReadonlyArray<(book: LineageCandidate) => string | null> = [
@@ -274,7 +212,7 @@ function matchBookLineage(
       const oldBook = oldGroup[0]!;
       const newBook = newGroup[0]!;
       if (matchedOld.has(oldBook.id) || matchedNew.has(newBook.id)) continue;
-      if (hasConflictingIsbn(oldBook, newBook)) continue;
+      if (hasConflictingChapterIdentity(oldBook, newBook)) continue;
       matchedOld.add(oldBook.id);
       matchedNew.add(newBook.id);
       remapped.set(oldBook.id, newBook.id);
@@ -288,7 +226,7 @@ function hasBrowserReaderPreferences(
   bookId: string,
 ): boolean {
   return READER_PREFERENCE_PREFIXES.some((prefix) =>
-    hasNonEmptyPreferenceValue(preferences[`${prefix}${bookId}`]),
+    hasNonEmptyReaderPreferenceValue(preferences[`${prefix}${bookId}`]),
   );
 }
 
@@ -1380,8 +1318,11 @@ export async function markDownloaded(
   const baselineBytes = baseline?.downloadedBytes ?? size;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      const targetId = state.books.some((item) => item.id === bookId)
+        ? bookId
+        : resolveRemappedBookId(bookId);
       state.books = state.books.map((book) => {
-        if (book.id !== bookId) return book;
+        if (book.id !== targetId) return book;
         const previouslyUndownloaded = !book.downloadPath && book.downloadStatus === 'none';
         const remoteFileSize =
           book.remoteFileSize !== undefined
@@ -1403,28 +1344,37 @@ export async function markDownloaded(
           remoteFileSize,
           downloadedBytes: baselineBytes,
           downloadedPages,
-          downloadOutdated: false,
+          downloadOutdated: isBookDownloadOutdated({
+            downloadPath: path,
+            downloadStatus: 'available',
+            pages: book.pages,
+            remoteFileSize,
+            downloadedBytes: baselineBytes,
+            downloadedPages,
+          }),
         };
       });
     });
     return;
   }
   const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    `UPDATE books SET
-      download_path=?,
-      download_status='available',
-      file_size=?,
-      remote_file_size=COALESCE(
-        remote_file_size,
-        CASE WHEN download_path IS NULL AND download_status='none' THEN file_size ELSE NULL END
-      ),
-      downloaded_bytes=?,
-      downloaded_pages=COALESCE(?, CASE WHEN pages>0 THEN pages ELSE NULL END)
-    WHERE id=?`,
-    [path, size, baselineBytes, baseline?.downloadedPages ?? null, bookId],
-  );
+  await enqueueNativeWrite(async () => {
+    const effectiveId = await resolveNativeRemappedBookId(db, bookId);
+    await db.run(
+      `UPDATE books SET
+        download_path=?,
+        download_status='available',
+        file_size=?,
+        remote_file_size=COALESCE(
+          remote_file_size,
+          CASE WHEN download_path IS NULL AND download_status='none' THEN file_size ELSE NULL END
+        ),
+        downloaded_bytes=?,
+        downloaded_pages=COALESCE(?, CASE WHEN pages>0 THEN pages ELSE NULL END)
+      WHERE id=?`,
+      [path, size, baselineBytes, baseline?.downloadedPages ?? null, effectiveId],
+    );
+  });
 }
 
 export interface StoredReadingState {
@@ -1515,6 +1465,18 @@ function updateBrowserBookProgress(
   state.books = state.books.map((item) =>
     item.id === bookId ? { ...item, pagesRead, lastReadAt } : item,
   );
+}
+
+async function resolveNativeRemappedBookId(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  bookId: string,
+): Promise<string> {
+  const candidateId = resolveRemappedBookId(bookId);
+  if (candidateId === bookId) return bookId;
+  const existingOriginal = await db.query('SELECT 1 FROM books WHERE id=?', [bookId]);
+  if (existingOriginal.values?.length) return bookId;
+  const existingRemapped = await db.query('SELECT 1 FROM books WHERE id=?', [candidateId]);
+  return existingRemapped.values?.length ? candidateId : bookId;
 }
 
 async function resolveNativeRemappedTargetBook(
@@ -2150,34 +2112,61 @@ export async function markSyncFailure(
 export async function removeDownload(bookId: string): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
-      state.books = state.books.map((book) =>
-        book.id === bookId
-          ? {
-              ...book,
-              downloadPath: null,
-              downloadStatus: 'none',
-              fileSize: book.remoteFileSize ?? null,
-              downloadedBytes: null,
-              downloadedPages: null,
-              downloadOutdated: false,
-            }
-          : book,
-      );
+      const targetId = state.books.some((item) => item.id === bookId)
+        ? bookId
+        : resolveRemappedBookId(bookId);
+      state.books = state.books.flatMap((book) => {
+        if (book.id !== targetId) return [book];
+        const updated: BookRecord = {
+          ...book,
+          downloadPath: null,
+          downloadStatus: 'none',
+          fileSize: book.remoteFileSize ?? null,
+          downloadedBytes: null,
+          downloadedPages: null,
+          downloadOutdated: false,
+        };
+        if (updated.remoteAvailable === false && !hasBrowserLocalData(state, updated)) {
+          for (const prefix of READER_PREFERENCE_PREFIXES) {
+            delete state.preferences[`${prefix}${updated.id}`];
+          }
+          return [];
+        }
+        return [{ ...updated, hasLocalData: hasBrowserLocalData(state, updated) }];
+      });
     });
     return;
   }
   const db = await openDatabase();
-  await executeNativeRun(
-    db,
-    `UPDATE books SET
-      download_path=NULL,
-      download_status='none',
-      file_size=remote_file_size,
-      downloaded_bytes=NULL,
-      downloaded_pages=NULL
-    WHERE id=?`,
-    [bookId],
-  );
+  await enqueueNativeWrite(async () => {
+    const effectiveId = await resolveNativeRemappedBookId(db, bookId);
+    await db.executeTransaction([
+      {
+        statement: `UPDATE books SET
+          download_path=NULL,
+          download_status='none',
+          file_size=remote_file_size,
+          downloaded_bytes=NULL,
+          downloaded_pages=NULL
+        WHERE id=?`,
+        values: [effectiveId],
+      },
+      {
+        statement: `DELETE FROM preferences WHERE key IN (
+          'readerBookmarks:' || ?,
+          'readerAnnotations:' || ?,
+          'readerHistory:' || ?
+        ) AND EXISTS (
+          SELECT 1 FROM books WHERE id=? AND remote_available=0 AND NOT ${retainedBookCondition}
+        )`,
+        values: [effectiveId, effectiveId, effectiveId, effectiveId],
+      },
+      {
+        statement: `DELETE FROM books WHERE id=? AND remote_available=0 AND NOT ${retainedBookCondition}`,
+        values: [effectiveId],
+      },
+    ]);
+  });
 }
 
 export async function getPreferences(keys: readonly string[]): Promise<Map<string, string>> {

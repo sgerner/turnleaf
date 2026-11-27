@@ -10,6 +10,108 @@ export interface StoredReaderLocation {
 export const MAX_BOOKMARKS = 100;
 const MAX_HISTORY = 12;
 
+export const READER_PREFERENCE_PREFIXES = [
+  'readerBookmarks:',
+  'readerAnnotations:',
+  'readerHistory:',
+] as const;
+
+export type ReaderPreferencePrefix = (typeof READER_PREFERENCE_PREFIXES)[number];
+
+export function hasNonEmptyReaderPreferenceValue(value: string | undefined | null): boolean {
+  return typeof value === 'string' && value.trim() !== '' && value.trim() !== '[]';
+}
+
+function parseJsonArray(raw: string): unknown[] | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function mergeReaderPreferenceValue(
+  prefix: ReaderPreferencePrefix,
+  oldRaw: string | undefined,
+  newRaw: string | undefined,
+): string | undefined {
+  if (oldRaw === undefined) return newRaw;
+  if (newRaw === undefined) return oldRaw;
+  if (!hasNonEmptyReaderPreferenceValue(oldRaw)) return newRaw;
+  if (!hasNonEmptyReaderPreferenceValue(newRaw)) return oldRaw;
+  const oldParsed = parseJsonArray(oldRaw);
+  const newParsed = parseJsonArray(newRaw);
+  if (!oldParsed && !newParsed) return newRaw;
+  if (!oldParsed) return newRaw;
+  if (!newParsed) return oldRaw;
+
+  if (prefix === 'readerAnnotations:') {
+    const merged = new Map<string, Record<string, unknown>>();
+    const keyOf = (entry: unknown, index: number): string => {
+      if (!entry || typeof entry !== 'object') return `idx:${index}`;
+      const record = entry as Record<string, unknown>;
+      if (typeof record.cfi === 'string' && record.cfi.trim()) return `cfi:${record.cfi.trim()}`;
+      if (typeof record.id === 'string' && record.id) return `id:${record.id}`;
+      return `json:${JSON.stringify(record)}`;
+    };
+    oldParsed.forEach((entry, index) => {
+      if (entry && typeof entry === 'object') {
+        merged.set(keyOf(entry, index), entry as Record<string, unknown>);
+      }
+    });
+    newParsed.forEach((entry, index) => {
+      if (!entry || typeof entry !== 'object') return;
+      const next = entry as Record<string, unknown>;
+      const key = keyOf(entry, oldParsed.length + index);
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, next);
+        return;
+      }
+      const existingDate = typeof existing.createdAt === 'string' ? existing.createdAt : '';
+      const nextDate = typeof next.createdAt === 'string' ? next.createdAt : '';
+      const existingNote = typeof existing.note === 'string' ? existing.note.trim() : '';
+      const nextNote = typeof next.note === 'string' ? next.note.trim() : '';
+      if (nextDate >= existingDate || nextNote) {
+        merged.set(key, nextNote ? next : { ...next, note: existingNote || next.note });
+      }
+    });
+    return JSON.stringify([...merged.values()]);
+  }
+
+  const merged = new Map<string, Record<string, unknown>>();
+  const keyOf = (entry: unknown, index: number): string => {
+    if (!entry || typeof entry !== 'object') return `idx:${index}`;
+    const record = entry as Record<string, unknown>;
+    if (typeof record.id === 'string' && record.id) return record.id;
+    return `${String(record.cfi ?? '')}|${String(record.href ?? '')}`;
+  };
+  for (const [index, entry] of [...newParsed, ...oldParsed].entries()) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const key = keyOf(entry, index);
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, record);
+      continue;
+    }
+    const existingSaved = typeof existing.savedAt === 'string' ? existing.savedAt : '';
+    const nextSaved = typeof record.savedAt === 'string' ? record.savedAt : '';
+    if (nextSaved > existingSaved) merged.set(key, record);
+  }
+  const values = [...merged.values()];
+  if (prefix === 'readerHistory:') {
+    values.sort((a, b) => {
+      const savedA = typeof a.savedAt === 'string' ? a.savedAt : '';
+      const savedB = typeof b.savedAt === 'string' ? b.savedAt : '';
+      return savedB.localeCompare(savedA);
+    });
+    return JSON.stringify(values.slice(0, MAX_HISTORY));
+  }
+  return JSON.stringify(values);
+}
+
 function validLocation(value: unknown): value is StoredReaderLocation {
   if (!value || typeof value !== 'object') return false;
   const location = value as Partial<StoredReaderLocation>;

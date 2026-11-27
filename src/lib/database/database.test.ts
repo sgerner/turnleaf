@@ -1521,3 +1521,106 @@ it('saves normalized browser remote progress and guards against concurrent local
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
 });
+
+it('disqualifies title fallback for conflicting chapter numbers, redirects stale-ID downloads, and prunes unretained removed books on removeDownload', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  const volumeOne: BookRecord = {
+    ...existingBook,
+    id: 'primary:42:100',
+    serverId: 'primary',
+    seriesId: 42,
+    chapterId: 100,
+    title: 'Berserk',
+    author: 'Kentaro Miura',
+    series: null,
+    pages: 220,
+    pagesRead: 110,
+    downloadPath: '/books/primary-42-100.epub',
+    downloadStatus: 'available',
+    fileSize: 500_000,
+    remoteFileSize: 500_000,
+    downloadedBytes: 500_000,
+    downloadedPages: 220,
+    chapterKey: 'number:1',
+  };
+  await reconcileBooks('primary', [volumeOne]);
+  await saveLocalProgress(volumeOne, 'epubcfi(/6/6)', '/body/p[2]', 0.5);
+
+  const volumeTwo: BookRecord = {
+    ...volumeOne,
+    id: 'primary:42:101',
+    chapterId: 101,
+    pages: 240,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 520_000,
+    remoteFileSize: 520_000,
+    chapterKey: 'number:2',
+  };
+  delete volumeTwo.downloadedBytes;
+  delete volumeTwo.downloadedPages;
+
+  const conflictRemap = await reconcileBooks('primary', [volumeTwo]);
+  expect(conflictRemap.size).toBe(0);
+  const afterConflict = await getBooks('primary');
+  expect(afterConflict.map((b) => b.id).sort()).toEqual(['primary:42:100', 'primary:42:101']);
+  expect(afterConflict.find((b) => b.id === 'primary:42:101')).toMatchObject({
+    pagesRead: 0,
+    downloadPath: null,
+    hasLocalData: false,
+  });
+
+  // Reconcile volumeTwo -> primary:42:102 (matching number:2) while an in-flight download holds stale ID
+  const remapped = await reconcileBooks('primary', [
+    {
+      ...volumeTwo,
+      id: 'primary:42:102',
+      chapterId: 102,
+      pages: 260,
+      fileSize: 560_000,
+      remoteFileSize: 560_000,
+    },
+  ]);
+  expect(remapped).toEqual(new Map([['primary:42:101', 'primary:42:102']]));
+
+  await markDownloaded('primary:42:101', '/books/primary-42-101.epub', 520_000, {
+    downloadedBytes: 520_000,
+    downloadedPages: 240,
+  });
+  expect((await getBooks('primary')).find((b) => b.id === 'primary:42:102')).toMatchObject({
+    downloadPath: '/books/primary-42-101.epub',
+    downloadStatus: 'available',
+    downloadedBytes: 520_000,
+    downloadedPages: 240,
+    downloadOutdated: true,
+  });
+
+  // Seed a vanished book retained solely by its offline download; removeDownload must prune it
+  const vanishedDownloadOnly: BookRecord = {
+    ...existingBook,
+    id: 'primary:99:900',
+    serverId: 'primary',
+    seriesId: 99,
+    chapterId: 900,
+    title: 'Download Only Vanished',
+    downloadPath: '/books/vanished.epub',
+    downloadStatus: 'available',
+    fileSize: 100_000,
+    remoteFileSize: 100_000,
+    downloadedBytes: 100_000,
+    downloadedPages: 100,
+  };
+  await reconcileBooks('primary', [vanishedDownloadOnly]);
+  await reconcileBooks('primary', []);
+  expect((await getBooks('primary')).some((b) => b.id === 'primary:99:900')).toBe(true);
+
+  await removeDownload('primary:99:900');
+  expect((await getBooks('primary')).some((b) => b.id === 'primary:99:900')).toBe(false);
+});
