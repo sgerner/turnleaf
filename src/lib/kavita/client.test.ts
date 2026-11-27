@@ -48,8 +48,9 @@ it('builds download URLs without putting the api key in the query string', () =>
 it('loads covers with the api key header', async () => {
   const client = new KavitaClient('https://books.example.com', 'abc123');
 
-  await client.getCover(4);
+  const cover = await client.getCover(4);
 
+  expect(cover).toBeInstanceOf(Blob);
   expect(fetch).toHaveBeenCalledWith(
     'https://books.example.com/api/Image/series-cover?seriesId=4',
     expect.objectContaining({
@@ -59,6 +60,16 @@ it('loads covers with the api key header', async () => {
       }),
     }),
   );
+});
+
+it('does not duplicate cover loading on native platforms where covers stream via FileTransfer', async () => {
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('https://books.example.com', 'abc123');
+
+  await expect(client.getCover(4)).rejects.toThrow('cacheCover');
+  expect(CapacitorHttp.get).not.toHaveBeenCalled();
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+  expect(fetch).not.toHaveBeenCalled();
 });
 
 it('requests the Kavita series list with POST and an EPUB format filter', async () => {
@@ -166,6 +177,23 @@ it('rejects cross-origin redirects before sending the auth key to the new origin
   await expect(
     new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
   ).rejects.toThrow('Kavita redirected to a different server');
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it('rejects HTTPS-to-HTTP downgrade redirects before sending the auth key over HTTP', async () => {
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 307,
+    type: 'basic',
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === 'location' ? 'http://books.example.com/api/Series/v2' : null,
+    },
+  } as unknown as Response);
+
+  await expect(
+    new KavitaClient('https://books.example.com', 'abc123').getBookSeries(),
+  ).rejects.toThrow('redirected from HTTPS to insecure HTTP');
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
@@ -816,4 +844,46 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
   await expect(new KavitaClient('http://books.example', 'key').getBookSeries()).rejects.toThrow(
     'repeated series page',
   );
+});
+
+it('invokes beforeDispatch before API requests, covers, and native redirect hops', async () => {
+  let online = false;
+  const browserClient = new KavitaClient('http://books.example', 'key', {
+    beforeDispatch: async () => {
+      if (!online) throw new Error('Offline before dispatch');
+    },
+  });
+  await expect(browserClient.getCover(1)).rejects.toThrow('Offline before dispatch');
+  expect(fetch).not.toHaveBeenCalled();
+
+  capacitorRuntime.native = true;
+  const client = new KavitaClient('http://books.example', 'key', {
+    beforeDispatch: async () => {
+      if (!online) throw new Error('Offline before dispatch');
+    },
+  });
+
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'Kavita could not be reached. Check the address and network.',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  online = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    online = false;
+    return {
+      status: 307,
+      headers: {
+        location: 'http://books.example/redirected/api/Series/v2?PageNumber=1&PageSize=500',
+      },
+      url: 'http://books.example/api/Series/v2?PageNumber=1&PageSize=500',
+      data: '',
+    };
+  });
+
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
 });

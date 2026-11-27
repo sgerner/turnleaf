@@ -9,26 +9,40 @@ import type { KavitaProgress } from '../kavita/types';
 
 const flushing = new Map<string, Promise<void>>();
 
-export function flushProgress(client: KavitaClient, serverId: string): Promise<void> {
+export interface FlushProgressOptions {
+  canContinue?: (() => Promise<boolean> | boolean) | undefined;
+}
+
+export function flushProgress(
+  client: KavitaClient,
+  serverId: string,
+  options?: FlushProgressOptions,
+): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId).finally(() => {
+  const current = run(client, serverId, options).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
   return current;
 }
 
-async function run(client: KavitaClient, serverId: string): Promise<void> {
+async function run(
+  client: KavitaClient,
+  serverId: string,
+  options?: FlushProgressOptions,
+): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
   while (true) {
+    if (options?.canContinue && !(await options.canContinue())) break;
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
     if (pending.length === 0) break;
     for (const item of pending) {
+      if (options?.canContinue && !(await options.canContinue())) break;
       attempted.set(item.bookId, item);
       try {
         await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);

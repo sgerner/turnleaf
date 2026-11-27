@@ -295,7 +295,7 @@ describe('Reader.svelte stale bookmark and highlight recovery (real epubjs + mar
       Boolean(relocated[relocated.length - 1]?.href.includes('chapter-3-renamed.xhtml')),
     );
 
-    // Reopen Bookmarks panel and click the unresolvable bookmark -> shows clear status message without fatal alert
+    // Reopen Bookmarks panel and click the unresolvable bookmark -> shows dismissible runtime alertdialog without fatal startup screen
     await waitForCondition(() =>
       Boolean(host.querySelector('button[aria-controls="reader-bookmarks"]')),
     );
@@ -309,10 +309,18 @@ describe('Reader.svelte stale bookmark and highlight recovery (real epubjs + mar
     thirdBmButton!.click();
 
     await waitForCondition(() => {
-      const panelText = host.querySelector('#reader-bookmarks')?.textContent ?? '';
-      return panelText.includes('no longer available in the current EPUB');
+      const dialogText = host.querySelector('[role="alertdialog"]')?.textContent ?? '';
+      return dialogText.includes('no longer available in the current EPUB');
     });
-    // Reader did not enter fatal error screen
-    expect(host.querySelector('[role="alert"]')).toBeNull();
+    const errorDialog = host.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(errorDialog).not.toBeNull();
+    expect(errorDialog!.textContent).not.toContain('Unable to open book');
+    const dismissButton = [...errorDialog!.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Dismiss',
+    );
+    expect(dismissButton).toBeDefined();
+    dismissButton!.click();
+    await waitForCondition(() => host.querySelector('[role="alertdialog"]') === null);
+    expect(host.querySelector('#reader-bookmarks')).not.toBeNull();
   });
 });

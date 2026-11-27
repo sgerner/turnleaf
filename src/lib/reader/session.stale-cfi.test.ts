@@ -452,4 +452,141 @@ describe('ReaderSession stale CFI and highlight recovery (real epubjs + marks-pa
     });
     expect(missingJump).toEqual({ status: 'missing' });
   });
+
+  it('refuses to overwrite persisted CFIs when duplicate excerpts are ambiguous in a chapter or across chapters', async () => {
+    books.set(
+      'ambiguous-excerpts.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: [
+            '<p data-page="0">First occurrence of a recurring refrain in chapter one.</p>',
+            '<p data-page="1">Second occurrence of a recurring refrain in chapter one.</p>',
+            '<p data-page="1">Shared phrase across chapters without unique context.</p>',
+          ].join('\n'),
+        },
+        {
+          id: 'ch2',
+          href: 'chapter-2.xhtml',
+          title: 'Chapter Two',
+          body: '<p data-page="0">Shared phrase across chapters without unique context.</p>',
+        },
+      ]),
+    );
+
+    const resolutions: ReaderHighlightResolution[] = [];
+    const viewport = createViewport();
+    const session = trackSession(`${baseUrl}/ambiguous-excerpts.epub`);
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      () => {},
+      () => {},
+      undefined,
+      undefined,
+      (resolution) => resolutions.push(resolution),
+    );
+    await flushEpubLocationReport();
+
+    // 1. Same-chapter duplicate excerpt without prefix/suffix must NOT guess the first match or repair CFI
+    // 2. Removed chapter (chapter-9.xhtml) highlight must NOT passively render or repair onto Chapter 1
+    session.updateHighlights([
+      {
+        id: 'ambiguous-same-chapter',
+        cfi: 'epubcfi(/6/2!/4/99,/1:0,/1:17)',
+        excerpt: 'recurring refrain',
+        href: 'chapter-1.xhtml',
+      },
+      {
+        id: 'removed-chapter-hl',
+        cfi: 'epubcfi(/6/18!/4/2,/1:0,/1:52)',
+        excerpt: 'Shared phrase across chapters without unique context.',
+        href: 'chapter-9.xhtml',
+      },
+    ]);
+
+    expect(resolutions.flatMap((entry) => entry.repaired)).toHaveLength(0);
+    expect(resolutions.flatMap((entry) => entry.missingIds)).toContain('ambiguous-same-chapter');
+    expect(resolutions.flatMap((entry) => entry.missingIds)).not.toContain('removed-chapter-hl');
+    expect(viewport.querySelectorAll('svg g.turnleaf-highlight rect')).toHaveLength(0);
+
+    // Explicit navigation to an ambiguous cross-chapter excerpt without disambiguating context must refuse to overwrite CFI
+    const ambiguousCrossChapter = await session.displayAnnotation({
+      id: 'removed-chapter-hl',
+      cfi: 'epubcfi(/6/18!/4/2,/1:0,/1:52)',
+      excerpt: 'Shared phrase across chapters without unique context.',
+      href: 'chapter-9.xhtml',
+    });
+    expect(ambiguousCrossChapter).toEqual({ status: 'missing' });
+  });
+
+  it('renders and navigates 500-character-truncated excerpts without shrinking the stored CFI', async () => {
+    const longSelection = Array.from(
+      { length: 12 },
+      (_, index) =>
+        `Sentence ${index + 1} of the long highlighted passage with distinctive phrasing.`,
+    ).join(' ');
+    expect(longSelection.length).toBeGreaterThan(600);
+    const truncatedExcerpt = longSelection.slice(0, 500);
+
+    books.set(
+      'truncated-excerpt.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: [
+            '<p data-page="0">Added preface paragraph shifting original paths.</p>',
+            `<p data-page="1">${longSelection}</p>`,
+          ].join('\n'),
+        },
+      ]),
+    );
+
+    const resolutions: ReaderHighlightResolution[] = [];
+    const viewport = createViewport();
+    const session = trackSession(`${baseUrl}/truncated-excerpt.epub`);
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      () => {},
+      () => {},
+      undefined,
+      undefined,
+      (resolution) => resolutions.push(resolution),
+    );
+    await flushEpubLocationReport();
+
+    const originalFullSelectionCfi = 'epubcfi(/6/2!/4/2,/1:0,/1:680)';
+    session.updateHighlights([
+      {
+        id: 'truncated-hl',
+        cfi: originalFullSelectionCfi,
+        excerpt: truncatedExcerpt,
+        href: 'chapter-1.xhtml',
+      },
+    ]);
+
+    // Renders highlight rectangles for the surviving prefix without overwriting the stored full-selection CFI
+    expect(viewport.querySelectorAll('svg g.turnleaf-highlight rect').length).toBeGreaterThan(0);
+    expect(resolutions.flatMap((entry) => entry.repaired)).toHaveLength(0);
+    expect(resolutions.flatMap((entry) => entry.missingIds)).not.toContain('truncated-hl');
+
+    const jumpResult = await session.displayAnnotation({
+      id: 'truncated-hl',
+      cfi: originalFullSelectionCfi,
+      excerpt: truncatedExcerpt,
+      href: 'chapter-1.xhtml',
+    });
+    expect(jumpResult.status).toBe('displayed');
+  });
 });

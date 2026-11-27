@@ -491,6 +491,7 @@ export async function sanitizeEpubDocument(
 }
 
 const SELECTION_CONTEXT_CHARS = 64;
+const MAX_STORED_EXCERPT_LENGTH = 500;
 const IGNORED_TEXT_CONTAINERS = new Set(['head', 'noscript', 'script', 'style', 'title']);
 const BLOCK_ELEMENTS = new Set([
   'address',
@@ -813,7 +814,14 @@ function recordRangeInTextMap(
   }
 }
 
-export function findExcerptRangeInDocument(
+interface ExcerptMatchResult {
+  range: Range;
+  score: number;
+  candidateCount: number;
+  unambiguous: boolean;
+}
+
+function findExcerptMatchInDocument(
   doc: Document,
   excerpt: string,
   options?: {
@@ -821,8 +829,9 @@ export function findExcerptRangeInDocument(
     suffix?: string | undefined;
     textMap?: DocumentTextMap | undefined;
     claimedSpans?: ClaimedTextSpan[] | undefined;
+    requireUnambiguous?: boolean | undefined;
   },
-): Range | null {
+): ExcerptMatchResult | null {
   const query = normalizeWhitespace(excerpt);
   if (!query) return null;
   const map = options?.textMap ?? buildDocumentTextMap(doc);
@@ -855,8 +864,22 @@ export function findExcerptRangeInDocument(
   const claimed = options?.claimedSpans ?? [];
 
   let chosen = candidates[0]!;
-  if (candidates.length > 1) {
-    let bestScore = -1;
+  let bestScore: number;
+  let tiedBestCount = 1;
+
+  if (candidates.length === 1) {
+    const before = prefix
+      ? map.text.slice(Math.max(0, chosen.start - prefix.length - 8), chosen.start).trimEnd()
+      : '';
+    const after = suffix
+      ? map.text
+          .slice(chosen.end, Math.min(map.text.length, chosen.end + suffix.length + 8))
+          .trimStart()
+      : '';
+    bestScore = scoreContextAffix(before, prefix, true) + scoreContextAffix(after, suffix, false);
+  } else {
+    bestScore = -1;
+    tiedBestCount = 0;
     let bestUnclaimed = false;
     for (const candidate of candidates) {
       const before = prefix
@@ -874,12 +897,24 @@ export function findExcerptRangeInDocument(
       const isUnclaimed = !claimed.some(
         (span) => candidate.start < span.end && candidate.end > span.start,
       );
-      if (score > bestScore || (score === bestScore && isUnclaimed && !bestUnclaimed)) {
+      if (score > bestScore) {
         bestScore = score;
+        tiedBestCount = 1;
         bestUnclaimed = isUnclaimed;
         chosen = candidate;
+      } else if (score === bestScore) {
+        tiedBestCount += 1;
+        if (isUnclaimed && !bestUnclaimed) {
+          bestUnclaimed = isUnclaimed;
+          chosen = candidate;
+        }
       }
     }
+  }
+
+  const unambiguous = candidates.length === 1 || (bestScore > 0 && tiedBestCount === 1);
+  if (options?.requireUnambiguous && !unambiguous) {
+    return null;
   }
 
   const startPos = map.starts[chosen.start];
@@ -891,10 +926,24 @@ export function findExcerptRangeInDocument(
     range.setEnd(endPos.node, endPos.offset);
     if (range.collapsed) return null;
     options?.claimedSpans?.push(chosen);
-    return range;
+    return { range, score: Math.max(0, bestScore), candidateCount: candidates.length, unambiguous };
   } catch {
     return null;
   }
+}
+
+export function findExcerptRangeInDocument(
+  doc: Document,
+  excerpt: string,
+  options?: {
+    prefix?: string | undefined;
+    suffix?: string | undefined;
+    textMap?: DocumentTextMap | undefined;
+    claimedSpans?: ClaimedTextSpan[] | undefined;
+    requireUnambiguous?: boolean | undefined;
+  },
+): Range | null {
+  return findExcerptMatchInDocument(doc, excerpt, options)?.range ?? null;
 }
 
 function extractSelectionContext(
@@ -1323,7 +1372,9 @@ export class ReaderSession {
       if (outcome) {
         try {
           await this.navigate(() => this.awaitRenditionDisplay(outcome.cfi));
-          this.recordRepairedHighlight(annotation.id, outcome.cfi, primarySection.href);
+          if (outcome.repaired) {
+            this.recordRepairedHighlight(annotation.id, outcome.cfi, primarySection.href);
+          }
           return {
             status: outcome.repaired ? 'repaired' : 'displayed',
             cfi: outcome.cfi,
@@ -1337,32 +1388,85 @@ export class ReaderSession {
 
     if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
       const { sections } = this.getSpine();
+      const crossChapterCandidates: Array<{
+        section: SpineSection;
+        cfi: string;
+        score: number;
+        candidateCount: number;
+        unambiguousInSection: boolean;
+        unloadAfterFailure: () => void;
+      }> = [];
+      let totalOccurrences = 0;
+
       for (const section of sections) {
         if (primarySection && section.index === primarySection.index) continue;
         const loaded = await this.loadSectionDocument(section);
         if (!loaded) continue;
-        const matchedRange = findExcerptRangeInDocument(loaded.document, annotation.excerpt, {
+        const matched = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
           prefix: annotation.prefix,
           suffix: annotation.suffix,
         });
-        if (!matchedRange || !loaded.cfiBase) {
+        if (!matched || !loaded.cfiBase) {
           loaded.unloadAfterFailure();
           continue;
         }
-        let freshCfi: string;
+        totalOccurrences += matched.candidateCount;
         try {
-          freshCfi = new CfiClass(matchedRange, loaded.cfiBase).toString();
+          const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
+          crossChapterCandidates.push({
+            section,
+            cfi: freshCfi,
+            score: matched.score,
+            candidateCount: matched.candidateCount,
+            unambiguousInSection: matched.unambiguous,
+            unloadAfterFailure: loaded.unloadAfterFailure,
+          });
         } catch {
           loaded.unloadAfterFailure();
-          continue;
         }
-        try {
-          await this.navigate(() => this.awaitRenditionDisplay(freshCfi));
-          this.recordRepairedHighlight(annotation.id, freshCfi, section.href);
-          return { status: 'repaired', cfi: freshCfi, href: section.href };
-        } catch {
-          loaded.unloadAfterFailure();
-          return { status: 'missing' };
+      }
+
+      if (crossChapterCandidates.length > 0) {
+        let winner = crossChapterCandidates[0]!;
+        let bestScore = winner.score;
+        let tiedBestCount = 1;
+        for (let index = 1; index < crossChapterCandidates.length; index += 1) {
+          const candidate = crossChapterCandidates[index]!;
+          if (candidate.score > bestScore) {
+            bestScore = candidate.score;
+            tiedBestCount = 1;
+            winner = candidate;
+          } else if (candidate.score === bestScore) {
+            tiedBestCount += 1;
+          }
+        }
+
+        const globallyUnambiguous =
+          totalOccurrences === 1 ||
+          (bestScore > 0 && tiedBestCount === 1 && winner.unambiguousInSection);
+
+        for (const candidate of crossChapterCandidates) {
+          if (candidate !== winner || !globallyUnambiguous) {
+            candidate.unloadAfterFailure();
+          }
+        }
+
+        if (globallyUnambiguous) {
+          const canPersistRepair = annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
+          try {
+            await this.navigate(() => this.awaitRenditionDisplay(winner.cfi));
+            if (canPersistRepair) {
+              this.recordRepairedHighlight(annotation.id, winner.cfi, winner.section.href);
+            }
+            return {
+              status: canPersistRepair ? 'repaired' : 'displayed',
+              cfi: winner.cfi,
+              href: winner.section.href,
+            };
+          } catch {
+            winner.unloadAfterFailure();
+            return { status: 'missing' };
+          }
         }
       }
     }
@@ -2624,14 +2728,17 @@ export class ReaderSession {
       return { cfi: direct.cfi, repaired: direct.repaired };
     }
     if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
-      const matched = findExcerptRangeInDocument(loaded.document, annotation.excerpt, {
+      const matched = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
         prefix: annotation.prefix,
         suffix: annotation.suffix,
+        requireUnambiguous: true,
       });
       if (matched && loaded.cfiBase) {
         try {
-          const freshCfi = new CfiClass(matched, loaded.cfiBase).toString();
-          return { cfi: freshCfi, repaired: freshCfi !== annotation.cfi };
+          const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
+          const canPersistRepair =
+            freshCfi !== annotation.cfi && annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
+          return { cfi: freshCfi, repaired: canPersistRepair };
         } catch {
           // Fall through and unload temporary section.
         }
@@ -2712,17 +2819,18 @@ export class ReaderSession {
   ): { matches: boolean; authoritative: boolean } {
     if (annotation.href) {
       const byHref = this.findSpineSectionByHref(annotation.href);
-      if (byHref) {
-        const same = byHref.index === viewIndex || normalizeSpineHref(viewHref) === byHref.href;
-        return { matches: same, authoritative: same };
+      if (!byHref) {
+        return { matches: false, authoritative: false };
       }
+      const same = byHref.index === viewIndex || normalizeSpineHref(viewHref) === byHref.href;
+      return { matches: same, authoritative: same };
     }
     if (!parsed) {
-      return { matches: Boolean(annotation.excerpt), authoritative: false };
+      return { matches: false, authoritative: false };
     }
     const targetSection = this.resolveSpineSectionForCfi(parsed);
     if (!targetSection) {
-      return { matches: Boolean(annotation.excerpt), authoritative: false };
+      return { matches: false, authoritative: false };
     }
     const same = targetSection.index === viewIndex;
     return { matches: same, authoritative: same };
@@ -2843,18 +2951,21 @@ export class ReaderSession {
         }
 
         if (!resolvedCfi && annotation.excerpt && typeof contents.cfiFromRange === 'function') {
-          const matchedRange = findExcerptRangeInDocument(contents.document, annotation.excerpt, {
+          const matched = findExcerptMatchInDocument(contents.document, annotation.excerpt, {
             prefix: annotation.prefix,
             suffix: annotation.suffix,
             textMap: getTextMap(),
             claimedSpans,
+            requireUnambiguous: true,
           });
-          if (matchedRange) {
+          if (matched) {
             try {
-              const freshCfi = contents.cfiFromRange(matchedRange);
+              const freshCfi = contents.cfiFromRange(matched.range);
               if (this.isRangeUsableOnView(view, freshCfi)) {
                 resolvedCfi = freshCfi;
-                wasRepaired = freshCfi !== annotation.cfi || annotation.href !== viewHref;
+                wasRepaired =
+                  annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH &&
+                  (freshCfi !== annotation.cfi || annotation.href !== viewHref);
               }
             } catch {
               resolvedCfi = null;
