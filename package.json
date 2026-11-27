@@ -31,6 +31,7 @@
     "android:smoke": "node scripts/android-smoke.mjs",
     "android:journey": "node scripts/android-reading-journey.mjs",
     "android:release": "node scripts/android-build.mjs release",
+    "android:verify-release": "node scripts/verify-release-apk.mjs",
     "ios:sync": "node scripts/ios-sync.mjs",
     "ios:check": "node scripts/ios-sync.mjs --check",
     "ios:simulator": "node scripts/ios-simulator-build.mjs",
