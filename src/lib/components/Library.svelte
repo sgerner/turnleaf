@@ -736,6 +736,7 @@
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
+          const wasOffline = offline;
           offline = !connected;
           if (!connected) {
             refreshController?.abort();
@@ -748,7 +749,7 @@
             : displayableBooks.length
               ? 'No network connection. Showing your saved library.'
               : 'No network connection. Connect to Kavita to load your library.';
-          if (connected) void syncAndRefresh().catch(() => {});
+          if (connected && wasOffline) void syncAndRefresh().catch(() => {});
         }),
       ),
     );
