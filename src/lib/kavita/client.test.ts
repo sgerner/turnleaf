@@ -79,7 +79,7 @@ it('loads covers with the api key header', async () => {
   );
 });
 
-it('does not duplicate cover loading on native platforms where covers stream via FileTransfer', async () => {
+it('does not duplicate cover loading on native platforms where covers stream via PrivateTransfer', async () => {
   capacitorRuntime.native = true;
   const client = new KavitaClient('https://books.example.com', 'abc123');
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Stream EPUB downloads and cover caches directly into app-private storage without external storage permissions and export Markdown notes via system file and share sheets.
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

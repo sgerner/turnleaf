@@ -29,9 +29,13 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
     display: vi.fn(async () => {}),
+    next: vi.fn(async () => {}),
+    prev: vi.fn(async () => {}),
     getContents: vi.fn((): unknown[] => []),
     resize: vi.fn(),
     destroy: vi.fn(),
+    q: undefined as { enqueue: <T>(task: () => T | Promise<T>) => Promise<T> } | undefined,
+    manager: undefined as { stage?: unknown } | undefined,
   };
   const spine = {
     sections: [...defaultSpineSections],
@@ -85,6 +89,8 @@ describe('ReaderSession', () => {
     mockBook.navigation.toc = [];
     mockBook.spine.sections = [...defaultSpineSections];
     mockRendition.location = undefined;
+    mockRendition.q = undefined;
+    mockRendition.manager = undefined;
   });
 
   afterEach(() => vi.unstubAllGlobals());
@@ -1061,6 +1067,113 @@ describe('ReaderSession', () => {
       },
     });
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
+    session.destroy();
+  });
+
+  it('preserves active text selection across initial restore relocation and clears it on CFI changes', async () => {
+    const onSelection = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+      onSelection,
+    );
+    const relocated = getRenditionListener('relocated');
+
+    relocated(location('epubcfi(/6/2!/4/2/1:0)'));
+    expect(onSelection).not.toHaveBeenCalledWith(null);
+
+    relocated(location('epubcfi(/6/2!/4/2/1:0)'));
+    expect(onSelection).not.toHaveBeenCalledWith(null);
+
+    relocated(location('epubcfi(/6/4!/4/2/1:0)'));
+    expect(onSelection).toHaveBeenCalledWith(null);
+    session.destroy();
+  });
+
+  it('re-displays when resized before initial location settles and serializes overlapping resizes with navigation', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    let queueTail = Promise.resolve();
+    mockRendition.q = {
+      enqueue: <T>(task: () => T | Promise<T>): Promise<T> => {
+        const run = queueTail.then(task, task);
+        queueTail = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return run;
+      },
+    };
+    mockRendition.manager = { stage: {} };
+
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 412, 867));
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      viewport,
+      'epubcfi(/6/2!/4/2/1:0)',
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+    const relocated = getRenditionListener('relocated');
+    mockRendition.display.mockClear();
+
+    // Resize before rendition.location is populated re-displays the restored target.
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 891 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    await vi.waitFor(() => {
+      expect(mockRendition.resize).toHaveBeenCalledWith(412, 891, 'epubcfi(/6/2!/4/2/1:0)');
+      expect(mockRendition.display).toHaveBeenCalledWith('epubcfi(/6/2!/4/2/1:0)');
+    });
+
+    mockRendition.location = { start: { cfi: 'epubcfi(/6/2!/4/2/1:0)' } };
+    relocated(location('epubcfi(/6/2!/4/2/1:0)'));
+
+    mockRendition.next.mockImplementationOnce(async () => {
+      mockRendition.location = { start: { cfi: 'epubcfi(/6/4!/4/2/1:0)' } };
+      relocated(location('epubcfi(/6/4!/4/2/1:0)'));
+    });
+
+    // Trigger resize -> next() -> second resize concurrently (API 36 NoteExport + Next page pattern).
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 900 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    const nextPromise = session.next();
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    await nextPromise;
+    await vi.waitFor(() => {
+      expect(mockRendition.next).toHaveBeenCalledOnce();
+      expect(mockRendition.resize).toHaveBeenCalledWith(
+        412,
+        915,
+        expect.stringMatching(/^epubcfi\(/),
+      );
+    });
     session.destroy();
   });
 });

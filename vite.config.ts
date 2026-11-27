@@ -75,7 +75,7 @@ export default defineConfig({
     __APP_VERSION__: JSON.stringify(appVersion),
   },
   build: {
-    target: 'es2022',
+    target: ['chrome74', 'safari15'],
     sourcemap: false,
   },
 });

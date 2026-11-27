@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
   import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { tick, onDestroy, onMount } from 'svelte';
@@ -8,6 +7,7 @@
   import { Animation, StatusBar } from '@capacitor/status-bar';
   import { getPreferences, setPreferences } from '../database/database';
   import { KeepAwake } from '../native/keep-awake';
+  import { exportAnnotationsMarkdown, type AnnotationExportMode } from '../native/note-export';
   import { ReaderChrome } from '../native/reader-chrome';
   import { VolumeButtons } from '../native/volume-buttons';
   import { createReaderNativeFeatures } from '../native/reader-native-features';
@@ -245,7 +245,8 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
-        if (location?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
+        if (location !== null && location.cfi !== next.cfi && !hasSelectionDraft())
+          selectedText = null;
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
         updateDocumentTitle();
@@ -1071,40 +1072,16 @@
     }
   }
 
-  async function exportAnnotations(copy = false): Promise<void> {
+  async function exportAnnotations(mode: AnnotationExportMode = 'save'): Promise<void> {
     if (!annotations.length || exporting) return;
     exportMessage = '';
-    exportFallback = '';
+    if (mode === 'copy') exportFallback = '';
     exporting = true;
     const markdown = annotationsMarkdown(title, annotations);
-    const name = title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'book';
     try {
-      if (copy) {
-        await navigator.clipboard.writeText(markdown);
-        exportMessage = 'Markdown copied.';
-      } else if (Capacitor.isNativePlatform()) {
-        const filename = `${name}-notes-${Date.now()}.md`;
-        await Filesystem.writeFile({
-          path: filename,
-          data: markdown,
-          directory: Directory.Documents,
-          encoding: Encoding.UTF8,
-        });
-        exportMessage = `Saved to Documents as ${filename}.`;
-      } else {
-        const blob = new Blob([markdown], { type: 'text/markdown' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${name}-notes.md`;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      }
-    } catch {
-      exportFallback = markdown;
-      exportMessage = 'Copy the Markdown from the field below.';
+      const outcome = await exportAnnotationsMarkdown(title, markdown, mode);
+      exportMessage = outcome.message;
+      exportFallback = outcome.fallback;
     } finally {
       exporting = false;
     }
@@ -2367,15 +2344,25 @@
             <button
               class="btn btn-sm preset-tonal-surface"
               type="button"
-              onclick={() => void exportAnnotations()}
+              onclick={() => void exportAnnotations('save')}
               disabled={annotations.length === 0 || exporting}
             >
               Export Markdown
             </button>
+            {#if Capacitor.isNativePlatform()}
+              <button
+                class="btn btn-sm preset-tonal-surface"
+                type="button"
+                onclick={() => void exportAnnotations('share')}
+                disabled={annotations.length === 0 || exporting}
+              >
+                Share Markdown
+              </button>
+            {/if}
             <button
               class="btn btn-sm preset-tonal-surface"
               type="button"
-              onclick={() => void exportAnnotations(true)}
+              onclick={() => void exportAnnotations('copy')}
               disabled={annotations.length === 0 || exporting}
             >
               Copy Markdown
@@ -2612,23 +2599,22 @@
     color: var(--reader-text);
     touch-action: pan-y;
     user-select: none;
-    --reader-background: var(--color-surface-50);
-    --reader-text: var(--color-surface-950);
+    --reader-background: var(--color-surface-50, #fafafa);
+    --reader-text: var(--color-surface-950, #18181b);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 34%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 28%, transparent);
-    --reader-bar-text: var(--color-surface-950);
-    --reader-safe-top: max(0.5rem, env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
-    --reader-safe-bottom: max(
-      1rem,
-      env(safe-area-inset-bottom, 0px),
-      var(--safe-area-inset-bottom, 0px)
-    );
+    --reader-bar-text: var(--color-surface-950, #18181b);
+    --reader-safe-top: 0.5rem;
+    --reader-safe-bottom: 1rem;
     --reader-progress-height: 0.25rem;
   }
 
   .reader-viewport {
     position: absolute;
-    inset: var(--reader-safe-top) 0 var(--reader-safe-bottom) 0;
+    top: var(--reader-safe-top);
+    right: 0;
+    bottom: var(--reader-safe-bottom);
+    left: 0;
     overflow: hidden;
     width: 100%;
     height: auto;
@@ -2652,11 +2638,11 @@
   }
 
   .reader-shell[data-mode='dark'] {
-    --reader-background: var(--color-surface-950);
-    --reader-text: var(--color-surface-50);
+    --reader-background: var(--color-surface-950, #18181b);
+    --reader-text: var(--color-surface-50, #fafafa);
     --reader-overlay-top: color-mix(in oklab, var(--reader-text) 38%, transparent);
     --reader-overlay-bottom: color-mix(in oklab, var(--reader-text) 32%, transparent);
-    --reader-bar-text: var(--color-surface-50);
+    --reader-bar-text: var(--color-surface-50, #fafafa);
   }
 
   .reader-overlay {
@@ -2687,7 +2673,7 @@
     top: 0;
     left: 0;
     right: 0;
-    height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    height: 4rem;
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2699,7 +2685,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    height: 2.5rem;
     border: 0;
     background: transparent;
     -webkit-tap-highlight-color: transparent;
@@ -2738,7 +2724,8 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    padding-inline: max(1rem, env(safe-area-inset-left));
+    padding-left: 1rem;
+    padding-right: 1rem;
     color: var(--reader-bar-text);
   }
 
@@ -2831,7 +2818,7 @@
   }
 
   .reader-bottom {
-    bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    bottom: calc(var(--reader-progress-height) + 1.5rem);
     justify-content: space-between;
     padding-bottom: 0;
   }
@@ -2861,8 +2848,8 @@
 
   .reader-progress-reveal {
     position: absolute;
-    right: max(1rem, env(safe-area-inset-right));
-    bottom: max(0.25rem, env(safe-area-inset-bottom));
+    right: 1rem;
+    bottom: 0.25rem;
     z-index: 19;
     min-width: 3rem;
     min-height: 2.75rem;
@@ -2873,13 +2860,60 @@
     position: absolute;
     left: 1rem;
     right: 1rem;
-    bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    bottom: 4rem;
     margin-inline: auto;
     max-width: 30rem;
-    max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    max-height: 75vh;
     overflow: auto;
     padding: 1.25rem;
     z-index: 1;
+  }
+
+  @supports (top: max(1px, 2px)) {
+    .reader-shell {
+      --reader-safe-top: max(
+        0.5rem,
+        env(safe-area-inset-top, 0px),
+        var(--safe-area-inset-top, 0px)
+      );
+      --reader-safe-bottom: max(
+        1rem,
+        env(safe-area-inset-bottom, 0px),
+        var(--safe-area-inset-bottom, 0px)
+      );
+    }
+
+    .reader-top-reveal {
+      height: max(4rem, calc(env(safe-area-inset-top) + 3rem));
+    }
+
+    .reader-bottom-reveal {
+      height: max(2.5rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+    }
+
+    .reader-bar {
+      padding-left: max(1rem, env(safe-area-inset-left));
+      padding-right: max(1rem, env(safe-area-inset-right));
+    }
+
+    .reader-bottom {
+      bottom: calc(var(--reader-progress-height) + max(1.5rem, env(safe-area-inset-bottom) + 1rem));
+    }
+
+    .reader-progress-reveal {
+      right: max(1rem, env(safe-area-inset-right));
+      bottom: max(0.25rem, env(safe-area-inset-bottom));
+    }
+
+    .reader-settings {
+      bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
+    }
+  }
+
+  @supports (max-height: min(75dvh, 100dvh)) {
+    .reader-settings {
+      max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
+    }
   }
 
   .reader-panel-backdrop {

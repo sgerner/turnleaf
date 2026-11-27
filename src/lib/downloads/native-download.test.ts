@@ -1,12 +1,28 @@
 // @vitest-environment node
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  ALLOWED_ANDROID_PERMISSIONS,
+  assertMergedManifestPermissions,
+  extractManifestPermissions,
+  mergedManifestPath,
+} from '../../../scripts/check-android-manifest.mjs';
 
 const native = vi.hoisted(() => ({
   body: new Uint8Array(),
   deleted: [] as string[],
   renamed: false,
+  connected: true,
+  progressListener: null as
+    | ((event: {
+        transferId?: string;
+        url?: string;
+        bytes: number;
+        contentLength: number;
+        lengthComputable: boolean;
+      }) => void)
+    | null,
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -16,9 +32,11 @@ vi.mock('@capacitor/core', () => ({
   },
 }));
 
-vi.mock('@capacitor/file-transfer', () => ({
-  FileTransfer: {
+vi.mock('../native/private-transfer', () => ({
+  PRIVATE_TRANSFER_CONNECTION_FAILED: 'PRIVATE_TRANSFER_CONNECTION_FAILED',
+  PrivateTransfer: {
     downloadFile: vi.fn(),
+    abortTransfer: vi.fn(),
     addListener: vi.fn(),
   },
 }));
@@ -30,14 +48,27 @@ vi.mock('@capacitor/filesystem', () => ({
     mkdir: vi.fn(),
     getUri: vi.fn(),
     readFile: vi.fn(),
+    writeFile: vi.fn(),
     rename: vi.fn(),
     deleteFile: vi.fn(),
+    readdir: vi.fn(),
+    rmdir: vi.fn(),
   },
 }));
 
-import { FileTransfer } from '@capacitor/file-transfer';
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    })),
+  },
+}));
+
 import { Filesystem } from '@capacitor/filesystem';
+import { Network } from '@capacitor/network';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import { PRIVATE_TRANSFER_CONNECTION_FAILED, PrivateTransfer } from '../native/private-transfer';
 import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
@@ -46,16 +77,30 @@ function encoded(bytes: Uint8Array): string {
 
 beforeEach(() => {
   clearDiagnostics();
+  Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, value: true });
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
-  vi.mocked(FileTransfer.downloadFile)
+  native.connected = true;
+  native.progressListener = null;
+  vi.mocked(Network.getStatus)
     .mockReset()
-    .mockResolvedValue({} as never);
-  vi.mocked(FileTransfer.addListener)
+    .mockImplementation(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    }));
+  vi.mocked(PrivateTransfer.downloadFile)
     .mockReset()
-    .mockResolvedValue({ remove: vi.fn(async () => {}) });
+    .mockResolvedValue({ status: 200, bytesWritten: 64 });
+  vi.mocked(PrivateTransfer.abortTransfer).mockReset().mockResolvedValue(undefined);
+  vi.mocked(PrivateTransfer.addListener)
+    .mockReset()
+    .mockImplementation(async (_event, listener) => {
+      native.progressListener = listener;
+      return { remove: vi.fn(async () => {}) };
+    });
   vi.mocked(Filesystem.mkdir).mockReset().mockResolvedValue(undefined);
+  vi.mocked(Filesystem.readdir).mockReset().mockResolvedValue({ files: [] });
   vi.mocked(Filesystem.rename)
     .mockReset()
     .mockImplementation(async () => {
@@ -94,32 +139,36 @@ afterEach(() => vi.useRealTimers());
 
 describe('native EPUB download boundary', () => {
   it.each([
-    { code: 'OS-PLUG-FLTR-0008' },
+    { reject: { code: PRIVATE_TRANSFER_CONNECTION_FAILED }, expectedStatus: undefined },
     {
-      code: 'OS-PLUG-FLTR-0010',
-      data: { httpStatus: 503, body: 'private book title', source: 'https://private.example' },
+      resolve: { status: 503, bytesWritten: 0 },
+      expectedStatus: 503,
     },
-  ])('retries a transient transfer failure and validates the replacement', async (error) => {
+  ])('retries a transient transfer failure and validates the replacement', async (scenario) => {
     vi.useFakeTimers();
-    vi.mocked(FileTransfer.downloadFile)
-      .mockRejectedValueOnce(error)
-      .mockImplementationOnce(async () => {
-        expect(native.deleted).toEqual(['books/server-book.epub.partial']);
-        native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
-        return {};
-      });
+    if ('reject' in scenario && scenario.reject) {
+      vi.mocked(PrivateTransfer.downloadFile).mockRejectedValueOnce(scenario.reject);
+    } else if ('resolve' in scenario && scenario.resolve) {
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce(scenario.resolve);
+    }
+    vi.mocked(PrivateTransfer.downloadFile).mockImplementationOnce(async () => {
+      expect(native.deleted).toEqual(['books/server-book.epub.partial']);
+      const epubBytes = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+      native.body = epubBytes;
+      return { status: 200, bytesWritten: epubBytes.length };
+    });
 
     const result = expect(
       downloadEpub('https://private.example/download', 'secret', 'server-book'),
     ).resolves.toMatchObject({ relativePath: 'books/server-book.epub' });
     await Promise.all([result, vi.runAllTimersAsync()]);
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(2);
     expect(native.renamed).toBe(true);
     const log = exportDiagnostics({ appVersion: 'test', platform: 'android' });
     expect(log).toContain('endpoint=/api/Download/chapter');
     expect(log).toContain('detail=download-retry');
-    if (error.data) expect(log).toContain('status=503');
+    if (scenario.expectedStatus) expect(log).toContain(`status=${scenario.expectedStatus}`);
     expect(log).not.toMatch(/private|secret|server-book/);
   });
 
@@ -128,16 +177,16 @@ describe('native EPUB download boundary', () => {
     { status: 503, attempts: 2 },
   ])('stops after $attempts attempt(s) on HTTP $status', async ({ status, attempts }) => {
     vi.useFakeTimers();
-    vi.mocked(FileTransfer.downloadFile).mockRejectedValue({
-      code: 'OS-PLUG-FLTR-0010',
-      data: { httpStatus: status },
+    vi.mocked(PrivateTransfer.downloadFile).mockResolvedValue({
+      status,
+      bytesWritten: 0,
     });
     const result = expect(
       downloadEpub('https://books.example.com/download', 'secret', 'server-book'),
     ).rejects.toMatchObject({ status });
     await Promise.all([result, vi.runAllTimersAsync()]);
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(attempts);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(attempts);
     expect(native.deleted).toHaveLength(attempts);
     expect(native.renamed).toBe(false);
   });
@@ -149,7 +198,7 @@ describe('native EPUB download boundary', () => {
 
     expect(native.renamed).toBe(false);
     expect(native.deleted).toContain('books/server-book.epub.partial');
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
   });
 
   it('does not inspect or delete a path outside the private books directory', async () => {
@@ -193,19 +242,10 @@ describe('native EPUB download boundary', () => {
     expect(native.deleted).toEqual(['books/book.epub']);
   });
 
-  it('disables automatic redirects, follows up to five same-origin 3xx hops, and tracks active hop progress', async () => {
-    let progressHandler:
-      | ((event: {
-          type: 'download' | 'upload';
-          url: string;
-          bytes: number;
-          contentLength: number;
-          lengthComputable: boolean;
-        }) => void)
-      | undefined;
+  it('follows up to five same-origin 3xx hops and tracks active hop progress by transferId', async () => {
     const removeListener = vi.fn(async () => {});
-    vi.mocked(FileTransfer.addListener).mockImplementationOnce(async (_event, callback) => {
-      progressHandler = callback;
+    vi.mocked(PrivateTransfer.addListener).mockImplementationOnce(async (_event, callback) => {
+      native.progressListener = callback;
       return { remove: removeListener };
     });
 
@@ -217,28 +257,29 @@ describe('native EPUB download boundary', () => {
       '/kavita/download/final?chapterId=42',
     ];
     for (const location of hops) {
-      vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
-        code: 'OS-PLUG-FLTR-0010',
-        data: { httpStatus: 302, headers: { Location: location } },
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+        status: 302,
+        location,
+        bytesWritten: 0,
       });
     }
-    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async ({ url }) => {
-      progressHandler?.({
-        type: 'download',
-        url: 'https://books.example.com/api/Download/chapter?chapterId=42',
+    vi.mocked(PrivateTransfer.downloadFile).mockImplementationOnce(async ({ transferId }) => {
+      const staleHopId = vi.mocked(PrivateTransfer.downloadFile).mock.calls[0]?.[0].transferId;
+      native.progressListener?.({
+        ...(staleHopId ? { transferId: staleHopId } : {}),
         bytes: 10,
         contentLength: 100,
         lengthComputable: true,
       });
-      progressHandler?.({
-        type: 'download',
-        url,
+      native.progressListener?.({
+        ...(transferId ? { transferId } : {}),
         bytes: 64,
         contentLength: 100,
         lengthComputable: true,
       });
-      native.body = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
-      return {};
+      const epubBytes = readFileSync('dev/kavita/data/Books/lorem-ipsum.epub');
+      native.body = epubBytes;
+      return { status: 200, bytesWritten: epubBytes.length };
     });
 
     const progressUpdates: number[] = [];
@@ -252,14 +293,14 @@ describe('native EPUB download boundary', () => {
       ),
     ).resolves.toMatchObject({ relativePath: 'books/server-book.epub' });
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(6);
-    for (const [options] of vi.mocked(FileTransfer.downloadFile).mock.calls) {
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(6);
+    for (const [options] of vi.mocked(PrivateTransfer.downloadFile).mock.calls) {
       expect(options).toMatchObject({
-        disableRedirects: true,
+        relativePath: 'books/server-book.epub.partial',
         headers: { 'x-api-key': 'secret' },
       });
     }
-    expect(vi.mocked(FileTransfer.downloadFile).mock.calls[5]?.[0].url).toBe(
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[5]?.[0].url).toBe(
       'https://books.example.com/kavita/download/final?chapterId=42',
     );
     expect(progressUpdates).toEqual([64]);
@@ -268,9 +309,10 @@ describe('native EPUB download boundary', () => {
 
   it('rejects more than five same-origin redirect hops during EPUB download', async () => {
     for (let step = 1; step <= 6; step += 1) {
-      vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
-        code: 'OS-PLUG-FLTR-0010',
-        data: { httpStatus: 302, headers: { location: `/download/step-${step}` } },
+      vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+        status: 302,
+        location: `/download/step-${step}`,
+        bytesWritten: 0,
       });
     }
 
@@ -284,7 +326,7 @@ describe('native EPUB download boundary', () => {
       ),
     ).rejects.toThrow('redirected too many times');
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(6);
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(6);
     expect(native.renamed).toBe(false);
     expect(native.deleted).toContain('books/server-book.epub.partial');
   });
@@ -295,6 +337,13 @@ describe('native EPUB download boundary', () => {
       initialUrl: 'https://books.example.com/download',
       serverOrigin: 'https://books.example.com',
       redirects: ['/download/hop', '/download'],
+      expectedMessage: 'redirected in a loop',
+    },
+    {
+      label: 'fragment-only redirect loop',
+      initialUrl: 'https://books.example.com/download#start',
+      serverOrigin: 'https://books.example.com',
+      redirects: ['/download#again'],
       expectedMessage: 'redirected in a loop',
     },
     {
@@ -329,9 +378,10 @@ describe('native EPUB download boundary', () => {
     'rejects $label in EPUB transfer before sending credentials to the unsafe target',
     async ({ initialUrl, serverOrigin, redirects, expectedMessage }) => {
       for (const location of redirects) {
-        vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
-          code: 'OS-PLUG-FLTR-0010',
-          data: { httpStatus: 307, headers: { Location: location } },
+        vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+          status: 307,
+          location,
+          bytesWritten: 0,
         });
       }
 
@@ -339,9 +389,9 @@ describe('native EPUB download boundary', () => {
         downloadEpub(initialUrl, 'secret', 'server-book', undefined, serverOrigin),
       ).rejects.toThrow(expectedMessage);
 
-      expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
-      for (const [options] of vi.mocked(FileTransfer.downloadFile).mock.calls) {
-        expect(options.disableRedirects).toBe(true);
+      expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
+      for (const [options] of vi.mocked(PrivateTransfer.downloadFile).mock.calls) {
+        expect(options.relativePath).toBe('books/server-book.epub.partial');
         expect(new URL(options.url).origin).toBe(serverOrigin);
       }
       expect(native.renamed).toBe(false);
@@ -360,7 +410,7 @@ describe('native EPUB download boundary', () => {
       ),
     ).rejects.toThrow('redirected to a different server');
 
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
   });
 });
 
@@ -375,10 +425,71 @@ describe('native cover cache', () => {
       directory: 'DATA',
     });
     expect(Filesystem.mkdir).not.toHaveBeenCalled();
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
   });
 
-  it('follows validated same-origin 3xx cover redirects with disableRedirects enabled', async () => {
+  it('streams a missing cover into app-private storage and renames atomically', async () => {
+    vi.mocked(Filesystem.stat)
+      .mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' })
+      .mockRejectedValueOnce({ code: 'OS-PLUG-FILE-0008' })
+      .mockResolvedValueOnce({
+        type: 'file',
+        size: 128,
+        name: 'covers/server_1/7.img.partial',
+        mtime: 0,
+        uri: 'file://covers/server_1/7.img.partial',
+      });
+
+    await expect(
+      cacheCover('https://books.example.com/cover', 'secret', 7, undefined, 'server:1'),
+    ).resolves.toBe('web://file://covers/server_1/7.img');
+
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        url: 'https://books.example.com/cover',
+        relativePath: 'covers/server_1/7.img.partial',
+        headers: { 'x-api-key': 'secret' },
+        connectTimeout: 5_000,
+        readTimeout: 5_000,
+        transferId: expect.stringMatching(/^transfer-\d+-hop-0$/),
+      }),
+    );
+    expect(Filesystem.rename).toHaveBeenCalledExactlyOnceWith({
+      from: 'covers/server_1/7.img.partial',
+      to: 'covers/server_1/7.img',
+      directory: 'DATA',
+    });
+  });
+
+  it('aborts an in-flight native cover stream and deletes the partial file when AbortSignal fires', async () => {
+    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
+    const controller = new AbortController();
+    let capturedTransferId: string | undefined;
+    vi.mocked(PrivateTransfer.downloadFile).mockImplementationOnce(
+      ({ transferId }) =>
+        new Promise((_resolve, reject) => {
+          capturedTransferId = transferId;
+          controller.signal.addEventListener(
+            'abort',
+            () => reject({ code: PRIVATE_TRANSFER_CONNECTION_FAILED }),
+            { once: true },
+          );
+          controller.abort();
+        }),
+    );
+
+    await expect(
+      cacheCover('https://books.example.com/cover', 'secret', 7, controller.signal),
+    ).rejects.toMatchObject({ code: PRIVATE_TRANSFER_CONNECTION_FAILED });
+
+    expect(capturedTransferId).toBeDefined();
+    expect(PrivateTransfer.abortTransfer).toHaveBeenCalledExactlyOnceWith({
+      transferId: capturedTransferId,
+    });
+    expect(native.deleted).toContain('covers/default/7.img.partial');
+  });
+
+  it('follows validated same-origin 3xx cover redirects into app-private storage', async () => {
     let downloaded = false;
     vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
       if (path === 'covers/server-1') throw new Error('missing directory');
@@ -391,17 +502,15 @@ describe('native cover cache', () => {
         uri: `file://${path}`,
       };
     });
-    vi.mocked(FileTransfer.downloadFile)
-      .mockRejectedValueOnce({
-        code: 'OS-PLUG-FLTR-0010',
-        data: {
-          httpStatus: 302,
-          headers: { Location: '/kavita/api/Image/series-cover?seriesId=7' },
-        },
+    vi.mocked(PrivateTransfer.downloadFile)
+      .mockResolvedValueOnce({
+        status: 302,
+        location: '/kavita/api/Image/series-cover?seriesId=7',
+        bytesWritten: 0,
       })
       .mockImplementationOnce(async () => {
         downloaded = true;
-        return {};
+        return { status: 200, bytesWritten: 68 };
       });
 
     await expect(
@@ -416,15 +525,15 @@ describe('native cover cache', () => {
       ),
     ).resolves.toBe('web://file://covers/server-1/7.img');
 
-    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(FileTransfer.downloadFile).mock.calls[0]?.[0]).toMatchObject({
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[0]?.[0]).toMatchObject({
       url: 'https://books.example.com/api/Image/series-cover?seriesId=7',
-      disableRedirects: true,
+      relativePath: 'covers/server-1/7.img.partial',
       headers: { 'x-api-key': 'secret' },
     });
-    expect(vi.mocked(FileTransfer.downloadFile).mock.calls[1]?.[0]).toMatchObject({
+    expect(vi.mocked(PrivateTransfer.downloadFile).mock.calls[1]?.[0]).toMatchObject({
       url: 'https://books.example.com/kavita/api/Image/series-cover?seriesId=7',
-      disableRedirects: true,
+      relativePath: 'covers/server-1/7.img.partial',
       headers: { 'x-api-key': 'secret' },
     });
     expect(native.renamed).toBe(true);
@@ -462,9 +571,10 @@ describe('native cover cache', () => {
         };
       });
       for (const location of redirects) {
-        vi.mocked(FileTransfer.downloadFile).mockRejectedValueOnce({
-          code: 'OS-PLUG-FLTR-0010',
-          data: { httpStatus: 302, headers: { location } },
+        vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+          status: 302,
+          location,
+          bytesWritten: 0,
         });
       }
 
@@ -480,13 +590,150 @@ describe('native cover cache', () => {
         ),
       ).rejects.toThrow(expectedMessage);
 
-      expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
-      for (const [options] of vi.mocked(FileTransfer.downloadFile).mock.calls) {
-        expect(options.disableRedirects).toBe(true);
+      expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(redirects.length);
+      for (const [options] of vi.mocked(PrivateTransfer.downloadFile).mock.calls) {
+        expect(options.relativePath).toBe('covers/server-1/7.img.partial');
         expect(new URL(options.url).origin).toBe('https://books.example.com');
       }
       expect(native.renamed).toBe(false);
       expect(native.deleted).toContain('covers/server-1/7.img.partial');
     },
   );
+
+  it('blocks native EPUB and cover transfers when the transport or WebView is offline', async () => {
+    vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+      if (path === 'books' || path === 'covers/server-1' || path === 'covers/server-1/7.img') {
+        throw new Error('missing');
+      }
+      return {
+        type: 'file',
+        size: native.body.length,
+        name: path,
+        mtime: 0,
+        uri: `file://${path}`,
+      };
+    });
+    vi.mocked(Network.getStatus).mockResolvedValueOnce({
+      connected: false,
+      connectionType: 'none',
+    });
+    await expect(
+      downloadEpub('https://books.example.com/book.epub', 'secret', 'book-1', undefined),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached while offline.',
+    });
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
+
+    Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, value: false });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+      ),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached while offline.',
+    });
+    expect(PrivateTransfer.downloadFile).not.toHaveBeenCalled();
+
+    Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, value: true });
+    vi.mocked(Network.getStatus)
+      .mockResolvedValueOnce({ connected: true, connectionType: 'wifi' })
+      .mockResolvedValueOnce({ connected: false, connectionType: 'none' });
+    vi.mocked(PrivateTransfer.downloadFile).mockResolvedValueOnce({
+      status: 302,
+      location: 'https://books.example.com/cover-v2',
+    });
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'secret',
+        7,
+        undefined,
+        'server-1',
+        true,
+        'https://books.example.com',
+      ),
+    ).rejects.toMatchObject({
+      kind: 'network',
+      message: 'Kavita could not be reached while offline.',
+    });
+    expect(PrivateTransfer.downloadFile).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Android manifest and storage permission bounds', () => {
+  it('omits @capacitor/file-transfer and preserves SDK 24-36 and unexported cache FileProvider bounds', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    expect(packageJson.dependencies).not.toHaveProperty('@capacitor/file-transfer');
+    expect(packageJson.devDependencies).not.toHaveProperty('@capacitor/file-transfer');
+
+    const variablesGradle = readFileSync('android/variables.gradle', 'utf8');
+    expect(variablesGradle).toMatch(/\bminSdkVersion\s*=\s*24\b/);
+    expect(variablesGradle).toMatch(/\btargetSdkVersion\s*=\s*36\b/);
+
+    const filePathsXml = readFileSync('android/app/src/main/res/xml/file_paths.xml', 'utf8');
+    expect(filePathsXml).toContain('<cache-path name="shared_cache" path="shared/" />');
+    expect(filePathsXml).not.toMatch(
+      /external-path|external-files-path|external-cache-path|root-path/,
+    );
+
+    const sourceManifest = readFileSync('android/app/src/main/AndroidManifest.xml', 'utf8');
+    expect(extractManifestPermissions(sourceManifest)).toEqual(['android.permission.INTERNET']);
+    expect(sourceManifest).toContain('android:name="androidx.core.content.FileProvider"');
+    expect(sourceManifest).toContain('android:exported="false"');
+  });
+
+  it('enforces that merged Android manifests declare only INTERNET and ACCESS_NETWORK_STATE', () => {
+    const validMergedManifest = `<?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="app.turnleaf.reader">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <uses-permission android:name="app.turnleaf.reader.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+      </manifest>`;
+    expect(assertMergedManifestPermissions(validMergedManifest)).toEqual(
+      ALLOWED_ANDROID_PERMISSIONS,
+    );
+
+    const legacyStorageManifest = `<?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="app.turnleaf.reader">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+      </manifest>`;
+    expect(() => assertMergedManifestPermissions(legacyStorageManifest)).toThrow(
+      /READ_EXTERNAL_STORAGE/,
+    );
+
+    const unexpectedPermissionManifest = `<?xml version="1.0" encoding="utf-8"?>
+      <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          package="app.turnleaf.reader">
+        <uses-permission android:name="android.permission.INTERNET" />
+        <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+      </manifest>`;
+    expect(() => assertMergedManifestPermissions(unexpectedPermissionManifest)).toThrow(
+      /USE_BIOMETRIC/,
+    );
+
+    for (const variant of ['debug', 'release'] as const) {
+      const path = mergedManifestPath(variant);
+      if (existsSync(path)) {
+        expect(assertMergedManifestPermissions(readFileSync(path, 'utf8'), variant)).toEqual(
+          ALLOWED_ANDROID_PERMISSIONS,
+        );
+      }
+    }
+  });
 });

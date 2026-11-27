@@ -14,6 +14,7 @@ import { main as smoke } from './android-smoke.mjs';
 const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 const title = 'Turnleaf CI EPUB';
 const key = 'turnleaf-ci-only';
+const uiDumpRemotePath = '/data/local/tmp/turnleaf-ui.xml';
 const coverPng = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
   'base64',
@@ -43,6 +44,111 @@ async function waitFor(label, check) {
     await delay(250);
   } while (Date.now() < end);
   throw new Error(`Timed out waiting for ${label}.`, { cause: lastError });
+}
+
+async function isAppResumed() {
+  const activities = await adb('shell', 'dumpsys', 'activity', 'activities');
+  return activities
+    .split('\n')
+    .some(
+      (line) =>
+        /(?:topResumedActivity|mResumedActivity)/.test(line) && line.includes(`${packageName}/`),
+    );
+}
+
+export function parseUiNodes(xml) {
+  const nodes = [];
+  const nodePattern = /<node\b([^>]*?)\/?>/g;
+  for (const match of xml.matchAll(nodePattern)) {
+    const attrs = match[1] ?? '';
+    const readAttr = (name) => new RegExp(`\\b${name}="([^"]*)"`).exec(attrs)?.[1] ?? '';
+    const boundsMatch = /^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/.exec(readAttr('bounds'));
+    if (!boundsMatch) continue;
+    const x1 = Number(boundsMatch[1]);
+    const y1 = Number(boundsMatch[2]);
+    const x2 = Number(boundsMatch[3]);
+    const y2 = Number(boundsMatch[4]);
+    if (x2 <= x1 || y2 <= y1) continue;
+    nodes.push({
+      resourceId: readAttr('resource-id'),
+      text: readAttr('text'),
+      contentDesc: readAttr('content-desc'),
+      enabled: readAttr('enabled') !== 'false',
+      centerX: Math.round((x1 + x2) / 2),
+      centerY: Math.round((y1 + y2) / 2),
+    });
+  }
+  return nodes;
+}
+
+async function tapNode(node) {
+  await adb('shell', 'input', 'tap', String(node.centerX), String(node.centerY));
+}
+
+export async function waitBrieflyForAppResume(
+  checkResumed = isAppResumed,
+  { attempts = 8, intervalMs = 250 } = {},
+) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await delay(intervalMs);
+    if (await checkResumed()) return true;
+  }
+  return false;
+}
+
+export async function cancelSystemExportSheet({
+  checkResumed = isAppResumed,
+  sendBack = () => adb('shell', 'input', 'keyevent', 'KEYCODE_BACK'),
+  settleAttempts = 8,
+  settleIntervalMs = 250,
+} = {}) {
+  await waitFor('system export sheet to open', async () => !(await checkResumed()));
+  await waitFor('system export sheet cancellation', async () => {
+    if (await checkResumed()) return true;
+    await sendBack();
+    return waitBrieflyForAppResume(checkResumed, {
+      attempts: settleAttempts,
+      intervalMs: settleIntervalMs,
+    });
+  });
+}
+
+export async function completeSystemExportSheet({
+  checkResumed = isAppResumed,
+  readUiXml = async () => {
+    await adb('shell', 'uiautomator', 'dump', uiDumpRemotePath);
+    return adb('shell', 'cat', uiDumpRemotePath);
+  },
+  tap = tapNode,
+  settleAttempts = 8,
+  settleIntervalMs = 250,
+} = {}) {
+  await waitFor('system export sheet to open', async () => !(await checkResumed()));
+  await waitFor('system export completion', async () => {
+    if (await checkResumed()) return true;
+    const xml = await readUiXml();
+    const nodes = parseUiNodes(xml).filter((node) => node.enabled);
+    const saveButton = nodes.find(
+      (node) => node.resourceId === 'android:id/button1' || /^save$/i.test(node.text.trim()),
+    );
+    if (saveButton) {
+      await tap(saveButton);
+      return waitBrieflyForAppResume(checkResumed, {
+        attempts: settleAttempts,
+        intervalMs: settleIntervalMs,
+      });
+    }
+    const downloadsRoot = nodes.find((node) => /^downloads?$/i.test(node.text.trim()));
+    if (downloadsRoot) {
+      await tap(downloadsRoot);
+      return false;
+    }
+    const showRoots = nodes.find((node) => /show roots/i.test(node.contentDesc));
+    if (showRoots) {
+      await tap(showRoots);
+    }
+    return false;
+  });
 }
 
 async function connectWebView() {
@@ -205,6 +311,10 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
   const titleName = title;
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
+  foreignServer.keepAliveTimeout = 60_000;
+  foreignServer.headersTimeout = 65_000;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
@@ -238,29 +348,110 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     close() {
       server.close();
       foreignServer.close();
+      server.closeAllConnections?.();
+      foreignServer.closeAllConnections?.();
     },
   };
 }
 
-const click = (selector) => `(() => {
-  const button = document.querySelector(${JSON.stringify(selector)});
-  if (!button || button.disabled) return false;
-  button.click();
-  return true;
-})()`;
+// Expressions passed to WebView Runtime.evaluate run untranspiled inside Android's
+// system WebView (Chrome 74 / V8 7.4 on API 29), so they must stay ES2019-compatible
+// (no optional chaining `?.`, nullish coalescing `??`, or logical assignment).
+export const journeyExpressions = {
+  hasOnboardingUrlInput: () => "!!document.querySelector('input[type=url]')",
+  fillOnboardingCredentials: (origin, authKey) => `(() => {
+    const fill = (selector, value) => {
+      const input = document.querySelector(selector);
+      input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    fill('input[type=url]', ${JSON.stringify(origin)});
+    fill('#kavita-auth-key', ${JSON.stringify(authKey)});
+  })()`,
+  click: (selector) => `(() => {
+    const button = document.querySelector(${JSON.stringify(selector)});
+    if (!button || button.disabled || (button.closest && button.closest('[inert]'))) return false;
+    button.click();
+    return true;
+  })()`,
+  clickByText: (containerSelector, label) => `(() => {
+    const root = document.querySelector(${JSON.stringify(containerSelector)});
+    if (!root) return false;
+    const button = Array.from(root.querySelectorAll('button')).find(
+      item =>
+        !item.disabled &&
+        !(item.closest && item.closest('[inert]')) &&
+        item.textContent.trim() === ${JSON.stringify(label)}
+    );
+    if (!button) return false;
+    button.click();
+    return true;
+  })()`,
+  hasCachedCoverImage: () =>
+    "Array.from(document.querySelectorAll('img')).some(img => img.src.includes('_capacitor_file_') && img.complete && img.naturalWidth > 0)",
+  hasCatalogBookCard: () => "Boolean(document.querySelector('[data-book-open]'))",
+  renderedCover: () => `(() => {
+    const trigger = document.querySelector('[data-book-open]');
+    const parent = trigger && trigger.parentElement;
+    const image = parent && parent.querySelector('img');
+    return Boolean(image && image.complete && image.naturalWidth > 0);
+  })()`,
+  retryDownloadReady: () => `Array.from(document.querySelectorAll('button')).some(
+    button =>
+      !button.disabled &&
+      !(button.closest && button.closest('[inert]')) &&
+      button.textContent &&
+      button.textContent.trim() === 'Retry download'
+  )`,
+  chapter: (number) => `Array.from(document.querySelectorAll('iframe')).some(frame => {
+    const doc = frame.contentDocument;
+    const heading = doc && doc.querySelector('h1');
+    return Boolean(heading && heading.textContent === 'Chapter ${number}');
+  })`,
+  selectChapterHeading: (number) => `(() => {
+    const frame = Array.from(document.querySelectorAll('iframe')).find(item => {
+      const doc = item.contentDocument;
+      const heading = doc && doc.querySelector('h1');
+      return Boolean(heading && heading.textContent === 'Chapter ${number}');
+    });
+    const doc = frame && frame.contentDocument;
+    const heading = doc && doc.querySelector('h1');
+    if (!frame || !doc || !heading || !frame.contentWindow) return false;
+    const range = doc.createRange();
+    range.selectNodeContents(heading);
+    const selection = frame.contentWindow.getSelection();
+    if (!selection) return false;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    doc.dispatchEvent(new Event('selectionchange'));
+    return true;
+  })()`,
+  hasMarkdownCopyFallback: (bookTitle) => `(() => {
+    const field = document.querySelector('#reader-annotations textarea[readonly]');
+    return Boolean(
+      field && field.value && field.value.includes(${JSON.stringify(`# Notes for ${bookTitle}`)})
+    );
+  })()`,
+  hasSavedNoteExportConfirmation: () => `(() => {
+    const statuses = Array.from(document.querySelectorAll('#reader-annotations [role="status"]'));
+    return Boolean(
+      statuses.some(status => status.textContent && status.textContent.includes('Saved notes as')) &&
+        !document.querySelector('#reader-annotations textarea[readonly]')
+    );
+  })()`,
+  isNetworkConnected: () =>
+    'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
+  hasReaderProgressAtLeast: (minimumPercent) => `(() => {
+    const bar = document.querySelector('.reader-progress');
+    return Boolean(bar && Number(bar.getAttribute('aria-valuenow')) >= ${Number(minimumPercent)});
+  })()`,
+  hasDownloadedBookProgress: (bookTitle, percent) =>
+    `Boolean(document.querySelector(${JSON.stringify(`[aria-label="Open ${bookTitle}, downloaded for offline reading, ${percent}% complete"]`)}))`,
+};
 
-const chapter = (number) => `Array.from(document.querySelectorAll('iframe')).some(
-  frame => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter ${number}'
-)`;
-
-const renderedCover = `(() => {
-  const image = document.querySelector('[data-book-open]')?.parentElement?.querySelector('img');
-  return Boolean(image && image.complete && image.naturalWidth > 0);
-})()`;
-
-const retryDownloadReady = `Array.from(document.querySelectorAll('button')).some(
-  button => !button.disabled && button.textContent?.trim() === 'Retry download'
-)`;
+const { click, clickByText, chapter } = journeyExpressions;
+const renderedCover = journeyExpressions.renderedCover();
+const retryDownloadReady = journeyExpressions.retryDownloadReady();
 
 let receivedSignal;
 
@@ -311,23 +502,20 @@ async function run() {
       serial: deviceSerial,
     });
     throwIfInterrupted();
+
+    const packageInfo = await adb('shell', 'dumpsys', 'package', packageName);
+    if (/android\.permission\.(?:READ|WRITE|MANAGE)_EXTERNAL_STORAGE/.test(packageInfo)) {
+      throw new Error(`${packageName} declared forbidden external storage permissions.`);
+    }
+
     web = await connectWebView();
-    await waitFor('onboarding', () => web.evaluate("!!document.querySelector('input[type=url]')"));
-    await web.evaluate(`(() => {
-      const fill = (selector, value) => {
-        const input = document.querySelector(selector);
-        input.value = value;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-      };
-      fill('input[type=url]', 'http://127.0.0.1:${fixture.port}');
-      fill('#kavita-auth-key', ${JSON.stringify(key)});
-    })()`);
+    await waitFor('onboarding', () => web.evaluate(journeyExpressions.hasOnboardingUrlInput()));
+    await web.evaluate(
+      journeyExpressions.fillOnboardingCredentials(`http://127.0.0.1:${fixture.port}`, key),
+    );
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
     await web.evaluate(click('button[type=submit]'));
-
-    await waitFor('catalog book card', () =>
-      web.evaluate("Boolean(document.querySelector('[data-book-open]'))"),
-    );
+    await waitFor('catalog book card', () => web.evaluate(journeyExpressions.hasCatalogBookCard()));
     await waitFor('blocked cross-origin cover redirect', () => fixture.coverRedirects >= 1);
     await waitFor('attempt redirected EPUB download', () =>
       web.evaluate(click('[data-book-open]')),
@@ -345,29 +533,62 @@ async function run() {
     await waitFor('refresh library for online cover', () =>
       web.evaluate(click('[aria-label="Refresh library"]')),
     );
-    await waitFor('rendered online cover', () => web.evaluate(renderedCover));
+    await waitFor(
+      'rendered online cached cover',
+      async () =>
+        (await web.evaluate(renderedCover)) &&
+        (await web.evaluate(journeyExpressions.hasCachedCoverImage())),
+    );
     if (fixture.covers !== 1) throw new Error('Expected one cached cover transfer.');
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
+    await waitFor('selected passage in first chapter', () =>
+      web.evaluate(journeyExpressions.selectChapterHeading(1)),
+    );
+    await waitFor('add-note action', () =>
+      web.evaluate(clickByText('[aria-label="Selected text"]', 'Add note')),
+    );
+    await waitFor('save highlight button', () =>
+      web.evaluate(click('#reader-annotations button[type="submit"]')),
+    );
+    await waitFor('export markdown trigger (cancel check)', () =>
+      web.evaluate(clickByText('#reader-annotations', 'Export Markdown')),
+    );
+    await cancelSystemExportSheet();
+    await waitFor('markdown copy fallback after cancel', () =>
+      web.evaluate(journeyExpressions.hasMarkdownCopyFallback(title)),
+    );
+
+    await waitFor('export markdown trigger (save check)', () =>
+      web.evaluate(clickByText('#reader-annotations', 'Export Markdown')),
+    );
+    await completeSystemExportSheet();
+    await waitFor('saved note export confirmation', () =>
+      web.evaluate(journeyExpressions.hasSavedNoteExportConfirmation()),
+    );
+    await waitFor('close highlights and notes panel', () =>
+      web.evaluate(click('[aria-label="Close highlights and notes"]')),
+    );
+
     disabledNetwork = true;
     await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
     await waitFor('offline state', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
-      );
+      const connected = await web.evaluate(journeyExpressions.isNetworkConnected());
       return connected === false;
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
-    await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
+    await waitFor('next-page control', async () => {
+      if (await web.evaluate(click('[aria-label="Next page"]'))) return true;
+      await web.evaluate(click('[aria-label="Show reading controls"]'));
+      return false;
+    });
     await waitFor('second chapter', () => web.evaluate(chapter(2)));
     await waitFor('reader position in the second chapter', () =>
-      web.evaluate(
-        'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
-      ),
+      web.evaluate(journeyExpressions.hasReaderProgressAtLeast(50)),
     );
     await waitFor('return to library control', async () => {
       if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
@@ -375,9 +596,7 @@ async function run() {
       return false;
     });
     await waitFor('saved offline progress', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(journeyExpressions.hasDownloadedBookProgress(title, 50)),
     );
     await waitFor('rendered offline cover before restart', () => web.evaluate(renderedCover));
 
@@ -394,7 +613,12 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
-    await waitFor('rendered offline cover after restart', () => web.evaluate(renderedCover));
+    await waitFor(
+      'rendered offline cached cover after restart',
+      async () =>
+        (await web.evaluate(renderedCover)) &&
+        (await web.evaluate(journeyExpressions.hasCachedCoverImage())),
+    );
     await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
     if (fixture.offlineRequests.length > 0) {
@@ -421,9 +645,7 @@ async function run() {
       return false;
     });
     await waitFor('saved passage after reconnect', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(journeyExpressions.hasDownloadedBookProgress(title, 50)),
     );
     await waitFor('rendered cover after reconnect', () => web.evaluate(renderedCover));
     assertRedirectIsolation(fixture);
@@ -442,6 +664,9 @@ async function run() {
     }
   } finally {
     const cleanup = [];
+    if (deviceSerial) {
+      cleanup.push(['remove temporary UI dump', () => adb('shell', 'rm', '-f', uiDumpRemotePath)]);
+    }
     if (disabledNetwork) {
       cleanup.push(['restore Wi-Fi', () => adb('shell', 'svc', 'wifi', 'enable')]);
       cleanup.push(['restore mobile data', () => adb('shell', 'svc', 'data', 'enable')]);
@@ -472,7 +697,9 @@ async function run() {
     throw journeyError;
   }
   if (cleanupError) throw cleanupError;
-  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+  console.log(
+    'Android reading journey passed: connect, cache cover, download, export notes, read, restart offline, sync.',
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

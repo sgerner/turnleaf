@@ -69,7 +69,20 @@ android {
 }
 
 gradle.taskGraph.whenReady { graph ->
-    if (graph.allTasks.any { it.name.toLowerCase().contains('release') } && !releaseSigningConfigured) {
+    def requiresReleaseSigning = graph.allTasks.any { task ->
+        def name = task.name.toLowerCase()
+        task.project == project &&
+            name.contains('release') &&
+            (
+                name.startsWith('assemble') ||
+                name.startsWith('bundle') ||
+                name.startsWith('package') ||
+                name.startsWith('publish') ||
+                name.startsWith('install') ||
+                name.contains('signing')
+            )
+    }
+    if (requiresReleaseSigning && !releaseSigningConfigured) {
         throw new GradleException('Release signing is not configured. Create android/keystore.properties or set TURNLEAF_* environment variables.')
     }
 }

@@ -1,5 +1,6 @@
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mergedManifestPath, verifyMergedManifestFile } from './check-android-manifest.mjs';
 import { runCommand } from './run-command.mjs';
 import {
   detectJavaCompatibility,
@@ -63,6 +64,7 @@ export async function main(
     validateSdk = () => validateAndroidSdk(sdkCandidates({ env: environment, platform })),
     detectJava = detectJavaCompatibility,
     run = runCommand,
+    verifyManifests = run === runCommand,
     log = console.log,
     errorLog = console.error,
   } = {},
@@ -108,7 +110,23 @@ export async function main(
     let buildError;
     let stopError;
     try {
-      await run(gradle, args, { cwd: androidDirectory, env: gradleEnv });
+      const manifestTasks =
+        mode === 'lint'
+          ? ['processDebugMainManifest', 'processReleaseMainManifest']
+          : [mode === 'debug' ? 'processReleaseMainManifest' : 'processDebugMainManifest'];
+      const effectiveArgs = verifyManifests ? [args[0], ...manifestTasks, ...args.slice(1)] : args;
+      await run(gradle, effectiveArgs, { cwd: androidDirectory, env: gradleEnv });
+      if (verifyManifests) {
+        for (const variant of ['debug', 'release']) {
+          const permissions = verifyMergedManifestFile(
+            mergedManifestPath(variant, projectRoot),
+            `${variant} merged AndroidManifest.xml`,
+          );
+          log(
+            `Verified ${variant} merged AndroidManifest.xml permissions: ${permissions.join(', ')}.`,
+          );
+        }
+      }
     } catch (error) {
       buildError = error;
     } finally {
