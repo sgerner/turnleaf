@@ -1,3 +1,12 @@
+export const V8_MIGRATION_VERSION = 8;
+
+export const V8_BOOK_COLUMNS = [
+  { name: 'remote_file_size', definition: 'INTEGER' },
+  { name: 'downloaded_bytes', definition: 'INTEGER' },
+  { name: 'downloaded_pages', definition: 'INTEGER' },
+  { name: 'chapter_key', definition: 'TEXT' },
+] as const;
+
 export const migrations = [
   {
     version: 1,
@@ -103,6 +112,15 @@ export const migrations = [
       UPDATE reading_state SET sync_revision=COALESCE(
         (SELECT revision FROM sync_queue WHERE sync_queue.book_id=reading_state.book_id), 0
       );
+    `,
+  },
+  {
+    version: V8_MIGRATION_VERSION,
+    statements: `
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
     `,
   },
 ] as const;

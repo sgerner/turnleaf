@@ -361,3 +361,67 @@ it('maps EPUBs when Kavita omits optional names, covers, or file extensions', ()
     },
   ]);
 });
+
+it('derives stable chapterKey markers while keeping composite server:series:chapter IDs', () => {
+  const series = {
+    id: 42,
+    name: 'Hainish Cycle',
+    libraryId: 1,
+    format: 3,
+    pages: 20,
+    pagesRead: 0,
+    created: '2026-09-05',
+    latestReadDate: '0001-01-01T00:00:00',
+    coverImage: null,
+  } satisfies KavitaSeries;
+  const detail = {
+    chapters: [],
+    specials: [
+      {
+        id: 100,
+        title: 'Replaced Filename v1',
+        titleName: 'The Dispossessed',
+        volumeId: 420,
+        pages: 10,
+        pagesRead: 0,
+        summary: '',
+        format: 3,
+        isbn: '978-0-06-105488-4',
+        range: 'the-dispossessed-v1.epub',
+        number: '-100000',
+        isSpecial: true,
+        files: [{ id: 100, bytes: 153600, extension: '.epub', format: 3 }],
+        writers: [{ name: 'Ursula K. Le Guin' }],
+      },
+      {
+        id: 101,
+        title: 'Book 2',
+        titleName: 'Book 2',
+        volumeId: 421,
+        pages: 12,
+        pagesRead: 0,
+        summary: '',
+        format: 3,
+        number: '2',
+        range: 'Book 2',
+        files: [{ id: 101, bytes: 160000, extension: '.epub', format: 3 }],
+        writers: [{ name: 'Ursula K. Le Guin' }],
+      },
+    ],
+    volumes: [],
+    storylineChapters: [],
+  } satisfies KavitaSeriesDetail;
+
+  expect(mapSeriesToBooks('primary', series, detail)).toMatchObject([
+    {
+      id: 'primary:42:100',
+      chapterKey: 'isbn:9780061054884',
+      remoteFileSize: 153600,
+    },
+    {
+      id: 'primary:42:101',
+      chapterKey: 'number:2',
+      remoteFileSize: 160000,
+    },
+  ]);
+});

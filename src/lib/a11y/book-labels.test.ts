@@ -102,6 +102,26 @@ describe('book accessibility labels', () => {
     );
   });
 
+  it('exposes outdated download status on open and book actions labels when still available on server', () => {
+    const outdatedBook = makeBook({
+      title: 'Expanded Edition',
+      author: 'Ursula K. Le Guin',
+      series: 'Hainish Cycle',
+      downloadPath: 'books/expanded.epub',
+      downloadOutdated: true,
+      pages: 25,
+      pagesRead: 4,
+      remoteAvailable: true,
+    });
+
+    expect(openBookLabel(outdatedBook)).toBe(
+      'Open Expanded Edition, by Ursula K. Le Guin, Hainish Cycle, downloaded for offline reading, update available, 16% complete',
+    );
+    expect(bookActionsLabel(outdatedBook)).toBe(
+      'Book actions for Expanded Edition, by Ursula K. Le Guin, Hainish Cycle, update available',
+    );
+  });
+
   it('exposes indeterminate and percentage download progress states', () => {
     const book = makeBook({
       id: 'primary:7:7',

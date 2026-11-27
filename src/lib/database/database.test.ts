@@ -990,6 +990,315 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
 
+it('remaps browser lineage across chapter and series replacements and flags outdated downloads', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  const original: BookRecord = {
+    ...existingBook,
+    id: 'primary:42:100',
+    serverId: 'primary',
+    seriesId: 42,
+    chapterId: 100,
+    pages: 10,
+    pagesRead: 3,
+    fileSize: 153_600,
+    remoteFileSize: 153_600,
+    downloadedBytes: 153_600,
+    downloadedPages: 10,
+    downloadPath: 'epubs/primary-42-100.epub',
+    downloadStatus: 'available',
+    chapterKey: 'isbn:9780000000042',
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'primary' },
+      books: [original],
+      readingState: {
+        [original.id]: {
+          cfi: 'epubcfi(/6/6)',
+          xpath: '//body/DocFragment[3]/body/p[1]',
+          percentage: 0.3,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+          syncRevision: 2,
+        },
+      },
+      syncQueue: {
+        [original.id]: {
+          bookId: original.id,
+          serverId: 'primary',
+          payloadJson: JSON.stringify({
+            libraryId: 1,
+            seriesId: 42,
+            volumeId: 10,
+            chapterId: 100,
+            pageNum: 3,
+          }),
+          attemptCount: 1,
+          lastAttemptAt: updatedAt,
+          lastError: 'HTTP 404',
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 2,
+        },
+      },
+      preferences: {
+        [`readerAnnotations:${original.id}`]:
+          '[{"id":"a1","cfi":"epubcfi(/6/6)","excerpt":"quote","note":"note","createdAt":"2026-09-07T00:00:00.000Z"}]',
+      },
+    }),
+  );
+
+  const remapped = await reconcileBooks('primary', [
+    {
+      ...original,
+      id: 'primary:43:102',
+      seriesId: 43,
+      volumeId: 430,
+      chapterId: 102,
+      pages: 25,
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 220_000,
+      remoteFileSize: 220_000,
+      downloadedBytes: null,
+      downloadedPages: null,
+    },
+  ]);
+
+  expect(remapped).toEqual(new Map([['primary:42:100', 'primary:43:102']]));
+  const [migrated] = await getBooks('primary');
+  expect(migrated).toMatchObject({
+    id: 'primary:43:102',
+    seriesId: 43,
+    chapterId: 102,
+    pages: 25,
+    pagesRead: 3,
+    downloadPath: 'epubs/primary-42-100.epub',
+    downloadedBytes: 153_600,
+    downloadedPages: 10,
+    remoteFileSize: 220_000,
+    downloadOutdated: true,
+    hasLocalData: true,
+  });
+  const pending = await getPendingSync('primary');
+  expect(pending).toHaveLength(1);
+  expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+    seriesId: 43,
+    volumeId: 430,
+    chapterId: 102,
+    pageNum: 3,
+  });
+  const rawPrefs = (
+    JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+      preferences: Record<string, string>;
+    }
+  ).preferences;
+  expect(rawPrefs['readerAnnotations:primary:42:100']).toBeUndefined();
+  expect(rawPrefs['readerAnnotations:primary:43:102']).toContain('"note":"note"');
+});
+
+it('keeps same-title browser editions with different nonempty ISBNs separate without transferring local data', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  const oldEdition: BookRecord = {
+    ...existingBook,
+    id: 'primary:42:100',
+    serverId: 'primary',
+    seriesId: 42,
+    chapterId: 100,
+    title: 'Dune',
+    author: 'Frank Herbert',
+    series: 'Dune Chronicles',
+    pages: 412,
+    pagesRead: 150,
+    lastReadAt: updatedAt,
+    downloadPath: 'epubs/dune-first-edition.epub',
+    downloadStatus: 'available',
+    fileSize: 180_000,
+    remoteFileSize: 180_000,
+    downloadedBytes: 180_000,
+    downloadedPages: 412,
+    chapterKey: 'isbn:978-0-441-17271-9',
+  };
+  const oldBookmarkJson =
+    '[{"id":"bm-1","cfi":"epubcfi(/6/6)","href":"ch3.xhtml","percentage":0.36,"label":"Arrakis","savedAt":"2026-09-07T00:00:00.000Z"}]';
+  const oldAnnotationJson =
+    '[{"id":"an-1","cfi":"epubcfi(/6/6)","excerpt":"Fear is the mind-killer","note":"Litany","createdAt":"2026-09-07T00:00:00.000Z"}]';
+
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'primary' },
+      books: [oldEdition],
+      readingState: {
+        [oldEdition.id]: {
+          cfi: 'epubcfi(/6/6)',
+          xpath: '//body/DocFragment[3]/body/p[1]',
+          percentage: 0.36,
+          localUpdatedAt: updatedAt,
+          syncedLocalUpdatedAt: null,
+          serverUpdatedAt: null,
+          pendingSync: true,
+          syncRevision: 2,
+        },
+      },
+      syncQueue: {
+        [oldEdition.id]: {
+          bookId: oldEdition.id,
+          serverId: 'primary',
+          payloadJson: JSON.stringify({
+            libraryId: 1,
+            seriesId: 42,
+            volumeId: 10,
+            chapterId: 100,
+            pageNum: 150,
+          }),
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: updatedAt,
+          updatedAt,
+          revision: 2,
+        },
+      },
+      preferences: {
+        [`readerBookmarks:${oldEdition.id}`]: oldBookmarkJson,
+        [`readerAnnotations:${oldEdition.id}`]: oldAnnotationJson,
+      },
+    }),
+  );
+
+  const newEdition: BookRecord = {
+    ...oldEdition,
+    id: 'primary:42:101',
+    chapterId: 101,
+    pages: 688,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 260_000,
+    remoteFileSize: 260_000,
+    downloadedBytes: null,
+    downloadedPages: null,
+    chapterKey: 'isbn:9780441013593',
+  };
+
+  const remapped = await reconcileBooks('primary', [newEdition]);
+  expect(remapped.size).toBe(0);
+
+  const books = await getBooks('primary');
+  expect(books).toHaveLength(2);
+  expect(books.find((item) => item.id === newEdition.id)).toMatchObject({
+    id: 'primary:42:101',
+    remoteAvailable: true,
+    pages: 688,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    downloadOutdated: false,
+    hasLocalData: false,
+    chapterKey: 'isbn:9780441013593',
+  });
+  expect(books.find((item) => item.id === oldEdition.id)).toMatchObject({
+    id: 'primary:42:100',
+    remoteAvailable: false,
+    pages: 412,
+    pagesRead: 150,
+    lastReadAt: updatedAt,
+    downloadPath: 'epubs/dune-first-edition.epub',
+    downloadStatus: 'available',
+    hasLocalData: true,
+    chapterKey: 'isbn:978-0-441-17271-9',
+  });
+
+  await expect(getReadingState(newEdition.id)).resolves.toBeNull();
+  await expect(getReadingState(oldEdition.id)).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/6)',
+    pendingSync: true,
+  });
+  await expect(getPendingSync('primary')).resolves.toEqual([]);
+
+  const saved = JSON.parse(storage.getItem(BROWSER_STORAGE_KEY) ?? '{}') as {
+    syncQueue: Record<string, unknown>;
+    preferences: Record<string, string>;
+  };
+  expect(saved.syncQueue[oldEdition.id]).toBeDefined();
+  expect(saved.syncQueue[newEdition.id]).toBeUndefined();
+  expect(saved.preferences[`readerBookmarks:${oldEdition.id}`]).toBe(oldBookmarkJson);
+  expect(saved.preferences[`readerAnnotations:${oldEdition.id}`]).toBe(oldAnnotationJson);
+  expect(saved.preferences[`readerBookmarks:${newEdition.id}`]).toBeUndefined();
+  expect(saved.preferences[`readerAnnotations:${newEdition.id}`]).toBeUndefined();
+
+  // Preserve title fallback when only one edition exists and the incoming replacement lacks an ISBN
+  await reconcileBooks('primary', []);
+  expect((await getBooks('primary')).map((item) => item.id)).toEqual([oldEdition.id]);
+  const fallbackRemap = await reconcileBooks('primary', [
+    {
+      ...newEdition,
+      id: 'primary:42:102',
+      chapterId: 102,
+      chapterKey: null,
+    },
+  ]);
+  expect(fallbackRemap).toEqual(new Map([['primary:42:100', 'primary:42:102']]));
+});
+
+it('retains vanished non-downloaded browser books that hold bookmarks or annotations', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const annotatedOnly: BookRecord = {
+    ...existingBook,
+    id: 'server:9:99',
+    chapterId: 99,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: { id: 'server' },
+      books: [annotatedOnly],
+      readingState: {},
+      syncQueue: {},
+      preferences: {
+        'readerBookmarks:server:9:99':
+          '[{"id":"bm-1","cfi":"epubcfi(/6/2)","href":"ch1.xhtml","percentage":0.1,"label":"10%","savedAt":"2026-09-07T00:00:00.000Z"}]',
+      },
+    }),
+  );
+
+  await reconcileBooks('server', []);
+
+  await expect(getBooks('server')).resolves.toMatchObject([
+    {
+      id: 'server:9:99',
+      remoteAvailable: false,
+      downloadPath: null,
+      hasLocalData: true,
+    },
+  ]);
+});
+
 it('mirrors browser theme, mode, and surface colors to localStorage and clears them on reset', async () => {
   const storage = new MemoryStorage();
   Object.defineProperty(window, 'localStorage', {
@@ -1211,4 +1520,107 @@ it('saves normalized browser remote progress and guards against concurrent local
   const setItemSpy = vi.spyOn(storage, 'setItem');
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
+});
+
+it('disqualifies title fallback for conflicting chapter numbers, redirects stale-ID downloads, and prunes unretained removed books on removeDownload', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  const volumeOne: BookRecord = {
+    ...existingBook,
+    id: 'primary:42:100',
+    serverId: 'primary',
+    seriesId: 42,
+    chapterId: 100,
+    title: 'Berserk',
+    author: 'Kentaro Miura',
+    series: null,
+    pages: 220,
+    pagesRead: 110,
+    downloadPath: '/books/primary-42-100.epub',
+    downloadStatus: 'available',
+    fileSize: 500_000,
+    remoteFileSize: 500_000,
+    downloadedBytes: 500_000,
+    downloadedPages: 220,
+    chapterKey: 'number:1',
+  };
+  await reconcileBooks('primary', [volumeOne]);
+  await saveLocalProgress(volumeOne, 'epubcfi(/6/6)', '/body/p[2]', 0.5);
+
+  const volumeTwo: BookRecord = {
+    ...volumeOne,
+    id: 'primary:42:101',
+    chapterId: 101,
+    pages: 240,
+    pagesRead: 0,
+    lastReadAt: null,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 520_000,
+    remoteFileSize: 520_000,
+    chapterKey: 'number:2',
+  };
+  delete volumeTwo.downloadedBytes;
+  delete volumeTwo.downloadedPages;
+
+  const conflictRemap = await reconcileBooks('primary', [volumeTwo]);
+  expect(conflictRemap.size).toBe(0);
+  const afterConflict = await getBooks('primary');
+  expect(afterConflict.map((b) => b.id).sort()).toEqual(['primary:42:100', 'primary:42:101']);
+  expect(afterConflict.find((b) => b.id === 'primary:42:101')).toMatchObject({
+    pagesRead: 0,
+    downloadPath: null,
+    hasLocalData: false,
+  });
+
+  // Reconcile volumeTwo -> primary:42:102 (matching number:2) while an in-flight download holds stale ID
+  const remapped = await reconcileBooks('primary', [
+    {
+      ...volumeTwo,
+      id: 'primary:42:102',
+      chapterId: 102,
+      pages: 260,
+      fileSize: 560_000,
+      remoteFileSize: 560_000,
+    },
+  ]);
+  expect(remapped).toEqual(new Map([['primary:42:101', 'primary:42:102']]));
+
+  await markDownloaded('primary:42:101', '/books/primary-42-101.epub', 520_000, {
+    downloadedBytes: 520_000,
+    downloadedPages: 240,
+  });
+  expect((await getBooks('primary')).find((b) => b.id === 'primary:42:102')).toMatchObject({
+    downloadPath: '/books/primary-42-101.epub',
+    downloadStatus: 'available',
+    downloadedBytes: 520_000,
+    downloadedPages: 240,
+    downloadOutdated: true,
+  });
+
+  // Seed a vanished book retained solely by its offline download; removeDownload must prune it
+  const vanishedDownloadOnly: BookRecord = {
+    ...existingBook,
+    id: 'primary:99:900',
+    serverId: 'primary',
+    seriesId: 99,
+    chapterId: 900,
+    title: 'Download Only Vanished',
+    downloadPath: '/books/vanished.epub',
+    downloadStatus: 'available',
+    fileSize: 100_000,
+    remoteFileSize: 100_000,
+    downloadedBytes: 100_000,
+    downloadedPages: 100,
+  };
+  await reconcileBooks('primary', [vanishedDownloadOnly]);
+  await reconcileBooks('primary', []);
+  expect((await getBooks('primary')).some((b) => b.id === 'primary:99:900')).toBe(true);
+
+  await removeDownload('primary:99:900');
+  expect((await getBooks('primary')).some((b) => b.id === 'primary:99:900')).toBe(false);
 });

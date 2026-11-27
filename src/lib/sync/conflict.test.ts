@@ -136,4 +136,10 @@ describe('Kavita page updates', () => {
     expect(toKavitaPageNumber(0.94, 16, 8)).toBe(9);
     expect(toKavitaPageNumber(0.1, 16, 15)).toBe(15);
   });
+
+  it('scales spine progress against downloadedPages when a 10-page EPUB is upgraded to 25 pages', () => {
+    expect(toKavitaPageNumber(0.98, 25, 9, 10)).toBe(24);
+    expect(toKavitaPageNumber(0.5, 25, 4, 10)).toBe(13);
+    expect(toKavitaPageNumber(0.5, 10, 4, 10)).toBe(5);
+  });
 });

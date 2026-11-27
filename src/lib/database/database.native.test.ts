@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 7;
+  let databaseVersion = 8;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 7;
+      databaseVersion = 8;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -86,7 +86,9 @@ const readingState = {
   pendingSync: false,
 };
 
-beforeEach(() => {
+beforeEach(async () => {
+  mocks.reset();
+  await openAndClearMocks();
   mocks.reset();
 });
 
@@ -381,7 +383,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(7);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(8);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -391,6 +393,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -400,6 +403,7 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 5;',
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
+    'PRAGMA user_version = 8;',
   ]);
 });
 
@@ -436,4 +440,52 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+it('checks PRAGMA table_info before ALTER TABLE ADD COLUMN and skips pre-existing v8 columns when upgrading from v7', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(7);
+  mocks.executeTransaction.mockClear();
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      { cid: 0, name: 'id', type: 'TEXT' },
+      { cid: 21, name: 'remote_file_size', type: 'INTEGER' },
+      { cid: 22, name: 'downloaded_bytes', type: 'INTEGER' },
+    ],
+  });
+
+  await openDatabase();
+
+  expect(mocks.db.query).toHaveBeenCalledExactlyOnceWith("PRAGMA table_info('books');");
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks).toEqual([
+    { statement: 'ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;' },
+    { statement: 'ALTER TABLE books ADD COLUMN chapter_key TEXT;' },
+    { statement: 'PRAGMA user_version = 8;' },
+  ]);
+});
+
+it('skips all ALTER TABLE ADD COLUMN statements and advances user_version when all v8 columns already exist at v7', async () => {
+  const { openDatabase, resetLocalDatabase } = await import('./database');
+  await resetLocalDatabase();
+  mocks.setDatabaseVersion(7);
+  mocks.executeTransaction.mockClear();
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      { cid: 0, name: 'id', type: 'TEXT' },
+      { cid: 21, name: 'remote_file_size', type: 'INTEGER' },
+      { cid: 22, name: 'downloaded_bytes', type: 'INTEGER' },
+      { cid: 23, name: 'downloaded_pages', type: 'INTEGER' },
+      { cid: 24, name: 'chapter_key', type: 'TEXT' },
+    ],
+  });
+
+  await openDatabase();
+
+  expect(mocks.db.query).toHaveBeenCalledExactlyOnceWith("PRAGMA table_info('books');");
+  expect(mocks.executeTransaction).toHaveBeenCalledOnce();
+  const [tasks] = mocks.executeTransaction.mock.calls[0] ?? [];
+  expect(tasks).toEqual([{ statement: 'PRAGMA user_version = 8;' }]);
 });

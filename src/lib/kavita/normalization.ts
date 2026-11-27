@@ -242,6 +242,20 @@ function isEpubFile(value: unknown): boolean {
   );
 }
 
+function trimmedMarker(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function booleanMarker(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function matchesCachedChapter(row: Row, cached: KavitaChapter, parentVolumeId?: number): boolean {
   const volumeId = row.volumeId == null ? parentVolumeId : integer(row.volumeId);
   if (
@@ -250,7 +264,12 @@ function matchesCachedChapter(row: Row, cached: KavitaChapter, parentVolumeId?: 
     row.titleName !== cached.titleName ||
     row.summary !== cached.summary ||
     integer(row.pages) !== cached.pages ||
-    integer(row.pagesRead) !== cached.pagesRead
+    integer(row.pagesRead) !== cached.pagesRead ||
+    trimmedMarker(row.range) !== cached.range ||
+    trimmedMarker(row.number) !== cached.number ||
+    finiteNumber(row.sortOrder) !== cached.sortOrder ||
+    booleanMarker(row.isSpecial) !== cached.isSpecial ||
+    trimmedMarker(row.isbn) !== cached.isbn
   )
     return false;
   if (
@@ -423,6 +442,11 @@ function chapters(
         true,
         onFallback,
       ) || null;
+    const range = trimmedMarker(row.range);
+    const number = trimmedMarker(row.number);
+    const sortOrder = finiteNumber(row.sortOrder);
+    const isSpecial = booleanMarker(row.isSpecial);
+    const isbn = trimmedMarker(row.isbn);
 
     const normalized: KavitaChapter =
       pagesRead === undefined
@@ -451,6 +475,11 @@ function chapters(
             pagesRead,
             lastReadingProgressUtc,
           };
+    if (range !== undefined) normalized.range = range;
+    if (number !== undefined) normalized.number = number;
+    if (sortOrder !== undefined) normalized.sortOrder = sortOrder;
+    if (isSpecial !== undefined) normalized.isSpecial = isSpecial;
+    if (isbn !== undefined) normalized.isbn = isbn;
     if (!hadFallback && !cache.has(chapterId)) {
       cache.set(chapterId, normalized);
     }

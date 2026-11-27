@@ -2,7 +2,15 @@ import type { BookRecord } from '../database/database';
 
 export type BookLabelTarget = Pick<
   BookRecord,
-  'id' | 'title' | 'author' | 'series' | 'pages' | 'pagesRead' | 'downloadPath' | 'remoteAvailable'
+  | 'id'
+  | 'title'
+  | 'author'
+  | 'series'
+  | 'pages'
+  | 'pagesRead'
+  | 'downloadPath'
+  | 'downloadOutdated'
+  | 'remoteAvailable'
 >;
 
 export type BookMetadataTarget = Pick<BookRecord, 'title' | 'author' | 'series'>;
@@ -37,6 +45,8 @@ function statusParts(book: BookLabelTarget, options: BookStatusOptions): string[
   const parts: string[] = [];
   if (book.remoteAvailable === false) {
     parts.push('removed from server');
+  } else if (book.downloadPath && book.downloadOutdated) {
+    parts.push('update available');
   }
   if (options.downloadingBookId === book.id) {
     parts.push(downloadProgressValueText(options.downloadPercent).toLowerCase());
