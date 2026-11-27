@@ -1,3 +1,25 @@
+export const V8_MIGRATION_VERSION = 8;
+
+export const V8_BOOK_COLUMNS = [
+  { name: 'remote_file_size', definition: 'INTEGER' },
+  { name: 'downloaded_bytes', definition: 'INTEGER' },
+  { name: 'downloaded_pages', definition: 'INTEGER' },
+  { name: 'chapter_key', definition: 'TEXT' },
+] as const;
+
+export const V9_MIGRATION_VERSION = 9;
+
+export const V9_BOOK_COLUMNS = [
+  { name: 'file_id', definition: 'INTEGER' },
+  { name: 'file_name', definition: 'TEXT' },
+  { name: 'chapter_epub_index', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'multi_file_chapter', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'sync_progress', definition: 'INTEGER NOT NULL DEFAULT 1' },
+] as const;
+
+export const BOOKS_SERVER_FILE_INDEX_SQL =
+  'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);';
+
 export const migrations = [
   {
     version: 1,
@@ -103,6 +125,26 @@ export const migrations = [
       UPDATE reading_state SET sync_revision=COALESCE(
         (SELECT revision FROM sync_queue WHERE sync_queue.book_id=reading_state.book_id), 0
       );
+    `,
+  },
+  {
+    version: V8_MIGRATION_VERSION,
+    statements: `
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+    `,
+  },
+  {
+    version: V9_MIGRATION_VERSION,
+    statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
     `,
   },
 ] as const;

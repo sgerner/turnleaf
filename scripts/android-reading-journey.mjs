@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { crc32, deflateRawSync } from 'node:zlib';
 import { createCdpClient } from './android-cdp.mjs';
 import { runCleanup } from './android-cleanup.mjs';
 import { resolveDeviceSerial } from './android-device.mjs';
@@ -13,6 +14,14 @@ import { main as smoke } from './android-smoke.mjs';
 
 const packageName = process.env.ANDROID_PACKAGE_NAME || 'app.turnleaf.reader.debug';
 const title = 'Turnleaf CI EPUB';
+const primaryFileName = 'edition-1-primary.epub';
+const companionFileName = 'edition-2-companion.epub';
+const primaryTitle = `${title} (edition-1-primary)`;
+const companionTitle = `${title} (edition-2-companion)`;
+const primaryOpenLabel = `Open ${primaryTitle}, ${title}`;
+const primaryReadLabel = `${primaryOpenLabel}, downloaded for offline reading, 50% complete`;
+const companionOpenLabel = `Open ${companionTitle}, ${title}`;
+const companionReadLabel = `${companionOpenLabel}, downloaded for offline reading, 50% complete`;
 const key = 'turnleaf-ci-only';
 const coverPng = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
@@ -72,10 +81,86 @@ async function connectWebView() {
   }
 }
 
+function appendZipComment(epubBytes, commentText) {
+  const comment = Buffer.from(commentText, 'utf8');
+  const copy = Buffer.alloc(epubBytes.length + comment.length);
+  epubBytes.copy(copy, 0);
+  copy.writeUInt16LE(comment.length, epubBytes.length - 2);
+  comment.copy(copy, epubBytes.length);
+  return copy;
+}
+
+export function buildChapterZipArchive(entries) {
+  const prepared = entries.map((entry) => {
+    const name = Buffer.from(entry.name, 'utf8');
+    const raw = Buffer.from(entry.data);
+    const compressed = deflateRawSync(raw);
+    return {
+      name,
+      compressed,
+      uncompressedSize: raw.length,
+      crc: crc32(raw),
+    };
+  });
+  const localSize = prepared.reduce(
+    (sum, item) => sum + 30 + item.name.length + item.compressed.length,
+    0,
+  );
+  const centralSize = prepared.reduce((sum, item) => sum + 46 + item.name.length, 0);
+  const archive = Buffer.alloc(localSize + centralSize + 22);
+  let offset = 0;
+  const localOffsets = [];
+  for (const item of prepared) {
+    localOffsets.push(offset);
+    archive.writeUInt32LE(0x04034b50, offset);
+    archive.writeUInt16LE(20, offset + 4);
+    archive.writeUInt16LE(0x800, offset + 6);
+    archive.writeUInt16LE(8, offset + 8);
+    archive.writeUInt32LE(item.crc, offset + 14);
+    archive.writeUInt32LE(item.compressed.length, offset + 18);
+    archive.writeUInt32LE(item.uncompressedSize, offset + 22);
+    archive.writeUInt16LE(item.name.length, offset + 26);
+    offset += 30;
+    item.name.copy(archive, offset);
+    offset += item.name.length;
+    item.compressed.copy(archive, offset);
+    offset += item.compressed.length;
+  }
+  const centralOffset = offset;
+  prepared.forEach((item, index) => {
+    archive.writeUInt32LE(0x02014b50, offset);
+    archive.writeUInt16LE(20, offset + 4);
+    archive.writeUInt16LE(20, offset + 6);
+    archive.writeUInt16LE(0x800, offset + 8);
+    archive.writeUInt16LE(8, offset + 10);
+    archive.writeUInt32LE(item.crc, offset + 16);
+    archive.writeUInt32LE(item.compressed.length, offset + 20);
+    archive.writeUInt32LE(item.uncompressedSize, offset + 24);
+    archive.writeUInt16LE(item.name.length, offset + 28);
+    archive.writeUInt32LE(localOffsets[index], offset + 42);
+    offset += 46;
+    item.name.copy(archive, offset);
+    offset += item.name.length;
+  });
+  archive.writeUInt32LE(0x06054b50, offset);
+  archive.writeUInt16LE(prepared.length, offset + 8);
+  archive.writeUInt16LE(prepared.length, offset + 10);
+  archive.writeUInt32LE(centralSize, offset + 12);
+  archive.writeUInt32LE(centralOffset, offset + 16);
+  return archive;
+}
+
 export async function startFixture({ crossOriginRedirects = false } = {}) {
-  const epub = await readFile(
+  const primaryEpub = await readFile(
     new URL('../dev/kavita/data/Books/lorem-ipsum.epub', import.meta.url),
   );
+  const companionEpub = appendZipComment(primaryEpub, 'turnleaf-companion-edition');
+  const referencePdf = Buffer.from('%PDF-1.7\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n', 'utf8');
+  const chapterArchive = buildChapterZipArchive([
+    { name: `edition-1-primary/${primaryFileName}`, data: primaryEpub },
+    { name: `edition-2-companion/${companionFileName}`, data: companionEpub },
+    { name: 'reference/reference.pdf', data: referencePdf },
+  ]);
   const uploads = [];
   let downloads = 0;
   let covers = 0;
@@ -123,7 +208,7 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
         body = [{ id: 1, name: 'Books', type: 2 }];
         break;
       case '/api/Series/v2':
-        body = [{ id: 1, libraryId: 1, name: title, format: 3, pages: 2, pagesRead }];
+        body = [{ id: 1, libraryId: 1, name: title, format: 3, pages: 14, pagesRead }];
         break;
       case '/api/Series/series-detail':
         body = {
@@ -135,11 +220,36 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
                   id: 1,
                   volumeId: 1,
                   title,
-                  titleName,
-                  pages: 2,
+                  titleName: title,
+                  pages: 14,
                   pagesRead,
                   format: 3,
-                  files: [{ id: 1, format: 3, extension: '.epub', bytes: epub.length }],
+                  files: [
+                    {
+                      id: 1,
+                      format: 3,
+                      extension: '.epub',
+                      pages: 2,
+                      bytes: primaryEpub.length,
+                      filePath: `/manga/Books/Turnleaf CI/${primaryFileName}`,
+                    },
+                    {
+                      id: 2,
+                      format: 3,
+                      extension: '.epub',
+                      pages: 2,
+                      bytes: companionEpub.length,
+                      filePath: `/manga/Books/Turnleaf CI/${companionFileName}`,
+                    },
+                    {
+                      id: 3,
+                      format: 4,
+                      extension: '.pdf',
+                      pages: 10,
+                      bytes: referencePdf.length,
+                      filePath: '/manga/Books/Turnleaf CI/reference.pdf',
+                    },
+                  ],
                 },
               ],
             },
@@ -177,10 +287,10 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
         downloads += 1;
         response
           .writeHead(200, {
-            'Content-Type': 'application/epub+zip',
-            'Content-Length': epub.length,
+            'Content-Type': 'application/vnd.comicbook+zip',
+            'Content-Length': chapterArchive.length,
           })
-          .end(epub);
+          .end(chapterArchive);
         return;
       case '/api/Reader/get-progress':
         body = uploads.at(-1) ?? emptyProgress;
@@ -204,12 +314,20 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     }
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
-  const titleName = title;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
     port: server.address().port,
     foreignPort,
+    key,
+    primaryTitle,
+    companionTitle,
+    primaryOpenLabel,
+    primaryReadLabel,
+    companionOpenLabel,
+    companionReadLabel,
+    primaryByteSize: primaryEpub.length,
+    companionByteSize: companionEpub.length,
     uploads,
     get downloads() {
       return downloads;
@@ -324,13 +442,14 @@ async function run() {
     })()`);
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
     await web.evaluate(click('button[type=submit]'));
-
-    await waitFor('catalog book card', () =>
-      web.evaluate("Boolean(document.querySelector('[data-book-open]'))"),
+    await waitFor('both disambiguated EPUB books in catalog', () =>
+      web.evaluate(
+        `Boolean(document.querySelector('[aria-label="${primaryOpenLabel}"]')) && Boolean(document.querySelector('[aria-label="${companionOpenLabel}"]'))`,
+      ),
     );
     await waitFor('blocked cross-origin cover redirect', () => fixture.coverRedirects >= 1);
     await waitFor('attempt redirected EPUB download', () =>
-      web.evaluate(click('[data-book-open]')),
+      web.evaluate(click(`[aria-label="${primaryOpenLabel}"]`)),
     );
     await waitFor('blocked cross-origin EPUB redirect', () => web.evaluate(retryDownloadReady));
     if (fixture.downloadRedirects !== 1) {
@@ -347,9 +466,11 @@ async function run() {
     );
     await waitFor('rendered online cover', () => web.evaluate(renderedCover));
     if (fixture.covers !== 1) throw new Error('Expected one cached cover transfer.');
-    await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
-    await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
-    if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
+    await waitFor('open primary catalog book', () =>
+      web.evaluate(click(`[aria-label="${primaryOpenLabel}"]`)),
+    );
+    await waitFor('downloaded and unwrapped first chapter', () => web.evaluate(chapter(1)));
+    if (fixture.downloads !== 1) throw new Error('Expected one chapter archive transfer.');
 
     disabledNetwork = true;
     await adb('shell', 'svc', 'wifi', 'disable');
@@ -375,9 +496,7 @@ async function run() {
       return false;
     });
     await waitFor('saved offline progress', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(`Boolean(document.querySelector('[aria-label="${primaryReadLabel}"]'))`),
     );
     await waitFor('rendered offline cover before restart', () => web.evaluate(renderedCover));
 
@@ -395,7 +514,9 @@ async function run() {
     );
     web = await connectWebView();
     await waitFor('rendered offline cover after restart', () => web.evaluate(renderedCover));
-    await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
+    await waitFor('offline catalog book', () =>
+      web.evaluate(click(`[aria-label="${primaryReadLabel}"]`)),
+    );
     await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
     if (fixture.offlineRequests.length > 0) {
       throw new Error(
@@ -421,11 +542,34 @@ async function run() {
       return false;
     });
     await waitFor('saved passage after reconnect', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+      web.evaluate(`Boolean(document.querySelector('[aria-label="${primaryReadLabel}"]'))`),
     );
     await waitFor('rendered cover after reconnect', () => web.evaluate(renderedCover));
+
+    const uploadsBeforeCompanion = fixture.uploads.length;
+    await waitFor('open secondary companion EPUB', () =>
+      web.evaluate(click(`[aria-label="${companionOpenLabel}"]`)),
+    );
+    await waitFor('downloaded and unwrapped companion first chapter', () =>
+      web.evaluate(chapter(1)),
+    );
+    if (fixture.downloads !== 2) throw new Error('Expected second chapter archive transfer.');
+    await waitFor('companion next-page control', () =>
+      web.evaluate(click('[aria-label="Next page"]')),
+    );
+    await waitFor('companion second chapter', () => web.evaluate(chapter(2)));
+    await waitFor('return to library from companion EPUB', async () => {
+      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
+      await web.evaluate(click('[aria-label="Show reading controls"]'));
+      return false;
+    });
+    await waitFor('saved local companion progress', () =>
+      web.evaluate(`Boolean(document.querySelector('[aria-label="${companionReadLabel}"]'))`),
+    );
+    await delay(3_000);
+    if (fixture.uploads.length !== uploadsBeforeCompanion) {
+      throw new Error('Secondary EPUB sent remote progress for a shared chapterId.');
+    }
     assertRedirectIsolation(fixture);
     if (fixture.notFoundPaths.length > 0) {
       throw new Error(

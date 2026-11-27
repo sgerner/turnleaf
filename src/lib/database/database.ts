@@ -7,9 +7,15 @@ import {
   type SQLiteDBConnection,
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
+import { sanitizeEpubFileName } from '../kavita/normalization';
 import type { KavitaProgress } from '../kavita/types';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations } from './schema';
+import {
+  BOOKS_SERVER_FILE_INDEX_SQL,
+  migrations,
+  V8_BOOK_COLUMNS,
+  V9_BOOK_COLUMNS,
+} from './schema';
 
 export interface ServerConfig {
   id: string;
@@ -27,6 +33,8 @@ export interface BookRecord {
   seriesId: number;
   volumeId: number;
   chapterId: number;
+  fileId?: number | null;
+  fileName?: string | null;
   title: string;
   author: string | null;
   series: string | null;
@@ -39,6 +47,11 @@ export interface BookRecord {
   downloadPath: string | null;
   downloadStatus: string;
   fileSize: number | null;
+  remoteFileSize?: number | null;
+  chapterEpubIndex?: number;
+  multiFileChapter?: boolean;
+  /** False keeps progress local when Kavita shares chapter progress with another primary file. */
+  syncProgress?: boolean;
   /** False means Kavita no longer advertises the book; local retention may keep it. */
   remoteAvailable?: boolean;
   /** False means Kavita omitted usable progress fields from this metadata snapshot. */
@@ -48,7 +61,10 @@ export interface BookRecord {
 }
 
 function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
-  const record = { ...book };
+  const record: BookRecord = {
+    ...book,
+    ...(book.fileName !== undefined ? { fileName: sanitizeEpubFileName(book.fileName) } : {}),
+  };
   delete record.remoteProgressKnown;
   delete record.remoteReadDateKnown;
   return record;
@@ -79,6 +95,105 @@ interface BrowserSyncQueueRow {
 }
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
+const REKEY_TEMP_PREFIX = '__turnleaf_rekey__:';
+const READER_PREFERENCE_PREFIXES = [
+  'readerBookmarks:',
+  'readerHistory:',
+  'readerAnnotations:',
+] as const;
+
+function readerPreferenceKeys(bookId: string): [string, string, string] {
+  return [`readerBookmarks:${bookId}`, `readerHistory:${bookId}`, `readerAnnotations:${bookId}`];
+}
+
+interface ExistingBookIdentity {
+  id: string;
+  chapterId: number;
+  fileId?: number | null;
+}
+
+interface BookReconciliationPlan {
+  matchedOldIdByIncomingId: Map<string, string>;
+  claimedExistingIds: Set<string>;
+  rekeys: Array<{ oldId: string; newId: string }>;
+  evictedIds: string[];
+}
+
+function legacyChapterBookId(
+  serverId: string,
+  book: Pick<BookRecord, 'seriesId' | 'chapterId'>,
+): string {
+  return `${serverId}:${book.seriesId}:${book.chapterId}`;
+}
+
+function findMatchingExistingBook<T extends ExistingBookIdentity>(
+  serverId: string,
+  existingRows: readonly T[],
+  claimedExistingIds: ReadonlySet<string>,
+  book: BookRecord,
+): T | undefined {
+  const candidates = existingRows.filter((row) => !claimedExistingIds.has(row.id));
+  if (book.fileId != null) {
+    const exactMatches = candidates.filter((row) => row.fileId === book.fileId);
+    if (exactMatches.length > 0) {
+      return [...exactMatches].sort((left, right) => {
+        const leftChapter = left.chapterId === book.chapterId ? 0 : 1;
+        const rightChapter = right.chapterId === book.chapterId ? 0 : 1;
+        if (leftChapter !== rightChapter) return leftChapter - rightChapter;
+        const leftId = left.id === book.id ? 0 : 1;
+        const rightId = right.id === book.id ? 0 : 1;
+        return leftId - rightId;
+      })[0];
+    }
+    if (book.syncProgress !== false) {
+      const legacyId = legacyChapterBookId(serverId, book);
+      const nullMatches = candidates.filter(
+        (row) => row.fileId == null && (row.id === book.id || row.id === legacyId),
+      );
+      if (nullMatches.length > 0) {
+        return [...nullMatches].sort((left, right) => {
+          const leftId = left.id === book.id ? 0 : 1;
+          const rightId = right.id === book.id ? 0 : 1;
+          return leftId - rightId;
+        })[0];
+      }
+    }
+    return undefined;
+  }
+  return candidates.find((row) => row.id === book.id && row.fileId == null);
+}
+
+function planBookFileReconciliation<T extends ExistingBookIdentity>(
+  serverId: string,
+  existingRows: readonly T[],
+  incomingBooks: readonly BookRecord[],
+): BookReconciliationPlan {
+  const incomingById = new Map(incomingBooks.map((book) => [book.id, book]));
+  const matchedOldIdByIncomingId = new Map<string, string>();
+  const claimedExistingIds = new Set<string>();
+  const rekeys: Array<{ oldId: string; newId: string }> = [];
+
+  for (const book of incomingById.values()) {
+    const matched = findMatchingExistingBook(serverId, existingRows, claimedExistingIds, book);
+    if (!matched) continue;
+    claimedExistingIds.add(matched.id);
+    matchedOldIdByIncomingId.set(book.id, matched.id);
+    if (matched.id !== book.id) {
+      rekeys.push({ oldId: matched.id, newId: book.id });
+    }
+  }
+
+  const evictedIds = existingRows
+    .filter((row) => !claimedExistingIds.has(row.id) && incomingById.has(row.id))
+    .map((row) => row.id);
+
+  return {
+    matchedOldIdByIncomingId,
+    claimedExistingIds,
+    rekeys,
+    evictedIds,
+  };
+}
 
 function enqueueNativeWrite<T>(operation: () => Promise<T>): Promise<T> {
   const next = nativeTransactionQueue.then(operation);
@@ -162,6 +277,8 @@ function readBrowserState(): BrowserDatabaseState {
     const books = Array.isArray(parsed.books)
       ? (parsed.books as BookRecord[]).map((book) => ({
           ...book,
+          ...(book.fileName !== undefined ? { fileName: sanitizeEpubFileName(book.fileName) } : {}),
+          ...(book.syncProgress !== undefined ? { syncProgress: book.syncProgress !== false } : {}),
           remoteAvailable: book.remoteAvailable !== false,
         }))
       : [];
@@ -231,7 +348,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
       : await sqlite.createConnection('turnleaf', false, 'no-encryption', 1, false);
   await db.open();
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
-  await migrate(db);
+  await migrateDatabase(db);
   return db;
 }
 
@@ -259,14 +376,185 @@ export async function resetLocalDatabase(): Promise<void> {
   }
 }
 
-async function migrate(db: SQLiteDBConnection): Promise<void> {
+export type MigrationConnection = Pick<
+  SQLiteDBConnection,
+  'executeTransaction' | 'getVersion' | 'query'
+> &
+  Partial<Pick<SQLiteDBConnection, 'execute'>>;
+
+const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
+const REQUIRED_BOOK_COLUMNS = [...V8_BOOK_COLUMNS, ...V9_BOOK_COLUMNS] as const;
+const ALTER_TABLE_ADD_COLUMN_STATEMENT =
+  /^ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+ADD\s+(?:COLUMN\s+)?([a-z_][a-z0-9_]*)\s+[\s\S]+$/i;
+
+function isMissingColumnError(error: unknown): boolean {
+  return String(error).toLowerCase().includes('no such column');
+}
+
+function isMissingTableError(error: unknown, tableName: string): boolean {
+  return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
+}
+
+async function queryExistingTableColumns(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  tableName: string,
+): Promise<Set<string>> {
+  if (!SAFE_SQL_IDENTIFIER.test(tableName)) {
+    throw new Error(`Unsafe SQLite table identifier: ${tableName}`);
+  }
+  const rows = (await executeNativeQuery(db, `PRAGMA table_info('${tableName}')`)).values ?? [];
+  return new Set(rows.map((row) => String(row.name)));
+}
+
+async function queryExistingBookColumns(
+  db: Pick<SQLiteDBConnection, 'query'>,
+): Promise<Set<string> | null> {
+  const columns = await queryExistingTableColumns(db, 'books');
+  return columns.size > 0 ? columns : null;
+}
+
+async function hasBooksServerFileIndex(db: Pick<SQLiteDBConnection, 'query'>): Promise<boolean> {
+  const rows = (await executeNativeQuery(db, "PRAGMA index_list('books')")).values ?? [];
+  return rows.some((row) => String(row.name) === 'books_server_file_idx');
+}
+
+async function buildIdempotentMigrationStatements(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  migration: (typeof migrations)[number],
+): Promise<string | null> {
+  const statements = migration.statements
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+
+  const parsedStatements = statements.map((statement) => {
+    const match = ALTER_TABLE_ADD_COLUMN_STATEMENT.exec(statement);
+    if (!match) {
+      return { statement, alterTarget: null };
+    }
+    return {
+      statement,
+      alterTarget: {
+        tableName: match[1]!,
+        columnName: match[2]!,
+      },
+    };
+  });
+
+  const alteredTables = new Set(
+    parsedStatements
+      .map((entry) => entry.alterTarget?.tableName)
+      .filter((tableName): tableName is string => Boolean(tableName)),
+  );
+  if (alteredTables.size === 0) {
+    return migration.statements;
+  }
+
+  const columnsByTable = new Map<string, Set<string>>();
+  for (const tableName of alteredTables) {
+    columnsByTable.set(tableName, await queryExistingTableColumns(db, tableName));
+  }
+
+  const booksColumns = columnsByTable.get('books');
+  const missingV8PrefixStatements =
+    migration.version === 9 && booksColumns && booksColumns.size > 0
+      ? V8_BOOK_COLUMNS.filter((column) => !booksColumns.has(column.name)).map((column) => {
+          booksColumns.add(column.name);
+          return `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition}`;
+        })
+      : [];
+
+  let skippedAnyColumn = false;
+  const filteredStatements: string[] = [...missingV8PrefixStatements];
+
+  for (const entry of parsedStatements) {
+    if (!entry.alterTarget) {
+      filteredStatements.push(entry.statement);
+      continue;
+    }
+    const existingColumns = columnsByTable.get(entry.alterTarget.tableName);
+    if (existingColumns?.has(entry.alterTarget.columnName)) {
+      skippedAnyColumn = true;
+      continue;
+    }
+    existingColumns?.add(entry.alterTarget.columnName);
+    filteredStatements.push(entry.statement);
+  }
+
+  if (!skippedAnyColumn && missingV8PrefixStatements.length === 0) {
+    return migration.statements;
+  }
+  if (filteredStatements.length === 0) {
+    return null;
+  }
+  return filteredStatements.map((statement) => `${statement};`).join('\n');
+}
+
+function buildBookSchemaReconciliationTasks(
+  existingColumns: ReadonlySet<string>,
+  targetVersion: number,
+): capTask[] {
+  const missingColumns = REQUIRED_BOOK_COLUMNS.filter(
+    (column) => !existingColumns.has(column.name),
+  );
+  return [
+    ...(missingColumns.length > 0
+      ? [
+          {
+            statement: missingColumns
+              .map((column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`)
+              .join('\n'),
+          },
+        ]
+      : []),
+    { statement: BOOKS_SERVER_FILE_INDEX_SQL },
+    { statement: `PRAGMA user_version = ${targetVersion};` },
+  ];
+}
+
+export async function migrateDatabase(db: MigrationConnection): Promise<void> {
   const current = await db.getVersion();
+  const currentVersion = current.version ?? 0;
   for (const migration of migrations) {
-    if (migration.version <= (current.version ?? 0)) continue;
+    if (migration.version <= currentVersion) continue;
+    const statement = await buildIdempotentMigrationStatements(db, migration);
     await executeNativeTransaction(db, [
-      { statement: migration.statements },
+      ...(statement ? [{ statement }] : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
+  }
+
+  if (currentVersion >= LATEST_SCHEMA_VERSION) {
+    if (typeof db.execute === 'function') {
+      const executeDb = { execute: db.execute.bind(db) };
+      const probeAssignments = REQUIRED_BOOK_COLUMNS.map(
+        (column) => `${column.name} = ${column.name}`,
+      ).join(', ');
+      try {
+        await executeNativeStatement(
+          executeDb,
+          `UPDATE books SET ${probeAssignments} WHERE 0;\n${BOOKS_SERVER_FILE_INDEX_SQL}`,
+        );
+        return;
+      } catch (error) {
+        if (!isMissingColumnError(error)) {
+          if (isMissingTableError(error, 'books')) return;
+          throw error;
+        }
+      }
+    }
+
+    const existingColumns = await queryExistingBookColumns(db);
+    if (!existingColumns) return;
+    const missingColumns = REQUIRED_BOOK_COLUMNS.filter(
+      (column) => !existingColumns.has(column.name),
+    );
+    const hasIndex = await hasBooksServerFileIndex(db);
+    if (missingColumns.length === 0 && hasIndex) return;
+    await executeNativeTransaction(
+      db,
+      buildBookSchemaReconciliationTasks(existingColumns, currentVersion),
+    );
   }
 }
 
@@ -360,9 +648,61 @@ export async function reconcileBooks(
       const incoming = new Map(
         books.map((book) => [book.id, { ...withoutRemoteProgressMarkers(book), serverId }]),
       );
+      const incomingList = [...incoming.values()];
       const existing = state.books.filter((book) => book.serverId === serverId);
       const existingById = new Map(existing.map((book) => [book.id, book]));
-      const unmatched = existing.filter((book) => !incoming.has(book.id));
+      const plan = planBookFileReconciliation(serverId, existing, incomingList);
+
+      const previousReadingState = { ...state.readingState };
+      const previousSyncQueue = { ...state.syncQueue };
+      const previousPreferences = { ...state.preferences };
+
+      const clearBookLocalArtifacts = (bookId: string): void => {
+        delete state.readingState[bookId];
+        delete state.syncQueue[bookId];
+        for (const prefix of READER_PREFERENCE_PREFIXES) {
+          delete state.preferences[`${prefix}${bookId}`];
+        }
+      };
+
+      for (const evictedId of plan.evictedIds) {
+        clearBookLocalArtifacts(evictedId);
+      }
+      for (const { oldId, newId } of plan.rekeys) {
+        if (!incoming.has(oldId)) {
+          clearBookLocalArtifacts(oldId);
+        }
+        clearBookLocalArtifacts(newId);
+      }
+      for (const book of incomingList) {
+        const matchedOldId = plan.matchedOldIdByIncomingId.get(book.id);
+        if (!matchedOldId) {
+          clearBookLocalArtifacts(book.id);
+          continue;
+        }
+        if (matchedOldId === book.id) continue;
+        const migratedReading = previousReadingState[matchedOldId];
+        if (migratedReading) {
+          state.readingState[book.id] = { ...migratedReading };
+        }
+        const migratedQueue = previousSyncQueue[matchedOldId];
+        if (migratedQueue) {
+          state.syncQueue[book.id] = {
+            ...migratedQueue,
+            bookId: book.id,
+          };
+        }
+        for (const prefix of READER_PREFERENCE_PREFIXES) {
+          const oldKey = `${prefix}${matchedOldId}`;
+          if (Object.prototype.hasOwnProperty.call(previousPreferences, oldKey)) {
+            state.preferences[`${prefix}${book.id}`] = previousPreferences[oldKey]!;
+          }
+        }
+      }
+
+      const unmatched = existing.filter(
+        (book) => !plan.claimedExistingIds.has(book.id) && !incoming.has(book.id),
+      );
       const retained = preserveMissing
         ? unmatched
         : unmatched
@@ -370,30 +710,48 @@ export async function reconcileBooks(
               (book) =>
                 Boolean(book.downloadPath) ||
                 book.downloadStatus === 'available' ||
-                Boolean(state.syncQueue[book.id]) ||
-                Boolean(state.readingState[book.id]),
+                Boolean(previousSyncQueue[book.id]) ||
+                Boolean(previousReadingState[book.id]),
             )
             .map((book) => ({ ...withoutRemoteProgressMarkers(book), remoteAvailable: false }));
       const began = snapshotStartedAt ? Date.parse(snapshotStartedAt) : Infinity;
-      const merged = [...incoming.values()].map((book) => {
-        const previous = existingById.get(book.id);
-        if (!previous) return { ...book, remoteAvailable: true };
-        const reading = state.readingState[book.id];
-        const pending = Boolean(state.syncQueue[book.id]) || reading?.pendingSync === true;
+      const merged = incomingList.map((book) => {
+        const matchedOldId = plan.matchedOldIdByIncomingId.get(book.id);
+        const previous = matchedOldId ? existingById.get(matchedOldId) : undefined;
+        if (!previous) {
+          return {
+            ...book,
+            downloadPath: book.downloadPath ?? null,
+            downloadStatus: book.downloadStatus ?? 'none',
+            remoteFileSize: book.remoteFileSize ?? book.fileSize,
+            syncProgress: book.syncProgress !== false,
+            remoteAvailable: true,
+          };
+        }
+        const reading = previousReadingState[previous.id];
+        const pending = Boolean(previousSyncQueue[previous.id]) || reading?.pendingSync === true;
         const changedDuringRefresh =
           reading &&
           (Date.parse(reading.localUpdatedAt) >= began ||
             Date.parse(reading.serverUpdatedAt ?? '') >= began);
-        const preserveProgress = pending || changedDuringRefresh || unknownProgress.has(book.id);
+        const localOnlyProgress = book.syncProgress === false || previous.syncProgress === false;
+        const preserveProgress =
+          localOnlyProgress || pending || changedDuringRefresh || unknownProgress.has(book.id);
         const preserveReadDate = preserveProgress || unknownReadDate.has(book.id);
+        const hasLocalDownload =
+          Boolean(previous.downloadPath) || previous.downloadStatus === 'available';
         return {
           ...withoutRemoteProgressMarkers(previous),
           ...book,
+          id: book.id,
           serverId,
+          fileId: book.fileId ?? previous.fileId ?? null,
+          syncProgress: book.syncProgress !== false,
           remoteAvailable: true,
           downloadPath: previous.downloadPath,
           downloadStatus: previous.downloadStatus,
-          fileSize: previous.fileSize,
+          fileSize: hasLocalDownload ? previous.fileSize : (book.fileSize ?? previous.fileSize),
+          remoteFileSize: book.remoteFileSize ?? book.fileSize ?? previous.remoteFileSize ?? null,
           pagesRead: preserveProgress ? previous.pagesRead : book.pagesRead,
           lastReadAt: preserveReadDate ? previous.lastReadAt : book.lastReadAt,
         };
@@ -427,18 +785,290 @@ const preserveReadingProgress = `EXISTS (
 const replaceBookStatement = `INSERT INTO books
   (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
    description_html, format, metadata_refreshed_at, download_path, download_status, file_size,
-   pages, pages_read, created_at, last_read_at, remote_available)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   pages, pages_read, created_at, last_read_at, remote_available,
+   file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(id) DO UPDATE SET
    library_id=excluded.library_id, series_id=excluded.series_id,
    volume_id=excluded.volume_id, chapter_id=excluded.chapter_id,
    title=excluded.title, author=excluded.author, series=excluded.series,
    description_html=excluded.description_html, format=excluded.format,
-   metadata_refreshed_at=excluded.metadata_refreshed_at, pages=excluded.pages,
-   pages_read=CASE WHEN ?=0 OR ${preserveReadingProgress} THEN books.pages_read ELSE excluded.pages_read END,
+   metadata_refreshed_at=excluded.metadata_refreshed_at,
+   file_size=CASE WHEN books.download_path IS NOT NULL OR books.download_status='available'
+     THEN books.file_size ELSE COALESCE(excluded.file_size, books.file_size) END,
+   pages=excluded.pages,
+   pages_read=CASE WHEN books.sync_progress=0 OR excluded.sync_progress=0 OR ?=0 OR ${preserveReadingProgress}
+     THEN books.pages_read ELSE excluded.pages_read END,
    created_at=excluded.created_at,
-   last_read_at=CASE WHEN ?=0 OR ?=0 OR ${preserveReadingProgress} THEN books.last_read_at ELSE excluded.last_read_at END,
-   remote_available=excluded.remote_available`;
+   last_read_at=CASE WHEN books.sync_progress=0 OR excluded.sync_progress=0 OR ?=0 OR ?=0 OR ${preserveReadingProgress}
+     THEN books.last_read_at ELSE excluded.last_read_at END,
+   remote_available=excluded.remote_available,
+   file_id=COALESCE(excluded.file_id, books.file_id), file_name=excluded.file_name,
+   remote_file_size=COALESCE(excluded.remote_file_size, books.remote_file_size),
+   chapter_epub_index=excluded.chapter_epub_index,
+   multi_file_chapter=excluded.multi_file_chapter,
+   sync_progress=excluded.sync_progress`;
+
+const BASE_BOOK_COLUMNS_WITHOUT_ID = [
+  'server_id',
+  'library_id',
+  'series_id',
+  'volume_id',
+  'chapter_id',
+  'title',
+  'author',
+  'series',
+  'description_html',
+  'cover_path',
+  'format',
+  'metadata_refreshed_at',
+  'download_path',
+  'download_status',
+  'file_size',
+  'pages',
+  'pages_read',
+  'created_at',
+  'last_read_at',
+  'remote_available',
+  'file_id',
+  'file_name',
+  'remote_file_size',
+  'downloaded_bytes',
+  'downloaded_pages',
+  'chapter_key',
+  'chapter_epub_index',
+  'multi_file_chapter',
+  'sync_progress',
+] as const;
+
+const bookColumnsWithoutId = BASE_BOOK_COLUMNS_WITHOUT_ID.join(', ');
+
+const OPTIONAL_STUDY_TABLES = ['annotations', 'bookmarks', 'reading_history'] as const;
+
+interface IdentityMigrationSchema {
+  bookColumnsCsv: string;
+  studyTables: ReadonlySet<string>;
+}
+
+const DEFAULT_IDENTITY_MIGRATION_SCHEMA: IdentityMigrationSchema = {
+  bookColumnsCsv: bookColumnsWithoutId,
+  studyTables: new Set(),
+};
+
+const SAFE_SQL_IDENTIFIER = /^[a-z_][a-z0-9_]*$/i;
+
+async function queryIdentityMigrationSchema(
+  db: Pick<SQLiteDBConnection, 'query'>,
+): Promise<IdentityMigrationSchema> {
+  const [tableInfo, studyTableInfo] = await Promise.all([
+    db.query("PRAGMA table_info('books')"),
+    db.query(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('annotations', 'bookmarks', 'reading_history')",
+    ),
+  ]);
+  const knownColumns = new Set<string>(['id', ...BASE_BOOK_COLUMNS_WITHOUT_ID]);
+  const extraBookColumns = (tableInfo.values ?? [])
+    .map((row) => String(row.name))
+    .filter((name) => SAFE_SQL_IDENTIFIER.test(name) && !knownColumns.has(name));
+  const allColumns =
+    extraBookColumns.length > 0
+      ? [...BASE_BOOK_COLUMNS_WITHOUT_ID, ...extraBookColumns].join(', ')
+      : bookColumnsWithoutId;
+  const studyTables = new Set(
+    (studyTableInfo.values ?? [])
+      .map((row) => String(row.name))
+      .filter((name) => (OPTIONAL_STUDY_TABLES as readonly string[]).includes(name)),
+  );
+  return {
+    bookColumnsCsv: allColumns,
+    studyTables,
+  };
+}
+
+function moveBookIdentityTasks(
+  sourceId: string,
+  targetId: string,
+  clearTargetPreferences: boolean,
+  schema: IdentityMigrationSchema = DEFAULT_IDENTITY_MIGRATION_SCHEMA,
+): capTask[] {
+  const tasks: capTask[] = [];
+  if (clearTargetPreferences) {
+    tasks.push({
+      statement: `DELETE FROM preferences WHERE key IN (?, ?, ?)
+        AND EXISTS (SELECT 1 FROM books WHERE id = ?)`,
+      values: [...readerPreferenceKeys(targetId), sourceId],
+    });
+  }
+  tasks.push(
+    {
+      statement: `INSERT INTO books (id, ${schema.bookColumnsCsv})
+        SELECT ?, ${schema.bookColumnsCsv} FROM books WHERE id = ?`,
+      values: [targetId, sourceId],
+    },
+    {
+      statement: 'UPDATE reading_state SET book_id = ? WHERE book_id = ?',
+      values: [targetId, sourceId],
+    },
+    {
+      statement: 'UPDATE sync_queue SET book_id = ? WHERE book_id = ?',
+      values: [targetId, sourceId],
+    },
+    {
+      statement: `UPDATE OR REPLACE preferences
+        SET key = substr(key, 1, instr(key, ':')) || ?
+        WHERE key IN (?, ?, ?)`,
+      values: [targetId, ...readerPreferenceKeys(sourceId)],
+    },
+  );
+  for (const studyTable of OPTIONAL_STUDY_TABLES) {
+    if (schema.studyTables.has(studyTable)) {
+      tasks.push({
+        statement: `UPDATE ${studyTable} SET book_id = ? WHERE book_id = ?`,
+        values: [targetId, sourceId],
+      });
+    }
+  }
+  tasks.push({
+    statement: 'DELETE FROM books WHERE id = ? AND EXISTS (SELECT 1 FROM books WHERE id = ?)',
+    values: [sourceId, targetId],
+  });
+  return tasks;
+}
+
+function evictBookIdentityTasks(serverId: string, bookId: string): capTask[] {
+  return [
+    {
+      statement: `DELETE FROM preferences WHERE key IN (?, ?, ?)
+        AND EXISTS (SELECT 1 FROM books WHERE id = ? AND server_id = ?)`,
+      values: [...readerPreferenceKeys(bookId), bookId, serverId],
+    },
+    {
+      statement: 'DELETE FROM books WHERE id = ? AND server_id = ?',
+      values: [bookId, serverId],
+    },
+  ];
+}
+
+function plannedNativeIdentityTasks(
+  serverId: string,
+  plan: BookReconciliationPlan,
+  schema: IdentityMigrationSchema = DEFAULT_IDENTITY_MIGRATION_SCHEMA,
+): capTask[] {
+  const tasks: capTask[] = [];
+  plan.rekeys.forEach(({ oldId }, index) => {
+    tasks.push(...moveBookIdentityTasks(oldId, `${REKEY_TEMP_PREFIX}${index}`, false, schema));
+  });
+  for (const evictedId of plan.evictedIds) {
+    tasks.push(...evictBookIdentityTasks(serverId, evictedId));
+  }
+  plan.rekeys.forEach(({ newId }, index) => {
+    tasks.push(...moveBookIdentityTasks(`${REKEY_TEMP_PREFIX}${index}`, newId, true, schema));
+  });
+  return tasks;
+}
+
+function sqlOnlyIdentityTasks(serverId: string, incomingBooks: readonly BookRecord[]): capTask[] {
+  const uniqueBooks = [...new Map(incomingBooks.map((book) => [book.id, book])).values()];
+  const tasks: capTask[] = [];
+
+  uniqueBooks.forEach((book, index) => {
+    const tempId = `${REKEY_TEMP_PREFIX}${index}`;
+    let matchSubquery: string;
+    let matchParams: unknown[];
+    if (book.fileId != null) {
+      const legacyId = legacyChapterBookId(serverId, book);
+      const allowNull = book.syncProgress === false ? 0 : 1;
+      matchSubquery = `(SELECT id FROM books
+        WHERE server_id = ?
+          AND id NOT LIKE '${REKEY_TEMP_PREFIX}%'
+          AND (file_id = ? OR (? = 1 AND file_id IS NULL AND (id = ? OR id = ?)))
+        ORDER BY
+          CASE WHEN file_id = ? THEN 0 ELSE 1 END,
+          CASE WHEN chapter_id = ? THEN 0 ELSE 1 END,
+          CASE WHEN id = ? THEN 0 ELSE 1 END
+        LIMIT 1)`;
+      matchParams = [
+        serverId,
+        book.fileId,
+        allowNull,
+        book.id,
+        legacyId,
+        book.fileId,
+        book.chapterId,
+        book.id,
+      ];
+    } else {
+      matchSubquery = `(SELECT id FROM books
+        WHERE server_id = ? AND id = ? AND file_id IS NULL
+        LIMIT 1)`;
+      matchParams = [serverId, book.id];
+    }
+    tasks.push(
+      {
+        statement: `INSERT INTO books (id, ${bookColumnsWithoutId})
+          SELECT ?, ${bookColumnsWithoutId} FROM books WHERE id = ${matchSubquery}`,
+        values: [tempId, ...matchParams],
+      },
+      {
+        statement: `UPDATE reading_state SET book_id = ? WHERE book_id = ${matchSubquery}`,
+        values: [tempId, ...matchParams],
+      },
+      {
+        statement: `UPDATE sync_queue SET book_id = ? WHERE book_id = ${matchSubquery}`,
+        values: [tempId, ...matchParams],
+      },
+      {
+        statement: `UPDATE OR REPLACE preferences
+          SET key = substr(key, 1, instr(key, ':')) || ?
+          WHERE key IN (
+            SELECT prefix || matched.id
+            FROM (
+              SELECT 'readerBookmarks:' AS prefix
+              UNION ALL SELECT 'readerHistory:'
+              UNION ALL SELECT 'readerAnnotations:'
+            )
+            JOIN (SELECT id FROM books WHERE id = ${matchSubquery}) AS matched
+          )`,
+        values: [tempId, ...matchParams],
+      },
+      {
+        statement: `DELETE FROM books WHERE id = ${matchSubquery}
+          AND EXISTS (SELECT 1 FROM books WHERE id = ?)`,
+        values: [...matchParams, tempId],
+      },
+    );
+  });
+
+  uniqueBooks.forEach((book, index) => {
+    const tempId = `${REKEY_TEMP_PREFIX}${index}`;
+    tasks.push(
+      ...evictBookIdentityTasks(serverId, book.id),
+      ...moveBookIdentityTasks(tempId, book.id, true),
+    );
+  });
+
+  return tasks;
+}
+
+function parseNullableInteger(value: unknown): number | null {
+  if (value == null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+async function queryExistingBookIdentities(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  serverId: string,
+): Promise<ExistingBookIdentity[]> {
+  const result = await db.query('SELECT id, chapter_id, file_id FROM books WHERE server_id = ?', [
+    serverId,
+  ]);
+  return (result.values ?? []).map((row) => ({
+    id: String(row.id),
+    chapterId: Number(row.chapter_id),
+    fileId: parseNullableInteger(row.file_id),
+  }));
+}
 
 function replaceBookTask(
   serverId: string,
@@ -446,6 +1076,7 @@ function replaceBookTask(
   refreshedAt: string,
   snapshotStartedAt: string | null = null,
 ): capTask {
+  const remoteFileSize = book.remoteFileSize ?? (book.downloadPath ? null : book.fileSize);
   return {
     statement: replaceBookStatement,
     values: [
@@ -469,6 +1100,12 @@ function replaceBookTask(
       book.createdAt,
       book.lastReadAt,
       book.remoteAvailable !== false ? 1 : 0,
+      book.fileId ?? null,
+      sanitizeEpubFileName(book.fileName),
+      remoteFileSize,
+      book.chapterEpubIndex ?? 0,
+      book.multiFileChapter ? 1 : 0,
+      book.syncProgress === false ? 0 : 1,
       book.remoteProgressKnown === false ? 0 : 1,
       snapshotStartedAt,
       snapshotStartedAt,
@@ -486,16 +1123,42 @@ function replaceBookTask(
  * file columns and related reading/sync rows intact.
  */
 export async function replaceBooksInTransaction(
-  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  db: Pick<SQLiteDBConnection, 'executeTransaction'> & Partial<Pick<SQLiteDBConnection, 'query'>>,
   serverId: string,
   books: BookRecord[],
   refreshedAt = new Date().toISOString(),
 ): Promise<void> {
   if (books.length === 0) return;
-  await executeNativeTransaction(
-    db,
-    books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
-  );
+  if (books.every((book) => book.fileId == null)) {
+    await executeNativeTransaction(
+      db,
+      books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
+    );
+    return;
+  }
+  await enqueueNativeWrite(async () => {
+    let identityTasks: capTask[];
+    if (typeof db.query === 'function') {
+      const queryDb = { query: db.query.bind(db) };
+      const plan = planBookFileReconciliation(
+        serverId,
+        await queryExistingBookIdentities(queryDb, serverId),
+        books,
+      );
+      const schema =
+        plan.rekeys.length > 0
+          ? await queryIdentityMigrationSchema(queryDb)
+          : DEFAULT_IDENTITY_MIGRATION_SCHEMA;
+      identityTasks = plannedNativeIdentityTasks(serverId, plan, schema);
+    } else {
+      identityTasks = sqlOnlyIdentityTasks(serverId, books);
+    }
+    const tasks = [
+      ...identityTasks,
+      ...books.map((book) => replaceBookTask(serverId, book, refreshedAt)),
+    ];
+    await db.executeTransaction(tasks);
+  });
 }
 
 const retainedBookCondition = `(download_path IS NOT NULL OR download_status='available'
@@ -504,34 +1167,62 @@ const retainedBookCondition = `(download_path IS NOT NULL OR download_status='av
 
 /** Apply metadata and optional removal reconciliation atomically on native SQLite. */
 export async function reconcileBooksInTransaction(
-  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  db: Pick<SQLiteDBConnection, 'executeTransaction'> & Partial<Pick<SQLiteDBConnection, 'query'>>,
   serverId: string,
   books: BookRecord[],
   refreshedAt = new Date().toISOString(),
   preserveMissing = false,
   snapshotStartedAt: string | null = null,
 ): Promise<void> {
-  const tasks: capTask[] = [];
-  if (!preserveMissing) {
-    tasks.push({
-      statement: 'UPDATE books SET remote_available=0 WHERE server_id=? AND remote_available=1',
-      values: [serverId],
-    });
-  }
-  for (const book of books) {
-    tasks.push(
-      replaceBookTask(serverId, { ...book, remoteAvailable: true }, refreshedAt, snapshotStartedAt),
-    );
-  }
-  if (!preserveMissing) {
-    tasks.push({
-      statement: `DELETE FROM books WHERE server_id=? AND remote_available=0
-        AND NOT ${retainedBookCondition}`,
-      values: [serverId],
-    });
-  }
-  if (!tasks.length) return;
-  await executeNativeTransaction(db, tasks);
+  const hasFileIds = books.some((book) => book.fileId != null);
+  await enqueueNativeWrite(async () => {
+    let identityTasks: capTask[] = [];
+    if (hasFileIds) {
+      if (typeof db.query === 'function') {
+        const queryDb = { query: db.query.bind(db) };
+        const plan = planBookFileReconciliation(
+          serverId,
+          await queryExistingBookIdentities(queryDb, serverId),
+          books,
+        );
+        const schema =
+          plan.rekeys.length > 0
+            ? await queryIdentityMigrationSchema(queryDb)
+            : DEFAULT_IDENTITY_MIGRATION_SCHEMA;
+        identityTasks = plannedNativeIdentityTasks(serverId, plan, schema);
+      } else {
+        identityTasks = sqlOnlyIdentityTasks(serverId, books);
+      }
+    }
+
+    const tasks: capTask[] = [];
+    if (!preserveMissing) {
+      tasks.push({
+        statement: 'UPDATE books SET remote_available=0 WHERE server_id=? AND remote_available=1',
+        values: [serverId],
+      });
+    }
+    tasks.push(...identityTasks);
+    for (const book of books) {
+      tasks.push(
+        replaceBookTask(
+          serverId,
+          { ...book, remoteAvailable: true },
+          refreshedAt,
+          snapshotStartedAt,
+        ),
+      );
+    }
+    if (!preserveMissing) {
+      tasks.push({
+        statement: `DELETE FROM books WHERE server_id=? AND remote_available=0
+          AND NOT ${retainedBookCondition}`,
+        values: [serverId],
+      });
+    }
+    if (!tasks.length) return;
+    await db.executeTransaction(tasks);
+  });
 }
 
 export async function getBooks(
@@ -545,9 +1236,10 @@ export async function getBooks(
   const db = await openDatabase();
   const result = await executeNativeQuery(
     db,
-    `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
-      format, pages, pages_read, created_at, last_read_at, download_path, download_status,
-      file_size, remote_available${includeDescription ? ', description_html' : ''}
+    `SELECT id, server_id, library_id, series_id, volume_id, chapter_id, file_id, file_name,
+      title, author, series, format, pages, pages_read, created_at, last_read_at, download_path,
+      download_status, file_size, remote_file_size, chapter_epub_index, multi_file_chapter,
+      sync_progress, remote_available${includeDescription ? ', description_html' : ''}
       FROM books WHERE server_id = ? ORDER BY title`,
     [serverId],
   );
@@ -558,6 +1250,8 @@ export async function getBooks(
     seriesId: Number(row.series_id),
     volumeId: Number(row.volume_id),
     chapterId: Number(row.chapter_id),
+    fileId: parseNullableInteger(row.file_id),
+    fileName: sanitizeEpubFileName(row.file_name),
     title: String(row.title),
     author: row.author ? String(row.author) : null,
     series: row.series ? String(row.series) : null,
@@ -569,7 +1263,11 @@ export async function getBooks(
     lastReadAt: row.last_read_at ? String(row.last_read_at) : null,
     downloadPath: row.download_path ? String(row.download_path) : null,
     downloadStatus: String(row.download_status),
-    fileSize: row.file_size == null ? null : Number(row.file_size),
+    fileSize: parseNullableInteger(row.file_size),
+    remoteFileSize: parseNullableInteger(row.remote_file_size),
+    chapterEpubIndex: Number(row.chapter_epub_index ?? 0),
+    multiFileChapter: Number(row.multi_file_chapter ?? 0) !== 0,
+    syncProgress: Number(row.sync_progress ?? 1) !== 0,
     remoteAvailable: Number(row.remote_available ?? 1) !== 0,
   }));
 }
@@ -628,6 +1326,13 @@ const readingStateUpsertStatement = `INSERT INTO reading_state
   local_updated_at=excluded.local_updated_at,pending_sync=1,
   sync_revision=reading_state.sync_revision+1`;
 
+const localOnlyReadingStateUpsertStatement = `INSERT INTO reading_state
+  (book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync,sync_revision)
+  VALUES (?,?,?,?,?,0,1) ON CONFLICT(book_id) DO UPDATE SET cfi=excluded.cfi,
+  kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
+  local_updated_at=excluded.local_updated_at,pending_sync=0,
+  sync_revision=reading_state.sync_revision+1`;
+
 const syncQueueUpsertStatement = `INSERT INTO sync_queue
   (book_id,payload_json,created_at,updated_at,revision)
   VALUES (?,?,?,?,COALESCE((SELECT sync_revision FROM reading_state WHERE book_id=?),1))
@@ -641,9 +1346,10 @@ function createReadingStateTask(
   xpath: string | null,
   percentage: number,
   updatedAt: string,
+  pendingSync = true,
 ): capTask {
   return {
-    statement: readingStateUpsertStatement,
+    statement: pendingSync ? readingStateUpsertStatement : localOnlyReadingStateUpsertStatement,
     values: [bookId, cfi, xpath, percentage, updatedAt],
   };
 }
@@ -699,6 +1405,7 @@ export async function saveLocalProgress(
 ): Promise<void> {
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
+  const shouldSync = book.syncProgress !== false;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
       const syncRevision =
@@ -713,32 +1420,50 @@ export async function saveLocalProgress(
         localUpdatedAt: now,
         syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
         serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
-        pendingSync: true,
+        pendingSync: shouldSync,
         syncRevision,
       };
-      state.syncQueue[book.id] = {
-        bookId: book.id,
-        payloadJson: JSON.stringify({
-          libraryId: book.libraryId,
-          seriesId: book.seriesId,
-          volumeId: book.volumeId,
-          chapterId: book.chapterId,
-          pageNum: pagesRead,
-          bookScrollId: xpath,
-        }),
-        serverId: book.serverId,
-        attemptCount: 0,
-        lastAttemptAt: null,
-        lastError: null,
-        createdAt: state.syncQueue[book.id]?.createdAt ?? now,
-        updatedAt: now,
-        revision: syncRevision,
-      };
+      if (shouldSync) {
+        state.syncQueue[book.id] = {
+          bookId: book.id,
+          payloadJson: JSON.stringify({
+            libraryId: book.libraryId,
+            seriesId: book.seriesId,
+            volumeId: book.volumeId,
+            chapterId: book.chapterId,
+            pageNum: pagesRead,
+            bookScrollId: xpath,
+          }),
+          serverId: book.serverId,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: state.syncQueue[book.id]?.createdAt ?? now,
+          updatedAt: now,
+          revision: syncRevision,
+        };
+      } else {
+        delete state.syncQueue[book.id];
+      }
       updateBrowserBookProgress(state, book.id, pagesRead, now);
     });
     return;
   }
   const db = await openDatabase();
+  if (!shouldSync) {
+    await executeNativeTransaction(db, [
+      createReadingStateTask(book.id, cfi, xpath, percentage, now, false),
+      {
+        statement: 'DELETE FROM sync_queue WHERE book_id=?',
+        values: [book.id],
+      },
+      {
+        statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+        values: [pagesRead, now, book.id],
+      },
+    ]);
+    return;
+  }
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -759,6 +1484,7 @@ export async function saveLocalProgress(
 
 export async function markBookCompleted(book: BookRecord): Promise<void> {
   const now = new Date().toISOString();
+  const shouldSync = book.syncProgress !== false;
   const payload: PendingProgressPayload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -782,20 +1508,24 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
         localUpdatedAt: now,
         syncedLocalUpdatedAt: state.readingState[book.id]?.syncedLocalUpdatedAt ?? null,
         serverUpdatedAt: state.readingState[book.id]?.serverUpdatedAt ?? null,
-        pendingSync: true,
+        pendingSync: shouldSync,
         syncRevision,
       };
-      state.syncQueue[book.id] = {
-        bookId: book.id,
-        payloadJson: JSON.stringify(payload),
-        serverId: book.serverId,
-        attemptCount: 0,
-        lastAttemptAt: null,
-        lastError: null,
-        createdAt: state.syncQueue[book.id]?.createdAt ?? now,
-        updatedAt: now,
-        revision: syncRevision,
-      };
+      if (shouldSync) {
+        state.syncQueue[book.id] = {
+          bookId: book.id,
+          payloadJson: JSON.stringify(payload),
+          serverId: book.serverId,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          lastError: null,
+          createdAt: state.syncQueue[book.id]?.createdAt ?? now,
+          updatedAt: now,
+          revision: syncRevision,
+        };
+      } else {
+        delete state.syncQueue[book.id];
+      }
     });
     return;
   }
@@ -806,8 +1536,15 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
       values: [book.pages, now, book.id],
     },
   ];
-  tasks.push(createReadingStateTask(book.id, '', null, 1, now));
-  tasks.push(createSyncQueueTask(book.id, payload, now));
+  tasks.push(createReadingStateTask(book.id, '', null, 1, now, shouldSync));
+  if (shouldSync) {
+    tasks.push(createSyncQueueTask(book.id, payload, now));
+  } else {
+    tasks.push({
+      statement: 'DELETE FROM sync_queue WHERE book_id=?',
+      values: [book.id],
+    });
+  }
   await executeNativeTransaction(db, tasks);
 }
 
@@ -847,6 +1584,7 @@ function getBrowserSyncRows(
       !book ||
       book.serverId !== serverId ||
       book.remoteAvailable === false ||
+      book.syncProgress === false ||
       row.serverId !== book.serverId
     ) {
       return [];
@@ -880,7 +1618,8 @@ export async function getPendingSync(serverId: string): Promise<PendingSyncItem[
     `SELECT sync_queue.book_id,sync_queue.payload_json,sync_queue.updated_at,sync_queue.revision,
       books.library_id,books.series_id,books.volume_id,books.chapter_id
     FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at`,
+    WHERE books.server_id=? AND books.remote_available=1 AND books.sync_progress=1
+    ORDER BY sync_queue.updated_at`,
     [serverId],
   );
   return (result.values ?? []).map((row) => {
@@ -928,7 +1667,8 @@ export async function getSyncStatus(serverId: string): Promise<SyncStatus> {
     db,
     `SELECT sync_queue.updated_at,sync_queue.last_error
     FROM sync_queue CROSS JOIN books ON books.id=sync_queue.book_id
-    WHERE books.server_id=? AND books.remote_available=1 ORDER BY sync_queue.updated_at DESC`,
+    WHERE books.server_id=? AND books.remote_available=1 AND books.sync_progress=1
+    ORDER BY sync_queue.updated_at DESC`,
     [serverId],
   );
   return summarizeSyncRows(

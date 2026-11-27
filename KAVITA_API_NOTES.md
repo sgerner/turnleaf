@@ -12,9 +12,9 @@ Kavita supports user-created auth keys through the `x-api-key` header. Turnleaf 
 - `GET /api/Library/libraries`: user-visible libraries; retain only book libraries.
 - `POST /api/Series/v2`: paginated filtered series retrieval.
 - `GET /api/Series/series-detail`: volume, special, chapter, and file metadata.
-- `GET /api/Download/chapter`: EPUB download by `chapterId`.
-- `GET /api/Reader/get-progress`: current `ProgressDto` by `chapterId`.
-- `POST /api/Reader/progress`: save `ProgressDto`.
+- `GET /api/Download/chapter`: EPUB download by `chapterId` (streams a raw `.epub` for single-file chapters or an outer `.cbz` ZIP archive when Kavita attaches multiple files to one chapter).
+- `GET /api/Reader/get-progress`: current `ProgressDto` by `chapterId` (tracks `chapter.Files[0]` only).
+- `POST /api/Reader/progress`: save `ProgressDto` (used only for the primary EPUB of a chapter so sibling EPUBs do not overwrite server state).
 - `GET /api/Image/series-cover`: cover retrieval.
 - `GET /api/Search/search`: server search.
 

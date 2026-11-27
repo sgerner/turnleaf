@@ -1,10 +1,11 @@
 // @vitest-environment node
 
 import { readFileSync } from 'node:fs';
+import { crc32, deflateRawSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const native = vi.hoisted(() => ({
-  body: new Uint8Array(),
+  body: new Uint8Array() as Uint8Array<ArrayBufferLike>,
   deleted: [] as string[],
   renamed: false,
 }));
@@ -30,6 +31,8 @@ vi.mock('@capacitor/filesystem', () => ({
     mkdir: vi.fn(),
     getUri: vi.fn(),
     readFile: vi.fn(),
+    writeFile: vi.fn(),
+    appendFile: vi.fn(),
     rename: vi.fn(),
     deleteFile: vi.fn(),
   },
@@ -38,10 +41,87 @@ vi.mock('@capacitor/filesystem', () => ({
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import { EpubValidationError } from './epub-validation';
 import { cacheCover, downloadEpub, verifyDownloadedEpub } from './native-download';
 
 function encoded(bytes: Uint8Array): string {
-  return btoa(String.fromCharCode(...bytes));
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  }
+  return btoa(binary);
+}
+
+function decoded(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function makeDeflatedArchive(entries: Array<{ name: string; data: Uint8Array }>): Uint8Array {
+  const write16 = (bytes: Uint8Array, offset: number, value: number) => {
+    bytes[offset] = value & 0xff;
+    bytes[offset + 1] = (value >>> 8) & 0xff;
+  };
+  const write32 = (bytes: Uint8Array, offset: number, value: number) => {
+    write16(bytes, offset, value);
+    write16(bytes, offset + 2, value >>> 16);
+  };
+  const items = entries.map((entry) => ({
+    name: new TextEncoder().encode(entry.name),
+    compressed: new Uint8Array(deflateRawSync(entry.data)),
+    uncompressedSize: entry.data.length,
+    crc: crc32(entry.data),
+  }));
+  const localSize = items.reduce(
+    (sum, item) => sum + 30 + item.name.length + item.compressed.length,
+    0,
+  );
+  const centralSize = items.reduce((sum, item) => sum + 46 + item.name.length, 0);
+  const out = new Uint8Array(localSize + centralSize + 22);
+  let offset = 0;
+  const localOffsets: number[] = [];
+  for (const item of items) {
+    localOffsets.push(offset);
+    write32(out, offset, 0x04034b50);
+    write16(out, offset + 4, 20);
+    write16(out, offset + 6, 0x800);
+    write16(out, offset + 8, 8);
+    write32(out, offset + 14, item.crc);
+    write32(out, offset + 18, item.compressed.length);
+    write32(out, offset + 22, item.uncompressedSize);
+    write16(out, offset + 26, item.name.length);
+    offset += 30;
+    out.set(item.name, offset);
+    offset += item.name.length;
+    out.set(item.compressed, offset);
+    offset += item.compressed.length;
+  }
+  const centralOffset = offset;
+  items.forEach((item, index) => {
+    write32(out, offset, 0x02014b50);
+    write16(out, offset + 4, 20);
+    write16(out, offset + 6, 20);
+    write16(out, offset + 8, 0x800);
+    write16(out, offset + 10, 8);
+    write32(out, offset + 16, item.crc);
+    write32(out, offset + 20, item.compressed.length);
+    write32(out, offset + 24, item.uncompressedSize);
+    write16(out, offset + 28, item.name.length);
+    write32(out, offset + 42, localOffsets[index]!);
+    offset += 46;
+    out.set(item.name, offset);
+    offset += item.name.length;
+  });
+  write32(out, offset, 0x06054b50);
+  write16(out, offset + 8, items.length);
+  write16(out, offset + 10, items.length);
+  write32(out, offset + 12, centralSize);
+  write32(out, offset + 16, centralOffset);
+  return out;
 }
 
 beforeEach(() => {
@@ -88,6 +168,21 @@ beforeEach(() => {
     .mockImplementation(async ({ offset = 0, length = -1 }) => ({
       data: encoded(native.body.slice(offset, length > 0 ? offset + length : undefined)),
     }));
+  vi.mocked(Filesystem.writeFile)
+    .mockReset()
+    .mockImplementation(async ({ data }) => {
+      native.body = typeof data === 'string' ? decoded(data) : new Uint8Array();
+      return { uri: 'file://books/written' };
+    });
+  vi.mocked(Filesystem.appendFile)
+    .mockReset()
+    .mockImplementation(async ({ data }) => {
+      const appended = typeof data === 'string' ? decoded(data) : new Uint8Array();
+      const combined = new Uint8Array(native.body.length + appended.length);
+      combined.set(native.body, 0);
+      combined.set(appended, native.body.length);
+      native.body = combined;
+    });
 });
 
 afterEach(() => vi.useRealTimers());
@@ -191,6 +286,67 @@ describe('native EPUB download boundary', () => {
   it('clears a file whose contents fail EPUB validation', async () => {
     await expect(verifyDownloadedEpub('books/book.epub')).resolves.toBeNull();
     expect(native.deleted).toEqual(['books/book.epub']);
+  });
+
+  it('unwraps a multi-file chapter CBZ archive, saves only the matched EPUB, and passes verification', async () => {
+    const primaryEpub = new Uint8Array(readFileSync('dev/kavita/data/Books/lorem-ipsum.epub'));
+    const comment = new TextEncoder().encode('secondary-edition');
+    const secondaryEpub = new Uint8Array(primaryEpub.length + comment.length);
+    secondaryEpub.set(primaryEpub);
+    secondaryEpub[primaryEpub.length - 2] = comment.length;
+    secondaryEpub[primaryEpub.length - 1] = 0;
+    secondaryEpub.set(comment, primaryEpub.length);
+
+    const outerCbz = makeDeflatedArchive([
+      { name: 'edition-1/edition-1.epub', data: primaryEpub },
+      { name: 'edition-2/edition-2.epub', data: secondaryEpub },
+      { name: 'scan/supplement.pdf', data: new TextEncoder().encode('%PDF-1.7 test') },
+    ]);
+    native.body = outerCbz;
+
+    const downloaded = await downloadEpub(
+      'https://books.example.com/api/Download/chapter?chapterId=1406',
+      'secret',
+      'primary-82-1406-2115',
+      undefined,
+      'https://books.example.com',
+      {
+        fileName: 'edition-2.epub',
+        expectedByteSize: secondaryEpub.length,
+        epubIndex: 1,
+      },
+    );
+
+    expect(downloaded).toMatchObject({
+      relativePath: 'books/primary-82-1406-2115.epub',
+      size: secondaryEpub.length,
+    });
+    expect(native.renamed).toBe(true);
+    expect(native.body).toEqual(secondaryEpub);
+    await expect(verifyDownloadedEpub(downloaded.relativePath)).resolves.toMatchObject({
+      relativePath: 'books/primary-82-1406-2115.epub',
+      size: secondaryEpub.length,
+    });
+  });
+
+  it('deletes the temporary partial file and raises EpubValidationError when an outer archive lacks a matching EPUB', async () => {
+    native.body = makeDeflatedArchive([
+      { name: 'scan/supplement.pdf', data: new TextEncoder().encode('%PDF-1.7 only') },
+    ]);
+
+    await expect(
+      downloadEpub(
+        'https://books.example.com/api/Download/chapter?chapterId=1406',
+        'secret',
+        'primary-82-1406',
+        undefined,
+        'https://books.example.com',
+        { fileName: 'missing.epub', epubIndex: 0 },
+      ),
+    ).rejects.toBeInstanceOf(EpubValidationError);
+
+    expect(native.renamed).toBe(false);
+    expect(native.deleted).toContain('books/primary-82-1406.epub.partial');
   });
 
   it('disables automatic redirects, follows up to five same-origin 3xx hops, and tracks active hop progress', async () => {

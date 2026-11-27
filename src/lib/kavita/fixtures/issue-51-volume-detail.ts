@@ -5,7 +5,7 @@ function chapter(
   volumeId: number,
   pages: number,
   titleName: string,
-  files: Array<{ id: number; bytes: number }>,
+  files: Array<{ id: number; bytes: number; pages: number; fileName: string }>,
 ): KavitaChapter {
   return {
     id,
@@ -16,6 +16,7 @@ function chapter(
     pagesRead: 0,
     summary: '',
     format: 3,
+    ...(files.length > 1 ? { hasMultipleFiles: true } : {}),
     files: files.map((file) => ({ ...file, extension: '.epub', format: 3 })),
     writers: [{ name: 'George Rawlinson' }],
     lastReadingProgressUtc: '0001-01-01T00:00:00',
@@ -32,8 +33,13 @@ export const issue51VolumeDetail = {
       id: 188,
       chapters: [
         chapter(1406, 188, 9, 'The Seven Great Monarchies Of The Ancient Eastern World, Vol 3', [
-          { id: 2114, bytes: 1955734 },
-          { id: 2115, bytes: 2169759 },
+          { id: 2114, bytes: 1955734, pages: 5, fileName: 'pg16163-images-3.epub' },
+          {
+            id: 2115,
+            bytes: 2169759,
+            pages: 4,
+            fileName: 'The-Seven-Great-Monarchies-Of-The-Ancient-Eastern-World-Vol-3-Media.epub',
+          },
         ]),
       ],
     },
@@ -41,7 +47,7 @@ export const issue51VolumeDetail = {
       id: 189,
       chapters: [
         chapter(1407, 189, 16, 'The Seven Great Monarchies Of The Ancient Eastern World, Vol 5', [
-          { id: 2116, bytes: 10039970 },
+          { id: 2116, bytes: 10039970, pages: 16, fileName: 'pg16165-images-3.epub' },
         ]),
       ],
     },
@@ -49,7 +55,7 @@ export const issue51VolumeDetail = {
       id: 191,
       chapters: [
         chapter(1409, 191, 8, 'The Seven Great Monarchies Of The Ancient Eastern World, Vol 6', [
-          { id: 2118, bytes: 2902733 },
+          { id: 2118, bytes: 2902733, pages: 8, fileName: 'pg16166-images-3.epub' },
         ]),
       ],
     },
@@ -57,7 +63,7 @@ export const issue51VolumeDetail = {
       id: 190,
       chapters: [
         chapter(1408, 190, 11, 'The Seven Great Monarchies Of The Ancient Eastern World, Vol 7', [
-          { id: 2117, bytes: 6659250 },
+          { id: 2117, bytes: 6659250, pages: 11, fileName: 'pg16167-images-3.epub' },
         ]),
       ],
     },

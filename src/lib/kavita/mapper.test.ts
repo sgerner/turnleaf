@@ -234,8 +234,51 @@ it('maps the minimized volume-only payload reported in issue #51', () => {
   } satisfies KavitaSeries;
 
   const books = mapSeriesToBooks('primary', series, issue51VolumeDetail);
-  expect(books.map((book) => book.chapterId)).toEqual([1406, 1407, 1409, 1408]);
-  expect(books.map((book) => book.series)).toEqual(Array(4).fill(series.name));
+  expect(books).toHaveLength(5);
+  expect(books.map((book) => book.chapterId)).toEqual([1406, 1406, 1407, 1409, 1408]);
+  expect(books.map((book) => book.fileId)).toEqual([2114, 2115, 2116, 2118, 2117]);
+  expect(books.map((book) => book.id)).toEqual([
+    'primary:82:1406:2114',
+    'primary:82:1406:2115',
+    'primary:82:1407',
+    'primary:82:1409',
+    'primary:82:1408',
+  ]);
+  expect(books.map((book) => book.pages)).toEqual([5, 4, 16, 8, 11]);
+  expect(books.map((book) => book.fileSize)).toEqual([
+    1955734, 2169759, 10039970, 2902733, 6659250,
+  ]);
+  expect(books[0]).toMatchObject({
+    id: 'primary:82:1406:2114',
+    fileId: 2114,
+    fileName: 'pg16163-images-3.epub',
+    title: 'The Seven Great Monarchies Of The Ancient Eastern World, Vol 3 (pg16163-images-3)',
+    pages: 5,
+    fileSize: 1955734,
+    remoteFileSize: 1955734,
+    chapterEpubIndex: 0,
+    multiFileChapter: true,
+    syncProgress: true,
+  });
+  expect(books[1]).toMatchObject({
+    id: 'primary:82:1406:2115',
+    fileId: 2115,
+    fileName: 'The-Seven-Great-Monarchies-Of-The-Ancient-Eastern-World-Vol-3-Media.epub',
+    title:
+      'The Seven Great Monarchies Of The Ancient Eastern World, Vol 3 (The-Seven-Great-Monarchies-Of-The-Ancient-Eastern-World-Vol-3-Media)',
+    pages: 4,
+    pagesRead: 0,
+    lastReadAt: null,
+    fileSize: 2169759,
+    remoteFileSize: 2169759,
+    chapterEpubIndex: 1,
+    multiFileChapter: true,
+    syncProgress: false,
+    remoteProgressKnown: false,
+    remoteReadDateKnown: false,
+  });
+  expect(books[2]?.title).toBe('The Seven Great Monarchies Of The Ancient Eastern World, Vol 5');
+  expect(books.map((book) => book.series)).toEqual(Array(5).fill(series.name));
 });
 
 it('keeps chapter progress and dates separate from series aggregates', () => {
@@ -360,4 +403,132 @@ it('maps EPUBs when Kavita omits optional names, covers, or file extensions', ()
       fileSize: 1000,
     },
   ]);
+});
+
+it('maps mixed EPUB-plus-PDF chapters using per-file pages and keeps sibling EPUB progress local', () => {
+  const series = normalizeSeriesPage([
+    {
+      id: 55,
+      libraryId: 1,
+      format: 3,
+      pages: 400,
+      pagesRead: 9,
+      name: 'Collected Editions',
+      created: '2026-09-05T00:00:00Z',
+      latestReadDate: '2026-09-06T10:00:00Z',
+    },
+  ])[0]!;
+  const detail = normalizeSeriesDetail({
+    volumes: [
+      {
+        id: 500,
+        chapters: [
+          {
+            id: 5001,
+            volumeId: 500,
+            title: 'Volume One',
+            titleName: 'Volume One',
+            pages: 320,
+            pagesRead: 18,
+            summary: '',
+            format: 3,
+            lastReadingProgressUtc: '2026-09-06T10:00:00Z',
+            writers: [{ name: 'Editor' }],
+            files: [
+              {
+                id: 9001,
+                format: 3,
+                bytes: 512000,
+                pages: 12,
+                extension: '.epub',
+                filePath: '/books/Collected/Volume-One-Text.epub',
+              },
+              {
+                id: 9002,
+                format: 4,
+                bytes: 8400000,
+                pages: 308,
+                extension: '.pdf',
+                filePath: '/books/Collected/Volume-One-Scan.pdf',
+              },
+            ],
+          },
+          {
+            id: 5002,
+            volumeId: 500,
+            title: 'Volume Two',
+            titleName: 'Volume Two',
+            pages: 25,
+            pagesRead: 9,
+            summary: '',
+            format: 3,
+            lastReadingProgressUtc: '2026-09-06T12:00:00Z',
+            writers: [{ name: 'Editor' }],
+            files: [
+              { id: 9003, format: 3, bytes: 300000, pages: 10, extension: '.epub' },
+              { id: 9004, format: 3, bytes: 450000, pages: 15, extension: '.epub' },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  const books = mapSeriesToBooks('primary', series, detail);
+  expect(books).toHaveLength(3);
+  expect(books[0]).toMatchObject({
+    id: 'primary:55:5001',
+    fileId: 9001,
+    fileName: 'Volume-One-Text.epub',
+    title: 'Volume One',
+    pages: 12,
+    pagesRead: 12,
+    fileSize: 512000,
+    multiFileChapter: true,
+    syncProgress: true,
+  });
+  expect(books[1]).toMatchObject({
+    id: 'primary:55:5002:9003',
+    fileId: 9003,
+    title: 'Volume Two (File 1)',
+    pages: 10,
+    pagesRead: 9,
+    lastReadAt: '2026-09-06T12:00:00Z',
+    syncProgress: true,
+  });
+  expect(books[2]).toMatchObject({
+    id: 'primary:55:5002:9004',
+    fileId: 9004,
+    title: 'Volume Two (File 2)',
+    pages: 15,
+    pagesRead: 0,
+    lastReadAt: null,
+    syncProgress: false,
+    remoteProgressKnown: false,
+    remoteReadDateKnown: false,
+  });
+
+  const reversedDetail = structuredClone(detail);
+  reversedDetail.volumes![0]!.chapters[1]!.files.reverse();
+  const reversedBooks = mapSeriesToBooks('primary', series, reversedDetail);
+  expect(reversedBooks[1]).toMatchObject({
+    id: 'primary:55:5002:9004',
+    fileId: 9004,
+    title: 'Volume Two (File 2)',
+    pages: 15,
+    pagesRead: 0,
+    lastReadAt: null,
+    chapterEpubIndex: 0,
+    syncProgress: false,
+  });
+  expect(reversedBooks[2]).toMatchObject({
+    id: 'primary:55:5002:9003',
+    fileId: 9003,
+    title: 'Volume Two (File 1)',
+    pages: 10,
+    pagesRead: 9,
+    lastReadAt: '2026-09-06T12:00:00Z',
+    chapterEpubIndex: 1,
+    syncProgress: true,
+  });
 });

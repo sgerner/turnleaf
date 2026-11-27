@@ -6,7 +6,9 @@
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline
 - Block authenticated Kavita requests at the native transport boundary when offline.
+- fix(database): move multi-EPUB books schema to idempotent migration v9
 - chore(deps): bump svelte to 5.59.2
+- fix(database): move multi-EPUB books schema to idempotent migration v9 after #330 v8
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests

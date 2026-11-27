@@ -9,10 +9,16 @@ import {
   KavitaError,
   nativeHeader,
 } from '../kavita/redirects';
-import { EpubValidationError, validateEpubArchive } from './epub-validation';
+import {
+  EpubValidationError,
+  prepareDownloadedEpub,
+  validateEpubArchive,
+  type EpubArchiveTarget,
+} from './epub-validation';
 
 const BOOK_DIRECTORY = 'books';
 const PARTIAL_SUFFIX = '.partial';
+const WRITE_CHUNK_BYTES = 3 * 1024 * 1024;
 export const EPUB_DOWNLOAD_ENDPOINT = '/api/Download/chapter';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 500, 502, 503, 504]);
 let interruptedDownloadCleanup: Promise<void> | undefined;
@@ -34,6 +40,30 @@ function decodeNativeBytes(data: string | Blob): Uint8Array {
     bytes[index] = binary.charCodeAt(index);
   }
   return bytes;
+}
+
+function encodeNativeBytes(bytes: Uint8Array): string {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  }
+  return btoa(binary);
+}
+
+async function writeNativeBytes(path: string, bytes: Uint8Array): Promise<void> {
+  if (bytes.length === 0) {
+    await Filesystem.writeFile({ path, directory: Directory.Data, data: '' });
+    return;
+  }
+  for (let offset = 0; offset < bytes.length; offset += WRITE_CHUNK_BYTES) {
+    const chunk = bytes.subarray(offset, offset + WRITE_CHUNK_BYTES);
+    const data = encodeNativeBytes(chunk);
+    if (offset === 0) {
+      await Filesystem.writeFile({ path, directory: Directory.Data, data });
+    } else {
+      await Filesystem.appendFile({ path, directory: Directory.Data, data });
+    }
+  }
 }
 
 async function readNativeRange(path: string, offset: number, length: number): Promise<Uint8Array> {
@@ -196,9 +226,10 @@ export async function downloadEpub(
   bookId: string,
   onProgress?: (percent: number) => void,
   serverOrigin?: string,
+  archiveTarget?: EpubArchiveTarget,
 ): Promise<DownloadedBookFile> {
   if (!Capacitor.isNativePlatform()) throw new Error('Downloads require the native application.');
-  const target = assertSafeTransferTarget(
+  const transferTarget = assertSafeTransferTarget(
     downloadUrl,
     serverOrigin,
     'Invalid Kavita download address.',
@@ -210,7 +241,7 @@ export async function downloadEpub(
   const finalPath = `${BOOK_DIRECTORY}/${bookId}.epub`;
   const temporaryPath = `${finalPath}${PARTIAL_SUFFIX}`;
   const destination = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
-  let activeHopUrl = target.url;
+  let activeHopUrl = transferTarget.url;
   const listener = onProgress
     ? await FileTransfer.addListener('progress', (event) => {
         if (
@@ -231,9 +262,9 @@ export async function downloadEpub(
     for (let attempt = 0; ; attempt += 1) {
       try {
         await downloadFileWithRedirects({
-          initialUrl: target.url,
-          normalizedInitialUrl: target.normalizedUrl,
-          serverOrigin: target.serverOrigin,
+          initialUrl: transferTarget.url,
+          normalizedInitialUrl: transferTarget.normalizedUrl,
+          serverOrigin: transferTarget.serverOrigin,
           path: destination.uri,
           apiKey,
           progress: Boolean(listener),
@@ -266,20 +297,12 @@ export async function downloadEpub(
     if (stat.type !== 'file') throw new EpubValidationError('Kavita did not return an EPUB file.');
     const readRange = (offset: number, length: number) =>
       readNativeRange(temporaryPath, offset, length);
-    const repaired = await validateEpubArchive(stat.size, readRange, true);
-    if (repaired) {
-      let binary = '';
-      for (let offset = 0; offset < repaired.length; offset += 8192) {
-        binary += String.fromCharCode(...repaired.subarray(offset, offset + 8192));
-      }
-      await Filesystem.writeFile({
-        path: temporaryPath,
-        directory: Directory.Data,
-        data: btoa(binary),
-      });
+    const prepared = await prepareDownloadedEpub(stat.size, readRange, archiveTarget);
+    if (prepared) {
+      await writeNativeBytes(temporaryPath, prepared);
       const written = await Filesystem.stat({ path: temporaryPath, directory: Directory.Data });
-      if (written.type !== 'file' || written.size !== repaired.length) {
-        throw new Error('The repaired EPUB could not be saved.');
+      if (written.type !== 'file' || written.size !== prepared.length) {
+        throw new Error('The extracted EPUB could not be saved.');
       }
       await validateEpubArchive(written.size, readRange);
     }
@@ -294,7 +317,7 @@ export async function downloadEpub(
       relativePath: finalPath,
       nativeUri: final.uri,
       webViewUrl,
-      size: repaired?.length ?? stat.size,
+      size: prepared?.length ?? stat.size,
     };
   } catch (error) {
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});

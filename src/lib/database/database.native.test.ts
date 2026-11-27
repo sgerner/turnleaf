@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 7;
+  let databaseVersion = 9;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 7;
+      databaseVersion = 9;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -381,7 +381,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(7);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(9);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -391,6 +391,8 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN file_id'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
     'PRAGMA user_version = 1;',
@@ -400,6 +402,36 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 5;',
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
+    'PRAGMA user_version = 8;',
+    'PRAGMA user_version = 9;',
+  ]);
+});
+
+it('saves secondary EPUB progress locally without inserting into sync_queue', async () => {
+  const { markBookCompleted, saveLocalProgress } = await import('./database');
+  const siblingBook = {
+    ...book,
+    id: 'server:1:10:2115',
+    fileId: 2115,
+    chapterEpubIndex: 1,
+    multiFileChapter: true,
+    syncProgress: false,
+  };
+
+  await saveLocalProgress(siblingBook, readingState.cfi, readingState.xpath, 0.5, 1);
+  await markBookCompleted(siblingBook);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
+  const [progressTasks, completionTasks] = mocks.executeTransaction.mock.calls;
+  expect(progressTasks?.[0]?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('pending_sync=0'),
+    'DELETE FROM sync_queue WHERE book_id=?',
+    expect.stringContaining('UPDATE books'),
+  ]);
+  expect(completionTasks?.[0]?.map((task) => task.statement)).toEqual([
+    expect.stringContaining('UPDATE books'),
+    expect.stringContaining('pending_sync=0'),
+    'DELETE FROM sync_queue WHERE book_id=?',
   ]);
 });
 
@@ -436,4 +468,126 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
   } finally {
     vi.unstubAllGlobals();
   }
+});
+
+it('reconciles native SQLite legacy null file_id bridge rows into file-scoped book IDs in one transaction', async () => {
+  const { getBooks, reconcileBooks } = await import('./database');
+  mocks.db.query.mockResolvedValueOnce({
+    values: [{ id: 'server:1:10', chapter_id: 10, file_id: 'null' }],
+  });
+
+  await reconcileBooks('server', [
+    {
+      ...book,
+      id: 'server:1:10:2114',
+      fileId: 2114,
+      multiFileChapter: true,
+      syncProgress: true,
+    },
+    {
+      ...book,
+      id: 'server:1:10:2115',
+      fileId: 2115,
+      chapterEpubIndex: 1,
+      multiFileChapter: true,
+      syncProgress: false,
+    },
+  ]);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(1);
+  const statements = mocks.executeTransaction.mock.calls[0]?.[0]?.map((task) => task.statement);
+  expect(statements).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining('INSERT INTO books (id,'),
+      'UPDATE reading_state SET book_id = ? WHERE book_id = ?',
+      'UPDATE sync_queue SET book_id = ? WHERE book_id = ?',
+      expect.stringContaining('UPDATE OR REPLACE preferences'),
+    ]),
+  );
+
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      {
+        id: 'server:1:10:2114',
+        server_id: 'server',
+        library_id: 1,
+        series_id: 1,
+        volume_id: 10,
+        chapter_id: 10,
+        file_id: 'null',
+        file_name: null,
+        title: 'Book',
+        author: null,
+        series: null,
+        format: 'epub',
+        pages: 100,
+        pages_read: 0,
+        created_at: '2026-01-01T00:00:00.000Z',
+        last_read_at: null,
+        download_path: null,
+        download_status: 'none',
+        file_size: 'null',
+        remote_file_size: '',
+        chapter_epub_index: 0,
+        multi_file_chapter: 1,
+        sync_progress: 1,
+        remote_available: 1,
+      },
+    ],
+  });
+  await expect(getBooks('server', { includeDescription: false })).resolves.toMatchObject([
+    {
+      id: 'server:1:10:2114',
+      fileId: null,
+      fileSize: null,
+      remoteFileSize: null,
+    },
+  ]);
+});
+
+it('checks PRAGMA table_info before ALTER TABLE ADD COLUMN and skips already-existing columns', async () => {
+  const { migrateDatabase } = await import('./database');
+  mocks.setDatabaseVersion(7);
+  const existingColumns = new Set([
+    'id',
+    'remote_file_size',
+    'downloaded_bytes',
+    'file_id',
+    'sync_progress',
+  ]);
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    if (statement === "PRAGMA table_info('books')") {
+      return { values: [...existingColumns].map((name) => ({ name })) };
+    }
+    return { values: [] };
+  });
+
+  await migrateDatabase(mocks.db);
+
+  expect(mocks.db.query).toHaveBeenCalledWith("PRAGMA table_info('books')");
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
+  const [v8Tasks, v9Tasks] = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
+
+  const v8Statement = v8Tasks?.[0]?.statement ?? '';
+  expect(v8Statement).not.toContain('remote_file_size');
+  expect(v8Statement).not.toContain('downloaded_bytes');
+  expect(v8Statement).toContain('ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;');
+  expect(v8Statement).toContain('ALTER TABLE books ADD COLUMN chapter_key TEXT;');
+  expect(v8Tasks?.[1]?.statement).toBe('PRAGMA user_version = 8;');
+
+  const v9Statement = v9Tasks?.[0]?.statement ?? '';
+  expect(v9Statement).not.toContain('remote_file_size');
+  expect(v9Statement).not.toContain('ADD COLUMN file_id');
+  expect(v9Statement).not.toContain('ADD COLUMN sync_progress');
+  expect(v9Statement).toContain('ALTER TABLE books ADD COLUMN file_name TEXT;');
+  expect(v9Statement).toContain(
+    'ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(v9Statement).toContain(
+    'ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(v9Statement).toContain(
+    'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);',
+  );
+  expect(v9Tasks?.[1]?.statement).toBe('PRAGMA user_version = 9;');
 });

@@ -38,6 +38,8 @@ export interface KavitaPerson {
 export interface KavitaFile {
   id: number;
   bytes: number;
+  pages?: number;
+  fileName?: string | null;
   extension?: string | null;
   format: number;
 }
@@ -51,6 +53,7 @@ export interface KavitaChapter {
   pagesRead?: number;
   summary: string;
   format?: number | null;
+  hasMultipleFiles?: boolean;
   files: KavitaFile[];
   writers: KavitaPerson[];
   lastReadingProgressUtc?: string | null;
