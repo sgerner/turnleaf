@@ -4,36 +4,55 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import type { KavitaClient } from '../kavita/client';
+import { KavitaError, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
 const flushing = new Map<string, Promise<void>>();
 
-export function flushProgress(client: KavitaClient, serverId: string): Promise<void> {
+export function flushProgress(
+  client: KavitaClient,
+  serverId: string,
+  signal?: AbortSignal,
+): Promise<void> {
   const pending = flushing.get(serverId);
   if (pending) return pending;
-  const current = run(client, serverId).finally(() => {
+  const current = run(client, serverId, signal).finally(() => {
     if (flushing.get(serverId) === current) flushing.delete(serverId);
   });
   flushing.set(serverId, current);
   return current;
 }
 
-async function run(client: KavitaClient, serverId: string): Promise<void> {
+function isAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === 'AbortError') ||
+    (error instanceof Error && error.name === 'AbortError')
+  );
+}
+
+async function run(client: KavitaClient, serverId: string, signal?: AbortSignal): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
-  while (true) {
+  cancelled: while (!signal?.aborted) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
-    if (pending.length === 0) break;
+    if (pending.length === 0 || signal?.aborted) break;
     for (const item of pending) {
+      if (signal?.aborted) break cancelled;
       attempted.set(item.bookId, item);
       try {
         await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
         await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
       } catch (error) {
+        if (
+          signal?.aborted ||
+          isAbortError(error) ||
+          (error instanceof KavitaError && error.transportDenied)
+        ) {
+          break cancelled;
+        }
         await markSyncFailure(
           item.bookId,
           error instanceof Error ? error.message : 'Sync failed',

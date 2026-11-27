@@ -76,10 +76,11 @@
   } from '../a11y/book-labels';
   import {
     activeElement,
-    focusModal,
+    focusAfterUnmount,
+    focusViewEntry,
+    modalFocusTrap,
     restoreFocus,
     restoreModalFocus,
-    trapModalKeydown,
   } from '../a11y/modal-focus';
 
   let {
@@ -109,7 +110,7 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   let activeApiKey = $derived(apiKey);
-  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey, ensureClientTransport));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
@@ -251,6 +252,7 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let syncController: AbortController | null = null;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -270,9 +272,6 @@
   let confirmDeleteServer = $state(false);
   let credentialCleanupComplete = false;
   let actionMenuBook = $state<BookRecord | null>(null);
-  let actionMenuDialog = $state<HTMLElement | null>(null);
-  let conflictDialog = $state<HTMLElement | null>(null);
-  let settingsDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
@@ -717,41 +716,30 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    offline = !(await Network.getStatus().catch(() => null))?.connected;
+    const initialNetworkStatus = await Network.getStatus().catch(() => null);
     if (destroyed) return;
+    offline = !isConnectedStatus(initialNetworkStatus);
     books = savedBooks;
     retainCoversFor(books);
     loading = false;
     void refreshSyncStatus();
-    offlineMessage = offline
-      ? displayableBooks.length
-        ? 'No network connection. Showing your saved library.'
-        : 'No network connection. Connect to Kavita to load your library.'
-      : '';
+    offlineMessage = offline ? disconnectedLibraryMessage() : '';
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', ({ connected }) => {
+        await Network.addListener('networkStatusChange', (nextStatus) => {
           if (destroyed) return;
-          const wasOffline = offline;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
+          const revision = ++networkStatusRevision;
+          if (!isConnectedStatus(nextStatus)) {
+            latestAppliedProbeId = ++statusProbeSequence;
+            applyDisconnectedState();
+            return;
           }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected && wasOffline) {
-            const baselineRevision = activeSyncStartRevision ?? messageRevision;
-            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-            void syncProgress(false);
-            void startRefresh(false, baselineRevision, baselineMessage);
+          if (!Capacitor.isNativePlatform()) {
+            applyConnectedState();
+            return;
           }
+          void confirmReconnectStatus(revision);
         }),
       ),
     );
@@ -795,11 +783,106 @@
     return handle.remove;
   }
 
+  let networkStatusRevision = 0;
+  let disconnectRevision = 0;
+  let statusProbeSequence = 0;
+  let latestAppliedProbeId = 0;
+  let pendingReconnectSync = false;
+
+  function isConnectedStatus(
+    status: { connected?: boolean; connectionType?: string } | null | undefined,
+  ): boolean {
+    return (
+      Boolean(status?.connected) && status?.connectionType !== 'none' && navigator.onLine !== false
+    );
+  }
+
+  function disconnectedLibraryMessage(): string {
+    return displayableBooks.length
+      ? 'No network connection. Showing your saved library.'
+      : 'No network connection. Connect to Kavita to load your library.';
+  }
+
+  function applyDisconnectedState(): void {
+    disconnectRevision += 1;
+    pendingReconnectSync = false;
+    offline = true;
+    kavitaUnreachable = false;
+    if (syncTimer !== null) {
+      window.clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    syncController?.abort();
+    refreshController?.abort();
+    openProgressProbe?.abort();
+    cancelCoverLoading();
+    sharedCoverLoader.cancel();
+    coverReloadRequest += 1;
+    offlineMessage = disconnectedLibraryMessage();
+  }
+
+  function applyConnectedState(): void {
+    const wasOffline = offline;
+    offline = false;
+    kavitaUnreachable = false;
+    offlineMessage = '';
+    coverReloadRequest += 1;
+    if (wasOffline) {
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+      if (syncWork) {
+        pendingReconnectSync = true;
+      } else {
+        void syncProgress(false);
+      }
+      void startRefresh(false, baselineRevision, baselineMessage);
+    }
+  }
+
+  async function confirmReconnectStatus(revision: number): Promise<void> {
+    const disconnectAtStart = disconnectRevision;
+    const probeId = ++statusProbeSequence;
+    const liveStatus = await Network.getStatus().catch(() => null);
+    if (
+      destroyed ||
+      revision !== networkStatusRevision ||
+      disconnectRevision !== disconnectAtStart
+    ) {
+      return;
+    }
+    if (probeId <= latestAppliedProbeId) return;
+    latestAppliedProbeId = probeId;
+    if (!isConnectedStatus(liveStatus)) {
+      applyDisconnectedState();
+      return;
+    }
+    applyConnectedState();
+  }
+
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
-    if (!Capacitor.isNativePlatform()) return true;
+    if (!Capacitor.isNativePlatform()) return navigator.onLine !== false;
+    const disconnectAtStart = disconnectRevision;
+    const probeId = ++statusProbeSequence;
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    if (destroyed || disconnectRevision !== disconnectAtStart) return false;
+    if (!isConnectedStatus(status)) {
+      if (probeId > latestAppliedProbeId) {
+        latestAppliedProbeId = probeId;
+        applyDisconnectedState();
+      }
+      return false;
+    }
+    if (probeId > latestAppliedProbeId) {
+      latestAppliedProbeId = probeId;
+    }
+    return !offline && disconnectRevision === disconnectAtStart;
+  }
+
+  async function ensureClientTransport(signal?: AbortSignal): Promise<boolean> {
+    if (destroyed || signal?.aborted) return false;
+    const available = await networkAvailable();
+    return available && !destroyed && !signal?.aborted;
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -813,13 +896,23 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
+    if (!showFeedback && offline) return Promise.resolve();
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
-    syncWork = runProgressSync(showFeedback).finally(() => {
-      syncWork = null;
+    const work = runProgressSync(showFeedback).finally(() => {
+      if (syncWork === work) {
+        syncController = null;
+        syncWork = null;
+        syncing = false;
+      }
+      if (pendingReconnectSync && !destroyed && !offline) {
+        pendingReconnectSync = false;
+        void syncProgress(false);
+      }
     });
-    return syncWork;
+    syncWork = work;
+    return work;
   }
 
   function setMessage(next: string): void {
@@ -829,19 +922,34 @@
 
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    const controller = new AbortController();
+    syncController = controller;
     activeSyncStartRevision = messageRevision;
+    const disconnectAtStart = disconnectRevision;
     try {
-      const available = Capacitor.isNativePlatform()
-        ? await networkAvailable()
+      const available = showFeedback
+        ? Capacitor.isNativePlatform()
+          ? await networkAvailable()
+          : !offline && !destroyed
         : !offline && !destroyed;
-      if (!available) {
-        if (showFeedback)
+      if (!available || controller.signal.aborted) {
+        if (!available && showFeedback)
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id);
+      pendingReconnectSync = false;
+      await flushProgress(client, server.id, controller.signal);
+      const remaining = await getSyncStatus(server.id).catch(() => null);
+      if (!destroyed && remaining) syncStatus = remaining;
+      if (disconnectRevision !== disconnectAtStart || controller.signal.aborted || offline) {
+        if (showFeedback && (remaining?.pendingCount ?? 0) > 0) {
+          setMessage('Offline. Reading progress will retry when Kavita is available.');
+        }
+        return;
+      }
       if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
+      if (controller.signal.aborted || offline) return;
       if (
         error instanceof AggregateError &&
         error.errors.some(
@@ -857,7 +965,6 @@
     } finally {
       await refreshSyncStatus();
       activeSyncStartRevision = null;
-      syncing = false;
     }
   }
 
@@ -868,6 +975,7 @@
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
+    syncController?.abort();
     openProgressProbe?.abort();
     refreshController?.abort();
     cancelCoverLoading();
@@ -920,7 +1028,13 @@
       message = '';
     }
     try {
-      if (!(await networkAvailable()) || controller.signal.aborted) return;
+      if (offline || destroyed || controller.signal.aborted) return;
+      if (
+        !Capacitor.isNativePlatform() &&
+        (!(await networkAvailable()) || controller.signal.aborted)
+      ) {
+        return;
+      }
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
@@ -967,7 +1081,9 @@
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || (cause instanceof KavitaError && cause.transportDenied)) {
+        return;
+      }
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -1241,8 +1357,13 @@
             (async () => {
               // Compare revisions only after any previous upload has settled.
               await upload;
-              if (probe.signal.aborted) return null;
-              if (!(await networkAvailable()) || probe.signal.aborted) return null;
+              if (offline || destroyed || probe.signal.aborted) return null;
+              if (
+                !Capacitor.isNativePlatform() &&
+                (!(await networkAvailable()) || probe.signal.aborted)
+              ) {
+                return null;
+              }
               return client.getProgress(book.chapterId, probe.signal).catch(() => null);
             })(),
           ]);
@@ -1394,7 +1515,7 @@
       savedBook.lastReadAt = lastReadAt;
     }
     if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    syncTimer = offline ? null : window.setTimeout(() => void syncProgress(false), 2_500);
   }
 
   async function syncLatestForReader(
@@ -1494,7 +1615,6 @@
   function openMenu(book: BookRecord): void {
     actionMenuOpener = activeElement();
     actionMenuBook = book;
-    focusModal(() => actionMenuDialog);
   }
 
   function closeMenu(): void {
@@ -1514,7 +1634,6 @@
     conflictOpener = activeElement();
     conflictError = '';
     conflict = next;
-    focusModal(() => conflictDialog);
   }
 
   function closeConflict(): void {
@@ -1579,12 +1698,12 @@
   function openSettings(): void {
     settingsOpener = activeElement();
     settingsVisible = true;
-    focusModal(() => settingsDialog);
   }
 
   function closeSettings(): void {
     settingsVisible = false;
     showReplacementKey = false;
+    confirmDeleteServer = false;
     const opener = settingsOpener;
     settingsOpener = null;
     restoreModalFocus(opener);
@@ -1678,7 +1797,11 @@
       const nextKey = replacementApiKey.trim();
       if (!nextKey) throw new Error('Enter a new Kavita auth key.');
 
-      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
+      const result = await new KavitaClient(
+        server.baseUrl,
+        nextKey,
+        ensureClientTransport,
+      ).testConnection();
       if (result.bookLibraries.length === 0) {
         throw new Error(
           'This account has no book or light novel libraries. Only EPUB books are supported.',
@@ -1693,7 +1816,11 @@
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
       // An upload started with the previous key may still be finishing.
-      while (syncWork) await syncWork;
+      while (syncWork) {
+        pendingReconnectSync = false;
+        await syncWork;
+      }
+      pendingReconnectSync = false;
       refreshController?.abort();
       activeApiKey = nextKey;
       onApiKeyChange(nextKey);
@@ -1741,7 +1868,7 @@
 
 {#if reading}
   {#await import('./Reader.svelte')}
-    <p class="m-8" role="status">Opening reader…</p>
+    <p class="m-8" role="status" tabindex="-1" use:focusViewEntry>Opening reader…</p>
   {:then { default: Reader }}
     <Reader
       bookUrl={reading.url}
@@ -1762,7 +1889,9 @@
     />
   {:catch}
     <div class="m-8 grid justify-items-start gap-3">
-      <p role="alert">Turnleaf could not load the reader. Reload the app to try again.</p>
+      <p role="alert" tabindex="-1" use:focusViewEntry>
+        Turnleaf could not load the reader. Reload the app to try again.
+      </p>
       <button class="btn preset-tonal-surface" type="button" onclick={() => void closeReader()}>
         Back to library
       </button>
@@ -1790,7 +1919,13 @@
       <div class="flex min-w-0 items-center gap-3">
         <TurnleafLogo size={36} wordmark={false} />
         <div class="min-w-0 leading-tight">
-          <h1 class="truncate font-serif text-3xl text-primary-950-50">Turnleaf</h1>
+          <h1
+            tabindex="-1"
+            use:focusViewEntry
+            class="truncate font-serif text-3xl text-primary-950-50"
+          >
+            Turnleaf
+          </h1>
         </div>
       </div>
       <div class="card preset-tonal-surface flex shrink-0 gap-1 p-1">
@@ -1907,6 +2042,7 @@
           <button
             type="button"
             class="btn btn-sm absolute right-1 top-1/2 h-11 w-11 -translate-y-1/2 p-0 preset-filled-surface-200-800"
+            use:focusAfterUnmount={'#library-search'}
             onclick={() => (query = '')}
             aria-label="Clear search"
             title="Clear search"
@@ -1975,6 +2111,7 @@
           <button
             class="btn btn-sm h-11 w-11 !p-0 rounded-none preset-tonal-surface"
             type="button"
+            use:focusAfterUnmount={'#library-results'}
             onclick={clearFilters}
             aria-label="Clear library filters"
             title="Clear filters"
@@ -2088,6 +2225,7 @@
           <button
             type="button"
             class="btn preset-tonal-primary"
+            use:focusAfterUnmount={['.reader-shell', '#library-results']}
             onclick={() => openProgressProbe?.abort()}
           >
             Open offline
@@ -2132,6 +2270,7 @@
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
+              use:focusAfterUnmount={'#library-results'}
               onclick={() => void retryDownloadCleanup()}
               disabled={cleanupInProgress}
             >
@@ -2141,6 +2280,7 @@
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
+              use:focusAfterUnmount={'#library-results'}
               onclick={() => void refresh()}
               disabled={refreshing}
             >
@@ -2150,6 +2290,7 @@
             <button
               class="btn btn-sm preset-tonal-surface h-11 shrink-0"
               type="button"
+              use:focusAfterUnmount={'#library-results'}
               onclick={() => void download(downloadFailureBook!)}
               disabled={Boolean(downloadingBookId) ||
                 offline ||
@@ -2179,6 +2320,7 @@
         <button
           class="btn btn-sm preset-tonal-warning h-10 shrink-0"
           type="button"
+          use:focusAfterUnmount={'#library-results'}
           onclick={() => void syncProgress()}
           disabled={syncing || offline}
         >
@@ -2220,6 +2362,7 @@
         <button
           class="btn preset-tonal-surface mt-2 h-11"
           type="button"
+          use:focusAfterUnmount={'#library-results'}
           onclick={() => void refresh()}
           disabled={refreshing || offline}
         >
@@ -2241,7 +2384,12 @@
         </svg>
         <p>No books match your search.</p>
         {#if libraryFiltersActive}
-          <button class="btn preset-tonal-surface mt-2 h-11" type="button" onclick={clearFilters}>
+          <button
+            class="btn preset-tonal-surface mt-2 h-11"
+            type="button"
+            use:focusAfterUnmount={'#library-results'}
+            onclick={clearFilters}
+          >
             Clear search and filters
           </button>
         {/if}
@@ -2535,7 +2683,6 @@
     onclick={(event) => event.target === event.currentTarget && closeMenu()}
   >
     <div
-      bind:this={actionMenuDialog}
       class="card preset-filled-surface-50-950 w-full max-w-md overflow-hidden p-4 shadow-2xl"
       role="dialog"
       aria-modal="true"
@@ -2544,7 +2691,7 @@
         ? 'book-actions-removed-warning'
         : undefined}
       tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, actionMenuDialog!, closeMenu)}
+      use:modalFocusTrap={closeMenu}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <div class="flex items-start justify-between gap-4">
@@ -2695,13 +2842,12 @@
     onclick={(event) => event.target === event.currentTarget && closeConflict()}
   >
     <div
-      bind:this={conflictDialog}
       class="card preset-filled-surface-50-950 w-full max-w-sm p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="sync-conflict-title"
       tabindex="-1"
-      onkeydown={(event) => trapModalKeydown(event, conflictDialog!, closeConflict)}
+      use:modalFocusTrap={closeConflict}
       transition:fly={{ y: 16, duration: 150 }}
     >
       <h2 id="sync-conflict-title" class="font-serif text-2xl">Choose where to continue</h2>
@@ -2771,11 +2917,7 @@
 {/if}
 
 {#if settingsVisible}
-  <DialogShell
-    bind:dialogElement={settingsDialog}
-    labelledBy="library-settings-title"
-    onClose={closeSettings}
-  >
+  <DialogShell labelledBy="library-settings-title" onClose={closeSettings}>
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
         <h2 id="library-settings-title" class="font-serif text-3xl">Settings</h2>
@@ -2979,13 +3121,56 @@
           {settingsError}
         </div>
         <button
+          id="delete-server-button"
           class="btn preset-tonal-error"
           type="button"
+          aria-expanded={confirmDeleteServer}
+          aria-controls={confirmDeleteServer ? 'delete-server-confirm' : undefined}
           onclick={() => (confirmDeleteServer = true)}
           disabled={deletingServer}
         >
           Delete server
         </button>
+        {#if confirmDeleteServer}
+          <div
+            id="delete-server-confirm"
+            class="rounded-xl border border-error-500/35 p-4"
+            role="group"
+            aria-labelledby="delete-server-confirm-title"
+            aria-describedby="delete-server-confirm-description"
+            tabindex="-1"
+            use:focusViewEntry={{ force: true }}
+            transition:fade
+          >
+            <p id="delete-server-confirm-title" class="text-sm font-medium text-error-700-300">
+              Delete this server?
+            </p>
+            <p id="delete-server-confirm-description" class="mt-2 text-sm text-surface-700-300">
+              This removes the server connection, downloaded books, cached covers, and local
+              progress from this device.
+            </p>
+            <div class="mt-4 flex gap-2">
+              <button
+                class="btn preset-outlined-error-500"
+                type="button"
+                use:focusAfterUnmount={'#delete-server-button'}
+                onclick={() => void deleteServer()}
+                disabled={deletingServer}
+              >
+                {deletingServer ? 'Deleting...' : 'Delete now'}
+              </button>
+              <button
+                class="btn preset-tonal-surface"
+                type="button"
+                use:focusAfterUnmount={'#delete-server-button'}
+                onclick={() => (confirmDeleteServer = false)}
+                disabled={deletingServer}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        {/if}
       </form>
     </section>
 
@@ -3023,33 +3208,6 @@
       </dl>
     </section>
     <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
-    {#if confirmDeleteServer}
-      <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-        <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
-        <p class="mt-2 text-sm text-surface-700-300">
-          This removes the server connection, downloaded books, cached covers, and local progress
-          from this device.
-        </p>
-        <div class="mt-4 flex gap-2">
-          <button
-            class="btn preset-outlined-error-500"
-            type="button"
-            onclick={() => void deleteServer()}
-            disabled={deletingServer}
-          >
-            {deletingServer ? 'Deleting...' : 'Delete now'}
-          </button>
-          <button
-            class="btn preset-tonal-surface"
-            type="button"
-            onclick={() => (confirmDeleteServer = false)}
-            disabled={deletingServer}
-          >
-            Cancel
-          </button>
-        </div>
-      </div>
-    {/if}
   </DialogShell>
 {/if}
 

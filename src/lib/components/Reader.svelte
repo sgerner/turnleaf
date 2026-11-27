@@ -48,8 +48,11 @@
   } from '../reader/bookmarks';
   import {
     activeElement,
+    focusAfterUnmount,
     focusFirstElement,
     focusModal,
+    focusViewEntry,
+    modalFocusTrap,
     restoreFocus,
     restoreModalFocus,
     trapModalKeydown,
@@ -398,15 +401,20 @@
     if (restoreToolbarFocus) void tick().then(() => focusFirstElement(readerToolbar));
   }
 
-  function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
+  function focusReaderTarget(
+    panel: HTMLElement | null | (() => HTMLElement | null),
+    target: string,
+    id?: string,
+  ): void {
     void tick().then(() => {
-      const controls = panel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
+      const resolvedPanel = typeof panel === 'function' ? panel() : panel;
+      const controls = resolvedPanel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
       const element = [...controls].find(
         (control) =>
           control.dataset.readerFocus === target &&
           (id === undefined || control.dataset.readerFocusId === id),
       );
-      (element ?? panel)?.focus();
+      (element ?? resolvedPanel)?.focus();
     });
   }
 
@@ -496,7 +504,6 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusModal(() => settingsPanel);
   }
 
   function closeSettings(): void {
@@ -548,7 +555,6 @@
     tocOpener = null;
     annotationsOpener = null;
     searchOpener = null;
-    focusModal(() => bookmarksPanel);
   }
 
   function closeBookmarks(): void {
@@ -594,9 +600,7 @@
     searchController = null;
     searching = false;
     if (focusAnnotationId) {
-      focusReaderTarget(annotationsPanel, 'annotation-editor', focusAnnotationId);
-    } else {
-      focusModal(() => annotationsPanel);
+      focusReaderTarget(() => annotationsPanel, 'annotation-editor', focusAnnotationId);
     }
   }
 
@@ -635,7 +639,6 @@
     bookmarksOpener = null;
     annotationsOpener = null;
     searchError = '';
-    focusModal(() => searchPanel);
   }
 
   function closeSearch(): void {
@@ -690,7 +693,6 @@
     syncConfirmationOpener = opener;
     closeOpenSubpanels();
     pendingSyncLocation = progress;
-    focusModal(() => syncConfirmationPanel);
   }
 
   function closeSyncConfirmation(restore = true): void {
@@ -1443,7 +1445,13 @@
   });
 </script>
 
-<main class="reader-shell" data-mode={appearance.mode} aria-describedby="reader-keyboard-help">
+<main
+  class="reader-shell"
+  tabindex="-1"
+  use:focusViewEntry
+  data-mode={appearance.mode}
+  aria-describedby="reader-keyboard-help"
+>
   <h1 class="sr-only">{title}</h1>
   <div class="reader-viewport" bind:this={viewport} inert={hasOpenReaderPanel()}></div>
 
@@ -1458,6 +1466,7 @@
       <button
         class="btn btn-sm preset-filled-primary-700-300 min-h-11"
         type="button"
+        use:focusAfterUnmount={'.reader-shell'}
         onpointerdown={(event) => event.preventDefault()}
         onclick={highlightSelection}
       >
@@ -1466,6 +1475,7 @@
       <button
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
+        use:focusAfterUnmount={'.reader-shell'}
         onpointerdown={(event) => event.preventDefault()}
         onclick={startSelectionNote}
       >
@@ -1474,6 +1484,7 @@
       <button
         class="btn btn-sm preset-tonal-surface min-h-11"
         type="button"
+        use:focusAfterUnmount={'.reader-shell'}
         onpointerdown={(event) => event.preventDefault()}
         onclick={() => void copySelection()}
       >
@@ -1521,6 +1532,7 @@
       class="absolute right-[max(1rem,env(safe-area-inset-right))] bottom-[calc(var(--reader-safe-bottom)+0.75rem)] z-30 btn min-h-11 preset-filled-primary-700-300 shadow"
       type="button"
       aria-label="Return to the location before this link"
+      use:focusAfterUnmount={'.reader-shell'}
       onclick={() => void returnToLink()}
     >
       Return to link
@@ -1754,6 +1766,7 @@
           aria-modal="true"
           aria-labelledby="reader-appearance-title"
           tabindex="-1"
+          use:modalFocusTrap={closeSettings}
           onkeydown={(event) => trapModalKeydown(event, settingsPanel!, closeSettings)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -1948,6 +1961,7 @@
           aria-modal="true"
           aria-labelledby="reader-contents-title"
           tabindex="-1"
+          use:modalFocusTrap={closeToc}
           onkeydown={(event) => trapModalKeydown(event, tocPanel!, closeToc)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -2056,6 +2070,7 @@
           aria-modal="true"
           aria-labelledby="reader-search-title"
           tabindex="-1"
+          use:modalFocusTrap={closeSearch}
           onkeydown={(event) => trapModalKeydown(event, searchPanel!, closeSearch)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -2128,6 +2143,7 @@
           aria-modal="true"
           aria-labelledby="reader-bookmarks-title"
           tabindex="-1"
+          use:modalFocusTrap={closeBookmarks}
           onkeydown={(event) => trapModalKeydown(event, bookmarksPanel!, closeBookmarks)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -2262,6 +2278,7 @@
           aria-modal="true"
           aria-labelledby="reader-annotations-title"
           tabindex="-1"
+          use:modalFocusTrap={closeAnnotations}
           onkeydown={(event) => trapModalKeydown(event, annotationsPanel!, closeAnnotations)}
           transition:fly={{ y: 12, duration: 150 }}
         >
@@ -2295,12 +2312,17 @@
                 <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
               </label>
               <div class="mt-3 flex gap-2">
-                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+                <button
+                  class="btn preset-filled-primary-700-300 flex-1"
+                  type="submit"
+                  use:focusAfterUnmount={'[data-reader-focus="annotations-heading"]'}
+                >
                   Save highlight
                 </button>
                 <button
                   class="btn preset-tonal-surface"
                   type="button"
+                  use:focusAfterUnmount={'[data-reader-focus="annotations-heading"]'}
                   onclick={() => {
                     selectedText = null;
                     annotationDraft = '';
@@ -2518,6 +2540,7 @@
         aria-labelledby="reader-sync-confirm-title"
         aria-describedby="reader-sync-confirm-description"
         tabindex="-1"
+        use:modalFocusTrap={() => closeSyncConfirmation()}
         onkeydown={(event) =>
           trapModalKeydown(event, syncConfirmationPanel!, () => closeSyncConfirmation())}
         transition:fly={{ y: 12, duration: 150 }}
@@ -2565,6 +2588,7 @@
         aria-labelledby="reader-error-title"
         aria-describedby="reader-error-description"
         tabindex="-1"
+        use:modalFocusTrap={handleErrorDialogClose}
         onkeydown={(event) => trapModalKeydown(event, errorPanel!, handleErrorDialogClose)}
         transition:fly={{ y: 12, duration: 150 }}
       >
@@ -2588,6 +2612,7 @@
             <button
               class="btn min-h-11 preset-filled-primary-700-300"
               type="button"
+              use:focusAfterUnmount={'.reader-shell'}
               disabled={retryingReader}
               onclick={() => void retryReaderOpen()}
             >
@@ -2624,6 +2649,10 @@
       var(--safe-area-inset-bottom, 0px)
     );
     --reader-progress-height: 0.25rem;
+  }
+
+  .reader-shell:focus-visible {
+    outline-offset: -3px;
   }
 
   .reader-viewport {

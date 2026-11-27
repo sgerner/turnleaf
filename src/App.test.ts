@@ -438,4 +438,81 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     flushSync();
     expect(target.querySelector('.app-ambient')).not.toBeNull();
   });
+
+  it('marks releaseBanner inert while Settings DialogShell is open, restores focus inside DialogShell for Delete server confirmation, and focuses Library heading on banner dismiss', async () => {
+    fetchLatestGithubReleaseMock.mockResolvedValue({
+      version: '0.4.0',
+      title: 'Accessibility Update',
+      releaseUrl: 'https://github.com/sgerner/turnleaf/releases/tag/v0.4.0',
+      downloadUrl: 'https://github.com/sgerner/turnleaf/releases/download/v0.4.0/turnleaf.apk',
+    });
+
+    mounted = mount(App, { target });
+
+    await vi.waitFor(() => {
+      expect(target.querySelector('.release-banner')).not.toBeNull();
+      expect(target.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+
+    const banner = target.querySelector<HTMLElement>('.release-banner')!;
+    const settingsButton = target.querySelector<HTMLButtonElement>(
+      'button[aria-label="Open settings"]',
+    )!;
+    expect(banner.inert).toBe(false);
+
+    settingsButton.focus();
+    flushSync(() => {
+      settingsButton.click();
+    });
+
+    const dialog = target.querySelector<HTMLElement>('[role="dialog"]')!;
+    expect(dialog.classList.contains('dialog-card')).toBe(true);
+    expect(dialog.querySelector('.dialog-header.shrink-0')).not.toBeNull();
+    const dialogBody = dialog.querySelector<HTMLElement>('.dialog-body.overflow-y-auto')!;
+    expect(dialogBody).not.toBeNull();
+    expect(banner.inert).toBe(true);
+
+    const deleteServerButton =
+      dialogBody.querySelector<HTMLButtonElement>('#delete-server-button')!;
+    deleteServerButton.focus();
+    flushSync(() => {
+      deleteServerButton.click();
+    });
+
+    const confirmGroup = dialogBody.querySelector<HTMLElement>('#delete-server-confirm')!;
+    expect(confirmGroup).not.toBeNull();
+    expect(deleteServerButton.nextElementSibling).toBe(confirmGroup);
+    expect(document.activeElement).toBe(confirmGroup);
+
+    const cancelDeleteButton = [...confirmGroup.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Cancel',
+    )!;
+    cancelDeleteButton.focus();
+    flushSync(() => {
+      cancelDeleteButton.click();
+    });
+    await tick();
+    expect(document.activeElement).toBe(deleteServerButton);
+
+    flushSync(() => {
+      document.body.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+      );
+    });
+    await tick();
+    expect(banner.inert).toBe(false);
+    expect(document.activeElement).toBe(settingsButton);
+
+    const dismissButton = [...banner.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Dismiss',
+    )!;
+    dismissButton.focus();
+    flushSync(() => {
+      dismissButton.click();
+    });
+    await tick();
+
+    const libraryHeading = target.querySelector<HTMLElement>('h1')!;
+    expect(document.activeElement).toBe(libraryHeading);
+  });
 });

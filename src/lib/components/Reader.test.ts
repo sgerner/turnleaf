@@ -1,17 +1,23 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushSync, mount, unmount } from 'svelte';
+import { flushSync, mount, tick, unmount } from 'svelte';
+import { MAX_ANNOTATIONS, type StoredAnnotation } from '../reader/annotations';
 import type * as SessionModule from '../reader/session';
 
-const { getPreferencesMock, setPreferencesMock, openSessionMock, destroySessionMock } = vi.hoisted(
-  () => ({
-    getPreferencesMock: vi.fn(),
-    setPreferencesMock: vi.fn(),
-    openSessionMock: vi.fn(),
-    destroySessionMock: vi.fn(),
-  }),
-);
+const {
+  getPreferencesMock,
+  setPreferencesMock,
+  openSessionMock,
+  updateHighlightsMock,
+  destroySessionMock,
+} = vi.hoisted(() => ({
+  getPreferencesMock: vi.fn(),
+  setPreferencesMock: vi.fn(),
+  openSessionMock: vi.fn(),
+  updateHighlightsMock: vi.fn(),
+  destroySessionMock: vi.fn(),
+}));
 
 vi.mock('../database/database', () => ({
   getPreferences: getPreferencesMock,
@@ -27,7 +33,7 @@ vi.mock('../reader/session', async (importOriginal) => {
       tableOfContents = () => [];
       getVisiblePassages = () => [];
       clearTextSelection = vi.fn();
-      updateHighlights = vi.fn();
+      updateHighlights = updateHighlightsMock;
       destroy = destroySessionMock;
     },
   };
@@ -163,5 +169,130 @@ describe('Reader mount lifecycle', () => {
     await unmount(mounted);
     mounted = null;
     expect(destroySessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('focuses reader-shell on mount, focuses the saved note editor via Add note, preserves selection drafts at highlight limit, and restores heading focus on Cancel', async () => {
+    let emitSelection: ((selection: { cfi: string; text: string } | null) => void) | undefined;
+    openSessionMock.mockImplementationOnce(async (...args: unknown[]) => {
+      emitSelection = args[7] as (selection: { cfi: string; text: string } | null) => void;
+    });
+
+    const cappedButOne: StoredAnnotation[] = Array.from(
+      { length: MAX_ANNOTATIONS - 1 },
+      (_, index) => ({
+        id: `ann-${index}`,
+        cfi: `epubcfi(/6/2!/4/2/${index})`,
+        excerpt: `Passage ${index}`,
+        note: '',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }),
+    );
+    getPreferencesMock.mockResolvedValueOnce(
+      new Map([['readerAnnotations:book-notes', JSON.stringify(cappedButOne)]]),
+    );
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:notes-book',
+        bookId: 'book-notes',
+        title: 'Notes Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+      },
+    });
+    flushSync();
+
+    const shell = target.querySelector<HTMLElement>('.reader-shell')!;
+    expect(document.activeElement).toBe(shell);
+
+    await vi.waitFor(() => {
+      expect(emitSelection).toBeTypeOf('function');
+    });
+
+    flushSync(() => {
+      emitSelection?.({ cfi: 'epubcfi(/6/2!/4/2/999)', text: 'Selected passage for note' });
+    });
+
+    const addNoteButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Add note',
+    )!;
+    addNoteButton.focus();
+    flushSync(() => {
+      addNoteButton.click();
+    });
+    await tick();
+
+    const annotationsDialog = target.querySelector<HTMLElement>('#reader-annotations')!;
+    expect(annotationsDialog).not.toBeNull();
+    const noteEditor = annotationsDialog.querySelector<HTMLTextAreaElement>(
+      '[data-reader-focus="annotation-editor"]',
+    )!;
+    expect(noteEditor).not.toBeNull();
+    expect(document.activeElement).toBe(noteEditor);
+
+    flushSync(() => {
+      target
+        .querySelector<HTMLButtonElement>('button[aria-label="Close highlights and notes"]')
+        ?.click();
+    });
+    await tick();
+
+    // Now at MAX_ANNOTATIONS: selecting a new passage and clicking Highlight opens annotations with limit alert.
+    flushSync(() => {
+      emitSelection?.({ cfi: 'epubcfi(/6/2!/4/2/1000)', text: 'Overflow passage' });
+    });
+    const highlightButton = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+      (btn) => btn.textContent?.trim() === 'Highlight',
+    )!;
+    highlightButton.focus();
+    flushSync(() => {
+      highlightButton.click();
+    });
+    await tick();
+
+    const cappedDialog = target.querySelector<HTMLElement>('#reader-annotations')!;
+    expect(cappedDialog.querySelector('[role="alert"]')?.textContent).toContain(
+      `up to ${MAX_ANNOTATIONS} highlights`,
+    );
+
+    const draftTextarea = cappedDialog.querySelector<HTMLTextAreaElement>('form textarea')!;
+    draftTextarea.value = 'Unsaved selection draft';
+    draftTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+    flushSync();
+
+    // Closing with an active selection draft preserves selectedText across panel close/reopen.
+    flushSync(() => {
+      target
+        .querySelector<HTMLButtonElement>('button[aria-label="Close highlights and notes"]')
+        ?.click();
+    });
+    await tick();
+    flushSync(() => {
+      target
+        .querySelector<HTMLButtonElement>('button[aria-controls="reader-annotations"]')
+        ?.click();
+    });
+    await tick();
+
+    const reopenedDialog = target.querySelector<HTMLElement>('#reader-annotations')!;
+    expect(reopenedDialog.querySelector<HTMLTextAreaElement>('form textarea')?.value).toBe(
+      'Unsaved selection draft',
+    );
+
+    const cancelDraftButton = [
+      ...reopenedDialog.querySelectorAll<HTMLButtonElement>('form button'),
+    ].find((btn) => btn.textContent?.trim() === 'Cancel')!;
+    cancelDraftButton.focus();
+    flushSync(() => {
+      cancelDraftButton.click();
+    });
+    await tick();
+
+    const savedHeading = reopenedDialog.querySelector<HTMLElement>(
+      '[data-reader-focus="annotations-heading"]',
+    )!;
+    expect(document.activeElement).toBe(savedHeading);
   });
 });

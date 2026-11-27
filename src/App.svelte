@@ -15,6 +15,7 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+  import { focusAfterUnmount, focusViewEntry } from './lib/a11y/modal-focus';
   import {
     DEFAULT_MODE,
     DEFAULT_THEME,
@@ -206,6 +207,7 @@
             <button
               class="btn btn-sm preset-tonal-error !text-sm"
               type="button"
+              use:focusAfterUnmount={['.reader-shell', 'h1', '[role="alert"]', 'main']}
               onclick={() => (releaseBanner = null)}
             >
               Dismiss
@@ -218,7 +220,12 @@
 
   <div class="app-stage">
     {#if booting}
-      <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
+      <main
+        class="grid min-h-full place-items-center"
+        aria-label="Opening Turnleaf"
+        tabindex="-1"
+        use:focusViewEntry
+      >
         <div class="grid justify-items-center gap-4">
           <TurnleafLogo size={104} />
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
@@ -246,7 +253,12 @@
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
     {:else if startupError}
-      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
+      <div
+        class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3"
+        role="alert"
+        tabindex="-1"
+        use:focusViewEntry
+      >
         <p>{startupError}</p>
         <div class="flex flex-wrap gap-2">
           <button

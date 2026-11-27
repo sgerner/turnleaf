@@ -5,6 +5,7 @@
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
   import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { focusViewEntry } from '../a11y/modal-focus';
   import { getDiagnosticCount, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -221,6 +222,8 @@
   <header class="flex flex-col lg:pr-4" in:fly={{ y: 12, duration: 280 }}>
     <TurnleafLogo size={80} />
     <h1
+      tabindex="-1"
+      use:focusViewEntry
       class="mt-6 font-serif text-4xl leading-[1.05] tracking-tight text-surface-950-50 sm:text-5xl lg:mt-10 lg:text-6xl"
     >
       {#if savedServer}

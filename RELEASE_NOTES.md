@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Preserve keyboard focus across view switches, conditional controls, and modals, and stop queued progress uploads between requests when offline.
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline
