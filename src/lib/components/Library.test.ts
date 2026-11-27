@@ -5,10 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => {
   let connected = true;
+  let platform: 'web' | 'android' = 'web';
   const networkListeners = new Set<(status: { connected: boolean }) => void>();
   return {
     get connected() {
       return connected;
+    },
+    get platform() {
+      return platform;
+    },
+    setPlatform(next: 'web' | 'android') {
+      platform = next;
     },
     setConnected(next: boolean, notify = false) {
       connected = next;
@@ -44,7 +51,7 @@ const mocks = vi.hoisted(() => {
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
     isNativePlatform: () => false,
-    getPlatform: () => 'web',
+    getPlatform: () => mocks.platform,
     convertFileSrc: (uri: string) => uri,
   },
   registerPlugin: vi.fn(() => ({})),
@@ -303,6 +310,7 @@ beforeEach(async () => {
   await resetLocalDatabase();
   await saveServer(server);
   mocks.resetListeners();
+  mocks.setPlatform('web');
   mocks.setConnected(true, false);
   mocks.downloadEpub.mockReset();
   mocks.verifyDownloadedEpub.mockReset();
@@ -701,6 +709,7 @@ describe('Library download banners, cancellation, and offline guards', () => {
   });
 
   it('confirms networkStatusChange disconnects with Network.getStatus before cancelling an active download or latching offline', async () => {
+    mocks.setPlatform('android');
     const book = makeBook({ chapterId: 1, title: 'Dual Radio Book' });
     await reconcileBooks(server.id, [book]);
     setupCatalogFromBooks([book]);
@@ -752,6 +761,7 @@ describe('Library download banners, cancellation, and offline guards', () => {
   });
 
   it('flushes queued reading progress before refreshing the catalog on reconnect', async () => {
+    mocks.setPlatform('android');
     mocks.setConnected(false, false);
     const book = makeBook({ chapterId: 1, title: 'Queued Sync Book' });
     await reconcileBooks(server.id, [book]);
