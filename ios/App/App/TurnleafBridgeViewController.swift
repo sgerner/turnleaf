@@ -28,10 +28,6 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         TurnleafReaderChromeController.shared.enabled
     }
 
-    override var prefersHomeIndicatorAutoHidden: Bool {
-        TurnleafReaderChromeController.shared.enabled
-    }
-
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
         TurnleafReaderChromeController.shared.enabled ? [.bottom] : []
     }
@@ -204,7 +200,7 @@ final class TurnleafReaderChromeController {
     static let shared = TurnleafReaderChromeController()
 
     private weak var bridge: CAPBridgeProtocol?
-    private var enabled = false
+    fileprivate var enabled = false
 
     func attach(to bridge: CAPBridgeProtocol?) {
         self.bridge = bridge
@@ -408,7 +404,7 @@ private final class PrivateTransferSessionDelegate: NSObject, URLSessionDataDele
             try handle.write(contentsOf: data)
             bytesWritten += Int64(data.count)
             if trackProgress {
-                let now = CACurrentMediaTime()
+                let now = ProcessInfo.processInfo.systemUptime
                 if now - lastProgressTime >= 0.1 {
                     let computable = expectedLength > 0
                     var payload: [String: Any] = [
@@ -443,7 +439,7 @@ private final class PrivateTransferSessionDelegate: NSObject, URLSessionDataDele
         }
 
         if (300..<400).contains(statusCode) {
-            var result: JSObject = ["status": statusCode, "bytesWritten": 0]
+            var result: PluginCallResultData = ["status": statusCode, "bytesWritten": 0]
             if let redirectLocation {
                 result["location"] = redirectLocation
             }
