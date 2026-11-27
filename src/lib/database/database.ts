@@ -57,6 +57,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
+let resetGeneration = 0;
 
 interface BrowserDatabaseState {
   serverConfig: ServerConfig | null;
@@ -236,12 +237,19 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 }
 
 export async function resetLocalDatabase(): Promise<void> {
+  resetGeneration += 1;
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
     clearBootThemeCache();
     return;
   }
 
+  if (opening) await opening.catch(() => undefined);
+  let pending: Promise<void>;
+  do {
+    pending = nativeTransactionQueue;
+    await pending;
+  } while (pending !== nativeTransactionQueue);
   try {
     if (connection) {
       try {
@@ -690,17 +698,28 @@ function updateBrowserBookProgress(
   );
 }
 
+export interface SaveLocalProgressOptions {
+  shouldCommit?: () => boolean;
+}
+
 export async function saveLocalProgress(
   book: BookRecord,
   cfi: string,
   xpath: string | null,
   percentage: number,
   spineIndex?: number,
+  options?: SaveLocalProgressOptions,
 ): Promise<void> {
+  const generation = resetGeneration;
+  const canCommit = () =>
+    generation === resetGeneration && (!options?.shouldCommit || options.shouldCommit());
+  if (!canCommit()) return;
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (!canCommit()) return false;
+      if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
@@ -739,6 +758,7 @@ export async function saveLocalProgress(
     return;
   }
   const db = await openDatabase();
+  if (!canCommit()) return;
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -747,14 +767,17 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await executeNativeTransaction(db, [
-    createReadingStateTask(book.id, cfi, xpath, percentage, now),
-    createSyncQueueTask(book.id, payload, now),
-    {
-      statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
-      values: [pagesRead, now, book.id],
-    },
-  ]);
+  await enqueueNativeWrite(async () => {
+    if (!canCommit() || connection !== db) return;
+    await db.executeTransaction([
+      createReadingStateTask(book.id, cfi, xpath, percentage, now),
+      createSyncQueueTask(book.id, payload, now),
+      {
+        statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+        values: [pagesRead, now, book.id],
+      },
+    ]);
+  });
 }
 
 export async function markBookCompleted(book: BookRecord): Promise<void> {

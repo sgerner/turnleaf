@@ -16,7 +16,6 @@
     removeDownload,
     removeServer,
     reconcileBooks,
-    saveLocalProgress,
     saveRemoteProgress,
     saveServer,
     setPreference,
@@ -48,6 +47,7 @@
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { clearDiagnostics, recordDiagnostic } from '../diagnostics/log';
   import { chooseOpenProgress, shouldPreferFurthest, toKavitaPageNumber } from '../sync/conflict';
+  import { createLocalProgressBuffer } from '../sync/local-progress-buffer';
   import { flushProgress } from '../sync/sync';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import DialogShell from './DialogShell.svelte';
@@ -313,6 +313,7 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  const localProgressBuffer = createLocalProgressBuffer();
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -758,7 +759,14 @@
     cleanups.push(
       await registerListener(
         await App.addListener('appStateChange', ({ isActive }) => {
-          if (!destroyed && !isActive) void syncProgress(false);
+          if (!destroyed && !isActive) {
+            void localProgressBuffer
+              .flush()
+              .catch(() => {})
+              .finally(() => {
+                if (!destroyed) void syncProgress(false);
+              });
+          }
         }),
       ),
     );
@@ -813,7 +821,13 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
-    if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+    if (
+      destroyed ||
+      conflict ||
+      resolvingOpenProgress ||
+      acceptingRemoteProgress ||
+      deletingServer
+    ) {
       return Promise.resolve();
     }
     syncWork = runProgressSync(showFeedback).finally(() => {
@@ -830,7 +844,15 @@
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
     activeSyncStartRevision = messageRevision;
+    let localFlushError: unknown = null;
     try {
+      if (localProgressBuffer.hasPending()) {
+        try {
+          await localProgressBuffer.flush();
+        } catch (error) {
+          localFlushError = error;
+        }
+      }
       const available = Capacitor.isNativePlatform()
         ? await networkAvailable()
         : !offline && !destroyed;
@@ -840,6 +862,7 @@
         return;
       }
       await flushProgress(client, server.id);
+      if (localFlushError) throw localFlushError;
       if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
@@ -865,6 +888,7 @@
     destroyed = true;
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
+    void localProgressBuffer.flush().catch(() => {});
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
@@ -1226,6 +1250,13 @@
 
   async function checkOpenProgress(book: BookRecord, force?: boolean) {
     try {
+      try {
+        await localProgressBuffer.flush();
+      } catch (error) {
+        if (localProgressBuffer.hasPending(book.id)) {
+          return { ok: false as const, error };
+        }
+      }
       let remote: KavitaProgress | null = null;
       if (!offline && (!kavitaUnreachable || force) && book.remoteAvailable !== false) {
         const probe = new AbortController();
@@ -1308,7 +1339,10 @@
     if (openProgress === 'remote' && remote) {
       resolvingOpenProgress = true;
       try {
-        if (!(await saveRemoteProgress(book, remote, local))) {
+        const accepted = await localProgressBuffer.runAuthoritative(book.id, () =>
+          saveRemoteProgress(book, remote, local),
+        );
+        if (!accepted) {
           message = 'The saved reading position changed. Open the book again.';
           return;
         }
@@ -1379,13 +1413,7 @@
   }
 
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
-    await saveLocalProgress(
-      book,
-      location.cfi,
-      location.xpath,
-      location.percentage,
-      location.spineIndex,
-    );
+    if (deletingServer) return;
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
     const savedBook = books.find((item) => item.id === book.id);
@@ -1393,8 +1421,15 @@
       savedBook.pagesRead = pagesRead;
       savedBook.lastReadAt = lastReadAt;
     }
-    if (syncTimer !== null) window.clearTimeout(syncTimer);
-    syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    if (!destroyed) {
+      if (syncTimer !== null) window.clearTimeout(syncTimer);
+      syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
+    }
+    try {
+      await localProgressBuffer.queue(book, location);
+    } catch {
+      // Retain failed local progress writes in the buffer for the next flush or retry.
+    }
   }
 
   async function syncLatestForReader(
@@ -1412,15 +1447,18 @@
     }
     if (manual) {
       try {
+        await localProgressBuffer.flush();
         await flushProgress(client, server.id);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
         void refreshSyncStatus();
       }
+    } else {
+      await localProgressBuffer.flush().catch(() => {});
     }
     const local = await getReadingState(book.id);
-    if (local?.pendingSync) {
+    if (local?.pendingSync || localProgressBuffer.hasPending(book.id)) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
       return null;
     }
@@ -1432,9 +1470,12 @@
       accept: async () => {
         acceptingRemoteProgress = true;
         try {
+          await localProgressBuffer.clear(book.id);
           // An upload cannot race with deletion of the exact revision it is sending.
           await syncWork;
-          const accepted = await saveRemoteProgress(book, remote, local);
+          const accepted = await localProgressBuffer.runAuthoritative(book.id, () =>
+            saveRemoteProgress(book, remote, local),
+          );
           if (!accepted)
             throw new Error('The saved reading position changed. Sync again to retry.');
           updateRemoteBookProgress(book, remote);
@@ -1455,7 +1496,14 @@
   }
 
   async function markDone(book: BookRecord): Promise<void> {
-    await markBookCompleted(book);
+    try {
+      await localProgressBuffer.runAuthoritative(book.id, () => markBookCompleted(book));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'storage error';
+      message = `Could not mark ${book.title} as read: ${detail}`;
+      closeMenu();
+      return;
+    }
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1475,6 +1523,7 @@
     const bookId = reading?.book.id;
     reading = null;
     await tick();
+    await localProgressBuffer.flush().catch(() => {});
     if (reading || !libraryMain) return;
 
     const index = visibleBooks.findIndex((book) => book.id === bookId);
@@ -1540,13 +1589,13 @@
       return;
     }
 
+    const expectedRevision = local.syncRevision;
     acceptingRemoteProgress = true;
     try {
-      const accepted = await acceptRemoteProgress(
-        current.book,
-        current.remote,
-        local.syncRevision,
-        local.localUpdatedAt,
+      await localProgressBuffer.clear(current.book.id);
+      await syncWork;
+      const accepted = await localProgressBuffer.runAuthoritative(current.book.id, () =>
+        acceptRemoteProgress(current.book, current.remote, expectedRevision, local.localUpdatedAt),
       );
       if (!accepted) {
         dismissConflict();
@@ -1658,9 +1707,10 @@
     await setPreference('syncFurthest', String(next));
   }
 
-  function handleRelocated(location: ReaderLocation): void {
-    if (!reading) return;
-    void relocated(reading.book, location);
+  function handleRelocated(book: BookRecord): (location: ReaderLocation) => void {
+    return (location) => {
+      void relocated(book, location);
+    };
   }
 
   function registerReaderBackHandler(handler: () => boolean): () => void {
@@ -1721,7 +1771,11 @@
         await removeApiKey(server.credentialRef);
         credentialCleanupComplete = true;
       }
-      await removeServer(server.id);
+      if (syncTimer !== null) {
+        window.clearTimeout(syncTimer);
+        syncTimer = null;
+      }
+      await localProgressBuffer.runAuthoritative(undefined, () => removeServer(server.id));
       await clearDiagnostics();
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
@@ -1752,7 +1806,7 @@
       initialXPath={reading.xpath}
       initialPercentage={reading.percentage}
       onBack={() => void closeReader()}
-      onRelocated={handleRelocated}
+      onRelocated={handleRelocated(reading.book)}
       onSyncLatest={(manual) => syncLatestForReader(reading!.book, manual)}
       onRetryDownload={offline || reading.book.remoteAvailable === false
         ? undefined

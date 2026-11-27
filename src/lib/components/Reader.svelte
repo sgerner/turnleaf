@@ -374,6 +374,8 @@
   }
 
   onDestroy(() => {
+    session?.destroy();
+    session = null;
     destroyed = true;
     onMountChange?.(false);
     removeBackHandler?.();
@@ -388,7 +390,6 @@
     resumeHandle = null;
     void handle?.remove();
     void nativeFeatures?.disable();
-    session?.destroy();
   });
 
   function showControls(): void {

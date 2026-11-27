@@ -376,6 +376,9 @@ export class ReaderSession {
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
   private keyboardNavigation: ((event: KeyboardEvent) => void) | null = null;
   private current: Location | null = null;
+  private applyRelocation:
+    ((location: Location, fromSyncFlush: boolean, allowReflow?: boolean) => void) | null = null;
+  private flushedLocationCfi: string | null = null;
   private spine: {
     sections: SpineSection[];
     indexes: Map<string, number>;
@@ -543,7 +546,18 @@ export class ReaderSession {
       });
     }
     this.onLocation = onLocation;
-    this.relocated = (location) => {
+    this.applyRelocation = (location, fromSyncFlush, allowReflow = true) => {
+      if (
+        !fromSyncFlush &&
+        !this.userNavigationPending &&
+        !this.reflowPending &&
+        this.flushedLocationCfi !== null &&
+        this.flushedLocationCfi === location.start.cfi &&
+        this.current?.start.displayed.page === location.start.displayed.page &&
+        this.current?.start.displayed.total === location.start.displayed.total
+      ) {
+        return;
+      }
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
       const isUserNavigation =
         this.userNavigationPending &&
@@ -552,6 +566,7 @@ export class ReaderSession {
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
+      this.flushedLocationCfi = fromSyncFlush ? location.start.cfi : null;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
         this.userNavigationPending = false;
         this.userNavigationStartCfi = null;
@@ -564,8 +579,13 @@ export class ReaderSession {
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
-        this.preserveCfi(location.start.cfi, this.locationGeneration);
+        if (allowReflow) {
+          this.preserveCfi(location.start.cfi, this.locationGeneration);
+        }
       }
+    };
+    this.relocated = (location) => {
+      this.applyRelocation?.(location, false, true);
     };
     this.rendition.on('relocated', this.relocated);
     this.renderedListener = () => {
@@ -918,6 +938,7 @@ export class ReaderSession {
     });
     rendition.themes.select('turnleaf');
     if (!layoutChanged) return;
+    this.flushedLocationCfi = null;
     this.syncVisibleColumnLinks();
     const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
     if (!cfi) return;
@@ -929,6 +950,7 @@ export class ReaderSession {
   }
 
   destroy(): void {
+    this.flushPendingNavigation(false);
     this.locationGeneration += 1;
     for (const contents of [...this.trackedContents]) {
       this.cleanupContents(contents);
@@ -957,13 +979,18 @@ export class ReaderSession {
     this.unloadedHookRegistered = false;
     this.rendition = null;
     this.relocated = null;
+    this.applyRelocation = null;
     this.renderedListener = null;
     this.resizedListener = null;
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
     this.current = null;
+    this.flushedLocationCfi = null;
+    this.userNavigationPending = false;
     this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1320,6 +1347,7 @@ export class ReaderSession {
       if (!width || !height) return;
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
       this.viewportSize = { width, height };
+      this.flushedLocationCfi = null;
       this.displayOperationCount += 1;
       try {
         this.rendition.resize(width, height);
@@ -1431,10 +1459,51 @@ export class ReaderSession {
     }
   }
 
+  private readCurrentLocation(): Location | null {
+    const rendition = this.rendition as (Rendition & { currentLocation?: () => unknown }) | null;
+    if (!rendition || typeof rendition.currentLocation !== 'function') return null;
+    try {
+      const candidate = rendition.currentLocation();
+      if (!candidate || typeof candidate !== 'object') return null;
+      if ('then' in candidate && typeof (candidate as { then?: unknown }).then === 'function') {
+        return null;
+      }
+      const location = candidate as Partial<Location>;
+      const start = location.start;
+      if (
+        !start ||
+        typeof start.cfi !== 'string' ||
+        !start.cfi ||
+        typeof start.href !== 'string' ||
+        !start.displayed ||
+        typeof start.displayed.page !== 'number' ||
+        typeof start.displayed.total !== 'number'
+      ) {
+        return null;
+      }
+      return location as Location;
+    } catch {
+      return null;
+    }
+  }
+
+  private flushPendingNavigation(allowReflow = true): void {
+    if (!this.userNavigationPending || !this.applyRelocation) return;
+    const location = this.readCurrentLocation();
+    if (!location) return;
+    const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+    const moved = startCfi ? startCfi !== location.start.cfi : !this.reflowPending;
+    if (!moved) return;
+    this.applyRelocation(location, true, allowReflow);
+  }
+
   private async navigate(display: () => Promise<unknown>): Promise<void> {
     const generation = this.beginLocationOperation(true);
     try {
       await this.runDisplayOperation(display);
+      if (this.isCurrentLocationOperation(generation)) {
+        this.flushPendingNavigation();
+      }
     } catch (error) {
       if (this.isCurrentLocationOperation(generation)) {
         this.userNavigationPending = false;
@@ -1446,19 +1515,25 @@ export class ReaderSession {
 
   private beginLocationOperation(userNavigation: boolean): number {
     this.locationGeneration += 1;
+    this.flushedLocationCfi = null;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
     this.pendingLinkReturnTarget = null;
     this.userNavigationStartCfi = userNavigation
-      ? (this.current?.start.cfi ?? this.rendition?.location?.start.cfi ?? null)
+      ? (this.current?.start.cfi ??
+        this.rendition?.location?.start.cfi ??
+        this.readCurrentLocation()?.start.cfi ??
+        null)
       : null;
     return this.locationGeneration;
   }
 
   private beginLinkedNavigation(): void {
-    const start = this.current?.start ?? this.rendition?.location?.start;
+    const start =
+      this.current?.start ?? this.rendition?.location?.start ?? this.readCurrentLocation()?.start;
     if (!start) return;
     this.locationGeneration += 1;
+    this.flushedLocationCfi = null;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
     this.userNavigationOrigin = 'link';

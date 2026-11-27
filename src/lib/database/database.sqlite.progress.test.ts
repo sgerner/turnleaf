@@ -852,4 +852,143 @@ describe('native progress transactions against SQLite', () => {
       pendingSync: true,
     });
   });
+
+  it('interleaves buffered native writes with clear() and resetLocalDatabase() without stale rows or lost post-reset progress', async () => {
+    const database = await importDatabase();
+    const { createLocalProgressBuffer } = await import('../sync/local-progress-buffer');
+    const secondBook = {
+      ...book,
+      id: 'server:1:11',
+      chapterId: 11,
+      title: 'Second Book',
+    };
+    const makeLocation = (page: number) => ({
+      cfi: `epubcfi(/6/2!/4/2/${page}:0)`,
+      xpath: `//body/DocFragment[1]/body/p[${page}]`,
+      href: 'chapter-1.xhtml',
+      percentage: page / 100,
+      spineIndex: page - 1,
+      pageIndex: page - 1,
+      pageCount: 100,
+    });
+
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book, secondBook]);
+
+    let notifyGateStarted: (() => void) | null = null;
+    let releaseGate: (() => void) | null = null;
+    let gatePromise: Promise<void> | null = null;
+    const armGate = () => {
+      const started = new Promise<void>((resolve) => {
+        notifyGateStarted = resolve;
+      });
+      gatePromise = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      return {
+        started,
+        release: () => {
+          const release = releaseGate;
+          releaseGate = null;
+          gatePromise = null;
+          release?.();
+        },
+      };
+    };
+
+    const buffer = createLocalProgressBuffer(async (target, location, context) => {
+      if (gatePromise && target.id === book.id) {
+        const currentGate = gatePromise;
+        notifyGateStarted?.();
+        notifyGateStarted = null;
+        await currentGate;
+      }
+      await database.saveLocalProgress(
+        target,
+        location.cfi,
+        location.xpath,
+        location.percentage,
+        location.spineIndex,
+        { shouldCommit: context.isCurrent },
+      );
+    });
+
+    // 1. Clear an in-flight write for `book` while preserving `secondBook`'s queued write.
+    const firstGate = armGate();
+    const clearedWrite = buffer.queue(book, makeLocation(18));
+    await firstGate.started;
+    const survivingWrite = buffer.queue(secondBook, makeLocation(34));
+    const clearSingle = buffer.clear(book.id);
+    firstGate.release();
+    await Promise.all([clearedWrite, survivingWrite, clearSingle]);
+
+    expect(await database.getReadingState(book.id)).toBeNull();
+    expect(await database.getReadingState(secondBook.id)).toMatchObject({
+      percentage: 0.34,
+      pendingSync: true,
+    });
+
+    // 2. Interleave an active native transaction, a queued pre-reset native saveLocalProgress,
+    // an in-flight buffered write, `buffer.clear()`, and `resetLocalDatabase()`, then re-seed
+    // the same book IDs and save fresh post-reset progress before releasing the buffered gate.
+    let releaseTransactionTask!: () => void;
+    const transactionTaskGate = new Promise<void>((resolve) => {
+      releaseTransactionTask = resolve;
+    });
+    let notifyTransactionStarted!: () => void;
+    const transactionStarted = new Promise<void>((resolve) => {
+      notifyTransactionStarted = resolve;
+    });
+    native.onTransactionTask = async (index) => {
+      if (index !== 0) return;
+      native.onTransactionTask = null;
+      notifyTransactionStarted();
+      await transactionTaskGate;
+    };
+
+    const inFlightNativeTx = database.saveLocalProgress(book, 'tx-before-reset', '/tx', 0.22);
+    await transactionStarted;
+    // Queue another native saveLocalProgress behind `inFlightNativeTx` in `nativeTransactionQueue`.
+    const queuedPreResetSave = database.saveLocalProgress(
+      secondBook,
+      'stale-pre-reset',
+      '/stale',
+      0.55,
+    );
+
+    const secondGate = armGate();
+    const bufferedPreReset = buffer.queue(book, makeLocation(49));
+    await secondGate.started;
+
+    const clearAll = buffer.clear();
+    const resetPromise = database.resetLocalDatabase();
+    releaseTransactionTask();
+    await Promise.all([inFlightNativeTx, queuedPreResetSave, resetPromise]);
+
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book, secondBook]);
+    const postResetWrite = buffer.queue(secondBook, makeLocation(74));
+
+    secondGate.release();
+    await Promise.all([bufferedPreReset, clearAll, postResetWrite]);
+
+    const reopened = await reopenDatabase(database);
+    expect(await reopened.getReadingState(book.id)).toBeNull();
+    expect(await reopened.getReadingState(secondBook.id)).toMatchObject({
+      cfi: 'epubcfi(/6/2!/4/2/74:0)',
+      xpath: '//body/DocFragment[1]/body/p[74]',
+      percentage: 0.74,
+      pendingSync: true,
+    });
+    const booksAfterReset = await reopened.getBooks(server.id);
+    expect(booksAfterReset.find((item) => item.id === book.id)?.pagesRead).toBe(0);
+    expect(booksAfterReset.find((item) => item.id === secondBook.id)?.pagesRead).toBe(74);
+    const pending = await reopened.getPendingSync(server.id);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.bookId).toBe(secondBook.id);
+    expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+      chapterId: secondBook.chapterId,
+      pageNum: 74,
+    });
+  });
 });
