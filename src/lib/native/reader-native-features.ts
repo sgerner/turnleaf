@@ -23,11 +23,13 @@ export interface ReaderNativeFeatures {
 // finish before a newly opened reader enables them.
 let queue = Promise.resolve();
 
-export function enqueueNativeOperation(operation: () => Promise<void>): Promise<void> {
+export function enqueueNativeWindowAction(operation: () => Promise<void>): Promise<void> {
   const next = queue.then(operation, operation);
   queue = next.catch(() => undefined);
   return next;
 }
+
+export const enqueueNativeOperation = enqueueNativeWindowAction;
 
 export function createReaderNativeFeatures(
   actions: ReaderNativeFeatureActions,
@@ -35,7 +37,7 @@ export function createReaderNativeFeatures(
   let active = true;
 
   function enqueue(operation: () => Promise<void>): Promise<void> {
-    return enqueueNativeOperation(operation);
+    return enqueueNativeWindowAction(operation);
   }
 
   async function attempt(operation: () => Promise<void>): Promise<void> {

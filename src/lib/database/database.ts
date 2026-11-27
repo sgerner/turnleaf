@@ -8,7 +8,27 @@ import {
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
+import * as ThemesModule from '../themes/themes';
 import { migrations } from './schema';
+
+function safeClearBootThemeCache(): void {
+  try {
+    ThemesModule.clearBootThemeCache?.();
+  } catch {
+    // Optional under partial theme module mocks in unit tests.
+  }
+}
+
+function safeMirrorBootThemePreferences(
+  preferences: ReadonlyMap<string, string>,
+  fallback?: { theme?: string | undefined; mode?: string | undefined },
+): void {
+  try {
+    ThemesModule.mirrorBootThemePreferences?.(preferences, fallback);
+  } catch {
+    // Optional under partial theme module mocks in unit tests.
+  }
+}
 
 export interface ServerConfig {
   id: string;
@@ -237,6 +257,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 export async function resetLocalDatabase(): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
+    safeClearBootThemeCache();
     return;
   }
 
@@ -251,6 +272,7 @@ export async function resetLocalDatabase(): Promise<void> {
     connection = null;
     opening = null;
     await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+    safeClearBootThemeCache();
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
   }
@@ -1243,8 +1265,16 @@ export async function setPreference(key: string, value: string): Promise<void> {
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
+    let nextTheme: string | undefined;
+    let nextMode: string | undefined;
     updateBrowserState((state) => {
       for (const [key, value] of preferences) state.preferences[key] = value;
+      nextTheme = state.preferences.uiTheme;
+      nextMode = state.preferences.uiMode;
+    });
+    safeMirrorBootThemePreferences(preferences, {
+      theme: nextTheme,
+      mode: nextMode,
     });
     return;
   }
@@ -1257,4 +1287,5 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
+  safeMirrorBootThemePreferences(preferences);
 }

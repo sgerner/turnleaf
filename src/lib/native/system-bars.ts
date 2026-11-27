@@ -1,6 +1,6 @@
 import * as CapacitorCore from '@capacitor/core';
 import type { SystemBarsStyle, SystemBarsVisibilityOptions } from '@capacitor/core';
-import { enqueueNativeOperation } from './reader-native-features';
+import { enqueueNativeWindowAction } from './reader-native-features';
 
 const LIGHT_SYSTEM_BARS_STYLE = 'LIGHT' as SystemBarsStyle;
 const DARK_SYSTEM_BARS_STYLE = 'DARK' as SystemBarsStyle;
@@ -382,5 +382,5 @@ export async function showSystemBars(
 export function syncShellSystemBars(mode: SurfaceMode, doc: Document = document): Promise<void> {
   const resolved = resolveShellSystemBars(mode, doc);
   applyThemeColorMeta(resolved.themeColor, doc);
-  return enqueueNativeOperation(() => applySystemBarsStyle(resolved.style));
+  return enqueueNativeWindowAction(() => applySystemBarsStyle(resolved.style));
 }
