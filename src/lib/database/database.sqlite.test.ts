@@ -13,7 +13,12 @@ import {
 } from './database';
 import { parseAnnotations } from '../reader/annotations';
 import { parseBookmarks, parseLocationHistory } from '../reader/bookmarks';
-import { migrations, V8_BOOK_COLUMNS, V8_BOOK_INDEX_SQL } from './schema';
+import {
+  BOOKS_SERVER_FILE_INDEX_SQL,
+  migrations,
+  V8_BOOK_COLUMNS,
+  V9_BOOK_COLUMNS,
+} from './schema';
 
 const baseBook: BookRecord = {
   id: 'server:1:10',
@@ -460,7 +465,40 @@ describe('native metadata transactions against SQLite', () => {
   });
 });
 
-const STUDY_STORAGE_MIGRATION_VERSION = 10;
+const STUDY_STORAGE_MIGRATION_VERSION = 11;
+
+const EXPECTED_FINAL_V9_BOOK_COLUMNS = [
+  'id',
+  'server_id',
+  'library_id',
+  'series_id',
+  'volume_id',
+  'chapter_id',
+  'title',
+  'author',
+  'series',
+  'description_html',
+  'cover_path',
+  'format',
+  'metadata_refreshed_at',
+  'download_path',
+  'download_status',
+  'file_size',
+  'pages',
+  'pages_read',
+  'created_at',
+  'last_read_at',
+  'remote_available',
+  'remote_file_size',
+  'downloaded_bytes',
+  'downloaded_pages',
+  'chapter_key',
+  'file_id',
+  'file_name',
+  'chapter_epub_index',
+  'multi_file_chapter',
+  'sync_progress',
+] as const;
 
 const LEGACY_PR328_ONLY_V8_STATEMENTS = `
   ALTER TABLE books ADD COLUMN file_id INTEGER;
@@ -472,20 +510,20 @@ const LEGACY_PR328_ONLY_V8_STATEMENTS = `
   CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
 `;
 
-const LEGACY_PR330_ONLY_V8_STATEMENTS = `
+const PR330_V8_STATEMENTS = `
   ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
   ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
   ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
   ALTER TABLE books ADD COLUMN chapter_key TEXT;
 `;
 
-const PR339_V9_STATEMENTS = `
+const PR339_V10_STATEMENTS = `
   ALTER TABLE books ADD COLUMN sort_order REAL;
   ALTER TABLE books ADD COLUMN min_number REAL;
   ALTER TABLE books ADD COLUMN volume_number REAL;
 `;
 
-const PR345_V10_STATEMENTS = `
+const PR345_V11_STATEMENTS = `
   CREATE TABLE IF NOT EXISTS annotations (
     id TEXT PRIMARY KEY NOT NULL,
     book_id TEXT NOT NULL,
@@ -573,8 +611,9 @@ const DELETE_LEGACY_STUDY_PREFERENCES_SQL = `
        OR key LIKE 'readerHistory:%';
 `;
 
-const EXPECTED_V8_AND_V9_BOOK_COLUMNS = [
+const EXPECTED_V8_TO_V10_BOOK_COLUMNS = [
   ...V8_BOOK_COLUMNS.map((column) => column.name),
+  ...V9_BOOK_COLUMNS.map((column) => column.name),
   'sort_order',
   'min_number',
   'volume_number',
@@ -614,6 +653,57 @@ function createMigrationAdapter(
       }
     },
   };
+}
+
+function createDatabaseAtVersion(targetVersion: number): DatabaseSync {
+  const db = new DatabaseSync(':memory:');
+  db.exec('PRAGMA foreign_keys = ON;');
+  for (const migration of migrations.filter((entry) => entry.version <= targetVersion)) {
+    db.exec(migration.statements);
+    db.exec(`PRAGMA user_version = ${migration.version};`);
+  }
+
+  db.prepare(
+    `INSERT INTO server_config
+      (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+      VALUES ('srv_active', 'Active Kavita', 'https://active.example', 'server_srv_active_api_key', '0.8.8', '2026-01-01T00:00:00.000Z')`,
+  ).run();
+
+  db.prepare(
+    `INSERT INTO books
+      (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+       format, metadata_refreshed_at, download_path, download_status, file_size)
+      VALUES
+        ('srv_active:82:1406', 'srv_active', 1, 82, 188, 1406, 'Vol 3', 'Rawlinson', 'Ancient World',
+         'epub', '2026-01-01T00:00:00.000Z', 'books/legacy-vol3.epub', 'available', 1955734)`,
+  ).run();
+
+  if (targetVersion >= 2) {
+    db.prepare(
+      `UPDATE books
+       SET pages = 9, pages_read = 3, created_at = '2026-01-01T00:00:00.000Z',
+           last_read_at = '2026-01-05T00:00:00.000Z'
+       WHERE id = 'srv_active:82:1406'`,
+    ).run();
+  }
+  if (targetVersion >= 8) {
+    db.prepare(
+      `UPDATE books
+       SET remote_file_size = 1955734, downloaded_bytes = 1955734,
+           downloaded_pages = 5, chapter_key = 'number:3'
+       WHERE id = 'srv_active:82:1406'`,
+    ).run();
+  }
+  if (targetVersion >= 9) {
+    db.prepare(
+      `UPDATE books
+       SET file_id = 2114, file_name = 'pg16163-images-3.epub',
+           chapter_epub_index = 0, multi_file_chapter = 1, sync_progress = 1
+       WHERE id = 'srv_active:82:1406'`,
+    ).run();
+  }
+
+  return db;
 }
 
 function createPopulatedV7Database(): DatabaseSync {
@@ -821,26 +911,17 @@ async function runSimpleMigrations(
   }
 }
 
-async function runCoordinatedV9AndV10Upgrade(
+async function runDownstreamV10AndV11Upgrade(
   adapter: MigrationConnection,
-  options: { includePr330OnlyV8?: boolean } = {},
+  options: { omitPr328V9?: boolean } = {},
 ): Promise<void> {
   const current = await adapter.getVersion();
   const currentVersion = current.version ?? 0;
   const tableInfoRows = (await adapter.query("PRAGMA table_info('books')")).values ?? [];
   const existingColumns = new Set(tableInfoRows.map((row) => String(row.name)));
 
-  const targetV8Columns = options.includePr330OnlyV8
-    ? [
-        { name: 'remote_file_size', definition: 'INTEGER' },
-        { name: 'downloaded_bytes', definition: 'INTEGER' },
-        { name: 'downloaded_pages', definition: 'INTEGER' },
-        { name: 'chapter_key', definition: 'TEXT' },
-      ]
-    : V8_BOOK_COLUMNS;
-
   if (currentVersion < 8) {
-    const missingV8 = targetV8Columns.filter((column) => !existingColumns.has(column.name));
+    const missingV8 = V8_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
     await adapter.executeTransaction([
       ...(missingV8.length > 0
         ? [
@@ -853,23 +934,18 @@ async function runCoordinatedV9AndV10Upgrade(
             },
           ]
         : []),
-      ...(options.includePr330OnlyV8 ? [] : [{ statement: V8_BOOK_INDEX_SQL }]),
       { statement: 'PRAGMA user_version = 8;' },
     ]);
     for (const column of missingV8) existingColumns.add(column.name);
   }
 
-  if (currentVersion < 9) {
-    const v9Columns = [
-      { name: 'sort_order', definition: 'REAL' },
-      { name: 'min_number', definition: 'REAL' },
-      { name: 'volume_number', definition: 'REAL' },
-    ].filter((column) => !existingColumns.has(column.name));
+  if (currentVersion < 9 && !options.omitPr328V9) {
+    const missingV9 = V9_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
     await adapter.executeTransaction([
-      ...(v9Columns.length > 0
+      ...(missingV9.length > 0
         ? [
             {
-              statement: v9Columns
+              statement: missingV9
                 .map(
                   (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
                 )
@@ -877,21 +953,39 @@ async function runCoordinatedV9AndV10Upgrade(
             },
           ]
         : []),
+      { statement: BOOKS_SERVER_FILE_INDEX_SQL },
       { statement: 'PRAGMA user_version = 9;' },
     ]);
-    for (const column of v9Columns) existingColumns.add(column.name);
+    for (const column of missingV9) existingColumns.add(column.name);
+  }
+
+  if (currentVersion < 10) {
+    const v10Columns = [
+      { name: 'sort_order', definition: 'REAL' },
+      { name: 'min_number', definition: 'REAL' },
+      { name: 'volume_number', definition: 'REAL' },
+    ].filter((column) => !existingColumns.has(column.name));
+    await adapter.executeTransaction([
+      ...(v10Columns.length > 0
+        ? [
+            {
+              statement: v10Columns
+                .map(
+                  (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
+                )
+                .join('\n'),
+            },
+          ]
+        : []),
+      { statement: 'PRAGMA user_version = 10;' },
+    ]);
+    for (const column of v10Columns) existingColumns.add(column.name);
   }
 
   if (currentVersion < STUDY_STORAGE_MIGRATION_VERSION) {
-    const missingPreV10 = [
-      ...(options.includePr330OnlyV8
-        ? [
-            { name: 'remote_file_size', definition: 'INTEGER' },
-            { name: 'downloaded_bytes', definition: 'INTEGER' },
-            { name: 'downloaded_pages', definition: 'INTEGER' },
-            { name: 'chapter_key', definition: 'TEXT' },
-          ]
-        : V8_BOOK_COLUMNS),
+    const missingPreV11 = [
+      ...V8_BOOK_COLUMNS,
+      ...(options.omitPr328V9 ? [] : V9_BOOK_COLUMNS),
       { name: 'sort_order', definition: 'REAL' },
       { name: 'min_number', definition: 'REAL' },
       { name: 'volume_number', definition: 'REAL' },
@@ -981,10 +1075,10 @@ async function runCoordinatedV9AndV10Upgrade(
     }
 
     await adapter.executeTransaction([
-      ...(missingPreV10.length > 0
+      ...(missingPreV11.length > 0
         ? [
             {
-              statement: missingPreV10
+              statement: missingPreV11
                 .map(
                   (column) => `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition};`,
                 )
@@ -992,8 +1086,8 @@ async function runCoordinatedV9AndV10Upgrade(
             },
           ]
         : []),
-      ...(options.includePr330OnlyV8 ? [] : [{ statement: V8_BOOK_INDEX_SQL }]),
-      { statement: PR345_V10_STATEMENTS },
+      ...(options.omitPr328V9 ? [] : [{ statement: BOOKS_SERVER_FILE_INDEX_SQL }]),
+      { statement: PR345_V11_STATEMENTS },
       ...copyTasks,
       { statement: DELETE_LEGACY_STUDY_PREFERENCES_SQL },
       { statement: `PRAGMA user_version = ${STUDY_STORAGE_MIGRATION_VERSION};` },
@@ -1021,7 +1115,85 @@ function listTableNames(db: DatabaseSync): string[] {
   ).map((row) => row.name);
 }
 
-describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, and #345', () => {
+describe('idempotent v1-to-v9 SQLite schema upgrades and final column set', () => {
+  let db: DatabaseSync | undefined;
+
+  afterEach(() => db?.close());
+
+  it.each([7, 8, 9])(
+    'upgrades a populated database from version %i to version 9 and asserts the exact final column set',
+    async (startVersion) => {
+      db = createDatabaseAtVersion(startVersion);
+      const adapter = createMigrationAdapter(db);
+
+      await migrateDatabase(adapter);
+      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      expect(listColumnNames(db, 'books')).toEqual([...EXPECTED_FINAL_V9_BOOK_COLUMNS]);
+      expect(listIndexNames(db, 'books')).toEqual(
+        expect.arrayContaining(['books_server_title_idx', 'books_server_file_idx']),
+      );
+
+      // Re-running migrateDatabase at v9 is a clean idempotent no-op.
+      await migrateDatabase(adapter);
+      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      expect(listColumnNames(db, 'books')).toEqual([...EXPECTED_FINAL_V9_BOOK_COLUMNS]);
+      expect(readBook(db, 'srv_active:82:1406')).toMatchObject({
+        download_path: 'books/legacy-vol3.epub',
+        download_status: 'available',
+        file_size: 1955734,
+        pages: 9,
+        pages_read: 3,
+        sync_progress: 1,
+      });
+    },
+  );
+
+  it.each([1, 2, 3, 4, 5, 6])(
+    'upgrades earlier version %i databases cleanly through version 9 with the exact final column set',
+    async (startVersion) => {
+      db = createDatabaseAtVersion(startVersion);
+      const adapter = createMigrationAdapter(db);
+
+      await migrateDatabase(adapter);
+
+      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      expect(listColumnNames(db, 'books')).toEqual([...EXPECTED_FINAL_V9_BOOK_COLUMNS]);
+      expect(listColumnNames(db, 'sync_queue')).toContain('revision');
+      expect(listColumnNames(db, 'reading_state')).toContain('sync_revision');
+      expect(listIndexNames(db, 'books')).toEqual(
+        expect.arrayContaining(['books_server_title_idx', 'books_server_file_idx']),
+      );
+    },
+  );
+
+  it('checks PRAGMA table_info before ALTER TABLE ADD COLUMN when columns already exist in v1..v9', async () => {
+    db = createDatabaseAtVersion(1);
+    // Pre-add a subset of columns from v2, v4, v6, v7, v8, and v9 before running migrations.
+    db.exec(`
+      ALTER TABLE books ADD COLUMN pages INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN remote_available INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE sync_queue ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE reading_state ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+    `);
+
+    const adapter = createMigrationAdapter(db);
+    await migrateDatabase(adapter);
+
+    expect(await adapter.getVersion()).toEqual({ version: 9 });
+    const finalBookColumns = listColumnNames(db, 'books');
+    expect(finalBookColumns).toHaveLength(EXPECTED_FINAL_V9_BOOK_COLUMNS.length);
+    expect(new Set(finalBookColumns)).toEqual(new Set(EXPECTED_FINAL_V9_BOOK_COLUMNS));
+    expect(finalBookColumns.filter((name) => name === 'remote_file_size')).toHaveLength(1);
+    expect(listIndexNames(db, 'books')).toEqual(
+      expect.arrayContaining(['books_server_title_idx', 'books_server_file_idx']),
+    );
+  });
+});
+
+describe('sequenced v7-to-v11 SQLite schema upgrades across #330 (v8), #328 (v9), #339 (v10), and #345 (v11)', () => {
   let db: DatabaseSync | undefined;
 
   afterEach(() => db?.close());
@@ -1044,9 +1216,9 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
     `);
   }
 
-  function assertCompleteV10Schema(targetDb: DatabaseSync): void {
+  function assertCompleteV11Schema(targetDb: DatabaseSync): void {
     const bookColumns = listColumnNames(targetDb, 'books');
-    for (const column of EXPECTED_V8_AND_V9_BOOK_COLUMNS) {
+    for (const column of EXPECTED_V8_TO_V10_BOOK_COLUMNS) {
       expect(bookColumns).toContain(column);
     }
     expect(bookColumns.filter((name) => name === 'remote_file_size')).toHaveLength(1);
@@ -1062,8 +1234,8 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
     ]);
   }
 
-  it('upgrades populated v7 databases with a #328-only v8 shape to v10 in both merge orders without duplicate columns or data loss', async () => {
-    // Merge Order A: #328-only v8 -> coordinated #328/#330 migrateDatabase -> #339 v9 -> #345 v10
+  it('upgrades populated v7 databases with a legacy #328-only v8 shape through v9, v10, and v11 without duplicate columns or data loss', async () => {
+    // Path A: legacy #328-only v8 -> #328 v9 migrateDatabase -> #339 v10 -> #345 v11
     const orderADb = createPopulatedV7Database();
     try {
       const adapter = createMigrationAdapter(orderADb);
@@ -1082,10 +1254,9 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
         .run();
 
       await migrateDatabase(adapter);
-      // Must keep user_version at 8 so #339 v9 and #345 v10 still execute in sequence.
-      expect(await adapter.getVersion()).toEqual({ version: 8 });
-      expect(listColumnNames(orderADb, 'books')).toEqual(
-        expect.arrayContaining(V8_BOOK_COLUMNS.map((column) => column.name)),
+      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      expect(new Set(listColumnNames(orderADb, 'books'))).toEqual(
+        new Set(EXPECTED_FINAL_V9_BOOK_COLUMNS),
       );
       orderADb
         .prepare(
@@ -1095,8 +1266,8 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
         )
         .run();
 
-      await runSimpleMigrations(adapter, [{ version: 9, statements: PR339_V9_STATEMENTS }]);
-      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      await runSimpleMigrations(adapter, [{ version: 10, statements: PR339_V10_STATEMENTS }]);
+      expect(await adapter.getVersion()).toEqual({ version: 10 });
       orderADb
         .prepare(
           `UPDATE books SET sort_order = 3, min_number = 3, volume_number = 3
@@ -1105,11 +1276,11 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
         .run();
 
       attachLegacyPreferenceDeleteGuard(orderADb);
-      await runCoordinatedV9AndV10Upgrade(adapter);
+      await runDownstreamV10AndV11Upgrade(adapter);
       await migrateDatabase(adapter);
 
       expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-      assertCompleteV10Schema(orderADb);
+      assertCompleteV11Schema(orderADb);
       expect(readBook(orderADb, 'srv_active:82:1406')).toMatchObject({
         download_path: 'books/legacy-vol3.epub',
         download_status: 'available',
@@ -1140,7 +1311,7 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
       orderADb.close();
     }
 
-    // Merge Order B: #328-only v8 -> #339 v9 -> #345 v10 -> coordinated #328 migrateDatabase
+    // Path B: legacy #328-only v8 -> #339 v10 -> #345 v11 -> #328 migrateDatabase heals missing #330 v8 columns at v11
     db = createPopulatedV7Database();
     const adapterB = createMigrationAdapter(db);
     await runSimpleMigrations(adapterB, [
@@ -1153,29 +1324,28 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
            multi_file_chapter = 1, sync_progress = 1
        WHERE id = 'srv_active:82:1406'`,
     ).run();
-    await runSimpleMigrations(adapterB, [{ version: 9, statements: PR339_V9_STATEMENTS }]);
+    await runSimpleMigrations(adapterB, [{ version: 10, statements: PR339_V10_STATEMENTS }]);
     db.prepare(
       `UPDATE books SET sort_order = 3, min_number = 3, volume_number = 3
        WHERE id = 'srv_active:82:1406'`,
     ).run();
 
-    // Simulate #345 v10 running before #330/#328 coordinated v8 columns were reconciled:
     attachLegacyPreferenceDeleteGuard(db);
     await runSimpleMigrations(adapterB, [
       {
         version: STUDY_STORAGE_MIGRATION_VERSION,
-        statements: `${PR345_V10_STATEMENTS}\nINSERT INTO annotations (id, book_id, cfi, xpath, excerpt, note, created_at, updated_at, sync_state, sync_revision) VALUES ('srv_active:82:1406:ann-vol3', 'srv_active:82:1406', 'epubcfi(/6/2!/4/8/1:0)', '//body/DocFragment[1]/body', 'Media and Babylon', 'Primary edition note', '2026-01-03T00:00:00.000Z', '2026-01-03T00:00:00.000Z', 'pending_create', 1), ('srv_active:1:10:ann-10', 'srv_active:1:10', 'epubcfi(/6/4!/4/2/1:0)', '//body/DocFragment[2]/body', 'Book Ten highlight', 'Book Ten note', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z', 'pending_create', 1);\nINSERT INTO bookmarks (id, book_id, cfi, xpath, href, percentage, label, saved_at, updated_at, sync_state, sync_revision) VALUES ('srv_active:82:1406:bm-vol3', 'srv_active:82:1406', 'epubcfi(/6/2!/4/8)', '//body/DocFragment[1]/body', 'Text/ch1.xhtml', 0.6, 'Vol 3 Bookmark', '2026-01-03T01:00:00.000Z', '2026-01-03T01:00:00.000Z', 'pending_create', 1), ('srv_active:1:10:bm-10', 'srv_active:1:10', 'epubcfi(/6/4!/4/2)', '//body/DocFragment[2]/body', 'Text/ch2.xhtml', 0.35, 'Chapter Two', '2026-01-02T10:00:00.000Z', '2026-01-02T10:00:00.000Z', 'pending_create', 1);\nINSERT INTO reading_history (book_id, id, cfi, href, percentage, label, saved_at) VALUES ('srv_active:82:1406', 'hist-vol3', 'epubcfi(/6/2!/4/4)', 'Text/ch1.xhtml', 0.3, '30% · ch1.xhtml', '2026-01-03T00:30:00.000Z'), ('srv_active:1:11', 'hist-11-1', 'epubcfi(/6/4!/4/2)', 'Text/ch2.xhtml', 0.2, '20% · ch2.xhtml', '2026-01-04T00:00:00.000Z'), ('srv_active:1:11', 'hist-11-2', 'epubcfi(/6/6!/4/2)', 'Text/ch3.xhtml', 0.5, '50% · ch3.xhtml', '2026-01-05T00:00:00.000Z');\n${DELETE_LEGACY_STUDY_PREFERENCES_SQL}`,
+        statements: `${PR345_V11_STATEMENTS}\nINSERT INTO annotations (id, book_id, cfi, xpath, excerpt, note, created_at, updated_at, sync_state, sync_revision) VALUES ('srv_active:82:1406:ann-vol3', 'srv_active:82:1406', 'epubcfi(/6/2!/4/8/1:0)', '//body/DocFragment[1]/body', 'Media and Babylon', 'Primary edition note', '2026-01-03T00:00:00.000Z', '2026-01-03T00:00:00.000Z', 'pending_create', 1), ('srv_active:1:10:ann-10', 'srv_active:1:10', 'epubcfi(/6/4!/4/2/1:0)', '//body/DocFragment[2]/body', 'Book Ten highlight', 'Book Ten note', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z', 'pending_create', 1);\nINSERT INTO bookmarks (id, book_id, cfi, xpath, href, percentage, label, saved_at, updated_at, sync_state, sync_revision) VALUES ('srv_active:82:1406:bm-vol3', 'srv_active:82:1406', 'epubcfi(/6/2!/4/8)', '//body/DocFragment[1]/body', 'Text/ch1.xhtml', 0.6, 'Vol 3 Bookmark', '2026-01-03T01:00:00.000Z', '2026-01-03T01:00:00.000Z', 'pending_create', 1), ('srv_active:1:10:bm-10', 'srv_active:1:10', 'epubcfi(/6/4!/4/2)', '//body/DocFragment[2]/body', 'Text/ch2.xhtml', 0.35, 'Chapter Two', '2026-01-02T10:00:00.000Z', '2026-01-02T10:00:00.000Z', 'pending_create', 1);\nINSERT INTO reading_history (book_id, id, cfi, href, percentage, label, saved_at) VALUES ('srv_active:82:1406', 'hist-vol3', 'epubcfi(/6/2!/4/4)', 'Text/ch1.xhtml', 0.3, '30% · ch1.xhtml', '2026-01-03T00:30:00.000Z'), ('srv_active:1:11', 'hist-11-1', 'epubcfi(/6/4!/4/2)', 'Text/ch2.xhtml', 0.2, '20% · ch2.xhtml', '2026-01-04T00:00:00.000Z'), ('srv_active:1:11', 'hist-11-2', 'epubcfi(/6/6!/4/2)', 'Text/ch3.xhtml', 0.5, '50% · ch3.xhtml', '2026-01-05T00:00:00.000Z');\n${DELETE_LEGACY_STUDY_PREFERENCES_SQL}`,
       },
     ]);
     expect(await adapterB.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
     expect(listColumnNames(db, 'books')).not.toContain('downloaded_bytes');
 
-    // Running #328's migrateDatabase at v10 reconciles missing #330 v8 columns without downgrading user_version.
+    // Running #328's migrateDatabase at v11 reconciles missing #330 v8 columns without downgrading user_version.
     await migrateDatabase(adapterB);
     await migrateDatabase(adapterB);
 
     expect(await adapterB.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-    assertCompleteV10Schema(db);
+    assertCompleteV11Schema(db);
     expect(readBook(db, 'srv_active:82:1406')).toMatchObject({
       file_id: 2114,
       file_name: 'pg16163-images-3.epub',
@@ -1186,7 +1356,7 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
     });
   });
 
-  it('upgrades populated v7 databases with a #330-only v8 shape to v10 in both merge orders and preserves v8/v9/v10 data across multi-EPUB re-keying', async () => {
+  it('upgrades populated v7 databases through #330 v8 -> #328 v9 -> #339 v10 -> #345 v11 and preserves v8/v9/v10/v11 data across multi-EPUB re-keying', async () => {
     const multiEpubBooks: BookRecord[] = [
       {
         id: 'srv_active:82:1406:2114',
@@ -1242,13 +1412,13 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
       },
     ];
 
-    // Merge Order A: #330-only v8 -> #328 migrateDatabase + multi-EPUB reconcile -> #339 v9 -> #345 v10
+    // Canonical sequence: #330 v8 -> #328 v9 migrateDatabase + multi-EPUB reconcile -> #339 v10 -> #345 v11
     const orderADb = createPopulatedV7Database();
     try {
       const adapter = createMigrationAdapter(orderADb);
       await runSimpleMigrations(adapter, [
         ...migrations.slice(0, 7),
-        { version: 8, statements: LEGACY_PR330_ONLY_V8_STATEMENTS },
+        { version: 8, statements: PR330_V8_STATEMENTS },
       ]);
       expect(await adapter.getVersion()).toEqual({ version: 8 });
       orderADb
@@ -1260,10 +1430,8 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
         .run();
 
       await migrateDatabase(adapter);
-      expect(await adapter.getVersion()).toEqual({ version: 8 });
-      expect(listColumnNames(orderADb, 'books')).toEqual(
-        expect.arrayContaining(V8_BOOK_COLUMNS.map((column) => column.name)),
-      );
+      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      expect(listColumnNames(orderADb, 'books')).toEqual([...EXPECTED_FINAL_V9_BOOK_COLUMNS]);
       expect(listIndexNames(orderADb, 'books')).toContain('books_server_file_idx');
 
       await reconcileBooksInTransaction(adapter, 'srv_active', multiEpubBooks, undefined, true);
@@ -1281,9 +1449,9 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
       });
 
       attachLegacyPreferenceDeleteGuard(orderADb);
-      await runCoordinatedV9AndV10Upgrade(adapter);
+      await runDownstreamV10AndV11Upgrade(adapter);
       expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-      assertCompleteV10Schema(orderADb);
+      assertCompleteV11Schema(orderADb);
       expect(
         orderADb
           .prepare('SELECT book_id, excerpt FROM annotations WHERE book_id = ?')
@@ -1312,10 +1480,10 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
       orderADb.close();
     }
 
-    // Merge Order B: #330-only v8 -> #339 v9 -> #345 v10 -> #328 migrateDatabase + multi-EPUB reconcile at v10
+    // Recovery sequence: v11 DB missing #328 v9 columns -> #328 migrateDatabase + multi-EPUB reconcile at v11
     db = createPopulatedV7Database();
     const adapterB = createMigrationAdapter(db);
-    await runCoordinatedV9AndV10Upgrade(adapterB, { includePr330OnlyV8: true });
+    await runDownstreamV10AndV11Upgrade(adapterB, { omitPr328V9: true });
     expect(await adapterB.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
     expect(listColumnNames(db, 'books')).not.toContain('file_id');
 
@@ -1329,7 +1497,7 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
     await migrateDatabase(adapterB);
     await migrateDatabase(adapterB);
     expect(await adapterB.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-    assertCompleteV10Schema(db);
+    assertCompleteV11Schema(db);
 
     await reconcileBooksInTransaction(adapterB, 'srv_active', multiEpubBooks, undefined, true);
     expect(readBook(db, 'srv_active:82:1406')).toBeUndefined();
@@ -1387,23 +1555,19 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
     });
   });
 
-  it('upgrades populated v7 databases cleanly when coordinated #328 v8 lands before or after #330/#339/#345', async () => {
-    // Merge Order 1: #328 coordinated v8 first -> #330 v8 (no-op) -> #339 v9 -> #345 v10
+  it('upgrades populated v7 databases cleanly through v9 and downstream v10/v11 migrations', async () => {
     const firstOrderDb = createPopulatedV7Database();
     try {
       const adapter = createMigrationAdapter(firstOrderDb);
       await migrateDatabase(adapter);
-      expect(await adapter.getVersion()).toEqual({ version: 8 });
-      // #330's v8 migration is skipped cleanly because user_version is 8 AND all #330 columns already exist.
-      await runSimpleMigrations(adapter, [
-        ...migrations.slice(0, 7),
-        { version: 8, statements: LEGACY_PR330_ONLY_V8_STATEMENTS },
-      ]);
+      expect(await adapter.getVersion()).toEqual({ version: 9 });
+      expect(listColumnNames(firstOrderDb, 'books')).toEqual([...EXPECTED_FINAL_V9_BOOK_COLUMNS]);
+
       attachLegacyPreferenceDeleteGuard(firstOrderDb);
-      await runCoordinatedV9AndV10Upgrade(adapter);
+      await runDownstreamV10AndV11Upgrade(adapter);
 
       expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-      assertCompleteV10Schema(firstOrderDb);
+      assertCompleteV11Schema(firstOrderDb);
       expect(firstOrderDb.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({
         total: 2,
       });
@@ -1417,14 +1581,13 @@ describe('coordinated v7-to-v10 SQLite schema upgrades across #328, #330, #339, 
       firstOrderDb.close();
     }
 
-    // Merge Order 2: coordinated #330/#339/#345 first -> #328 migrateDatabase afterward
     db = createPopulatedV7Database();
     const adapter2 = createMigrationAdapter(db);
     attachLegacyPreferenceDeleteGuard(db);
-    await runCoordinatedV9AndV10Upgrade(adapter2);
+    await runDownstreamV10AndV11Upgrade(adapter2);
     await migrateDatabase(adapter2);
 
     expect(await adapter2.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-    assertCompleteV10Schema(db);
+    assertCompleteV11Schema(db);
   });
 });

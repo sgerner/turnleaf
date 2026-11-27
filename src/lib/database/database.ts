@@ -10,7 +10,12 @@ import { toKavitaPageNumber } from '../sync/conflict';
 import { sanitizeEpubFileName } from '../kavita/normalization';
 import type { KavitaProgress } from '../kavita/types';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
-import { migrations, V8_BOOK_COLUMNS, V8_BOOK_INDEX_SQL } from './schema';
+import {
+  BOOKS_SERVER_FILE_INDEX_SQL,
+  migrations,
+  V8_BOOK_COLUMNS,
+  V9_BOOK_COLUMNS,
+} from './schema';
 
 export interface ServerConfig {
   id: string;
@@ -377,6 +382,11 @@ export type MigrationConnection = Pick<
 > &
   Partial<Pick<SQLiteDBConnection, 'execute'>>;
 
+const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
+const REQUIRED_BOOK_COLUMNS = [...V8_BOOK_COLUMNS, ...V9_BOOK_COLUMNS] as const;
+const ALTER_TABLE_ADD_COLUMN_STATEMENT =
+  /^ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+ADD\s+(?:COLUMN\s+)?([a-z_][a-z0-9_]*)\s+[\s\S]+$/i;
+
 function isMissingColumnError(error: unknown): boolean {
   return String(error).toLowerCase().includes('no such column');
 }
@@ -385,12 +395,22 @@ function isMissingTableError(error: unknown, tableName: string): boolean {
   return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
 }
 
+async function queryExistingTableColumns(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  tableName: string,
+): Promise<Set<string>> {
+  if (!SAFE_SQL_IDENTIFIER.test(tableName)) {
+    throw new Error(`Unsafe SQLite table identifier: ${tableName}`);
+  }
+  const rows = (await executeNativeQuery(db, `PRAGMA table_info('${tableName}')`)).values ?? [];
+  return new Set(rows.map((row) => String(row.name)));
+}
+
 async function queryExistingBookColumns(
   db: Pick<SQLiteDBConnection, 'query'>,
 ): Promise<Set<string> | null> {
-  const rows = (await executeNativeQuery(db, "PRAGMA table_info('books')")).values ?? [];
-  if (rows.length === 0) return null;
-  return new Set(rows.map((row) => String(row.name)));
+  const columns = await queryExistingTableColumns(db, 'books');
+  return columns.size > 0 ? columns : null;
 }
 
 async function hasBooksServerFileIndex(db: Pick<SQLiteDBConnection, 'query'>): Promise<boolean> {
@@ -398,11 +418,85 @@ async function hasBooksServerFileIndex(db: Pick<SQLiteDBConnection, 'query'>): P
   return rows.some((row) => String(row.name) === 'books_server_file_idx');
 }
 
-function buildV8ReconciliationTasks(
+async function buildIdempotentMigrationStatements(
+  db: Pick<SQLiteDBConnection, 'query'>,
+  migration: (typeof migrations)[number],
+): Promise<string | null> {
+  const statements = migration.statements
+    .split(';')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+
+  const parsedStatements = statements.map((statement) => {
+    const match = ALTER_TABLE_ADD_COLUMN_STATEMENT.exec(statement);
+    if (!match) {
+      return { statement, alterTarget: null };
+    }
+    return {
+      statement,
+      alterTarget: {
+        tableName: match[1]!,
+        columnName: match[2]!,
+      },
+    };
+  });
+
+  const alteredTables = new Set(
+    parsedStatements
+      .map((entry) => entry.alterTarget?.tableName)
+      .filter((tableName): tableName is string => Boolean(tableName)),
+  );
+  if (alteredTables.size === 0) {
+    return migration.statements;
+  }
+
+  const columnsByTable = new Map<string, Set<string>>();
+  for (const tableName of alteredTables) {
+    columnsByTable.set(tableName, await queryExistingTableColumns(db, tableName));
+  }
+
+  const booksColumns = columnsByTable.get('books');
+  const missingV8PrefixStatements =
+    migration.version === 9 && booksColumns && booksColumns.size > 0
+      ? V8_BOOK_COLUMNS.filter((column) => !booksColumns.has(column.name)).map((column) => {
+          booksColumns.add(column.name);
+          return `ALTER TABLE books ADD COLUMN ${column.name} ${column.definition}`;
+        })
+      : [];
+
+  let skippedAnyColumn = false;
+  const filteredStatements: string[] = [...missingV8PrefixStatements];
+
+  for (const entry of parsedStatements) {
+    if (!entry.alterTarget) {
+      filteredStatements.push(entry.statement);
+      continue;
+    }
+    const existingColumns = columnsByTable.get(entry.alterTarget.tableName);
+    if (existingColumns?.has(entry.alterTarget.columnName)) {
+      skippedAnyColumn = true;
+      continue;
+    }
+    existingColumns?.add(entry.alterTarget.columnName);
+    filteredStatements.push(entry.statement);
+  }
+
+  if (!skippedAnyColumn && missingV8PrefixStatements.length === 0) {
+    return migration.statements;
+  }
+  if (filteredStatements.length === 0) {
+    return null;
+  }
+  return filteredStatements.map((statement) => `${statement};`).join('\n');
+}
+
+function buildBookSchemaReconciliationTasks(
   existingColumns: ReadonlySet<string>,
   targetVersion: number,
 ): capTask[] {
-  const missingColumns = V8_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
+  const missingColumns = REQUIRED_BOOK_COLUMNS.filter(
+    (column) => !existingColumns.has(column.name),
+  );
   return [
     ...(missingColumns.length > 0
       ? [
@@ -413,7 +507,7 @@ function buildV8ReconciliationTasks(
           },
         ]
       : []),
-    { statement: V8_BOOK_INDEX_SQL },
+    { statement: BOOKS_SERVER_FILE_INDEX_SQL },
     { statement: `PRAGMA user_version = ${targetVersion};` },
   ];
 }
@@ -423,29 +517,23 @@ export async function migrateDatabase(db: MigrationConnection): Promise<void> {
   const currentVersion = current.version ?? 0;
   for (const migration of migrations) {
     if (migration.version <= currentVersion) continue;
-    if (migration.version === 8 && currentVersion >= 1) {
-      const existingColumns = await queryExistingBookColumns(db);
-      if (existingColumns) {
-        await executeNativeTransaction(db, buildV8ReconciliationTasks(existingColumns, 8));
-        continue;
-      }
-    }
+    const statement = await buildIdempotentMigrationStatements(db, migration);
     await executeNativeTransaction(db, [
-      { statement: migration.statements },
+      ...(statement ? [{ statement }] : []),
       { statement: `PRAGMA user_version = ${migration.version};` },
     ]);
   }
 
-  if (currentVersion >= 8) {
+  if (currentVersion >= LATEST_SCHEMA_VERSION) {
     if (typeof db.execute === 'function') {
       const executeDb = { execute: db.execute.bind(db) };
-      const v8ProbeAssignments = V8_BOOK_COLUMNS.map(
+      const probeAssignments = REQUIRED_BOOK_COLUMNS.map(
         (column) => `${column.name} = ${column.name}`,
       ).join(', ');
       try {
         await executeNativeStatement(
           executeDb,
-          `UPDATE books SET ${v8ProbeAssignments} WHERE 0;\n${V8_BOOK_INDEX_SQL}`,
+          `UPDATE books SET ${probeAssignments} WHERE 0;\n${BOOKS_SERVER_FILE_INDEX_SQL}`,
         );
         return;
       } catch (error) {
@@ -458,10 +546,15 @@ export async function migrateDatabase(db: MigrationConnection): Promise<void> {
 
     const existingColumns = await queryExistingBookColumns(db);
     if (!existingColumns) return;
-    const missingColumns = V8_BOOK_COLUMNS.filter((column) => !existingColumns.has(column.name));
+    const missingColumns = REQUIRED_BOOK_COLUMNS.filter(
+      (column) => !existingColumns.has(column.name),
+    );
     const hasIndex = await hasBooksServerFileIndex(db);
     if (missingColumns.length === 0 && hasIndex) return;
-    await executeNativeTransaction(db, buildV8ReconciliationTasks(existingColumns, currentVersion));
+    await executeNativeTransaction(
+      db,
+      buildBookSchemaReconciliationTasks(existingColumns, currentVersion),
+    );
   }
 }
 

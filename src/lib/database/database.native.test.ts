@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { capSQLiteChanges, capTask } from '@capacitor-community/sqlite';
 
 const mocks = vi.hoisted(() => {
-  let databaseVersion = 8;
+  let databaseVersion = 9;
   const executeTransaction = vi.fn<(tasks: capTask[]) => Promise<capSQLiteChanges>>(async () => ({
     changes: { changes: 0 },
   }));
@@ -28,7 +28,7 @@ const mocks = vi.hoisted(() => {
     db,
     executeTransaction,
     reset() {
-      databaseVersion = 8;
+      databaseVersion = 9;
       vi.clearAllMocks();
     },
     setDatabaseVersion(version: number) {
@@ -381,7 +381,7 @@ it('records each migration and its user version in one transaction', async () =>
 
   await openDatabase();
 
-  expect(mocks.executeTransaction).toHaveBeenCalledTimes(8);
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(9);
   const migrationTasks = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
   expect(migrationTasks.map((tasks) => tasks?.[0]?.statement)).toEqual([
     expect.stringContaining('CREATE TABLE IF NOT EXISTS server_config'),
@@ -391,6 +391,7 @@ it('records each migration and its user version in one transaction', async () =>
     expect.stringContaining('CREATE INDEX IF NOT EXISTS books_server_title_idx'),
     expect.stringContaining('ALTER TABLE sync_queue ADD COLUMN revision'),
     expect.stringContaining('ALTER TABLE reading_state ADD COLUMN sync_revision'),
+    expect.stringContaining('ALTER TABLE books ADD COLUMN remote_file_size'),
     expect.stringContaining('ALTER TABLE books ADD COLUMN file_id'),
   ]);
   expect(migrationTasks.map((tasks) => tasks?.[1]?.statement)).toEqual([
@@ -402,6 +403,7 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
     'PRAGMA user_version = 8;',
+    'PRAGMA user_version = 9;',
   ]);
 });
 
@@ -541,4 +543,51 @@ it('reconciles native SQLite legacy null file_id bridge rows into file-scoped bo
       remoteFileSize: null,
     },
   ]);
+});
+
+it('checks PRAGMA table_info before ALTER TABLE ADD COLUMN and skips already-existing columns', async () => {
+  const { migrateDatabase } = await import('./database');
+  mocks.setDatabaseVersion(7);
+  const existingColumns = new Set([
+    'id',
+    'remote_file_size',
+    'downloaded_bytes',
+    'file_id',
+    'sync_progress',
+  ]);
+  mocks.db.query.mockImplementation(async (statement: string) => {
+    if (statement === "PRAGMA table_info('books')") {
+      return { values: [...existingColumns].map((name) => ({ name })) };
+    }
+    return { values: [] };
+  });
+
+  await migrateDatabase(mocks.db);
+
+  expect(mocks.db.query).toHaveBeenCalledWith("PRAGMA table_info('books')");
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(2);
+  const [v8Tasks, v9Tasks] = mocks.executeTransaction.mock.calls.map(([tasks]) => tasks);
+
+  const v8Statement = v8Tasks?.[0]?.statement ?? '';
+  expect(v8Statement).not.toContain('remote_file_size');
+  expect(v8Statement).not.toContain('downloaded_bytes');
+  expect(v8Statement).toContain('ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;');
+  expect(v8Statement).toContain('ALTER TABLE books ADD COLUMN chapter_key TEXT;');
+  expect(v8Tasks?.[1]?.statement).toBe('PRAGMA user_version = 8;');
+
+  const v9Statement = v9Tasks?.[0]?.statement ?? '';
+  expect(v9Statement).not.toContain('remote_file_size');
+  expect(v9Statement).not.toContain('ADD COLUMN file_id');
+  expect(v9Statement).not.toContain('ADD COLUMN sync_progress');
+  expect(v9Statement).toContain('ALTER TABLE books ADD COLUMN file_name TEXT;');
+  expect(v9Statement).toContain(
+    'ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(v9Statement).toContain(
+    'ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;',
+  );
+  expect(v9Statement).toContain(
+    'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);',
+  );
+  expect(v9Tasks?.[1]?.statement).toBe('PRAGMA user_version = 9;');
 });

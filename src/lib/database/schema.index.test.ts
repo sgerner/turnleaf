@@ -2,7 +2,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
-import { migrations, V8_BOOK_COLUMNS } from './schema';
+import { migrations, V8_BOOK_COLUMNS, V9_BOOK_COLUMNS } from './schema';
 
 describe('native library indexes', () => {
   let db: DatabaseSync;
@@ -30,18 +30,22 @@ describe('native library indexes', () => {
     expect(plan.some((row) => row.detail.includes('books_server_title_idx'))).toBe(true);
   });
 
-  it('defines one complete coordinated v8 books column set and server-file index without duplicate columns', () => {
+  it('defines #330 v8 and #328 v9 books migrations sequentially without re-adding remote_file_size', () => {
     db = new DatabaseSync(':memory:');
     for (const migration of migrations) {
       db.exec(migration.statements);
     }
 
-    expect(migrations.at(-1)?.version).toBe(8);
+    expect(migrations.at(-1)?.version).toBe(9);
+    const v8Statements = migrations.find((migration) => migration.version === 8)?.statements ?? '';
+    const v9Statements = migrations.find((migration) => migration.version === 9)?.statements ?? '';
+    expect(v8Statements).toContain('remote_file_size');
+    expect(v9Statements).not.toContain('remote_file_size');
 
     const columns = (db.prepare("PRAGMA table_info('books')").all() as Array<{ name: string }>).map(
       (column) => column.name,
     );
-    for (const column of V8_BOOK_COLUMNS) {
+    for (const column of [...V8_BOOK_COLUMNS, ...V9_BOOK_COLUMNS]) {
       expect(columns).toContain(column.name);
     }
     expect(columns.filter((name) => name === 'remote_file_size')).toHaveLength(1);

@@ -745,7 +745,7 @@ describe('native progress transactions against SQLite', () => {
     ).toBe(4);
   });
 
-  it('upgrades a version-7 SQLite database to version 8 and preserves per-file downloads and progress across reversed file order', async () => {
+  it('upgrades a version-7 SQLite database to version 9 and preserves per-file downloads and progress across reversed file order', async () => {
     const updatedAt = '2026-09-05T12:00:00.000Z';
     native.database = new DatabaseSync(native.databasePath);
     native.database.exec('PRAGMA foreign_keys = ON;');
@@ -847,13 +847,13 @@ describe('native progress transactions against SQLite', () => {
       ],
     });
 
-    // Upgrade reconcile even when Kavita returns reversed order [2115, 2114] on first v8 scan!
+    // Upgrade reconcile even when Kavita returns reversed order [2115, 2114] on first v9 scan!
     const firstScan = mapSeriesToBooks(server.id, seriesMeta, detailFor([file2115, file2114]));
     await database.reconcileBooks(server.id, firstScan);
 
     expect(
       native.database.prepare('PRAGMA user_version').get() as { user_version: number },
-    ).toEqual({ user_version: 8 });
+    ).toEqual({ user_version: 9 });
 
     let saved = await database.getBooks(server.id);
     expect(saved).toHaveLength(2);
@@ -1140,12 +1140,13 @@ describe('native progress transactions against SQLite', () => {
     });
   });
 
-  it('reconciles on-disk SQLite databases through openDatabase() across #328-only and #330-only v8 shapes up to v10 without downgrading user_version', async () => {
+  it('reconciles on-disk SQLite databases through openDatabase() across #330 v8, #328 v9, #339 v10, and #345 v11 without downgrading user_version', async () => {
     const updatedAt = '2026-09-05T12:00:00.000Z';
-    const { migrations, V8_BOOK_COLUMNS } = await import('./schema');
+    const { migrations, V8_BOOK_COLUMNS, V9_BOOK_COLUMNS } = await import('./schema');
 
     for (const mode of [
-      'pr330-v8-then-v10-then-pr328',
+      'pr330-v8-then-open-then-v10',
+      'pr330-v8-then-v11-then-pr328',
       'pr328-only-v8-then-open-then-v10',
     ] as const) {
       const modePath = join(directory, `${mode}.sqlite`);
@@ -1157,7 +1158,15 @@ describe('native progress transactions against SQLite', () => {
         native.database.exec(migration.statements);
       }
 
-      if (mode === 'pr330-v8-then-v10-then-pr328') {
+      if (mode === 'pr330-v8-then-open-then-v10') {
+        native.database.exec(`
+          ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+          ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+          ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+          ALTER TABLE books ADD COLUMN chapter_key TEXT;
+          PRAGMA user_version = 8;
+        `);
+      } else if (mode === 'pr330-v8-then-v11-then-pr328') {
         native.database.exec(`
           ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
           ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
@@ -1203,7 +1212,7 @@ describe('native progress transactions against SQLite', () => {
             PRIMARY KEY(book_id, id),
             FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
           );
-          PRAGMA user_version = 10;
+          PRAGMA user_version = 11;
         `);
       } else {
         native.database.exec(`
@@ -1250,7 +1259,7 @@ describe('native progress transactions against SQLite', () => {
         )
         .run(updatedAt, updatedAt);
 
-      if (mode === 'pr330-v8-then-v10-then-pr328') {
+      if (mode === 'pr330-v8-then-v11-then-pr328') {
         native.database
           .prepare(
             `UPDATE books SET downloaded_bytes = 1955734, downloaded_pages = 5,
@@ -1275,13 +1284,13 @@ describe('native progress transactions against SQLite', () => {
       const columns = (
         native.database!.prepare("PRAGMA table_info('books')").all() as Array<{ name: string }>
       ).map((row) => row.name);
-      for (const column of V8_BOOK_COLUMNS) {
+      for (const column of [...V8_BOOK_COLUMNS, ...V9_BOOK_COLUMNS]) {
         expect(columns).toContain(column.name);
       }
       expect(columns.filter((name) => name === 'remote_file_size')).toHaveLength(1);
 
-      if (mode === 'pr330-v8-then-v10-then-pr328') {
-        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+      if (mode === 'pr330-v8-then-v11-then-pr328') {
+        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
         await database.reconcileBooks(server.id, [
           {
             ...book,
@@ -1337,16 +1346,16 @@ describe('native progress transactions against SQLite', () => {
           note: 'Note',
         });
       } else {
-        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
+        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
         native.database!.exec(`
           ALTER TABLE books ADD COLUMN sort_order REAL;
           ALTER TABLE books ADD COLUMN min_number REAL;
           ALTER TABLE books ADD COLUMN volume_number REAL;
-          PRAGMA user_version = 9;
+          PRAGMA user_version = 10;
         `);
         const reopened = await reopenDatabase(database);
         await reopened.openDatabase();
-        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+        expect(native.database!.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
         expect(await reopened.getBooks(server.id)).toMatchObject([
           {
             id: 'server:82:1406',

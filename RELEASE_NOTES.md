@@ -2,8 +2,9 @@
 
 ## Unreleased
 
+- fix(database): move multi-EPUB books schema to idempotent migration v9
 - chore(deps): bump svelte to 5.59.2
-- fix(database): coordinate idempotent v8 books schema across #328/#330 and v7-to-v10 upgrades
+- fix(database): move multi-EPUB books schema to idempotent migration v9 after #330 v8
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests
