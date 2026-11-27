@@ -114,6 +114,12 @@ jobs:
           TURNLEAF_REUSE_WEB_BUILD: 'true'
         run: npm run android:debug
 
+      - name: Run Android lint for manual release
+        if: steps.release_preflight.outputs.already_released != 'true' && github.event_name == 'workflow_dispatch'
+        env:
+          TURNLEAF_REUSE_WEB_BUILD: 'true'
+        run: npm run android:lint
+
       - name: Enable emulator hardware acceleration
         if: steps.release_preflight.outputs.already_released != 'true'
         run: |
