@@ -449,7 +449,7 @@ async function run() {
     await restartApp();
     await waitFor('offline library with restored stale key', () =>
       web.evaluate(
-        `document.querySelector('[data-credential-alert]') === null && Boolean(document.querySelector('[data-book-open]')) && document.querySelectorAll('.alert').length === 1`,
+        `document.querySelector('[data-credential-alert]') === null && Boolean(document.querySelector('[data-book-open]')) && document.body.textContent.includes('No network connection. Showing your saved library.') && document.body.textContent.includes('1 reading progress update waiting to sync.') && document.querySelectorAll('.alert').length === 2`,
       ),
     );
     if (fixture.offlineRequests.length > 0) {

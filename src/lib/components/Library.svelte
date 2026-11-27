@@ -361,6 +361,8 @@
   let observedTheme = untrack(() => theme);
   let virtualizationFrame: number | null = null;
   let syncTimer: number | null = null;
+  let pluginConnected = true;
+  let webViewOnlineTimer: number | null = null;
   const cleanups: Array<() => Promise<void>> = [];
   const SERIES_DETAIL_BATCH_SIZE = 8;
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
@@ -369,6 +371,78 @@
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
+
+  function isWebViewOnline(): boolean {
+    return typeof navigator === 'undefined' || navigator.onLine !== false;
+  }
+
+  function clearWebViewOnlineTimer(): void {
+    if (webViewOnlineTimer !== null) {
+      window.clearTimeout(webViewOnlineTimer);
+      webViewOnlineTimer = null;
+    }
+  }
+
+  function scheduleWebViewOnlineCheck(): void {
+    if (webViewOnlineTimer !== null || destroyed) return;
+    webViewOnlineTimer = window.setTimeout(() => {
+      webViewOnlineTimer = null;
+      if (!destroyed) applyConnectivity();
+    }, 50);
+  }
+
+  function applyConnectivity(nextPluginConnected = pluginConnected): void {
+    if (destroyed) return;
+    pluginConnected = nextPluginConnected;
+    const webOnline = isWebViewOnline();
+    if (pluginConnected && !webOnline) {
+      scheduleWebViewOnlineCheck();
+    } else {
+      clearWebViewOnlineTimer();
+    }
+    const connected = pluginConnected && webOnline;
+    const wasOffline = offline;
+    offline = !connected;
+    if (!connected) {
+      if (!wasOffline) {
+        stopActiveNetworkWork(true);
+        coverReloadRequest += 1;
+        kavitaUnreachable = false;
+      }
+      offlineMessage = !credentialReady
+        ? ''
+        : displayableBooks.length
+          ? 'No network connection. Showing your saved library.'
+          : 'No network connection. Connect to Kavita to load your library.';
+      return;
+    }
+    coverReloadRequest += 1;
+    kavitaUnreachable = false;
+    offlineMessage = '';
+    if (wasOffline && credentialReady && client.canSendRequests()) {
+      initialRefreshPending = true;
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+      void syncProgress(false);
+      void startRefresh(false, baselineRevision, baselineMessage);
+    }
+  }
+
+  function handleWindowOnline(): void {
+    if (destroyed) return;
+    applyConnectivity();
+    if (!pluginConnected && Capacitor.isNativePlatform()) {
+      void Network.getStatus()
+        .then((status) => {
+          if (status && !destroyed) applyConnectivity(status.connected);
+        })
+        .catch(() => {});
+    }
+  }
+
+  function handleWindowOffline(): void {
+    applyConnectivity();
+  }
 
   function clearSyncTimer(): void {
     if (syncTimer !== null) {
@@ -827,8 +901,12 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    offline = !(await Network.getStatus().catch(() => null))?.connected;
+    pluginConnected = (await Network.getStatus().catch(() => null))?.connected === true;
     if (destroyed) return;
+    offline = !(pluginConnected && isWebViewOnline());
+    if (pluginConnected && !isWebViewOnline()) {
+      scheduleWebViewOnlineCheck();
+    }
     books = savedBooks;
     retainCoversFor(books);
     initialRefreshPending = !offline && credentialReady;
@@ -841,30 +919,12 @@
           : 'No network connection. Connect to Kavita to load your library.'
         : '';
     if (destroyed) return;
+    window.addEventListener('online', handleWindowOnline);
+    window.addEventListener('offline', handleWindowOffline);
     cleanups.push(
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
-          if (destroyed) return;
-          const wasOffline = offline;
-          offline = !connected;
-          if (!connected) {
-            stopActiveNetworkWork(true);
-          }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage =
-            connected || !credentialReady
-              ? ''
-              : displayableBooks.length
-                ? 'No network connection. Showing your saved library.'
-                : 'No network connection. Connect to Kavita to load your library.';
-          if (connected && wasOffline && credentialReady && client.canSendRequests()) {
-            initialRefreshPending = true;
-            const baselineRevision = activeSyncStartRevision ?? messageRevision;
-            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-            void syncProgress(false);
-            void startRefresh(false, baselineRevision, baselineMessage);
-          }
+          applyConnectivity(connected);
         }),
       ),
     );
@@ -913,10 +973,10 @@
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) {
-      return typeof navigator === 'undefined' || navigator.onLine !== false;
+      return isWebViewOnline();
     }
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true && navigator.onLine !== false;
+    return !offline && !destroyed && status?.connected === true && isWebViewOnline();
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -1016,11 +1076,14 @@
   onDestroy(() => {
     destroyed = true;
     replacementApiKey = '';
+    clearWebViewOnlineTimer();
     unsubscribeCredentials();
     onReaderOpenChange?.(false);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
+    window.removeEventListener('online', handleWindowOnline);
+    window.removeEventListener('offline', handleWindowOffline);
     stopActiveNetworkWork(true);
     clearCovers();
     cleanups.forEach((remove) => void remove());
@@ -2013,33 +2076,31 @@
         kavitaVersion: result.version,
         lastConnectedAt: new Date().toISOString(),
       };
+      // An upload started with the previous key may still be finishing.
+      while (syncWork) await syncWork;
+      if (destroyed) return;
+      refreshController?.abort();
       await saveApiKey(server.credentialRef, nextKey);
+      if (destroyed) return;
+      syncLoadedCredential(nextKey, server.credentialRef);
+      activeApiKey = nextKey;
+      initialRefreshPending = !offline;
+      onApiKeyChange(nextKey);
+      replacementApiKey = '';
       try {
         await saveServer(updatedServer);
       } catch (storageError) {
-        while (syncWork) await syncWork;
-        refreshController?.abort();
-        syncLoadedCredential(nextKey, server.credentialRef);
-        activeApiKey = nextKey;
-        onApiKeyChange(nextKey);
-        replacementApiKey = '';
+        initialRefreshPending = false;
         throw new Error(
           'The auth key was updated, but local server details could not be saved. Retry in Settings.',
           { cause: storageError },
         );
       }
-      // An upload started with the previous key may still be finishing.
-      while (syncWork) await syncWork;
-      refreshController?.abort();
-      syncLoadedCredential(nextKey, server.credentialRef);
-      activeApiKey = nextKey;
       const onlineAfterUpdate = await networkAvailable();
       initialRefreshPending = onlineAfterUpdate && !offline && credentialReady;
       onServerChange?.(updatedServer);
-      onApiKeyChange(nextKey);
       kavitaUnreachable = false;
       offlineMessage = '';
-      replacementApiKey = '';
       setMessage('API key updated.');
       closeSettings();
       if (onlineAfterUpdate && !destroyed && !offline && credentialReady) {

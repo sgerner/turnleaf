@@ -1399,4 +1399,145 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     finishTransfer!();
     await waitForCondition(() => target.textContent?.includes('is ready offline.') === true);
   });
+
+  it('waits for WebView navigator.onLine before firing native reconnect probes and consolidates alerts on 401', async () => {
+    runtime.native = true;
+    runtime.online = false;
+    let pluginOnline = false;
+    let webViewOnline = false;
+    const onLineSpy = vi
+      .spyOn(window.navigator, 'onLine', 'get')
+      .mockImplementation(() => webViewOnline);
+    secureStorageMock.values.set('server_primary_api_key', 'stale-native-key');
+    seedDatabase({ books: [downloadedBook], pendingSync: true });
+
+    vi.mocked(Network.getStatus).mockImplementation(async () => ({
+      connected: pluginOnline,
+      connectionType: pluginOnline ? 'wifi' : 'none',
+    }));
+
+    const nativeCalls: Array<{ url: string; apiKey: string | undefined }> = [];
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      const apiKey = options.headers?.['x-api-key'];
+      nativeCalls.push({ url: options.url, apiKey });
+      if (apiKey !== 'rotated-native-key') {
+        return { status: 401, headers: {}, url: options.url, data: '' };
+      }
+      if (options.url.includes('/api/Library/libraries')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify([{ id: 1, name: 'Books', type: 2 }]),
+        };
+      }
+      if (options.url.includes('/api/Health')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({ version: '0.8.5' }),
+        };
+      }
+      if (options.url.includes('/api/Reader/progress')) {
+        return { status: 200, headers: {}, url: options.url, data: '{}' };
+      }
+      if (options.url.includes('/api/Series/v2')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify([
+            { id: 1, libraryId: 1, name: 'Offline Novel', format: 3, pages: 100, pagesRead: 50 },
+          ]),
+        };
+      }
+      if (options.url.includes('/api/Series/series-detail')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({
+            volumes: [
+              {
+                id: 1,
+                chapters: [
+                  {
+                    id: 1,
+                    volumeId: 1,
+                    title: 'Offline Novel',
+                    pages: 100,
+                    pagesRead: 50,
+                    format: 3,
+                    files: [{ id: 1, format: 3, extension: '.epub', bytes: 4096 }],
+                  },
+                ],
+              },
+            ],
+          }),
+        };
+      }
+      throw new Error(`Unexpected native request ${options.url}`);
+    });
+
+    try {
+      mounted = mount(App, { target });
+      await waitForCondition(
+        () =>
+          target.querySelector('[data-credential-alert]') === null &&
+          target.querySelector('[data-book-open]') !== null &&
+          target.textContent?.includes('No network connection. Showing your saved library.') ===
+            true &&
+          target.textContent?.includes('1 reading progress update waiting to sync.') === true &&
+          target.querySelectorAll('.alert').length === 2,
+      );
+      expect(nativeCalls).toEqual([]);
+
+      // Capacitor Network reports Wi-Fi connected before Chromium WebView flips navigator.onLine
+      pluginOnline = true;
+      for (const listener of runtime.networkListeners) {
+        listener({ connected: true, connectionType: 'wifi' });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(nativeCalls).toEqual([]);
+      expect(target.querySelector('[data-credential-alert]')).toBeNull();
+
+      // WebView flips navigator.onLine to true without firing another Capacitor networkStatusChange
+      webViewOnline = true;
+      window.dispatchEvent(new Event('online'));
+
+      await waitForCondition(
+        () =>
+          target.querySelector('[data-credential-alert="rejected"]') !== null &&
+          target.querySelectorAll('.alert').length === 1,
+      );
+      expect(nativeCalls.length).toBeGreaterThanOrEqual(1);
+      expect(nativeCalls.length).toBeLessThanOrEqual(2);
+
+      // Rotate API key in Settings and verify queued progress flushes cleanly without transient missing alerts
+      const recoverBtn = target.querySelector<HTMLButtonElement>('[data-credential-recover]');
+      expect(recoverBtn).not.toBeNull();
+      recoverBtn!.click();
+      flushSync();
+
+      const keyInput = target.querySelector<HTMLInputElement>('#replacement-api-key');
+      expect(keyInput).not.toBeNull();
+      keyInput!.value = 'rotated-native-key';
+      keyInput!.dispatchEvent(new Event('input', { bubbles: true }));
+      flushSync();
+
+      keyInput!
+        .closest('form')!
+        .dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+
+      await waitForCondition(
+        async () =>
+          (await Database.getPendingSync('primary')).length === 0 &&
+          target.querySelector('[data-credential-alert]') === null,
+      );
+      expect(target.textContent).toContain('API key updated.');
+    } finally {
+      onLineSpy.mockRestore();
+    }
+  });
 });
