@@ -2,6 +2,7 @@
 
 import { mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as ThemesModule from '../themes/themes';
 
 const { backListeners, mockDeleteDownloadedEpub, mockClearCoverCache, mockRemoveApiKey } =
   vi.hoisted(() => ({
@@ -52,10 +53,14 @@ vi.mock('../native/credentials', () => ({
   saveApiKey: vi.fn(async () => {}),
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['fennec', 'vintage'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    skeletonThemes: ['fennec', 'vintage'],
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 import {
   getBooks,

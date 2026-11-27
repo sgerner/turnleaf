@@ -71,12 +71,12 @@ To open Android Studio or Xcode, use `npm run android:open` or `npm run ios:open
 1. Create a branch from the current `master` branch with a short `feature/` or `fix/` name.
 2. Keep the PR narrow. Separate UI, data, native, documentation, and dependency changes when they can be reviewed independently.
 3. Add or update a focused test for behavior that can be exercised in Node or the browser.
-4. Run `npm run verify`; run `npm run android:debug`, `npm run android:lint`, `npm run android:smoke`, and `npm run android:journey` for native changes when the toolchain and emulator are available.
+4. Run `npm run verify` and `npm run ios:check` (`npm run ios:sync` updates iOS manifests when Capacitor packages or `package.json` versions change); run `npm run android:debug`, `npm run android:lint`, `npm run android:smoke`, and `npm run android:journey` on Android and `npm run ios:simulator` on macOS for native or Capacitor changes when the toolchains and emulator are available.
 5. For UI changes, test at narrow and large viewport sizes and attach a screenshot or short recording.
-6. For Android behavior, record the device/emulator, OS version, commit, and manual results using [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md).
+6. For Android behavior, record the device/emulator, OS version, commit, and manual results using [DEVICE_VALIDATION.md](DEVICE_VALIDATION.md); for iOS device checks, use [IOS_BUILD.md](IOS_BUILD.md).
 7. Describe the user-visible behavior, test commands, and any platform limitation in the PR body. The pull-request template includes the expected checks.
 
-GitHub Actions runs the web quality gates, Android debug build, Android lint, and emulator reading journey. The release workflow waits for the successful same-revision CI run, checks that master has not moved, and smoke-tests the signed APK before publishing. Manual releases run the debug APK, Android lint, and reading journey first. Dependency review and CodeQL run separately.
+GitHub Actions runs the web quality gates, iOS Capacitor sync and manifest checks on Linux, Android debug build, Android lint, Android emulator reading journey, and an unsigned iPhone Simulator build on `macos-latest`. The release workflow waits for the successful same-revision CI run, checks that master has not moved, and smoke-tests the signed APK before publishing. Manual releases run the debug APK, Android lint, and reading journey first. Dependency review and CodeQL (JavaScript/TypeScript, Java/Kotlin, and Swift) run separately.
 
 ## Release notes and versions
 
