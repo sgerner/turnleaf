@@ -37,7 +37,10 @@ async function run(
   const attempted = new Map<string, PendingSyncItem>();
   while (true) {
     if (options?.signal?.aborted) break;
-    if (options?.canContinue && !(await options.canContinue())) break;
+    if (options?.canContinue) {
+      const allowed = options.canContinue();
+      if (!(typeof allowed === 'boolean' ? allowed : await allowed)) break;
+    }
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
@@ -45,7 +48,10 @@ async function run(
     if (pending.length === 0) break;
     for (const item of pending) {
       if (options?.signal?.aborted) break;
-      if (options?.canContinue && !(await options.canContinue())) break;
+      if (options?.canContinue) {
+        const allowed = options.canContinue();
+        if (!(typeof allowed === 'boolean' ? allowed : await allowed)) break;
+      }
       attempted.set(item.bookId, item);
       try {
         const payload = JSON.parse(item.payload) as KavitaProgress;

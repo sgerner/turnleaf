@@ -101,13 +101,14 @@
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
-  const client = $derived(new KavitaClient(server.baseUrl, apiKey));
+  let activeApiKey = $derived(apiKey);
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
       return cacheCover(
         client.coverUrl(seriesId),
-        apiKey,
+        activeApiKey,
         seriesId,
         signal,
         server.id,
@@ -235,8 +236,8 @@
   let offline = $state(false);
   let networkEventSequence = 0;
   let reconnectTimer: number | null = null;
-  let syncController: AbortController | null = null;
   let message = $state('');
+  let messageRevision = 0;
   let syncStatus = $state<SyncStatus>({
     pendingCount: 0,
     failedCount: 0,
@@ -245,6 +246,7 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
@@ -757,7 +759,6 @@
             }
             refreshController?.abort();
             openProgressProbe?.abort();
-            syncController?.abort();
             cancelCoverLoading();
             sharedCoverLoader.cancel();
             kavitaUnreachable = false;
@@ -770,14 +771,23 @@
           if (!shouldReconnect) return;
           kavitaUnreachable = false;
           offlineMessage = '';
+          const triggerReconnectSyncAndRefresh = () => {
+            coverReloadRequest += 1;
+            const baselineRevision = activeSyncStartRevision ?? messageRevision;
+            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+            void syncProgress(false);
+            void startRefresh(false, baselineRevision, baselineMessage);
+          };
+          if (!Capacitor.isNativePlatform()) {
+            triggerReconnectSyncAndRefresh();
+            return;
+          }
           if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = null;
             void (async () => {
               if (destroyed || offline || !(await networkAvailable())) return;
-              coverReloadRequest += 1;
-              await refresh();
-              if (!destroyed && !offline) await syncProgress(false);
+              triggerReconnectSyncAndRefresh();
             })().catch(() => {});
           }, 150);
         }),
@@ -806,8 +816,10 @@
       ),
     );
     if (!destroyed && !offline) {
-      await refresh();
+      const baselineRevision = activeSyncStartRevision ?? messageRevision;
+      const baselineMessage = activeSyncStartRevision !== null ? '' : message;
       void syncProgress(false);
+      await startRefresh(false, baselineRevision, baselineMessage);
     }
   });
 
@@ -848,39 +860,44 @@
     return syncWork;
   }
 
+  function setMessage(next: string): void {
+    messageRevision += 1;
+    message = next;
+  }
+
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
-    const controller = new AbortController();
-    syncController = controller;
+    activeSyncStartRevision = messageRevision;
     try {
-      if (!(await networkAvailable()) || controller.signal.aborted) {
+      const available = Capacitor.isNativePlatform()
+        ? await networkAvailable()
+        : !offline && !destroyed;
+      if (!available) {
         if (showFeedback)
-          message = 'Offline. Reading progress will retry when Kavita is available.';
+          setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
       await flushProgress(client, server.id, {
-        signal: controller.signal,
-        canContinue: networkAvailable,
+        canContinue: () =>
+          Capacitor.isNativePlatform() ? networkAvailable() : !offline && !destroyed,
       });
-      if (showFeedback && !controller.signal.aborted && !offline) {
-        message = 'Reading progress synced.';
-      }
+      if (showFeedback && !offline) setMessage('Reading progress synced.');
     } catch (error) {
-      if (controller.signal.aborted || offline) return;
       if (
         error instanceof AggregateError &&
         error.errors.some(
           (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
         )
       ) {
-        message =
-          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
-      } else if (showFeedback) {
-        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+        setMessage(
+          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+        );
+      } else if (showFeedback && !offline) {
+        setMessage('Some reading progress is waiting to sync. Retry when Kavita is available.');
       }
     } finally {
-      if (syncController === controller) syncController = null;
       await refreshSyncStatus();
+      activeSyncStartRevision = null;
       syncing = false;
     }
   }
@@ -895,7 +912,6 @@
     window.removeEventListener('resize', handleWindowResize);
     openProgressProbe?.abort();
     refreshController?.abort();
-    syncController?.abort();
     cancelCoverLoading();
     clearCovers();
     sharedCoverLoader.cancel();
@@ -903,23 +919,48 @@
   });
 
   function refresh(): Promise<void> {
+    return startRefresh(false);
+  }
+
+  function startRefresh(
+    preserveMessage: boolean,
+    requestedRevision = messageRevision,
+    requestedMessage = message,
+  ): Promise<void> {
     if (destroyed || offline) return Promise.resolve();
-    if (refreshWork && refreshController?.signal.aborted) return refreshWork.then(refresh);
+    if (refreshWork && refreshController?.signal.aborted) {
+      return refreshWork.then(() =>
+        startRefresh(preserveMessage, requestedRevision, requestedMessage),
+      );
+    }
     if (!refreshWork) {
-      refreshWork = refreshCatalog().finally(() => {
-        refreshWork = null;
-      });
+      const work = refreshCatalog(preserveMessage, requestedRevision, requestedMessage).finally(
+        () => {
+          if (refreshWork === work) {
+            refreshController = null;
+            refreshWork = null;
+            refreshing = false;
+          }
+        },
+      );
+      refreshWork = work;
     }
     return refreshWork;
   }
 
-  async function refreshCatalog(): Promise<void> {
+  async function refreshCatalog(
+    preserveMessage: boolean,
+    initialRevision: number,
+    initialMessage: string,
+  ): Promise<void> {
     refreshing = true;
     const controller = new AbortController();
     refreshController = controller;
     const snapshotStartedAt = new Date().toISOString();
     let diagnosticEndpoint = '/api/unknown';
-    message = '';
+    if (!preserveMessage && messageRevision === initialRevision && message === initialMessage) {
+      message = '';
+    }
     try {
       if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
@@ -1003,9 +1044,6 @@
       } else {
         offlineMessage = `The Kavita library could not be refreshed. ${savedBooks}`;
       }
-    } finally {
-      refreshController = null;
-      refreshing = false;
     }
   }
 
@@ -1086,7 +1124,7 @@
     try {
       const file = await downloadEpub(
         client.downloadUrl(book.chapterId),
-        apiKey,
+        activeApiKey,
         book.id.replaceAll(':', '-'),
         (percent) => {
           if (downloadingBookId === book.id) downloadPercent = percent;
@@ -1696,14 +1734,15 @@
       };
       await saveApiKey(server.credentialRef, nextKey);
       await saveServer(updatedServer);
+      // An upload started with the previous key may still be finishing.
+      while (syncWork) await syncWork;
+      refreshController?.abort();
+      activeApiKey = nextKey;
       onApiKeyChange(nextKey);
       replacementApiKey = '';
-      message = 'API key updated.';
+      setMessage('API key updated.');
       closeSettings();
-      // An upload started with the previous key may still be finishing.
-      await syncWork;
-      await refresh();
-      await syncProgress(false);
+      await Promise.all([syncProgress(false), startRefresh(true)]);
     } catch (cause) {
       settingsError =
         cause instanceof Error ? cause.message : 'Turnleaf could not update the API key.';
