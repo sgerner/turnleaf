@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
+import type * as ThemesModule from '../themes/themes';
 import {
   getBooks,
   getPendingSync,
@@ -78,8 +79,6 @@ vi.mock('../native/credentials', () => ({
   saveApiKey: vi.fn(async () => {}),
   removeApiKey: vi.fn(async () => {}),
 }));
-
-import type * as ThemesModule from '../themes/themes';
 
 vi.mock('../themes/themes', async (importOriginal) => {
   const actual = await importOriginal<typeof ThemesModule>();
