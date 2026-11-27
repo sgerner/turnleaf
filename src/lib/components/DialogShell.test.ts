@@ -146,4 +146,32 @@ describe('DialogShell', () => {
     backdrop.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(onClose).toHaveBeenCalledTimes(2);
   });
+
+  it('focuses the header close button on mount and recovers Tab/Escape from document.body after a body control unmounts', () => {
+    const { onClose, closeButton, lastBody } = mountShell();
+    expect(document.activeElement).toBe(closeButton);
+
+    lastBody.focus();
+    lastBody.remove();
+    expect(document.activeElement).toBe(document.body);
+
+    const tabFromBody = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(tabFromBody);
+    expect(tabFromBody.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(closeButton);
+
+    closeButton.blur();
+    const escapeFromBody = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(escapeFromBody);
+    expect(escapeFromBody.defaultPrevented).toBe(true);
+    expect(onClose).toHaveBeenCalledOnce();
+  });
 });

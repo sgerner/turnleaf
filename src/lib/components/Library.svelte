@@ -2977,10 +2977,7 @@
           type="button"
           aria-expanded={confirmDeleteServer}
           aria-controls={confirmDeleteServer ? 'delete-server-confirm' : undefined}
-          onclick={() => {
-            confirmDeleteServer = true;
-            document.getElementById('delete-server-confirm')?.focus({ preventScroll: true });
-          }}
+          onclick={() => (confirmDeleteServer = true)}
           disabled={deletingServer}
         >
           Delete server

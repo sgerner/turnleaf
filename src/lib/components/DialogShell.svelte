@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { fade, fly } from 'svelte/transition';
-  import { modalFocusTrap, trapModalKeydown } from '../a11y/modal-focus';
+  import { modalFocusTrap } from '../a11y/modal-focus';
 
   let {
     labelledBy,
@@ -31,7 +31,6 @@
     aria-modal="true"
     aria-labelledby={labelledBy}
     tabindex="-1"
-    onkeydown={(event) => trapModalKeydown(event, event.currentTarget, onClose)}
     use:modalFocusTrap={onClose}
     transition:fly={{ y: 16, duration: 150 }}
   >
