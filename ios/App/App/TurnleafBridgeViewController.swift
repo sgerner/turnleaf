@@ -8,15 +8,14 @@ import WebKit
 final class TurnleafBridgeViewController: CAPBridgeViewController {
     private var contentSizeObserver: NSObjectProtocol?
 
-    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
-        let configuration = super.webViewConfiguration(for: instanceConfiguration)
+    override func capacitorDidLoad() {
+        super.capacitorDidLoad()
         let script = WKUserScript(
             source: Self.dynamicTypeScript(for: resolvedContentSizeCategory()),
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
-        configuration.userContentController.addUserScript(script)
-        return configuration
+        webView?.configuration.userContentController.addUserScript(script)
     }
 
     override func viewDidLoad() {
@@ -38,7 +37,7 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
             self?.applyDynamicTypeScale()
         }
         if #available(iOS 17.0, *) {
-            registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
+            _ = registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
                 self.applyDynamicTypeScale()
             }
         }
@@ -48,13 +47,6 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         applyDynamicTypeScale()
-    }
-
-    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
-        super.traitCollectionDidChange(previousTraitCollection)
-        if previousTraitCollection?.preferredContentSizeCategory != traitCollection.preferredContentSizeCategory {
-            applyDynamicTypeScale()
-        }
     }
 
     deinit {
@@ -81,9 +73,15 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
         return min(2.0, max(0.85, scaledPoints / basePoints))
     }
 
+    private static func formattedScale(for category: UIContentSizeCategory) -> String {
+        let raw = Double(dynamicTypeScale(for: category))
+        let rounded = (raw * 1000).rounded() / 1000
+        return String(rounded)
+    }
+
     private static func dynamicTypeScript(for category: UIContentSizeCategory) -> String {
         let resolved = category == .unspecified ? .large : category
-        let scale = String(format: "%.3f", dynamicTypeScale(for: resolved))
+        let scale = formattedScale(for: resolved)
         return """
         (() => {
           const root = document.documentElement;
@@ -97,7 +95,7 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
     private func applyDynamicTypeScale() {
         let category = resolvedContentSizeCategory()
         let resolved = category == .unspecified ? .large : category
-        let scale = String(format: "%.3f", Self.dynamicTypeScale(for: resolved))
+        let scale = Self.formattedScale(for: resolved)
         webView?.evaluateJavaScript(Self.dynamicTypeScript(for: resolved), completionHandler: nil)
         bridge?.triggerWindowJSEvent(
             eventName: "turnleafDynamicType",
@@ -106,10 +104,6 @@ final class TurnleafBridgeViewController: CAPBridgeViewController {
     }
 
     override var prefersStatusBarHidden: Bool {
-        TurnleafReaderChromeController.shared.enabled
-    }
-
-    override var prefersHomeIndicatorAutoHidden: Bool {
         TurnleafReaderChromeController.shared.enabled
     }
 
@@ -285,7 +279,7 @@ final class TurnleafReaderChromeController {
     static let shared = TurnleafReaderChromeController()
 
     private weak var bridge: CAPBridgeProtocol?
-    private var enabled = false
+    fileprivate var enabled = false
 
     func attach(to bridge: CAPBridgeProtocol?) {
         self.bridge = bridge
