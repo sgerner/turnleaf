@@ -48,7 +48,7 @@
     type LibraryViewMode,
     type VirtualWindow,
   } from './library-virtualization';
-  import type { SkeletonTheme } from '../themes/themes';
+  import { DEFAULT_THEME, isSkeletonTheme, type SkeletonTheme } from '../themes/themes';
   import {
     bookActionsLabel,
     downloadProgressLabel,
@@ -282,8 +282,8 @@
   let settingsVisible = $state(false);
   let settingsAttempt = $state(0);
   let settingsFallbackDialog = $state<HTMLElement | null>(null);
-  let pendingTheme = $state<SkeletonTheme>('vintage');
-  let pendingMode = $state<'light' | 'dark'>('dark');
+  let pendingTheme = $derived<SkeletonTheme>(isSkeletonTheme(theme) ? theme : DEFAULT_THEME);
+  let pendingMode = $derived<'light' | 'dark'>(mode);
   let pendingAutoSync = $state(false);
   let credentialCleanupComplete = $state(false);
   let actionMenuBook = $state<BookRecord | null>(null);
@@ -726,8 +726,6 @@
       getBooks(server.id, { includeDescription: false }),
     ]);
     if (destroyed) return;
-    pendingTheme = theme as SkeletonTheme;
-    pendingMode = mode;
     pendingAutoSync = (preferences.get('syncFurthest') ?? 'true') === 'true';
     downloadedOnly = parseBooleanPreference(preferences.get('libraryDownloadedOnly'), false);
     hideCompleted = parseBooleanPreference(preferences.get('libraryHideCompleted'), true);

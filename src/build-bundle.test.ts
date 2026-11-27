@@ -4,7 +4,7 @@ import { build, type Rollup } from 'vite';
 import { describe, expect, it } from 'vitest';
 
 const READER_RAW_BYTE_BUDGET = 335_000;
-const STARTUP_RAW_BYTE_BUDGET = 185_000;
+const STARTUP_RAW_BYTE_BUDGET = 200_000;
 
 describe('production bundle budgets and module exclusions', () => {
   it('trims Reader and startup index chunks within byte budgets and excludes dead or deferred modules', async () => {

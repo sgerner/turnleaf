@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerConfig } from './lib/database/database';
+import type * as ThemesModule from './lib/themes/themes';
 
 const hooks = vi.hoisted(() => ({
   onboardingLoads: 0,
@@ -47,7 +48,8 @@ describe('App cold-launch lazy Onboarding loading', () => {
       getApiKey: vi.fn(async () => hooks.apiKey),
     }));
 
-    vi.doMock('./lib/themes/themes', () => ({
+    vi.doMock('./lib/themes/themes', async (importOriginal) => ({
+      ...(await importOriginal<typeof ThemesModule>()),
       loadTheme: vi.fn(async () => true),
     }));
 

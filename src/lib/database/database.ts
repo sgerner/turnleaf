@@ -9,6 +9,7 @@ import {
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
+import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 
 export const LATEST_SCHEMA_VERSION = 7;
 
@@ -360,6 +361,7 @@ async function openNativeDatabase(): Promise<NativeSQLiteConnection> {
 export async function resetLocalDatabase(): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
+    clearBootThemeCache();
     return;
   }
 
@@ -374,6 +376,7 @@ export async function resetLocalDatabase(): Promise<void> {
     connection = null;
     opening = null;
     await sqlitePlugin.deleteDatabase({ database: NATIVE_DATABASE, readonly: false });
+    clearBootThemeCache();
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
   }
@@ -1368,8 +1371,16 @@ export async function setPreference(key: string, value: string): Promise<void> {
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
+    let nextTheme: string | undefined;
+    let nextMode: string | undefined;
     updateBrowserState((state) => {
       for (const [key, value] of preferences) state.preferences[key] = value;
+      nextTheme = state.preferences.uiTheme;
+      nextMode = state.preferences.uiMode;
+    });
+    mirrorBootThemePreferences(preferences, {
+      theme: nextTheme,
+      mode: nextMode,
     });
     return;
   }
@@ -1382,4 +1393,5 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
+  mirrorBootThemePreferences(preferences);
 }
