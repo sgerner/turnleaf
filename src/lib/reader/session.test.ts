@@ -18,9 +18,8 @@ const { testState, mockBook, mockRendition } = vi.hoisted(() => {
     on: vi.fn(),
     off: vi.fn(),
     started: Promise.resolve(),
-    themes: { register: vi.fn(), registerCss: vi.fn(), select: vi.fn() } as {
+    themes: { register: vi.fn(), select: vi.fn() } as {
       register: (...args: unknown[]) => void;
-      registerCss: (name: string, css: string) => void;
       select: (name: string) => void;
     },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
