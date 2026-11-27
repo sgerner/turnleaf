@@ -1,10 +1,12 @@
 <script lang="ts">
   import { Capacitor } from '@capacitor/core';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
   import Onboarding from './lib/components/Onboarding.svelte';
   import Library from './lib/components/Library.svelte';
+  import DiagnosticsPanel from './lib/components/DiagnosticsPanel.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
+  import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
   import {
     getPreferences,
@@ -13,12 +15,45 @@
     type ServerConfig,
   } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
-  import { loadTheme } from './lib/themes/themes';
+  import {
+    DEFAULT_MODE,
+    DEFAULT_THEME,
+    isSkeletonTheme,
+    loadTheme,
+    normalizeUiMode,
+    readBootThemeCache,
+    syncShellAppearanceChrome,
+    writeBootThemeCache,
+    type SkeletonTheme,
+    type UiMode,
+  } from './lib/themes/themes';
 
   const themePreferenceKey = 'uiTheme';
   const modePreferenceKey = 'uiMode';
-  const defaultTheme = 'fennec';
-  const defaultMode = 'dark';
+
+  let {
+    initialTheme,
+    initialMode,
+  }: {
+    initialTheme?: SkeletonTheme | undefined;
+    initialMode?: UiMode | undefined;
+  } = $props();
+
+  function resolveInitialAppearance(): { theme: SkeletonTheme; mode: UiMode } {
+    const cached = readBootThemeCache();
+    if (cached) return { theme: cached.theme, mode: cached.mode };
+    if (typeof document !== 'undefined') {
+      const domTheme = document.documentElement.dataset.theme;
+      const domMode = document.documentElement.dataset.mode;
+      return {
+        theme: domTheme && isSkeletonTheme(domTheme) ? domTheme : DEFAULT_THEME,
+        mode: normalizeUiMode(domMode),
+      };
+    }
+    return { theme: DEFAULT_THEME, mode: DEFAULT_MODE };
+  }
+
+  const bootAppearance = resolveInitialAppearance();
 
   let server = $state<ServerConfig | null>(null);
   let booting = $state(Capacitor.isNativePlatform());
@@ -26,10 +61,11 @@
   let repairing = $state(false);
   let changingServerAddress = $state(false);
   let apiKey = $state<string | null>(null);
-  let uiTheme = $state(defaultTheme);
-  let uiMode = $state<'light' | 'dark'>(defaultMode);
+  let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
+  let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let stageOverlayActive = $state(false);
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -45,19 +81,36 @@
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
-      const theme = savedTheme ?? defaultTheme;
-      uiTheme = (await loadTheme(theme).catch(() => false)) ? theme : defaultTheme;
-      uiMode = savedMode === 'light' ? 'light' : 'dark';
+      const requestedTheme = savedTheme && isSkeletonTheme(savedTheme) ? savedTheme : DEFAULT_THEME;
+      const resolvedTheme: SkeletonTheme = (await loadTheme(requestedTheme).catch(() => false))
+        ? requestedTheme
+        : DEFAULT_THEME;
+      const resolvedMode = normalizeUiMode(savedMode);
+      uiTheme = resolvedTheme;
+      uiMode = resolvedMode;
+      if (savedTheme !== undefined || savedMode !== undefined) {
+        writeBootThemeCache(resolvedTheme, resolvedMode);
+      }
       if (saved) {
         server = saved;
         try {
           apiKey = await getApiKey(saved.credentialRef);
         } catch {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/credentials',
+            detail: 'credential-read-failed',
+          });
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
       }
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-open-failed',
+      });
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
@@ -66,6 +119,7 @@
   }
 
   onMount(() => {
+    void hydrateDiagnostics();
     void loadLocalData();
   });
 
@@ -73,8 +127,14 @@
     repairing = true;
     try {
       await resetLocalDatabase();
+      await clearDiagnostics();
       await loadLocalData();
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-reset-failed',
+      });
       startupError =
         'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
       return;
@@ -95,6 +155,7 @@
   $effect(() => {
     document.documentElement.dataset.theme = uiTheme;
     document.documentElement.dataset.mode = uiMode;
+    syncShellAppearanceChrome(uiTheme, uiMode, { readerActive: readerOpen });
   });
 </script>
 
@@ -108,9 +169,9 @@
     </div>
   {/if}
 
-  <div class="app-stage">
-    {#if releaseBanner}
-      <div class="sticky top-0 z-20 mx-auto w-full max-w-4xl px-4 pt-4" transition:fade>
+  {#if releaseBanner}
+    <div class="release-banner" inert={stageOverlayActive} transition:fade>
+      <div class="mx-auto w-full max-w-4xl px-4 pb-2 pt-[max(1rem,env(safe-area-inset-top))]">
         <div
           class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
         >
@@ -152,8 +213,10 @@
           </div>
         </div>
       </div>
-    {/if}
+    </div>
+  {/if}
 
+  <div class="app-stage">
     {#if booting}
       <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
@@ -180,6 +243,7 @@
           server = null;
           apiKey = null;
         }}
+        onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
     {:else if startupError}
       <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
@@ -220,6 +284,7 @@
             </button>
           {/if}
         </div>
+        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
     {:else}
       <Onboarding
@@ -240,6 +305,8 @@
   .app-shell {
     position: fixed;
     inset: 0;
+    display: flex;
+    flex-direction: column;
     isolation: isolate;
     overflow: hidden;
     background-color: var(--color-root-bg-light);
@@ -341,12 +408,26 @@
     );
   }
 
+  .release-banner {
+    position: relative;
+    flex: 0 0 auto;
+    min-height: 0;
+    max-height: 50%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scroll-padding-block: 8px;
+    z-index: 1;
+  }
+
   .app-stage {
     position: relative;
-    height: 100%;
+    flex: 1 1 0%;
+    min-height: 0;
     overflow: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    scroll-padding-block: 8px;
     z-index: 1;
   }
 

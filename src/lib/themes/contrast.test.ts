@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { skeletonThemes, type SkeletonTheme } from './themes';
+import { DEFAULT_THEME, skeletonThemes, type SkeletonTheme } from './themes';
 
 type ColorMode = 'light' | 'dark';
 
@@ -282,7 +282,8 @@ describe('theme contrast and control boundary normalization', () => {
     expect(skeletonThemes).toHaveLength(23);
     expect(skeletonThemes).toContain('fennec');
     expect(skeletonThemes).toContain('eink');
-    expect(appSvelte).toContain("const defaultTheme = 'fennec';");
+    expect(DEFAULT_THEME).toBe('fennec');
+    expect(appSvelte).toContain('DEFAULT_THEME');
   });
 
   it('keeps eink surface-50 pure white, surface-950 pure black, and zero chroma across all tokens', () => {
