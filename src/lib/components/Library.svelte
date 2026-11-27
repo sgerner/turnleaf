@@ -787,10 +787,19 @@
     return handle.remove;
   }
 
+  function canContinueSync(): Promise<boolean> | boolean {
+    if (offline || destroyed) return false;
+    return Capacitor.isNativePlatform() ? networkAvailable() : true;
+  }
+
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
     const status = await Network.getStatus().catch(() => null);
+    if (status && !status.connected && !destroyed) {
+      refreshController?.abort();
+      openProgressProbe?.abort();
+    }
     return !offline && !destroyed && status?.connected === true;
   }
 
@@ -831,8 +840,17 @@
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id);
-      if (showFeedback) setMessage('Reading progress synced.');
+      await flushProgress(client, server.id, canContinueSync);
+      if (showFeedback) {
+        const stillAvailable = Capacitor.isNativePlatform()
+          ? await networkAvailable()
+          : !offline && !destroyed;
+        setMessage(
+          stillAvailable
+            ? 'Reading progress synced.'
+            : 'Offline. Reading progress will retry when Kavita is available.',
+        );
+      }
     } catch (error) {
       if (
         error instanceof AggregateError &&
@@ -918,13 +936,20 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (!(await networkAvailable()) || controller.signal.aborted) {
+          controller.abort();
+          return;
+        }
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
           ...(
             await Promise.all(
               batch.map(async (item) => {
+                if (!(await networkAvailable()) || controller.signal.aborted) {
+                  controller.abort();
+                  return [];
+                }
                 const detail = await client.getSeriesDetail(item.id, controller.signal);
                 if (detail.incomplete) incomplete = true;
                 return mapSeriesToBooks(server.id, item, detail);
@@ -933,7 +958,10 @@
           ).flat(),
         );
       }
-      if (controller.signal.aborted) return;
+      if (!(await networkAvailable()) || controller.signal.aborted) {
+        controller.abort();
+        return;
+      }
       // Reconcile only after every series page and detail batch completed.
       // Errors and lifecycle cancellation leave the last known local library intact.
       diagnosticEndpoint = '/api/unknown';
@@ -1404,7 +1432,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, canContinueSync);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
@@ -1414,6 +1442,10 @@
     const local = await getReadingState(book.id);
     if (local?.pendingSync) {
       if (manual) throw new Error('A newer position is saved here. Sync again to upload it.');
+      return null;
+    }
+    if (!(await networkAvailable())) {
+      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
       return null;
     }
     const remote = await client.getProgress(book.chapterId);

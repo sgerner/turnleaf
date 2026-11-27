@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { startFixture } from './android-reading-journey.mjs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { enterOfflineMode, startFixture } from './android-reading-journey.mjs';
 
 const fixtures = [];
 
@@ -74,5 +74,60 @@ describe('Android reading journey fixture', () => {
     });
     expect(fixture.foreignRequests).toEqual(['/probe', '/probe-auth']);
     expect(fixture.foreignAuthHeaders).toBe(1);
+  });
+
+  it('disables mobile data before wifi and waits for in-flight loopback requests to settle before offline mode', async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+
+    const adbCalls = [];
+    const adbCommand = vi.fn(async (...args) => {
+      adbCalls.push(args.join(' '));
+      return '';
+    });
+
+    let connected = true;
+    const webClient = {
+      evaluate: vi.fn(async () => connected),
+    };
+
+    let pollCount = 0;
+    let simulatedLateRequest;
+    const wait = async (_label, check) => {
+      while (!(await check())) {
+        pollCount += 1;
+        if (pollCount === 1) {
+          connected = false;
+          // Simulate a pre-disconnect request arriving over adb reverse right as status flips offline
+          simulatedLateRequest = fetch(
+            `http://127.0.0.1:${fixture.port}/api/Series/series-detail`,
+            {
+              headers: { 'x-api-key': 'turnleaf-ci-only' },
+            },
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    };
+
+    await enterOfflineMode({
+      adbCommand,
+      webClient,
+      fixture,
+      settleMs: 30,
+      wait,
+    });
+    await simulatedLateRequest;
+
+    expect(adbCalls).toEqual(['shell svc data disable', 'shell svc wifi disable']);
+    expect(fixture.inFlightRequests).toBe(0);
+    expect(fixture.requestCount).toBe(1);
+    expect(fixture.offlineRequests).toEqual([]);
+
+    // Any request arriving after enterOfflineMode completes is recorded as an offline leak.
+    await fetch(`http://127.0.0.1:${fixture.port}/api/Series/series-detail`, {
+      headers: { 'x-api-key': 'turnleaf-ci-only' },
+    });
+    expect(fixture.offlineRequests).toEqual(['/api/Series/series-detail']);
   });
 });
