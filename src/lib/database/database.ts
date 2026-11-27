@@ -8,6 +8,7 @@ import {
 } from '@capacitor-community/sqlite';
 import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
+import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 import { migrations } from './schema';
 
 export interface ServerConfig {
@@ -56,6 +57,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 let sqlite: SQLiteConnection | null = null;
 let connection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
+let resetting: Promise<void> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 const trackedConnections = new WeakSet<SQLiteDBConnection>();
 
@@ -216,6 +218,9 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
+  while (resetting) {
+    await resetting.catch(() => undefined);
+  }
   if (connection) return connection;
 
   if (opening) return opening;
@@ -261,35 +266,47 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 export async function resetLocalDatabase(): Promise<void> {
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
+    clearBootThemeCache();
     return;
   }
 
+  while (resetting) {
+    await resetting.catch(() => undefined);
+  }
   const manager = getSqliteConnection();
-  try {
+  const task = (async () => {
     if (opening) {
       await opening.catch(() => undefined);
     }
-    await nativeTransactionQueue;
-    const hadConnection =
-      Boolean(connection) || Boolean((await manager.isConnection('turnleaf', false)).result);
-    if (connection) {
-      try {
-        await connection.close();
-      } catch {
-        // Best effort only; a broken connection can still be removed.
+    await enqueueNativeWrite(async () => {
+      const hadConnection =
+        Boolean(connection) || Boolean((await manager.isConnection('turnleaf', false)).result);
+      if (connection) {
+        try {
+          await connection.close();
+        } catch {
+          // Best effort only; a broken connection can still be removed.
+        }
       }
-    }
-    connection = null;
-    opening = null;
-    if (!hadConnection) {
-      await manager.createConnection('turnleaf', false, 'no-encryption', 1, false);
-    }
-    await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
-    if ((await manager.isConnection('turnleaf', false)).result) {
-      await manager.closeConnection('turnleaf', false);
-    }
+      connection = null;
+      opening = null;
+      if (!hadConnection) {
+        await manager.createConnection('turnleaf', false, 'no-encryption', 1, false);
+      }
+      await CapacitorSQLite.deleteDatabase({ database: 'turnleaf', readonly: false });
+      if ((await manager.isConnection('turnleaf', false)).result) {
+        await manager.closeConnection('turnleaf', false);
+      }
+    });
+    clearBootThemeCache();
+  })();
+  resetting = task;
+  try {
+    await task;
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
+  } finally {
+    if (resetting === task) resetting = null;
   }
 }
 
@@ -1280,8 +1297,16 @@ export async function setPreference(key: string, value: string): Promise<void> {
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
   if (!Capacitor.isNativePlatform()) {
+    let nextTheme: string | undefined;
+    let nextMode: string | undefined;
     updateBrowserState((state) => {
       for (const [key, value] of preferences) state.preferences[key] = value;
+      nextTheme = state.preferences.uiTheme;
+      nextMode = state.preferences.uiMode;
+    });
+    mirrorBootThemePreferences(preferences, {
+      theme: nextTheme,
+      mode: nextMode,
     });
     return;
   }
@@ -1294,4 +1319,5 @@ export async function setPreferences(preferences: ReadonlyMap<string, string>): 
     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
     Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
   );
+  mirrorBootThemePreferences(preferences);
 }

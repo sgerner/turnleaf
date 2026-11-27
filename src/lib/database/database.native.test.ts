@@ -21,8 +21,10 @@ const mocks = vi.hoisted(() => {
   };
   const sqlite = {
     checkConnectionsConsistency: vi.fn(async () => ({ result: true })),
+    closeConnection: vi.fn(async () => undefined),
     createConnection: vi.fn(async () => db),
     isConnection: vi.fn(async () => ({ result: false })),
+    retrieveConnection: vi.fn(async () => db),
   };
   return {
     db,
@@ -401,4 +403,39 @@ it('records each migration and its user version in one transaction', async () =>
     'PRAGMA user_version = 6;',
     'PRAGMA user_version = 7;',
   ]);
+});
+
+it('mirrors native SQLite theme and mode preferences to browser localStorage and clears on reset', async () => {
+  const store = new Map<string, string>();
+  const mockStorage = {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => void store.set(key, value),
+    removeItem: (key: string) => void store.delete(key),
+  };
+  vi.stubGlobal('window', { localStorage: mockStorage });
+  try {
+    const { resetLocalDatabase, setPreferences } = await import('./database');
+    const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+
+    await setPreferences(
+      new Map([
+        ['uiTheme', 'eink'],
+        ['uiMode', 'light'],
+      ]),
+    );
+
+    expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toEqual({
+      theme: 'eink',
+      mode: 'light',
+      rootBgLight: 'oklch(1 0 0)',
+      rootBgDark: 'oklch(0 0 0)',
+      surfaceLight: 'oklch(1 0 0)',
+      surfaceDark: 'oklch(0 0 0)',
+    });
+
+    await resetLocalDatabase();
+    expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });
