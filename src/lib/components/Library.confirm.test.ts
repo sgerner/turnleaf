@@ -4,13 +4,19 @@ import { mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as ThemesModule from '../themes/themes';
 
-const { backListeners, mockDeleteDownloadedEpub, mockClearCoverCache, mockRemoveApiKey } =
-  vi.hoisted(() => ({
-    backListeners: [] as Array<() => void>,
-    mockDeleteDownloadedEpub: vi.fn(async () => {}),
-    mockClearCoverCache: vi.fn(async () => {}),
-    mockRemoveApiKey: vi.fn(async () => {}),
-  }));
+const {
+  backListeners,
+  mockDownloadEpub,
+  mockDeleteDownloadedEpub,
+  mockClearCoverCache,
+  mockRemoveApiKey,
+} = vi.hoisted(() => ({
+  backListeners: [] as Array<() => void>,
+  mockDownloadEpub: vi.fn(),
+  mockDeleteDownloadedEpub: vi.fn(async () => {}),
+  mockClearCoverCache: vi.fn(async () => {}),
+  mockRemoveApiKey: vi.fn(async () => {}),
+}));
 
 vi.mock('@capacitor/network', () => ({
   Network: {
@@ -44,7 +50,7 @@ vi.mock('../downloads/native-download', () => ({
   clearCoverCache: mockClearCoverCache,
   cleanupInterruptedEpubDownloads: vi.fn(async () => {}),
   deleteDownloadedEpub: mockDeleteDownloadedEpub,
-  downloadEpub: vi.fn(),
+  downloadEpub: mockDownloadEpub,
   verifyDownloadedEpub: vi.fn(),
 }));
 
@@ -542,16 +548,28 @@ describe('Library destructive action confirmations', () => {
     confirmMarkRead.click();
     await flushUi();
 
-    // Card stays visible when persisted libraryHideCompleted is false, restoring focus to its menu trigger
+    // Card stays visible when persisted libraryHideCompleted is false, updates savedBook completion state in place, and restores focus to its menu trigger
     const remainingTrigger = host.querySelector<HTMLButtonElement>(
       '[aria-label^="Book actions for The Left Hand of Darkness"]',
     );
     expect(remainingTrigger).not.toBeNull();
     expect(document.activeElement).toBe(remainingTrigger);
 
-    // Removing a server-available download while persisted libraryDownloadedOnly is true runs immediately and focuses #library-results
+    // Reopening Mark as read reflects 100% completion (not stale 40% complete) from in-place savedBook state
     remainingTrigger!.click();
     await flushUi();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Mark as read')!
+      .click();
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')?.textContent).not.toContain('40% complete');
+    expect(host.querySelector('[role="alertdialog"]')?.textContent).toContain(
+      'overwrites any saved reading position with 100% completion',
+    );
+    host.querySelector<HTMLButtonElement>('[role="alertdialog"] button')!.click();
+    await flushUi();
+
+    // Removing a server-available download while persisted libraryDownloadedOnly is true runs immediately and focuses #library-results
     const removeButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
       (button) => button.textContent?.trim() === 'Remove download',
     )!;
@@ -564,5 +582,135 @@ describe('Library destructive action confirmations', () => {
       host.querySelector('[aria-label^="Book actions for The Left Hand of Darkness"]'),
     ).toBeNull();
     expect(document.activeElement?.id).toBe('library-results');
+  });
+
+  it('guards Remove download and Remove all downloaded books while downloadingBookId or cleanupInProgress is active', async () => {
+    const undownloadedBook: BookRecord = {
+      ...activeBook,
+      id: 'primary:3:30',
+      seriesId: 3,
+      volumeId: 30,
+      chapterId: 300,
+      title: 'A Wizard of Earthsea',
+      pagesRead: 0,
+      lastReadAt: null,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+      remoteAvailable: true,
+    };
+    await reconcileBooks(server.id, [activeBook, undownloadedBook]);
+
+    let finishDownload: ((value: { relativePath: string; size: number }) => void) | null = null;
+    mockDownloadEpub.mockImplementationOnce(
+      () =>
+        new Promise<{ relativePath: string; size: number }>((resolve) => {
+          finishDownload = resolve;
+        }),
+    );
+
+    mounted = mount(Library, {
+      target: host,
+      props: {
+        server,
+        apiKey: 'secret-key',
+        theme: 'fennec',
+        mode: 'dark',
+        onThemeChange: vi.fn(),
+        onModeChange: vi.fn(),
+        onApiKeyChange: vi.fn(),
+        onServerDeleted: vi.fn(),
+        onChangeServerAddress: vi.fn(),
+      },
+    });
+    await flushUi();
+
+    // Start an in-flight download so downloadingBookId is set
+    host
+      .querySelector<HTMLButtonElement>('[data-book-open][aria-label*="A Wizard of Earthsea"]')!
+      .click();
+    await flushUi();
+
+    // Settings disables Remove all downloaded books while downloadingBookId is active
+    host.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await flushUi();
+    expect(
+      Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+        (button) => button.textContent?.trim() === 'Remove all downloaded books',
+      )!.disabled,
+    ).toBe(true);
+    host.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click();
+    await flushUi();
+
+    // Attempting to remove a sole offline copy while downloadingBookId is active skips ConfirmDialog and shows the busy guard
+    host
+      .querySelector<HTMLButtonElement>('[aria-label^="Book actions for Out of Print Edition"]')!
+      .click();
+    await flushUi();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Remove download')!
+      .click();
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(mockDeleteDownloadedEpub).not.toHaveBeenCalled();
+    expect(host.textContent).toContain(
+      'Wait for the current download or cleanup to finish before removing a book.',
+    );
+
+    // Fail markDownloaded + initial file cleanup so failedDownloadCleanupPath renders Retry cleanup
+    vi.spyOn(localStorage, 'setItem').mockImplementationOnce(() => {
+      throw new Error('QuotaExceededError');
+    });
+    mockDeleteDownloadedEpub.mockRejectedValueOnce(new Error('EBUSY'));
+    finishDownload!({ relativePath: 'books/primary-3-30.epub', size: 1024 });
+    await flushUi();
+
+    let finishCleanup: (() => void) | null = null;
+    mockDeleteDownloadedEpub.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishCleanup = resolve;
+        }),
+    );
+
+    const retryCleanupButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Retry cleanup',
+    )!;
+    retryCleanupButton.click();
+    await flushUi();
+
+    // While cleanupInProgress is true, Settings disables Remove all downloaded books and Remove download skips ConfirmDialog
+    host.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await flushUi();
+    expect(
+      Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+        (button) => button.textContent?.trim() === 'Remove all downloaded books',
+      )!.disabled,
+    ).toBe(true);
+    host.querySelector<HTMLButtonElement>('[aria-label="Close settings"]')!.click();
+    await flushUi();
+
+    mockDeleteDownloadedEpub.mockClear();
+    host
+      .querySelector<HTMLButtonElement>('[aria-label^="Book actions for Out of Print Edition"]')!
+      .click();
+    await flushUi();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.trim() === 'Remove download')!
+      .click();
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(mockDeleteDownloadedEpub).not.toHaveBeenCalled();
+
+    // Once cleanup finishes, Remove all downloaded books becomes enabled again
+    finishCleanup!();
+    await flushUi();
+    host.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await flushUi();
+    expect(
+      Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+        (button) => button.textContent?.trim() === 'Remove all downloaded books',
+      )!.disabled,
+    ).toBe(false);
   });
 });

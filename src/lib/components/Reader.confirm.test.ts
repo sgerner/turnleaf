@@ -339,8 +339,21 @@ describe('Reader destructive action confirmations', () => {
     expect(currentToggle.textContent?.trim()).toBe('Bookmark this page');
   });
 
-  it('uses ConfirmDialog when manual sync finds a divergent Kavita reading position', async () => {
-    const accept = vi.fn(async () => {});
+  it('uses ConfirmDialog when manual sync finds a divergent Kavita reading position, awaiting async acceptance and surfacing rejection errors', async () => {
+    let resolveAccept: (() => void) | null = null;
+    let shouldRejectAccept = false;
+    const accept = vi.fn(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          resolveAccept = () => {
+            if (shouldRejectAccept) {
+              reject(new Error('Kavita sync write failed.'));
+            } else {
+              resolve();
+            }
+          };
+        }),
+    );
     const onSyncLatest = vi.fn(async () => {
       // Real browsers blur a focused <button> as soon as disabled={syncingLatest} flips true
       if (document.activeElement instanceof HTMLElement) {
@@ -377,6 +390,7 @@ describe('Reader destructive action confirmations', () => {
 
     const dialog = host.querySelector<HTMLElement>('[role="alertdialog"]');
     expect(dialog).not.toBeNull();
+    expect(dialog?.parentElement?.classList.contains('z-40')).toBe(true);
     expect(dialog?.textContent).toContain('Move to Kavita’s latest position?');
     const buttons = Array.from(dialog!.querySelectorAll('button'));
     expect(document.activeElement).toBe(buttons[0]);
@@ -389,7 +403,7 @@ describe('Reader destructive action confirmations', () => {
     expect(accept).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(syncButton);
 
-    // Re-trigger sync and confirm moving to the synced location
+    // Re-trigger sync and confirm: closes dialog immediately, awaits async accept(), then navigates and restores focus
     syncButton.click();
     await flushUi();
     const confirmButtons = Array.from(
@@ -397,8 +411,34 @@ describe('Reader destructive action confirmations', () => {
     );
     confirmButtons[1]!.click();
     await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
     expect(accept).toHaveBeenCalledOnce();
+    expect(mockDisplayServerLocation).not.toHaveBeenCalled();
+
+    resolveAccept!();
+    await flushUi();
     expect(mockDisplayServerLocation).toHaveBeenCalledWith('/body/div/p[9]');
+    expect(document.activeElement).toBe(syncButton);
+
+    // Async rejection during accept() opens decoupled z-40 reader error alertdialog and restores focus on dismiss
+    mockDisplayServerLocation.mockClear();
+    shouldRejectAccept = true;
+    syncButton.click();
+    await flushUi();
+    Array.from(host.querySelectorAll<HTMLButtonElement>('[role="alertdialog"] button'))[1]!.click();
+    await flushUi();
+    resolveAccept!();
+    await flushUi();
+
+    expect(mockDisplayServerLocation).not.toHaveBeenCalled();
+    const errorDialog = host.querySelector<HTMLElement>('[aria-labelledby="reader-error-title"]');
+    expect(errorDialog).not.toBeNull();
+    expect(errorDialog?.parentElement?.classList.contains('z-40')).toBe(true);
+    expect(errorDialog?.textContent).toContain('Kavita sync write failed.');
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await flushUi();
+    expect(host.querySelector('[aria-labelledby="reader-error-title"]')).toBeNull();
     expect(document.activeElement).toBe(syncButton);
   });
 
