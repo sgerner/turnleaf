@@ -30,6 +30,8 @@ const mocks = vi.hoisted(() => {
   };
 });
 
+const syncMocks = vi.hoisted(() => ({ flushProgress: vi.fn(async () => {}) }));
+
 vi.mock('@capacitor/app', () => ({
   App: {
     addListener: vi.fn(async (event: string, listener: () => void) => {
@@ -105,6 +107,8 @@ vi.mock('./lib/native/credentials', () => ({
   saveApiKey: mocks.saveApiKey,
   removeApiKey: mocks.removeApiKey,
 }));
+
+vi.mock('./lib/sync/sync', () => ({ flushProgress: syncMocks.flushProgress }));
 
 vi.mock('./lib/github/releases', () => ({
   fetchLatestGithubRelease: mocks.fetchLatestGithubRelease,
@@ -196,6 +200,7 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
     mocks.removeApiKey.mockReset().mockResolvedValue(undefined);
     mocks.fetchLatestGithubRelease.mockReset().mockResolvedValue(null);
     mocks.loadTheme.mockReset().mockResolvedValue(true);
+    syncMocks.flushProgress.mockReset().mockResolvedValue(undefined);
     mocks.networkConnected = true;
 
     Element.prototype.animate = () => {
@@ -782,6 +787,68 @@ describe('Onboarding, inline Settings address editing, OPDS paste, and Android B
     );
     expect(target.textContent).toContain('Previous auth key removed from this device.');
     expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('persists a failed credential cleanup reference before waiting for an in-flight progress sync', async () => {
+    mocks.getServer.mockResolvedValue({
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: 'https://old.example.com',
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    });
+    mocks.getApiKey.mockResolvedValue('saved-active-key');
+
+    let finishSync: (() => void) | undefined;
+    syncMocks.flushProgress.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (finishSync = resolve)),
+    );
+
+    instance = mount(App, { target });
+    await settle();
+    expect(finishSync).toBeDefined();
+
+    target.querySelector<HTMLButtonElement>('[aria-label="Open settings"]')!.click();
+    await settle();
+    Array.from(target.querySelectorAll('button'))
+      .find((btn) => btn.textContent?.trim() === 'Change server address')!
+      .click();
+    await settle();
+
+    setInputValue(
+      target.querySelector<HTMLInputElement>('#settings-server-url')!,
+      'https://new.example.com',
+    );
+    setInputValue(
+      target.querySelector<HTMLInputElement>('#replacement-api-key')!,
+      'rotated-active-key',
+    );
+    mocks.removeApiKey.mockRejectedValueOnce(new Error('SecureStorage remove failed'));
+    target
+      .querySelector<HTMLInputElement>('#settings-server-url')!
+      .closest('form')!
+      .querySelector<HTMLButtonElement>('button[type="submit"]')!
+      .click();
+    await settle();
+
+    expect(mocks.setPreference).toHaveBeenCalledWith(
+      'staleCredentialRefs',
+      JSON.stringify(['server_primary_api_key']),
+    );
+    expect(target.querySelector('#settings-credential-cleanup-warning')?.textContent).toContain(
+      'previous auth key could not be removed from this device',
+    );
+    expect(
+      target.querySelector<HTMLButtonElement>('#settings-credential-cleanup-warning button')
+        ?.disabled,
+    ).toBe(true);
+
+    finishSync!();
+    await settle();
+    expect(target.querySelector('#settings-credential-cleanup-warning')?.textContent).toContain(
+      'previous auth key could not be removed from this device',
+    );
   });
 
   it('keeps the reconnected library active and surfaces retryable cleanup warning if old-key deletion fails during Onboarding address change', async () => {

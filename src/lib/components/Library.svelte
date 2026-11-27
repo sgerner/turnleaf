@@ -1869,6 +1869,14 @@
       );
       const updatedServer = rotation.server;
 
+      // Persist failed cleanup references before waiting on an upload that may
+      // outlive this screen or the app process.
+      await persistStaleCredentialRefs(
+        rotation.staleCredentialRefs,
+        hadStaleCredentialRefs,
+        updatedServer.credentialRef,
+      );
+
       // An upload started with the previous connection may still be finishing.
       while (syncWork) await syncWork;
       refreshController?.abort();
@@ -1879,7 +1887,6 @@
       const keyChanged = candidateKey !== activeApiKey;
       activeServer = updatedServer;
       activeApiKey = candidateKey;
-      await persistStaleCredentialRefs(rotation.staleCredentialRefs, hadStaleCredentialRefs);
       onServerChange(updatedServer, candidateKey);
       if (keyChanged) onApiKeyChange(candidateKey);
       nextServerUrl = normalized.baseUrl;
@@ -1958,9 +1965,10 @@
   async function persistStaleCredentialRefs(
     nextRefs: readonly string[],
     hadPreviousRefs: boolean,
+    activeCredentialRef = activeServer.credentialRef,
   ): Promise<void> {
     const normalizedRefs = [...new Set(nextRefs)].filter(
-      (ref) => Boolean(ref) && ref !== activeServer.credentialRef,
+      (ref) => Boolean(ref) && ref !== activeCredentialRef,
     );
     staleCredentialRefs = normalizedRefs;
     onStaleCredentialRefsChange?.([...normalizedRefs]);
@@ -2593,7 +2601,7 @@
           class="btn btn-sm preset-tonal-warning min-h-11 shrink-0"
           type="button"
           onclick={() => void retryCredentialCleanup()}
-          disabled={retryingCredentialCleanup}
+          disabled={retryingCredentialCleanup || savingServerAddress}
         >
           {retryingCredentialCleanup ? 'Cleaning up…' : 'Retry cleanup'}
         </button>

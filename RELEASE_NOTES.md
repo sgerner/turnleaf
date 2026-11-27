@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: persist stale credentials before sync barrier
 - Surface and retry stale credential cleanup after server address rotation
 - Edit Kavita server addresses inline from Settings and accept pasted OPDS URLs without exposing tokens in diagnostics.
 - refactor: consolidate duplicated database persistence helpers
