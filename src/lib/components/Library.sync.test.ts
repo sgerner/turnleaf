@@ -12,7 +12,6 @@ import {
   type BookRecord,
   type ServerConfig,
 } from '../database/database';
-import type * as ThemesModule from '../themes/themes';
 
 const networkListeners = new Set<
   (status: { connected: boolean; connectionType: string }) => void

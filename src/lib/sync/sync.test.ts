@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { KavitaError } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -226,4 +227,76 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('stops between requests without marking failures when AbortSignal aborts or transport drops offline', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2' }, { ...book, id: 'book-3' });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.readingState['book-3'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:02.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-3'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-3',
+    payloadJson: '{"pageNum":3}',
+    createdAt: '2026-09-07T00:00:02.000Z',
+    updatedAt: '2026-09-07T00:00:02.000Z',
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const firstController = new AbortController();
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      firstController.abort();
+    })
+    .mockRejectedValueOnce(new KavitaError('Kavita could not be reached while offline.', 'network'))
+    .mockResolvedValue(undefined);
+
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', firstController.signal),
+  ).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+
+  let saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']).toBeUndefined();
+  expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
+  expect(saved.syncQueue['book-3']?.attemptCount).toBe(0);
+
+  const secondController = new AbortController();
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', secondController.signal),
+  ).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+
+  saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
+  expect(saved.syncQueue['book-3']?.attemptCount).toBe(0);
+
+  const reconnectController = new AbortController();
+  await expect(
+    flushProgress({ saveProgress } as never, 'server', reconnectController.signal),
+  ).resolves.toBeUndefined();
+  expect(saveProgress).toHaveBeenCalledTimes(4);
+
+  saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-2']).toBeUndefined();
+  expect(saved.syncQueue['book-3']).toBeUndefined();
 });

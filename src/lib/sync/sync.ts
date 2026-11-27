@@ -4,36 +4,77 @@ import {
   markSyncFailure,
   type PendingSyncItem,
 } from '../database/database';
-import type { KavitaClient } from '../kavita/client';
+import { KavitaError, type KavitaClient } from '../kavita/client';
 import type { KavitaProgress } from '../kavita/types';
 
-const flushing = new Map<string, Promise<void>>();
-
-export function flushProgress(client: KavitaClient, serverId: string): Promise<void> {
-  const pending = flushing.get(serverId);
-  if (pending) return pending;
-  const current = run(client, serverId).finally(() => {
-    if (flushing.get(serverId) === current) flushing.delete(serverId);
-  });
-  flushing.set(serverId, current);
-  return current;
+interface ActiveFlush {
+  promise: Promise<void>;
+  signal: AbortSignal | undefined;
 }
 
-async function run(client: KavitaClient, serverId: string): Promise<void> {
+const flushing = new Map<string, ActiveFlush>();
+
+function isTransportDropped(signal?: AbortSignal): boolean {
+  return (
+    Boolean(signal?.aborted) || (typeof navigator !== 'undefined' && navigator.onLine === false)
+  );
+}
+
+function isTransportAbort(signal: AbortSignal | undefined, error: unknown): boolean {
+  if (isTransportDropped(signal)) return true;
+  if (error instanceof DOMException && error.name === 'AbortError') return true;
+  return (
+    error instanceof KavitaError &&
+    error.kind === 'network' &&
+    error.message === 'Kavita could not be reached while offline.'
+  );
+}
+
+export function flushProgress(
+  client: KavitaClient,
+  serverId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (isTransportDropped(signal)) return Promise.resolve();
+  const active = flushing.get(serverId);
+  if (active) {
+    if (active.signal?.aborted) {
+      return active.promise.then(() => flushProgress(client, serverId, signal));
+    }
+    return active.promise;
+  }
+  const entry: ActiveFlush = { promise: Promise.resolve(), signal };
+  entry.promise = run(client, serverId, signal).finally(() => {
+    if (flushing.get(serverId) === entry) flushing.delete(serverId);
+  });
+  flushing.set(serverId, entry);
+  return entry.promise;
+}
+
+async function run(client: KavitaClient, serverId: string, signal?: AbortSignal): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
-  while (true) {
+  let stopped = false;
+  while (!stopped && !isTransportDropped(signal)) {
     const pending = (await getPendingSync(serverId)).filter((item) => {
       const previous = attempted.get(item.bookId);
       return previous?.revision !== item.revision || previous.updatedAt !== item.updatedAt;
     });
-    if (pending.length === 0) break;
+    if (pending.length === 0 || isTransportDropped(signal)) break;
     for (const item of pending) {
+      if (isTransportDropped(signal)) {
+        stopped = true;
+        break;
+      }
       attempted.set(item.bookId, item);
       try {
         await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
         await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
       } catch (error) {
+        if (isTransportAbort(signal, error)) {
+          stopped = true;
+          break;
+        }
         await markSyncFailure(
           item.bookId,
           error instanceof Error ? error.message : 'Sync failed',

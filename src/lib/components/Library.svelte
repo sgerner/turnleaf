@@ -251,6 +251,8 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let syncController: AbortController | null = null;
+  let readerSyncController: AbortController | null = null;
   let activeSyncStartRevision: number | null = null;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
@@ -742,6 +744,8 @@
           const wasOffline = offline;
           offline = !connected;
           if (!connected) {
+            syncController?.abort();
+            readerSyncController?.abort();
             refreshController?.abort();
             openProgressProbe?.abort();
           }
@@ -818,13 +822,20 @@
   }
 
   function syncProgress(showFeedback = true): Promise<void> {
-    if (syncWork) return syncWork;
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
-    syncWork = runProgressSync(showFeedback).finally(() => {
-      syncWork = null;
+    if (syncWork && syncController?.signal.aborted) {
+      return syncWork.then(() => syncProgress(showFeedback));
+    }
+    if (syncWork) return syncWork;
+    const work = runProgressSync(showFeedback).finally(() => {
+      if (syncWork === work) {
+        syncController = null;
+        syncWork = null;
+      }
     });
+    syncWork = work;
     return syncWork;
   }
 
@@ -835,17 +846,24 @@
 
   async function runProgressSync(showFeedback: boolean): Promise<void> {
     syncing = true;
+    const controller = new AbortController();
+    syncController = controller;
     activeSyncStartRevision = messageRevision;
     try {
       const available = Capacitor.isNativePlatform()
         ? await networkAvailable()
         : !offline && !destroyed;
-      if (!available) {
-        if (showFeedback)
+      if (!available || controller.signal.aborted) {
+        if (showFeedback && !destroyed)
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id);
+      await flushProgress(client, server.id, controller.signal);
+      if (controller.signal.aborted || offline) {
+        if (showFeedback && !destroyed)
+          setMessage('Offline. Reading progress will retry when Kavita is available.');
+        return;
+      }
       if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
@@ -874,6 +892,8 @@
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
+    syncController?.abort();
+    readerSyncController?.abort();
     openProgressProbe?.abort();
     refreshController?.abort();
     cancelCoverLoading();
@@ -1417,12 +1437,18 @@
       return null;
     }
     if (manual) {
+      const controller = new AbortController();
+      readerSyncController = controller;
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, controller.signal);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
+        if (readerSyncController === controller) readerSyncController = null;
         void refreshSyncStatus();
+      }
+      if (controller.signal.aborted || !(await networkAvailable())) {
+        throw new Error('Kavita is unavailable. Your reading position is saved here.');
       }
     }
     const local = await getReadingState(book.id);
