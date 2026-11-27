@@ -378,43 +378,6 @@ describe('native cover cache', () => {
     expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
 
-  it('re-checks allowDownload callback right before starting FileTransfer.downloadFile', async () => {
-    let online = true;
-    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
-    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
-      online = false;
-      return { uri: `file://${path}` };
-    });
-
-    await expect(
-      cacheCover(
-        'https://books.example.com/cover',
-        'secret',
-        7,
-        undefined,
-        'default',
-        () => online,
-      ),
-    ).rejects.toThrow('Offline');
-
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
-  });
-
-  it('aborts before FileTransfer.downloadFile if signal aborts during filesystem setup', async () => {
-    const controller = new AbortController();
-    vi.mocked(Filesystem.stat).mockRejectedValue({ code: 'OS-PLUG-FILE-0008' });
-    vi.mocked(Filesystem.getUri).mockImplementationOnce(async ({ path }) => {
-      controller.abort();
-      return { uri: `file://${path}` };
-    });
-
-    await expect(
-      cacheCover('https://books.example.com/cover', 'secret', 7, controller.signal),
-    ).rejects.toMatchObject({ name: 'AbortError' });
-
-    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
-  });
-
   it('follows validated same-origin 3xx cover redirects with disableRedirects enabled', async () => {
     let downloaded = false;
     vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {

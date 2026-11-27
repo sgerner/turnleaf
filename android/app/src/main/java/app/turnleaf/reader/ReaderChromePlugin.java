@@ -14,11 +14,17 @@ public class ReaderChromePlugin extends Plugin {
     public void setEnabled(PluginCall call) {
         Boolean value = call.getBoolean("enabled", false);
         enabled = value != null && value;
-        Activity activity = getActivity();
+        apply();
+        call.resolve();
+    }
+
+    static void applyTo(Activity activity, boolean enabled) {
         if (activity instanceof MainActivity) {
-            ((MainActivity) activity).applyReaderChrome(enabled, call::resolve);
-        } else {
-            call.resolve();
+            ((MainActivity) activity).applyReaderChrome(enabled);
         }
+    }
+
+    private void apply() {
+        applyTo(getActivity(), enabled);
     }
 }

@@ -4,13 +4,10 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, tick, unmount } from 'svelte';
-import type * as CapacitorCoreModule from '@capacitor/core';
 import type { BookRecord, ServerConfig } from './lib/database/database';
 import type * as ThemesModule from './lib/themes/themes';
 
 const {
-  capacitorRuntime,
-  capacitorHttpRequestMock,
   fetchLatestGithubReleaseMock,
   getServerMock,
   getPreferencesMock,
@@ -30,8 +27,6 @@ const {
   openSessionMock,
   destroySessionMock,
 } = vi.hoisted(() => ({
-  capacitorRuntime: { native: false },
-  capacitorHttpRequestMock: vi.fn(),
   fetchLatestGithubReleaseMock: vi.fn(),
   getServerMock: vi.fn(),
   getPreferencesMock: vi.fn(),
@@ -51,22 +46,6 @@ const {
   openSessionMock: vi.fn(),
   destroySessionMock: vi.fn(),
 }));
-
-vi.mock('@capacitor/core', async (importOriginal) => {
-  const actual = await importOriginal<typeof CapacitorCoreModule>();
-  return {
-    ...actual,
-    Capacitor: {
-      ...actual.Capacitor,
-      isNativePlatform: () => capacitorRuntime.native,
-      getPlatform: () => (capacitorRuntime.native ? 'android' : 'web'),
-    },
-    CapacitorHttp: {
-      ...actual.CapacitorHttp,
-      request: capacitorHttpRequestMock,
-    },
-  };
-});
 
 vi.mock('./lib/github/releases', () => ({
   fetchLatestGithubRelease: fetchLatestGithubReleaseMock,
@@ -144,7 +123,6 @@ vi.mock('./lib/reader/session', () => ({
   },
 }));
 
-import { Network } from '@capacitor/network';
 import App from './App.svelte';
 
 function ensureElementAnimate(): void {
@@ -459,155 +437,5 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     });
     flushSync();
     expect(target.querySelector('.app-ambient')).not.toBeNull();
-  });
-
-  it('ignores duplicate online networkStatusChange events and aborts cover transfers on disconnect', async () => {
-    const captured: {
-      networkListener: ((status: { connected: boolean; connectionType: string }) => void) | null;
-      coverSignal: AbortSignal | undefined;
-    } = {
-      networkListener: null,
-      coverSignal: undefined,
-    };
-    vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
-    vi.mocked(Network.addListener).mockImplementation(async (event, cb) => {
-      if (event === 'networkStatusChange') {
-        captured.networkListener = cb as NonNullable<typeof captured.networkListener>;
-      }
-      return { remove: async () => {} };
-    });
-
-    let libraryFetches = 0;
-    const fetchSpy = vi
-      .spyOn(globalThis, 'fetch')
-      .mockImplementation(async (input, init?: RequestInit) => {
-        const url = String(input);
-        if (url.includes('/api/Series/v2')) {
-          libraryFetches += 1;
-        }
-        if (url.includes('/api/Image/series-cover')) {
-          captured.coverSignal = init?.signal ?? undefined;
-          return new Promise<Response>(() => {});
-        }
-        return new Response(JSON.stringify([]), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      });
-
-    try {
-      mounted = mount(App, { target });
-
-      await vi.waitFor(() => {
-        expect(captured.networkListener).not.toBeNull();
-        expect(libraryFetches).toBe(1);
-        expect(captured.coverSignal).toBeDefined();
-      });
-
-      // Wi-Fi -> Cellular handoff while already online should not trigger another catalog refresh
-      captured.networkListener?.({ connected: true, connectionType: 'cellular' });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(libraryFetches).toBe(1);
-
-      // Going offline should abort any active cover request
-      vi.mocked(Network.getStatus).mockResolvedValue({ connected: false, connectionType: 'none' });
-      captured.networkListener?.({ connected: false, connectionType: 'none' });
-      expect(captured.coverSignal?.aborted).toBe(true);
-
-      // Reconnecting from offline should refresh again
-      vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
-      captured.networkListener?.({ connected: true, connectionType: 'wifi' });
-      await vi.waitFor(() => {
-        expect(libraryFetches).toBe(2);
-      });
-    } finally {
-      fetchSpy.mockRestore();
-    }
-  });
-
-  it('waits for native connectivity to settle before refreshing so Android Wi-Fi-to-cellular teardown does not leak requests', async () => {
-    vi.useFakeTimers();
-    const captured: {
-      networkListener: ((status: { connected: boolean; connectionType: string }) => void) | null;
-    } = {
-      networkListener: null,
-    };
-    capacitorRuntime.native = true;
-    vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
-    vi.mocked(Network.addListener).mockImplementation(async (event, cb) => {
-      if (event === 'networkStatusChange') {
-        captured.networkListener = cb as NonNullable<typeof captured.networkListener>;
-      }
-      return { remove: async () => {} };
-    });
-
-    let libraryFetches = 0;
-    capacitorHttpRequestMock.mockImplementation(async (options: { url: string }) => {
-      if (options.url.includes('/api/Series/v2')) {
-        libraryFetches += 1;
-      }
-      return {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-        url: options.url,
-        data: [],
-      };
-    });
-
-    try {
-      mounted = mount(App, { target });
-
-      await vi.waitFor(() => {
-        expect(captured.networkListener).not.toBeNull();
-        expect(libraryFetches).toBe(1);
-      });
-
-      // Simulate `adb shell svc wifi disable`:
-      // 1. NetworkPlugin.java onLost(wifi) emits { connected: false, connectionType: 'none' }
-      // 2. ConnectivityService promotes cellular -> { connected: true, connectionType: 'cellular' }
-      vi.mocked(Network.getStatus).mockResolvedValue({
-        connected: true,
-        connectionType: 'cellular',
-      });
-      captured.networkListener?.({ connected: false, connectionType: 'none' });
-      await vi.advanceTimersByTimeAsync(10);
-      captured.networkListener?.({ connected: true, connectionType: 'cellular' });
-
-      // 3. `adb shell svc data disable` runs (~500ms later, before 1500ms settle window expires)
-      await vi.advanceTimersByTimeAsync(500);
-      expect(libraryFetches).toBe(1);
-
-      vi.mocked(Network.getStatus).mockResolvedValue({ connected: false, connectionType: 'none' });
-      captured.networkListener?.({ connected: false, connectionType: 'none' });
-
-      // Even well past the settle window while offline, zero background requests are sent
-      await vi.advanceTimersByTimeAsync(3_000);
-      expect(libraryFetches).toBe(1);
-
-      // Genuine reconnect (`svc wifi enable`) refreshes once connectivity stays up past settle window
-      vi.mocked(Network.getStatus).mockResolvedValue({ connected: true, connectionType: 'wifi' });
-      captured.networkListener?.({ connected: true, connectionType: 'wifi' });
-      await vi.advanceTimersByTimeAsync(1_400);
-      expect(libraryFetches).toBe(1);
-
-      await vi.advanceTimersByTimeAsync(200);
-      await vi.waitFor(() => {
-        expect(libraryFetches).toBe(2);
-      });
-
-      // Reverse Android handoff order: cellular already active before onLost(wifi) emits connected=false
-      vi.mocked(Network.getStatus).mockResolvedValue({
-        connected: true,
-        connectionType: 'cellular',
-      });
-      captured.networkListener?.({ connected: false, connectionType: 'none' });
-      await vi.advanceTimersByTimeAsync(1_600);
-      await vi.waitFor(() => {
-        expect(libraryFetches).toBe(3);
-      });
-    } finally {
-      capacitorRuntime.native = false;
-      vi.useRealTimers();
-    }
   });
 });
