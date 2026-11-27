@@ -21,8 +21,10 @@ const mocks = vi.hoisted(() => {
   };
   const sqlite = {
     checkConnectionsConsistency: vi.fn(async () => ({ result: true })),
+    closeConnection: vi.fn(async () => undefined),
     createConnection: vi.fn(async () => db),
     isConnection: vi.fn(async () => ({ result: false })),
+    retrieveConnection: vi.fn(async () => db),
   };
   return {
     db,

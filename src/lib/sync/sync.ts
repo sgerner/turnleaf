@@ -19,6 +19,12 @@ export function flushProgress(client: KavitaClient, serverId: string): Promise<v
   return current;
 }
 
+function formatSyncError(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === 'string' && error.trim()) return error;
+  return 'Sync failed';
+}
+
 async function run(client: KavitaClient, serverId: string): Promise<void> {
   const failures: unknown[] = [];
   const attempted = new Map<string, PendingSyncItem>();
@@ -34,12 +40,11 @@ async function run(client: KavitaClient, serverId: string): Promise<void> {
         await client.saveProgress(JSON.parse(item.payload) as KavitaProgress);
         await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
       } catch (error) {
-        await markSyncFailure(
-          item.bookId,
-          error instanceof Error ? error.message : 'Sync failed',
-          item.revision,
-          item.updatedAt,
-        );
+        try {
+          await markSyncFailure(item.bookId, formatSyncError(error), item.revision, item.updatedAt);
+        } catch (markError) {
+          failures.push(markError);
+        }
         failures.push(error);
       }
     }

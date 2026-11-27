@@ -1,55 +1,41 @@
 // @vitest-environment node
 
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import type { SQLInputValue } from 'node:sqlite';
-import type { capTask } from '@capacitor-community/sqlite';
+import { writeFileSync } from 'node:fs';
+import { SQLiteConnection, SQLiteDBConnection } from '@capacitor-community/sqlite';
+import type * as CapacitorSQLiteModule from '@capacitor-community/sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { migrations } from './schema';
+import type { SQLiteTestBridge } from './sqlite-test-bridge';
 
-const native = vi.hoisted(() => ({
-  databasePath: '',
-  database: null as DatabaseSync | null,
-  isOpen: false,
-  failTransactionAt: null as number | null,
-  onTransactionTask: null as ((index: number) => void | Promise<void>) | null,
-  createAdapter: null as (() => unknown) | null,
+const hoisted = vi.hoisted(() => ({
+  bridge: null as SQLiteTestBridge | null,
 }));
 
 vi.mock('@capacitor/core', () => ({
   Capacitor: {
     isNativePlatform: () => true,
   },
+  registerPlugin: () => ({}),
 }));
 
-vi.mock('@capacitor-community/sqlite', () => ({
-  CapacitorSQLite: {
-    deleteDatabase: async () => {
-      if (native.database) native.database.close();
-      native.database = null;
-      native.isOpen = false;
-      rmSync(native.databasePath, { force: true });
-    },
-  },
-  SQLiteConnection: class {
-    async checkConnectionsConsistency(): Promise<{ result: boolean }> {
-      return { result: true };
-    }
+vi.mock('@capacitor-community/sqlite', async (importOriginal) => {
+  const actual = await importOriginal<typeof CapacitorSQLiteModule>();
+  const { createSQLiteTestBridge } = await import('./sqlite-test-bridge');
+  hoisted.bridge ??= createSQLiteTestBridge('turnleaf-r2-');
+  return {
+    ...actual,
+    CapacitorSQLite: hoisted.bridge.plugin as unknown as typeof actual.CapacitorSQLite,
+  };
+});
 
-    async isConnection(): Promise<{ result: boolean }> {
-      return { result: native.isOpen };
-    }
+import * as database from './database';
 
-    async retrieveConnection(): Promise<unknown> {
-      return native.createAdapter?.();
-    }
-
-    async createConnection(): Promise<unknown> {
-      return native.createAdapter?.();
-    }
-  },
-}));
+function getBridge(): SQLiteTestBridge {
+  if (!hoisted.bridge) {
+    throw new Error('SQLite test bridge was not initialized');
+  }
+  return hoisted.bridge;
+}
 
 const server = {
   id: 'server',
@@ -81,119 +67,77 @@ const book = {
   fileSize: null,
 };
 
-function createAdapter() {
-  return {
-    async open(): Promise<void> {
-      if (!native.database) native.database = new DatabaseSync(native.databasePath);
-      native.isOpen = true;
-    },
-    async close(): Promise<void> {
-      if (native.database) native.database.close();
-      native.database = null;
-      native.isOpen = false;
-    },
-    async getVersion(): Promise<{ version: number }> {
-      const row = native.database?.prepare('PRAGMA user_version').get() as
-        { user_version?: number } | undefined;
-      return { version: Number(row?.user_version ?? 0) };
-    },
-    async execute(statement: string): Promise<{ changes: { changes: number } }> {
-      native.database?.exec(statement);
-      return { changes: { changes: 0 } };
-    },
-    async run(
-      statement: string,
-      values: unknown[] = [],
-    ): Promise<{ changes: { changes: number } }> {
-      const result = native.database?.prepare(statement).run(...(values as SQLInputValue[]));
-      return { changes: { changes: Number(result?.changes ?? 0) } };
-    },
-    async query(
-      statement: string,
-      values: unknown[] = [],
-    ): Promise<{ values: Record<string, unknown>[] }> {
-      const rows = native.database?.prepare(statement).all(...(values as SQLInputValue[])) as
-        Record<string, unknown>[] | undefined;
-      return { values: rows ?? [] };
-    },
-    async executeTransaction(tasks: capTask[]): Promise<{ changes: { changes: number } }> {
-      const database = native.database;
-      if (!database) throw new Error('database is not open');
-      const failAt = native.failTransactionAt;
-      native.failTransactionAt = null;
-      database.exec('BEGIN');
-      await Promise.resolve();
-      try {
-        for (const [index, task] of tasks.entries()) {
-          if (index === failAt) throw new Error(`injected transaction failure at ${index}`);
-          if (task.values && task.values.length > 0) {
-            database.prepare(task.statement).run(...(task.values as SQLInputValue[]));
-          } else {
-            database.exec(task.statement);
-          }
-          await Promise.resolve();
-          await native.onTransactionTask?.(index);
-        }
-        await Promise.resolve();
-        database.exec('COMMIT');
-        return { changes: { changes: tasks.length } };
-      } catch (error) {
-        await Promise.resolve();
-        database.exec('ROLLBACK');
-        throw error;
-      }
-    },
-  };
+async function reopenDatabase() {
+  const conn = await database.openDatabase();
+  expect(conn).toBeInstanceOf(SQLiteDBConnection);
+  await conn.close();
+  return database;
 }
 
-native.createAdapter = createAdapter;
-
-async function importDatabase() {
-  vi.resetModules();
-  return import('./database');
-}
-
-async function reopenDatabase(database: Awaited<ReturnType<typeof importDatabase>>) {
-  const connection = await database.openDatabase();
-  await connection.close();
-  return importDatabase();
-}
-
-async function seedDatabase(database: Awaited<ReturnType<typeof importDatabase>>) {
+async function seedDatabase() {
   await database.saveServer(server);
   await database.reconcileBooks(server.id, [book]);
   await database.saveLocalProgress(book, 'old-cfi', '/old', 0.25);
 }
 
 describe('native progress transactions against SQLite', () => {
-  let directory = '';
-
   beforeEach(() => {
-    directory = mkdtempSync(join(tmpdir(), 'turnleaf-r2-'));
-    native.databasePath = join(directory, 'turnleaf.sqlite');
-    native.database = null;
-    native.isOpen = false;
-    native.failTransactionAt = null;
-    native.onTransactionTask = null;
+    getBridge().useNewDirectory('turnleaf-r2-');
   });
 
-  afterEach(() => {
-    if (native.database) native.database.close();
-    native.database = null;
-    native.isOpen = false;
-    native.failTransactionAt = null;
-    native.onTransactionTask = null;
-    rmSync(directory, { recursive: true, force: true });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    getBridge().clearFaults();
+    await database.resetLocalDatabase().catch(() => undefined);
+    getBridge().cleanup();
+  });
+
+  it('reuses a single SQLiteConnection, retrieves closed connections on reopen, and cleans up on reset', async () => {
+    const bridge = getBridge();
+    const consistencySpy = vi.spyOn(SQLiteConnection.prototype, 'checkConnectionsConsistency');
+    const createSpy = vi.spyOn(SQLiteConnection.prototype, 'createConnection');
+    const retrieveSpy = vi.spyOn(SQLiteConnection.prototype, 'retrieveConnection');
+    const closeConnectionSpy = vi.spyOn(SQLiteConnection.prototype, 'closeConnection');
+
+    const first = await database.openDatabase();
+    expect(first).toBeInstanceOf(SQLiteDBConnection);
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(retrieveSpy).toHaveBeenCalledTimes(0);
+    expect(bridge.isNativeHandleOpen('turnleaf')).toBe(true);
+
+    await first.close();
+    expect(bridge.hasNativeConnection('turnleaf')).toBe(true);
+    expect(bridge.isNativeHandleOpen('turnleaf')).toBe(false);
+
+    const second = await database.openDatabase();
+    expect(second).toBe(first);
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(retrieveSpy).toHaveBeenCalledTimes(1);
+    expect(bridge.isNativeHandleOpen('turnleaf')).toBe(true);
+
+    await database.resetLocalDatabase();
+    expect(closeConnectionSpy).toHaveBeenCalledWith('turnleaf', false);
+    expect(bridge.hasNativeConnection('turnleaf')).toBe(false);
+
+    const third = await database.openDatabase();
+    expect(third).toBeInstanceOf(SQLiteDBConnection);
+    expect(third).not.toBe(first);
+    expect(createSpy).toHaveBeenCalledTimes(2);
+    expect(new Set(consistencySpy.mock.instances).size).toBe(1);
+
+    await database.resetLocalDatabase();
+    writeFileSync(bridge.databasePath('turnleaf'), 'seed');
+    await database.resetLocalDatabase();
+    expect(bridge.hasNativeConnection('turnleaf')).toBe(false);
   });
 
   it('persists a remote-only position across reopen without scheduling an upload', async () => {
-    const database = await importDatabase();
     await database.saveServer(server);
     await database.reconcileBooks(server.id, [book]);
     const remote = { ...book, pageNum: 41, bookScrollId: '/remote' };
 
     expect(await database.saveRemoteProgress(book, remote, null)).toBe(true);
-    const reopened = await reopenDatabase(database);
+    const reopened = await reopenDatabase();
     const saved = await reopened.getReadingState(book.id);
     expect(saved).toMatchObject({ xpath: '/remote', percentage: 0.41, pendingSync: false });
     expect((await reopened.getBooks(server.id))[0]?.pagesRead).toBe(41);
@@ -209,8 +153,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('updates server_config in place without cascading deletes until removeServer runs', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     await database.markDownloaded(book.id, 'books/server-1-10.epub', 4096);
 
     const baselineBook = (await database.getBooks(server.id))[0];
@@ -234,7 +177,7 @@ describe('native progress transactions against SQLite', () => {
     };
     await database.saveServer(updatedServer);
 
-    const reopened = await reopenDatabase(database);
+    const reopened = await reopenDatabase();
     expect(await reopened.getServer()).toEqual(updatedServer);
     expect(await reopened.getBooks(server.id)).toEqual([baselineBook]);
     expect(await reopened.getReadingState(book.id)).toEqual(baselineReading);
@@ -253,37 +196,41 @@ describe('native progress transactions against SQLite', () => {
     expect(await reopened.getBooks(server.id)).toEqual([]);
     expect(await reopened.getReadingState(book.id)).toBeNull();
     expect(await reopened.getPendingSync(server.id)).toEqual([]);
-    expect(
-      native.database
-        ?.prepare(
-          `SELECT
-            (SELECT COUNT(*) FROM books) AS books_count,
-            (SELECT COUNT(*) FROM reading_state) AS reading_state_count,
-            (SELECT COUNT(*) FROM sync_queue) AS sync_queue_count`,
-        )
-        .get(),
-    ).toEqual({
-      books_count: 0,
-      reading_state_count: 0,
-      sync_queue_count: 0,
-    });
+    const raw = getBridge().openDirect('turnleaf');
+    try {
+      expect(
+        raw
+          .prepare(
+            `SELECT
+              (SELECT COUNT(*) FROM books) AS books_count,
+              (SELECT COUNT(*) FROM reading_state) AS reading_state_count,
+              (SELECT COUNT(*) FROM sync_queue) AS sync_queue_count`,
+          )
+          .get(),
+      ).toEqual({
+        books_count: 0,
+        reading_state_count: 0,
+        sync_queue_count: 0,
+      });
+    } finally {
+      raw.close();
+    }
   });
 
   it.each([0, 1, 2])(
     'rolls back every progress write when task %i fails and preserves the prior retryable state after reopen',
     async (failAt) => {
-      const database = await importDatabase();
-      await seedDatabase(database);
+      await seedDatabase();
       const baselineReading = await database.getReadingState(book.id);
       const baselineQueue = await database.getPendingSync(server.id);
       const baselineBook = (await database.getBooks(server.id))[0];
 
-      native.failTransactionAt = failAt;
-      await expect(database.saveLocalProgress(book, 'new-cfi', '/new', 0.8)).rejects.toThrow(
+      getBridge().failTransactionAt(failAt);
+      await expect(database.saveLocalProgress(book, 'new-cfi', '/new', 0.8)).rejects.toBe(
         `injected transaction failure at ${failAt}`,
       );
 
-      const reopened = await reopenDatabase(database);
+      const reopened = await reopenDatabase();
       expect(await reopened.getReadingState(book.id)).toEqual(baselineReading);
       expect(await reopened.getPendingSync(server.id)).toEqual(baselineQueue);
       expect((await reopened.getBooks(server.id))[0]).toEqual(baselineBook);
@@ -291,31 +238,29 @@ describe('native progress transactions against SQLite', () => {
   );
 
   it('rolls back a failed completion transaction without losing its retryable queue row', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const baselineReading = await database.getReadingState(book.id);
     const baselineQueue = await database.getPendingSync(server.id);
     const baselineBook = (await database.getBooks(server.id))[0];
 
-    native.failTransactionAt = 2;
-    await expect(database.markBookCompleted(book)).rejects.toThrow(
+    getBridge().failTransactionAt(2);
+    await expect(database.markBookCompleted(book)).rejects.toBe(
       'injected transaction failure at 2',
     );
 
-    const reopened = await reopenDatabase(database);
+    const reopened = await reopenDatabase();
     expect(await reopened.getReadingState(book.id)).toEqual(baselineReading);
     expect(await reopened.getPendingSync(server.id)).toEqual(baselineQueue);
     expect((await reopened.getBooks(server.id))[0]).toEqual(baselineBook);
   });
 
   it('rolls back a failed acknowledgement so the queue can be retried after reopen', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const pending = (await database.getPendingSync(server.id))[0];
     const before = await database.getReadingState(book.id);
     expect(pending).toBeDefined();
 
-    native.failTransactionAt = 1;
+    getBridge().failTransactionAt(1);
     await expect(
       database.confirmSync(
         book.id,
@@ -323,9 +268,9 @@ describe('native progress transactions against SQLite', () => {
         pending!.revision,
         pending!.updatedAt,
       ),
-    ).rejects.toThrow('injected transaction failure at 1');
+    ).rejects.toBe('injected transaction failure at 1');
 
-    const reopened = await reopenDatabase(database);
+    const reopened = await reopenDatabase();
     expect(await reopened.getReadingState(book.id)).toEqual(before);
     expect(await reopened.getPendingSync(server.id)).toEqual([pending]);
 
@@ -335,7 +280,7 @@ describe('native progress transactions against SQLite', () => {
       pending!.revision,
       pending!.updatedAt,
     );
-    const afterRetry = await reopenDatabase(reopened);
+    const afterRetry = await reopenDatabase();
     expect(await afterRetry.getPendingSync(server.id)).toEqual([]);
     expect(await afterRetry.getReadingState(book.id)).toMatchObject({
       pendingSync: false,
@@ -345,8 +290,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('keeps pending SQLite progress ahead of a known remote snapshot', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     await database.saveLocalProgress(book, 'local-cfi', '/local', 0.4);
     const localProgress = (await database.getBooks(server.id))[0];
     expect(localProgress).toBeDefined();
@@ -370,8 +314,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('keeps progress acknowledged while an older catalog snapshot was in flight', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     await database.saveLocalProgress(book, 'local-cfi', '/local', 0.4);
     const pending = (await database.getPendingSync(server.id))[0]!;
     const startedAt = new Date(Date.parse(pending.updatedAt) + 1000).toISOString();
@@ -391,7 +334,6 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('filters SQLite sync work by its owning server', async () => {
-    const database = await importDatabase();
     const otherServer = { ...server, id: 'other', baseUrl: 'https://other.example.com' };
     const otherBook = { ...book, id: 'other:1:10', serverId: otherServer.id };
     await database.saveServer(server);
@@ -410,7 +352,6 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('routes queued SQLite progress through refreshed book IDs', async () => {
-    const database = await importDatabase();
     await database.saveServer(server);
     await database.reconcileBooks(server.id, [book]);
     await database.saveLocalProgress(book, 'local-cfi', '/local', 0.4);
@@ -434,8 +375,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('clears native retry errors when a new local revision replaces the failed payload', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const failed = (await database.getPendingSync(server.id))[0];
     expect(failed).toBeDefined();
     await database.markSyncFailure(book.id, 'expired key', failed!.revision, failed!.updatedAt);
@@ -458,8 +398,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('adopts a selected server location and clears only the displayed SQLite revision', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const initial = await database.getReadingState(book.id);
     expect(initial?.syncRevision).toBe(1);
     const remote = {
@@ -509,8 +448,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('keeps progress for removed books locally and resumes uploads when they return', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     await database.reconcileBooks(server.id, []);
     await database.saveLocalProgress(book, 'offline-cfi', '/offline', 0.5);
 
@@ -523,13 +461,12 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('marks and clears SQLite download metadata across reopen without touching other books', async () => {
-    const database = await importDatabase();
     const sibling = { ...book, id: 'server:1:11', chapterId: 11, title: 'Sibling' };
     await database.saveServer(server);
     await database.reconcileBooks(server.id, [book, sibling]);
 
     await database.markDownloaded(book.id, 'books/server-1-10.epub', 4096);
-    const afterMark = await reopenDatabase(database);
+    const afterMark = await reopenDatabase();
     expect(await afterMark.getBooks(server.id)).toEqual([
       expect.objectContaining({
         id: book.id,
@@ -546,7 +483,7 @@ describe('native progress transactions against SQLite', () => {
     ]);
 
     await afterMark.removeDownload(book.id);
-    const afterRemove = await reopenDatabase(afterMark);
+    const afterRemove = await reopenDatabase();
     expect(await afterRemove.getBooks(server.id)).toEqual([
       expect.objectContaining({
         id: book.id,
@@ -561,18 +498,22 @@ describe('native progress transactions against SQLite', () => {
         fileSize: null,
       }),
     ]);
-    const rawRow = native.database
-      ?.prepare('SELECT download_path, download_status, file_size FROM books WHERE id=?')
-      .get(book.id);
-    expect(rawRow).toEqual({
-      download_path: null,
-      download_status: 'none',
-      file_size: null,
-    });
+    const raw = getBridge().openDirect('turnleaf');
+    try {
+      const rawRow = raw
+        .prepare('SELECT download_path, download_status, file_size FROM books WHERE id=?')
+        .get(book.id);
+      expect(rawRow).toEqual({
+        download_path: null,
+        download_status: 'none',
+        file_size: null,
+      });
+    } finally {
+      raw.close();
+    }
   });
 
   it('normalizes zero-page remote progress to zero percent while storing raw server_page_num', async () => {
-    const database = await importDatabase();
     const zeroPageBook = { ...book, pages: 0 };
     await database.saveServer(server);
     await database.reconcileBooks(server.id, [zeroPageBook]);
@@ -594,109 +535,351 @@ describe('native progress transactions against SQLite', () => {
       pendingSync: false,
     });
     expect((await database.getBooks(server.id))[0]?.pagesRead).toBe(0);
-    expect(
-      native.database
-        ?.prepare('SELECT percentage, server_page_num FROM reading_state WHERE book_id=?')
-        .get(zeroPageBook.id),
-    ).toEqual({
-      percentage: 0,
-      server_page_num: 17,
-    });
+    const raw = getBridge().openDirect('turnleaf');
+    try {
+      expect(
+        raw
+          .prepare('SELECT percentage, server_page_num FROM reading_state WHERE book_id=?')
+          .get(zeroPageBook.id),
+      ).toEqual({
+        percentage: 0,
+        server_page_num: 17,
+      });
+    } finally {
+      raw.close();
+    }
   });
 
-  it('seeds the persistent progress revision when upgrading a pending version-6 queue', async () => {
+  it('upgrades a populated version-1 database sequentially through version 7, preserving getBooks, syncRevision, and cascades', async () => {
     const updatedAt = '2026-01-01T00:00:00.000Z';
-    native.database = new DatabaseSync(native.databasePath);
-    native.database.exec(`
-      CREATE TABLE books (
-        id TEXT PRIMARY KEY NOT NULL,
-        server_id TEXT NOT NULL,
-        library_id INTEGER NOT NULL DEFAULT 0,
-        series_id INTEGER NOT NULL DEFAULT 0,
-        volume_id INTEGER NOT NULL DEFAULT 0,
-        chapter_id INTEGER NOT NULL DEFAULT 0,
-        pages_read INTEGER NOT NULL DEFAULT 0,
-        last_read_at TEXT,
-        remote_available INTEGER NOT NULL DEFAULT 1
-      );
-      CREATE TABLE reading_state (
-        book_id TEXT PRIMARY KEY NOT NULL,
-        cfi TEXT NOT NULL,
-        kavita_xpath TEXT,
-        percentage REAL NOT NULL,
-        local_updated_at TEXT NOT NULL,
-        synced_local_updated_at TEXT,
-        server_page_num INTEGER,
-        server_xpath TEXT,
-        server_updated_at TEXT,
-        pending_sync INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE sync_queue (
-        book_id TEXT PRIMARY KEY NOT NULL,
-        payload_json TEXT NOT NULL,
-        attempt_count INTEGER NOT NULL DEFAULT 0,
-        last_attempt_at TEXT,
-        last_error TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        revision INTEGER NOT NULL DEFAULT 0
-      );
-      INSERT INTO books(id,server_id,library_id,series_id,volume_id,chapter_id,pages_read,last_read_at)
-        VALUES ('server:1:10','server',1,1,10,10,25,'${updatedAt}');
-      INSERT INTO reading_state(
-        book_id,cfi,kavita_xpath,percentage,local_updated_at,pending_sync
-      ) VALUES ('server:1:10','legacy-cfi','/legacy',0.25,'${updatedAt}',1);
-      INSERT INTO sync_queue(
-        book_id,payload_json,created_at,updated_at,revision
-      ) VALUES ('server:1:10','{"pageNum":25}','${updatedAt}','${updatedAt}',7);
-      PRAGMA user_version = 6;
-    `);
+    const syncedBookId = 'server:1:11';
+    const otherServerId = 'legacy-other';
+    const otherBookId = 'legacy-other:2:20';
 
-    const database = await importDatabase();
-    const legacy = await database.getReadingState(book.id);
-    expect(legacy?.syncRevision).toBe(7);
+    const raw = getBridge().openDirect('turnleaf');
+    try {
+      const v1 = migrations.find((entry) => entry.version === 1)!;
+      raw.exec(v1.statements);
+      raw.exec('PRAGMA user_version = 1;');
 
-    await database.saveLocalProgress(book, 'next-cfi', '/next', 0.5);
+      raw
+        .prepare(
+          `INSERT INTO server_config
+            (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          server.id,
+          server.displayName,
+          server.baseUrl,
+          server.credentialRef,
+          '0.8.0',
+          updatedAt,
+        );
+      raw
+        .prepare(
+          `INSERT INTO server_config
+            (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          otherServerId,
+          'Other server',
+          'https://other.example.com',
+          'other-cred',
+          null,
+          updatedAt,
+        );
 
-    expect(await database.getPendingSync(server.id)).toMatchObject([{ revision: 8 }]);
+      const insertV1Book = raw.prepare(
+        `INSERT INTO books
+          (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+           description_html, cover_path, format, metadata_refreshed_at, download_path,
+           download_status, file_size)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insertV1Book.run(
+        book.id,
+        server.id,
+        1,
+        1,
+        10,
+        10,
+        'Alpha Book',
+        'Jane Roe',
+        'Series A',
+        '<p>Alpha summary</p>',
+        null,
+        'epub',
+        updatedAt,
+        'books/alpha.epub',
+        'available',
+        4096,
+      );
+      insertV1Book.run(
+        syncedBookId,
+        server.id,
+        1,
+        2,
+        11,
+        11,
+        'Beta Book',
+        null,
+        null,
+        null,
+        null,
+        'epub',
+        updatedAt,
+        null,
+        'none',
+        null,
+      );
+      insertV1Book.run(
+        otherBookId,
+        otherServerId,
+        2,
+        3,
+        20,
+        20,
+        'Other Server Book',
+        null,
+        null,
+        null,
+        null,
+        'epub',
+        updatedAt,
+        null,
+        'none',
+        null,
+      );
+
+      const insertV1Reading = raw.prepare(
+        `INSERT INTO reading_state
+          (book_id, cfi, kavita_xpath, percentage, local_updated_at, synced_local_updated_at,
+           server_updated_at, pending_sync)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      insertV1Reading.run(book.id, 'legacy-cfi', '/legacy', 0.25, updatedAt, null, null, 1);
+      insertV1Reading.run(
+        syncedBookId,
+        'synced-cfi',
+        '/synced',
+        0.5,
+        updatedAt,
+        updatedAt,
+        updatedAt,
+        0,
+      );
+      insertV1Reading.run(otherBookId, 'other-cfi', '/other', 0.1, updatedAt, null, null, 1);
+
+      const insertV1Queue = raw.prepare(
+        `INSERT INTO sync_queue (book_id, payload_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      );
+      insertV1Queue.run(book.id, '{"pageNum":25}', updatedAt, updatedAt);
+      insertV1Queue.run(otherBookId, '{"pageNum":10}', updatedAt, updatedAt);
+
+      const latestVersion = migrations.at(-1)!.version;
+      for (const migration of migrations) {
+        if (migration.version <= 1 || migration.version >= latestVersion) continue;
+        raw.exec(migration.statements);
+        raw.exec(`PRAGMA user_version = ${migration.version};`);
+        if (migration.version === 2) {
+          raw
+            .prepare(
+              'UPDATE books SET pages = 100, pages_read = 25, created_at = ?, last_read_at = ? WHERE id = ?',
+            )
+            .run(updatedAt, updatedAt, book.id);
+        }
+        if (migration.version === 3) {
+          raw
+            .prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)')
+            .run('uiTheme', 'paper', updatedAt);
+        }
+        if (migration.version === 6) {
+          raw.prepare('UPDATE sync_queue SET revision = 7 WHERE book_id = ?').run(book.id);
+          raw.prepare('UPDATE sync_queue SET revision = 3 WHERE book_id = ?').run(otherBookId);
+        }
+      }
+    } finally {
+      raw.close();
+    }
+
+    const latestVersion = migrations.at(-1)!.version;
+    const conn = await database.openDatabase();
+    expect((await conn.getVersion()).version).toBe(latestVersion);
+
+    const migratedBooks = await database.getBooks(server.id);
+    expect(migratedBooks).toMatchObject([
+      {
+        id: book.id,
+        serverId: server.id,
+        libraryId: 1,
+        seriesId: 1,
+        volumeId: 10,
+        chapterId: 10,
+        title: 'Alpha Book',
+        author: 'Jane Roe',
+        series: 'Series A',
+        descriptionHtml: '<p>Alpha summary</p>',
+        format: 'epub',
+        pages: 100,
+        pagesRead: 25,
+        createdAt: updatedAt,
+        lastReadAt: updatedAt,
+        downloadPath: 'books/alpha.epub',
+        downloadStatus: 'available',
+        fileSize: 4096,
+        remoteAvailable: true,
+      },
+      {
+        id: syncedBookId,
+        serverId: server.id,
+        libraryId: 1,
+        seriesId: 2,
+        volumeId: 11,
+        chapterId: 11,
+        title: 'Beta Book',
+        author: null,
+        series: null,
+        descriptionHtml: null,
+        format: 'epub',
+        pages: 0,
+        pagesRead: 0,
+        createdAt: '',
+        lastReadAt: null,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+        remoteAvailable: true,
+      },
+    ]);
+
+    expect((await database.getReadingState(book.id))?.syncRevision).toBe(7);
+    expect((await database.getReadingState(syncedBookId))?.syncRevision).toBe(0);
+    expect((await database.getPreferences(['uiTheme'])).get('uiTheme')).toBe('paper');
+
+    await database.saveLocalProgress(
+      { ...book, title: 'Alpha Book', pages: 100 },
+      'next-cfi',
+      '/next',
+      0.5,
+    );
+    expect(await database.getPendingSync(server.id)).toMatchObject([
+      { bookId: book.id, revision: 8 },
+    ]);
     expect(await database.getReadingState(book.id)).toMatchObject({
       cfi: 'next-cfi',
       syncRevision: 8,
       pendingSync: true,
     });
+
+    // Updating server_config in place (e.g. API key rotation) must not cascade-delete child rows.
+    await database.saveServer({ ...server, kavitaVersion: '0.8.4' });
+    expect((await database.getServer())?.kavitaVersion).toBe('0.8.4');
+    expect(await database.getBooks(server.id)).toHaveLength(2);
+    expect(await database.getPendingSync(server.id)).toHaveLength(1);
+
+    // Verify ON DELETE CASCADE from server_config -> books -> reading_state / sync_queue.
+    await database.removeServer(otherServerId);
+    expect(await database.getBooks(otherServerId)).toEqual([]);
+    expect(await database.getReadingState(otherBookId)).toBeNull();
+    expect(await database.getPendingSync(otherServerId)).toEqual([]);
+
+    // Verify ON DELETE CASCADE directly from books -> reading_state / sync_queue.
+    await conn.run('DELETE FROM books WHERE id = ?', [book.id]);
+    expect(await database.getReadingState(book.id)).toBeNull();
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+  });
+
+  it('migrates a populated version-1 database directly through openDatabase()', async () => {
+    const updatedAt = '2026-01-01T00:00:00.000Z';
+    const raw = getBridge().openDirect('turnleaf');
+    try {
+      raw.exec(migrations[0]!.statements);
+      raw.exec('PRAGMA user_version = 1;');
+      raw
+        .prepare(
+          `INSERT INTO server_config
+            (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(server.id, server.displayName, server.baseUrl, server.credentialRef, null, updatedAt);
+      raw
+        .prepare(
+          `INSERT INTO books
+            (id, server_id, library_id, series_id, volume_id, chapter_id, title, format, metadata_refreshed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(book.id, server.id, 1, 1, 10, 10, 'Legacy V1 Book', 'epub', updatedAt);
+      raw
+        .prepare(
+          `INSERT INTO reading_state
+            (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync)
+           VALUES (?, ?, ?, ?, ?, 1)`,
+        )
+        .run(book.id, 'v1-cfi', '/v1', 0.3, updatedAt);
+      raw
+        .prepare(
+          `INSERT INTO sync_queue (book_id, payload_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(book.id, '{"pageNum":30}', updatedAt, updatedAt);
+    } finally {
+      raw.close();
+    }
+
+    const conn = await database.openDatabase();
+    expect((await conn.getVersion()).version).toBe(migrations.at(-1)!.version);
+    expect(await database.getBooks(server.id)).toMatchObject([
+      {
+        id: book.id,
+        title: 'Legacy V1 Book',
+        pages: 0,
+        pagesRead: 0,
+        remoteAvailable: true,
+      },
+    ]);
+    expect(await database.getReadingState(book.id)).toMatchObject({
+      cfi: 'v1-cfi',
+      syncRevision: 0,
+      pendingSync: true,
+    });
+
+    await database.saveLocalProgress(book, 'v7-cfi', '/v7', 0.6);
+    expect(await database.getPendingSync(server.id)).toMatchObject([
+      { bookId: book.id, revision: 1 },
+    ]);
   });
 
   it('retries an interrupted migration after reopening the same database file', async () => {
-    const database = await importDatabase();
-    native.failTransactionAt = 1;
-    await expect(database.openDatabase()).rejects.toThrow('injected transaction failure at 1');
+    const retrieveSpy = vi.spyOn(SQLiteConnection.prototype, 'retrieveConnection');
+    getBridge().failTransactionAt(1);
+    await expect(database.openDatabase()).rejects.toBe('injected transaction failure at 1');
+    expect(getBridge().isNativeHandleOpen('turnleaf')).toBe(false);
 
-    if (native.database) native.database.close();
-    native.database = null;
-    native.isOpen = false;
-
-    const reopened = await importDatabase();
-    await expect(reopened.openDatabase()).resolves.toBeDefined();
-    await expect(reopened.saveServer(server)).resolves.toBeUndefined();
+    const conn = await database.openDatabase();
+    expect(conn).toBeInstanceOf(SQLiteDBConnection);
+    expect(retrieveSpy).toHaveBeenCalledWith('turnleaf', false);
+    await expect(database.saveServer(server)).resolves.toBeUndefined();
   });
 
   it('serializes reads behind reconcileBooks so mid-transaction remote_available=0 is hidden', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
 
     const captured: {
       pending?: ReturnType<typeof database.getPendingSync>;
       status?: ReturnType<typeof database.getSyncStatus>;
       books?: ReturnType<typeof database.getBooks>;
     } = {};
-    native.onTransactionTask = async (index) => {
+    getBridge().onTransactionTask(async (index) => {
       if (index !== 0) return;
-      native.onTransactionTask = null;
+      getBridge().onTransactionTask(null);
       captured.pending = database.getPendingSync(server.id);
       captured.status = database.getSyncStatus(server.id);
       captured.books = database.getBooks(server.id);
       await new Promise((resolve) => setTimeout(resolve, 0));
-    };
+    });
 
     await database.reconcileBooks(server.id, [{ ...book, title: 'Refreshed during sync' }]);
 
@@ -709,8 +892,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('hides uncommitted progress rows when saveLocalProgress rolls back mid-transaction', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const baselineReading = await database.getReadingState(book.id);
     const baselineQueue = await database.getPendingSync(server.id);
 
@@ -718,18 +900,18 @@ describe('native progress transactions against SQLite', () => {
       reading?: ReturnType<typeof database.getReadingState>;
       queue?: ReturnType<typeof database.getPendingSync>;
     } = {};
-    native.failTransactionAt = 2;
-    native.onTransactionTask = async (index) => {
+    getBridge().failTransactionAt(2);
+    getBridge().onTransactionTask(async (index) => {
       if (index !== 1) return;
-      native.onTransactionTask = null;
+      getBridge().onTransactionTask(null);
       captured.reading = database.getReadingState(book.id);
       captured.queue = database.getPendingSync(server.id);
       await new Promise((resolve) => setTimeout(resolve, 0));
-    };
+    });
 
     await expect(
       database.saveLocalProgress(book, 'rolled-back-cfi', '/rolled-back', 0.8),
-    ).rejects.toThrow('injected transaction failure at 2');
+    ).rejects.toBe('injected transaction failure at 2');
 
     expect(await captured.reading).toEqual(baselineReading);
     expect(await captured.queue).toEqual(baselineQueue);
@@ -737,21 +919,20 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('prevents torn reads across reading_state and sync_queue during confirmSync', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const pending = (await database.getPendingSync(server.id))[0]!;
 
     const captured: {
       reading?: ReturnType<typeof database.getReadingState>;
       queue?: ReturnType<typeof database.getPendingSync>;
     } = {};
-    native.onTransactionTask = async (index) => {
+    getBridge().onTransactionTask(async (index) => {
       if (index !== 0) return;
-      native.onTransactionTask = null;
+      getBridge().onTransactionTask(null);
       captured.reading = database.getReadingState(book.id);
       captured.queue = database.getPendingSync(server.id);
       await new Promise((resolve) => setTimeout(resolve, 0));
-    };
+    });
 
     await database.confirmSync(
       book.id,
@@ -769,7 +950,6 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('keeps internal reads unqueued in saveRemoteProgress while serializing concurrent reads', async () => {
-    const database = await importDatabase();
     await database.saveServer(server);
     await database.reconcileBooks(server.id, [book]);
     const remote = { ...book, pageNum: 41, bookScrollId: '/remote' };
@@ -778,13 +958,13 @@ describe('native progress transactions against SQLite', () => {
       reading?: ReturnType<typeof database.getReadingState>;
       books?: ReturnType<typeof database.getBooks>;
     } = {};
-    native.onTransactionTask = async (index) => {
+    getBridge().onTransactionTask(async (index) => {
       if (index !== 0) return;
-      native.onTransactionTask = null;
+      getBridge().onTransactionTask(null);
       captured.reading = database.getReadingState(book.id);
       captured.books = database.getBooks(server.id);
       await new Promise((resolve) => setTimeout(resolve, 0));
-    };
+    });
 
     expect(await database.saveRemoteProgress(book, remote, null)).toBe(true);
     expect(await captured.reading).toMatchObject({
@@ -796,8 +976,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('keeps acceptRemoteProgress transaction and verification atomic ahead of queued reads and writes', async () => {
-    const database = await importDatabase();
-    await seedDatabase(database);
+    await seedDatabase();
     const initial = (await database.getReadingState(book.id))!;
     const remote = {
       libraryId: 1,
@@ -815,15 +994,15 @@ describe('native progress transactions against SQLite', () => {
       books?: ReturnType<typeof database.getBooks>;
       queuedLocalSave?: Promise<void>;
     } = {};
-    native.onTransactionTask = async (index) => {
+    getBridge().onTransactionTask(async (index) => {
       if (index !== 0) return;
-      native.onTransactionTask = null;
+      getBridge().onTransactionTask(null);
       captured.reading = database.getReadingState(book.id);
       captured.queue = database.getPendingSync(server.id);
       captured.books = database.getBooks(server.id);
       captured.queuedLocalSave = database.saveLocalProgress(book, 'newer-cfi', '/newer', 0.9);
       await new Promise((resolve) => setTimeout(resolve, 0));
-    };
+    });
 
     expect(
       await database.acceptRemoteProgress(
@@ -851,5 +1030,270 @@ describe('native progress transactions against SQLite', () => {
       cfi: 'newer-cfi',
       pendingSync: true,
     });
+  });
+
+  function stubMockLocalStorage() {
+    const store = new Map<string, string>();
+    const mockStorage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+      clear: () => void store.clear(),
+    };
+    vi.stubGlobal('window', { localStorage: mockStorage });
+    return { store, mockStorage };
+  }
+
+  it('clears the boot theme cache and serializes concurrent openDatabase calls across resetLocalDatabase', async () => {
+    const { store } = stubMockLocalStorage();
+    try {
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+      await seedDatabase();
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'light'],
+        ]),
+      );
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(true);
+
+      const [, reopenedConn] = await Promise.all([
+        database.resetLocalDatabase(),
+        database.openDatabase(),
+      ]);
+
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+      expect(reopenedConn).toBeInstanceOf(SQLiteDBConnection);
+      expect(getBridge().isNativeHandleOpen('turnleaf')).toBe(true);
+      expect(await database.getServer()).toBeNull();
+      expect(await database.getPreferences(['uiTheme', 'uiMode'])).toEqual(new Map());
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('interleaves native progress writes with localStorage.clear(), removeServer, and resetLocalDatabase so no stale row survives and nothing is lost', async () => {
+    const { store, mockStorage } = stubMockLocalStorage();
+    const staleCompletedBook = {
+      ...book,
+      id: 'server:1:11',
+      volumeId: 11,
+      chapterId: 11,
+      title: 'Completed Stale Book',
+    };
+    const staleRemote = { ...book, pageNum: 48, bookScrollId: '/stale-remote' };
+    const keptServer = { ...server, id: 'kept-server', displayName: 'Kept server' };
+    const keptBook = {
+      ...book,
+      id: 'kept-server:1:20',
+      serverId: keptServer.id,
+      volumeId: 20,
+      chapterId: 20,
+      title: 'Kept Book',
+    };
+    const freshServer = {
+      ...server,
+      id: 'fresh-server',
+      displayName: 'Fresh server',
+      lastConnectedAt: '2026-01-03T00:00:00.000Z',
+    };
+    const freshBook = {
+      ...book,
+      id: 'fresh-server:2:30',
+      serverId: freshServer.id,
+      libraryId: 2,
+      seriesId: 3,
+      volumeId: 30,
+      chapterId: 30,
+      title: 'Fresh Post-Reset Book',
+    };
+
+    try {
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+      await database.saveServer(server);
+      await database.saveServer(keptServer);
+      await database.reconcileBooks(server.id, [book, staleCompletedBook]);
+      await database.reconcileBooks(keptServer.id, [keptBook]);
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'light'],
+        ]),
+      );
+
+      // Interleave localStorage.clear() with a single-key native preference update.
+      mockStorage.clear();
+      expect(store.size).toBe(0);
+      await database.setPreference('uiTheme', 'cerberus');
+      expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+        theme: 'cerberus',
+        mode: 'light',
+      });
+
+      // Interleave removeServer with pre-remove, post-remove stale, and sibling-server writes.
+      const [, , keptWrite, lateLocalAfterRemove, lateCompletedAfterRemove, lateRemoteAfterRemove] =
+        await Promise.all([
+          database.saveLocalProgress(book, 'stale-cfi', '/stale', 0.35, 1),
+          database.removeServer(server.id),
+          database.saveLocalProgress(keptBook, 'kept-cfi', '/kept', 0.45, 1),
+          database.saveLocalProgress(book, 'late-after-remove', '/late-remove', 0.7, 1),
+          database.markBookCompleted(staleCompletedBook),
+          database.saveRemoteProgress(book, staleRemote, null),
+          database.markDownloaded(book.id, 'books/orphan.epub', 1024),
+        ]);
+      expect(keptWrite).toBeUndefined();
+      expect(lateLocalAfterRemove).toBeUndefined();
+      expect(lateCompletedAfterRemove).toBeUndefined();
+      expect(lateRemoteAfterRemove).toBe(false);
+      expect(await database.getBooks(server.id)).toEqual([]);
+      expect(await database.getReadingState(book.id)).toBeNull();
+      expect(await database.getReadingState(staleCompletedBook.id)).toBeNull();
+      expect(await database.getPendingSync(server.id)).toEqual([]);
+      expect(await database.getReadingState(keptBook.id)).toMatchObject({
+        cfi: 'kept-cfi',
+        pendingSync: true,
+      });
+
+      // Capture a pre-reset SQLiteDBConnection handle, then fire unawaited writes before and after reset.
+      const staleConn = await database.openDatabase();
+      const preResetWrites = [
+        database.saveServer(server),
+        database.reconcileBooks(server.id, [book, staleCompletedBook]),
+        database.saveLocalProgress(book, 'pre-reset-cfi', '/pre-reset', 0.42, 1),
+        database.markBookCompleted(staleCompletedBook),
+        database.setPreference('uiTheme', 'eink'),
+      ];
+      mockStorage.clear();
+      const resetOp = database.resetLocalDatabase();
+      const lateStaleRemoteAfterReset = database.saveRemoteProgress(book, staleRemote, null);
+      const postResetWrites = [
+        database.saveLocalProgress(book, 'late-post-reset-cfi', '/late-post-reset', 0.9, 1),
+        database.markBookCompleted(staleCompletedBook),
+        lateStaleRemoteAfterReset,
+        database.saveServer(freshServer),
+        database.reconcileBooks(freshServer.id, [freshBook]),
+        database.saveLocalProgress(freshBook, 'post-reset-cfi', '/post-reset', 0.64, 2),
+        database.setPreferences(
+          new Map([
+            ['uiTheme', 'pine'],
+            ['uiMode', 'light'],
+          ]),
+        ),
+      ];
+      await Promise.all([...preResetWrites, resetOp, ...postResetWrites]);
+      expect(await lateStaleRemoteAfterReset).toBe(false);
+
+      // Stale pre-reset SQLiteDBConnection handles must not mutate or close the post-reset database.
+      await expect(staleConn.close()).resolves.toBeUndefined();
+      expect(getBridge().isNativeHandleOpen('turnleaf')).toBe(true);
+      await expect(staleConn.run('DELETE FROM books WHERE id = ?', [freshBook.id])).rejects.toThrow(
+        'resetLocalDatabase',
+      );
+      await expect(
+        database.replaceBooksInTransaction(staleConn, server.id, [book]),
+      ).rejects.toThrow('resetLocalDatabase');
+      await expect(
+        database.reconcileBooksInTransaction(staleConn, server.id, [book]),
+      ).rejects.toThrow('resetLocalDatabase');
+
+      const reopened = await reopenDatabase();
+      expect(await reopened.getServer()).toEqual(freshServer);
+      expect(await reopened.getBooks(server.id)).toEqual([]);
+      expect(await reopened.getBooks(keptServer.id)).toEqual([]);
+      expect(await reopened.getReadingState(book.id)).toBeNull();
+      expect(await reopened.getReadingState(staleCompletedBook.id)).toBeNull();
+      expect(await reopened.getReadingState(keptBook.id)).toBeNull();
+      expect(await reopened.getPendingSync(server.id)).toEqual([]);
+      expect(await reopened.getPendingSync(keptServer.id)).toEqual([]);
+
+      expect(await reopened.getBooks(freshServer.id)).toMatchObject([
+        { id: freshBook.id, pagesRead: 3, remoteAvailable: true },
+      ]);
+      expect(await reopened.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'post-reset-cfi',
+        xpath: '/post-reset',
+        percentage: 0.64,
+        pendingSync: true,
+        syncRevision: 1,
+      });
+      const pending = await reopened.getPendingSync(freshServer.id);
+      expect(pending).toHaveLength(1);
+      expect(JSON.parse(pending[0]!.payload)).toMatchObject({
+        chapterId: freshBook.chapterId,
+        pageNum: 3,
+        bookScrollId: '/post-reset',
+      });
+      expect(await reopened.getPreferences(['uiTheme', 'uiMode'])).toEqual(
+        new Map([
+          ['uiTheme', 'pine'],
+          ['uiMode', 'light'],
+        ]),
+      );
+      expect(JSON.parse(store.get(BOOT_THEME_STORAGE_KEY) ?? '{}')).toMatchObject({
+        theme: 'pine',
+        mode: 'light',
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('fences mid-transaction saveLocalProgress interleaved with localStorage.clear() and resetLocalDatabase', async () => {
+    const { store, mockStorage } = stubMockLocalStorage();
+    const freshServer = { ...server, id: 'after-mid-tx', displayName: 'After Mid-Tx Reset' };
+    const freshBook = {
+      ...book,
+      id: 'after-mid-tx:1:99',
+      serverId: freshServer.id,
+      chapterId: 99,
+      title: 'Saved After Mid-Transaction Reset',
+    };
+
+    try {
+      const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
+      await seedDatabase();
+      await database.setPreferences(
+        new Map([
+          ['uiTheme', 'eink'],
+          ['uiMode', 'dark'],
+        ]),
+      );
+
+      let queuedDuringTx: Promise<unknown> | null = null;
+      getBridge().onTransactionTask(async (index) => {
+        if (index !== 1) return;
+        getBridge().onTransactionTask(null);
+        mockStorage.clear();
+        const resetPromise = database.resetLocalDatabase();
+        const afterReset = Promise.all([
+          database.saveLocalProgress(book, 'late-after-mid-tx', '/late', 0.91, 2),
+          database.saveServer(freshServer),
+          database.reconcileBooks(freshServer.id, [freshBook]),
+          database.saveLocalProgress(freshBook, 'after-cfi', '/after', 0.52, 1),
+        ]);
+        queuedDuringTx = Promise.all([resetPromise, afterReset]);
+      });
+
+      await database.saveLocalProgress(book, 'in-flight-cfi', '/in-flight', 0.88, 2);
+      expect(queuedDuringTx).not.toBeNull();
+      await queuedDuringTx;
+
+      const reopened = await reopenDatabase();
+      expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
+      expect(await reopened.getServer()).toEqual(freshServer);
+      expect(await reopened.getBooks(server.id)).toEqual([]);
+      expect(await reopened.getReadingState(book.id)).toBeNull();
+      expect(await reopened.getPendingSync(server.id)).toEqual([]);
+      expect(await reopened.getReadingState(freshBook.id)).toMatchObject({
+        cfi: 'after-cfi',
+        xpath: '/after',
+        percentage: 0.52,
+        pendingSync: true,
+        syncRevision: 1,
+      });
+      expect(await reopened.getPendingSync(freshServer.id)).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

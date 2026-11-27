@@ -245,6 +245,7 @@
       appearance,
       (next, origin, returnTarget) => {
         if (destroyed) return;
+        if (!toc.length) toc = nextSession.tableOfContents();
         if (location?.cfi !== next.cfi && !hasSelectionDraft()) selectedText = null;
         location = next;
         if (annotationsVisible) refreshVisiblePassages();
@@ -1274,7 +1275,9 @@
       openReaderError(
         cause instanceof Error
           ? cause.message
-          : 'Kavita’s latest reading position could not be opened.',
+          : typeof cause === 'string' && cause.trim()
+            ? cause
+            : 'Kavita’s latest reading position could not be opened.',
         opener,
       );
     }
@@ -1308,7 +1311,11 @@
     } catch (cause) {
       if (showFeedback && !destroyed && session === reader) {
         readerSyncMessage =
-          cause instanceof Error ? cause.message : 'Reading progress could not sync.';
+          cause instanceof Error
+            ? cause.message
+            : typeof cause === 'string' && cause.trim()
+              ? cause
+              : 'Reading progress could not sync.';
         showControls();
       }
     } finally {

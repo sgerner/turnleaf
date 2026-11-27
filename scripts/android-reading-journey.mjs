@@ -26,7 +26,7 @@ const adb = async (...args) =>
     })
   ).stdout.trim();
 
-async function waitFor(label, check) {
+async function waitFor(label, check, describeTimeout) {
   const end = Date.now() + 30_000;
   let lastError;
   do {
@@ -42,7 +42,16 @@ async function waitFor(label, check) {
     }
     await delay(250);
   } while (Date.now() < end);
-  throw new Error(`Timed out waiting for ${label}.`, { cause: lastError });
+  let detail = '';
+  if (describeTimeout) {
+    try {
+      const info = await describeTimeout();
+      if (info !== undefined) detail = ` (${JSON.stringify(info)})`;
+    } catch (diagnosticError) {
+      detail = ` (diagnostic failed: ${String(diagnosticError)})`;
+    }
+  }
+  throw new Error(`Timed out waiting for ${label}${detail}.`, { cause: lastError });
 }
 
 async function connectWebView() {
@@ -205,6 +214,8 @@ export async function startFixture({ crossOriginRedirects = false } = {}) {
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
   const titleName = title;
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
@@ -258,9 +269,225 @@ const renderedCover = `(() => {
   return Boolean(image && image.complete && image.naturalWidth > 0);
 })()`;
 
+const renderedBookCover = (bookId) => `(() => {
+  const card = document.querySelector(${JSON.stringify(`article[data-book-id="${bookId}"]`)});
+  const image = card?.querySelector('img');
+  return Boolean(image && image.complete && image.naturalWidth > 0);
+})()`;
+
+const libraryBookCardSnapshot = (bookId, fallbackTitle = title) => `(() => {
+  const byId = ${bookId ? `document.querySelector(${JSON.stringify(`article[data-book-id="${bookId}"]`)})` : 'null'};
+  const card =
+    byId ??
+    Array.from(document.querySelectorAll('article[data-book-id]')).find(
+      (el) => el.querySelector('h2')?.textContent?.trim() === ${JSON.stringify(fallbackTitle)},
+    );
+  if (!card) return null;
+  const openButton = card.querySelector('[data-book-open]');
+  const progressBar = card.querySelector('[role="progressbar"]');
+  return {
+    bookId: card.getAttribute('data-book-id'),
+    heading: card.querySelector('h2')?.textContent?.trim() ?? null,
+    openDisabled: Boolean(openButton?.disabled),
+    openLabel: openButton?.getAttribute('aria-label') ?? null,
+    progressNow: progressBar?.getAttribute('aria-valuenow') ?? null,
+    progressText: progressBar?.getAttribute('aria-valuetext') ?? null,
+  };
+})()`;
+
+export function expectedBookCardPercent({ pages, pagesRead }) {
+  const totalPages = Number(pages);
+  const readPages = Number(pagesRead);
+  if (!Number.isFinite(totalPages) || totalPages <= 0 || !Number.isFinite(readPages)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, Math.round((readPages / totalPages) * 100)));
+}
+
+export function inspectLibraryBookCard(
+  snapshot,
+  { bookId, title: expectedTitle, expectedPercent },
+) {
+  if (!snapshot || typeof snapshot !== 'object') return false;
+  if (bookId && snapshot.bookId !== bookId) return false;
+  if (snapshot.heading !== expectedTitle || snapshot.openDisabled) return false;
+  if (typeof snapshot.openLabel !== 'string') return false;
+  if (
+    !snapshot.openLabel.startsWith(`Open ${expectedTitle},`) ||
+    !snapshot.openLabel.includes('downloaded for offline reading')
+  ) {
+    return false;
+  }
+  if (expectedPercent > 0) {
+    if (Number(snapshot.progressNow) !== expectedPercent) return false;
+    if (snapshot.progressText !== `${expectedPercent}% complete`) return false;
+    if (
+      snapshot.openLabel.includes('% complete') &&
+      !snapshot.openLabel.includes(`${expectedPercent}% complete`)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return snapshot.progressNow === null && !snapshot.openLabel.includes('% complete');
+}
+
+export function hasQueuedSyncBanner(warningTexts) {
+  return (
+    Array.isArray(warningTexts) &&
+    warningTexts.some(
+      (text) =>
+        typeof text === 'string' && text.includes('1 reading progress update waiting to sync.'),
+    )
+  );
+}
+
+async function captureLibraryDiagnostics(web) {
+  const dom = await web.evaluate(`(() => ({
+    booting: Boolean(document.querySelector('[aria-label="Opening Turnleaf"]')),
+    alerts: Array.from(document.querySelectorAll('[role="alert"], [role="status"], .alert')).map(
+      (el) => el.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+    ),
+    cards: Array.from(document.querySelectorAll('article[data-book-id]')).map((el) => ({
+      bookId: el.getAttribute('data-book-id'),
+      heading: el.querySelector('h2')?.textContent?.trim() ?? null,
+      openLabel: el.querySelector('[data-book-open]')?.getAttribute('aria-label') ?? null,
+      progressNow: el.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow') ?? null,
+    })),
+  }))()`);
+  const books = await web
+    .evaluate(
+      querySqliteRows(
+        'SELECT id, title, pages, pages_read, download_path, remote_available FROM books',
+      ),
+    )
+    .catch((error) => ({ error: String(error) }));
+  const queue = await web
+    .evaluate(querySqliteRows('SELECT book_id, revision, last_error, updated_at FROM sync_queue'))
+    .catch((error) => ({ error: String(error) }));
+  return { dom, books, queue };
+}
+
 const retryDownloadReady = `Array.from(document.querySelectorAll('button')).some(
   button => !button.disabled && button.textContent?.trim() === 'Retry download'
 )`;
+
+const readerSnapshotExpression = `(() => {
+  const shell = document.querySelector('.reader-shell');
+  const viewport = document.querySelector('.reader-viewport');
+  const frame = viewport?.querySelector('iframe');
+  const doc = frame?.contentDocument;
+  if (!shell || !viewport || !frame || !doc) return null;
+  const liveText =
+    shell.querySelector('[aria-live="polite"]')?.textContent?.replace(/\\s+/g, ' ').trim() ?? '';
+  const pageMatch = liveText.match(/,\\s*page\\s+(\\d+)\\s+of\\s+(\\d+),/i);
+  if (!pageMatch) return null;
+  const progressAttr = shell.querySelector('.reader-progress')?.getAttribute('aria-valuenow');
+  const progressNow = progressAttr === null || progressAttr === undefined ? NaN : Number(progressAttr);
+  const headingEl = doc.querySelector('h1');
+  const heading = headingEl?.textContent?.trim() ?? null;
+  if (!heading) return null;
+  const viewportRect = viewport.getBoundingClientRect();
+  const frameRect = frame.getBoundingClientRect();
+  const inViewport = (el) => {
+    const rect = el.getBoundingClientRect();
+    const left = frameRect.left + rect.left;
+    const right = frameRect.left + rect.right;
+    const top = frameRect.top + rect.top;
+    const bottom = frameRect.top + rect.bottom;
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      right > viewportRect.left + 8 &&
+      left < viewportRect.right - 8 &&
+      bottom > viewportRect.top + 8 &&
+      top < viewportRect.bottom - 8
+    );
+  };
+  const headingVisible = headingEl ? inViewport(headingEl) : false;
+  const visibleParagraphs = Array.from(doc.querySelectorAll('p'))
+    .filter((el) => inViewport(el))
+    .map((el) => el.textContent?.replace(/\\s+/g, ' ').trim().slice(0, 32) ?? '')
+    .filter(Boolean);
+  return {
+    heading,
+    headingVisible,
+    liveText,
+    page: Number(pageMatch[1]),
+    pageCount: Number(pageMatch[2]),
+    progressNow,
+    visibleParagraphs,
+  };
+})()`;
+
+const querySqliteRows = (statement) => `(async () => {
+  const txBefore = await Capacitor.Plugins.CapacitorSQLite.isTransactionActive({
+    database: 'turnleaf',
+  });
+  if (txBefore?.result !== false) return null;
+  const res = await Capacitor.Plugins.CapacitorSQLite.query({
+    database: 'turnleaf',
+    statement: ${JSON.stringify(statement)},
+    values: [],
+    readonly: false,
+  });
+  const txAfter = await Capacitor.Plugins.CapacitorSQLite.isTransactionActive({
+    database: 'turnleaf',
+  });
+  return txAfter?.result === false ? (res?.values ?? []) : null;
+})()`;
+
+function isMidChapterTwoSnapshot(snapshot) {
+  if (!snapshot || snapshot.heading !== 'Chapter 2') return false;
+  if (!Number.isFinite(snapshot.page) || !Number.isFinite(snapshot.pageCount)) return false;
+  if (snapshot.pageCount < 3) return false;
+  const minMidPage = snapshot.pageCount >= 4 ? 3 : 2;
+  return (
+    snapshot.page >= minMidPage &&
+    snapshot.page < snapshot.pageCount &&
+    snapshot.headingVisible === false &&
+    Number.isFinite(snapshot.progressNow) &&
+    snapshot.progressNow > 50 &&
+    snapshot.visibleParagraphs.length > 0 &&
+    !snapshot.visibleParagraphs.some((snippet) => snippet.startsWith('Chapter 2, paragraph 1.'))
+  );
+}
+
+async function advanceToMidChapterTwo(web) {
+  let current = await waitFor('settled initial reader page snapshot', async () => {
+    const first = await web.evaluate(`(() => {
+      const rect = document.querySelector('.reader-viewport')?.getBoundingClientRect();
+      const snap = ${readerSnapshotExpression};
+      if (!rect || !snap) return null;
+      return { w: Math.floor(rect.width), h: Math.floor(rect.height), snap };
+    })()`);
+    if (!first || first.w <= 0 || first.h <= 0) return null;
+    await delay(200);
+    const second = await web.evaluate(`(() => {
+      const rect = document.querySelector('.reader-viewport')?.getBoundingClientRect();
+      const snap = ${readerSnapshotExpression};
+      if (!rect || !snap) return null;
+      return { w: Math.floor(rect.width), h: Math.floor(rect.height), snap };
+    })()`);
+    if (!second || second.w !== first.w || second.h !== first.h) return null;
+    if (second.snap.liveText !== first.snap.liveText) return null;
+    return second.snap;
+  });
+  for (let step = 0; step < 20; step += 1) {
+    if (isMidChapterTwoSnapshot(current)) return current;
+    const previousLiveText = current.liveText;
+    await waitFor(`next-page control (step ${step + 1})`, () =>
+      web.evaluate(click('[aria-label="Next page"]')),
+    );
+    current = await waitFor(`page relocation (step ${step + 1})`, async () => {
+      const next = await web.evaluate(readerSnapshotExpression);
+      return next && next.liveText !== previousLiveText ? next : null;
+    });
+  }
+  throw new Error(
+    `Did not reach a mid-chapter page in Chapter 2 after 20 page turns (last=${JSON.stringify(current)}).`,
+  );
+}
 
 let receivedSignal;
 
@@ -323,7 +550,7 @@ async function run() {
       fill('#kavita-auth-key', ${JSON.stringify(key)});
     })()`);
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
-    await web.evaluate(click('button[type=submit]'));
+    await waitFor('connect submit', () => web.evaluate(click('button[type=submit]')));
 
     await waitFor('catalog book card', () =>
       web.evaluate("Boolean(document.querySelector('[data-book-open]'))"),
@@ -352,34 +579,78 @@ async function run() {
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
+    await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
+      const status = await web.evaluate('Capacitor.Plugins.Network.getStatus()');
+      return (
+        status?.connected === false &&
+        status?.connectionType !== 'wifi' &&
+        status?.connectionType !== 'cellular'
       );
-      return connected === false;
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
-    await waitFor('next-page control', () => web.evaluate(click('[aria-label="Next page"]')));
-    await waitFor('second chapter', () => web.evaluate(chapter(2)));
-    await waitFor('reader position in the second chapter', () =>
-      web.evaluate(
-        'Number(document.querySelector(".reader-progress")?.getAttribute("aria-valuenow")) >= 50',
-      ),
+
+    const midChapterTarget = await advanceToMidChapterTwo(web);
+    const anchorParagraph = midChapterTarget.visibleParagraphs[0];
+    const committedProgress = await waitFor(
+      'persisted mid-chapter SQLite progress while Reader remains mounted',
+      async () => {
+        const readerMounted = await web.evaluate(
+          "Boolean(document.querySelector('.reader-shell .reader-viewport iframe'))",
+        );
+        if (!readerMounted) {
+          throw new Error('Reader unmounted unexpectedly before am force-stop.');
+        }
+        const rows = await web.evaluate(
+          querySqliteRows(
+            `SELECT b.id AS book_id, b.pages, b.pages_read,
+                    r.cfi, r.kavita_xpath, r.percentage, r.pending_sync, q.revision
+             FROM reading_state r
+             JOIN sync_queue q ON q.book_id = r.book_id
+             JOIN books b ON b.id = r.book_id`,
+          ),
+        );
+        if (!Array.isArray(rows) || rows.length !== 1) return null;
+        const row = rows[0];
+        const xpathMatch =
+          typeof row.kavita_xpath === 'string'
+            ? row.kavita_xpath.match(/^\/\/body\/DocFragment\[2\]\/body\/p\[(\d+)\]$/)
+            : null;
+        const paragraphNumber = xpathMatch ? Number(xpathMatch[1]) : 0;
+        if (
+          typeof row.book_id === 'string' &&
+          row.book_id.length > 0 &&
+          Number(row.pending_sync) === 1 &&
+          typeof row.cfi === 'string' &&
+          row.cfi.startsWith('epubcfi(') &&
+          paragraphNumber > 1 &&
+          Math.round(Number(row.percentage) * 100) === midChapterTarget.progressNow
+        ) {
+          const pages = Number(row.pages);
+          const pagesRead = Number(row.pages_read);
+          return {
+            bookId: row.book_id,
+            cfi: row.cfi,
+            expectedCardPercent: expectedBookCardPercent({ pages, pagesRead }),
+            pages,
+            pagesRead,
+            percentage: Number(row.percentage),
+            revision: Number(row.revision),
+            xpath: row.kavita_xpath,
+          };
+        }
+        return null;
+      },
     );
-    await waitFor('return to library control', async () => {
-      if (await web.evaluate(click('[aria-label="Back to library"]'))) return true;
-      await web.evaluate(click('[aria-label="Show reading controls"]'));
-      return false;
-    });
-    await waitFor('saved offline progress', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+
+    const stillMountedBeforeStop = await web.evaluate(
+      "Boolean(document.querySelector('.reader-shell .reader-viewport iframe'))",
     );
-    await waitFor('rendered offline cover before restart', () => web.evaluate(renderedCover));
+    if (!stillMountedBeforeStop) {
+      throw new Error('Expected Reader.svelte to remain mounted immediately before force-stop.');
+    }
 
     const offlineRequestsBeforeRestart = fixture.offlineRequests.length;
     await web.close();
@@ -394,9 +665,46 @@ async function run() {
       `${packageName}/app.turnleaf.reader.MainActivity`,
     );
     web = await connectWebView();
-    await waitFor('rendered offline cover after restart', () => web.evaluate(renderedCover));
-    await waitFor('offline catalog book', () => web.evaluate(click('[data-book-open]')));
-    await waitFor('offline passage restored after restart', () => web.evaluate(chapter(2)));
+    const bookOpenSelector = `article[data-book-id="${committedProgress.bookId}"] [data-book-open]`;
+    await waitFor(
+      'offline library book card after restart',
+      async () => {
+        const snapshot = await web.evaluate(libraryBookCardSnapshot(committedProgress.bookId));
+        return inspectLibraryBookCard(snapshot, {
+          bookId: committedProgress.bookId,
+          title,
+          expectedPercent: committedProgress.expectedCardPercent,
+        });
+      },
+      () => captureLibraryDiagnostics(web),
+    );
+    await waitFor(
+      'queued reading progress banner after restart',
+      async () => {
+        const warningTexts = await web.evaluate(`Array.from(
+          document.querySelectorAll('.alert.preset-tonal-warning'),
+          (el) => el.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+        )`);
+        return hasQueuedSyncBanner(warningTexts);
+      },
+      () => captureLibraryDiagnostics(web),
+    );
+    await waitFor(
+      'rendered offline cover after restart',
+      () => web.evaluate(renderedBookCover(committedProgress.bookId)),
+      () => captureLibraryDiagnostics(web),
+    );
+    await waitFor('offline catalog book', () => web.evaluate(click(bookOpenSelector)));
+    await waitFor('exact mid-chapter offline passage restored after force-stop', async () => {
+      const restored = await web.evaluate(readerSnapshotExpression);
+      if (!isMidChapterTwoSnapshot(restored)) return false;
+      return (
+        restored.page === midChapterTarget.page &&
+        restored.pageCount === midChapterTarget.pageCount &&
+        restored.progressNow === midChapterTarget.progressNow &&
+        restored.visibleParagraphs.includes(anchorParagraph)
+      );
+    });
     if (fixture.offlineRequests.length > 0) {
       throw new Error(
         `Turnleaf sent authenticated requests offline (${offlineRequestsBeforeRestart} before restart): ${fixture.offlineRequests.join(', ')}.`,
@@ -407,12 +715,12 @@ async function run() {
     await adb('shell', 'svc', 'wifi', 'enable');
     await adb('shell', 'svc', 'data', 'enable');
     disabledNetwork = false;
-    await waitFor('queued passage uploaded after reconnect', () =>
+    await waitFor('queued mid-chapter passage uploaded after reconnect', () =>
       fixture.uploads
         .slice(uploadCount)
         .some(
           (progress) =>
-            progress.chapterId === 1 && progress.bookScrollId?.includes('DocFragment[2]'),
+            progress.chapterId === 1 && progress.bookScrollId === committedProgress.xpath,
         ),
     );
     await waitFor('return to library after reconnect', async () => {
@@ -420,12 +728,43 @@ async function run() {
       await web.evaluate(click('[aria-label="Show reading controls"]'));
       return false;
     });
-    await waitFor('saved passage after reconnect', () =>
-      web.evaluate(
-        `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
-      ),
+    await waitFor(
+      'synced passage in library with zero pending sync warning banners',
+      async () => {
+        const domState = await web.evaluate(`(() => ({
+          card: ${libraryBookCardSnapshot(committedProgress.bookId)},
+          hasWarning: Boolean(document.querySelector('.alert.preset-tonal-warning')),
+        }))()`);
+        if (
+          !domState ||
+          domState.hasWarning ||
+          !inspectLibraryBookCard(domState.card, {
+            bookId: committedProgress.bookId,
+            title,
+            expectedPercent: committedProgress.expectedCardPercent,
+          })
+        ) {
+          return false;
+        }
+        const queueRows = await web.evaluate(
+          querySqliteRows('SELECT COUNT(*) AS count FROM sync_queue'),
+        );
+        const readingRows = await web.evaluate(
+          querySqliteRows('SELECT pending_sync FROM reading_state'),
+        );
+        return (
+          Number(queueRows?.[0]?.count ?? -1) === 0 &&
+          readingRows?.length === 1 &&
+          Number(readingRows[0]?.pending_sync) === 0
+        );
+      },
+      () => captureLibraryDiagnostics(web),
     );
-    await waitFor('rendered cover after reconnect', () => web.evaluate(renderedCover));
+    await waitFor(
+      'rendered cover after reconnect',
+      () => web.evaluate(renderedBookCover(committedProgress.bookId)),
+      () => captureLibraryDiagnostics(web),
+    );
     assertRedirectIsolation(fixture);
     if (fixture.notFoundPaths.length > 0) {
       throw new Error(
@@ -472,7 +811,9 @@ async function run() {
     throw journeyError;
   }
   if (cleanupError) throw cleanupError;
-  console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
+  console.log(
+    'Android reading journey passed: connect, download, force-stop mid-chapter offline, restore exact passage, sync.',
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
