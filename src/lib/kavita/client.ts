@@ -9,7 +9,19 @@ import {
   normalizeSeriesDetail,
 } from './normalization';
 import { recordDiagnostic } from '../diagnostics/log';
-import { advanceRedirect, createRedirectState, KavitaError, nativeHeader } from './redirects';
+import {
+  canSendCredential,
+  getCredentialState,
+  markCredentialRejected,
+  resolveCredentialEpoch,
+} from '../native/credentials';
+import {
+  advanceRedirect,
+  assertSafeTransferTarget,
+  createRedirectState,
+  KavitaError,
+  nativeHeader,
+} from './redirects';
 
 export { KavitaError };
 
@@ -41,19 +53,72 @@ function normalizePayload<T>(endpoint: string, read: () => T, context = ''): T {
   }
 }
 
+export type BeforeNativeRequest = (signal?: AbortSignal) => Promise<boolean> | boolean;
+
+export interface KavitaClientOptions {
+  credentialEpoch?: number | undefined;
+  probe?: boolean | undefined;
+  beforeNativeRequest?: BeforeNativeRequest | undefined;
+}
+
 export class KavitaClient {
+  private readonly credentialEpoch: number | undefined;
+  private readonly probe: boolean;
+  private readonly beforeNativeRequest: BeforeNativeRequest | undefined;
+  private localRejectedStatus: number | undefined;
+
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
-  ) {}
+    optionsOrBeforeNativeRequest?: KavitaClientOptions | BeforeNativeRequest,
+  ) {
+    const options =
+      typeof optionsOrBeforeNativeRequest === 'function'
+        ? { beforeNativeRequest: optionsOrBeforeNativeRequest }
+        : (optionsOrBeforeNativeRequest ?? {});
+    this.probe = options.probe === true;
+    this.beforeNativeRequest = options.beforeNativeRequest;
+    this.credentialEpoch = this.probe
+      ? undefined
+      : resolveCredentialEpoch(apiKey, options.credentialEpoch);
+  }
+
+  canSendRequests(): boolean {
+    if (!this.apiKey.trim()) return false;
+    if (this.localRejectedStatus !== undefined) return false;
+    if (this.probe) return true;
+    return canSendCredential(this.apiKey, this.credentialEpoch);
+  }
+
+  private assertCredentialReady(probe = this.probe): void {
+    if (!this.apiKey.trim()) {
+      throw new KavitaError('Enter a Kavita auth key.', 'authentication');
+    }
+    if (probe) return;
+    if (
+      this.localRejectedStatus !== undefined ||
+      !canSendCredential(this.apiKey, this.credentialEpoch)
+    ) {
+      const status = this.localRejectedStatus ?? getCredentialState().statusCode;
+      throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+    }
+  }
+
+  private rejectCredential(status: number, probe = this.probe): never {
+    if (!probe) {
+      this.localRejectedStatus = status;
+      markCredentialRejected(this.credentialEpoch, status);
+    }
+    throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+  }
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
     const options = signal ? { signal } : {};
     const [libraries, health] = await Promise.all([
-      this.request<unknown>('/api/Library/libraries', options).then((payload) =>
+      this.request<unknown>('/api/Library/libraries', options, true).then((payload) =>
         normalizePayload('/api/Library/libraries', () => normalizeLibraries(payload)),
       ),
-      this.request<unknown>('/api/Health', options).catch(() => null),
+      this.request<unknown>('/api/Health', options, true).catch(() => null),
     ]);
     return {
       version: readHealthVersion(health),
@@ -127,6 +192,7 @@ export class KavitaClient {
     if (Capacitor.isNativePlatform()) {
       throw new Error('Covers on native platforms must use cacheCover.');
     }
+    this.assertCredentialReady();
     const url = this.coverUrl(seriesId);
     return this.withBrowserTimeout(signal, async (combined) => {
       const response = await this.browserFetchWithRedirects(url, {
@@ -153,12 +219,13 @@ export class KavitaClient {
     } catch (error) {
       const retryable =
         error instanceof KavitaError &&
-        (error.kind === 'network' ||
+        ((error.kind === 'network' &&
+          error.message !== 'Kavita could not be reached while offline.') ||
           (error.kind === 'server' &&
             error.status !== undefined &&
             error.status >= 500 &&
             error.status < 600));
-      if (signal?.aborted || !retryable) throw error;
+      if (signal?.aborted || !retryable || !this.canSendRequests()) throw error;
       const progress = await this.request<unknown>(path, options);
       if (!isKavitaProgress(progress)) {
         throw new KavitaError(
@@ -179,22 +246,29 @@ export class KavitaClient {
     return this.request('/api/Reader/progress', options);
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
+  private async request<T>(path: string, init: RequestInit = {}, probe = this.probe): Promise<T> {
+    this.assertCredentialReady(probe);
+    if (Capacitor.isNativePlatform()) {
+      return this.nativeRequest<T>(path, init, probe);
+    }
     return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
       try {
-        const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
-          ...init,
-          signal,
-          headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-            'x-api-key': this.apiKey,
-            ...init.headers,
+        const response = await this.browserFetchWithRedirects(
+          this.resolveUrl(path),
+          {
+            ...init,
+            signal,
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+              ...init.headers,
+              'x-api-key': this.apiKey,
+            },
           },
-        });
+          probe,
+        );
 
-        this.assertStatus(response.status, path);
+        this.assertStatus(response.status, path, probe);
         if (response.status === 204 || response.headers.get('content-length') === '0') {
           return undefined as T;
         }
@@ -210,8 +284,9 @@ export class KavitaClient {
     });
   }
 
-  private async nativeRequest<T>(path: string, init: RequestInit): Promise<T> {
+  private async nativeRequest<T>(path: string, init: RequestInit, probe = this.probe): Promise<T> {
     if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    this.assertCredentialReady(probe);
     const method = init.method ?? 'GET';
     const options: HttpOptions = {
       url: this.resolveUrl(path),
@@ -230,12 +305,30 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
-        const networkStatus = await Network.getStatus().catch(() => null);
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        if (networkStatus?.connected !== true || navigator.onLine === false) {
+        this.assertCredentialReady(probe);
+        const allowedBefore = this.beforeNativeRequest
+          ? await this.beforeNativeRequest(init.signal ?? undefined)
+          : true;
+        const networkStatus = allowedBefore ? await Network.getStatus().catch(() => null) : null;
+        if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        this.assertCredentialReady(probe);
+        const allowedAfter =
+          allowedBefore &&
+          (this.beforeNativeRequest
+            ? await this.beforeNativeRequest(init.signal ?? undefined)
+            : true);
+        if (!allowedAfter || networkStatus?.connected !== true || navigator.onLine === false) {
           throw new KavitaError('Kavita could not be reached while offline.', 'network');
         }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
+        if (!probe && (response.status === 401 || response.status === 403)) {
+          this.localRejectedStatus = response.status;
+          markCredentialRejected(this.credentialEpoch, response.status);
+          if (init.signal?.aborted) {
+            recordDiagnostic({ category: 'response', endpoint: path, status: response.status });
+          }
+        }
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         if (
           !advanceRedirect(redirects, response.status, nativeHeader(response.headers, 'location'))
@@ -243,7 +336,7 @@ export class KavitaClient {
           break;
         }
       }
-      this.assertStatus(response.status, path);
+      this.assertStatus(response.status, path, probe);
       if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (typeof response.data === 'string') {
         if (!response.data.trim()) return undefined as T;
@@ -260,10 +353,20 @@ export class KavitaClient {
     }
   }
 
-  private async browserFetchWithRedirects(url: string, init: RequestInit): Promise<Response> {
+  private async browserFetchWithRedirects(
+    url: string,
+    init: RequestInit,
+    probe = this.probe,
+  ): Promise<Response> {
     const redirects = createRedirectState(url, new URL(this.baseUrl).origin, init.method ?? 'GET');
     while (true) {
+      if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      this.assertCredentialReady(probe);
       const response = await fetch(redirects.currentUrl, { ...init, redirect: 'manual' });
+      if (!probe && init.signal?.aborted && (response.status === 401 || response.status === 403)) {
+        this.localRejectedStatus = response.status;
+        markCredentialRejected(this.credentialEpoch, response.status);
+      }
       if (
         !advanceRedirect(
           redirects,
@@ -304,21 +407,42 @@ export class KavitaClient {
     }
   }
 
-  private assertStatus(status: number, endpoint?: string): void {
+  private assertStatus(status: number, endpoint?: string, probe = this.probe): void {
     if (endpoint !== undefined && status >= 400) {
       recordDiagnostic({ category: 'response', endpoint, status });
     }
     if (status === 401 || status === 403) {
-      throw new KavitaError('Kavita rejected this auth key.', 'authentication', status);
+      this.rejectCredential(status, probe);
     }
     if (status < 200 || status >= 300) {
       throw new KavitaError(`Kavita returned an error (${status}).`, 'server', status);
     }
   }
 
+  private parseBaseOrigin(): URL {
+    let parsed: URL;
+    try {
+      parsed = new URL(this.baseUrl);
+    } catch {
+      throw new KavitaError('Invalid Kavita server address.', 'server');
+    }
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      throw new KavitaError('Invalid Kavita server address.', 'server');
+    }
+    return parsed;
+  }
+
   private resolveUrl(path: string): string {
+    const parsedBase = this.parseBaseOrigin();
     const baseUrl = this.baseUrl.replace(/\/+$/, '') + '/';
     const absolute = new URL(path.replace(/^\/+/, ''), baseUrl).toString();
+    assertSafeTransferTarget(absolute, parsedBase.origin, 'Invalid Kavita server address.');
     if (
       !Capacitor.isNativePlatform() &&
       import.meta.env.DEV &&

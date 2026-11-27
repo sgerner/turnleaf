@@ -12,6 +12,8 @@ import {
   type BookRecord,
   type ServerConfig,
 } from '../database/database';
+import { resetCredentialState } from '../native/credentials';
+import type * as CredentialsModule from '../native/credentials';
 
 const networkListeners = new Set<
   (status: { connected: boolean; connectionType: string }) => void
@@ -71,10 +73,14 @@ vi.mock('../downloads/native-download', () => ({
   verifyDownloadedEpub: (path: string) => verifyDownloadedEpubMock(path),
 }));
 
-vi.mock('../native/credentials', () => ({
-  saveApiKey: vi.fn(async () => {}),
-  removeApiKey: vi.fn(async () => {}),
-}));
+vi.mock('../native/credentials', async (importOriginal) => {
+  const actual = await importOriginal<typeof CredentialsModule>();
+  return {
+    ...actual,
+    saveApiKey: vi.fn(async () => {}),
+    removeApiKey: vi.fn(async () => {}),
+  };
+});
 
 vi.mock('../themes/themes', async (importOriginal) => {
   const actual = await importOriginal<typeof ThemesModule>();
@@ -235,6 +241,7 @@ async function mountLibrary(
 }
 
 beforeEach(async () => {
+  resetCredentialState();
   networkConnected = true;
   networkListeners.clear();
   appStateListeners.clear();
@@ -244,13 +251,18 @@ beforeEach(async () => {
     value: new MemoryStorage(),
   });
   if (!Element.prototype.animate) {
-    Element.prototype.animate = () =>
-      ({
+    Element.prototype.animate = () => {
+      const animation = {
         cancel: () => {},
-        finish: () => {},
-        onfinish: null,
+        finish: () => {
+          animation.onfinish?.();
+        },
+        onfinish: null as (() => void) | null,
         finished: Promise.resolve(),
-      }) as unknown as Animation;
+      };
+      queueMicrotask(() => animation.onfinish?.());
+      return animation as unknown as Animation;
+    };
   }
   await saveServer(server);
   await reconcileBooks(server.id, [seededBook]);
@@ -526,7 +538,6 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
 
   it('preserves authentication failure notices from runProgressSync when refreshCatalog runs concurrently or after abort', async () => {
     networkConnected = false;
-    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
 
     let seriesAttempt = 0;
     const releaseAbortedCleanup = deferred<void>();
@@ -576,28 +587,27 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) {
       listener({ connected: false, connectionType: 'none' });
     }
+    await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[2]', 0.25, 1);
 
-    // Reconnect immediately: syncProgress fails with 401 before the second refreshCatalog begins
+    // Reconnect immediately: syncProgress fails with 401, tripping the credential circuit breaker
     networkConnected = true;
     for (const listener of networkListeners) {
       listener({ connected: true, connectionType: 'wifi' });
     }
     await waitForCondition(() =>
-      Boolean(
-        target.textContent?.includes(
-          'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
-        ),
-      ),
+      Boolean(target.querySelector('[data-credential-alert="rejected"]')),
     );
 
-    // Let the aborted refresh finish unwinding so the queued second refreshCatalog starts and completes
+    // Let the aborted refresh finish unwinding; the 401 circuit breaker prevents any second catalog request
+    // while keeping the single consolidated rejected-key alert intact.
     releaseAbortedCleanup.resolve();
-    await waitForCondition(() => seriesAttempt === 2);
     await new Promise((resolve) => setTimeout(resolve, 25));
 
-    expect(target.textContent).toContain(
-      'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.',
+    expect(seriesAttempt).toBe(1);
+    expect(target.querySelector('[data-credential-alert="rejected"]')?.textContent).toContain(
+      'Kavita rejected the saved auth key.',
     );
+    expect(target.querySelectorAll('.alert')).toHaveLength(1);
   });
 
   it('pauses automatic progress uploads while opening a book or resolving a reading conflict', async () => {

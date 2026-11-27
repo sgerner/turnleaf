@@ -2,6 +2,7 @@
 
 import { flushSync, mount, unmount, type Component } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type * as CredentialsModule from '../native/credentials';
 import type * as ThemesModule from '../themes/themes';
 
 const env = vi.hoisted(() => ({
@@ -80,18 +81,24 @@ vi.mock('../database/database', () => ({
   }),
 }));
 
-vi.mock('../native/credentials', () => ({
-  getApiKey: vi.fn(async () => {
-    if (env.failGetApiKey) throw new Error('Keystore locked');
-    return env.savedApiKey;
-  }),
-  saveApiKey: vi.fn(async (_ref: string, key: string) => {
-    env.savedApiKey = key;
-  }),
-  removeApiKey: vi.fn(async () => {
-    env.savedApiKey = null;
-  }),
-}));
+vi.mock('../native/credentials', async (importOriginal) => {
+  const actual = await importOriginal<typeof CredentialsModule>();
+  return {
+    ...actual,
+    getApiKey: vi.fn(async () => {
+      if (env.failGetApiKey) throw new Error('Keystore locked');
+      return env.savedApiKey;
+    }),
+    saveApiKey: vi.fn(async (ref: string, key: string) => {
+      env.savedApiKey = key;
+      actual.syncLoadedCredential(key, ref);
+    }),
+    removeApiKey: vi.fn(async () => {
+      env.savedApiKey = null;
+      actual.resetCredentialState();
+    }),
+  };
+});
 
 vi.mock('../github/releases', () => ({
   fetchLatestGithubRelease: vi.fn(async () => null),
@@ -109,6 +116,7 @@ vi.mock('../themes/themes', async (importOriginal) => {
 import { Filesystem } from '@capacitor/filesystem';
 import App from '../../App.svelte';
 import Onboarding from '../components/Onboarding.svelte';
+import { resetCredentialState } from '../native/credentials';
 import { clearDiagnostics, exportDiagnostics, getDiagnosticCount } from './log';
 
 const mountedComponents: Array<Record<string, unknown>> = [];
@@ -158,6 +166,7 @@ describe('shared diagnostics across onboarding and startup', () => {
     env.savedServer = null;
     env.savedApiKey = null;
     window.localStorage.clear();
+    resetCredentialState();
     vi.clearAllMocks();
     await clearDiagnostics();
   });

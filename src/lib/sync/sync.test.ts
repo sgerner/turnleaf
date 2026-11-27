@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { KavitaError } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -226,4 +227,134 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('stops immediately on authentication or in-flight network KavitaErrors without trying remaining queued books', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const buildTwoBookQueue = (): ExpandableFixture => {
+    const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+    state.books.push({ ...book, id: 'book-2', chapterId: 2 });
+    state.readingState['book-2'] = {
+      ...state.readingState['book-1']!,
+      localUpdatedAt: '2026-09-07T00:00:01.000Z',
+    };
+    state.syncQueue['book-2'] = {
+      ...state.syncQueue['book-1']!,
+      bookId: 'book-2',
+      serverId: 'server',
+      payloadJson: '{"pageNum":2}',
+      createdAt: '2026-09-07T00:00:01.000Z',
+      updatedAt: '2026-09-07T00:00:01.000Z',
+      revision: 1,
+    };
+    return state;
+  };
+
+  for (const error of [
+    new KavitaError('Kavita rejected this auth key.', 'authentication', 401),
+    new KavitaError('Kavita could not be reached. Check the address and network.', 'network'),
+  ]) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(buildTwoBookQueue()));
+    const saveProgress = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(undefined);
+
+    await expect(flushProgress({ saveProgress } as never, 'server')).rejects.toThrow(
+      '1 reading progress item failed to sync.',
+    );
+    expect(saveProgress).toHaveBeenCalledTimes(1);
+
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ExpandableFixture;
+    expect(saved.syncQueue['book-1']?.attemptCount).toBe(1);
+    expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
+    expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+    expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+  }
+});
+
+it('stops between requests without penalizing unattempted items when AbortSignal aborts, credentials lock, or beforeNativeRequest reports disconnected', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+
+  const buildThreeBookQueue = (): ExpandableFixture => {
+    const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+    for (const [id, chapterId, sec] of [
+      ['book-2', 2, '01'],
+      ['book-3', 3, '02'],
+    ] as const) {
+      state.books.push({ ...book, id, chapterId });
+      state.readingState[id] = {
+        ...state.readingState['book-1']!,
+        localUpdatedAt: `2026-09-07T00:00:${sec}.000Z`,
+      };
+      state.syncQueue[id] = {
+        ...state.syncQueue['book-1']!,
+        bookId: id,
+        serverId: 'server',
+        payloadJson: JSON.stringify({ pageNum: chapterId }),
+        createdAt: `2026-09-07T00:00:${sec}.000Z`,
+        updatedAt: `2026-09-07T00:00:${sec}.000Z`,
+        revision: 1,
+      };
+    }
+    return state;
+  };
+
+  // 1) Credentials already unavailable before starting
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
+  const blockedSave = vi.fn();
+  await expect(
+    flushProgress({ saveProgress: blockedSave, canSendRequests: () => false } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(blockedSave).not.toHaveBeenCalled();
+
+  // 2) AbortSignal aborts right after book-1 finishes uploading -> book-1 confirmed, book-2 & book-3 untouched
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
+  const controller = new AbortController();
+  const saveProgressOnAbort = vi.fn(async () => {
+    controller.abort();
+  });
+
+  await expect(
+    flushProgress({ saveProgress: saveProgressOnAbort } as never, 'server', controller.signal),
+  ).resolves.toBeUndefined();
+  expect(saveProgressOnAbort).toHaveBeenCalledTimes(1);
+
+  const afterAbort = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ExpandableFixture;
+  expect(afterAbort.syncQueue['book-1']).toBeUndefined();
+  expect(afterAbort.readingState['book-1']?.pendingSync).toBe(false);
+  expect(afterAbort.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
+  expect(afterAbort.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
+
+  // 3) beforeNativeRequest / native gate throws pre-dispatch offline KavitaError on book-2 -> stops without penalizing book-2 or book-3
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
+  const saveProgressTransportDrop = vi
+    .fn()
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(
+      new KavitaError('Kavita could not be reached while offline.', 'network'),
+    );
+
+  await expect(
+    flushProgress({ saveProgress: saveProgressTransportDrop } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(saveProgressTransportDrop).toHaveBeenCalledTimes(2);
+
+  const afterTransportDrop = JSON.parse(
+    localStorage.getItem(STORAGE_KEY) ?? '{}',
+  ) as ExpandableFixture;
+  expect(afterTransportDrop.syncQueue['book-1']).toBeUndefined();
+  expect(afterTransportDrop.syncQueue['book-2']).toMatchObject({
+    attemptCount: 0,
+    lastError: null,
+  });
+  expect(afterTransportDrop.syncQueue['book-3']).toMatchObject({
+    attemptCount: 0,
+    lastError: null,
+  });
 });

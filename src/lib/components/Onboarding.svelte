@@ -4,7 +4,7 @@
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
-  import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { removeApiKey, saveApiKey, syncLoadedCredential } from '../native/credentials';
   import { getDiagnosticCount, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -13,11 +13,15 @@
     savedServer = null,
     editAddress = false,
     onCancel,
+    onApiKeySaved,
+    onRestoreCredentials,
     onConnected,
   }: {
     savedServer?: ServerConfig | null;
     editAddress?: boolean;
     onCancel?: (() => void) | undefined;
+    onApiKeySaved?: ((key: string) => void) | undefined;
+    onRestoreCredentials?: (() => Promise<boolean>) | undefined;
     onConnected: (server: ServerConfig, key: string) => void;
   } = $props();
 
@@ -59,6 +63,7 @@
       try {
         await removeApiKey(server.credentialRef);
       } catch (cleanupError) {
+        await onRestoreCredentials?.().catch(() => false);
         recordDiagnostic({
           category: 'startup',
           endpoint: 'local/credentials',
@@ -66,6 +71,7 @@
         });
         throw new Error(messages.cleanupFailed, { cause: cleanupError });
       }
+      await onRestoreCredentials?.().catch(() => false);
       recordDiagnostic({
         category: 'startup',
         endpoint: 'local/database',
@@ -122,7 +128,7 @@
       }
 
       if (savedServer) {
-        let connectedServer = savedServer;
+        let connectedServer: ServerConfig;
         if (changingServerAddress) {
           const credentialRef = `${savedServer.credentialRef}_${Date.now().toString(36)}`;
           connectedServer = {
@@ -140,6 +146,11 @@
           });
           await removeApiKey(savedServer.credentialRef).catch(() => {});
         } else {
+          connectedServer = {
+            ...savedServer,
+            kavitaVersion: result.version,
+            lastConnectedAt: new Date().toISOString(),
+          };
           try {
             await saveApiKey(savedServer.credentialRef, key);
           } catch (credentialError) {
@@ -150,7 +161,24 @@
             });
             throw credentialError;
           }
+          syncLoadedCredential(key, savedServer.credentialRef);
+          onApiKeySaved?.(key);
+          try {
+            await saveServer(connectedServer);
+          } catch (storageError) {
+            recordDiagnostic({
+              category: 'startup',
+              endpoint: 'local/database',
+              detail: 'server-save-failed',
+            });
+            throw new Error(
+              'The auth key worked, but local server details could not be updated. Retry reconnect.',
+              { cause: storageError },
+            );
+          }
         }
+        apiKey = '';
+        syncLoadedCredential(key, connectedServer.credentialRef);
         onConnected(connectedServer, key);
         return;
       }
@@ -173,6 +201,7 @@
           'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
       });
       apiKey = '';
+      syncLoadedCredential(key, server.credentialRef);
       onConnected(server, key);
     } catch (cause) {
       if (cause instanceof ServerUrlError) {

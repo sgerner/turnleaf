@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Centralize Kavita credential state, gate 401/403 requests, and stop queued syncs on disconnect.
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity
 - fix: block native Kavita requests while offline

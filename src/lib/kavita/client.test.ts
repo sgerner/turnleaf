@@ -3,8 +3,16 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
 import { Network } from '@capacitor/network';
-import { KavitaClient } from './client';
+import { KavitaClient, KavitaError } from './client';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+import {
+  getCredentialState,
+  markCredentialMissing,
+  markCredentialUnreadable,
+  resetCredentialState,
+  saveApiKey,
+  syncLoadedCredential,
+} from '../native/credentials';
 
 const capacitorRuntime = vi.hoisted(() => ({ native: false, connected: true }));
 
@@ -30,6 +38,7 @@ vi.mock('@capacitor/network', () => ({
 
 beforeEach(() => {
   clearDiagnostics();
+  resetCredentialState();
   Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
   capacitorRuntime.native = false;
   capacitorRuntime.connected = true;
@@ -756,13 +765,14 @@ it('omits response diagnostics when getCover receives an error status while requ
   });
 
   capacitorRuntime.native = true;
+  const nativeClient = new KavitaClient('https://books.example.com', 'native-key');
   vi.mocked(CapacitorHttp.request).mockResolvedValueOnce({
     status: 503,
     headers: {},
     url: '',
     data: '',
   });
-  await expect(client.getSeriesDetail(4)).rejects.toMatchObject({
+  await expect(nativeClient.getSeriesDetail(4)).rejects.toMatchObject({
     kind: 'server',
     status: 503,
   });
@@ -894,4 +904,293 @@ it('rejects duplicate EPUB IDs within a single page before reconciliation', asyn
   await expect(new KavitaClient('http://books.example', 'key').getBookSeries()).rejects.toThrow(
     'repeated series page',
   );
+});
+
+it('never sends empty or whitespace x-api-key headers on browser or native requests', async () => {
+  const browserClient = new KavitaClient('https://books.example.com', '   ');
+  expect(browserClient.canSendRequests()).toBe(false);
+  await expect(browserClient.getBookSeries()).rejects.toThrow(KavitaError);
+  await expect(browserClient.getCover(4)).rejects.toThrow('Enter a Kavita auth key.');
+  expect(fetch).not.toHaveBeenCalled();
+
+  capacitorRuntime.native = true;
+  const nativeClient = new KavitaClient('https://books.example.com', '');
+  await expect(nativeClient.getProgress(1)).rejects.toThrow('Enter a Kavita auth key.');
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+});
+
+it('trips the central credential breaker on 401 and 403 and blocks follow-up requests', async () => {
+  const loaded = syncLoadedCredential('stale-key', 'server_primary_api_key');
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+  } as unknown as Response);
+
+  const client = new KavitaClient('https://books.example.com', 'stale-key', {
+    credentialEpoch: loaded.epoch,
+  });
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'authentication',
+    status: 401,
+  });
+  expect(getCredentialState()).toEqual({
+    status: 'rejected',
+    epoch: loaded.epoch,
+    statusCode: 401,
+  });
+
+  const secondClient = new KavitaClient('https://books.example.com', 'stale-key', {
+    credentialEpoch: loaded.epoch,
+  });
+  expect(secondClient.canSendRequests()).toBe(false);
+  await expect(secondClient.getCover(4)).rejects.toMatchObject({
+    kind: 'authentication',
+    status: 401,
+  });
+  await expect(secondClient.getProgress(1)).rejects.toMatchObject({
+    kind: 'authentication',
+    status: 401,
+  });
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it('ignores a late 401 from an older client epoch after a replacement key is saved', async () => {
+  const stale = syncLoadedCredential('stale-key', 'server_primary_api_key');
+  let rejectInFlight!: (response: Response) => void;
+  vi.mocked(fetch)
+    .mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          rejectInFlight = resolve;
+        }),
+    )
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [],
+    } as unknown as Response);
+
+  const staleClient = new KavitaClient('https://books.example.com', 'stale-key', {
+    credentialEpoch: stale.epoch,
+  });
+  const pending = staleClient.getBookSeries();
+
+  await saveApiKey('server_primary_api_key', 'fresh-key');
+  const freshEpoch = getCredentialState().epoch;
+  const freshClient = new KavitaClient('https://books.example.com', 'fresh-key', {
+    credentialEpoch: freshEpoch,
+  });
+
+  rejectInFlight({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+  } as unknown as Response);
+  await expect(pending).rejects.toMatchObject({ kind: 'authentication', status: 401 });
+
+  expect(getCredentialState()).toEqual({ status: 'ready', epoch: freshEpoch });
+  expect(freshClient.canSendRequests()).toBe(true);
+  await expect(freshClient.getBookSeries()).resolves.toEqual([]);
+});
+
+it('allows testConnection probes for a replacement key while saved credentials are rejected', async () => {
+  const stale = syncLoadedCredential('stale-key', 'server_primary_api_key');
+  vi.mocked(fetch).mockResolvedValueOnce({
+    ok: false,
+    status: 401,
+    headers: { get: () => null },
+  } as unknown as Response);
+  await expect(
+    new KavitaClient('https://books.example.com', 'stale-key', {
+      credentialEpoch: stale.epoch,
+    }).getBookSeries(),
+  ).rejects.toThrow('Kavita rejected this auth key.');
+  expect(getCredentialState().status).toBe('rejected');
+
+  vi.mocked(fetch)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => [{ id: 1, name: 'Books', type: 2 }],
+    } as unknown as Response)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({ version: '0.8.8' }),
+    } as unknown as Response);
+
+  const probeResult = await new KavitaClient(
+    'https://books.example.com',
+    'replacement-key',
+  ).testConnection();
+  expect(probeResult).toEqual({
+    version: '0.8.8',
+    bookLibraries: [{ id: 1, name: 'Books', type: 2 }],
+  });
+});
+
+it('trips the credential breaker when an in-flight native request returns 401 after abort', async () => {
+  capacitorRuntime.native = true;
+  const loaded = syncLoadedCredential('stale-key', 'server_primary_api_key');
+  const controller = new AbortController();
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    controller.abort();
+    return {
+      status: 401,
+      headers: {},
+      url: 'https://books.example.com/api/Series/v2',
+      data: '',
+    };
+  });
+
+  const client = new KavitaClient('https://books.example.com', 'stale-key', {
+    credentialEpoch: loaded.epoch,
+  });
+  await expect(client.getBookSeries(controller.signal)).rejects.toMatchObject({
+    name: 'AbortError',
+  });
+  expect(getCredentialState()).toEqual({
+    status: 'rejected',
+    epoch: loaded.epoch,
+    statusCode: 401,
+  });
+  expect(client.canSendRequests()).toBe(false);
+});
+
+it('blocks non-probe requests and getProgress retries when credentials become missing or unreadable', async () => {
+  capacitorRuntime.native = true;
+  markCredentialMissing(null);
+
+  const staleClient = new KavitaClient('https://books.example.com', 'leftover-key');
+  expect(staleClient.canSendRequests()).toBe(false);
+  await expect(staleClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'authentication',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  markCredentialUnreadable('server_primary_api_key');
+  const unreadableClient = new KavitaClient('https://books.example.com', 'leftover-key');
+  expect(unreadableClient.canSendRequests()).toBe(false);
+  await expect(unreadableClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'authentication',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  // Probe requests for a candidate replacement key remain allowed while saved credentials are missing/unreadable
+  vi.mocked(CapacitorHttp.request)
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify([{ id: 1, name: 'Books', type: 2 }]),
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify({ version: '0.8.9' }),
+    });
+  await expect(
+    new KavitaClient('https://books.example.com', 'candidate-key').testConnection(),
+  ).resolves.toEqual({
+    version: '0.8.9',
+    bookLibraries: [{ id: 1, name: 'Books', type: 2 }],
+  });
+
+  // getProgress does not retry a transient error if credentials become missing mid-request
+  capacitorRuntime.native = false;
+  const active = syncLoadedCredential('active-key', 'server_primary_api_key');
+  const activeClient = new KavitaClient('https://books.example.com', 'active-key', {
+    credentialEpoch: active.epoch,
+  });
+  const fetchMock = vi.fn().mockImplementationOnce(async () => {
+    markCredentialMissing('server_primary_api_key');
+    return {
+      ok: false,
+      status: 500,
+      headers: { get: () => null },
+    };
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await expect(activeClient.getProgress(7)).rejects.toMatchObject({
+    kind: 'server',
+    status: 500,
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+it('rejects tampered baseUrl values before sending x-api-key over browser or native requests', async () => {
+  for (const unsafeBaseUrl of [
+    'ftp://books.example.com',
+    'file:///etc/passwd',
+    'https://user:pass@books.example.com',
+    'https://books.example.com?api_key=leak',
+    'https://books.example.com#fragment',
+  ]) {
+    await expect(new KavitaClient(unsafeBaseUrl, 'secret-key').getBookSeries()).rejects.toThrow(
+      'Invalid Kavita server address.',
+    );
+    await expect(new KavitaClient(unsafeBaseUrl, 'secret-key').testConnection()).rejects.toThrow(
+      'Invalid Kavita server address.',
+    );
+  }
+  expect(fetch).not.toHaveBeenCalled();
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+});
+
+it('gates initial, retry, and redirect native requests via beforeNativeRequest and credentials', async () => {
+  capacitorRuntime.native = true;
+  const loaded = syncLoadedCredential('live-key', 'server_primary_api_key');
+  let allowTransport = false;
+  const beforeNativeRequest = vi.fn(
+    async (signal?: AbortSignal) => !signal?.aborted && allowTransport,
+  );
+  const client = new KavitaClient('https://books.example.com', 'live-key', {
+    credentialEpoch: loaded.epoch,
+    beforeNativeRequest,
+  });
+
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'Kavita could not be reached while offline.',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  allowTransport = true;
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    allowTransport = false;
+    return {
+      status: 503,
+      headers: {},
+      url: 'https://books.example.com/api/Reader/get-progress?chapterId=7',
+      data: '',
+    };
+  });
+  await expect(client.getProgress(7)).rejects.toMatchObject({
+    kind: 'network',
+    message: 'Kavita could not be reached while offline.',
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
+
+  allowTransport = true;
+  vi.mocked(CapacitorHttp.request).mockReset();
+  vi.mocked(CapacitorHttp.request).mockImplementationOnce(async () => {
+    allowTransport = false;
+    return {
+      status: 307,
+      headers: { location: '/next/api/Series/v2?PageNumber=1&PageSize=500' },
+      url: 'https://books.example.com/api/Series/v2?PageNumber=1&PageSize=500',
+      data: '',
+    };
+  });
+  await expect(client.getBookSeries()).rejects.toMatchObject({
+    kind: 'network',
+    message: 'Kavita could not be reached while offline.',
+  });
+  expect(CapacitorHttp.request).toHaveBeenCalledTimes(1);
 });

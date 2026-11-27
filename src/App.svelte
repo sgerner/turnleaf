@@ -14,7 +14,12 @@
     resetLocalDatabase,
     type ServerConfig,
   } from './lib/database/database';
-  import { getApiKey } from './lib/native/credentials';
+  import {
+    getApiKey,
+    markCredentialMissing,
+    markCredentialUnreadable,
+    syncLoadedCredential,
+  } from './lib/native/credentials';
   import {
     DEFAULT_MODE,
     DEFAULT_THEME,
@@ -60,19 +65,44 @@
   let startupError = $state('');
   let repairing = $state(false);
   let changingServerAddress = $state(false);
-  let apiKey = $state<string | null>(null);
+  let reconnectingServer = $state(false);
+  let apiKey = $state('');
   let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
 
+  async function loadServerCredential(saved: ServerConfig): Promise<boolean> {
+    try {
+      const loaded = await getApiKey(saved.credentialRef);
+      if (loaded && loaded.trim()) {
+        apiKey = loaded;
+        syncLoadedCredential(loaded, saved.credentialRef);
+        return true;
+      }
+      apiKey = '';
+      markCredentialMissing(saved.credentialRef);
+      return false;
+    } catch {
+      apiKey = '';
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/credentials',
+        detail: 'credential-read-failed',
+      });
+      markCredentialUnreadable(saved.credentialRef);
+      return false;
+    }
+  }
+
   async function loadLocalData(): Promise<void> {
     booting = true;
     startupError = '';
     server = null;
-    apiKey = null;
+    apiKey = '';
     readerOpen = false;
+    markCredentialMissing(null);
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -92,18 +122,8 @@
         writeBootThemeCache(resolvedTheme, resolvedMode);
       }
       if (saved) {
+        await loadServerCredential(saved);
         server = saved;
-        try {
-          apiKey = await getApiKey(saved.credentialRef);
-        } catch {
-          recordDiagnostic({
-            category: 'startup',
-            endpoint: 'local/credentials',
-            detail: 'credential-read-failed',
-          });
-          startupError =
-            'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
-        }
       }
     } catch {
       recordDiagnostic({
@@ -224,7 +244,7 @@
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
         </div>
       </main>
-    {:else if server && apiKey && !changingServerAddress}
+    {:else if server && !changingServerAddress && !reconnectingServer}
       <Library
         {server}
         {apiKey}
@@ -233,7 +253,16 @@
         onThemeChange={(value) => (uiTheme = value)}
         onModeChange={(value) => (uiMode = value)}
         onApiKeyChange={(value) => (apiKey = value)}
+        onServerChange={(updatedServer) => (server = updatedServer)}
+        onRetryCredentials={async () => {
+          if (!server) return false;
+          return loadServerCredential(server);
+        }}
         onReaderOpenChange={(open) => (readerOpen = open)}
+        onReconnect={() => {
+          readerOpen = false;
+          reconnectingServer = true;
+        }}
         onChangeServerAddress={() => {
           readerOpen = false;
           changingServerAddress = true;
@@ -241,7 +270,10 @@
         onServerDeleted={() => {
           readerOpen = false;
           server = null;
-          apiKey = null;
+          apiKey = '';
+          markCredentialMissing(null);
+          changingServerAddress = false;
+          reconnectingServer = false;
         }}
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
@@ -257,32 +289,22 @@
           >
             Retry
           </button>
-          {#if server}
-            <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
-              type="button"
-              onclick={() => (startupError = '')}
-            >
-              Enter auth key
-            </button>
-          {:else}
-            <button
-              class="btn btn-sm preset-tonal-error !text-sm"
-              type="button"
-              disabled={repairing}
-              onclick={() => {
-                if (
-                  window.confirm(
-                    'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
-                  )
-                ) {
-                  void repairLocalData();
-                }
-              }}
-            >
-              {repairing ? 'Resetting...' : 'Reset local data'}
-            </button>
-          {/if}
+          <button
+            class="btn btn-sm preset-tonal-error !text-sm"
+            type="button"
+            disabled={repairing}
+            onclick={() => {
+              if (
+                window.confirm(
+                  'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
+                )
+              ) {
+                void repairLocalData();
+              }
+            }}
+          >
+            {repairing ? 'Resetting...' : 'Reset local data'}
+          </button>
         </div>
         <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
@@ -290,11 +312,32 @@
       <Onboarding
         savedServer={server}
         editAddress={changingServerAddress}
-        onCancel={changingServerAddress ? () => (changingServerAddress = false) : undefined}
+        onCancel={server
+          ? () => {
+              changingServerAddress = false;
+              reconnectingServer = false;
+            }
+          : undefined}
+        onApiKeySaved={server
+          ? (savedKey) => {
+              if (server) {
+                syncLoadedCredential(savedKey, server.credentialRef);
+                apiKey = savedKey;
+              }
+            }
+          : undefined}
+        onRestoreCredentials={server
+          ? async () => {
+              if (!server) return false;
+              return loadServerCredential(server);
+            }
+          : undefined}
         onConnected={(connected, key) => {
+          syncLoadedCredential(key, connected.credentialRef);
           apiKey = key;
           server = connected;
           changingServerAddress = false;
+          reconnectingServer = false;
         }}
       />
     {/if}

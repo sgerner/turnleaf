@@ -60,11 +60,15 @@ vi.mock('./lib/themes/themes', async (importOriginal) => {
   };
 });
 
-vi.mock('./lib/native/credentials', () => ({
-  getApiKey: getApiKeyMock,
-  removeApiKey: removeApiKeyMock,
-  saveApiKey: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('./lib/native/credentials', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    getApiKey: getApiKeyMock,
+    removeApiKey: removeApiKeyMock,
+    saveApiKey: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 vi.mock('./lib/database/database', () => ({
   getServer: getServerMock,
