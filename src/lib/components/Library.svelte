@@ -126,15 +126,6 @@
   const initialResolvedOffline = untrack(
     () => (preloadedStartup ? Boolean(initialOffline) : false) || isBrowserOffline(),
   );
-  function offlineStartupNotice(isOffline: boolean, items: readonly BookRecord[]): string {
-    if (!isOffline) return '';
-    const hasDisplayable = items.some(
-      (book) => book.remoteAvailable !== false || Boolean(book.downloadPath),
-    );
-    return hasDisplayable
-      ? 'No network connection. Showing your saved library.'
-      : 'No network connection. Connect to Kavita to load your library.';
-  }
   let activeApiKey = $derived(apiKey);
   const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
@@ -155,47 +146,35 @@
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
   });
-  let books = $state<BookRecord[]>(untrack(() => (preloadedStartup ? (initialBooks ?? []) : [])));
+  let books = $state<BookRecord[]>(untrack(() => initialBooks ?? []));
   let displayableBooks = $derived(
     books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
   );
+  function formatOfflineNotice(isOffline: boolean): string {
+    if (!isOffline) return '';
+    return displayableBooks.length
+      ? 'No network connection. Showing your saved library.'
+      : 'No network connection. Connect to Kavita to load your library.';
+  }
   let query = $state('');
   let offlineMessage = $state(
-    untrack(() =>
-      preloadedStartup ? offlineStartupNotice(initialResolvedOffline, initialBooks ?? []) : '',
-    ),
+    untrack(() => (preloadedStartup ? formatOfflineNotice(initialResolvedOffline) : '')),
   );
   let downloadedOnly = $state(
-    untrack(() =>
-      preloadedStartup
-        ? parseBooleanPreference(initialPreferences?.get('libraryDownloadedOnly'), false)
-        : false,
-    ),
+    untrack(() => parseBooleanPreference(initialPreferences?.get('libraryDownloadedOnly'), false)),
   );
   let hideCompleted = $state(
-    untrack(() =>
-      preloadedStartup
-        ? parseBooleanPreference(initialPreferences?.get('libraryHideCompleted'), true)
-        : true,
-    ),
+    untrack(() => parseBooleanPreference(initialPreferences?.get('libraryHideCompleted'), true)),
   );
   let queryTerms = $derived(normalizeLibrarySearch(query).split(' ').filter(Boolean));
   let sortOrder = $state<LibrarySortOrder>(
-    untrack(() =>
-      preloadedStartup ? parseSortOrder(initialPreferences?.get('librarySort') ?? null) : 'title',
-    ),
+    untrack(() => parseSortOrder(initialPreferences?.get('librarySort') ?? null)),
   );
-  let authorFilter = $state(
-    untrack(() => (preloadedStartup ? (initialPreferences?.get('libraryAuthor') ?? '') : '')),
-  );
-  let seriesFilter = $state(
-    untrack(() => (preloadedStartup ? (initialPreferences?.get('librarySeries') ?? '') : '')),
-  );
+  let authorFilter = $state(untrack(() => initialPreferences?.get('libraryAuthor') ?? ''));
+  let seriesFilter = $state(untrack(() => initialPreferences?.get('librarySeries') ?? ''));
   let filtersVisible = $state(false);
   let viewMode = $state<LibraryViewMode>(
-    untrack(() =>
-      preloadedStartup ? parseViewMode(initialPreferences?.get('libraryView') ?? null) : 'grid',
-    ),
+    untrack(() => parseViewMode(initialPreferences?.get('libraryView') ?? null)),
   );
   let advancedFiltersActive = $derived(
     sortOrder !== 'title' || Boolean(authorFilter) || Boolean(seriesFilter),
@@ -784,7 +763,7 @@
       books = savedBooks;
       retainCoversFor(books);
       loading = false;
-      offlineMessage = offlineStartupNotice(offline, books);
+      offlineMessage = formatOfflineNotice(offline);
     }
     void refreshSyncStatus();
     if (destroyed) return;
@@ -862,11 +841,7 @@
     }
     coverReloadRequest += 1;
     kavitaUnreachable = false;
-    offlineMessage = effectiveConnected
-      ? ''
-      : displayableBooks.length
-        ? 'No network connection. Showing your saved library.'
-        : 'No network connection. Connect to Kavita to load your library.';
+    offlineMessage = formatOfflineNotice(!effectiveConnected);
     if (effectiveConnected && wasOffline) {
       const baselineRevision = activeSyncStartRevision ?? messageRevision;
       const baselineMessage = activeSyncStartRevision !== null ? '' : message;

@@ -126,27 +126,30 @@
       const requestedTheme = savedTheme && isSkeletonTheme(savedTheme) ? savedTheme : DEFAULT_THEME;
       const resolvedMode = normalizeUiMode(savedMode);
 
-      if (saved) {
-        let credentialFailed = false;
-        const [themeLoaded, loadedKey, savedBooks, networkStatus] = await Promise.all([
-          loadTheme(requestedTheme).catch(() => false),
-          credentialsReady
-            .then(() => getApiKey(saved.credentialRef))
-            .catch(() => {
-              credentialFailed = true;
-              return null;
-            }),
-          getBooks(saved.id, { includeDescription: false }),
-          networkStatusPromise,
-        ]);
-        if (destroyed || generation !== loadGeneration) return;
+      let credentialFailed = false;
+      const [themeLoaded, loadedKey, savedBooks, networkStatus] = await Promise.all([
+        loadTheme(requestedTheme).catch(() => false),
+        saved
+          ? credentialsReady
+              .then(() => getApiKey(saved.credentialRef))
+              .catch(() => {
+                credentialFailed = true;
+                return null;
+              })
+          : Promise.resolve(null),
+        saved ? getBooks(saved.id, { includeDescription: false }) : Promise.resolve([]),
+        saved ? networkStatusPromise : Promise.resolve(null),
+      ]);
+      if (destroyed || generation !== loadGeneration) return;
 
-        const resolvedTheme: SkeletonTheme = themeLoaded ? requestedTheme : DEFAULT_THEME;
-        uiTheme = resolvedTheme;
-        uiMode = resolvedMode;
-        if (savedTheme !== undefined || savedMode !== undefined) {
-          writeBootThemeCache(resolvedTheme, resolvedMode);
-        }
+      const resolvedTheme: SkeletonTheme = themeLoaded ? requestedTheme : DEFAULT_THEME;
+      uiTheme = resolvedTheme;
+      uiMode = resolvedMode;
+      if (savedTheme !== undefined || savedMode !== undefined) {
+        writeBootThemeCache(resolvedTheme, resolvedMode);
+      }
+
+      if (saved) {
         const effectiveConnected = latestNetworkConnected ?? networkStatus?.connected === true;
         server = saved;
         apiKey = loadedKey;
@@ -164,19 +167,6 @@
           });
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
-        }
-      } else {
-        const [themeLoaded] = await Promise.all([
-          loadTheme(requestedTheme).catch(() => false),
-          networkStatusPromise,
-        ]);
-        if (destroyed || generation !== loadGeneration) return;
-
-        const resolvedTheme: SkeletonTheme = themeLoaded ? requestedTheme : DEFAULT_THEME;
-        uiTheme = resolvedTheme;
-        uiMode = resolvedMode;
-        if (savedTheme !== undefined || savedMode !== undefined) {
-          writeBootThemeCache(resolvedTheme, resolvedMode);
         }
       }
     } catch {

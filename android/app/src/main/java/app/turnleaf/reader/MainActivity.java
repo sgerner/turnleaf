@@ -10,52 +10,6 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 public class MainActivity extends BridgeActivity {
-    static final class ReaderChromeDispatchTracker {
-        private Boolean desired = null;
-        private Boolean applied = null;
-        private boolean scheduled = false;
-
-        synchronized boolean request(boolean enabled) {
-            desired = enabled;
-            if (!scheduled && Boolean.valueOf(enabled).equals(applied)) {
-                return false;
-            }
-            if (scheduled) {
-                return false;
-            }
-            scheduled = true;
-            return true;
-        }
-
-        synchronized Boolean beginApply() {
-            if (desired == null || desired.equals(applied)) {
-                scheduled = false;
-                return null;
-            }
-            return desired;
-        }
-
-        synchronized boolean completeApply(boolean appliedTarget, boolean succeeded) {
-            if (succeeded) {
-                applied = appliedTarget;
-            }
-            if (succeeded && desired != null && !desired.equals(applied)) {
-                return true;
-            }
-            scheduled = false;
-            return false;
-        }
-
-        synchronized void invalidateIfEnabled() {
-            if (Boolean.TRUE.equals(applied)) {
-                applied = null;
-            }
-        }
-    }
-
-    private final ReaderChromeDispatchTracker readerChromeTracker =
-        new ReaderChromeDispatchTracker();
-
     @Override
     public void onCreate(Bundle savedInstanceState) {
         SplashScreen.installSplashScreen(this);
@@ -72,54 +26,31 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
-    public void onPause() {
-        readerChromeTracker.invalidateIfEnabled();
-        super.onPause();
-    }
-
-    @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) {
             applyReaderChrome(ReaderChromePlugin.enabled);
-        } else {
-            readerChromeTracker.invalidateIfEnabled();
         }
     }
 
     void applyReaderChrome(boolean enabled) {
-        if (!readerChromeTracker.request(enabled)) {
-            return;
-        }
-        dispatchQueuedReaderChrome();
-    }
-
-    private void dispatchQueuedReaderChrome() {
         runOnUiThread(
             () -> {
-                Boolean target = readerChromeTracker.beginApply();
-                if (target == null) {
+                Window window = getWindow();
+                WindowCompat.setDecorFitsSystemWindows(window, !enabled);
+                WindowInsetsControllerCompat controller =
+                    WindowCompat.getInsetsController(window, window.getDecorView());
+                if (controller == null) {
                     return;
                 }
 
-                Window window = getWindow();
-                WindowCompat.setDecorFitsSystemWindows(window, !target);
-                WindowInsetsControllerCompat controller =
-                    WindowCompat.getInsetsController(window, window.getDecorView());
-                boolean succeeded = controller != null;
-                if (controller != null) {
-                    if (target) {
-                        controller.hide(WindowInsetsCompat.Type.systemBars());
-                        controller.setSystemBarsBehavior(
-                            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                        );
-                    } else {
-                        controller.show(WindowInsetsCompat.Type.systemBars());
-                    }
-                }
-
-                if (readerChromeTracker.completeApply(target, succeeded)) {
-                    dispatchQueuedReaderChrome();
+                if (enabled) {
+                    controller.hide(WindowInsetsCompat.Type.systemBars());
+                    controller.setSystemBarsBehavior(
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                } else {
+                    controller.show(WindowInsetsCompat.Type.systemBars());
                 }
             }
         );
