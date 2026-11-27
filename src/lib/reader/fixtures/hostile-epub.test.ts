@@ -271,6 +271,108 @@ it('sanitizes Section.render output and packaged stylesheets before iframe seria
   }
 });
 
+it('fails closed on cyclic packaged @import chains (A -> B -> A) without hanging or making remote requests', async () => {
+  const restoreObjectUrls = installObjectUrlShim();
+  const fetchSpy = vi.fn(async () => {
+    throw new Error('Unexpected network fetch during cyclic stylesheet sanitization');
+  });
+  vi.stubGlobal('fetch', fetchSpy);
+
+  const cyclicChapter = `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>Cyclic Stylesheets</title>
+    <link rel="stylesheet" href="styles/a.css" />
+    <link rel="stylesheet" href="styles/nested/b.css" />
+  </head>
+  <body>
+    <p class="cycle-a cycle-b">Cyclic stylesheet chapter</p>
+  </body>
+</html>`;
+  const cssA = `
+@import url('nested/b.css');
+@import url('https://attacker.example/cycle-a-remote.css');
+.cycle-a {
+  color: rgb(11, 22, 33);
+  background-image: url('../../Images/paper.png');
+}
+`;
+  const cssB = `
+@import '../a.css';
+@import url('b.css');
+@import url('https://attacker.example/cycle-b-remote.css');
+.cycle-b {
+  border-color: rgb(44, 55, 66);
+  background-image: url('../../../Images/cover.jpg');
+  list-style-image: url('https://attacker.example/cycle-b-bg.png');
+}
+`;
+  const opf = `<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="book-id">urn:uuid:cyclic-epub-fixture</dc:identifier>
+    <dc:title>Cyclic Stylesheet Fixture</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="chapter-1" href="Text/chapter-1.xhtml" media-type="application/xhtml+xml" />
+    <item id="css-a" href="Text/styles/a.css" media-type="text/css" />
+    <item id="css-b" href="Text/styles/nested/b.css" media-type="text/css" />
+    <item id="cover-image" href="Images/cover.jpg" media-type="image/png" />
+    <item id="paper-image" href="Images/paper.png" media-type="image/png" />
+  </manifest>
+  <spine>
+    <itemref idref="chapter-1" />
+  </spine>
+</package>`;
+
+  const archive = buildEpubArchive([
+    ['mimetype', 'application/epub+zip'],
+    [
+      'META-INF/container.xml',
+      '<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>',
+    ],
+    ['OEBPS/content.opf', opf],
+    ['OEBPS/Text/chapter-1.xhtml', cyclicChapter],
+    ['OEBPS/Text/styles/a.css', cssA],
+    ['OEBPS/Text/styles/nested/b.css', cssB],
+    ['OEBPS/Images/cover.jpg', ONE_PIXEL_PNG],
+    ['OEBPS/Images/paper.png', ONE_PIXEL_PNG],
+  ]);
+
+  const book = ePub(archive);
+  registerEpubSpineSanitizer(book as unknown as Parameters<typeof registerEpubSpineSanitizer>[0]);
+
+  try {
+    await book.opened;
+    const section = book.spine.get(0);
+    const rendered = await Promise.race([
+      section.render(book.load.bind(book)),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Timed out rendering cyclic stylesheet chapter')), 2000),
+      ),
+    ]);
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(rendered).not.toContain('attacker.example');
+    expect(rendered).not.toMatch(/@import/i);
+
+    const serializedDoc = new DOMParser().parseFromString(rendered, 'text/html');
+    expect(serializedDoc.querySelector('link[rel="stylesheet"]')).toBeNull();
+    const combinedStyles = [...serializedDoc.querySelectorAll('style')]
+      .map((style) => style.textContent ?? '')
+      .join('\n');
+    expect(combinedStyles).toContain('color: rgb(11, 22, 33)');
+    expect(combinedStyles).toContain('border-color: rgb(44, 55, 66)');
+    expect(combinedStyles).toMatch(/url\(['"]?blob:/);
+    expect(combinedStyles).not.toContain('attacker.example');
+    expect(combinedStyles).not.toMatch(/@import/i);
+  } finally {
+    book.destroy();
+    restoreObjectUrls();
+  }
+});
+
 it('opens hostile EPUBs in ReaderSession with zero outbound requests and aligned search CFIs', async () => {
   const restoreObjectUrls = installObjectUrlShim();
   const outboundRequests: string[] = [];

@@ -233,12 +233,16 @@ function sanitizeSrcset(value: string): string | null {
   return candidates.length ? candidates.join(', ') : null;
 }
 
+const MAX_STYLESHEET_IMPORT_DEPTH = 4;
+const CSS_IMPORT_STATEMENT =
+  /@import(?:\s+|(?=['"(]))(?:url\(\s*)?(?:'([^']*)'|"([^"]*)"|([^'"\s);]+))\s*\)?(?:\s+([^;{}]+);|\s*;?)/gi;
+
 function sanitizeCss(value: string): string {
   const withoutRemoteImports = value.replace(
-    /@import(?:\s+|(?=['"(]))(?:url\(\s*)?(?:'[^']*'|"[^"]*"|[^;\s)]+)\s*\)?\s*;?/gi,
-    (statement) => {
-      const match = statement.match(/(?:url\(\s*)?(['"]?)([^'"\s)]+)\1\s*\)?/i);
-      return match?.[2] && isSafeEpubReference(match[2], 'resource') ? statement : '';
+    CSS_IMPORT_STATEMENT,
+    (statement, singleQuoted?: string, doubleQuoted?: string, unquoted?: string) => {
+      const target = (singleQuoted ?? doubleQuoted ?? unquoted ?? '').trim();
+      return target && isSafeEpubReference(target, 'resource') ? statement : '';
     },
   );
   return withoutRemoteImports.replace(
@@ -331,63 +335,94 @@ function resolveArchiveUrl(reference: string, basePath: string): URL | null {
   }
 }
 
+function rewriteArchivedCssUrls(
+  cssChunk: string,
+  archive: EpubArchiveLike,
+  stylesheetPath: string,
+  sectionPath: string,
+): string {
+  return cssChunk.replace(
+    /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
+    (whole, quote: string, reference: string) => {
+      const trimmed = reference.trim();
+      if (!trimmed || trimmed === 'none') return whole;
+      if (!isSafeEpubReference(trimmed, 'resource')) return 'none';
+      if (trimmed.startsWith('#') || /^[a-z][a-z\d+.-]*:/i.test(trimmed)) return whole;
+      const assetUrl = resolveArchiveUrl(trimmed, stylesheetPath);
+      if (!assetUrl) return 'none';
+      const cachedUrl = archive.urlCache?.[assetUrl.pathname];
+      const rewritten =
+        cachedUrl && isSafeEpubReference(cachedUrl, 'resource')
+          ? cachedUrl
+          : relativeArchivePath(sectionPath, assetUrl.pathname);
+      const delimiter = quote || "'";
+      return `url(${delimiter}${rewritten}${delimiter})`;
+    },
+  );
+}
+
+async function resolveArchivedStylesheet(
+  archive: EpubArchiveLike,
+  stylesheetPath: string,
+  sectionPath: string,
+  visited: ReadonlySet<string>,
+  depth = 0,
+): Promise<string | null> {
+  if (depth > MAX_STYLESHEET_IMPORT_DEPTH || !archive.getText) return null;
+  let raw: string | undefined;
+  try {
+    raw = await archive.getText(stylesheetPath);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== 'string') return null;
+  const sanitized = sanitizeCss(raw);
+  let output = '';
+  let cursor = 0;
+  for (const match of sanitized.matchAll(CSS_IMPORT_STATEMENT)) {
+    const index = match.index ?? 0;
+    output += rewriteArchivedCssUrls(
+      sanitized.slice(cursor, index),
+      archive,
+      stylesheetPath,
+      sectionPath,
+    );
+    cursor = index + match[0].length;
+    const importHref = (match[1] ?? match[2] ?? match[3] ?? '').trim();
+    const mediaQuery = match[4]?.trim();
+    const importedUrl = isSafeEpubReference(importHref, 'stylesheet')
+      ? resolveArchiveUrl(importHref, stylesheetPath)
+      : null;
+    const importedCss =
+      importedUrl && !visited.has(importedUrl.pathname)
+        ? await resolveArchivedStylesheet(
+            archive,
+            importedUrl.pathname,
+            sectionPath,
+            new Set([...visited, importedUrl.pathname]),
+            depth + 1,
+          )
+        : null;
+    if (importedCss) {
+      output += mediaQuery ? `@media ${mediaQuery} {\n${importedCss}\n}` : importedCss;
+    }
+  }
+  output += rewriteArchivedCssUrls(sanitized.slice(cursor), archive, stylesheetPath, sectionPath);
+  return output;
+}
+
 async function loadArchivedStylesheet(
   archive: EpubArchiveLike,
   stylesheetPath: string,
   sectionPath: string,
   cache: StylesheetCache,
-  depth = 0,
 ): Promise<string | null> {
-  if (depth > 4 || !archive.getText) return null;
+  if (!archive.getText) return null;
   const key = `archive:${sectionPath}->${stylesheetPath}`;
   return rememberCachedStylesheet(
     key,
-    async () => {
-      const raw = await archive.getText?.(stylesheetPath);
-      if (typeof raw !== 'string') return null;
-      const sanitized = sanitizeCss(raw);
-      const importMatches = [
-        ...sanitized.matchAll(
-          /@import(?:\s+|(?=['"(]))(?:url\(\s*)?(['"]?)([^'"\s)]+)\1\s*\)?\s*;?/gi,
-        ),
-      ];
-      let withImports = sanitized;
-      for (const match of importMatches) {
-        const statement = match[0];
-        const importHref = match[2] ?? '';
-        const importedUrl = isSafeEpubReference(importHref, 'stylesheet')
-          ? resolveArchiveUrl(importHref, stylesheetPath)
-          : null;
-        const importedCss = importedUrl
-          ? await loadArchivedStylesheet(
-              archive,
-              importedUrl.pathname,
-              sectionPath,
-              cache,
-              depth + 1,
-            )
-          : null;
-        withImports = withImports.replace(statement, importedCss ?? '');
-      }
-      return withImports.replace(
-        /url\(\s*(['"]?)(.*?)\1\s*\)/gi,
-        (whole, quote: string, reference: string) => {
-          const trimmed = reference.trim();
-          if (!trimmed || trimmed === 'none') return whole;
-          if (!isSafeEpubReference(trimmed, 'resource')) return 'none';
-          if (trimmed.startsWith('#') || /^[a-z][a-z\d+.-]*:/i.test(trimmed)) return whole;
-          const assetUrl = resolveArchiveUrl(trimmed, stylesheetPath);
-          if (!assetUrl) return 'none';
-          const cachedUrl = archive.urlCache?.[assetUrl.pathname];
-          const rewritten =
-            cachedUrl && isSafeEpubReference(cachedUrl, 'resource')
-              ? cachedUrl
-              : relativeArchivePath(sectionPath, assetUrl.pathname);
-          const delimiter = quote || "'";
-          return `url(${delimiter}${rewritten}${delimiter})`;
-        },
-      );
-    },
+    () =>
+      resolveArchivedStylesheet(archive, stylesheetPath, sectionPath, new Set([stylesheetPath]), 0),
     cache,
   );
 }
