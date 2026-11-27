@@ -48,6 +48,7 @@
     applyNetworkStatusChange,
     canAttemptKavitaRequest,
     createReachabilityState,
+    hasActiveTransport,
     isKavitaNetworkFailure,
     type ReachabilityState,
   } from '../kavita/reachability';
@@ -118,7 +119,7 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   let activeApiKey = $derived(apiKey);
-  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey, ensureClientTransport));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     const allowDownload = !initialRefreshPending && (await networkAvailable({ manual: false }));
@@ -132,6 +133,10 @@
           server.id,
           allowDownload,
           serverOrigin,
+          (transferSignal) =>
+            !initialRefreshPending &&
+            !transferSignal?.aborted &&
+            networkAvailable({ manual: false }),
         );
       } catch (error) {
         if (!signal.aborted && isKavitaNetworkFailure(error)) {
@@ -763,12 +768,18 @@
       await registerListener(
         await Network.addListener('networkStatusChange', (nextStatus) => {
           if (destroyed) return;
-          if (handleNetworkStatus(nextStatus)) {
-            const baselineRevision = activeSyncStartRevision ?? messageRevision;
-            const baselineMessage = activeSyncStartRevision !== null ? '' : message;
-            void syncProgress(false);
-            void startRefresh(false, baselineRevision, baselineMessage);
+          const revision = ++networkStatusRevision;
+          if (!hasActiveTransport(nextStatus, transportOptions())) {
+            handleNetworkStatus(nextStatus);
+            return;
           }
+          if (!Capacitor.isNativePlatform()) {
+            if (handleNetworkStatus(nextStatus)) {
+              launchReconnectSyncAndRefresh();
+            }
+            return;
+          }
+          void confirmNativeNetworkStatus(revision);
         }),
       ),
     );
@@ -834,14 +845,40 @@
     sharedCoverLoader.cancel();
   }
 
+  let networkStatusRevision = 0;
+  let disconnectRevision = 0;
+
+  function applyDisconnectedState(state: ReachabilityState): void {
+    disconnectRevision += 1;
+    reachability = state;
+    initialRefreshPending = false;
+    abortActiveNetworkProbes();
+    offlineMessage = disconnectedLibraryMessage();
+  }
+
+  function launchReconnectSyncAndRefresh(): void {
+    const baselineRevision = activeSyncStartRevision ?? messageRevision;
+    const baselineMessage = activeSyncStartRevision !== null ? '' : message;
+    void syncProgress(false);
+    void startRefresh(false, baselineRevision, baselineMessage);
+  }
+
+  async function confirmNativeNetworkStatus(revision: number): Promise<void> {
+    const liveStatus = await Network.getStatus().catch(() => null);
+    if (destroyed || revision !== networkStatusRevision) return;
+    if (handleNetworkStatus(liveStatus)) {
+      launchReconnectSyncAndRefresh();
+    }
+  }
+
   function handleNetworkStatus(status: ConnectionStatus | null): boolean {
     const transition = applyNetworkStatusChange(reachability, status, transportOptions());
-    reachability = transition.state;
     if (transition.disconnected) {
-      initialRefreshPending = false;
-      abortActiveNetworkProbes();
-      offlineMessage = disconnectedLibraryMessage();
-    } else if (transition.shouldReconnect) {
+      applyDisconnectedState(transition.state);
+      return false;
+    }
+    reachability = transition.state;
+    if (transition.shouldReconnect) {
       initialRefreshPending = true;
       offlineMessage = '';
     }
@@ -868,17 +905,28 @@
 
   async function networkAvailable(options: { manual?: boolean } = {}): Promise<boolean> {
     if (destroyed || !canAttemptKavitaRequest(reachability, options)) return false;
+    const disconnectAtStart = disconnectRevision;
+    const statusRevisionAtStart = networkStatusRevision;
     const status = await Network.getStatus().catch(() => null);
     if (destroyed) return false;
     const transition = applyNetworkStatusChange(reachability, status, transportOptions());
     if (transition.disconnected) {
-      reachability = transition.state;
-      initialRefreshPending = false;
-      abortActiveNetworkProbes();
-      offlineMessage = disconnectedLibraryMessage();
+      applyDisconnectedState(transition.state);
       return false;
     }
+    if (disconnectRevision !== disconnectAtStart && reachability.offline) {
+      return false;
+    }
+    if (networkStatusRevision === statusRevisionAtStart) {
+      reachability = transition.state;
+    }
     return !destroyed && canAttemptKavitaRequest(reachability, options);
+  }
+
+  async function ensureClientTransport(signal?: AbortSignal): Promise<boolean> {
+    if (destroyed || signal?.aborted) return false;
+    const available = await networkAvailable({ manual: true });
+    return available && !destroyed && !signal?.aborted;
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -1186,6 +1234,7 @@
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
         serverOrigin,
+        ensureClientTransport,
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1814,7 +1863,11 @@
         throw new Error('No network connection. Connect to Kavita to update the API key.');
       }
 
-      const result = await new KavitaClient(server.baseUrl, nextKey).testConnection();
+      const result = await new KavitaClient(
+        server.baseUrl,
+        nextKey,
+        ensureClientTransport,
+      ).testConnection();
       if (result.bookLibraries.length === 0) {
         throw new Error(
           'This account has no book or light novel libraries. Only EPUB books are supported.',

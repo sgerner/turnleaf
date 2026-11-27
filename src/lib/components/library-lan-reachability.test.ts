@@ -12,6 +12,7 @@ import type { ConnectionStatus } from '@capacitor/network';
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BookRecord, ServerConfig } from '../database/database';
+import type * as ThemesModule from '../themes/themes';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as {
   DatabaseSync: typeof DatabaseSyncType;
@@ -330,10 +331,13 @@ vi.mock('@capacitor-community/sqlite', () => ({
   },
 }));
 
-vi.mock('../themes/themes', () => ({
-  skeletonThemes: ['vintage', 'fennec'],
-  loadTheme: vi.fn(async () => true),
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn(async () => true),
+  };
+});
 
 vi.mock('./Reader.svelte', async () => {
   interface MockReaderProps {
@@ -658,12 +662,15 @@ beforeEach(async () => {
   const { resetLocalDatabase } = await import('../database/database');
   await resetLocalDatabase();
   if (!Element.prototype.animate) {
-    Element.prototype.animate = () =>
-      ({
+    Element.prototype.animate = () => {
+      const animation = {
         cancel: () => undefined,
         finish: () => undefined,
-        onfinish: null,
-      }) as unknown as Animation;
+        onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+      };
+      queueMicrotask(() => animation.onfinish?.(new Event('finish') as AnimationPlaybackEvent));
+      return animation as unknown as Animation;
+    };
   }
   document.body.innerHTML = '';
   container = document.createElement('div');
@@ -1179,5 +1186,98 @@ describe('LAN transport and Kavita reachability component journeys', () => {
     openOfflineButton.click();
 
     await waitForCondition(() => harness.readerProps !== null);
+  });
+
+  it('blocks stale reconnect events and mid-refresh Series/v2 requests when native status drops to none', async () => {
+    fixture = await startKavitaFixture('lan-key-1');
+    harness.networkStatus = { connected: true, connectionType: 'wifi' };
+
+    const database = await import('../database/database');
+    const { Network } = await import('@capacitor/network');
+    const { saveApiKey } = await import('../native/credentials');
+    const { default: Library } = await import('./Library.svelte');
+
+    const server: ServerConfig = {
+      id: 'primary',
+      displayName: 'Books',
+      baseUrl: fixture.baseUrl,
+      credentialRef: 'server_primary_api_key',
+      kavitaVersion: '0.8.4',
+      lastConnectedAt: '2026-01-01T00:00:00.000Z',
+    };
+    await saveApiKey(server.credentialRef, 'lan-key-1');
+    await database.saveServer(server);
+
+    mountedComponent = mount(Library, {
+      target: container!,
+      props: {
+        server,
+        apiKey: 'lan-key-1',
+        theme: 'vintage',
+        mode: 'dark',
+        onThemeChange: vi.fn(),
+        onModeChange: vi.fn(),
+        onApiKeyChange: vi.fn(),
+        onServerDeleted: vi.fn(),
+        onChangeServerAddress: vi.fn(),
+      },
+    });
+
+    await waitForCondition(
+      () =>
+        Boolean(container!.querySelector('img[src*="covers/primary/1.img"]')) &&
+        Boolean(container!.querySelector('img[src*="covers/primary/2.img"]')),
+      2_000,
+    );
+    fixture.requests.length = 0;
+
+    // 1. Simulate Wi-Fi + cellular teardown: OS getStatus() already reports 'none',
+    // while a queued cellular networkStatusChange arrives late from the native bridge.
+    harness.emitNetworkChange({ connected: false, connectionType: 'none' });
+    harness.networkStatus = { connected: false, connectionType: 'none' };
+    for (const listener of harness.networkListeners) {
+      listener({ connected: false, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(fixture.requests).toHaveLength(0);
+    expect(container!.textContent).toContain('No network connection');
+
+    // 2. Reconnect cleanly, then simulate native status dropping to 'none' between
+    // refreshCatalog's initial admission check and KavitaClient's /api/Series/v2 call.
+    harness.emitNetworkChange({ connected: false, connectionType: 'wifi' });
+    await waitForCondition(
+      () =>
+        fixture!.requests.some((request) => request.path === '/api/Series/v2') &&
+        !container!.textContent?.includes('No network connection') &&
+        !container!.querySelector<HTMLButtonElement>('button[aria-label="Refresh library"]')!
+          .disabled &&
+        Boolean(container!.querySelector('img[src*="covers/primary/1.img"]')) &&
+        Boolean(container!.querySelector('img[src*="covers/primary/2.img"]')),
+      2_000,
+    );
+    fixture.requests.length = 0;
+
+    let statusCallCount = 0;
+    vi.mocked(Network.getStatus).mockImplementation(async () => {
+      statusCallCount += 1;
+      if (statusCallCount === 1) {
+        return { connected: false, connectionType: 'wifi' };
+      }
+      harness.networkStatus = { connected: false, connectionType: 'none' };
+      return { connected: false, connectionType: 'none' };
+    });
+
+    container!.querySelector<HTMLButtonElement>('button[aria-label="Refresh library"]')!.click();
+    await waitForCondition(
+      () => Boolean(container!.textContent?.includes('No network connection')),
+      2_000,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(fixture.requests).toHaveLength(0);
+    expect(
+      container!.querySelector<HTMLButtonElement>('button[aria-label="Refresh library"]')!.disabled,
+    ).toBe(true);
+    vi.mocked(Network.getStatus).mockImplementation(async () => ({ ...harness.networkStatus }));
   });
 });
