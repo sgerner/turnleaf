@@ -687,17 +687,25 @@ function updateBrowserBookProgress(
   );
 }
 
+export interface SaveLocalProgressOptions {
+  shouldCommit?: () => boolean;
+}
+
 export async function saveLocalProgress(
   book: BookRecord,
   cfi: string,
   xpath: string | null,
   percentage: number,
   spineIndex?: number,
+  options?: SaveLocalProgressOptions,
 ): Promise<void> {
+  if (options?.shouldCommit && !options.shouldCommit()) return;
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (options?.shouldCommit && !options.shouldCommit()) return false;
+      if (!state.books.some((item) => item.id === book.id)) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
@@ -736,6 +744,7 @@ export async function saveLocalProgress(
     return;
   }
   const db = await openDatabase();
+  if (options?.shouldCommit && !options.shouldCommit()) return;
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -744,14 +753,17 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await executeNativeTransaction(db, [
-    createReadingStateTask(book.id, cfi, xpath, percentage, now),
-    createSyncQueueTask(book.id, payload, now),
-    {
-      statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
-      values: [pagesRead, now, book.id],
-    },
-  ]);
+  await enqueueNativeWrite(async () => {
+    if (options?.shouldCommit && !options.shouldCommit()) return;
+    await db.executeTransaction([
+      createReadingStateTask(book.id, cfi, xpath, percentage, now),
+      createSyncQueueTask(book.id, payload, now),
+      {
+        statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
+        values: [pagesRead, now, book.id],
+      },
+    ]);
+  });
 }
 
 export async function markBookCompleted(book: BookRecord): Promise<void> {

@@ -806,7 +806,13 @@
 
   function syncProgress(showFeedback = true): Promise<void> {
     if (syncWork) return syncWork;
-    if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
+    if (
+      destroyed ||
+      conflict ||
+      resolvingOpenProgress ||
+      acceptingRemoteProgress ||
+      deletingServer
+    ) {
       return Promise.resolve();
     }
     syncWork = runProgressSync(showFeedback).finally(() => {
@@ -1283,11 +1289,13 @@
     if (openProgress === 'remote' && remote) {
       resolvingOpenProgress = true;
       try {
-        if (!(await saveRemoteProgress(book, remote, local))) {
+        const accepted = await localProgressBuffer.runAuthoritative(book.id, () =>
+          saveRemoteProgress(book, remote, local),
+        );
+        if (!accepted) {
           message = 'The saved reading position changed. Open the book again.';
           return;
         }
-        localProgressBuffer.clear(book.id);
         updateRemoteBookProgress(book, remote);
       } catch {
         message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
@@ -1355,6 +1363,7 @@
   }
 
   async function relocated(book: BookRecord, location: ReaderLocation): Promise<void> {
+    if (deletingServer) return;
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
     const savedBook = books.find((item) => item.id === book.id);
@@ -1411,12 +1420,14 @@
       accept: async () => {
         acceptingRemoteProgress = true;
         try {
+          await localProgressBuffer.clear(book.id);
           // An upload cannot race with deletion of the exact revision it is sending.
           await syncWork;
-          const accepted = await saveRemoteProgress(book, remote, local);
+          const accepted = await localProgressBuffer.runAuthoritative(book.id, () =>
+            saveRemoteProgress(book, remote, local),
+          );
           if (!accepted)
             throw new Error('The saved reading position changed. Sync again to retry.');
-          localProgressBuffer.clear(book.id);
           updateRemoteBookProgress(book, remote);
           void refreshSyncStatus();
         } finally {
@@ -1436,14 +1447,13 @@
 
   async function markDone(book: BookRecord): Promise<void> {
     try {
-      await markBookCompleted(book);
+      await localProgressBuffer.runAuthoritative(book.id, () => markBookCompleted(book));
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'storage error';
       message = `Could not mark ${book.title} as read: ${detail}`;
       closeMenu();
       return;
     }
-    localProgressBuffer.clear(book.id);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
       savedBook.pagesRead = book.pages;
@@ -1529,13 +1539,13 @@
       return;
     }
 
+    const expectedRevision = local.syncRevision;
     acceptingRemoteProgress = true;
     try {
-      const accepted = await acceptRemoteProgress(
-        current.book,
-        current.remote,
-        local.syncRevision,
-        local.localUpdatedAt,
+      await localProgressBuffer.clear(current.book.id);
+      await syncWork;
+      const accepted = await localProgressBuffer.runAuthoritative(current.book.id, () =>
+        acceptRemoteProgress(current.book, current.remote, expectedRevision, local.localUpdatedAt),
       );
       if (!accepted) {
         dismissConflict();
@@ -1543,7 +1553,6 @@
         return;
       }
 
-      localProgressBuffer.clear(current.book.id);
       const lastReadAt = current.remote.lastModifiedUtc ?? new Date().toISOString();
       const pagesRead = Math.max(0, Math.min(current.book.pages, current.remote.pageNum));
       books = books.map((book) =>
@@ -1706,8 +1715,11 @@
         await removeApiKey(server.credentialRef);
         credentialCleanupComplete = true;
       }
-      await removeServer(server.id);
-      localProgressBuffer.clear();
+      if (syncTimer !== null) {
+        window.clearTimeout(syncTimer);
+        syncTimer = null;
+      }
+      await localProgressBuffer.runAuthoritative(undefined, () => removeServer(server.id));
       await clearDiagnostics();
       onServerDeleted();
       message = 'Server removed. Add it again to browse the library.';
