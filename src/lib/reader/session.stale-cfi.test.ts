@@ -946,4 +946,63 @@ describe('ReaderSession stale CFI and highlight recovery (real epubjs + marks-pa
     expect(finalEntry?.location.href).toContain('chapter-1.xhtml');
     expect(finalEntry?.location.cfi).toBe(initialLocation?.cfi);
   });
+
+  it('preserves saved chapter restoration when the viewport resizes during open and before initial relocation settles', async () => {
+    books.set(
+      'resize-open-restore.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter 1',
+          body: '<h1>Chapter 1</h1><p id="p1" data-page="0">Opening chapter paragraph.</p>',
+        },
+        {
+          id: 'ch2',
+          href: 'chapter-2.xhtml',
+          title: 'Chapter 2',
+          body: '<h1>Chapter 2</h1><p id="p2" data-page="0">Restored offline passage in chapter two.</p>',
+        },
+      ]),
+    );
+
+    const savedCfi = 'epubcfi(/6/4[ch2]!/4/4[p2]/1:0)';
+
+    for (const timing of ['during-open', 'before-initial-raf'] as const) {
+      const locations: Array<{ location: ReaderLocation; origin: string }> = [];
+      const viewport = createViewport();
+      const session = trackSession(`${baseUrl}/resize-open-restore.epub`);
+      const openPromise = session.open(
+        viewport,
+        savedCfi,
+        '//body/DocFragment[2]/body/p[1]',
+        0.5,
+        defaultAppearance,
+        (loc, origin) => locations.push({ location: loc, origin }),
+        () => {},
+      );
+
+      if (timing === 'during-open') {
+        triggerTestViewportResize(viewport, 411, 914);
+        await openPromise;
+      } else {
+        await openPromise;
+        triggerTestViewportResize(viewport, 411, 914);
+      }
+
+      for (let attempt = 0; attempt < 10 && locations.length === 0; attempt += 1) {
+        await flushEpubLocationReport();
+      }
+      await flushEpubLocationReport();
+
+      expect(viewport.querySelectorAll('iframe').length).toBeGreaterThan(0);
+      const renderedHeading = Array.from(viewport.querySelectorAll('iframe')).some(
+        (frame) => frame.contentDocument?.querySelector('h1')?.textContent === 'Chapter 2',
+      );
+      expect(renderedHeading).toBe(true);
+      expect(locations.at(-1)?.origin).toBe('restore');
+      expect(locations.at(-1)?.location.href).toContain('chapter-2.xhtml');
+      expect(locations.at(-1)?.location.cfi).toMatch(/^epubcfi\(\/6\/4/);
+    }
+  });
 });
