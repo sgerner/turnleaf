@@ -73,7 +73,7 @@ export function activeElement(): HTMLElement | null {
 }
 
 export function focusFirstElement(container: HTMLElement | null): void {
-  if (!container) return;
+  if (!container || isHiddenOrInert(container)) return;
   const candidates = container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
   const first = findFirstFocusableElement(candidates)?.element;
   (first ?? container).focus();

@@ -377,6 +377,29 @@ describe('Reader inspectors, keyboard selection, and Dynamic Type', () => {
     await flushAsync();
     expect(host.querySelector('#reader-figure-viewer')).toBeNull();
     expect(document.activeElement).toBe(figureOpener);
+
+    // 4. Disconnected inspector opener falls back to reader reveal/toolbar via modal-focus guards
+    const disconnectedOpener = document.createElement('a');
+    disconnectedOpener.href = '#fn-2';
+    host.append(disconnectedOpener);
+    sessionMock.inspectors.onFootnote?.(
+      {
+        title: 'Footnote 2',
+        paragraphs: ['Detached opener fallback test.'],
+      },
+      disconnectedOpener,
+    );
+    await flushAsync();
+    disconnectedOpener.remove();
+
+    host
+      .querySelector<HTMLElement>('#reader-footnote')!
+      .dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+      );
+    await flushAsync();
+    expect(host.querySelector('#reader-footnote')).toBeNull();
+    expect(document.activeElement).toBe(host.querySelector('.reader-top-reveal'));
   });
 
   it('scales default reader font size when turnleafDynamicType fires without adding custom preferences', async () => {

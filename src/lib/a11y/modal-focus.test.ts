@@ -79,19 +79,48 @@ it('closes on Escape and restores focus to a connected opener', () => {
   expect(document.activeElement).toBe(opener);
 });
 
-it('restores focus to an opener inside a child iframe', () => {
+it('restores focus to an opener inside a child iframe and falls back when the iframe is inert or body', () => {
+  const fallback = document.createElement('button');
+  document.body.append(fallback);
+
+  const wrapper = document.createElement('div');
   const iframe = document.createElement('iframe');
-  document.body.append(iframe);
+  wrapper.append(iframe);
+  document.body.append(wrapper);
   const childDoc = iframe.contentDocument!;
   const childLink = childDoc.createElement('a');
   childLink.setAttribute('role', 'link');
   childLink.tabIndex = 0;
   childDoc.body.append(childLink);
 
-  restoreFocus(childLink);
-
+  restoreFocus(childLink, fallback);
   expect(childDoc.activeElement).toBe(childLink);
-  iframe.remove();
+
+  first.focus();
+  restoreFocus(childDoc.body, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  wrapper.inert = true;
+  first.focus();
+  restoreFocus(childLink, fallback);
+  expect(document.activeElement).toBe(fallback);
+
+  const inertOverlay = document.createElement('div');
+  inertOverlay.setAttribute('inert', '');
+  const inertDialog = document.createElement('dialog');
+  inertDialog.setAttribute('open', '');
+  inertDialog.tabIndex = -1;
+  const inertClose = document.createElement('button');
+  inertDialog.append(inertClose);
+  inertOverlay.append(inertDialog);
+  document.body.append(inertOverlay);
+
+  first.focus();
+  focusFirstElement(inertDialog);
+  expect(document.activeElement).toBe(first);
+
+  wrapper.remove();
+  inertOverlay.remove();
 });
 
 it('falls back when opener is disabled, disconnected, document.body, or inside an inert ancestor', () => {

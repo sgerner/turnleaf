@@ -227,3 +227,69 @@ it('allows a manual retry after an authorization failure', async () => {
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
 });
+
+it('halts in-flight progress flush on network handover without dropping concurrent reader relocations, then uploads latest revision on reconnect', async () => {
+  vi.useFakeTimers();
+  const t0 = '2026-09-07T00:00:00.000Z';
+  vi.setSystemTime(new Date(t0));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(pendingState(t0, '{"pageNum":10}')));
+
+  let networkUp = true;
+  let releaseInFlightSave!: () => void;
+  const inFlightSave = new Promise<void>((resolve) => {
+    releaseInFlightSave = resolve;
+  });
+  let notifySaveStarted!: () => void;
+  const saveStarted = new Promise<void>((resolve) => {
+    notifySaveStarted = resolve;
+  });
+
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      notifySaveStarted();
+      return inFlightSave;
+    })
+    .mockResolvedValue(undefined);
+  const client = { saveProgress } as never;
+
+  const firstFlush = flushProgress(client, 'server', {
+    canContinue: () => networkUp,
+  });
+  await saveStarted;
+
+  // User turns pages while the earlier progress upload is in flight, then connectivity drops
+  vi.setSystemTime(new Date('2026-09-07T00:00:02.000Z'));
+  await saveLocalProgress(book, 'cfi-ch2', '/body/DocFragment[2]/body/p[1]', 0.5, 1);
+  networkUp = false;
+  releaseInFlightSave();
+  await firstFlush;
+
+  // No second authenticated request was sent after connectivity dropped, and the newer relocation stays pending
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+  const midState = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(midState.readingState['book-1']?.pendingSync).toBe(true);
+  expect(midState.syncQueue['book-1']).toBeDefined();
+
+  // Reconnecting flushes the latest reader navigation target cleanly
+  networkUp = true;
+  await flushProgress(client, 'server', {
+    canContinue: () => networkUp,
+  });
+
+  expect(saveProgress).toHaveBeenCalledTimes(2);
+  expect(saveProgress).toHaveBeenNthCalledWith(
+    2,
+    expect.objectContaining({
+      pageNum: 2,
+      bookScrollId: '/body/DocFragment[2]/body/p[1]',
+    }),
+  );
+  const finalState = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(finalState.readingState['book-1']?.pendingSync).toBe(false);
+  expect(finalState.syncQueue['book-1']).toBeUndefined();
+});

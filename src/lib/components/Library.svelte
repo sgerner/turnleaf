@@ -1466,7 +1466,10 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id);
+        await flushProgress(client, server.id, {
+          canContinue: () =>
+            Capacitor.isNativePlatform() ? networkAvailable() : !offline && !destroyed,
+        });
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {

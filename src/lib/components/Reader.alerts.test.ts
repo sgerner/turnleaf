@@ -4,6 +4,7 @@ import { flushSync, mount, tick, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as SessionModule from '../reader/session';
 import type {
+  ReaderInspectorCallbacks,
   ReaderLinkReturnTarget,
   ReaderLocation,
   ReaderLocationOrigin,
@@ -21,6 +22,7 @@ const mocks = vi.hoisted(() => {
     onZoneTap: (zone: 'previous' | 'center' | 'next') => void;
     onSelection: (selection: ReaderSelection | null) => void;
     onKeydown: (event: KeyboardEvent) => void;
+    inspectors: ReaderInspectorCallbacks;
   };
 
   let latestHandlers: OpenHandlers | null = null;
@@ -54,8 +56,9 @@ const mocks = vi.hoisted(() => {
         onZoneTap: OpenHandlers['onZoneTap'],
         onSelection: OpenHandlers['onSelection'],
         onKeydown: OpenHandlers['onKeydown'],
+        inspectors: ReaderInspectorCallbacks = {},
       ) => {
-        latestHandlers = { onRelocated, onZoneTap, onSelection, onKeydown };
+        latestHandlers = { onRelocated, onZoneTap, onSelection, onKeydown, inspectors };
         await openImpl();
       },
     );
@@ -653,5 +656,120 @@ describe('Reader alert modals and focus containment', () => {
     expect(target.querySelector('[role="alertdialog"]')).toBeNull();
     expect(target.querySelector('.reader-overlay')).toBeNull();
     expect(document.activeElement).toBe(target.querySelector('.reader-top-reveal'));
+  });
+
+  it('keeps z-40 sync alert focus and inert boundaries intact when an inspector opens and closes while a sync alert is raised', async () => {
+    const onSyncLatest = vi.fn(() =>
+      Promise.resolve({
+        xpath: '/body/DocFragment[2]/body/p[3]',
+        percentage: 0.55,
+        accept: vi.fn(() => Promise.resolve()),
+      }),
+    );
+
+    mounted = mount(Reader, {
+      target,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-sync-inspector',
+        title: 'Inspector Sync Book',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onSyncLatest,
+      },
+    });
+    await settle();
+
+    const viewport = target.querySelector<HTMLElement>('.reader-viewport')!;
+    const iframe = document.createElement('iframe');
+    viewport.append(iframe);
+    const childDoc = iframe.contentDocument!;
+    const footnoteLink = childDoc.createElement('a');
+    footnoteLink.href = '#fn-1';
+    childDoc.body.append(footnoteLink);
+
+    // Reveal controls and trigger Sync to raise the z-40 sync conflict alertdialog
+    target
+      .querySelector<HTMLButtonElement>('.reader-top-reveal[aria-label="Show reading controls"]')!
+      .click();
+    await settle();
+
+    const syncBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Sync latest reading position"]',
+    )!;
+    syncBtn.focus();
+    syncBtn.click();
+    await settle();
+
+    const syncDialog = target.querySelector<HTMLElement>(
+      '.z-40 [role="alertdialog"][aria-modal="true"]',
+    );
+    expect(syncDialog).not.toBeNull();
+    const stayBtn = Array.from(syncDialog!.querySelectorAll<HTMLButtonElement>('button')).find(
+      (btn) => btn.textContent?.includes('Stay here'),
+    )!;
+    expect(document.activeElement).toBe(stayBtn);
+    expect(isMarkedInert(viewport)).toBe(true);
+    expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(true);
+
+    // 1. Open and close an inspector (#reader-footnote) WHILE the sync alert remains raised
+    mocks.getHandlers()?.inspectors.onFootnote?.(
+      {
+        title: 'Footnote 1',
+        paragraphs: ['Inspector content opened behind active sync alert.'],
+      },
+      footnoteLink,
+    );
+    await settle();
+
+    const footnoteDialog = target.querySelector<HTMLElement>('#reader-footnote');
+    expect(footnoteDialog).not.toBeNull();
+    expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(true);
+    expect(isMarkedInert(viewport)).toBe(true);
+    expect(document.activeElement).toBe(stayBtn);
+
+    // Close the inspector while the sync alert is still raised
+    target.querySelector<HTMLButtonElement>('[aria-label="Close footnote"]')!.click();
+    await settle();
+
+    expect(target.querySelector('#reader-footnote')).toBeNull();
+    expect(target.querySelector('.z-40 [role="alertdialog"]')).toBe(syncDialog);
+    expect(isMarkedInert(viewport)).toBe(true);
+    expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(true);
+    expect(document.activeElement).toBe(stayBtn);
+    expect(childDoc.activeElement).not.toBe(footnoteLink);
+
+    // 2. Open an inspector again while sync alert is raised, dismiss sync alert first, then close inspector
+    mocks.getHandlers()?.inspectors.onFootnote?.(
+      {
+        title: 'Footnote 2',
+        paragraphs: ['Footnote remaining after sync alert dismissal.'],
+      },
+      footnoteLink,
+    );
+    await settle();
+    expect(target.querySelector('#reader-footnote')).not.toBeNull();
+    expect(document.activeElement).toBe(stayBtn);
+
+    // Dismissing the top-level sync alert un-inerts .reader-overlay and moves focus to #reader-footnote
+    stayBtn.click();
+    await settle();
+
+    expect(target.querySelector('.z-40 [role="alertdialog"]')).toBeNull();
+    expect(target.querySelector('#reader-footnote')).not.toBeNull();
+    expect(isMarkedInert(target.querySelector('.reader-overlay'))).toBe(false);
+    expect(isMarkedInert(viewport)).toBe(true);
+    const closeFootnoteBtn = target.querySelector<HTMLButtonElement>(
+      '[aria-label="Close footnote"]',
+    )!;
+    expect(document.activeElement).toBe(closeFootnoteBtn);
+
+    // Closing #reader-footnote now un-inerts .reader-viewport and restores focus to the iframe opener
+    closeFootnoteBtn.click();
+    await settle();
+
+    expect(target.querySelector('#reader-footnote')).toBeNull();
+    expect(isMarkedInert(viewport)).toBe(false);
+    expect(childDoc.activeElement).toBe(footnoteLink);
   });
 });

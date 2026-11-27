@@ -451,13 +451,14 @@
 
   function focusReaderTarget(panel: HTMLElement | null, target: string, id?: string): void {
     void tick().then(() => {
-      const controls = panel?.querySelectorAll<HTMLElement>('[data-reader-focus]') ?? [];
+      if (!panel || hasTopLevelAlert()) return;
+      const controls = panel.querySelectorAll<HTMLElement>('[data-reader-focus]');
       const element = [...controls].find(
         (control) =>
           control.dataset.readerFocus === target &&
           (id === undefined || control.dataset.readerFocusId === id),
       );
-      (element ?? panel)?.focus();
+      (element ?? panel).focus();
     });
   }
 
@@ -534,8 +535,9 @@
     return session !== null && sessionReady && !startupOpenFailed;
   }
 
-  function errorFallbackTarget(): HTMLElement | null {
-    if (errorRestoreReturnLink && returnToLinkButton) return returnToLinkButton;
+  function readerFocusFallback(preferred: HTMLElement | null = null): HTMLElement | null {
+    if (error) return errorPanel;
+    if (pendingSyncLocation) return syncConfirmationPanel;
     if (pendingExternalLink) return externalLinkPanel;
     if (activeFootnote) return footnotePanel;
     if (activeFigure) return figurePanel;
@@ -544,7 +546,28 @@
     if (bookmarksVisible) return bookmarksPanel;
     if (annotationsVisible) return annotationsPanel;
     if (searchVisible) return searchPanel;
-    return readerToolbar ?? topRevealButton;
+    return preferred ?? readerToolbar ?? topRevealButton;
+  }
+
+  function captureOverlayOpener(opener: HTMLElement | null = null): HTMLElement | null {
+    if (opener) return opener;
+    if (hasTopLevelAlert()) return null;
+    return activeElement();
+  }
+
+  function restoreOverlayFocus(
+    opener: HTMLElement | null,
+    preferredFallback: HTMLElement | null = null,
+  ): void {
+    restoreModalFocus(hasTopLevelAlert() ? null : opener, () =>
+      readerFocusFallback(preferredFallback),
+    );
+  }
+
+  function errorFallbackTarget(): HTMLElement | null {
+    if (pendingSyncLocation) return syncConfirmationPanel;
+    if (errorRestoreReturnLink && returnToLinkButton) return returnToLinkButton;
+    return readerFocusFallback();
   }
 
   function openReaderError(
@@ -594,7 +617,7 @@
   function openSettings(): void {
     pauseChromeHide();
     clearInspectorModals();
-    const opener = activeElement();
+    const opener = captureOverlayOpener();
     clearToolbarPanels();
     settingsOpener = opener;
     settingsVisible = true;
@@ -605,14 +628,17 @@
     settingsVisible = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(
+      opener,
+      readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-appearance"]') ?? null,
+    );
     resumeChromeHide();
   }
 
   function openToc(): void {
     pauseChromeHide();
     clearInspectorModals();
-    const opener = activeElement();
+    const opener = captureOverlayOpener();
     clearToolbarPanels();
     tocOpener = opener;
     tocVisible = true;
@@ -629,14 +655,17 @@
     }
     const opener = tocOpener;
     tocOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(
+      opener,
+      readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-contents"]') ?? null,
+    );
     resumeChromeHide();
   }
 
   function openBookmarks(): void {
     pauseChromeHide();
     clearInspectorModals();
-    const opener = activeElement();
+    const opener = captureOverlayOpener();
     clearToolbarPanels();
     bookmarksOpener = opener;
     bookmarksVisible = true;
@@ -649,7 +678,10 @@
     bookmarkLimitMessage = '';
     const opener = bookmarksOpener;
     bookmarksOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(
+      opener,
+      readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-bookmarks"]') ?? null,
+    );
     resumeChromeHide();
   }
 
@@ -665,7 +697,7 @@
     controlsVisible = true;
     pauseChromeHide();
     clearInspectorModals();
-    const opener = activeElement();
+    const opener = captureOverlayOpener();
     clearToolbarPanels();
     annotationsOpener = opener;
     refreshVisiblePassages();
@@ -684,13 +716,14 @@
     pauseChromeHide();
     clearInspectorModals();
     clearToolbarPanels();
-    annotationsOpener = opener ?? activeElement();
+    annotationsOpener = captureOverlayOpener(opener);
     activeAnnotationId = matched?.id ?? null;
     refreshVisiblePassages();
     annotationMessage = '';
     annotationsVisible = true;
     if (matched) {
       void tick().then(() => {
+        if (hasTopLevelAlert()) return;
         const cards =
           annotationsPanel?.querySelectorAll<HTMLElement>('[data-annotation-card]') ?? [];
         const card = [...cards].find((node) => node.dataset.annotationCard === matched.id);
@@ -717,11 +750,10 @@
     exportMessage = '';
     const opener = annotationsOpener;
     annotationsOpener = null;
-    void tick().then(() => {
-      if (opener?.isConnected && opener !== document.body) restoreFocus(opener);
-      else
-        readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-annotations"]')?.focus();
-    });
+    restoreOverlayFocus(
+      opener,
+      readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-annotations"]') ?? null,
+    );
     resumeChromeHide();
   }
 
@@ -735,7 +767,7 @@
   function openSearch(): void {
     pauseChromeHide();
     clearInspectorModals();
-    const opener = activeElement();
+    const opener = captureOverlayOpener();
     clearToolbarPanels();
     searchOpener = opener;
     searchVisible = true;
@@ -750,7 +782,10 @@
     searching = false;
     const opener = searchOpener;
     searchOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(
+      opener,
+      readerToolbar?.querySelector<HTMLElement>('[aria-controls="reader-search"]') ?? null,
+    );
     resumeChromeHide();
   }
 
@@ -771,7 +806,7 @@
     const opener = syncConfirmationOpener;
     syncConfirmationOpener = null;
     if (restore) {
-      restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
+      restoreModalFocus(hasOpenOverlayModal() ? null : opener, () => readerFocusFallback());
     }
     resumeChromeHide();
   }
@@ -780,7 +815,7 @@
     pauseChromeHide();
     clearToolbarPanels();
     clearInspectorModals();
-    externalLinkOpener = opener ?? activeElement();
+    externalLinkOpener = captureOverlayOpener(opener);
     pendingExternalLink = link;
     focusModal(() => externalLinkPanel);
   }
@@ -790,7 +825,7 @@
     externalLinkMessage = '';
     const opener = externalLinkOpener;
     externalLinkOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(opener);
     resumeChromeHide();
   }
 
@@ -823,7 +858,7 @@
     pauseChromeHide();
     clearToolbarPanels();
     clearInspectorModals();
-    footnoteOpener = opener ?? activeElement();
+    footnoteOpener = captureOverlayOpener(opener);
     activeFootnote = footnote;
     focusModal(() => footnotePanel);
   }
@@ -832,7 +867,7 @@
     activeFootnote = null;
     const opener = footnoteOpener;
     footnoteOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(opener);
     resumeChromeHide();
   }
 
@@ -840,7 +875,7 @@
     pauseChromeHide();
     clearToolbarPanels();
     clearInspectorModals();
-    figureOpener = opener ?? activeElement();
+    figureOpener = captureOverlayOpener(opener);
     figureZoom = 1;
     figurePan = { x: 0, y: 0 };
     activeFigure = figure;
@@ -854,7 +889,7 @@
     figurePointers.clear();
     const opener = figureOpener;
     figureOpener = null;
-    restoreModalFocus(opener);
+    restoreOverlayFocus(opener);
     resumeChromeHide();
   }
 
@@ -1538,6 +1573,8 @@
       await progress.accept?.();
       if (destroyed || session !== reader) return;
       await displaySyncedLocation(reader, progress);
+      clearInspectorModals();
+      clearToolbarPanels();
       showControls();
       restoreModalFocus(opener, () => readerToolbar ?? topRevealButton);
     } catch (cause) {
