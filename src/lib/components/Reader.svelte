@@ -21,6 +21,7 @@
   import {
     ReaderSession,
     resolveReaderKeyboardAction,
+    type ReaderCfiDisplayStatus,
     type ReaderLocation,
     type ReaderLinkReturnTarget,
     type ReaderSelection,
@@ -174,6 +175,7 @@
   let readerSyncMessage = $state('');
   let searchError = $state('');
   let searchController: AbortController | null = null;
+  let navigationController: AbortController | null = null;
   let appearance = $state<Appearance>({ ...defaultAppearance });
   let location = $state<ReaderLocation | null>(null);
   let linkReturnTarget = $state<ReaderLinkReturnTarget | null>(null);
@@ -297,14 +299,15 @@
             queuePreference(`readerAnnotations:${bookId}`, JSON.stringify(annotations));
           }
         }
-        if (resolution.missingIds.length > 0) {
-          unanchoredAnnotationIds = [
-            ...new Set([...unanchoredAnnotationIds, ...resolution.missingIds]),
-          ];
+        const activeMissingIds = resolution.missingIds.filter((id) =>
+          annotations.some((entry) => entry.id === id),
+        );
+        if (activeMissingIds.length > 0) {
+          unanchoredAnnotationIds = [...new Set([...unanchoredAnnotationIds, ...activeMissingIds])];
           const message =
-            resolution.missingIds.length === 1
+            activeMissingIds.length === 1
               ? '1 saved highlight no longer matches the text in this EPUB. Your note is still saved.'
-              : `${resolution.missingIds.length} saved highlights no longer match the text in this EPUB. Your notes are still saved.`;
+              : `${activeMissingIds.length} saved highlights no longer match the text in this EPUB. Your notes are still saved.`;
           annotationMessage = message;
           highlightNotice = message;
         }
@@ -412,6 +415,8 @@
     if (tocVirtualizationFrame !== null) window.cancelAnimationFrame(tocVirtualizationFrame);
     flushPendingPreferences();
     searchController?.abort();
+    navigationController?.abort();
+    navigationController = null;
     const handle = resumeHandle;
     resumeHandle = null;
     void handle?.remove();
@@ -1094,15 +1099,65 @@
     focusReaderTarget(annotationsPanel, next ? 'annotation-edit' : 'annotations-heading', next?.id);
   }
 
+  function beginNavigationRequest(): AbortSignal {
+    navigationController?.abort();
+    const controller = new AbortController();
+    navigationController = controller;
+    return controller.signal;
+  }
+
+  function cancelNavigationRequest(): void {
+    navigationController?.abort();
+    navigationController = null;
+  }
+
+  async function tryDisplayCfi(
+    reader: ReaderSession,
+    cfi: string,
+    fallbackHref: string | undefined,
+    signal: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (typeof reader.displayCfiStatus === 'function') {
+      return reader.displayCfiStatus(cfi, fallbackHref, signal);
+    }
+    const ok = await reader.displayCfi(cfi, fallbackHref, signal);
+    if (signal.aborted || destroyed || session !== reader) return 'aborted';
+    return ok ? 'displayed' : 'missing';
+  }
+
+  async function tryDisplayHref(
+    reader: ReaderSession,
+    href: string,
+    signal: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (typeof reader.displayHrefStatus === 'function') {
+      return reader.displayHrefStatus(href, signal);
+    }
+    if (typeof reader.displayHref === 'function') {
+      const ok = await reader.displayHref(href, signal);
+      return signal.aborted || destroyed || session !== reader
+        ? 'aborted'
+        : ok
+          ? 'displayed'
+          : 'missing';
+    }
+    await reader.display(href);
+    return signal.aborted || destroyed || session !== reader ? 'aborted' : 'displayed';
+  }
+
   async function selectAnnotation(annotation: StoredAnnotation): Promise<void> {
     const reader = session;
     if (!reader) return;
+    const signal = beginNavigationRequest();
     annotationMessage = '';
     highlightNotice = '';
-    const result = await reader.displayAnnotation(annotation);
-    if (destroyed || session !== reader) return;
+    const result = await reader.displayAnnotation(annotation, signal);
+    if (result.status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
     if (result.status === 'displayed' || result.status === 'repaired') {
-      if (result.status === 'repaired') {
+      if (
+        result.status === 'repaired' &&
+        annotations.some((entry) => entry.id === annotation.id && entry.cfi === annotation.cfi)
+      ) {
         const next = repairAnnotations(annotations, [
           { id: annotation.id, cfi: result.cfi, href: result.href },
         ]);
@@ -1124,16 +1179,14 @@
     }
     if (annotation.href) {
       try {
-        if (typeof reader.displayHref === 'function') {
-          await reader.displayHref(annotation.href);
-        } else {
-          await reader.display(annotation.href);
-        }
+        const fallbackStatus = await tryDisplayHref(reader, annotation.href, signal);
+        if (fallbackStatus === 'aborted') return;
       } catch {
         // Keep the saved note accessible in the panel even if the chapter href also disappeared.
       }
-      if (destroyed || session !== reader) return;
+      if (signal.aborted || destroyed || session !== reader) return;
     }
+    if (!annotations.some((entry) => entry.id === annotation.id)) return;
     annotationMessage =
       'This highlighted text is no longer available in the current EPUB. Your note is still saved.';
   }
@@ -1227,65 +1280,80 @@
   }
 
   async function openSearchResult(result: ReaderSearchResult): Promise<void> {
-    if (!session) return;
+    const reader = session;
+    if (!reader) return;
+    const signal = beginNavigationRequest();
     try {
-      const restored = await session.displayCfi(result.cfi, result.href);
-      if (restored) {
+      const status = await tryDisplayCfi(reader, result.cfi, result.href, signal);
+      if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      if (status === 'displayed') {
         closeSearch();
         showControls();
       } else {
         searchError = 'This search result is no longer available in the current EPUB.';
       }
     } catch {
-      searchError = 'This search result is no longer available in the current EPUB.';
+      if (!signal.aborted && !destroyed && session === reader) {
+        searchError = 'This search result is no longer available in the current EPUB.';
+      }
     }
   }
 
   async function returnToLocation(saved: StoredReaderLocation): Promise<void> {
-    if (!session) return;
+    const reader = session;
+    if (!reader) return;
+    const signal = beginNavigationRequest();
     highlightNotice = '';
     const opener = activeElement();
     try {
-      let restored = await session.displayCfi(saved.cfi, saved.href);
-      if (!restored && saved.href) {
-        restored =
-          typeof session.displayHref === 'function'
-            ? await session.displayHref(saved.href)
-            : (await session.display(saved.href), true);
+      let status = await tryDisplayCfi(reader, saved.cfi, saved.href, signal);
+      if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      if (status === 'missing' && saved.href) {
+        status = await tryDisplayHref(reader, saved.href, signal);
+        if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
       }
       if (
-        !restored &&
+        status === 'missing' &&
         Number.isFinite(saved.percentage) &&
         saved.percentage >= 0 &&
-        typeof session.displayPercentageLocation === 'function'
+        typeof reader.displayPercentageLocation === 'function'
       ) {
-        restored = await session.displayPercentageLocation(saved.percentage);
+        status =
+          typeof reader.displayPercentageLocationStatus === 'function'
+            ? await reader.displayPercentageLocationStatus(saved.percentage, signal)
+            : (await reader.displayPercentageLocation(saved.percentage, signal))
+              ? 'displayed'
+              : 'missing';
+        if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
       }
-      if (restored) {
+      if (status === 'displayed') {
         closeBookmarks();
         showControls();
       } else {
         openReaderError('This saved location is no longer available in the current EPUB.', opener);
       }
     } catch {
-      openReaderError('This saved location is no longer available in the current EPUB.', opener);
+      if (!signal.aborted && !destroyed && session === reader) {
+        openReaderError('This saved location is no longer available in the current EPUB.', opener);
+      }
     }
   }
 
   async function returnToLink(): Promise<void> {
-    if (!session || !linkReturnTarget) return;
+    const reader = session;
+    if (!reader || !linkReturnTarget) return;
+    const signal = beginNavigationRequest();
     const opener = activeElement();
     const restoreLink = opener === returnToLinkButton;
     const target = linkReturnTarget;
     try {
-      let restored = await session.displayCfi(target.cfi, target.href);
-      if (!restored && target.href) {
-        restored =
-          typeof session.displayHref === 'function'
-            ? await session.displayHref(target.href)
-            : (await session.display(target.href), true);
+      let status = await tryDisplayCfi(reader, target.cfi, target.href, signal);
+      if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
+      if (status === 'missing' && target.href) {
+        status = await tryDisplayHref(reader, target.href, signal);
+        if (status === 'aborted' || signal.aborted || destroyed || session !== reader) return;
       }
-      if (restored) {
+      if (status === 'displayed') {
         linkReturnTarget = null;
         showControls();
       } else {
@@ -1296,16 +1364,19 @@
         );
       }
     } catch {
-      openReaderError(
-        'The location before this link is no longer available in the current EPUB.',
-        opener,
-        restoreLink,
-      );
+      if (!signal.aborted && !destroyed && session === reader) {
+        openReaderError(
+          'The location before this link is no longer available in the current EPUB.',
+          opener,
+          restoreLink,
+        );
+      }
     }
   }
 
   async function turn(direction: 'next' | 'previous'): Promise<void> {
     if (!session || Boolean(error)) return;
+    cancelNavigationRequest();
     highlightNotice = '';
     const opener = activeElement();
     try {
@@ -2108,6 +2179,7 @@
                     aria-current={isCurrent ? 'location' : undefined}
                     type="button"
                     onclick={() => {
+                      cancelNavigationRequest();
                       void session?.display(item.href);
                       closeToc();
                     }}
@@ -2162,6 +2234,7 @@
                           type="button"
                           onkeydown={(event) => void continueTocTabbing(event, row.index)}
                           onclick={() => {
+                            cancelNavigationRequest();
                             void session?.display(row.href);
                             closeToc();
                           }}

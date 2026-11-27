@@ -9,6 +9,7 @@ import {
   installEpubJsdomEnvironment,
   TEST_PAGE_HEIGHT,
   TEST_PAGE_WIDTH,
+  triggerTestViewportResize,
 } from './fixtures/test-epub-harness';
 import {
   ReaderSession,
@@ -891,5 +892,58 @@ describe('ReaderSession stale CFI and highlight recovery (real epubjs + marks-pa
     expect(await session.displayAnnotation(midWordShortHighlight)).toEqual({ status: 'missing' });
     expect(await session.displayAnnotation(brokenRefrainOne)).toEqual({ status: 'missing' });
     expect(await session.displayAnnotation(brokenRefrainTwo)).toEqual({ status: 'missing' });
+  });
+
+  it('aborts a display that is in flight during a resize in real epubjs and preserves the final CFI', async () => {
+    books.set(
+      'resize-abort.epub',
+      buildTestEpub([
+        {
+          id: 'ch1',
+          href: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          body: '<p id="opening" data-page="0">Opening chapter paragraph retained across resize.</p>',
+        },
+        {
+          id: 'ch2',
+          href: 'chapter-2.xhtml',
+          title: 'Chapter Two',
+          body: '<p id="target" data-page="0">Chapter two target that is aborted mid-flight.</p>',
+        },
+      ]),
+    );
+
+    const locations: Array<{ location: ReaderLocation; origin: string }> = [];
+    const viewport = createViewport();
+    const session = trackSession(`${baseUrl}/resize-abort.epub`);
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      (loc, origin) => locations.push({ location: loc, origin }),
+      () => {},
+    );
+    await flushEpubLocationReport();
+
+    const initialLocation = locations.at(-1)?.location;
+    expect(initialLocation?.href).toContain('chapter-1.xhtml');
+    expect(initialLocation?.cfi).toMatch(/^epubcfi\(/);
+
+    locations.length = 0;
+    const inFlight = session.displayCfiStatus('epubcfi(/6/4!/4/2[target]/1:0)', 'chapter-2.xhtml');
+    triggerTestViewportResize(viewport, 480, 720);
+
+    await expect(inFlight).resolves.toBe('aborted');
+    for (let attempt = 0; attempt < 10 && locations.length === 0; attempt += 1) {
+      await flushEpubLocationReport();
+    }
+
+    const finalEntry = locations.at(-1);
+    expect(finalEntry).toBeDefined();
+    expect(finalEntry?.origin).toBe('restore');
+    expect(finalEntry?.location.href).toContain('chapter-1.xhtml');
+    expect(finalEntry?.location.cfi).toBe(initialLocation?.cfi);
   });
 });

@@ -1,10 +1,28 @@
-import ePub, {
-  type Contents,
-  type EpubCFI as EpubCfiInstance,
-  type Location,
-  type Rendition,
-} from 'epubjs';
+import ePub, { type Contents, type Location, type Rendition } from 'epubjs';
 import type { Appearance } from './appearance';
+import {
+  MAX_STORED_EXCERPT_LENGTH,
+  buildDocumentTextMap,
+  extractSelectionContext,
+  findExcerptMatchInDocument,
+  findExcerptRangeInDocument,
+  getEpubCfiConstructor,
+  normalizeSpineHref,
+  normalizeWhitespace,
+  parseRuntimeCfi,
+  recordRangeInTextMap,
+  validateAndClampReadingCfi,
+  validateHighlightRangeInDocument,
+  type ClaimedTextSpan,
+  type DocumentTextMap,
+  type EpubCfiConstructor,
+  type ReaderAnnotationDisplayResult,
+  type ReaderCfiDisplayStatus,
+  type ReaderHighlightInput,
+  type ReaderHighlightResolution,
+  type RenderedEpubView,
+  type RuntimeParsedCfi,
+} from './cfi-anchors';
 import {
   clipReaderSearchExcerpt,
   normalizeReaderSearchQuery,
@@ -19,6 +37,13 @@ import {
   type TocItem,
 } from './toc';
 
+export {
+  findExcerptRangeInDocument,
+  type ReaderAnnotationDisplayResult,
+  type ReaderCfiDisplayStatus,
+  type ReaderHighlightInput,
+  type ReaderHighlightResolution,
+};
 export type { TocItem } from './toc';
 
 export interface ReaderLocation {
@@ -42,25 +67,6 @@ export interface ReaderSelection {
   prefix?: string;
   suffix?: string;
 }
-
-export interface ReaderHighlightInput {
-  id?: string;
-  cfi: string;
-  excerpt?: string;
-  href?: string | undefined;
-  prefix?: string | undefined;
-  suffix?: string | undefined;
-}
-
-export interface ReaderHighlightResolution {
-  repaired: Array<{ id: string; cfi: string; href: string }>;
-  missingIds: string[];
-}
-
-export type ReaderAnnotationDisplayResult =
-  | { status: 'displayed'; cfi: string; href: string }
-  | { status: 'repaired'; cfi: string; href: string }
-  | { status: 'missing' };
 
 export type ReaderKeyboardAction = 'next' | 'previous' | 'clear-selection' | null;
 
@@ -95,100 +101,16 @@ interface SpineSection {
   unload: () => void;
 }
 
-interface RuntimeCfiStep {
-  type: 'element' | 'text';
-  index: number;
-  id: string | null;
-}
-
-interface RuntimeCfiComponent {
-  steps: Array<RuntimeCfiStep | undefined>;
-  terminal: {
-    offset: number | null;
-    assertion: string | null;
-  } | null;
-}
-
-interface RuntimeParsedCfi {
-  spinePos: number;
-  range: boolean;
-  base: RuntimeCfiComponent;
-  path: RuntimeCfiComponent;
-  start: RuntimeCfiComponent | null;
-  end: RuntimeCfiComponent | null;
-}
-
-interface EpubCfiConstructor {
-  new (
-    cfiFrom?: string | Range | Node,
-    base?: string | object,
-    ignoreClass?: string,
-  ): EpubCfiInstance;
-}
-
-interface InternalRenditionQueue {
-  enqueue?: <T>(task: () => T | Promise<T>) => Promise<T>;
-  running?: boolean;
-}
-
-interface InternalRenditionStage {
-  resizeFunc?: EventListener;
-  orientationChangeFunc?: EventListener;
-}
-
-interface InternalRenditionManager {
-  stage?: InternalRenditionStage;
-  resize?: (width?: number, height?: number, epubcfi?: string) => void;
-}
-
-type InternalRendition = Rendition & {
-  q?: InternalRenditionQueue;
-  displaying?: unknown;
-  manager?: InternalRenditionManager;
-};
-
-function hasRenditionQueue(rendition: Rendition | null): rendition is InternalRendition & {
-  q: Required<Pick<InternalRenditionQueue, 'enqueue'>> & InternalRenditionQueue;
-} {
-  return Boolean(rendition && typeof (rendition as InternalRendition).q?.enqueue === 'function');
-}
-
-interface RenderedViewContents {
-  document: Document;
-  sectionIndex?: number;
-  cfiBase?: string;
-  range: (cfi: string, ignoreClass?: string) => Range | null;
-  cfiFromRange: (range: Range, ignoreClass?: string) => string;
-}
-
-interface RenderedEpubView {
-  index: number;
-  displayed?: boolean;
-  section?: { href: string; index: number; cfiBase?: string };
-  contents?: RenderedViewContents;
-}
-
-interface TextMapPosition {
-  node: Text;
-  offset: number;
-}
-
-interface DocumentTextMap {
-  text: string;
-  lowerText: string;
-  starts: TextMapPosition[];
-  ends: TextMapPosition[];
-}
-
-interface ClaimedTextSpan {
-  start: number;
-  end: number;
-}
-
 interface EpubTocItem {
   label: string;
   href: string;
   subitems?: EpubTocItem[];
+}
+
+interface ActiveDisplayContext {
+  generation: number;
+  signal: AbortSignal;
+  isAborted: () => boolean;
 }
 
 const MODE_COLORS = {
@@ -490,575 +412,24 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
-const SELECTION_CONTEXT_CHARS = 64;
-const MAX_STORED_EXCERPT_LENGTH = 500;
-const IGNORED_TEXT_CONTAINERS = new Set(['head', 'noscript', 'script', 'style', 'title']);
-const BLOCK_ELEMENTS = new Set([
-  'address',
-  'article',
-  'aside',
-  'blockquote',
-  'dd',
-  'div',
-  'dl',
-  'dt',
-  'figcaption',
-  'figure',
-  'footer',
-  'h1',
-  'h2',
-  'h3',
-  'h4',
-  'h5',
-  'h6',
-  'header',
-  'li',
-  'main',
-  'nav',
-  'ol',
-  'p',
-  'pre',
-  'section',
-  'table',
-  'td',
-  'th',
-  'tr',
-  'ul',
-]);
-
-function normalizeWhitespace(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function normalizeSpineHref(href: string): string {
-  return href.split('#', 1)[0]?.trim() ?? '';
-}
-
-function getEpubCfiConstructor(rendition?: Rendition | null): EpubCfiConstructor | null {
-  const fromModule = (ePub as unknown as { CFI?: EpubCfiConstructor }).CFI;
-  if (typeof fromModule === 'function') return fromModule;
-  const fromRendition = (rendition as unknown as { epubcfi?: { constructor?: EpubCfiConstructor } })
-    ?.epubcfi?.constructor;
-  return typeof fromRendition === 'function' ? fromRendition : null;
-}
-
-function parseRuntimeCfi(
-  cfi: string,
-  CfiClass: EpubCfiConstructor | null,
-): RuntimeParsedCfi | null {
-  const trimmed = cfi.trim();
-  if (!trimmed || !trimmed.includes('!') || !CfiClass) return null;
+function raceWithAbort<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work();
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  let pending: Promise<T>;
   try {
-    const checker = new CfiClass();
-    if (!checker.isCfiString(trimmed)) return null;
-    const parsed = new CfiClass(trimmed) as unknown as RuntimeParsedCfi;
-    if (!Number.isInteger(parsed.spinePos) || parsed.spinePos < 0) return null;
-    if (!Array.isArray(parsed.base?.steps) || !Array.isArray(parsed.path?.steps)) return null;
-    return parsed;
-  } catch {
-    return null;
+    pending = Promise.resolve(work());
+  } catch (error) {
+    return Promise.reject(error);
   }
-}
-
-interface ResolvedCfiEndpoint {
-  node: Node;
-  offset: number;
-  clamped: boolean;
-  elementOnly: boolean;
-  relocatedById: boolean;
-}
-
-function canEpubCfiResolveInDocument(
-  doc: Document,
-  cfi: string,
-  CfiClass: EpubCfiConstructor,
-): boolean {
-  try {
-    const instance = new CfiClass(cfi) as unknown as {
-      toRange?: (targetDoc: Document) => Range | null;
-    };
-    if (typeof instance.toRange !== 'function') return true;
-    return Boolean(instance.toRange(doc));
-  } catch {
-    return false;
-  }
-}
-
-function resolveCfiStepsInDocument(
-  doc: Document,
-  steps: Array<RuntimeCfiStep | undefined>,
-  terminalOffset: number | null,
-): ResolvedCfiEndpoint | null {
-  const root = doc.documentElement;
-  if (!root || steps.length === 0) return null;
-  let current: Node | null = root;
-  let relocatedById = false;
-
-  for (let index = 0; index < steps.length; index += 1) {
-    const step = steps[index];
-    if (!step || !Number.isInteger(step.index) || step.index < 0) return null;
-
-    if (step.type === 'element') {
-      if (current.nodeType !== Node.ELEMENT_NODE) return null;
-      const element = current as Element;
-      if (step.id) {
-        const indexedChild = element.children[step.index];
-        if (indexedChild && indexedChild.getAttribute('id') === step.id) {
-          current = indexedChild;
-        } else {
-          const byId = doc.getElementById(step.id);
-          if (!byId || !root.contains(byId)) return null;
-          current = byId;
-          relocatedById = true;
-        }
-      } else {
-        current = element.children[step.index] ?? null;
-        if (!current) return null;
-      }
-      continue;
-    }
-
-    if (index !== steps.length - 1 || current.nodeType !== Node.ELEMENT_NODE) return null;
-    const textNodes = [...current.childNodes].filter(
-      (node): node is Text => node.nodeType === Node.TEXT_NODE,
-    );
-    const textNode = textNodes[step.index];
-    if (!textNode) return null;
-    const rawOffset = terminalOffset ?? 0;
-    const clampedOffset = Math.max(0, Math.min(rawOffset, textNode.data.length));
-    return {
-      node: textNode,
-      offset: clampedOffset,
-      clamped: clampedOffset !== rawOffset,
-      elementOnly: false,
-      relocatedById,
-    };
-  }
-
-  if (terminalOffset === null) {
-    return { node: current, offset: 0, clamped: false, elementOnly: true, relocatedById };
-  }
-  const maxOffset = current.childNodes.length;
-  const clampedOffset = Math.max(0, Math.min(terminalOffset, maxOffset));
-  return {
-    node: current,
-    offset: clampedOffset,
-    clamped: clampedOffset !== terminalOffset,
-    elementOnly: false,
-    relocatedById,
-  };
-}
-
-function cfiFromEndpoint(
-  doc: Document,
-  endpoint: ResolvedCfiEndpoint,
-  cfiBase: string,
-  CfiClass: EpubCfiConstructor,
-): string | null {
-  try {
-    if (endpoint.elementOnly || endpoint.node.nodeType === Node.ELEMENT_NODE) {
-      const targetNode =
-        !endpoint.elementOnly && endpoint.node.childNodes.length > 0
-          ? (endpoint.node.childNodes[
-              Math.min(endpoint.offset, endpoint.node.childNodes.length - 1)
-            ] ?? endpoint.node)
-          : endpoint.node;
-      if (targetNode.nodeType === Node.TEXT_NODE) {
-        const range = doc.createRange();
-        range.setStart(targetNode, 0);
-        range.collapse(true);
-        return new CfiClass(range, cfiBase).toString();
-      }
-      return new CfiClass(targetNode, cfiBase).toString();
-    }
-    const range = doc.createRange();
-    range.setStart(endpoint.node, endpoint.offset);
-    range.collapse(true);
-    return new CfiClass(range, cfiBase).toString();
-  } catch {
-    return null;
-  }
-}
-
-function validateAndClampReadingCfi(
-  doc: Document,
-  parsed: RuntimeParsedCfi,
-  originalCfi: string,
-  cfiBase: string | undefined,
-  sectionIndex: number,
-  CfiClass: EpubCfiConstructor,
-): string | null {
-  const spineShifted = parsed.spinePos !== sectionIndex;
-  if (!parsed.range) {
-    const endpoint = resolveCfiStepsInDocument(
-      doc,
-      parsed.path.steps,
-      parsed.path.terminal?.offset ?? null,
-    );
-    if (!endpoint) return null;
-    if (!cfiBase) {
-      return endpoint.clamped || endpoint.relocatedById || spineShifted ? null : originalCfi;
-    }
-    if (
-      !endpoint.clamped &&
-      !endpoint.relocatedById &&
-      !spineShifted &&
-      canEpubCfiResolveInDocument(doc, originalCfi, CfiClass)
-    ) {
-      return originalCfi;
-    }
-    return cfiFromEndpoint(doc, endpoint, cfiBase, CfiClass);
-  }
-
-  const startSteps = [...parsed.path.steps, ...(parsed.start?.steps ?? [])];
-  const endSteps = [...parsed.path.steps, ...(parsed.end?.steps ?? [])];
-  const start = resolveCfiStepsInDocument(doc, startSteps, parsed.start?.terminal?.offset ?? null);
-  if (!start) return null;
-  const end = resolveCfiStepsInDocument(doc, endSteps, parsed.end?.terminal?.offset ?? null);
-  if (!cfiBase) {
-    return start.clamped ||
-      start.relocatedById ||
-      end?.clamped ||
-      end?.relocatedById ||
-      spineShifted
-      ? null
-      : originalCfi;
-  }
-
-  if (
-    end &&
-    !start.clamped &&
-    !start.relocatedById &&
-    !end.clamped &&
-    !end.relocatedById &&
-    !spineShifted &&
-    canEpubCfiResolveInDocument(doc, originalCfi, CfiClass)
-  ) {
-    return originalCfi;
-  }
-
-  if (end && start.node.nodeType === Node.TEXT_NODE && end.node.nodeType === Node.TEXT_NODE) {
-    try {
-      const range = doc.createRange();
-      range.setStart(start.node, start.offset);
-      range.setEnd(end.node, end.offset);
-      if (!range.collapsed) return new CfiClass(range, cfiBase).toString();
-    } catch {
-      // Fall back to the validated start position when the end offset collapsed.
-    }
-  }
-  return cfiFromEndpoint(doc, start, cfiBase, CfiClass);
-}
-
-function rangeMatchesExcerpt(
-  rangeText: string,
-  expectedExcerpt: string,
-  excerptWasTruncated: boolean,
-): boolean {
-  const normalizedRange = normalizeWhitespace(rangeText);
-  const normalizedExcerpt = normalizeWhitespace(expectedExcerpt);
-  if (!normalizedRange || !normalizedExcerpt) return false;
-  if (normalizedRange === normalizedExcerpt) return true;
-  if (excerptWasTruncated && normalizedRange.startsWith(normalizedExcerpt)) return true;
-  const compactRange = normalizedRange.replace(/\s+/g, '');
-  const compactExcerpt = normalizedExcerpt.replace(/\s+/g, '');
-  if (compactRange === compactExcerpt) return true;
-  return excerptWasTruncated && compactRange.startsWith(compactExcerpt);
-}
-
-function isIgnoredTextNode(node: Text): boolean {
-  let parent = node.parentElement;
-  while (parent) {
-    if (IGNORED_TEXT_CONTAINERS.has(parent.localName.toLowerCase())) return true;
-    parent = parent.parentElement;
-  }
-  return false;
-}
-
-function closestBlockElement(node: Node): Element | null {
-  let current = node.parentElement;
-  while (current) {
-    if (BLOCK_ELEMENTS.has(current.localName.toLowerCase())) return current;
-    current = current.parentElement;
-  }
-  return null;
-}
-
-function buildDocumentTextMap(doc: Document): DocumentTextMap {
-  const root = doc.body ?? doc.documentElement;
-  if (!root) return { text: '', lowerText: '', starts: [], ends: [] };
-  const chars: string[] = [];
-  const starts: TextMapPosition[] = [];
-  const ends: TextMapPosition[] = [];
-  let lastBlock: Element | null = null;
-
-  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  let currentNode = walker.nextNode();
-  while (currentNode) {
-    const textNode = currentNode as Text;
-    currentNode = walker.nextNode();
-    if (!textNode.data || isIgnoredTextNode(textNode)) continue;
-    const block = closestBlockElement(textNode);
-    if (chars.length > 0 && block !== lastBlock && chars[chars.length - 1] !== ' ') {
-      const previousEnd = ends[ends.length - 1]!;
-      chars.push(' ');
-      starts.push(previousEnd);
-      ends.push({ node: textNode, offset: 0 });
-    }
-    if (block) lastBlock = block;
-
-    const data = textNode.data;
-    for (let offset = 0; offset < data.length; offset += 1) {
-      const character = data[offset]!;
-      if (/\s/.test(character)) {
-        if (chars.length === 0 || chars[chars.length - 1] === ' ') continue;
-        chars.push(' ');
-        starts.push({ node: textNode, offset });
-        ends.push({ node: textNode, offset: offset + 1 });
-      } else {
-        chars.push(character);
-        starts.push({ node: textNode, offset });
-        ends.push({ node: textNode, offset: offset + 1 });
-      }
-    }
-  }
-
-  if (chars[chars.length - 1] === ' ') {
-    chars.pop();
-    starts.pop();
-    ends.pop();
-  }
-  const text = chars.join('');
-  return { text, lowerText: text.toLowerCase(), starts, ends };
-}
-
-function scoreContextAffix(actual: string, expected: string, fromEnd: boolean): number {
-  if (!actual || !expected) return 0;
-  const actualLower = actual.toLowerCase();
-  const expectedLower = expected.toLowerCase();
-  const limit = Math.min(actualLower.length, expectedLower.length);
-  let matched = 0;
-  for (let index = 0; index < limit; index += 1) {
-    const actualChar = fromEnd ? actualLower[actualLower.length - 1 - index] : actualLower[index];
-    const expectedChar = fromEnd
-      ? expectedLower[expectedLower.length - 1 - index]
-      : expectedLower[index];
-    if (actualChar !== expectedChar) break;
-    matched += 1;
-  }
-  return matched;
-}
-
-function recordRangeInTextMap(
-  map: DocumentTextMap,
-  range: Range,
-  claimedSpans: ClaimedTextSpan[],
-): void {
-  if (map.starts.length === 0 || range.collapsed) return;
-  if (typeof range.comparePoint === 'function') {
-    let first = -1;
-    let last = -1;
-    for (let index = 0; index < map.starts.length; index += 1) {
-      const startPos = map.starts[index]!;
-      const endPos = map.ends[index]!;
-      try {
-        const startCmp = range.comparePoint(startPos.node, startPos.offset);
-        if (startCmp > 0) break;
-        if (startCmp === 0 && range.comparePoint(endPos.node, endPos.offset) === 0) {
-          if (first < 0) first = index;
-          last = index;
-        }
-      } catch {
-        return;
-      }
-    }
-    if (first >= 0 && last >= first) {
-      claimedSpans.push({ start: first, end: last + 1 });
-    }
-    return;
-  }
-
-  const startIndex = map.starts.findIndex(
-    (entry) => entry.node === range.startContainer && entry.offset >= range.startOffset,
-  );
-  if (startIndex < 0) return;
-  for (let index = startIndex; index < map.ends.length; index += 1) {
-    const entry = map.ends[index]!;
-    if (entry.node === range.endContainer && entry.offset >= range.endOffset) {
-      claimedSpans.push({ start: startIndex, end: index + 1 });
-      return;
-    }
-  }
-}
-
-interface ExcerptMatchResult {
-  range: Range;
-  score: number;
-  candidateCount: number;
-  unambiguous: boolean;
-}
-
-function isWordCharacter(char: string | undefined): boolean {
-  return Boolean(char && /[\p{L}\p{N}]/u.test(char));
-}
-
-function findExcerptMatchInDocument(
-  doc: Document,
-  excerpt: string,
-  options?: {
-    prefix?: string | undefined;
-    suffix?: string | undefined;
-    textMap?: DocumentTextMap | undefined;
-    claimedSpans?: ClaimedTextSpan[] | undefined;
-    competingBrokenCount?: number | undefined;
-    requireUnambiguous?: boolean | undefined;
-  },
-): ExcerptMatchResult | null {
-  const query = normalizeWhitespace(excerpt);
-  if (!query) return null;
-  const map = options?.textMap ?? buildDocumentTextMap(doc);
-  if (!map.text) return null;
-
-  const candidates: ClaimedTextSpan[] = [];
-  let searchFrom = 0;
-  while (searchFrom <= map.text.length - query.length) {
-    const found = map.text.indexOf(query, searchFrom);
-    if (found < 0) break;
-    candidates.push({ start: found, end: found + query.length });
-    searchFrom = found + 1;
-  }
-
-  if (candidates.length === 0) {
-    const lowerQuery = query.toLowerCase();
-    searchFrom = 0;
-    while (searchFrom <= map.lowerText.length - lowerQuery.length) {
-      const found = map.lowerText.indexOf(lowerQuery, searchFrom);
-      if (found < 0) break;
-      candidates.push({ start: found, end: found + lowerQuery.length });
-      searchFrom = found + 1;
-    }
-  }
-
-  if (candidates.length === 0) return null;
-
-  const prefix = options?.prefix ? normalizeWhitespace(options.prefix) : '';
-  const suffix = options?.suffix ? normalizeWhitespace(options.suffix) : '';
-  const claimed = options?.claimedSpans ?? [];
-  const overlapsClaimed = (candidate: ClaimedTextSpan): boolean =>
-    claimed.some((span) => candidate.start < span.end && candidate.end > span.start);
-
-  let bestScore = -1;
-  let tiedBestCount = 0;
-  let chosen: ClaimedTextSpan | null = null;
-  let chosenScore = -1;
-
-  for (const candidate of candidates) {
-    const before = prefix
-      ? map.text.slice(Math.max(0, candidate.start - prefix.length - 8), candidate.start).trimEnd()
-      : '';
-    const after = suffix
-      ? map.text
-          .slice(candidate.end, Math.min(map.text.length, candidate.end + suffix.length + 8))
-          .trimStart()
-      : '';
-    const score = scoreContextAffix(before, prefix, true) + scoreContextAffix(after, suffix, false);
-    if (score > bestScore) {
-      bestScore = score;
-      tiedBestCount = 1;
-    } else if (score === bestScore) {
-      tiedBestCount += 1;
-    }
-
-    if (!overlapsClaimed(candidate) && score > chosenScore) {
-      chosen = candidate;
-      chosenScore = score;
-    }
-  }
-
-  if (!chosen) return null;
-
-  const minContextScore = Math.min(4, prefix.length + suffix.length);
-  const contextContradicted =
-    minContextScore > 0 && query.length < 32 && chosenScore < minContextScore;
-  const embeddedMidWord =
-    query.length < 24 &&
-    chosenScore === 0 &&
-    ((isWordCharacter(query[0]) && isWordCharacter(map.text[chosen.start - 1])) ||
-      (isWordCharacter(query[query.length - 1]) && isWordCharacter(map.text[chosen.end])));
-  const competingBrokenAmbiguous =
-    (options?.competingBrokenCount ?? 1) > candidates.length &&
-    chosenScore < Math.max(1, minContextScore);
-  const unambiguous =
-    !contextContradicted &&
-    !embeddedMidWord &&
-    !competingBrokenAmbiguous &&
-    ((candidates.length === 1 && chosenScore === bestScore) ||
-      (bestScore >= Math.max(1, minContextScore) &&
-        tiedBestCount === 1 &&
-        chosenScore === bestScore));
-
-  if (options?.requireUnambiguous && !unambiguous) {
-    return null;
-  }
-
-  const startPos = map.starts[chosen.start];
-  const endPos = map.ends[chosen.end - 1];
-  if (!startPos || !endPos) return null;
-  try {
-    const range = doc.createRange();
-    range.setStart(startPos.node, startPos.offset);
-    range.setEnd(endPos.node, endPos.offset);
-    if (range.collapsed) return null;
-    options?.claimedSpans?.push(chosen);
-    return {
-      range,
-      score: Math.max(0, chosenScore),
-      candidateCount: candidates.length,
-      unambiguous,
-    };
-  } catch {
-    return null;
-  }
-}
-
-export function findExcerptRangeInDocument(
-  doc: Document,
-  excerpt: string,
-  options?: {
-    prefix?: string | undefined;
-    suffix?: string | undefined;
-    textMap?: DocumentTextMap | undefined;
-    claimedSpans?: ClaimedTextSpan[] | undefined;
-    requireUnambiguous?: boolean | undefined;
-  },
-): Range | null {
-  return findExcerptMatchInDocument(doc, excerpt, options)?.range ?? null;
-}
-
-function extractSelectionContext(
-  doc: Document,
-  range: Range,
-): { prefix?: string; suffix?: string } {
-  const root = doc.body ?? doc.documentElement;
-  if (!root) return {};
-  try {
-    const beforeRange = doc.createRange();
-    beforeRange.selectNodeContents(root);
-    beforeRange.setEnd(range.startContainer, range.startOffset);
-    const prefix = normalizeWhitespace(beforeRange.toString()).slice(-SELECTION_CONTEXT_CHARS);
-
-    const afterRange = doc.createRange();
-    afterRange.selectNodeContents(root);
-    afterRange.setStart(range.endContainer, range.endOffset);
-    const suffix = normalizeWhitespace(afterRange.toString()).slice(0, SELECTION_CONTEXT_CHARS);
-
-    return {
-      ...(prefix ? { prefix } : {}),
-      ...(suffix ? { suffix } : {}),
-    };
-  } catch {
-    return {};
-  }
+  void pending.catch(() => {});
+  let onAbort: (() => void) | null = null;
+  const abortPromise = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([pending, abortPromise]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  });
 }
 
 export class ReaderSession {
@@ -1087,6 +458,8 @@ export class ReaderSession {
   private epubContainer: HTMLElement | null = null;
   private lockedScrollLeft = 0;
   private displayOperationCount = 0;
+  private inFlightDisplayCount = 0;
+  private activeDisplayAbort: AbortController | null = null;
   private aligningFocusTarget: Element | null = null;
   private displayedListener: (() => void) | null = null;
   private renderedListener: (() => void) | null = null;
@@ -1094,16 +467,6 @@ export class ReaderSession {
   private unloadedHookRegistered = false;
   private readonly trackedContents = new Set<Contents>();
   private readonly contentCleanups = new Map<Contents, Array<() => void>>();
-  private renditionReady = false;
-  private initialRelocationCompleted = false;
-  private activeDisplayDepth = 0;
-  private pendingRelocationFrames = 0;
-  private relocationFrameSeq = 0;
-  private relocationResolvers = new Set<() => void>();
-  private pendingViewportResize: { width: number; height: number } | null = null;
-  private resizeFlushScheduled = false;
-  private applyingViewportResize = false;
-  private restoreManagerResize: (() => void) | null = null;
   private highlightCfis = new Set<string>();
   private storedHighlights: ReaderHighlightInput[] = [];
   private reportedMissingHighlightIds = new Set<string>();
@@ -1150,226 +513,206 @@ export class ReaderSession {
   ): Promise<void> {
     this.viewportTarget = target;
     this.onHighlightResolution = onHighlightResolution ?? null;
-    this.renditionReady = false;
-    this.initialRelocationCompleted = false;
-    this.pendingViewportResize = null;
-    this.resizeFlushScheduled = false;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
       height: '100%',
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: false,
+      resizeOnOrientationChange: true,
       allowScriptedContent: false,
     });
-    this.activeDisplayDepth += 1;
-    try {
-      this.observeViewport(target);
-      this.bindEpubContainer();
-      this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
-      if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
-        this.unloadedHookRegistered = true;
-        this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
-          if (view?.contents) this.cleanupContents(view.contents);
-          this.syncRenderedHighlights();
-        });
-      }
-      if (onSelection) {
-        this.rendition.hooks.content.register((contents: Contents) => {
-          this.registerContentFocusAndLinks(contents);
-          let tabKeyActive = false;
-          let blurredByTab = false;
-          let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
+    this.observeViewport(target);
+    this.bindEpubContainer();
+    this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
+    if (!this.unloadedHookRegistered && this.rendition.hooks.unloaded?.register) {
+      this.unloadedHookRegistered = true;
+      this.rendition.hooks.unloaded.register((view: { contents?: Contents } | undefined) => {
+        if (view?.contents) this.cleanupContents(view.contents);
+        this.syncRenderedHighlights();
+      });
+    }
+    if (onSelection) {
+      this.rendition.hooks.content.register((contents: Contents) => {
+        this.registerContentFocusAndLinks(contents);
+        let tabKeyActive = false;
+        let blurredByTab = false;
+        let tabResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-          const clearTabTimer = () => {
-            if (tabResetTimer !== null) {
-              clearTimeout(tabResetTimer);
+        const clearTabTimer = () => {
+          if (tabResetTimer !== null) {
+            clearTimeout(tabResetTimer);
+            tabResetTimer = null;
+          }
+        };
+        const handleKeydown = (event: KeyboardEvent) => {
+          if (event.key === 'Tab') {
+            tabKeyActive = true;
+            clearTabTimer();
+            tabResetTimer = setTimeout(() => {
               tabResetTimer = null;
-            }
-          };
-          const handleKeydown = (event: KeyboardEvent) => {
-            if (event.key === 'Tab') {
-              tabKeyActive = true;
-              clearTabTimer();
-              tabResetTimer = setTimeout(() => {
-                tabResetTimer = null;
-                tabKeyActive = false;
-              }, 0);
-            } else {
-              clearTabTimer();
               tabKeyActive = false;
-              blurredByTab = false;
-            }
-          };
-          const handleWindowBlur = () => {
-            if (tabKeyActive) blurredByTab = true;
-          };
-          const handleFocusOut = (event: FocusEvent) => {
-            if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
-          };
-          const clearBlurGuard = () => {
+            }, 0);
+          } else {
             clearTabTimer();
             tabKeyActive = false;
             blurredByTab = false;
-          };
-          const handler = () => {
-            const selection = contents.window.getSelection();
-            const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
-            const text = hasRange ? normalizePassageText(selection!.toString()) : '';
-            if (!hasRange || !text) {
-              const frame = contents.window.frameElement as HTMLElement | null | undefined;
-              const frameLostFocus = frame
-                ? frame.ownerDocument.activeElement !== frame
-                : typeof contents.document.hasFocus === 'function'
-                  ? !contents.document.hasFocus()
-                  : false;
-              if (blurredByTab || (tabKeyActive && frameLostFocus)) {
-                return;
-              }
-              onSelection(null);
+          }
+        };
+        const handleWindowBlur = () => {
+          if (tabKeyActive) blurredByTab = true;
+        };
+        const handleFocusOut = (event: FocusEvent) => {
+          if (tabKeyActive && !event.relatedTarget) blurredByTab = true;
+        };
+        const clearBlurGuard = () => {
+          clearTabTimer();
+          tabKeyActive = false;
+          blurredByTab = false;
+        };
+        const handler = () => {
+          const selection = contents.window.getSelection();
+          const hasRange = Boolean(selection && !selection.isCollapsed && selection.rangeCount);
+          const text = hasRange ? normalizePassageText(selection!.toString()) : '';
+          if (!hasRange || !text) {
+            const frame = contents.window.frameElement as HTMLElement | null | undefined;
+            const frameLostFocus = frame
+              ? frame.ownerDocument.activeElement !== frame
+              : typeof contents.document.hasFocus === 'function'
+                ? !contents.document.hasFocus()
+                : false;
+            if (blurredByTab || (tabKeyActive && frameLostFocus)) {
               return;
             }
-            blurredByTab = false;
-            try {
-              const range = selection!.getRangeAt(0);
-              const sectionIndex = (contents as unknown as { sectionIndex?: number }).sectionIndex;
-              const href =
-                typeof sectionIndex === 'number'
-                  ? this.getSpine().sections[sectionIndex]?.href
-                  : undefined;
-              const context = extractSelectionContext(contents.document, range);
-              onSelection({
-                cfi: contents.cfiFromRange(range),
-                text,
-                ...(href ? { href } : {}),
-                ...context,
-              });
-            } catch {
-              // Selection can change while a section is being replaced.
-            }
-          };
-          contents.document.addEventListener('keydown', handleKeydown, true);
-          contents.document.addEventListener('focusout', handleFocusOut);
-          contents.document.addEventListener('focusin', clearBlurGuard);
-          contents.document.addEventListener('pointerdown', clearBlurGuard);
-          contents.document.addEventListener('mousedown', clearBlurGuard);
-          contents.document.addEventListener('selectionchange', handler);
-          contents.window.addEventListener?.('blur', handleWindowBlur);
-          contents.window.addEventListener?.('focus', clearBlurGuard);
-          this.addContentCleanup(contents, () => {
-            clearTabTimer();
-            contents.document.removeEventListener('keydown', handleKeydown, true);
-            contents.document.removeEventListener('focusout', handleFocusOut);
-            contents.document.removeEventListener('focusin', clearBlurGuard);
-            contents.document.removeEventListener('pointerdown', clearBlurGuard);
-            contents.document.removeEventListener('mousedown', clearBlurGuard);
-            contents.document.removeEventListener('selectionchange', handler);
-            contents.window.removeEventListener?.('blur', handleWindowBlur);
-            contents.window.removeEventListener?.('focus', clearBlurGuard);
-          });
+            onSelection(null);
+            return;
+          }
+          blurredByTab = false;
+          try {
+            const range = selection!.getRangeAt(0);
+            const sectionIndex = (contents as unknown as { sectionIndex?: number }).sectionIndex;
+            const href =
+              typeof sectionIndex === 'number'
+                ? this.getSpine().sections[sectionIndex]?.href
+                : undefined;
+            onSelection({
+              cfi: contents.cfiFromRange(range),
+              text,
+              ...(href ? { href } : {}),
+              ...extractSelectionContext(contents.document, range),
+            });
+          } catch {
+            // Selection can change while a section is being replaced.
+          }
+        };
+        contents.document.addEventListener('keydown', handleKeydown, true);
+        contents.document.addEventListener('focusout', handleFocusOut);
+        contents.document.addEventListener('focusin', clearBlurGuard);
+        contents.document.addEventListener('pointerdown', clearBlurGuard);
+        contents.document.addEventListener('mousedown', clearBlurGuard);
+        contents.document.addEventListener('selectionchange', handler);
+        contents.window.addEventListener?.('blur', handleWindowBlur);
+        contents.window.addEventListener?.('focus', clearBlurGuard);
+        this.addContentCleanup(contents, () => {
+          clearTabTimer();
+          contents.document.removeEventListener('keydown', handleKeydown, true);
+          contents.document.removeEventListener('focusout', handleFocusOut);
+          contents.document.removeEventListener('focusin', clearBlurGuard);
+          contents.document.removeEventListener('pointerdown', clearBlurGuard);
+          contents.document.removeEventListener('mousedown', clearBlurGuard);
+          contents.document.removeEventListener('selectionchange', handler);
+          contents.window.removeEventListener?.('blur', handleWindowBlur);
+          contents.window.removeEventListener?.('focus', clearBlurGuard);
         });
+      });
+    }
+    this.displayedListener = () => this.syncRenderedHighlights();
+    this.rendition.on('displayed', this.displayedListener);
+    this.onLocation = onLocation;
+    this.relocated = (location) => {
+      const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
+      const isUserNavigation =
+        this.userNavigationPending &&
+        (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
+      const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
+      const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
+      if (startCfi !== location.start.cfi) onSelection?.(null);
+      this.current = location;
+      if (isUserNavigation || this.userNavigationOrigin === 'link') {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
+        this.pendingLinkReturnTarget = null;
       }
-      this.displayedListener = () => this.syncRenderedHighlights();
-      this.rendition.on('displayed', this.displayedListener);
-      this.onLocation = onLocation;
-      this.relocated = (location) => {
-        const hadInitialLocation = this.initialRelocationCompleted;
-        this.initialRelocationCompleted = true;
-        const isQueuedRendition = hasRenditionQueue(this.rendition);
-        const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
-        const isUserNavigation =
-          this.userNavigationPending &&
-          (startCfi
-            ? startCfi !== location.start.cfi
-            : (!isQueuedRendition || hadInitialLocation) && !this.reflowPending);
-        const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
-        const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-        if (startCfi !== location.start.cfi) onSelection?.(null);
-        this.current = location;
-        if (isUserNavigation || this.userNavigationOrigin === 'link') {
-          this.userNavigationPending = false;
-          this.userNavigationStartCfi = null;
-          this.userNavigationOrigin = 'navigation';
-          this.pendingLinkReturnTarget = null;
-        }
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-        this.reportLocation(location, origin, returnTarget);
-        if (this.reflowPending) {
-          this.reflowPending = false;
-          this.preserveCfi(location.start.cfi, this.locationGeneration);
-        }
-      };
-      this.rendition.on('relocated', this.relocated);
-      this.renderedListener = () => {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-      };
-      this.resizedListener = () => {
-        const container = this.bindEpubContainer();
-        if (container) this.lockedScrollLeft = container.scrollLeft;
-        this.syncVisibleColumnLinks();
-      };
-      this.rendition.on('rendered', this.renderedListener);
-      this.rendition.on('resized', this.resizedListener);
-      this.contentClick = (event, contents) => {
-        const eventTarget = event.target as Element | null;
-        const selection = contents.window.getSelection();
-        if (selection && !selection.isCollapsed) return;
-        const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
-        if (link) {
-          const href = link.getAttribute('href') ?? '';
-          if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
-          return;
-        }
-        if (
-          event.defaultPrevented ||
-          eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
-        ) {
-          return;
-        }
-        const frame = contents.window.frameElement;
-        const viewport = target.getBoundingClientRect();
-        if (!frame || viewport.width === 0) return;
-        // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
-        const position =
-          (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
-        onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
-      };
-      this.rendition.on('click', this.contentClick);
-      if (onKeyboardNavigation) {
-        this.keyboardNavigation = onKeyboardNavigation;
-        this.rendition.on('keydown', this.keyboardNavigation);
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+      this.reportLocation(location, origin, returnTarget);
+      if (this.reflowPending) {
+        this.reflowPending = false;
+        this.preserveCfi(location.start.cfi, this.locationGeneration);
       }
-      this.applyAppearance(appearance);
-      const restoreGeneration = this.beginLocationOperation(false);
-      await this.rendition.started;
-      this.bindEpubContainer();
-      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-      this.installViewportResizeGuard(target);
-      if (cfi) {
-        if (await this.displaySavedCfi(cfi, restoreGeneration)) return;
+    };
+    this.rendition.on('relocated', this.relocated);
+    this.renderedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.resizedListener = () => {
+      const container = this.bindEpubContainer();
+      if (container) this.lockedScrollLeft = container.scrollLeft;
+      this.syncVisibleColumnLinks();
+    };
+    this.rendition.on('rendered', this.renderedListener);
+    this.rendition.on('resized', this.resizedListener);
+    this.contentClick = (event, contents) => {
+      const eventTarget = event.target as Element | null;
+      const selection = contents.window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
+      if (link) {
+        const href = link.getAttribute('href') ?? '';
+        if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
+        return;
       }
-      if (serverXPath && (await this.displayXPath(serverXPath, restoreGeneration))) return;
       if (
-        serverPercentage &&
-        serverPercentage > 0 &&
-        (await this.displayPercentage(serverPercentage, restoreGeneration))
+        event.defaultPrevented ||
+        eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
       ) {
         return;
       }
-      await this.displayAtGeneration(undefined, restoreGeneration);
-    } finally {
-      this.activeDisplayDepth = Math.max(0, this.activeDisplayDepth - 1);
-      if (this.canApplyViewportResizeNow()) {
-        this.flushPendingViewportResize();
-      } else {
-        this.scheduleViewportResizeFlush();
-      }
+      const frame = contents.window.frameElement;
+      const viewport = target.getBoundingClientRect();
+      if (!frame || viewport.width === 0) return;
+      // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
+      const position =
+        (frame.getBoundingClientRect().left + event.clientX - viewport.left) / viewport.width;
+      onTap(position < 0.33 ? 'previous' : position > 0.67 ? 'next' : 'center');
+    };
+    this.rendition.on('click', this.contentClick);
+    if (onKeyboardNavigation) {
+      this.keyboardNavigation = onKeyboardNavigation;
+      this.rendition.on('keydown', this.keyboardNavigation);
     }
+    this.applyAppearance(appearance);
+    const restoreGeneration = this.beginLocationOperation(false);
+    await this.rendition.started;
+    this.bindEpubContainer();
+    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    if (cfi) {
+      if (await this.displaySavedCfi(cfi, restoreGeneration)) return;
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    }
+    if (serverXPath) {
+      if (await this.displayXPath(serverXPath, restoreGeneration)) return;
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    }
+    if (serverPercentage && serverPercentage > 0) {
+      if (await this.displayPercentage(serverPercentage, restoreGeneration)) return;
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+    }
+    await this.displayAtGeneration(undefined, restoreGeneration);
   }
 
   private reportLocation(
@@ -1405,12 +748,12 @@ export class ReaderSession {
 
   async next(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.next());
+    await this.navigate((signal) => raceWithAbort(() => this.rendition!.next(), signal));
   }
 
   async previous(): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.prev());
+    await this.navigate((signal) => raceWithAbort(() => this.rendition!.prev(), signal));
   }
 
   tableOfContents(): TocItem[] {
@@ -1441,153 +784,88 @@ export class ReaderSession {
 
   async displayAnnotation(
     annotation: ReaderHighlightInput,
+    signal?: AbortSignal,
   ): Promise<ReaderAnnotationDisplayResult> {
     if (!this.rendition) return { status: 'missing' };
-    const CfiClass = getEpubCfiConstructor(this.rendition);
-    if (!CfiClass) return { status: 'missing' };
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderAnnotationDisplayResult> => {
+        const CfiClass = getEpubCfiConstructor(this.rendition);
+        if (!CfiClass) return { status: 'missing' };
 
-    const parsed = parseRuntimeCfi(annotation.cfi, CfiClass);
-    const primarySection =
-      (annotation.href ? this.findSpineSectionByHref(annotation.href) : null) ??
-      (parsed ? this.resolveSpineSectionForCfi(parsed) : null);
-
-    if (primarySection) {
-      const outcome = await this.resolveAnnotationInSection(
-        annotation,
-        parsed,
-        primarySection,
-        CfiClass,
-      );
-      if (outcome) {
-        try {
-          await this.navigate(() => this.awaitRenditionDisplay(outcome.cfi));
-          if (outcome.repaired) {
-            this.recordRepairedHighlight(annotation.id, outcome.cfi, primarySection.href);
+        const trackedBefore = Boolean(
+          annotation.id && this.storedHighlights.some((item) => item.id === annotation.id),
+        );
+        const finalizeDisplay = (
+          cfi: string,
+          href: string,
+          canRepair: boolean,
+        ): ReaderAnnotationDisplayResult => {
+          if (!canRepair) return { status: 'displayed', cfi, href };
+          if (!trackedBefore) return { status: 'repaired', cfi, href };
+          const current = this.storedHighlights.find((item) => item.id === annotation.id);
+          if (!current) return { status: 'displayed', cfi, href };
+          if (current.cfi === cfi && (!current.href || current.href === href)) {
+            return { status: 'repaired', cfi, href };
           }
-          return {
-            status: outcome.repaired ? 'repaired' : 'displayed',
-            cfi: outcome.cfi,
-            href: primarySection.href,
-          };
-        } catch {
-          return { status: 'missing' };
-        }
-      }
-    }
+          const applied = this.recordRepairedHighlight(annotation.id, annotation.cfi, cfi, href);
+          return { status: applied ? 'repaired' : 'displayed', cfi, href };
+        };
 
-    if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
-      const { sections } = this.getSpine();
-      const crossChapterCandidates: Array<{
-        section: SpineSection;
-        cfi: string;
-        score: number;
-        candidateCount: number;
-        unambiguousInSection: boolean;
-        unloadAfterFailure: () => void;
-      }> = [];
-      let totalOccurrences = 0;
+        const parsed = parseRuntimeCfi(annotation.cfi, CfiClass);
+        const primarySection =
+          (annotation.href ? this.findSpineSectionByHref(annotation.href) : null) ??
+          (parsed ? this.resolveSpineSectionForCfi(parsed) : null);
 
-      for (const section of sections) {
-        if (primarySection && section.index === primarySection.index) continue;
-        const loaded = await this.loadSectionDocument(section);
-        if (!loaded) continue;
-        const textMap = buildDocumentTextMap(loaded.document);
-        const { claimedSpans, ownedCfis, competingBrokenCount } =
-          this.collectClaimedSpansForSection(
-            loaded.document,
-            textMap,
-            section,
-            loaded.cfiBase,
-            CfiClass,
+        if (primarySection) {
+          const outcome = await this.resolveAnnotationInSection(
             annotation,
+            parsed,
+            primarySection,
+            CfiClass,
+            op.isAborted,
           );
-        const matched = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
-          prefix: annotation.prefix,
-          suffix: annotation.suffix,
-          textMap,
-          claimedSpans,
-          competingBrokenCount,
-        });
-        if (!matched || !loaded.cfiBase) {
-          if (claimedSpans.length > 0) {
-            const anyOccurrence = findExcerptMatchInDocument(loaded.document, annotation.excerpt, {
-              textMap,
-            });
-            if (anyOccurrence) totalOccurrences += anyOccurrence.candidateCount;
-          }
-          loaded.unloadAfterFailure();
-          continue;
-        }
-        totalOccurrences += matched.candidateCount;
-        try {
-          const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
-          if (ownedCfis.has(freshCfi.trim())) {
-            loaded.unloadAfterFailure();
-            continue;
-          }
-          crossChapterCandidates.push({
-            section,
-            cfi: freshCfi,
-            score: matched.score,
-            candidateCount: matched.candidateCount,
-            unambiguousInSection: matched.unambiguous,
-            unloadAfterFailure: loaded.unloadAfterFailure,
-          });
-        } catch {
-          loaded.unloadAfterFailure();
-        }
-      }
-
-      if (crossChapterCandidates.length > 0) {
-        let winner = crossChapterCandidates[0]!;
-        let bestScore = winner.score;
-        let tiedBestCount = 1;
-        for (let index = 1; index < crossChapterCandidates.length; index += 1) {
-          const candidate = crossChapterCandidates[index]!;
-          if (candidate.score > bestScore) {
-            bestScore = candidate.score;
-            tiedBestCount = 1;
-            winner = candidate;
-          } else if (candidate.score === bestScore) {
-            tiedBestCount += 1;
-          }
-        }
-
-        const expectedContextLength =
-          (annotation.prefix ? normalizeWhitespace(annotation.prefix).length : 0) +
-          (annotation.suffix ? normalizeWhitespace(annotation.suffix).length : 0);
-        const minContextScore = Math.max(1, Math.min(4, expectedContextLength));
-        const globallyUnambiguous =
-          (totalOccurrences === 1 && winner.unambiguousInSection) ||
-          (bestScore >= minContextScore && tiedBestCount === 1 && winner.unambiguousInSection);
-
-        for (const candidate of crossChapterCandidates) {
-          if (candidate !== winner || !globallyUnambiguous) {
-            candidate.unloadAfterFailure();
-          }
-        }
-
-        if (globallyUnambiguous) {
-          const canPersistRepair = annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
-          try {
-            await this.navigate(() => this.awaitRenditionDisplay(winner.cfi));
-            if (canPersistRepair) {
-              this.recordRepairedHighlight(annotation.id, winner.cfi, winner.section.href);
+          if (op.isAborted()) return { status: 'aborted' };
+          if (outcome) {
+            try {
+              await this.awaitRenditionDisplay(outcome.cfi, op.signal);
+              if (op.isAborted()) return { status: 'aborted' };
+              return finalizeDisplay(outcome.cfi, primarySection.href, outcome.repaired);
+            } catch {
+              return op.isAborted() ? { status: 'aborted' } : { status: 'missing' };
             }
-            return {
-              status: canPersistRepair ? 'repaired' : 'displayed',
-              cfi: winner.cfi,
-              href: winner.section.href,
-            };
-          } catch {
-            winner.unloadAfterFailure();
-            return { status: 'missing' };
           }
         }
-      }
-    }
 
-    return { status: 'missing' };
+        if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
+          const crossChapter = await this.findCrossChapterAnnotation(
+            annotation,
+            primarySection,
+            CfiClass,
+            op.isAborted,
+          );
+          if (op.isAborted()) return { status: 'aborted' };
+          if (crossChapter) {
+            const canPersistRepair = annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
+            try {
+              await this.awaitRenditionDisplay(crossChapter.cfi, op.signal);
+              if (op.isAborted()) {
+                crossChapter.unloadAfterFailure();
+                return { status: 'aborted' };
+              }
+              return finalizeDisplay(crossChapter.cfi, crossChapter.section.href, canPersistRepair);
+            } catch {
+              crossChapter.unloadAfterFailure();
+              return op.isAborted() ? { status: 'aborted' } : { status: 'missing' };
+            }
+          }
+        }
+
+        return op.isAborted() ? { status: 'aborted' } : { status: 'missing' };
+      },
+      () => ({ status: 'aborted' }),
+    );
   }
 
   getVisiblePassages(): ReaderSelection[] {
@@ -1704,62 +982,119 @@ export class ReaderSession {
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
     const target = this.resolveDisplayTarget(href);
-    await this.navigate(() => this.awaitRenditionDisplay(target));
+    await this.navigate((signal) => this.awaitRenditionDisplay(target, signal));
   }
 
-  async displayHref(href: string): Promise<boolean> {
-    if (!this.rendition) return false;
-    const section = this.findSpineSectionByHref(href);
-    if (!section) return false;
-    let target = section.href;
-    const fragment = href.includes('#') ? href.slice(href.indexOf('#') + 1).trim() : '';
-    if (fragment) {
-      const loaded = await this.loadSectionDocument(section);
-      if (loaded?.document.getElementById(fragment)) {
-        target = `${section.href}#${fragment}`;
-      }
-    }
-    try {
-      await this.navigate(() => this.awaitRenditionDisplay(target));
-      return true;
-    } catch {
-      return false;
-    }
+  async displayHrefStatus(href: string, signal?: AbortSignal): Promise<ReaderCfiDisplayStatus> {
+    if (!this.rendition) return 'missing';
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderCfiDisplayStatus> => {
+        const section = this.findSpineSectionByHref(href);
+        if (!section) return 'missing';
+        let target = section.href;
+        const fragment = href.includes('#') ? href.slice(href.indexOf('#') + 1).trim() : '';
+        if (fragment) {
+          const loaded = await this.loadSectionDocument(section);
+          if (op.isAborted()) {
+            loaded?.unloadAfterFailure();
+            return 'aborted';
+          }
+          if (loaded?.document.getElementById(fragment)) {
+            target = `${section.href}#${fragment}`;
+          } else {
+            loaded?.unloadAfterFailure();
+          }
+        }
+        try {
+          await this.awaitRenditionDisplay(target, op.signal);
+          return op.isAborted() ? 'aborted' : 'displayed';
+        } catch {
+          return op.isAborted() ? 'aborted' : 'missing';
+        }
+      },
+      () => 'aborted',
+    );
   }
 
-  async displayCfi(cfi: string, fallbackHref?: string): Promise<boolean> {
-    if (!this.rendition) return false;
-    const resolvedCfi = await this.resolveValidCfi(cfi, fallbackHref);
-    if (!resolvedCfi || !this.rendition) return false;
-    try {
-      await this.navigate(() => this.awaitRenditionDisplay(resolvedCfi));
-      return true;
-    } catch {
-      return false;
-    }
+  async displayHref(href: string, signal?: AbortSignal): Promise<boolean> {
+    return (await this.displayHrefStatus(href, signal)) === 'displayed';
   }
 
-  async displayPercentageLocation(percentage: number): Promise<boolean> {
-    if (!this.rendition || !Number.isFinite(percentage) || percentage < 0) return false;
-    const { sections } = this.getSpine();
-    if (!sections.length) return false;
-    const position = Math.max(0, Math.min(0.999, percentage));
-    const section = sections[Math.floor(position * sections.length)];
-    if (!section) return false;
-    try {
-      await this.navigate(() => this.awaitRenditionDisplay(section.href));
-      return true;
-    } catch {
-      return false;
-    }
+  async displayCfiStatus(
+    cfi: string,
+    fallbackHref?: string,
+    signal?: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (!this.rendition) return 'missing';
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderCfiDisplayStatus> => {
+        const resolvedCfi = await this.resolveValidCfi(cfi, fallbackHref, op.isAborted);
+        if (op.isAborted()) return 'aborted';
+        if (!resolvedCfi || !this.rendition) return 'missing';
+        try {
+          await this.awaitRenditionDisplay(resolvedCfi, op.signal);
+          return op.isAborted() ? 'aborted' : 'displayed';
+        } catch {
+          return op.isAborted() ? 'aborted' : 'missing';
+        }
+      },
+      () => 'aborted',
+    );
   }
 
-  displayServerLocation(xpath: string): Promise<boolean> {
-    return this.displayXPath(xpath, this.beginLocationOperation(false));
+  async displayCfi(cfi: string, fallbackHref?: string, signal?: AbortSignal): Promise<boolean> {
+    return (await this.displayCfiStatus(cfi, fallbackHref, signal)) === 'displayed';
   }
 
-  displayServerPercentage(percentage: number): Promise<boolean> {
-    return this.displayPercentage(percentage, this.beginLocationOperation(false));
+  async displayPercentageLocationStatus(
+    percentage: number,
+    signal?: AbortSignal,
+  ): Promise<ReaderCfiDisplayStatus> {
+    if (!this.rendition || !Number.isFinite(percentage) || percentage < 0) return 'missing';
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op): Promise<ReaderCfiDisplayStatus> => {
+        const { sections } = this.getSpine();
+        if (!sections.length) return 'missing';
+        const position = Math.max(0, Math.min(0.999, percentage));
+        const section = sections[Math.floor(position * sections.length)];
+        if (!section) return 'missing';
+        try {
+          await this.awaitRenditionDisplay(section.href, op.signal);
+          return op.isAborted() ? 'aborted' : 'displayed';
+        } catch {
+          return op.isAborted() ? 'aborted' : 'missing';
+        }
+      },
+      () => 'aborted',
+    );
+  }
+
+  async displayPercentageLocation(percentage: number, signal?: AbortSignal): Promise<boolean> {
+    return (await this.displayPercentageLocationStatus(percentage, signal)) === 'displayed';
+  }
+
+  displayServerLocation(xpath: string, signal?: AbortSignal): Promise<boolean> {
+    return this.runAbortableDisplay(
+      false,
+      signal,
+      (op) => this.displayXPath(xpath, op.generation, op.signal),
+      () => false,
+    );
+  }
+
+  displayServerPercentage(percentage: number, signal?: AbortSignal): Promise<boolean> {
+    return this.runAbortableDisplay(
+      false,
+      signal,
+      (op) => this.displayPercentage(percentage, op.generation, op.signal),
+      () => false,
+    );
   }
 
   applyAppearance(value: Appearance): void {
@@ -1842,9 +1177,7 @@ export class ReaderSession {
   }
 
   destroy(): void {
-    this.locationGeneration += 1;
-    this.restoreManagerResize?.();
-    this.restoreManagerResize = null;
+    this.abortInFlightDisplay();
     for (const contents of [...this.trackedContents]) {
       this.cleanupContents(contents);
     }
@@ -1870,16 +1203,9 @@ export class ReaderSession {
     this.viewportTarget = null;
     this.lockedScrollLeft = 0;
     this.displayOperationCount = 0;
+    this.inFlightDisplayCount = 0;
     this.aligningFocusTarget = null;
     this.unloadedHookRegistered = false;
-    this.renditionReady = false;
-    this.initialRelocationCompleted = false;
-    this.activeDisplayDepth = 0;
-    this.pendingRelocationFrames = 0;
-    this.pendingViewportResize = null;
-    this.resizeFlushScheduled = false;
-    this.applyingViewportResize = false;
-    this.resolveRelocationWaiters();
     this.rendition = null;
     this.relocated = null;
     this.displayedListener = null;
@@ -2025,7 +1351,8 @@ export class ReaderSession {
   ): Promise<void> {
     if (!this.rendition) return;
     try {
-      await this.navigate(() => this.rendition!.display(cfi));
+      const completed = await this.navigate((signal) => this.awaitRenditionDisplay(cfi, signal));
+      if (!completed) return;
       const container = this.bindEpubContainer(contents);
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
@@ -2058,12 +1385,7 @@ export class ReaderSession {
   }
 
   private isProgrammaticScrollAllowed(): boolean {
-    return (
-      this.displayOperationCount > 0 ||
-      this.activeDisplayDepth > 0 ||
-      this.applyingViewportResize ||
-      this.userNavigationPending
-    );
+    return this.displayOperationCount > 0 || this.userNavigationPending;
   }
 
   private async runDisplayOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -2255,206 +1577,26 @@ export class ReaderSession {
       if (!width || !height) return;
       if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
       this.viewportSize = { width, height };
-      this.requestViewportResize(width, height);
+      if (
+        'manager' in this.rendition &&
+        !(this.rendition as { manager?: { stage?: unknown } }).manager?.stage
+      ) {
+        return;
+      }
+      if (this.inFlightDisplayCount > 0) {
+        this.abortInFlightDisplay();
+      }
+      this.displayOperationCount += 1;
+      try {
+        this.rendition.resize(width, height);
+      } finally {
+        const container = this.bindEpubContainer();
+        if (container) this.lockedScrollLeft = container.scrollLeft;
+        this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
+        this.syncVisibleColumnLinks();
+      }
     });
     this.resizeObserver.observe(target);
-  }
-
-  private invokeRenditionResize(width: number, height: number, targetCfi?: string): void {
-    const rendition = this.rendition;
-    if (!rendition) return;
-    this.displayOperationCount += 1;
-    try {
-      const resizeWithCfi = rendition.resize as (
-        nextWidth: number,
-        nextHeight: number,
-        epubcfi?: string,
-      ) => void;
-      if (targetCfi) {
-        resizeWithCfi.call(rendition, width, height, targetCfi);
-      } else {
-        rendition.resize(width, height);
-      }
-    } finally {
-      const container = this.bindEpubContainer();
-      if (container) this.lockedScrollLeft = container.scrollLeft;
-      this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
-      this.syncVisibleColumnLinks();
-    }
-  }
-
-  private installViewportResizeGuard(target: HTMLElement): void {
-    const rendition = this.rendition as InternalRendition | null;
-    if (!rendition) return;
-    const manager = rendition.manager;
-    const stage = manager?.stage;
-    if (typeof ResizeObserver !== 'undefined' && typeof window !== 'undefined' && stage) {
-      if (stage.resizeFunc) {
-        window.removeEventListener('resize', stage.resizeFunc, false);
-      }
-      if (stage.orientationChangeFunc) {
-        window.removeEventListener('orientationchange', stage.orientationChangeFunc, false);
-      }
-    }
-    if (manager && typeof manager.resize === 'function') {
-      const originalResize = manager.resize.bind(manager);
-      manager.resize = (width?: number, height?: number, epubcfi?: string) => {
-        if (this.applyingViewportResize) {
-          originalResize(width, height, epubcfi);
-          return;
-        }
-        const rect = target.getBoundingClientRect();
-        const nextWidth = Math.floor(width ?? rect.width);
-        const nextHeight = Math.floor(height ?? rect.height);
-        if (!nextWidth || !nextHeight) return;
-        this.viewportSize = { width: nextWidth, height: nextHeight };
-        this.requestViewportResize(nextWidth, nextHeight);
-      };
-      this.restoreManagerResize = () => {
-        manager.resize = originalResize;
-      };
-    }
-    this.renditionReady = true;
-  }
-
-  private canApplyViewportResizeNow(): boolean {
-    const rendition = this.rendition as InternalRendition | null;
-    if (!rendition || this.applyingViewportResize) return false;
-    if (!hasRenditionQueue(rendition)) {
-      return this.activeDisplayDepth === 0;
-    }
-    if (!this.renditionReady || !rendition.manager?.stage) return false;
-    if (this.activeDisplayDepth > 0 || this.pendingRelocationFrames > 0) return false;
-    if (this.userNavigationPending) return false;
-    if (rendition.q.running || rendition.displaying !== undefined) return false;
-    return Boolean(this.current?.start.cfi ?? rendition.location?.start?.cfi);
-  }
-
-  private requestViewportResize(width: number, height: number): void {
-    if (!this.rendition) return;
-    if (!hasRenditionQueue(this.rendition) && !(this.rendition as InternalRendition).manager) {
-      if (this.activeDisplayDepth === 0) {
-        this.invokeRenditionResize(width, height);
-      } else {
-        this.pendingViewportResize = { width, height };
-      }
-      return;
-    }
-    this.pendingViewportResize = { width, height };
-    if (this.canApplyViewportResizeNow()) {
-      this.flushPendingViewportResize();
-      return;
-    }
-    this.scheduleViewportResizeFlush();
-  }
-
-  private scheduleViewportResizeFlush(): void {
-    if (!this.pendingViewportResize || !this.rendition) return;
-    if (!hasRenditionQueue(this.rendition) && !(this.rendition as InternalRendition).manager) {
-      if (this.activeDisplayDepth === 0) {
-        const pending = this.pendingViewportResize;
-        this.pendingViewportResize = null;
-        this.invokeRenditionResize(pending.width, pending.height);
-      }
-      return;
-    }
-    if (this.resizeFlushScheduled) return;
-    this.resizeFlushScheduled = true;
-    const run = () => {
-      this.resizeFlushScheduled = false;
-      this.flushPendingViewportResize();
-    };
-    if (typeof requestAnimationFrame === 'function') {
-      requestAnimationFrame(run);
-    } else {
-      setTimeout(run, 0);
-    }
-  }
-
-  private flushPendingViewportResize(): void {
-    const rendition = this.rendition;
-    const pending = this.pendingViewportResize;
-    if (!rendition || !pending) return;
-    if (!this.canApplyViewportResizeNow()) return;
-
-    this.pendingViewportResize = null;
-    const targetCfi = this.current?.start.cfi ?? rendition.location?.start?.cfi;
-    const canListen = typeof rendition.on === 'function' && typeof rendition.off === 'function';
-    let didEmitResized = false;
-    const onResized = () => {
-      didEmitResized = true;
-    };
-    if (canListen) rendition.on('resized', onResized);
-    this.applyingViewportResize = true;
-    try {
-      this.invokeRenditionResize(pending.width, pending.height, targetCfi);
-    } finally {
-      this.applyingViewportResize = false;
-      if (canListen) rendition.off('resized', onResized);
-    }
-
-    if (didEmitResized && Boolean(rendition.location?.start)) {
-      this.trackPendingRelocationFrame(rendition);
-    }
-    if (this.pendingViewportResize) {
-      this.scheduleViewportResizeFlush();
-    }
-  }
-
-  private trackPendingRelocationFrame(rendition: Rendition): void {
-    if (!hasRenditionQueue(rendition)) return;
-    this.relocationFrameSeq += 1;
-    this.pendingRelocationFrames += 1;
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      if (this.rendition !== rendition) return;
-      this.pendingRelocationFrames = Math.max(0, this.pendingRelocationFrames - 1);
-      if (this.pendingRelocationFrames === 0) {
-        this.resolveRelocationWaiters();
-        if (this.canApplyViewportResizeNow()) {
-          this.flushPendingViewportResize();
-        } else {
-          this.scheduleViewportResizeFlush();
-        }
-      }
-    };
-    const scheduleAfterPaint = () => {
-      const afterFrame = () => {
-        void Promise.resolve().then(finish);
-      };
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(afterFrame);
-      } else {
-        setTimeout(afterFrame, 0);
-      }
-    };
-    void rendition.q
-      .enqueue(() => {
-        scheduleAfterPaint();
-      })
-      .catch(() => {
-        finish();
-      });
-  }
-
-  private waitForPendingRelocations(): Promise<void> {
-    if (!hasRenditionQueue(this.rendition) || this.pendingRelocationFrames === 0) {
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      this.relocationResolvers.add(resolve);
-    });
-  }
-
-  private resolveRelocationWaiters(): void {
-    if (this.relocationResolvers.size === 0) return;
-    const waiters = [...this.relocationResolvers];
-    this.relocationResolvers.clear();
-    for (const resolve of waiters) {
-      resolve();
-    }
   }
 
   private cfiToXPath(cfi: string, spineIndex: number): string | null {
@@ -2486,13 +1628,93 @@ export class ReaderSession {
     }
   }
 
+  private abortInFlightDisplay(): void {
+    this.locationGeneration += 1;
+    this.userNavigationPending = false;
+    this.userNavigationStartCfi = null;
+    this.userNavigationOrigin = 'navigation';
+    this.pendingLinkReturnTarget = null;
+    this.activeDisplayAbort?.abort();
+    this.activeDisplayAbort = null;
+  }
+
+  private async runAbortableDisplay<T>(
+    userNavigation: boolean,
+    externalSignal: AbortSignal | undefined,
+    work: (context: ActiveDisplayContext) => Promise<T>,
+    onAborted: () => T,
+  ): Promise<T> {
+    if (externalSignal?.aborted || !this.rendition) return onAborted();
+    this.activeDisplayAbort?.abort();
+    const generation = this.beginLocationOperation(userNavigation);
+    const controller = new AbortController();
+    this.activeDisplayAbort = controller;
+    const forwardAbort = () => controller.abort();
+    externalSignal?.addEventListener('abort', forwardAbort, { once: true });
+    const isAborted = () =>
+      controller.signal.aborted ||
+      Boolean(externalSignal?.aborted) ||
+      !this.isCurrentLocationOperation(generation);
+    this.inFlightDisplayCount += 1;
+    try {
+      const result = await work({ generation, signal: controller.signal, isAborted });
+      return isAborted() ? onAborted() : result;
+    } catch (error) {
+      if (isAborted()) return onAborted();
+      if (userNavigation && this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+      }
+      throw error;
+    } finally {
+      externalSignal?.removeEventListener('abort', forwardAbort);
+      this.inFlightDisplayCount = Math.max(0, this.inFlightDisplayCount - 1);
+      if (this.activeDisplayAbort === controller) {
+        this.activeDisplayAbort = null;
+      }
+    }
+  }
+
+  private async awaitRenditionDisplay(target?: string, signal?: AbortSignal): Promise<void> {
+    const rendition = this.rendition;
+    if (!rendition) throw new Error('Reader is not open.');
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const canListenForError =
+      typeof rendition.on === 'function' && typeof rendition.off === 'function';
+    let onError: ((error: unknown) => void) | null = null;
+    try {
+      await this.runDisplayOperation(async () => {
+        const invoke = () =>
+          target === undefined ? rendition.display() : rendition.display(target);
+        if (!canListenForError) {
+          await raceWithAbort(invoke, signal);
+          return;
+        }
+        const errorPromise = new Promise<never>((_, reject) => {
+          onError = (error: unknown) => {
+            reject(error instanceof Error ? error : new Error('Failed to display EPUB section.'));
+          };
+          rendition.on('displayError', onError);
+        });
+        await raceWithAbort(async () => {
+          const displayPromise = invoke();
+          void Promise.resolve(displayPromise).catch(() => {});
+          await Promise.race([displayPromise, errorPromise]);
+        }, signal);
+      });
+    } finally {
+      if (onError && canListenForError) rendition.off('displayError', onError);
+    }
+  }
+
   private async displayAtGeneration(
     target: string | undefined,
     generation: number,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
-    await this.awaitRenditionDisplay(target);
+    await this.awaitRenditionDisplay(target, signal);
     return this.isCurrentLocationOperation(generation);
   }
 
@@ -2502,7 +1724,11 @@ export class ReaderSession {
     fallbackHref?: string,
   ): Promise<boolean> {
     if (!this.rendition || !this.isCurrentLocationOperation(generation)) return false;
-    const resolvedCfi = await this.resolveValidCfi(cfi, fallbackHref);
+    const resolvedCfi = await this.resolveValidCfi(
+      cfi,
+      fallbackHref,
+      () => !this.isCurrentLocationOperation(generation),
+    );
     if (!resolvedCfi || !this.isCurrentLocationOperation(generation)) return false;
     try {
       return await this.displayAtGeneration(resolvedCfi, generation);
@@ -2511,43 +1737,11 @@ export class ReaderSession {
     }
   }
 
-  private async awaitRenditionDisplay(target?: string): Promise<void> {
-    const rendition = this.rendition;
-    if (!rendition) throw new Error('Reader is not open.');
-    const canListenForError =
-      typeof rendition.on === 'function' && typeof rendition.off === 'function';
-    this.activeDisplayDepth += 1;
-    let onError: ((error: unknown) => void) | null = null;
-    try {
-      await this.runDisplayOperation(async () => {
-        if (!canListenForError) {
-          if (target === undefined) await rendition.display();
-          else await rendition.display(target);
-          return;
-        }
-        const errorPromise = new Promise<never>((_, reject) => {
-          onError = (error: unknown) => {
-            reject(error instanceof Error ? error : new Error('Failed to display EPUB section.'));
-          };
-          rendition.on('displayError', onError);
-        });
-        const displayPromise =
-          target === undefined ? rendition.display() : rendition.display(target);
-        await Promise.race([displayPromise, errorPromise]);
-      });
-      this.trackPendingRelocationFrame(rendition);
-    } finally {
-      if (onError && canListenForError) rendition.off('displayError', onError);
-      this.activeDisplayDepth = Math.max(0, this.activeDisplayDepth - 1);
-      if (this.canApplyViewportResizeNow()) {
-        this.flushPendingViewportResize();
-      } else {
-        this.scheduleViewportResizeFlush();
-      }
-    }
-  }
-
-  private async displayXPath(xpath: string, generation: number): Promise<boolean> {
+  private async displayXPath(
+    xpath: string,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     const rendition = this.rendition;
     if (!rendition || !this.isCurrentLocationOperation(generation)) return false;
     const target = parseKavitaXPath(xpath);
@@ -2555,7 +1749,7 @@ export class ReaderSession {
     const section = this.getSpine().sections[target.spineIndex];
     if (!section) return false;
     try {
-      await this.awaitRenditionDisplay(section.href);
+      await this.awaitRenditionDisplay(section.href, signal);
       if (!this.isCurrentLocationOperation(generation)) return false;
       if (target.contentXPath === '/html/body') return true;
       const contents = (rendition.getContents() as unknown as Contents[]).find(
@@ -2566,7 +1760,7 @@ export class ReaderSession {
       if (!node) return false;
       const cfi = this.cfiFromXPathNode(contents, node);
       if (!(contents.range(cfi) as Range | null)) return false;
-      await this.awaitRenditionDisplay(cfi);
+      await this.awaitRenditionDisplay(cfi, signal);
       return this.isCurrentLocationOperation(generation);
     } catch {
       // A server XPath from a changed EPUB is not safe to guess around.
@@ -2589,7 +1783,11 @@ export class ReaderSession {
     return contents.cfiFromNode(node);
   }
 
-  private async displayPercentage(percentage: number, generation: number): Promise<boolean> {
+  private async displayPercentage(
+    percentage: number,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     if (!Number.isFinite(percentage) || !this.isCurrentLocationOperation(generation)) return false;
     const { sections } = this.getSpine();
     if (!sections.length) return false;
@@ -2597,38 +1795,26 @@ export class ReaderSession {
     const section = sections[Math.floor(position * sections.length)];
     if (!section) return false;
     try {
-      return await this.displayAtGeneration(section.href, generation);
+      return await this.displayAtGeneration(section.href, generation, signal);
     } catch {
       return false;
     }
   }
 
-  private async navigate(display: () => Promise<unknown>): Promise<void> {
-    await this.waitForPendingRelocations();
-    const rendition = this.rendition;
-    if (!rendition) throw new Error('Reader is not open.');
-    const generation = this.beginLocationOperation(true);
-    const framesBefore = this.relocationFrameSeq;
-    this.activeDisplayDepth += 1;
-    try {
-      await this.runDisplayOperation(display);
-      if (this.relocationFrameSeq === framesBefore) {
-        this.trackPendingRelocationFrame(rendition);
-      }
-    } catch (error) {
-      if (this.isCurrentLocationOperation(generation)) {
-        this.userNavigationPending = false;
-        this.userNavigationStartCfi = null;
-      }
-      throw error;
-    } finally {
-      this.activeDisplayDepth = Math.max(0, this.activeDisplayDepth - 1);
-      if (this.canApplyViewportResizeNow()) {
-        this.flushPendingViewportResize();
-      } else {
-        this.scheduleViewportResizeFlush();
-      }
-    }
+  private navigate(
+    display: (signal: AbortSignal) => Promise<unknown>,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!this.rendition) return Promise.reject(new Error('Reader is not open.'));
+    return this.runAbortableDisplay(
+      true,
+      signal,
+      async (op) => {
+        await this.runDisplayOperation(() => display(op.signal));
+        return true;
+      },
+      () => false,
+    );
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
@@ -2645,6 +1831,8 @@ export class ReaderSession {
   private beginLinkedNavigation(): void {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
+    this.activeDisplayAbort?.abort();
+    this.activeDisplayAbort = null;
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
@@ -2661,26 +1849,9 @@ export class ReaderSession {
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    if (!getEpubCfiConstructor(rendition)) {
-      void this.awaitRenditionDisplay(cfi).catch(() => {
-        // The current passage may disappear while a reflow is being applied.
-      });
-      return;
-    }
-    void this.resolveValidCfi(cfi)
-      .then((resolvedCfi) => {
-        if (
-          !resolvedCfi ||
-          !this.isCurrentLocationOperation(generation) ||
-          this.userNavigationPending
-        ) {
-          return;
-        }
-        return this.awaitRenditionDisplay(resolvedCfi);
-      })
-      .catch(() => {
-        // The current passage may disappear while a reflow is being applied.
-      });
+    void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
+      // The current passage may disappear while a reflow is being applied.
+    });
   }
 
   private findSpineSectionByHref(href: string): SpineSection | null {
@@ -2809,7 +1980,11 @@ export class ReaderSession {
     }
   }
 
-  private async resolveValidCfi(cfi: string, fallbackHref?: string): Promise<string | null> {
+  private async resolveValidCfi(
+    cfi: string,
+    fallbackHref?: string,
+    isAborted?: () => boolean,
+  ): Promise<string | null> {
     const CfiClass = getEpubCfiConstructor(this.rendition);
     if (!CfiClass) return cfi.trim() || null;
     const parsed = parseRuntimeCfi(cfi, CfiClass);
@@ -2818,6 +1993,10 @@ export class ReaderSession {
     if (!section) return null;
     const loaded = await this.loadSectionDocument(section);
     if (!loaded) return null;
+    if (isAborted?.()) {
+      loaded.unloadAfterFailure();
+      return null;
+    }
     const validated = validateAndClampReadingCfi(
       loaded.document,
       parsed,
@@ -2831,6 +2010,24 @@ export class ReaderSession {
       return null;
     }
     return validated;
+  }
+
+  private isHighlightCandidateForView(
+    annotation: ReaderHighlightInput,
+    parsed: RuntimeParsedCfi | null,
+    viewIndex: number,
+    viewHref: string,
+  ): { matches: boolean; authoritative: boolean } {
+    if (annotation.href) {
+      const byHref = this.findSpineSectionByHref(annotation.href);
+      if (!byHref) return { matches: false, authoritative: false };
+      const same = byHref.index === viewIndex || normalizeSpineHref(viewHref) === byHref.href;
+      return { matches: same, authoritative: same };
+    }
+    if (!parsed) return { matches: false, authoritative: false };
+    const targetSection = this.resolveSpineSectionForCfi(parsed);
+    const same = Boolean(targetSection && targetSection.index === viewIndex);
+    return { matches: same, authoritative: same };
   }
 
   private collectClaimedSpansForSection(
@@ -2854,20 +2051,17 @@ export class ReaderSession {
           : other.cfi === excludeAnnotation.cfi;
       if (sameAnnotation) continue;
       const otherParsed = parseRuntimeCfi(other.cfi, CfiClass);
-      const candidate = this.isHighlightCandidateForView(
-        other,
-        otherParsed,
-        section.index,
-        section.href,
-      );
-      if (!candidate.matches) continue;
+      if (
+        !this.isHighlightCandidateForView(other, otherParsed, section.index, section.href).matches
+      )
+        continue;
       ownedCfis.add(other.cfi.trim());
       const otherTargetSection = otherParsed
         ? this.resolveSpineSectionForCfi(otherParsed, other.href)
         : null;
       const validated =
         otherParsed && otherTargetSection?.index === section.index
-          ? this.validateHighlightRangeInDocument(
+          ? validateHighlightRangeInDocument(
               doc,
               otherParsed,
               other,
@@ -2895,15 +2089,20 @@ export class ReaderSession {
     parsed: RuntimeParsedCfi | null,
     section: SpineSection,
     CfiClass: EpubCfiConstructor,
+    isAborted: () => boolean,
   ): Promise<{ cfi: string; repaired: boolean } | null> {
     const loaded = await this.loadSectionDocument(section);
     if (!loaded) return null;
+    if (isAborted()) {
+      loaded.unloadAfterFailure();
+      return null;
+    }
     const cfiMatchesSection =
       parsed !== null &&
       this.resolveSpineSectionForCfi(parsed, annotation.href)?.index === section.index;
     const direct =
       parsed && cfiMatchesSection
-        ? this.validateHighlightRangeInDocument(
+        ? validateHighlightRangeInDocument(
             loaded.document,
             parsed,
             annotation,
@@ -2912,9 +2111,7 @@ export class ReaderSession {
             CfiClass,
           )
         : null;
-    if (direct) {
-      return { cfi: direct.cfi, repaired: direct.repaired };
-    }
+    if (direct) return { cfi: direct.cfi, repaired: direct.repaired };
     if (annotation.excerpt && normalizeWhitespace(annotation.excerpt)) {
       const textMap = buildDocumentTextMap(loaded.document);
       const { claimedSpans, ownedCfis, competingBrokenCount } = this.collectClaimedSpansForSection(
@@ -2937,9 +2134,9 @@ export class ReaderSession {
         try {
           const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
           if (!ownedCfis.has(freshCfi.trim())) {
-            const canPersistRepair =
+            const repaired =
               freshCfi !== annotation.cfi && annotation.excerpt.length < MAX_STORED_EXCERPT_LENGTH;
-            return { cfi: freshCfi, repaired: canPersistRepair };
+            return { cfi: freshCfi, repaired };
           }
         } catch {
           // Fall through and unload temporary section.
@@ -2950,110 +2147,106 @@ export class ReaderSession {
     return null;
   }
 
-  private validateHighlightRangeInDocument(
-    doc: Document,
-    parsed: RuntimeParsedCfi,
+  private async findCrossChapterAnnotation(
     annotation: ReaderHighlightInput,
-    cfiBase: string | undefined,
-    sectionIndex: number,
+    primarySection: SpineSection | null,
     CfiClass: EpubCfiConstructor,
-  ): { cfi: string; range: Range; repaired: boolean } | null {
-    const range = doc.createRange();
-    let clamped: boolean;
-    let relocatedById: boolean;
-    if (parsed.range) {
-      const startSteps = [...parsed.path.steps, ...(parsed.start?.steps ?? [])];
-      const endSteps = [...parsed.path.steps, ...(parsed.end?.steps ?? [])];
-      const start = resolveCfiStepsInDocument(
-        doc,
-        startSteps,
-        parsed.start?.terminal?.offset ?? null,
+    isAborted: () => boolean,
+  ): Promise<{ section: SpineSection; cfi: string; unloadAfterFailure: () => void } | null> {
+    const excerpt = annotation.excerpt ?? '';
+    const { sections } = this.getSpine();
+    const candidates: Array<{
+      section: SpineSection;
+      cfi: string;
+      score: number;
+      unambiguousInSection: boolean;
+      unloadAfterFailure: () => void;
+    }> = [];
+    let totalOccurrences = 0;
+
+    for (const section of sections) {
+      if (isAborted()) {
+        for (const candidate of candidates) candidate.unloadAfterFailure();
+        return null;
+      }
+      if (primarySection && section.index === primarySection.index) continue;
+      const loaded = await this.loadSectionDocument(section);
+      if (!loaded) continue;
+      if (isAborted()) {
+        loaded.unloadAfterFailure();
+        for (const candidate of candidates) candidate.unloadAfterFailure();
+        return null;
+      }
+      const textMap = buildDocumentTextMap(loaded.document);
+      const { claimedSpans, ownedCfis, competingBrokenCount } = this.collectClaimedSpansForSection(
+        loaded.document,
+        textMap,
+        section,
+        loaded.cfiBase,
+        CfiClass,
+        annotation,
       );
-      const end = resolveCfiStepsInDocument(doc, endSteps, parsed.end?.terminal?.offset ?? null);
-      if (!start || !end) return null;
+      const matched = findExcerptMatchInDocument(loaded.document, excerpt, {
+        prefix: annotation.prefix,
+        suffix: annotation.suffix,
+        textMap,
+        claimedSpans,
+        competingBrokenCount,
+      });
+      if (!matched || !loaded.cfiBase) {
+        if (claimedSpans.length > 0) {
+          const anyOccurrence = findExcerptMatchInDocument(loaded.document, excerpt, { textMap });
+          if (anyOccurrence) totalOccurrences += anyOccurrence.candidateCount;
+        }
+        loaded.unloadAfterFailure();
+        continue;
+      }
+      totalOccurrences += matched.candidateCount;
       try {
-        range.setStart(start.node, start.offset);
-        range.setEnd(end.node, end.offset);
+        const freshCfi = new CfiClass(matched.range, loaded.cfiBase).toString();
+        if (ownedCfis.has(freshCfi.trim())) {
+          loaded.unloadAfterFailure();
+          continue;
+        }
+        candidates.push({
+          section,
+          cfi: freshCfi,
+          score: matched.score,
+          unambiguousInSection: matched.unambiguous,
+          unloadAfterFailure: loaded.unloadAfterFailure,
+        });
       } catch {
-        return null;
+        loaded.unloadAfterFailure();
       }
-      clamped = start.clamped || end.clamped;
-      relocatedById = start.relocatedById || end.relocatedById;
-    } else {
-      const endpoint = resolveCfiStepsInDocument(
-        doc,
-        parsed.path.steps,
-        parsed.path.terminal?.offset ?? null,
-      );
-      if (!endpoint) return null;
-      if (endpoint.elementOnly && annotation.excerpt === undefined) return null;
-      try {
-        range.selectNodeContents(endpoint.node);
-      } catch {
-        return null;
-      }
-      clamped = endpoint.clamped;
-      relocatedById = endpoint.relocatedById;
     }
 
-    if (range.collapsed) return null;
-    const rangeText = range.toString();
-    if (!normalizeWhitespace(rangeText)) return null;
-    const hasExcerpt = Boolean(annotation.excerpt && normalizeWhitespace(annotation.excerpt));
-    const excerptWasTruncated = Boolean(
-      annotation.excerpt && annotation.excerpt.length >= MAX_STORED_EXCERPT_LENGTH,
-    );
-    if (hasExcerpt) {
-      if (!rangeMatchesExcerpt(rangeText, annotation.excerpt!, excerptWasTruncated)) {
-        return null;
+    if (candidates.length === 0) return null;
+    let winner = candidates[0]!;
+    let bestScore = winner.score;
+    let tiedBestCount = 1;
+    for (let index = 1; index < candidates.length; index += 1) {
+      const candidate = candidates[index]!;
+      if (candidate.score > bestScore) {
+        bestScore = candidate.score;
+        tiedBestCount = 1;
+        winner = candidate;
+      } else if (candidate.score === bestScore) {
+        tiedBestCount += 1;
       }
-    } else if (clamped || relocatedById || parsed.spinePos !== sectionIndex) {
-      return null;
     }
 
-    const needsFreshCfi =
-      clamped ||
-      relocatedById ||
-      parsed.spinePos !== sectionIndex ||
-      !canEpubCfiResolveInDocument(doc, annotation.cfi, CfiClass);
+    const expectedContextLength =
+      (annotation.prefix ? normalizeWhitespace(annotation.prefix).length : 0) +
+      (annotation.suffix ? normalizeWhitespace(annotation.suffix).length : 0);
+    const minContextScore = Math.max(1, Math.min(4, expectedContextLength));
+    const globallyUnambiguous =
+      (totalOccurrences === 1 && winner.unambiguousInSection) ||
+      (bestScore >= minContextScore && tiedBestCount === 1 && winner.unambiguousInSection);
 
-    if (!needsFreshCfi) {
-      return { cfi: annotation.cfi, range, repaired: false };
+    for (const candidate of candidates) {
+      if (candidate !== winner || !globallyUnambiguous) candidate.unloadAfterFailure();
     }
-    if (!cfiBase) return null;
-    try {
-      const freshCfi = new CfiClass(range, cfiBase).toString();
-      const canPersistRepair =
-        hasExcerpt && (!clamped || !excerptWasTruncated) && freshCfi !== annotation.cfi;
-      return { cfi: freshCfi, range, repaired: canPersistRepair };
-    } catch {
-      return null;
-    }
-  }
-
-  private isHighlightCandidateForView(
-    annotation: ReaderHighlightInput,
-    parsed: RuntimeParsedCfi | null,
-    viewIndex: number,
-    viewHref: string,
-  ): { matches: boolean; authoritative: boolean } {
-    if (annotation.href) {
-      const byHref = this.findSpineSectionByHref(annotation.href);
-      if (!byHref) {
-        return { matches: false, authoritative: false };
-      }
-      const same = byHref.index === viewIndex || normalizeSpineHref(viewHref) === byHref.href;
-      return { matches: same, authoritative: same };
-    }
-    if (!parsed) {
-      return { matches: false, authoritative: false };
-    }
-    const targetSection = this.resolveSpineSectionForCfi(parsed);
-    if (!targetSection) {
-      return { matches: false, authoritative: false };
-    }
-    const same = targetSection.index === viewIndex;
-    return { matches: same, authoritative: same };
+    return globallyUnambiguous ? winner : null;
   }
 
   private isRangeUsableOnView(view: RenderedEpubView, cfi: string): boolean {
@@ -3066,21 +2259,32 @@ export class ReaderSession {
     }
   }
 
-  private recordRepairedHighlight(id: string | undefined, cfi: string, href: string): void {
-    if (!id) return;
+  private recordRepairedHighlight(
+    id: string | undefined,
+    expectedOriginalCfi: string,
+    cfi: string,
+    href: string,
+  ): boolean {
+    if (!id) return false;
+    const existing = this.storedHighlights.find((item) => item.id === id);
+    if (!existing || existing.cfi !== expectedOriginalCfi) return false;
+    const occupied = this.storedHighlights.some(
+      (item) =>
+        item.id !== id && item.cfi.trim() === cfi.trim() && (!item.href || item.href === href),
+    );
+    if (occupied) return false;
     this.reportedMissingHighlightIds.delete(id);
     this.storedHighlights = this.storedHighlights.map((item) =>
       item.id === id ? { ...item, cfi, href } : item,
     );
+    return true;
   }
 
   private syncRenderedHighlights(): void {
     const rendition = this.rendition;
     if (!rendition) return;
 
-    const hasViewsMethod =
-      typeof (rendition as unknown as { views?: unknown }).views === 'function';
-    if (!hasViewsMethod) {
+    if (typeof (rendition as unknown as { views?: unknown }).views !== 'function') {
       const next = new Set(this.storedHighlights.map((annotation) => annotation.cfi));
       for (const cfi of this.highlightCfis) {
         if (!next.has(cfi)) rendition.annotations.remove(cfi, 'highlight');
@@ -3144,15 +2348,11 @@ export class ReaderSession {
       }
 
       const directResolved = new Map<ReaderHighlightInput, { cfi: string; repaired: boolean }>();
-
-      // Pass 1: Validate all intact, clamped, or spine-shifted DOM CFIs first and reserve their
-      // text spans so stale annotations in Pass 2 can never steal a surviving highlight's anchor.
       for (const { annotation, parsed } of viewCandidates) {
         if (!parsed || !CfiClass) continue;
         const targetSection = this.resolveSpineSectionForCfi(parsed, annotation.href);
         if (!targetSection || targetSection.index !== view.index) continue;
-
-        const validated = this.validateHighlightRangeInDocument(
+        const validated = validateHighlightRangeInDocument(
           contents.document,
           parsed,
           annotation,
@@ -3161,7 +2361,6 @@ export class ReaderSession {
           CfiClass,
         );
         if (!validated) continue;
-
         if (this.isRangeUsableOnView(view, validated.cfi)) {
           directResolved.set(annotation, { cfi: validated.cfi, repaired: validated.repaired });
           recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
@@ -3176,7 +2375,7 @@ export class ReaderSession {
               recordRangeInTextMap(getTextMap(), validated.range, claimedSpans);
             }
           } catch {
-            // Fall back to Pass 2 excerpt search below.
+            // Fall back to excerpt search below.
           }
         }
       }
@@ -3192,11 +2391,9 @@ export class ReaderSession {
         );
       }
 
-      // Pass 2: Attempt unambiguous excerpt recovery only against unclaimed spans.
       for (const { annotation, authoritative } of viewCandidates) {
         let resolvedCfi: string | null = null;
         let wasRepaired = false;
-
         const direct = directResolved.get(annotation);
         if (direct) {
           resolvedCfi = direct.cfi;
@@ -3271,16 +2468,15 @@ export class ReaderSession {
     }
     this.highlightCfis = applied;
 
-    if (repaired.length > 0) {
-      const repairById = new Map(repaired.map((entry) => [entry.id, entry]));
-      this.storedHighlights = this.storedHighlights.map((item) => {
-        const repair = item.id ? repairById.get(item.id) : undefined;
-        return repair ? { ...item, cfi: repair.cfi, href: repair.href } : item;
-      });
-    }
+    const appliedRepairs = repaired.filter((entry) => {
+      const current = this.storedHighlights.find((item) => item.id === entry.id);
+      return Boolean(
+        current && this.recordRepairedHighlight(entry.id, current.cfi, entry.cfi, entry.href),
+      );
+    });
 
-    if ((repaired.length > 0 || newlyMissingIds.length > 0) && this.onHighlightResolution) {
-      this.onHighlightResolution({ repaired, missingIds: newlyMissingIds });
+    if ((appliedRepairs.length > 0 || newlyMissingIds.length > 0) && this.onHighlightResolution) {
+      this.onHighlightResolution({ repaired: appliedRepairs, missingIds: newlyMissingIds });
     }
   }
 

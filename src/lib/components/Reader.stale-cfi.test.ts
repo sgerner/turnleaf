@@ -8,7 +8,11 @@ import { getPreferences, setPreferences } from '../database/database';
 import { parseAnnotations, type StoredAnnotation } from '../reader/annotations';
 import type { StoredReaderLocation } from '../reader/bookmarks';
 import type { ReaderLocation } from '../reader/session';
-import { buildTestEpub, installEpubJsdomEnvironment } from '../reader/fixtures/test-epub-harness';
+import {
+  buildTestEpub,
+  installEpubJsdomEnvironment,
+  triggerTestViewportResize,
+} from '../reader/fixtures/test-epub-harness';
 import Reader from './Reader.svelte';
 
 async function waitForCondition(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
@@ -322,5 +326,19 @@ describe('Reader.svelte stale bookmark and highlight recovery (real epubjs + mar
     dismissButton!.click();
     await waitForCondition(() => host.querySelector('[role="alertdialog"]') === null);
     expect(host.querySelector('#reader-bookmarks')).not.toBeNull();
+
+    // Clicking a bookmark and resizing while its display is in flight aborts cleanly
+    // without misfiring fallbacks or opening an error dialog, preserving the current CFI.
+    const cfiBeforeAbortedJump = relocated.at(-1)?.cfi;
+    const currentfirstBm = [
+      ...host.querySelectorAll<HTMLButtonElement>('#reader-bookmarks button'),
+    ].find((btn) => btn.textContent?.includes('Chapter Two Stale CFI'))!;
+    currentfirstBm.click();
+    const viewportEl = host.querySelector<HTMLElement>('.reader-viewport')!;
+    triggerTestViewportResize(viewportEl, 480, 720);
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(relocated.at(-1)?.href).toContain('chapter-3-renamed.xhtml');
+    expect(relocated.at(-1)?.cfi).toBe(cfiBeforeAbortedJump);
   });
 });

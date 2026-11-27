@@ -637,6 +637,70 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('aborts a display that is in flight during a resize and checks the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 640));
+
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+    const initialCfi = 'epubcfi(/6/2!/4/2/1:0)';
+    const abortedTargetCfi = 'epubcfi(/6/4!/4/2/1:0)';
+    const resizedFinalCfi = 'epubcfi(/6/2!/4/2/1:14)';
+
+    relocated(location(initialCfi));
+    onLocation.mockClear();
+    mockRendition.display.mockClear();
+
+    let resolveStaleDisplay: (() => void) | undefined;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveStaleDisplay = resolve;
+        }),
+    );
+
+    const inFlightDisplay = session.displayCfi(abortedTargetCfi);
+    await vi.waitFor(() => {
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(abortedTargetCfi);
+    });
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 720 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    await expect(inFlightDisplay).resolves.toBe(false);
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 720);
+
+    resolveStaleDisplay?.();
+    await Promise.resolve();
+    relocated(location(resizedFinalCfi));
+
+    expect(onLocation).toHaveBeenCalledTimes(1);
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cfi: resizedFinalCfi }),
+      'restore',
+    );
+
+    mockRendition.display.mockClear();
+    session.applyAppearance({ ...defaultAppearance, fontSize: 22 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(resizedFinalCfi);
+
+    session.destroy();
+  });
+
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const onLocation = vi.fn();

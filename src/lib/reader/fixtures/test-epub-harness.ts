@@ -13,6 +13,26 @@ interface ZipEntry {
 export const TEST_PAGE_WIDTH = 600;
 export const TEST_PAGE_HEIGHT = 800;
 
+const resizeObserversByTarget = new Map<Element, Set<ResizeObserverCallback>>();
+
+export function triggerTestViewportResize(
+  viewport: HTMLElement,
+  width: number,
+  height: number,
+): void {
+  viewport.style.width = `${width}px`;
+  viewport.style.height = `${height}px`;
+  const callbacks = resizeObserversByTarget.get(viewport);
+  if (!callbacks) return;
+  const entry = {
+    target: viewport,
+    contentRect: makeDomRect(0, 0, width, height),
+  } as unknown as ResizeObserverEntry;
+  for (const callback of callbacks) {
+    callback([entry], {} as ResizeObserver);
+  }
+}
+
 function write16(bytes: Uint8Array, offset: number, value: number): void {
   bytes[offset] = value & 0xff;
   bytes[offset + 1] = (value >>> 8) & 0xff;
@@ -269,7 +289,18 @@ function patchWindowDomGeometry(targetWindow: Window & typeof globalThis): void 
         this.classList.contains('epub-container') ||
         this.dataset.readerTestViewport === 'true'
       ) {
-        return makeDomRect(0, 0, TEST_PAGE_WIDTH, TEST_PAGE_HEIGHT);
+        const hostViewport =
+          this.classList.contains('epub-container') && this.parentElement
+            ? this.parentElement
+            : this;
+        const hostWidth = Number.parseFloat(hostViewport.style.width || '');
+        const hostHeight = Number.parseFloat(hostViewport.style.height || '');
+        return makeDomRect(
+          0,
+          0,
+          Number.isFinite(hostWidth) && hostWidth > 0 ? hostWidth : TEST_PAGE_WIDTH,
+          Number.isFinite(hostHeight) && hostHeight > 0 ? hostHeight : TEST_PAGE_HEIGHT,
+        );
       }
       if (this.classList.contains('epub-view')) {
         const scrollLeft = this.parentElement?.scrollLeft ?? 0;
@@ -374,15 +405,29 @@ export function installEpubJsdomEnvironment(): () => void {
   const originalResizeObserver = globalThis.ResizeObserver;
   window.scrollTo = (() => {}) as typeof window.scrollTo;
   window.scrollBy = (() => {}) as typeof window.scrollBy;
-  if (typeof globalThis.ResizeObserver === 'undefined') {
-    class StubResizeObserver {
-      observe(): void {}
-      unobserve(): void {}
-      disconnect(): void {}
+  resizeObserversByTarget.clear();
+  class StubResizeObserver {
+    private readonly targets = new Set<Element>();
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element): void {
+      this.targets.add(target);
+      const set = resizeObserversByTarget.get(target) ?? new Set<ResizeObserverCallback>();
+      set.add(this.callback);
+      resizeObserversByTarget.set(target, set);
     }
-    globalThis.ResizeObserver = StubResizeObserver as unknown as typeof ResizeObserver;
-    window.ResizeObserver = StubResizeObserver as unknown as typeof ResizeObserver;
+    unobserve(target: Element): void {
+      this.targets.delete(target);
+      resizeObserversByTarget.get(target)?.delete(this.callback);
+    }
+    disconnect(): void {
+      for (const target of this.targets) {
+        resizeObserversByTarget.get(target)?.delete(this.callback);
+      }
+      this.targets.clear();
+    }
   }
+  globalThis.ResizeObserver = StubResizeObserver as unknown as typeof ResizeObserver;
+  window.ResizeObserver = StubResizeObserver as unknown as typeof ResizeObserver;
 
   const hadSrcdoc = 'srcdoc' in HTMLIFrameElement.prototype;
   const srcdocDescriptor = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'srcdoc');
@@ -417,6 +462,7 @@ export function installEpubJsdomEnvironment(): () => void {
     Node.prototype.appendChild = originalAppendChild;
     window.scrollTo = originalScrollTo;
     window.scrollBy = originalScrollBy;
+    resizeObserversByTarget.clear();
     if (originalResizeObserver === undefined) {
       delete (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
       delete (window as { ResizeObserver?: unknown }).ResizeObserver;
