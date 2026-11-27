@@ -35,6 +35,9 @@ describe('native library indexes', () => {
     db.exec('PRAGMA foreign_keys = ON;');
     for (const migration of migrations) db.exec(migration.statements);
 
+    const bookIndexes = db.prepare("PRAGMA index_list('books')").all() as Array<{
+      name: string;
+    }>;
     const annotationIndexes = db.prepare("PRAGMA index_list('annotations')").all() as Array<{
       name: string;
     }>;
@@ -44,6 +47,9 @@ describe('native library indexes', () => {
     const historyIndexes = db.prepare("PRAGMA index_list('reading_history')").all() as Array<{
       name: string;
     }>;
+    expect(bookIndexes.map((index) => index.name)).toEqual(
+      expect.arrayContaining(['books_server_title_idx', 'books_server_file_idx']),
+    );
     expect(annotationIndexes.map((index) => index.name)).toContain('annotations_book_created_idx');
     expect(bookmarkIndexes.map((index) => index.name)).toContain('bookmarks_book_saved_idx');
     expect(historyIndexes.map((index) => index.name)).toContain('reading_history_book_saved_idx');

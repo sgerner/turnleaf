@@ -353,7 +353,12 @@ const COORDINATED_BOOK_COLUMNS: ReadonlyArray<{
   definition: string;
   version: 8 | 9;
 }> = [
+  { name: 'file_id', definition: 'INTEGER', version: 8 },
+  { name: 'file_name', definition: 'TEXT', version: 8 },
   { name: 'remote_file_size', definition: 'INTEGER', version: 8 },
+  { name: 'chapter_epub_index', definition: 'INTEGER NOT NULL DEFAULT 0', version: 8 },
+  { name: 'multi_file_chapter', definition: 'INTEGER NOT NULL DEFAULT 0', version: 8 },
+  { name: 'sync_progress', definition: 'INTEGER NOT NULL DEFAULT 1', version: 8 },
   { name: 'downloaded_bytes', definition: 'INTEGER', version: 8 },
   { name: 'downloaded_pages', definition: 'INTEGER', version: 8 },
   { name: 'chapter_key', definition: 'TEXT', version: 8 },
@@ -361,6 +366,9 @@ const COORDINATED_BOOK_COLUMNS: ReadonlyArray<{
   { name: 'min_number', definition: 'REAL', version: 9 },
   { name: 'volume_number', definition: 'REAL', version: 9 },
 ];
+
+const COORDINATED_BOOKS_SERVER_FILE_INDEX_SQL =
+  'CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);';
 
 function isMissingTableError(error: unknown, tableName: string): boolean {
   return String(error).toLowerCase().includes(`no such table: ${tableName.toLowerCase()}`);
@@ -466,6 +474,7 @@ export async function migrateDatabase(
               },
             ]
           : []),
+        { statement: COORDINATED_BOOKS_SERVER_FILE_INDEX_SQL },
         { statement: `PRAGMA user_version = ${migration.version};` },
       ]);
       for (const column of missingColumns) existingBookColumns.add(column.name);
@@ -489,6 +498,7 @@ export async function migrateDatabase(
               },
             ]
           : []),
+        ...(existingBookColumns ? [{ statement: COORDINATED_BOOKS_SERVER_FILE_INDEX_SQL }] : []),
         { statement: migration.statements },
         ...legacyTasks,
         ...(currentVersion >= 3 ? [{ statement: DELETE_LEGACY_STUDY_PREFERENCES_SQL }] : []),

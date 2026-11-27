@@ -117,10 +117,16 @@ export const migrations = [
   {
     version: 8,
     statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
       ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
       ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
       ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
       ALTER TABLE books ADD COLUMN chapter_key TEXT;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
     `,
   },
   {

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Coordinate SQLite v10 study storage migration and atomic legacy preference copy
+- Coordinate SQLite v8-v10 schema reconciliation across #328, #330, #339, and study storage migration
 - Stop in-flight Kavita sync and transfer requests when connectivity drops
 - Stop in-flight Kavita study sync, cover, and download requests when connectivity drops
 - Replace regex HTML tag stripping in annotation comment normalization

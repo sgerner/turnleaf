@@ -403,6 +403,12 @@ function listColumnNames(db: DatabaseSync, table: string): string[] {
   );
 }
 
+function listIndexNames(db: DatabaseSync, table: string): string[] {
+  return (db.prepare(`PRAGMA index_list('${table}')`).all() as Array<{ name: string }>).map(
+    (row) => row.name,
+  );
+}
+
 function listTableNames(db: DatabaseSync): string[] {
   return (
     db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as Array<{
@@ -572,25 +578,74 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
 
   afterEach(() => db?.close());
 
+  const pr328V8Migration = {
+    version: 8,
+    statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+    `,
+  } as const;
+
+  const pr330V8Migration = {
+    version: 8,
+    statements: `
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+    `,
+  } as const;
+
+  const pr328And330CombinedV8Migration = {
+    version: 8,
+    statements: `
+      ALTER TABLE books ADD COLUMN file_id INTEGER;
+      ALTER TABLE books ADD COLUMN file_name TEXT;
+      ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
+      ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
+      ALTER TABLE books ADD COLUMN chapter_key TEXT;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
+    `,
+  } as const;
+
+  const pr339V9Migration = {
+    version: 9,
+    statements: `
+      ALTER TABLE books ADD COLUMN sort_order REAL;
+      ALTER TABLE books ADD COLUMN min_number REAL;
+      ALTER TABLE books ADD COLUMN volume_number REAL;
+    `,
+  } as const;
+
+  const pr328OnlyMigrations = [...migrations.slice(0, 7), pr328V8Migration] as const;
+  const pr330OnlyMigrations = [...migrations.slice(0, 7), pr330V8Migration] as const;
+  const pr328And330CombinedV8Migrations = [
+    ...migrations.slice(0, 7),
+    pr328And330CombinedV8Migration,
+  ] as const;
+  const pr328And339SequentialMigrations = [
+    ...migrations.slice(0, 7),
+    pr328V8Migration,
+    pr339V9Migration,
+  ] as const;
   const pr330And339SequentialMigrations = [
     ...migrations.slice(0, 7),
-    {
-      version: 8,
-      statements: `
-        ALTER TABLE books ADD COLUMN remote_file_size INTEGER;
-        ALTER TABLE books ADD COLUMN downloaded_bytes INTEGER;
-        ALTER TABLE books ADD COLUMN downloaded_pages INTEGER;
-        ALTER TABLE books ADD COLUMN chapter_key TEXT;
-      `,
-    },
-    {
-      version: 9,
-      statements: `
-        ALTER TABLE books ADD COLUMN sort_order REAL;
-        ALTER TABLE books ADD COLUMN min_number REAL;
-        ALTER TABLE books ADD COLUMN volume_number REAL;
-      `,
-    },
+    pr330V8Migration,
+    pr339V9Migration,
+  ] as const;
+  const pr328And330And339SequentialMigrations = [
+    ...migrations.slice(0, 7),
+    pr328And330CombinedV8Migration,
+    pr339V9Migration,
   ] as const;
 
   const pr330And339CombinedV8Migrations = [
@@ -609,17 +664,28 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     },
   ] as const;
 
-  const pr330OnlyMigrations = pr330And339SequentialMigrations.slice(0, 8);
+  const pr339OnlyV8Migrations = [
+    ...migrations.slice(0, 7),
+    {
+      version: 8,
+      statements: pr339V9Migration.statements,
+    },
+  ] as const;
 
   const expectedCoordinatedBookColumns = [
+    'file_id',
+    'file_name',
     'remote_file_size',
+    'chapter_epub_index',
+    'multi_file_chapter',
+    'sync_progress',
     'downloaded_bytes',
     'downloaded_pages',
     'chapter_key',
     'sort_order',
     'min_number',
     'volume_number',
-  ];
+  ] as const;
 
   function assertV7StatePreserved(targetDb: DatabaseSync): void {
     expect(
@@ -657,39 +723,345 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     });
   }
 
-  it('upgrades cleanly from v7 when #330/#339 schema migrations land first (#330 v8 only, sequential v8+v9, and combined v8) and #345 upgrades second', async () => {
-    for (const priorMigrations of [
-      pr330OnlyMigrations,
-      pr330And339SequentialMigrations,
-      pr330And339CombinedV8Migrations,
-    ]) {
+  function assertCoordinatedBookSchemaAndIndex(targetDb: DatabaseSync): void {
+    const bookColumns = listColumnNames(targetDb, 'books');
+    for (const column of expectedCoordinatedBookColumns) {
+      expect(bookColumns).toContain(column);
+    }
+    expect(bookColumns.filter((column) => column === 'remote_file_size')).toHaveLength(1);
+    expect(listIndexNames(targetDb, 'books')).toEqual(
+      expect.arrayContaining(['books_server_title_idx', 'books_server_file_idx']),
+    );
+  }
+
+  function seedPopulatedPredecessorFields(
+    targetDb: DatabaseSync,
+    options: { has328: boolean; has330: boolean; has339: boolean },
+  ): void {
+    if (options.has328) {
+      targetDb
+        .prepare(
+          `UPDATE books
+           SET file_id = 1001,
+               file_name = 'book-ten.epub',
+               remote_file_size = 24576,
+               chapter_epub_index = 0,
+               multi_file_chapter = 0,
+               sync_progress = 1
+           WHERE id = 'srv_active:1:10'`,
+        )
+        .run();
+      targetDb
+        .prepare(
+          `INSERT INTO books
+            (id, server_id, library_id, series_id, volume_id, chapter_id, file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress, title, format, metadata_refreshed_at, download_path, download_status, file_size, pages, pages_read, created_at)
+            VALUES ('srv_active:1:11:2115', 'srv_active', 1, 1, 11, 11, 2115, 'book-eleven-part2.epub', 65536, 1, 1, 0, 'Book Eleven (Part 2)', 'epub', '2026-01-01T00:00:00.000Z', NULL, 'none', NULL, 64, 12, '2026-01-01T00:00:00.000Z')`,
+        )
+        .run();
+
+      const insertPref = targetDb.prepare(
+        'INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)',
+      );
+      insertPref.run(
+        'readerAnnotations:srv_active:1:11:2115',
+        JSON.stringify([
+          {
+            id: 'ann-multifile',
+            cfi: 'epubcfi(/6/2!/4/2/1:0)',
+            excerpt: 'Multi-file chapter highlight',
+            note: 'Multi-file note',
+            createdAt: '2026-01-06T00:00:00.000Z',
+          },
+        ]),
+        '2026-01-06T00:00:00.000Z',
+      );
+      insertPref.run(
+        'readerBookmarks:srv_active:1:11:2115',
+        JSON.stringify([
+          {
+            id: 'bm-multifile',
+            cfi: 'epubcfi(/6/2!/4/4)',
+            href: 'Text/part2.xhtml',
+            percentage: 0.5,
+            label: 'Part Two Midpoint',
+            savedAt: '2026-01-06T01:00:00.000Z',
+          },
+        ]),
+        '2026-01-06T01:00:00.000Z',
+      );
+      insertPref.run(
+        'readerHistory:srv_active:1:11:2115',
+        JSON.stringify([
+          {
+            id: 'hist-multifile',
+            cfi: 'epubcfi(/6/2!/4/6)',
+            href: 'Text/part2.xhtml',
+            percentage: 0.55,
+            label: '55% · part2.xhtml',
+            savedAt: '2026-01-06T02:00:00.000Z',
+          },
+        ]),
+        '2026-01-06T02:00:00.000Z',
+      );
+    }
+
+    if (options.has330) {
+      targetDb
+        .prepare(
+          `UPDATE books
+           SET remote_file_size = 24576,
+               downloaded_bytes = 20480,
+               downloaded_pages = 100,
+               chapter_key = '10:24576'
+           WHERE id = 'srv_active:1:10'`,
+        )
+        .run();
+    }
+
+    if (options.has339) {
+      targetDb
+        .prepare(
+          `UPDATE books
+           SET sort_order = 1.5,
+               min_number = 1,
+               volume_number = 2
+           WHERE id = 'srv_active:1:10'`,
+        )
+        .run();
+    }
+  }
+
+  function installReconciliationAndCopyOrderTrigger(
+    targetDb: DatabaseSync,
+    counts: { annotations: number; bookmarks: number; history: number },
+  ): void {
+    const quotedColumns = expectedCoordinatedBookColumns.map((name) => `'${name}'`).join(', ');
+    targetDb.exec(`
+      CREATE TRIGGER assert_reconciled_and_copied_before_preference_delete
+      BEFORE DELETE ON preferences
+      WHEN OLD.key LIKE 'readerAnnotations:%'
+        OR OLD.key LIKE 'readerBookmarks:%'
+        OR OLD.key LIKE 'readerHistory:%'
+      BEGIN
+        SELECT CASE
+          WHEN (
+            SELECT COUNT(*) FROM pragma_table_info('books')
+            WHERE name IN (${quotedColumns})
+          ) < ${expectedCoordinatedBookColumns.length}
+          THEN RAISE(ABORT, 'legacy preference deleted before coordinated books columns were reconciled')
+          WHEN (
+            SELECT COUNT(*) FROM pragma_index_list('books')
+            WHERE name = 'books_server_file_idx'
+          ) < 1
+          THEN RAISE(ABORT, 'legacy preference deleted before books_server_file_idx was reconciled')
+          WHEN (SELECT COUNT(*) FROM annotations) < ${counts.annotations}
+            OR (SELECT COUNT(*) FROM bookmarks) < ${counts.bookmarks}
+            OR (SELECT COUNT(*) FROM reading_history) < ${counts.history}
+          THEN RAISE(ABORT, 'legacy preference deleted before all study records were copied')
+        END;
+      END;
+    `);
+  }
+
+  function createOrderRecordingAdapter(
+    baseAdapter: Parameters<typeof migrateDatabase>[0],
+    executedStatements: string[],
+  ): Parameters<typeof migrateDatabase>[0] {
+    return {
+      ...baseAdapter,
+      executeTransaction(tasks) {
+        for (const task of tasks) executedStatements.push(task.statement.trim());
+        return baseAdapter.executeTransaction(tasks);
+      },
+    };
+  }
+
+  function assertReconciliationPrecededStudyCopyAndDelete(executedStatements: string[]): void {
+    const firstStudyCopyIndex = executedStatements.findIndex(
+      (sql) =>
+        sql.startsWith('INSERT INTO annotations') ||
+        sql.startsWith('INSERT INTO bookmarks') ||
+        sql.startsWith('INSERT INTO reading_history'),
+    );
+    const deleteLegacyPrefsIndex = executedStatements.findIndex((sql) =>
+      sql.startsWith('DELETE FROM preferences'),
+    );
+    expect(firstStudyCopyIndex).toBeGreaterThan(-1);
+    expect(deleteLegacyPrefsIndex).toBeGreaterThan(firstStudyCopyIndex);
+
+    for (let index = 0; index < executedStatements.length; index += 1) {
+      const sql = executedStatements[index] ?? '';
+      if (
+        sql.includes('ALTER TABLE books ADD COLUMN') ||
+        sql.includes('CREATE INDEX IF NOT EXISTS books_server_file_idx')
+      ) {
+        expect(index).toBeLessThan(firstStudyCopyIndex);
+        expect(index).toBeLessThan(deleteLegacyPrefsIndex);
+      }
+    }
+  }
+
+  it('upgrades populated v7 databases cleanly when #328-only, #330-only, combined v8, or #339 v9 migrations land first and #345 reconciles before copying/deleting legacy study preferences', async () => {
+    const scenarios = [
+      {
+        label: '#328-only v8',
+        priorMigrations: pr328OnlyMigrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: true,
+        has330: false,
+        has339: false,
+      },
+      {
+        label: '#330-only v8',
+        priorMigrations: pr330OnlyMigrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: false,
+        has330: true,
+        has339: false,
+      },
+      {
+        label: 'combined #328+#330 v8',
+        priorMigrations: pr328And330CombinedV8Migrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: true,
+        has330: true,
+        has339: false,
+      },
+      {
+        label: '#328 v8 + #339 v9',
+        priorMigrations: pr328And339SequentialMigrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: true,
+        has330: false,
+        has339: true,
+      },
+      {
+        label: '#330 v8 + #339 v9',
+        priorMigrations: pr330And339SequentialMigrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: false,
+        has330: true,
+        has339: true,
+      },
+      {
+        label: 'combined #328+#330 v8 + #339 v9',
+        priorMigrations: pr328And330And339SequentialMigrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: true,
+        has330: true,
+        has339: true,
+      },
+      {
+        label: 'uncoordinated #330+#339 combined v8',
+        priorMigrations: pr330And339CombinedV8Migrations,
+        followupMigrations: pr328And330And339SequentialMigrations,
+        has328: false,
+        has330: true,
+        has339: true,
+      },
+    ] as const;
+
+    for (const scenario of scenarios) {
       const candidateDb = createV7Database();
       try {
         seedV7StudyPreferencesFixture(candidateDb);
-        const adapter = createMigrationAdapter(candidateDb);
+        const baseAdapter = createMigrationAdapter(candidateDb);
 
-        await runSimpleMigrations(adapter, priorMigrations);
-        await migrateDatabase(adapter);
-        // If #339 lands after #330 + #345, its migrations are also a safe no-op at v10.
-        await runSimpleMigrations(adapter, pr330And339SequentialMigrations);
+        await runSimpleMigrations(baseAdapter, scenario.priorMigrations);
+        seedPopulatedPredecessorFields(candidateDb, scenario);
 
-        expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-        const bookColumns = listColumnNames(candidateDb, 'books');
-        for (const column of expectedCoordinatedBookColumns) {
-          expect(bookColumns).toContain(column);
-        }
+        const expectedAnnotations = scenario.has328 ? 3 : 2;
+        const expectedBookmarks = scenario.has328 ? 4 : 3;
+        const expectedHistory = scenario.has328 ? 13 : 12;
+        installReconciliationAndCopyOrderTrigger(candidateDb, {
+          annotations: expectedAnnotations,
+          bookmarks: expectedBookmarks,
+          history: expectedHistory,
+        });
+
+        const executedStatements: string[] = [];
+        const recordingAdapter = createOrderRecordingAdapter(baseAdapter, executedStatements);
+        await migrateDatabase(recordingAdapter);
+        assertReconciliationPrecededStudyCopyAndDelete(executedStatements);
+
+        // Any subsequent #328/#330/#339 migration sets are safe no-ops once at v10.
+        await runSimpleMigrations(baseAdapter, scenario.followupMigrations);
+
+        expect(await baseAdapter.getVersion(), scenario.label).toEqual({
+          version: STUDY_STORAGE_MIGRATION_VERSION,
+        });
+        assertCoordinatedBookSchemaAndIndex(candidateDb);
         expect(listTableNames(candidateDb)).toEqual(
           expect.arrayContaining(['annotations', 'bookmarks', 'reading_history']),
         );
         assertV7StatePreserved(candidateDb);
+
+        expect(
+          candidateDb
+            .prepare(
+              `SELECT file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress,
+                      downloaded_bytes, downloaded_pages, chapter_key, sort_order, min_number, volume_number
+               FROM books WHERE id = ?`,
+            )
+            .get('srv_active:1:10'),
+          scenario.label,
+        ).toEqual({
+          file_id: scenario.has328 ? 1001 : null,
+          file_name: scenario.has328 ? 'book-ten.epub' : null,
+          remote_file_size: scenario.has328 || scenario.has330 ? 24576 : null,
+          chapter_epub_index: 0,
+          multi_file_chapter: 0,
+          sync_progress: 1,
+          downloaded_bytes: scenario.has330 ? 20480 : null,
+          downloaded_pages: scenario.has330 ? 100 : null,
+          chapter_key: scenario.has330 ? '10:24576' : null,
+          sort_order: scenario.has339 ? 1.5 : null,
+          min_number: scenario.has339 ? 1 : null,
+          volume_number: scenario.has339 ? 2 : null,
+        });
+
+        if (scenario.has328) {
+          expect(
+            candidateDb
+              .prepare(
+                `SELECT file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress
+                 FROM books WHERE server_id = ? AND file_id = ?`,
+              )
+              .get('srv_active', 2115),
+            scenario.label,
+          ).toEqual({
+            file_id: 2115,
+            file_name: 'book-eleven-part2.epub',
+            remote_file_size: 65536,
+            chapter_epub_index: 1,
+            multi_file_chapter: 1,
+            sync_progress: 0,
+          });
+          expect(
+            candidateDb
+              .prepare('SELECT id FROM annotations WHERE book_id = ?')
+              .get('srv_active:1:11:2115'),
+          ).toEqual({ id: 'srv_active:1:11:2115:ann-multifile' });
+          expect(
+            candidateDb
+              .prepare('SELECT id FROM bookmarks WHERE book_id = ?')
+              .get('srv_active:1:11:2115'),
+          ).toEqual({ id: 'srv_active:1:11:2115:bm-multifile' });
+          expect(
+            candidateDb
+              .prepare('SELECT id FROM reading_history WHERE book_id = ?')
+              .get('srv_active:1:11:2115'),
+          ).toEqual({ id: 'hist-multifile' });
+        }
+
         expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({
-          total: 2,
+          total: expectedAnnotations,
         });
         expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM bookmarks').get()).toEqual({
-          total: 3,
+          total: expectedBookmarks,
         });
         expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM reading_history').get()).toEqual({
-          total: 12,
+          total: expectedHistory,
         });
         expect(
           candidateDb.prepare('SELECT key, value FROM preferences ORDER BY key ASC').all(),
@@ -704,25 +1076,62 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     db = undefined;
   });
 
-  it('upgrades cleanly from v7 when #345 lands first and #330/#339 migrations run afterward without skipping columns or study tables', async () => {
+  it('upgrades populated v7 databases cleanly when #345 lands first (reconciling v8+v9 before copying/deleting legacy preferences) and #328/#330/#339 migrations run afterward', async () => {
     db = createV7Database();
     seedV7StudyPreferencesFixture(db);
-    const adapter = createMigrationAdapter(db);
+    const baseAdapter = createMigrationAdapter(db);
 
-    await migrateDatabase(adapter);
-    await runSimpleMigrations(adapter, pr330OnlyMigrations);
-    await runSimpleMigrations(adapter, pr330And339SequentialMigrations);
-    await migrateDatabase(adapter);
+    installReconciliationAndCopyOrderTrigger(db, {
+      annotations: 2,
+      bookmarks: 3,
+      history: 12,
+    });
+    const executedStatements: string[] = [];
+    const recordingAdapter = createOrderRecordingAdapter(baseAdapter, executedStatements);
 
-    expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-    const bookColumns = listColumnNames(db, 'books');
-    for (const column of expectedCoordinatedBookColumns) {
-      expect(bookColumns).toContain(column);
+    await migrateDatabase(recordingAdapter);
+    assertReconciliationPrecededStudyCopyAndDelete(executedStatements);
+
+    for (const subsequentMigrations of [
+      pr328OnlyMigrations,
+      pr330OnlyMigrations,
+      pr328And330CombinedV8Migrations,
+      pr328And339SequentialMigrations,
+      pr330And339SequentialMigrations,
+      pr328And330And339SequentialMigrations,
+    ]) {
+      await runSimpleMigrations(baseAdapter, subsequentMigrations);
     }
+    await migrateDatabase(baseAdapter);
+
+    expect(await baseAdapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
+    assertCoordinatedBookSchemaAndIndex(db);
     expect(listTableNames(db)).toEqual(
       expect.arrayContaining(['annotations', 'bookmarks', 'reading_history']),
     );
     assertV7StatePreserved(db);
+    expect(
+      db
+        .prepare(
+          `SELECT file_id, file_name, remote_file_size, chapter_epub_index, multi_file_chapter, sync_progress,
+                  downloaded_bytes, downloaded_pages, chapter_key, sort_order, min_number, volume_number
+           FROM books WHERE id = ?`,
+        )
+        .get('srv_active:1:10'),
+    ).toEqual({
+      file_id: null,
+      file_name: null,
+      remote_file_size: null,
+      chapter_epub_index: 0,
+      multi_file_chapter: 0,
+      sync_progress: 1,
+      downloaded_bytes: null,
+      downloaded_pages: null,
+      chapter_key: null,
+      sort_order: null,
+      min_number: null,
+      volume_number: null,
+    });
     expect(db.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({ total: 2 });
     expect(db.prepare('SELECT COUNT(*) AS total FROM bookmarks').get()).toEqual({ total: 3 });
     expect(db.prepare('SELECT COUNT(*) AS total FROM reading_history').get()).toEqual({
@@ -730,31 +1139,40 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     });
   });
 
-  it('reconciles missing v8 books columns if an uncoordinated v8 migration added only #339 columns before #345 runs', async () => {
+  it('reconciles missing #328 and #330 v8 books columns and index if an uncoordinated v8 migration added only #339 columns before #345 runs', async () => {
     db = createV7Database();
     seedV7StudyPreferencesFixture(db);
-    const adapter = createMigrationAdapter(db);
+    const baseAdapter = createMigrationAdapter(db);
 
-    await runSimpleMigrations(adapter, [
-      ...migrations.slice(0, 7),
-      {
-        version: 8,
-        statements: `
-          ALTER TABLE books ADD COLUMN sort_order REAL;
-          ALTER TABLE books ADD COLUMN min_number REAL;
-          ALTER TABLE books ADD COLUMN volume_number REAL;
-        `,
-      },
-    ]);
-    expect(await adapter.getVersion()).toEqual({ version: 8 });
+    await runSimpleMigrations(baseAdapter, pr339OnlyV8Migrations);
+    seedPopulatedPredecessorFields(db, { has328: false, has330: false, has339: true });
+    expect(await baseAdapter.getVersion()).toEqual({ version: 8 });
 
-    await migrateDatabase(adapter);
+    installReconciliationAndCopyOrderTrigger(db, {
+      annotations: 2,
+      bookmarks: 3,
+      history: 12,
+    });
+    const executedStatements: string[] = [];
+    await migrateDatabase(createOrderRecordingAdapter(baseAdapter, executedStatements));
+    assertReconciliationPrecededStudyCopyAndDelete(executedStatements);
 
-    expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-    const bookColumns = listColumnNames(db, 'books');
-    for (const column of expectedCoordinatedBookColumns) {
-      expect(bookColumns).toContain(column);
-    }
+    expect(await baseAdapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
+    assertCoordinatedBookSchemaAndIndex(db);
+    expect(
+      db
+        .prepare(
+          'SELECT chapter_epub_index, multi_file_chapter, sync_progress, sort_order, min_number, volume_number FROM books WHERE id = ?',
+        )
+        .get('srv_active:1:10'),
+    ).toEqual({
+      chapter_epub_index: 0,
+      multi_file_chapter: 0,
+      sync_progress: 1,
+      sort_order: 1.5,
+      min_number: 1,
+      volume_number: 2,
+    });
     expect(db.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({ total: 2 });
     expect(db.prepare('SELECT COUNT(*) AS total FROM bookmarks').get()).toEqual({ total: 3 });
     expect(db.prepare('SELECT COUNT(*) AS total FROM reading_history').get()).toEqual({
@@ -768,22 +1186,12 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     const adapter = createMigrationAdapter(db);
 
     // SQLite trigger proves inside the database engine that when any legacy preference row is
-    // deleted, all supported active-server study records have ALREADY been inserted.
-    db.exec(`
-      CREATE TRIGGER assert_study_rows_copied_before_preference_delete
-      BEFORE DELETE ON preferences
-      WHEN OLD.key LIKE 'readerAnnotations:%'
-        OR OLD.key LIKE 'readerBookmarks:%'
-        OR OLD.key LIKE 'readerHistory:%'
-      BEGIN
-        SELECT CASE
-          WHEN (SELECT COUNT(*) FROM annotations) < 2
-            OR (SELECT COUNT(*) FROM bookmarks) < 3
-            OR (SELECT COUNT(*) FROM reading_history) < 12
-          THEN RAISE(ABORT, 'legacy preference deleted before all study records were copied')
-        END;
-      END;
-    `);
+    // deleted, all coordinated books columns, index, and active-server study records ALREADY exist.
+    installReconciliationAndCopyOrderTrigger(db, {
+      annotations: 2,
+      bookmarks: 3,
+      history: 12,
+    });
 
     await migrateDatabase(adapter);
 
@@ -882,117 +1290,144 @@ describe('coordinated schema v8-v10 migrations and legacy study-data rollback ag
     ]);
   });
 
-  it('rolls back the v10 migration and leaves all source preferences intact if any query or study insert fails, then succeeds on retry', async () => {
-    db = createV7Database();
-    seedV7StudyPreferencesFixture(db);
-    const adapter = createMigrationAdapter(db);
+  it('rolls back the v10 migration and leaves all source preferences intact if any query or study insert fails across #328/#330/#339 v8 and v9 predecessors, then succeeds on retry', async () => {
+    for (const priorCase of [
+      { migrations: pr328OnlyMigrations, has328: true, has330: false, has339: false },
+      { migrations: pr330OnlyMigrations, has328: false, has330: true, has339: false },
+      { migrations: pr328And339SequentialMigrations, has328: true, has330: false, has339: true },
+      { migrations: pr330And339SequentialMigrations, has328: false, has330: true, has339: true },
+    ] as const) {
+      const candidateDb = createV7Database();
+      try {
+        seedV7StudyPreferencesFixture(candidateDb);
+        const adapter = createMigrationAdapter(candidateDb);
 
-    const preferencesBefore = db
-      .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
-      .all();
-
-    await runSimpleMigrations(adapter, pr330And339SequentialMigrations);
-    expect(await adapter.getVersion()).toEqual({ version: 9 });
-
-    // 1. Transient query error while reading legacy preferences aborts before touching preferences.
-    const failingQueryAdapter: Parameters<typeof migrateDatabase>[0] = {
-      ...adapter,
-      query(statement, values) {
-        if (statement.includes('FROM preferences')) {
-          return Promise.reject(new Error('SQLITE_BUSY: database is locked'));
-        }
-        return adapter.query(statement, values);
-      },
-    };
-    await expect(migrateDatabase(failingQueryAdapter)).rejects.toThrow(/SQLITE_BUSY/);
-    expect(
-      db.prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC').all(),
-    ).toEqual(preferencesBefore);
-    expect(await adapter.getVersion()).toEqual({ version: 9 });
-
-    // 2. Inject NOT NULL violations on annotations, bookmarks, and reading_history inserts in turn.
-    for (const targetInsert of [
-      'INSERT INTO annotations',
-      'INSERT INTO bookmarks',
-      'INSERT INTO reading_history',
-    ]) {
-      const failingInsertAdapter: Parameters<typeof migrateDatabase>[0] = {
-        ...adapter,
-        executeTransaction(tasks) {
-          let injected = false;
-          const injectedTasks = tasks.map((task) => {
-            if (!injected && task.statement.includes(targetInsert)) {
-              injected = true;
-              const values = [...(task.values ?? [])];
-              values[values.length - 1] =
-                targetInsert === 'INSERT INTO reading_history' ? null : values[values.length - 1];
-              if (targetInsert !== 'INSERT INTO reading_history') {
-                // Null out a NOT NULL column (created_at on annotations, saved_at on bookmarks)
-                const nullIndex = targetInsert === 'INSERT INTO annotations' ? 13 : 12;
-                values[nullIndex] = null;
-              }
-              return { statement: task.statement, values };
-            }
-            return task;
-          });
-          return adapter.executeTransaction(injectedTasks);
-        },
-      };
-
-      await expect(migrateDatabase(failingInsertAdapter)).rejects.toThrow(/NOT NULL/i);
-
-      const preferencesAfterRollback = db
-        .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
-        .all();
-      expect(preferencesAfterRollback).toEqual(preferencesBefore);
-      expect(await adapter.getVersion()).toEqual({ version: 9 });
-      expect(listTableNames(db)).not.toContain('annotations');
-      expect(listTableNames(db)).not.toContain('bookmarks');
-      expect(listTableNames(db)).not.toContain('reading_history');
-    }
-
-    // 3. Inject a FOREIGN KEY violation on the final reading_history insert (after 2 annotations,
-    //    3 bookmarks, and 11 history rows have already inserted inside the transaction).
-    const failingFinalFkAdapter: Parameters<typeof migrateDatabase>[0] = {
-      ...adapter,
-      executeTransaction(tasks) {
-        const lastHistoryIndex = tasks.reduce(
-          (found, task, index) =>
-            task.statement.includes('INSERT INTO reading_history') ? index : found,
-          -1,
-        );
-        const injectedTasks = tasks.map((task, index) => {
-          if (index !== lastHistoryIndex) return task;
-          const values = [...(task.values ?? [])];
-          values[0] = 'srv_missing:999:999';
-          return { statement: task.statement, values };
+        await runSimpleMigrations(adapter, priorCase.migrations);
+        const has328 = priorCase.has328;
+        seedPopulatedPredecessorFields(candidateDb, {
+          has328: priorCase.has328,
+          has330: priorCase.has330,
+          has339: priorCase.has339,
         });
-        return adapter.executeTransaction(injectedTasks);
-      },
-    };
-    await expect(migrateDatabase(failingFinalFkAdapter)).rejects.toThrow(/FOREIGN KEY/i);
-    expect(
-      db.prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC').all(),
-    ).toEqual(preferencesBefore);
-    expect(await adapter.getVersion()).toEqual({ version: 9 });
-    expect(listTableNames(db)).not.toContain('annotations');
-    expect(listTableNames(db)).not.toContain('bookmarks');
-    expect(listTableNames(db)).not.toContain('reading_history');
 
-    // 4. Retrying once the failure is cleared migrates every supported record cleanly.
-    await migrateDatabase(adapter);
-    expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
-    expect(db.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({ total: 2 });
-    expect(db.prepare('SELECT COUNT(*) AS total FROM bookmarks').get()).toEqual({ total: 3 });
-    expect(db.prepare('SELECT COUNT(*) AS total FROM reading_history').get()).toEqual({
-      total: 12,
-    });
-    expect(
-      db
-        .prepare(
-          "SELECT key FROM preferences WHERE key LIKE 'readerAnnotations:%' OR key LIKE 'readerBookmarks:%' OR key LIKE 'readerHistory:%'",
-        )
-        .all(),
-    ).toEqual([]);
+        const preferencesBefore = candidateDb
+          .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
+          .all();
+
+        // 1. Transient query error while reading legacy preferences aborts before touching preferences.
+        const failingQueryAdapter: Parameters<typeof migrateDatabase>[0] = {
+          ...adapter,
+          query(statement, values) {
+            if (statement.includes('FROM preferences')) {
+              return Promise.reject(new Error('SQLITE_BUSY: database is locked'));
+            }
+            return adapter.query(statement, values);
+          },
+        };
+        await expect(migrateDatabase(failingQueryAdapter)).rejects.toThrow(/SQLITE_BUSY/);
+        expect(
+          candidateDb
+            .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
+            .all(),
+        ).toEqual(preferencesBefore);
+        expect(await adapter.getVersion()).toEqual({ version: 9 });
+
+        // 2. Inject NOT NULL violations on annotations, bookmarks, and reading_history inserts in turn.
+        for (const targetInsert of [
+          'INSERT INTO annotations',
+          'INSERT INTO bookmarks',
+          'INSERT INTO reading_history',
+        ]) {
+          const failingInsertAdapter: Parameters<typeof migrateDatabase>[0] = {
+            ...adapter,
+            executeTransaction(tasks) {
+              let injected = false;
+              const injectedTasks = tasks.map((task) => {
+                if (!injected && task.statement.includes(targetInsert)) {
+                  injected = true;
+                  const values = [...(task.values ?? [])];
+                  values[values.length - 1] =
+                    targetInsert === 'INSERT INTO reading_history'
+                      ? null
+                      : values[values.length - 1];
+                  if (targetInsert !== 'INSERT INTO reading_history') {
+                    // Null out a NOT NULL column (created_at on annotations, saved_at on bookmarks)
+                    const nullIndex = targetInsert === 'INSERT INTO annotations' ? 13 : 12;
+                    values[nullIndex] = null;
+                  }
+                  return { statement: task.statement, values };
+                }
+                return task;
+              });
+              return adapter.executeTransaction(injectedTasks);
+            },
+          };
+
+          await expect(migrateDatabase(failingInsertAdapter)).rejects.toThrow(/NOT NULL/i);
+
+          const preferencesAfterRollback = candidateDb
+            .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
+            .all();
+          expect(preferencesAfterRollback).toEqual(preferencesBefore);
+          expect(await adapter.getVersion()).toEqual({ version: 9 });
+          expect(listTableNames(candidateDb)).not.toContain('annotations');
+          expect(listTableNames(candidateDb)).not.toContain('bookmarks');
+          expect(listTableNames(candidateDb)).not.toContain('reading_history');
+        }
+
+        // 3. Inject a FOREIGN KEY violation on the final reading_history insert.
+        const failingFinalFkAdapter: Parameters<typeof migrateDatabase>[0] = {
+          ...adapter,
+          executeTransaction(tasks) {
+            const lastHistoryIndex = tasks.reduce(
+              (found, task, index) =>
+                task.statement.includes('INSERT INTO reading_history') ? index : found,
+              -1,
+            );
+            const injectedTasks = tasks.map((task, index) => {
+              if (index !== lastHistoryIndex) return task;
+              const values = [...(task.values ?? [])];
+              values[0] = 'srv_missing:999:999';
+              return { statement: task.statement, values };
+            });
+            return adapter.executeTransaction(injectedTasks);
+          },
+        };
+        await expect(migrateDatabase(failingFinalFkAdapter)).rejects.toThrow(/FOREIGN KEY/i);
+        expect(
+          candidateDb
+            .prepare('SELECT key, value, updated_at FROM preferences ORDER BY key ASC')
+            .all(),
+        ).toEqual(preferencesBefore);
+        expect(await adapter.getVersion()).toEqual({ version: 9 });
+        expect(listTableNames(candidateDb)).not.toContain('annotations');
+        expect(listTableNames(candidateDb)).not.toContain('bookmarks');
+        expect(listTableNames(candidateDb)).not.toContain('reading_history');
+
+        // 4. Retrying once the failure is cleared reconciles missing columns and migrates every supported record cleanly.
+        await migrateDatabase(adapter);
+        expect(await adapter.getVersion()).toEqual({ version: STUDY_STORAGE_MIGRATION_VERSION });
+        assertCoordinatedBookSchemaAndIndex(candidateDb);
+        expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM annotations').get()).toEqual({
+          total: has328 ? 3 : 2,
+        });
+        expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM bookmarks').get()).toEqual({
+          total: has328 ? 4 : 3,
+        });
+        expect(candidateDb.prepare('SELECT COUNT(*) AS total FROM reading_history').get()).toEqual({
+          total: has328 ? 13 : 12,
+        });
+        expect(
+          candidateDb
+            .prepare(
+              "SELECT key FROM preferences WHERE key LIKE 'readerAnnotations:%' OR key LIKE 'readerBookmarks:%' OR key LIKE 'readerHistory:%'",
+            )
+            .all(),
+        ).toEqual([]);
+      } finally {
+        candidateDb.close();
+      }
+    }
+    db = undefined;
   });
 });
