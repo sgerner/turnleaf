@@ -12,11 +12,27 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
+function isHiddenOrInert(element: HTMLElement): boolean {
+  if (element.closest('[hidden], [inert], [aria-hidden="true"]')) return true;
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    if (current.inert) return true;
+  }
+  return false;
+}
+
 export function isFocusableElement(element: HTMLElement): boolean {
-  return (
-    element.tabIndex >= 0 &&
+  return element.tabIndex >= 0 && !element.matches(':disabled') && !isHiddenOrInert(element);
+}
+
+function canRestoreFocusTarget(element: HTMLElement | null | undefined): element is HTMLElement {
+  return Boolean(
+    element &&
+    element.isConnected &&
+    element !== document.body &&
+    element !== document.documentElement &&
+    !element.hasAttribute('disabled') &&
     !element.matches(':disabled') &&
-    !element.closest('[hidden], [inert], [aria-hidden="true"]')
+    !isHiddenOrInert(element),
   );
 }
 
@@ -62,14 +78,26 @@ export function focusModal(getContainer: () => HTMLElement | null): void {
   void tick().then(() => focusFirstElement(getContainer()));
 }
 
-export function restoreFocus(element: HTMLElement | null): void {
-  if (element?.isConnected && !element.hasAttribute('disabled') && !element.matches(':disabled')) {
+export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement | null): void {
+  if (canRestoreFocusTarget(element)) {
     element.focus();
+    return;
   }
+  if (!canRestoreFocusTarget(fallback)) return;
+  if (fallback.matches(FOCUSABLE_SELECTOR) && fallback.tabIndex >= 0) {
+    fallback.focus();
+    return;
+  }
+  focusFirstElement(fallback);
 }
 
-export function restoreModalFocus(element: HTMLElement | null): void {
-  void tick().then(() => restoreFocus(element));
+export function restoreModalFocus(
+  element: HTMLElement | null,
+  fallback?: HTMLElement | null | (() => HTMLElement | null),
+): void {
+  void tick().then(() =>
+    restoreFocus(element, typeof fallback === 'function' ? fallback() : fallback),
+  );
 }
 
 export function trapModalKeydown(
