@@ -276,6 +276,31 @@ function assertRedirectIsolation(fixture) {
   }
 }
 
+export function formatActionsAnnotationMessage(lines) {
+  return lines
+    .filter(Boolean)
+    .join('\n')
+    .replaceAll('%', '%25')
+    .replaceAll('\r', '%0D')
+    .replaceAll('\n', '%0A');
+}
+
+export function formatJourneyFailureAnnotation(error, details = []) {
+  const lines = [];
+  let current = error;
+  let depth = 0;
+  while (current && depth < 4) {
+    const message = current instanceof Error ? current.message : String(current);
+    lines.push(depth === 0 ? message : `Caused by: ${message}`);
+    current = current instanceof Error ? current.cause : undefined;
+    depth += 1;
+  }
+  for (const detail of details) {
+    if (detail) lines.push(detail);
+  }
+  return `::error title=Android reading journey failed::${formatActionsAnnotationMessage(lines)}`;
+}
+
 async function run() {
   const onSignal = (signal) => {
     receivedSignal = signal;
@@ -436,9 +461,59 @@ async function run() {
     journeyPassed = true;
   } catch (error) {
     journeyError = error;
+    const diagnosticDetails = [];
+    if (fixture) {
+      diagnosticDetails.push(
+        `Fixture: covers=${fixture.covers}, coverRedirects=${fixture.coverRedirects}, downloads=${fixture.downloads}, downloadRedirects=${fixture.downloadRedirects}, uploads=${fixture.uploads.length}, offlineRequests=[${fixture.offlineRequests.join(',')}], notFound=[${fixture.notFoundPaths.join(',')}], foreign=[${fixture.foreignRequests.join(',')}]`,
+      );
+    }
+    if (web) {
+      const domSummary = await web
+        .evaluate(
+          `JSON.stringify({
+            href: location.href,
+            theme: document.documentElement?.dataset?.theme,
+            mode: document.documentElement?.dataset?.mode,
+            hasOnboarding: Boolean(document.querySelector('input[type=url]')),
+            bookAria: document.querySelector('[data-book-open]')?.getAttribute('aria-label') ?? null,
+            imgState: (() => {
+              const img = document.querySelector('[data-book-open]')?.parentElement?.querySelector('img');
+              if (!img) return null;
+              const r = img.getBoundingClientRect();
+              return { complete: img.complete, w: img.naturalWidth, loading: img.loading, top: Math.round(r.top), vh: window.innerHeight };
+            })(),
+            iframeH1s: Array.from(document.querySelectorAll('iframe')).map(f => f.contentDocument?.querySelector('h1')?.textContent ?? null),
+            text: document.body?.innerText?.replace(/\\s+/g, ' ').slice(0, 260) ?? ''
+          })`,
+        )
+        .catch((evalErr) => `evalError:${String(evalErr?.message || evalErr)}`);
+      diagnosticDetails.push(`DOM: ${domSummary}`);
+    }
     if (deviceSerial) {
       const crashes = await adb('logcat', '-d', '-b', 'crash', '-t', '80').catch(() => '');
-      if (crashes) console.error(crashes);
+      if (crashes) {
+        console.error(crashes);
+        diagnosticDetails.push(`Crash: ${crashes.slice(-600)}`);
+      }
+      const webLogs = await adb(
+        'logcat',
+        '-d',
+        '-s',
+        'chromium:E',
+        'Capacitor:E',
+        'Capacitor/Console:E',
+        'AndroidRuntime:E',
+        '-t',
+        '25',
+      ).catch(() => '');
+      if (webLogs) {
+        diagnosticDetails.push(`Logcat: ${webLogs.slice(-800)}`);
+      }
+    }
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      const annotation = formatJourneyFailureAnnotation(error, diagnosticDetails);
+      console.log(annotation);
+      console.error(annotation);
     }
   } finally {
     const cleanup = [];
@@ -471,7 +546,12 @@ async function run() {
     if (cleanupError) console.error(cleanupError.message);
     throw journeyError;
   }
-  if (cleanupError) throw cleanupError;
+  if (cleanupError) {
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      console.log(formatJourneyFailureAnnotation(cleanupError));
+    }
+    throw cleanupError;
+  }
   console.log('Android reading journey passed: connect, download, read, restart offline, sync.');
 }
 
