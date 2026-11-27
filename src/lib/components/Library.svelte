@@ -1921,33 +1921,33 @@
         {/if}
       </div>
       <div
-        class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]"
+        class="flex flex-wrap sm:grid sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto]"
         role="group"
         aria-label="Library filters"
       >
         <button
-          class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {downloadedOnly
+          class="min-h-11 min-w-[44px] flex-1 !whitespace-normal !px-2 !py-1.5 leading-tight btn btn-sm !text-xs sm:!text-sm rounded-none {downloadedOnly
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={downloadedOnly}
           onclick={toggleDownloadedOnly}
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 shrink-0">
             <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
           </svg>
           <span class="sm:hidden">Downloaded</span>
           <span class="hidden sm:inline">Downloaded Only</span>
         </button>
         <button
-          class="h-11 !px-2 !py-0 btn btn-sm !text-xs sm:!text-sm rounded-none {hideCompleted
+          class="min-h-11 min-w-[44px] flex-1 !whitespace-normal !px-2 !py-1.5 leading-tight btn btn-sm !text-xs sm:!text-sm rounded-none {hideCompleted
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
           aria-pressed={hideCompleted}
           onclick={toggleHideCompleted}
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 shrink-0">
             <path
               fill="currentColor"
               d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"
@@ -1957,7 +1957,8 @@
           <span class="hidden sm:inline">Hide completed</span>
         </button>
         <button
-          class="btn btn-sm h-11 w-11 !p-0 rounded-none {filtersVisible || advancedFiltersActive
+          class="btn btn-sm min-h-11 min-w-11 !p-0 rounded-none {filtersVisible ||
+          advancedFiltersActive
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
@@ -1973,7 +1974,7 @@
         </button>
         {#if libraryFiltersActive}
           <button
-            class="btn btn-sm h-11 w-11 !p-0 rounded-none preset-tonal-surface"
+            class="btn btn-sm min-h-11 min-w-11 !p-0 rounded-none preset-tonal-surface"
             type="button"
             onclick={clearFilters}
             aria-label="Clear library filters"

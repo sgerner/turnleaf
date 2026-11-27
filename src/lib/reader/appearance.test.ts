@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { defaultAppearance, parseAppearance, serializeAppearance } from './appearance';
+import {
+  defaultAppearance,
+  defaultReaderFontSize,
+  parseAppearance,
+  resolveDynamicTypeScale,
+  serializeAppearance,
+} from './appearance';
 
 describe('appearance serialization', () => {
   it('round trips supported preferences', () => {
@@ -42,5 +48,37 @@ describe('appearance serialization', () => {
     expect(parseAppearance('{}').volumeButtons).toBe(false);
     expect(parseAppearance('{"volumeButtons":true}').volumeButtons).toBe(true);
     expect(parseAppearance('{"volumeButtons":false}').volumeButtons).toBe(false);
+  });
+
+  it('resolves and clamps --turnleaf-text-scale for uncustomized default reader font size', () => {
+    expect(resolveDynamicTypeScale(null)).toBe(1);
+    expect(defaultReaderFontSize(null)).toBe(18);
+
+    const root = {
+      style: {
+        value: '',
+        getPropertyValue(name: string) {
+          return name === '--turnleaf-text-scale' ? this.value : '';
+        },
+      },
+    } as unknown as Element;
+
+    expect(resolveDynamicTypeScale(root)).toBe(1);
+    expect(defaultReaderFontSize(root)).toBe(18);
+
+    (root as unknown as { style: { value: string } }).style.value = '1.5';
+    expect(resolveDynamicTypeScale(root)).toBe(1.5);
+    expect(defaultReaderFontSize(root)).toBe(27);
+
+    (root as unknown as { style: { value: string } }).style.value = '2.5';
+    expect(resolveDynamicTypeScale(root)).toBe(2);
+    expect(defaultReaderFontSize(root)).toBe(34);
+
+    (root as unknown as { style: { value: string } }).style.value = '0.5';
+    expect(resolveDynamicTypeScale(root)).toBe(0.85);
+    expect(defaultReaderFontSize(root)).toBe(15);
+
+    (root as unknown as { style: { value: string } }).style.value = 'not-a-number';
+    expect(resolveDynamicTypeScale(root)).toBe(1);
   });
 });

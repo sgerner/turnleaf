@@ -28,7 +28,7 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
     location: undefined as { start: { cfi: string } } | undefined,
     themes: { register: vi.fn(), select: vi.fn() },
     annotations: { highlight: vi.fn(), remove: vi.fn() },
-    display: vi.fn(async () => {}),
+    display: vi.fn(async (_target?: string) => {}),
     getContents: vi.fn((): unknown[] => []),
     resize: vi.fn(),
     destroy: vi.fn(),
@@ -53,7 +53,14 @@ const { defaultSpineSections, mockBook, mockRendition } = vi.hoisted(() => {
 
 vi.mock('epubjs', () => ({ default: vi.fn(() => mockBook) }));
 
-import { ReaderSession, resolveReaderKeyboardAction } from './session';
+import {
+  parseExternalLink,
+  ReaderSession,
+  resolveReaderKeyboardAction,
+  sanitizeEpubDocument,
+  validateExternalBrowserUrl,
+  validateExternalLaunchUrl,
+} from './session';
 
 function getRenditionListener(
   event: 'click' | 'keydown' | 'relocated',
@@ -637,6 +644,124 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('aborts a display that is in flight during a resize and preserves the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onLocation = vi.fn();
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 560));
+
+    const session = new ReaderSession('book.epub');
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        href: 'first.xhtml',
+        index: 0,
+        percentage: 0,
+        displayed: { page: 1, total: 4 },
+      },
+    } as Location);
+
+    // 1. Start a display that remains in flight when a viewport resize occurs, then abort it as a newer CFI display completes.
+    let rejectInFlightDisplay!: (reason?: unknown) => void;
+    let resolveReplacementDisplay!: () => void;
+    mockRendition.display
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectInFlightDisplay = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveReplacementDisplay = resolve;
+          }),
+      );
+
+    const abortedDisplay = session.displayCfi('epubcfi(/6/4!/4/2/1:0)');
+    expect(mockRendition.display).toHaveBeenLastCalledWith('epubcfi(/6/4!/4/2/1:0)');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 640);
+
+    const replacementDisplay = session.displayCfi('epubcfi(/6/6!/4/2/1:0)');
+    rejectInFlightDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+    await expect(abortedDisplay).resolves.toBe(false);
+
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/6!/4/2/1:0)',
+        href: 'third.xhtml',
+        index: 2,
+        percentage: 0.5,
+        displayed: { page: 1, total: 4 },
+      },
+    } as Location);
+    resolveReplacementDisplay();
+    await expect(replacementDisplay).resolves.toBe(true);
+
+    expect(onLocation.mock.calls.at(-1)?.[0]).toMatchObject({
+      cfi: 'epubcfi(/6/6!/4/2/1:0)',
+      href: 'third.xhtml',
+    });
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('navigation');
+
+    // 2. Start another display that is aborted directly by a resize without a replacement navigation; verify the final CFI stays at /6/6.
+    let rejectResizeAbortedDisplay!: (reason?: unknown) => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectResizeAbortedDisplay = reject;
+        }),
+    );
+
+    const resizeAbortedDisplay = session.displayCfi('epubcfi(/6/8!/4/2/1:0)');
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 520, height: 700 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+    rejectResizeAbortedDisplay(new DOMException('Display aborted during resize', 'AbortError'));
+    await expect(resizeAbortedDisplay).resolves.toBe(false);
+
+    relocated({
+      start: {
+        cfi: 'epubcfi(/6/6!/4/2/1:0)',
+        href: 'third.xhtml',
+        index: 2,
+        percentage: 0.5,
+        displayed: { page: 2, total: 4 },
+      },
+    } as Location);
+
+    expect(onLocation.mock.calls.at(-1)?.[0]).toMatchObject({
+      cfi: 'epubcfi(/6/6!/4/2/1:0)',
+      href: 'third.xhtml',
+    });
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    mockRendition.display.mockReset();
+    mockRendition.display.mockResolvedValue(undefined);
+    session.applyAppearance({ ...defaultAppearance, fontSize: 22 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/6!/4/2/1:0)');
+
+    session.destroy();
+  });
+
   it('reports link jumps with a one-tap return location and does not retain stale origins', async () => {
     mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
     const onLocation = vi.fn();
@@ -886,6 +1011,427 @@ describe('ReaderSession', () => {
     session.destroy();
   });
 
+  it('validates http, https, and mailto URLs while rejecting unsafe or credentialed links', () => {
+    expect(parseExternalLink('https://example.org/docs?q=1')).toEqual({
+      href: 'https://example.org/docs?q=1',
+      scheme: 'https:',
+    });
+    expect(parseExternalLink('http://example.org/page')).toEqual({
+      href: 'http://example.org/page',
+      scheme: 'http:',
+    });
+    expect(parseExternalLink('mailto:reader@example.org?subject=Note')).toEqual({
+      href: 'mailto:reader@example.org?subject=Note',
+      scheme: 'mailto:',
+    });
+
+    expect(parseExternalLink('https://user:pass@example.org/')).toBeNull();
+    expect(parseExternalLink('javascript:alert(1)')).toBeNull();
+    expect(parseExternalLink('file:///etc/passwd')).toBeNull();
+    expect(parseExternalLink('//evil.example/path')).toBeNull();
+    expect(parseExternalLink('mailto:not-an-email')).toBeNull();
+    expect(parseExternalLink('https://example.org/%E0%A4%A')).toBeNull();
+
+    expect(validateExternalBrowserUrl('https://example.org/ref')).toBe('https://example.org/ref');
+    expect(validateExternalBrowserUrl('mailto:reader@example.org')).toBeNull();
+    expect(validateExternalLaunchUrl('mailto:reader@example.org')).toBe(
+      'mailto:reader@example.org',
+    );
+  });
+
+  it('routes sanitized external links, hidden EPUB 3 footnotes, and chapter figures to inspectors while preserving visible section jumps', async () => {
+    mockBook.spine.sections = [{ href: 'chapter.xhtml', index: 0 }];
+    const onLocation = vi.fn();
+    const onTap = vi.fn();
+    const onExternalLink = vi.fn();
+    const onFootnote = vi.fn();
+    const onFigure = vi.fn();
+    const session = new ReaderSession('book.epub');
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 640));
+
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      onTap,
+      undefined,
+      undefined,
+      { onExternalLink, onFootnote, onFigure },
+    );
+
+    const registeredTheme = mockRendition.themes.register.mock.calls.at(-1)?.[1] as Record<
+      string,
+      Record<string, string>
+    >;
+    expect(registeredTheme['a[href], a[data-turnleaf-external-href]']).toMatchObject({
+      'text-decoration': 'underline !important',
+    });
+    expect(registeredTheme['a:not([href]):not([data-turnleaf-external-href])']).toMatchObject({
+      color: 'inherit !important',
+      'text-decoration': 'none !important',
+    });
+
+    const hardenHook = mockRendition.hooks.content.register.mock.calls[0]?.[0] as (
+      contents: unknown,
+    ) => Promise<void>;
+    const relocated = getRenditionListener('relocated');
+
+    const doc = new DOMParser().parseFromString(
+      `<!doctype html><html><body>
+        <p>
+          <a id="ext" href="https://example.org/reference">Reference site</a>
+          <a id="mail" href="mailto:author@example.org">Email author</a>
+          <a id="unsafe" href="javascript:alert(1)">Unsafe prose</a>
+          <a id="noteref" epub:type="noteref" href="#fn-1">[1]</a>
+          <a id="jump" href="#part-2">Jump to section</a>
+        </p>
+        <h2 id="part-2">Part Two</h2>
+        <aside id="fn-1" epub:type="footnote" hidden>
+          <p><a epub:type="backlink" href="#noteref">↩</a> Clarifying footnote text without leaving the page.</p>
+        </aside>
+        <figure>
+          <img id="chart" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" alt=" Orbit diagram " />
+          <figcaption>Figure 1: Orbital eccentricity across epochs.</figcaption>
+        </figure>
+        <figure>
+          <svg id="vector" width="240" height="120" xmlns="http://www.w3.org/2000/svg">
+            <title>Phase plot</title>
+            <path d="M 0 0 L 120 60" stroke="currentColor" />
+          </svg>
+          <figcaption>Figure 2: Phase trajectory.</figcaption>
+        </figure>
+        <figure>
+          <svg id="wrapped-bitmap" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+            <image href="blob:http://localhost/diagram-bitmap" width="800" height="600" />
+          </svg>
+          <figcaption>Figure 3: Wrapped bitmap diagram.</figcaption>
+        </figure>
+      </body></html>`,
+      'text/html',
+    );
+
+    for (const id of ['ext', 'mail', 'noteref', 'jump', 'chart', 'vector', 'wrapped-bitmap']) {
+      const element = doc.getElementById(id)!;
+      vi.spyOn(element, 'getClientRects').mockReturnValue([
+        new DOMRect(24, 40, 120, 24),
+      ] as unknown as DOMRectList);
+    }
+
+    const contents = {
+      document: doc,
+      window: {
+        getSelection: () => ({ isCollapsed: true }),
+      },
+      sectionIndex: 0,
+    };
+    await hardenHook(contents);
+    relocated(location('source-cfi'));
+
+    const ext = doc.getElementById('ext')!;
+    expect(ext.hasAttribute('href')).toBe(false);
+    expect(ext.getAttribute('role')).toBe('link');
+    expect(ext.getAttribute('tabindex')).toBe('0');
+    expect(ext.getAttribute('data-turnleaf-external-href')).toBe('https://example.org/reference');
+
+    const unsafe = doc.getElementById('unsafe')!;
+    expect(unsafe.hasAttribute('href')).toBe(false);
+    expect(unsafe.hasAttribute('role')).toBe(false);
+    expect(unsafe.hasAttribute('tabindex')).toBe(false);
+    expect(unsafe.hasAttribute('data-turnleaf-external-href')).toBe(false);
+
+    ext.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(onExternalLink).toHaveBeenCalledExactlyOnceWith(
+      {
+        href: 'https://example.org/reference',
+        scheme: 'https:',
+        label: 'Reference site',
+      },
+      ext,
+    );
+
+    const mail = doc.getElementById('mail')!;
+    mail.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
+    expect(onExternalLink).toHaveBeenLastCalledWith(
+      {
+        href: 'mailto:author@example.org',
+        scheme: 'mailto:',
+        label: 'Email author',
+      },
+      mail,
+    );
+
+    const noteref = doc.getElementById('noteref')!;
+    let epubDefaultClickRan = false;
+    noteref.addEventListener('click', () => {
+      epubDefaultClickRan = true;
+    });
+    noteref.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(epubDefaultClickRan).toBe(false);
+    expect(onFootnote).toHaveBeenCalledExactlyOnceWith(
+      {
+        title: 'Footnote 1',
+        paragraphs: ['Clarifying footnote text without leaving the page.'],
+      },
+      noteref,
+    );
+
+    const chart = doc.getElementById('chart')!;
+    expect(chart.getAttribute('role')).toBe('button');
+    expect(chart.getAttribute('tabindex')).toBe('0');
+    chart.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(onFigure).toHaveBeenCalledExactlyOnceWith(
+      {
+        src: expect.stringContaining('data:image/png;base64,'),
+        alt: 'Orbit diagram',
+        caption: 'Figure 1: Orbital eccentricity across epochs.',
+      },
+      chart,
+    );
+
+    const vector = doc.getElementById('vector')!;
+    expect(vector.getAttribute('role')).toBe('button');
+    vector.dispatchEvent(
+      new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }),
+    );
+    expect(onFigure).toHaveBeenLastCalledWith(
+      {
+        src: expect.stringContaining('data:image/svg+xml;charset=utf-8,'),
+        alt: 'Phase plot',
+        caption: 'Figure 2: Phase trajectory.',
+      },
+      vector,
+    );
+
+    const wrappedBitmap = doc.getElementById('wrapped-bitmap')!;
+    expect(wrappedBitmap.getAttribute('role')).toBe('button');
+    wrappedBitmap.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(onFigure).toHaveBeenLastCalledWith(
+      {
+        src: 'blob:http://localhost/diagram-bitmap',
+        alt: 'Figure 3: Wrapped bitmap diagram.',
+        caption: 'Figure 3: Wrapped bitmap diagram.',
+      },
+      wrappedBitmap,
+    );
+
+    // Visible non-footnote internal link still navigates normally with Return to link tracking
+    const click = getRenditionListener('click');
+    const jump = doc.getElementById('jump')!;
+    click({ target: jump, clientX: 120 }, contents);
+    relocated(location('part-2-cfi'));
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('link');
+    expect(onLocation.mock.calls.at(-1)?.[2]).toEqual({
+      cfi: 'source-cfi',
+      href: 'chapter.xhtml',
+    });
+    expect(onTap).not.toHaveBeenCalled();
+
+    await sanitizeEpubDocument(doc);
+    session.destroy();
+  });
+
+  it('renders accessible 44x44 highlight overlay buttons without mutating chapter text and routes taps to #reader-annotations', async () => {
+    const onTap = vi.fn();
+    const onHighlight = vi.fn();
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 560));
+
+    const chapterDoc = new DOMParser().parseFromString(
+      '<!doctype html><html><body><p id="p1">Highlighted passage on current page.</p><p id="p2">Offscreen passage.</p></body></html>',
+      'text/html',
+    );
+    const initialHtml = chapterDoc.body.innerHTML;
+
+    const frame = document.createElement('iframe');
+    vi.spyOn(frame, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 320, 560));
+
+    const visibleCfi = 'epubcfi(/6/2!/4/2/1:0,/1:0,/1:19)';
+    const offscreenCfi = 'epubcfi(/6/2!/4/4/1:0,/1:0,/1:17)';
+
+    const visibleRange = chapterDoc.createRange();
+    visibleRange.selectNodeContents(chapterDoc.getElementById('p1')!);
+    visibleRange.getClientRects = () => [new DOMRect(40, 80, 120, 20)] as unknown as DOMRectList;
+
+    const offscreenRange = chapterDoc.createRange();
+    offscreenRange.selectNodeContents(chapterDoc.getElementById('p2')!);
+    offscreenRange.getClientRects = () => [new DOMRect(380, 80, 120, 20)] as unknown as DOMRectList;
+
+    const activeContents = {
+      document: chapterDoc,
+      window: {
+        frameElement: frame,
+        getSelection: () => ({ isCollapsed: true }),
+      },
+      range: (cfi: string) => {
+        if (cfi === visibleCfi) return visibleRange;
+        if (cfi === offscreenCfi) return offscreenRange;
+        return null;
+      },
+      cfiFromRange: (range: Range) => {
+        const text = range.toString();
+        return text.includes('Highlighted passage') ? visibleCfi : offscreenCfi;
+      },
+    };
+    mockRendition.getContents.mockReturnValue([activeContents]);
+
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      viewport,
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      onTap,
+      undefined,
+      undefined,
+      { onHighlight },
+    );
+
+    session.updateHighlights([
+      {
+        id: 'ann-1',
+        cfi: visibleCfi,
+        excerpt: 'Highlighted passage',
+        note: '',
+      },
+      {
+        id: 'ann-2',
+        cfi: offscreenCfi,
+        excerpt: 'Offscreen passage',
+        note: 'Later page',
+      },
+    ]);
+
+    // Chapter DOM text nodes remain completely unmutated so CFIs and XPath walks stay exact
+    expect(chapterDoc.body.innerHTML).toBe(initialHtml);
+
+    const buttons = viewport.querySelectorAll<HTMLButtonElement>(
+      'button.turnleaf-highlight-target',
+    );
+    expect(buttons).toHaveLength(1);
+    const button = buttons[0]!;
+    expect(button.getAttribute('aria-controls')).toBe('reader-annotations');
+    expect(button.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(button.getAttribute('aria-label')).toBe('Highlight: “Highlighted passage”, no note');
+    expect(Number.parseInt(button.style.width, 10)).toBeGreaterThanOrEqual(44);
+    expect(Number.parseInt(button.style.height, 10)).toBeGreaterThanOrEqual(44);
+
+    // Updating note reuses the existing button element and announces the note
+    session.updateHighlights([
+      {
+        id: 'ann-1',
+        cfi: visibleCfi,
+        excerpt: 'Highlighted passage',
+        note: 'Compare with chapter 3',
+      },
+    ]);
+    expect(viewport.querySelector('button.turnleaf-highlight-target')).toBe(button);
+    expect(button.getAttribute('aria-label')).toBe(
+      'Highlight: “Highlighted passage”, with note: Compare with chapter 3',
+    );
+
+    button.click();
+    expect(onHighlight).toHaveBeenCalledExactlyOnceWith(visibleCfi, button);
+    expect(onTap).not.toHaveBeenCalled();
+
+    // Clicking inside the highlighted range inside the EPUB iframe also opens Notes instead of turning pages
+    const click = getRenditionListener('click');
+    click(
+      {
+        target: chapterDoc.getElementById('p1'),
+        clientX: 60,
+        clientY: 90,
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+      },
+      activeContents,
+    );
+    expect(onHighlight).toHaveBeenCalledTimes(2);
+    expect(onTap).not.toHaveBeenCalled();
+
+    // getVisiblePassages returns only visible prose blocks on the current page and skips hidden footnotes
+    const hiddenFootnote = chapterDoc.createElement('aside');
+    hiddenFootnote.setAttribute('hidden', '');
+    const hiddenParagraph = chapterDoc.createElement('p');
+    hiddenParagraph.textContent = 'Hidden footnote body';
+    hiddenFootnote.append(hiddenParagraph);
+    chapterDoc.body.append(hiddenFootnote);
+    vi.spyOn(chapterDoc.getElementById('p1')!, 'getClientRects').mockReturnValue([
+      new DOMRect(40, 80, 120, 20),
+    ] as unknown as DOMRectList);
+    vi.spyOn(chapterDoc.getElementById('p2')!, 'getClientRects').mockReturnValue([
+      new DOMRect(380, 80, 120, 20),
+    ] as unknown as DOMRectList);
+    vi.spyOn(hiddenParagraph, 'getClientRects').mockReturnValue([
+      new DOMRect(40, 120, 120, 20),
+    ] as unknown as DOMRectList);
+
+    expect(session.getVisiblePassages()).toEqual([
+      {
+        cfi: visibleCfi,
+        text: 'Highlighted passage on current page.',
+      },
+    ]);
+
+    session.destroy();
+  });
+
+  it('unlocks EPUB.js contents.viewport pinch-zoom clamps during layout updates', async () => {
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      null,
+      null,
+      null,
+      defaultAppearance,
+      vi.fn(),
+      vi.fn(),
+    );
+
+    const hardenHook = mockRendition.hooks.content.register.mock.calls[0]?.[0] as (
+      contents: unknown,
+    ) => Promise<void>;
+    const doc = new DOMParser().parseFromString(
+      '<!doctype html><html><head><meta name="viewport" content="width=320, height=560, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"></head><body><p>Hello</p></body></html>',
+      'text/html',
+    );
+    const viewportSpy = vi.fn((options?: Record<string, string>) => options ?? {});
+    const contents = {
+      document: doc,
+      viewport: viewportSpy,
+    };
+
+    await hardenHook(contents);
+    contents.viewport({
+      width: '320px',
+      height: '560px',
+      scale: '1.0',
+      minimum: '0.5',
+      maximum: '1.0',
+      scalable: 'no',
+    });
+
+    expect(viewportSpy).toHaveBeenCalledWith({
+      width: '320px',
+      height: '560px',
+      scale: '1.0',
+      minimum: '0.5',
+      scalable: 'yes',
+    });
+    const metaContent = doc.querySelector('meta[name="viewport"]')?.getAttribute('content') ?? '';
+    expect(metaContent).not.toContain('user-scalable=no');
+    expect(metaContent).not.toContain('maximum-scale');
+
+    session.destroy();
+  });
+
   it('registers themes on initial mount and mode updates without reflowing the CFI', async () => {
     const unopened = new ReaderSession('book.epub');
     unopened.applyAppearance(defaultAppearance);
@@ -910,7 +1456,11 @@ describe('ReaderSession', () => {
     expect(mockRendition.themes.register).toHaveBeenCalledExactlyOnceWith(
       'turnleaf',
       expect.objectContaining({
-        a: { color: '--color-primary-700 !important' },
+        'a[href], a[data-turnleaf-external-href]': {
+          color: '--color-primary-700 !important',
+          'text-decoration': 'underline !important',
+          cursor: 'pointer',
+        },
       }),
     );
     expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
@@ -931,7 +1481,11 @@ describe('ReaderSession', () => {
     expect(mockRendition.themes.register).toHaveBeenCalledExactlyOnceWith(
       'turnleaf',
       expect.objectContaining({
-        a: { color: '--color-primary-300 !important' },
+        'a[href], a[data-turnleaf-external-href]': {
+          color: '--color-primary-300 !important',
+          'text-decoration': 'underline !important',
+          cursor: 'pointer',
+        },
       }),
     );
     expect(mockRendition.themes.select).toHaveBeenCalledExactlyOnceWith('turnleaf');
@@ -1062,5 +1616,76 @@ describe('ReaderSession', () => {
     });
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
+  });
+
+  it('ignores stale cross-section footnote loads when navigation advances before section loading finishes', async () => {
+    let resolveLoad!: (doc: Document) => void;
+    const unload = vi.fn();
+    mockBook.spine.sections = [
+      { href: 'chapter-1.xhtml', index: 0 },
+      {
+        href: 'notes.xhtml',
+        index: 1,
+        load: vi.fn(
+          () =>
+            new Promise<Document>((resolve) => {
+              resolveLoad = resolve;
+            }),
+        ),
+        unload,
+      } as unknown as { href: string; index: number },
+    ];
+    (mockBook as typeof mockBook & { load?: () => Promise<Document> }).load = vi.fn();
+
+    try {
+      const onFootnote = vi.fn();
+      const session = new ReaderSession('book.epub');
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        vi.fn(),
+        vi.fn(),
+        undefined,
+        undefined,
+        { onFootnote },
+      );
+
+      const hardenHook = mockRendition.hooks.content.register.mock.calls[0]?.[0] as (
+        contents: unknown,
+      ) => Promise<void>;
+      const doc = new DOMParser().parseFromString(
+        '<!doctype html><html><body><p><a id="xref" epub:type="noteref" href="notes.xhtml#n1">[1]</a></p></body></html>',
+        'text/html',
+      );
+      await hardenHook({
+        document: doc,
+        window: { getSelection: () => ({ isCollapsed: true }) },
+        sectionIndex: 0,
+      });
+
+      doc
+        .getElementById('xref')!
+        .dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+
+      await session.display('chapter-1.xhtml');
+
+      resolveLoad(
+        new DOMParser().parseFromString(
+          '<!doctype html><html><body><aside id="n1" epub:type="footnote"><p>Cross-chapter note text.</p></aside></body></html>',
+          'text/html',
+        ),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(onFootnote).not.toHaveBeenCalled();
+      expect(unload).toHaveBeenCalledOnce();
+      session.destroy();
+    } finally {
+      delete (mockBook as typeof mockBook & { load?: unknown }).load;
+    }
   });
 });

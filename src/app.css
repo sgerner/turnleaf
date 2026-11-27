@@ -5,6 +5,7 @@
 @custom-variant dark (&:where([data-mode='dark'], [data-mode='dark'] *));
 
 :root {
+  --turnleaf-text-scale: 1;
   --turnleaf-font-sans: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
   --typo-base--font-family: var(--turnleaf-font-sans);
   --typo-base--font-size: inherit;
@@ -13,9 +14,12 @@
   @variant dark {
     color-scheme: dark;
   }
+  font-size: calc(100% * var(--turnleaf-text-scale, 1));
   font-family: var(--turnleaf-font-sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 html[data-theme] {

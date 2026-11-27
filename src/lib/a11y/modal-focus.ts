@@ -17,6 +17,10 @@ function isHiddenOrInert(element: HTMLElement): boolean {
   for (let current: HTMLElement | null = element; current; current = current.parentElement) {
     if (current.inert) return true;
   }
+  const view = element.ownerDocument?.defaultView;
+  if (view && view !== window && view.frameElement instanceof HTMLElement) {
+    return isHiddenOrInert(view.frameElement);
+  }
   return false;
 }
 
@@ -25,11 +29,12 @@ export function isFocusableElement(element: HTMLElement): boolean {
 }
 
 function canRestoreFocusTarget(element: HTMLElement | null | undefined): element is HTMLElement {
+  const ownerDoc = element?.ownerDocument ?? document;
   return Boolean(
     element &&
     element.isConnected &&
-    element !== document.body &&
-    element !== document.documentElement &&
+    element !== ownerDoc.body &&
+    element !== ownerDoc.documentElement &&
     !element.hasAttribute('disabled') &&
     !element.matches(':disabled') &&
     !isHiddenOrInert(element),
@@ -68,7 +73,7 @@ export function activeElement(): HTMLElement | null {
 }
 
 export function focusFirstElement(container: HTMLElement | null): void {
-  if (!container) return;
+  if (!container || isHiddenOrInert(container)) return;
   const candidates = container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
   const first = findFirstFocusableElement(candidates)?.element;
   (first ?? container).focus();
@@ -80,6 +85,11 @@ export function focusModal(getContainer: () => HTMLElement | null): void {
 
 export function restoreFocus(element: HTMLElement | null, fallback?: HTMLElement | null): void {
   if (canRestoreFocusTarget(element)) {
+    const view = element.ownerDocument?.defaultView;
+    if (view && view !== window) {
+      const frame = view.frameElement;
+      if (frame && 'focus' in frame && typeof frame.focus === 'function') frame.focus();
+    }
     element.focus();
     return;
   }

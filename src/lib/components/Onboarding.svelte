@@ -216,12 +216,12 @@
 </script>
 
 <main
-  class="mx-auto flex min-h-full max-w-5xl flex-col px-6 pb-10 pt-[max(3rem,env(safe-area-inset-top))] sm:px-8 lg:grid lg:min-h-full lg:grid-cols-2 lg:items-center lg:gap-16 lg:py-16 xl:gap-24"
+  class="mx-auto flex min-h-full max-w-5xl flex-col px-[16px] pb-10 pt-[max(2rem,env(safe-area-inset-top))] sm:px-8 lg:grid lg:min-h-full lg:grid-cols-2 lg:items-center lg:gap-16 lg:py-16 xl:gap-24"
 >
-  <header class="flex flex-col lg:pr-4" in:fly={{ y: 12, duration: 280 }}>
+  <header class="flex min-w-0 flex-col lg:pr-4" in:fly={{ y: 12, duration: 280 }}>
     <TurnleafLogo size={80} />
     <h1
-      class="mt-6 font-serif text-4xl leading-[1.05] tracking-tight text-surface-950-50 sm:text-5xl lg:mt-10 lg:text-6xl"
+      class="mt-6 break-words font-serif text-3xl leading-[1.08] tracking-tight text-surface-950-50 sm:text-5xl lg:mt-10 lg:text-6xl"
     >
       {#if savedServer}
         Reconnect to Kavita
@@ -242,9 +242,12 @@
     </p>
   </header>
 
-  <div class="mt-10 flex flex-col gap-5 lg:mt-0" in:fly={{ y: 12, duration: 280, delay: 80 }}>
+  <div
+    class="mt-10 flex min-w-0 flex-col gap-5 lg:mt-0"
+    in:fly={{ y: 12, duration: 280, delay: 80 }}
+  >
     <form
-      class="card preset-filled-surface-50-950 space-y-5 p-6 shadow-2xl sm:p-8"
+      class="card preset-filled-surface-50-950 space-y-5 p-[16px] shadow-2xl sm:p-8"
       onsubmit={connect}
     >
       {#if !savedServer || changeServerAddress}
@@ -308,10 +311,10 @@
 
       <div class="label">
         <label class="label-text" for="kavita-auth-key">Auth key</label>
-        <div class="flex gap-2">
+        <div class="flex flex-wrap gap-2">
           <input
             id="kavita-auth-key"
-            class="input min-w-0 flex-1"
+            class="input min-w-0 basis-40 flex-1"
             type={showKey ? 'text' : 'password'}
             autocomplete="off"
             spellcheck="false"

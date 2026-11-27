@@ -35,6 +35,37 @@ export interface ReaderSelection {
   text: string;
 }
 
+export interface ReaderExternalLink {
+  href: string;
+  scheme: 'http:' | 'https:' | 'mailto:';
+  label: string;
+}
+
+export interface ReaderFootnotePreview {
+  title: string;
+  paragraphs: string[];
+}
+
+export interface ReaderFigurePreview {
+  src: string;
+  alt: string;
+  caption: string;
+}
+
+export interface ReaderHighlightAnnotation {
+  id?: string;
+  cfi: string;
+  excerpt?: string;
+  note?: string;
+}
+
+export interface ReaderInspectorCallbacks {
+  onExternalLink?: (link: ReaderExternalLink, opener: HTMLElement | null) => void;
+  onFootnote?: (footnote: ReaderFootnotePreview, opener: HTMLElement | null) => void;
+  onHighlight?: (cfi: string, opener: HTMLElement | null) => void;
+  onFigure?: (figure: ReaderFigurePreview, opener: HTMLElement | null) => void;
+}
+
 export type ReaderKeyboardAction = 'next' | 'previous' | 'clear-selection' | null;
 
 export function resolveReaderKeyboardAction(
@@ -48,7 +79,11 @@ export function resolveReaderKeyboardAction(
     return options.hasSelection ? 'clear-selection' : null;
   }
   const target = event.target as Element | null;
-  if (target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]')) {
+  if (
+    target?.closest?.(
+      'button, a, input, select, textarea, [contenteditable="true"], [role="button"], [role="link"]',
+    )
+  ) {
     return null;
   }
   if (event.key === 'ArrowLeft' || event.key === 'PageUp') return 'previous';
@@ -68,6 +103,12 @@ interface EpubTocItem {
   href: string;
   subitems?: EpubTocItem[];
 }
+
+const EPUB_NS = 'http://www.idpf.org/2007/ops';
+const EXTERNAL_HREF_ATTR = 'data-turnleaf-external-href';
+const FIGURE_ATTR = 'data-turnleaf-figure';
+const FIGURE_LABEL_ATTR = 'data-turnleaf-figure-label';
+const MIN_TARGET_PX = 44;
 
 const MODE_COLORS = {
   light: {
@@ -102,8 +143,21 @@ const RESOURCE_ATTRIBUTES = new Set([
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:gif|jpe?g|png|webp|avif);base64,[a-z0-9+/=\s]+$/i;
 const SAFE_DATA_STYLESHEET = /^data:text\/css(?:;charset=[^;,]+)?(?:;base64)?,/i;
+const EMAIL_RECIPIENT = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+const NOTE_REF_TOKENS = new Set(['noteref', 'doc-noteref']);
+const FOOTNOTE_TARGET_TOKENS = new Set([
+  'footnote',
+  'endnote',
+  'rearnote',
+  'note',
+  'doc-footnote',
+  'doc-endnote',
+]);
+const BACKLINK_TOKENS = new Set(['backlink', 'doc-backlink']);
+const SVG_GRAPHIC_SELECTOR =
+  'path, rect, circle, ellipse, line, polyline, polygon, text, image[href], image[*|href]';
 const PASSAGE_BLOCK_SELECTOR = 'p, li, blockquote, pre, h1, h2, h3, h4, h5, h6, dt, dd, figcaption';
-const FOCUSABLE_LINK_SELECTOR = 'a[href], area[href]';
+const FOCUSABLE_LINK_SELECTOR = `a[href], area[href], a[${EXTERNAL_HREF_ATTR}], [${FIGURE_ATTR}="true"]`;
 const SAVED_TABINDEX_ATTR = 'data-turnleaf-tabindex';
 const VIEWPORT_RECT_EPSILON = 0.5;
 
@@ -169,6 +223,50 @@ function decodedReference(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+export function parseExternalLink(
+  value: string,
+): { href: string; scheme: 'http:' | 'https:' | 'mailto:' } | null {
+  if (!decodedReference(value)) return null;
+  const trimmed = value.trim();
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      if (!url.hostname || url.username || url.password) return null;
+      return { href: url.toString(), scheme: url.protocol };
+    } catch {
+      return null;
+    }
+  }
+  if (/^mailto:/i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      if (url.protocol !== 'mailto:') return null;
+      const recipients = decodeURIComponent(url.pathname)
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      if (!recipients.length || recipients.some((entry) => !EMAIL_RECIPIENT.test(entry))) {
+        return null;
+      }
+      return { href: url.toString(), scheme: 'mailto:' };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+export function validateExternalBrowserUrl(value: string): string | null {
+  const parsed = parseExternalLink(value);
+  if (!parsed || (parsed.scheme !== 'http:' && parsed.scheme !== 'https:')) return null;
+  return parsed.href;
+}
+
+export function validateExternalLaunchUrl(value: string): string | null {
+  return parseExternalLink(value)?.href ?? null;
 }
 
 function isSafeEpubReference(value: string, kind: EpubReferenceKind): boolean {
@@ -304,6 +402,94 @@ function installEpubContentPolicy(document: Document): void {
   head.prepend(policy);
 }
 
+function unlockViewportMeta(document: Document): void {
+  document.querySelectorAll('meta[name]').forEach((meta) => {
+    if ((meta.getAttribute('name') ?? '').toLowerCase() !== 'viewport') return;
+    const raw = meta.getAttribute('content') ?? '';
+    const tokens = raw
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .filter((part) => !/^(?:maximum-scale|minimum-scale|user-scalable)\s*=/i.test(part));
+    tokens.push('user-scalable=yes');
+    meta.setAttribute('content', tokens.join(', '));
+  });
+}
+
+function normalizeWhitespace(value: string | null | undefined): string {
+  return (value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function extractFigureCaption(element: Element): string {
+  const figure = element.closest('figure');
+  const figcaption = normalizeWhitespace(figure?.querySelector('figcaption')?.textContent);
+  if (figcaption) return figcaption;
+  const describedBy = normalizeWhitespace(element.getAttribute('aria-describedby'));
+  if (describedBy) {
+    const parts = describedBy
+      .split(/\s+/)
+      .map((id) => normalizeWhitespace(element.ownerDocument?.getElementById(id)?.textContent))
+      .filter(Boolean);
+    if (parts.length) return parts.join(' ');
+  }
+  return normalizeWhitespace(element.getAttribute('title'));
+}
+
+function extractFigureLabel(element: Element, caption: string): string {
+  if (element.localName === 'img') {
+    const alt = normalizeWhitespace(element.getAttribute('alt'));
+    if (alt && caption && alt !== caption) return `${alt} — ${caption}`;
+    if (alt) return alt;
+  } else if (element.localName === 'svg') {
+    const svgLabel =
+      normalizeWhitespace(element.getAttribute('aria-label')) ||
+      normalizeWhitespace(element.querySelector('title')?.textContent);
+    if (svgLabel && caption && svgLabel !== caption) return `${svgLabel} — ${caption}`;
+    if (svgLabel) return svgLabel;
+  }
+  if (caption) return caption;
+  return element.localName === 'svg' ? 'Diagram' : 'Illustration';
+}
+
+function hasRenderableSvgContent(svg: Element): boolean {
+  try {
+    if (svg.querySelector(SVG_GRAPHIC_SELECTOR)) return true;
+  } catch {
+    if (svg.querySelector('path, rect, circle, ellipse, line, polyline, polygon, text')) {
+      return true;
+    }
+  }
+  return Array.from(svg.querySelectorAll('image')).some((img) =>
+    Boolean(img.getAttribute('href') || img.getAttribute('xlink:href')),
+  );
+}
+
+function prepareEpubFigures(document: Document): void {
+  const root = document.body ?? document.documentElement;
+  if (!root) return;
+  root.querySelectorAll('img, svg').forEach((element) => {
+    if (element.closest('a, button, svg svg, [hidden], [aria-hidden="true"]')) return;
+    const role = (element.getAttribute('role') ?? '').toLowerCase();
+    if (role === 'presentation' || role === 'none') return;
+    if (element.localName === 'img') {
+      const hasSource = Boolean(element.getAttribute('src') || element.getAttribute('srcset'));
+      if (!hasSource) return;
+      const altAttr = element.getAttribute('alt');
+      if (altAttr === '' && !extractFigureCaption(element)) return;
+    } else if (!hasRenderableSvgContent(element)) {
+      return;
+    }
+    const caption = extractFigureCaption(element);
+    const label = extractFigureLabel(element, caption);
+    element.setAttribute(FIGURE_ATTR, 'true');
+    element.setAttribute(FIGURE_LABEL_ATTR, label);
+    element.setAttribute('role', 'button');
+    if (!element.hasAttribute('tabindex')) element.setAttribute('tabindex', '0');
+    element.setAttribute('aria-haspopup', 'dialog');
+    element.setAttribute('aria-label', `Inspect figure: ${label}`);
+  });
+}
+
 function isSafeBaseReference(value: string, document: Document): boolean {
   const decoded = decodedReference(value);
   if (!decoded) return false;
@@ -324,11 +510,16 @@ export async function sanitizeEpubDocument(
   document
     .querySelectorAll('script, iframe, object, embed, form, meta[http-equiv]')
     .forEach((node) => node.remove());
+  unlockViewportMeta(document);
 
   document.querySelectorAll<HTMLElement>('*').forEach((element) => {
     for (const attribute of [...element.attributes]) {
       const name = attribute.name.toLowerCase();
-      if (name.startsWith('on') || name === 'ping') {
+      if (name.startsWith('on') || name === 'ping' || name.startsWith('data-turnleaf-')) {
+        element.removeAttribute(attribute.name);
+        continue;
+      }
+      if (name === 'target' && ['a', 'area'].includes(element.localName)) {
         element.removeAttribute(attribute.name);
         continue;
       }
@@ -356,9 +547,34 @@ export async function sanitizeEpubDocument(
           : isStylesheet
             ? 'stylesheet'
             : 'resource';
-      if (!isSafeEpubReference(attribute.value, kind)) element.removeAttribute(attribute.name);
+      if (!isSafeEpubReference(attribute.value, kind)) {
+        const rawValue = attribute.value;
+        element.removeAttribute(attribute.name);
+        if (kind === 'link' && element.localName === 'a') {
+          const external = parseExternalLink(rawValue);
+          if (external) {
+            element.setAttribute(EXTERNAL_HREF_ATTR, external.href);
+            element.setAttribute('role', 'link');
+            element.setAttribute('tabindex', '0');
+          }
+        }
+      }
+    }
+    if (
+      (element.localName === 'a' || element.localName === 'area') &&
+      !element.hasAttribute('href')
+    ) {
+      element.onclick = null;
+      if (!element.hasAttribute(EXTERNAL_HREF_ATTR)) {
+        if ((element.getAttribute('role') ?? '').toLowerCase() === 'link') {
+          element.removeAttribute('role');
+        }
+        element.removeAttribute('tabindex');
+      }
     }
   });
+
+  prepareEpubFigures(document);
 
   document.querySelectorAll('style').forEach((style) => {
     const safeStyle = sanitizeCss(style.textContent ?? '');
@@ -368,9 +584,193 @@ export async function sanitizeEpubDocument(
   installEpubContentPolicy(document);
 }
 
+function getSemanticTokens(element: Element | null): string[] {
+  if (!element) return [];
+  const raw = [
+    element.getAttribute('epub:type') ?? '',
+    element.getAttributeNS?.(EPUB_NS, 'type') ?? '',
+    element.getAttribute('role') ?? '',
+  ].join(' ');
+  return raw.toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+function isNoteRefElement(link: Element): boolean {
+  return getSemanticTokens(link).some((token) => NOTE_REF_TOKENS.has(token));
+}
+
+function isFootnoteTargetElement(target: Element): boolean {
+  let current: Element | null = target;
+  while (current && current.localName !== 'body' && current.localName !== 'html') {
+    if (getSemanticTokens(current).some((token) => FOOTNOTE_TARGET_TOKENS.has(token))) {
+      return true;
+    }
+    if (!['aside', 'li', 'div', 'dd', 'p'].includes(current.localName)) break;
+    current = current.parentElement;
+  }
+  return false;
+}
+
+function isElementHidden(element: Element, view?: Window | null): boolean {
+  let current: Element | null = element;
+  while (current && current.localName !== 'html') {
+    if (current.hasAttribute('hidden') || current.getAttribute('aria-hidden') === 'true') {
+      return true;
+    }
+    if (view && typeof view.getComputedStyle === 'function') {
+      const style = view.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden') return true;
+    }
+    current = current.parentElement;
+  }
+  return false;
+}
+
+function findFragmentTarget(document: Document, fragmentId: string): Element | null {
+  const byId = document.getElementById(fragmentId);
+  if (byId) return byId;
+  for (const candidate of document.querySelectorAll('[id], a[name]')) {
+    if (
+      candidate.getAttribute('id') === fragmentId ||
+      candidate.getAttribute('name') === fragmentId
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function extractFootnotePreview(link: Element, target: Element): ReaderFootnotePreview {
+  const rawLabel = normalizeWhitespace(link.textContent).replace(/^\[|\]$/g, '');
+  const title = rawLabel && rawLabel.length <= 24 ? `Footnote ${rawLabel}` : 'Footnote';
+
+  const clone = target.cloneNode(true) as Element;
+  clone.removeAttribute('hidden');
+  clone.removeAttribute('aria-hidden');
+  clone
+    .querySelectorAll('[hidden], [aria-hidden="true"], script, style, template, title')
+    .forEach((n) => n.remove());
+  clone.querySelectorAll('a').forEach((anchor) => {
+    const isBacklink = getSemanticTokens(anchor).some((token) => BACKLINK_TOKENS.has(token));
+    const text = normalizeWhitespace(anchor.textContent);
+    if (isBacklink && (!/[a-z0-9]/i.test(text) || /^(?:back|return)$/i.test(text))) {
+      anchor.remove();
+    }
+  });
+
+  const blocks = Array.from(clone.querySelectorAll('p, li, blockquote, dd, pre')).filter(
+    (block) => !block.querySelector('p, li, blockquote, dd, pre'),
+  );
+  const paragraphs = (
+    blocks.length > 0
+      ? blocks.map((block) => normalizeWhitespace(block.textContent))
+      : [normalizeWhitespace(clone.textContent)]
+  ).filter(Boolean);
+
+  return { title, paragraphs };
+}
+
+function formatHighlightAriaLabel(annotation: ReaderHighlightAnnotation): string {
+  const excerpt = normalizeWhitespace(annotation.excerpt).slice(0, 160);
+  const note = normalizeWhitespace(annotation.note).slice(0, 120);
+  if (excerpt && note) return `Highlight: “${excerpt}”, with note: ${note}`;
+  if (excerpt) return `Highlight: “${excerpt}”, no note`;
+  if (note) return `Highlight, with note: ${note}`;
+  return 'Saved highlight, no note';
+}
+
+function resolveSafeImageCandidate(candidate: string, doc: Document): string | null {
+  const trimmed = candidate.trim();
+  if (!trimmed) return null;
+  if (
+    trimmed.toLowerCase().startsWith('blob:') ||
+    SAFE_DATA_IMAGE.test(trimmed) ||
+    isLocalContentUrl(trimmed, doc) ||
+    isSafeEpubReference(trimmed, 'resource')
+  ) {
+    try {
+      return new URL(trimmed, doc.baseURI).href;
+    } catch {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+function serializeSvgPreview(svg: Element, doc: Document): string | null {
+  try {
+    const clone = svg.cloneNode(true) as Element;
+    clone.querySelectorAll('script, foreignObject').forEach((node) => node.remove());
+    clone.removeAttribute(FIGURE_ATTR);
+    clone.removeAttribute(FIGURE_LABEL_ATTR);
+    clone.removeAttribute('tabindex');
+    clone.removeAttribute('role');
+    clone.removeAttribute('aria-haspopup');
+    if (!clone.getAttribute('xmlns')) {
+      clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    }
+    if (!clone.getAttribute('color')) {
+      const computedColor = doc.defaultView?.getComputedStyle?.(svg)?.color?.trim();
+      if (computedColor) clone.setAttribute('color', computedColor);
+    }
+    if (!clone.getAttribute('viewBox')) {
+      const rect = svg.getBoundingClientRect?.();
+      const width = Number(clone.getAttribute('width')) || Math.round(rect?.width ?? 0);
+      const height = Number(clone.getAttribute('height')) || Math.round(rect?.height ?? 0);
+      if (width > 0 && height > 0) {
+        clone.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      }
+    }
+    const serializer = doc.defaultView?.XMLSerializer ?? XMLSerializer;
+    const markup = new serializer().serializeToString(clone);
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(markup)}`;
+  } catch {
+    return null;
+  }
+}
+
+function resolveFigurePreview(element: Element, doc: Document): ReaderFigurePreview | null {
+  const caption = extractFigureCaption(element);
+  const label =
+    normalizeWhitespace(element.getAttribute(FIGURE_LABEL_ATTR)) ||
+    extractFigureLabel(element, caption);
+  if (element.localName === 'svg') {
+    const alt =
+      normalizeWhitespace(element.querySelector('title')?.textContent) || label || 'Diagram';
+    const hasVectors = Boolean(
+      element.querySelector('path, rect, circle, ellipse, line, polyline, polygon, text'),
+    );
+    const images = Array.from(element.querySelectorAll('image'));
+    if (!hasVectors && images.length === 1) {
+      const imageHref =
+        images[0]?.getAttribute('href') || images[0]?.getAttribute('xlink:href') || '';
+      const directSrc = resolveSafeImageCandidate(imageHref, doc);
+      if (directSrc) return { src: directSrc, alt, caption };
+    }
+    const src = serializeSvgPreview(element, doc);
+    if (!src) return null;
+    return { src, alt, caption };
+  }
+  if (element.localName === 'img') {
+    const img = element as HTMLImageElement;
+    const rawAttrSrc = img.getAttribute('src') ?? '';
+    const firstSrcset =
+      (img.getAttribute('srcset') ?? '')
+        .split(',')
+        .map((part) => part.trim().split(/\s+/)[0] ?? '')
+        .find(Boolean) ?? '';
+    const candidate = img.currentSrc || rawAttrSrc || firstSrcset;
+    const resolvedSrc = resolveSafeImageCandidate(candidate, doc);
+    if (!resolvedSrc) return null;
+    const alt = normalizeWhitespace(img.getAttribute('alt')) || label || 'Illustration';
+    return { src: resolvedSrc, alt, caption };
+  }
+  return null;
+}
+
 export class ReaderSession {
   private readonly book;
   private readonly stylesheetCache: StylesheetCache = new Map();
+  private readonly handledEvents = new WeakSet<Event>();
   private rendition: Rendition | null = null;
   private relocated: ((location: Location) => void) | null = null;
   private contentClick: ((event: MouseEvent, contents: Contents) => void) | null = null;
@@ -400,7 +800,11 @@ export class ReaderSession {
   private unloadedHookRegistered = false;
   private readonly trackedContents = new Set<Contents>();
   private readonly contentCleanups = new Map<Contents, Array<() => void>>();
+  private highlightLayer: HTMLDivElement | null = null;
+  private highlightButtons = new Map<string, HTMLButtonElement>();
+  private highlightAnnotations = new Map<string, ReaderHighlightAnnotation>();
   private highlightCfis = new Set<string>();
+  private inspectors: ReaderInspectorCallbacks = {};
   private onLocation:
     | ((
         location: ReaderLocation,
@@ -439,7 +843,9 @@ export class ReaderSession {
     onTap: (zone: 'previous' | 'center' | 'next') => void,
     onSelection?: (selection: ReaderSelection | null) => void,
     onKeyboardNavigation?: (event: KeyboardEvent) => void,
+    inspectors: ReaderInspectorCallbacks = {},
   ): Promise<void> {
+    this.inspectors = inspectors;
     this.viewportTarget = target;
     this.rendition = this.book.renderTo(target, {
       width: '100%',
@@ -447,9 +853,10 @@ export class ReaderSession {
       manager: 'default',
       flow: 'paginated',
       spread: 'none',
-      resizeOnOrientationChange: true,
+      resizeOnOrientationChange: false,
       allowScriptedContent: false,
     });
+    this.ensureHighlightLayer(target);
     this.observeViewport(target);
     this.bindEpubContainer();
     this.rendition.hooks.content.register((contents: Contents) => this.prepareContents(contents));
@@ -561,6 +968,7 @@ export class ReaderSession {
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
+      this.syncHighlightOverlays();
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
@@ -572,31 +980,29 @@ export class ReaderSession {
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
+      this.syncHighlightOverlays();
     };
     this.resizedListener = () => {
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.syncVisibleColumnLinks();
+      this.syncHighlightOverlays();
     };
     this.rendition.on('rendered', this.renderedListener);
     this.rendition.on('resized', this.resizedListener);
     this.contentClick = (event, contents) => {
+      if (event && typeof event === 'object' && this.handledEvents.has(event)) return;
       const eventTarget = event.target as Element | null;
-      const selection = contents.window.getSelection();
+      const selection = contents.window?.getSelection?.();
       if (selection && !selection.isCollapsed) return;
-      const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
-      if (link) {
-        const href = link.getAttribute('href') ?? '';
-        if (isSafeEpubReference(href, 'link')) this.beginLinkedNavigation();
-        return;
-      }
+      if (this.routeContentInteraction(event, eventTarget, contents)) return;
       if (
         event.defaultPrevented ||
         eventTarget?.closest?.('button, input, select, textarea, [contenteditable="true"]')
       ) {
         return;
       }
-      const frame = contents.window.frameElement;
+      const frame = contents.window?.frameElement;
       const viewport = target.getBoundingClientRect();
       if (!frame || viewport.width === 0) return;
       // EPUB.js lays out multiple pages in one iframe and scrolls it past the viewport.
@@ -686,9 +1092,14 @@ export class ReaderSession {
     return mapItems(this.book.navigation?.toc ?? []);
   }
 
-  updateHighlights(annotations: Array<{ cfi: string }>): void {
+  updateHighlights(annotations: ReaderHighlightAnnotation[]): void {
     const rendition = this.rendition;
     if (!rendition) return;
+
+    this.highlightAnnotations.clear();
+    for (const annotation of annotations) {
+      this.highlightAnnotations.set(annotation.cfi, annotation);
+    }
 
     const next = new Set(annotations.map((annotation) => annotation.cfi));
     for (const cfi of this.highlightCfis) {
@@ -702,7 +1113,10 @@ export class ReaderSession {
         continue;
       }
       try {
-        rendition.annotations.highlight(cfi, {}, undefined, 'turnleaf-highlight', {
+        const callback = this.inspectors.onHighlight
+          ? () => this.activateHighlight(cfi, this.highlightButtons.get(cfi) ?? null)
+          : undefined;
+        rendition.annotations.highlight(cfi, {}, callback, 'turnleaf-highlight', {
           fill: '#facc15',
           'fill-opacity': '0.38',
         });
@@ -712,6 +1126,7 @@ export class ReaderSession {
       }
     }
     this.highlightCfis = applied;
+    this.syncHighlightOverlays();
   }
 
   getVisiblePassages(): ReaderSelection[] {
@@ -729,7 +1144,12 @@ export class ReaderSession {
       const candidates = Array.from(doc.body.querySelectorAll<HTMLElement>(PASSAGE_BLOCK_SELECTOR));
 
       for (const block of candidates) {
-        if (block.querySelector(PASSAGE_BLOCK_SELECTOR)) continue;
+        if (
+          block.querySelector(PASSAGE_BLOCK_SELECTOR) ||
+          isElementHidden(block, contents.window)
+        ) {
+          continue;
+        }
         if (metrics !== null) {
           if (!this.isElementVisibleInViewport(block, contents, metrics)) continue;
         } else if (pageRange && typeof pageRange.intersectsNode === 'function') {
@@ -875,6 +1295,7 @@ export class ReaderSession {
       content?.document?.getElementById('epubjs-inserted-css-turnleaf')?.remove();
     }
     const colors = MODE_COLORS[value.mode];
+    const linkColor = this.resolveToken(colors.link);
     const family =
       value.fontFamily === 'book'
         ? 'Iowan Old Style, Georgia, serif'
@@ -907,13 +1328,32 @@ export class ReaderSession {
             'text-align': `${value.alignment} !important`,
             hyphens: `${hyphens} !important`,
           },
-      'img, svg, video, canvas, table, pre, blockquote': {
+      'img, svg, video, canvas, table, pre, blockquote, figure': {
         'max-width': '100% !important',
+      },
+      figure: {
+        'margin-inline': '0',
       },
       img: {
         height: 'auto !important',
       },
-      a: { color: `${this.resolveToken(colors.link)} !important` },
+      [`[${FIGURE_ATTR}="true"]`]: {
+        cursor: 'zoom-in',
+      },
+      [`a[href], a[${EXTERNAL_HREF_ATTR}]`]: {
+        color: `${linkColor} !important`,
+        'text-decoration': 'underline !important',
+        cursor: 'pointer',
+      },
+      [`a:not([href]):not([${EXTERNAL_HREF_ATTR}])`]: {
+        color: 'inherit !important',
+        'text-decoration': 'none !important',
+        cursor: 'inherit',
+      },
+      ':focus-visible': {
+        outline: `3px solid ${linkColor} !important`,
+        'outline-offset': '2px !important',
+      },
       '::selection': { background: `${this.resolveToken(colors.selection)} !important` },
     });
     rendition.themes.select('turnleaf');
@@ -955,6 +1395,10 @@ export class ReaderSession {
     this.displayOperationCount = 0;
     this.aligningFocusTarget = null;
     this.unloadedHookRegistered = false;
+    this.highlightButtons.clear();
+    this.highlightAnnotations.clear();
+    this.highlightLayer?.remove();
+    this.highlightLayer = null;
     this.rendition = null;
     this.relocated = null;
     this.renderedListener = null;
@@ -962,6 +1406,7 @@ export class ReaderSession {
     this.contentClick = null;
     this.keyboardNavigation = null;
     this.onLocation = null;
+    this.inspectors = {};
     this.current = null;
     this.userNavigationStartCfi = null;
     this.appearance = null;
@@ -990,8 +1435,501 @@ export class ReaderSession {
     this.syncVisibleColumnLinks();
   }
 
-  private harden(contents: Contents): Promise<void> {
-    return sanitizeEpubDocument(contents.document, this.stylesheetCache);
+  private async harden(contents: Contents): Promise<void> {
+    await sanitizeEpubDocument(contents.document, this.stylesheetCache);
+    this.unlockContentsViewport(contents);
+    this.installContentInteractionHandlers(contents);
+  }
+
+  private unlockContentsViewport(contents: Contents): void {
+    if (typeof contents.viewport === 'function') {
+      const originalViewport = contents.viewport.bind(contents) as (
+        options?: Partial<Parameters<Contents['viewport']>[0]>,
+      ) => ReturnType<Contents['viewport']>;
+      contents.viewport = ((options?: Parameters<Contents['viewport']>[0]) => {
+        if (!options) return originalViewport();
+        const patched: Partial<Parameters<Contents['viewport']>[0]> = {
+          ...options,
+          scalable: 'yes',
+        };
+        delete patched.maximum;
+        const result = originalViewport(patched);
+        unlockViewportMeta(contents.document);
+        return result;
+      }) as Contents['viewport'];
+    }
+    if (contents.document) unlockViewportMeta(contents.document);
+  }
+
+  private installContentInteractionHandlers(contents: Contents): void {
+    const doc = contents.document;
+    if (!doc?.addEventListener) return;
+    const handleClick = (event: MouseEvent) => {
+      const selection = contents.window?.getSelection?.();
+      if (selection && !selection.isCollapsed) return;
+      const target = event.target as Element | null;
+      if (this.routeContentInteraction(event, target, contents, true)) {
+        this.handledEvents.add(event);
+      }
+    };
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as Element | null;
+      if (!target) return;
+      const externalLink = target.closest?.(`a[${EXTERNAL_HREF_ATTR}]`);
+      if (externalLink && event.key === 'Enter') {
+        event.preventDefault();
+        event.stopPropagation();
+        this.handledEvents.add(event);
+        this.openExternalLinkElement(externalLink);
+        return;
+      }
+      const internalLink = target.closest?.('a[href]');
+      if (internalLink && event.key === 'Enter') {
+        if (this.tryHandleFootnoteLink(event, internalLink, contents)) {
+          this.handledEvents.add(event);
+        }
+        return;
+      }
+      const figure = target.closest?.(`[${FIGURE_ATTR}="true"]`);
+      if (figure && (event.key === 'Enter' || event.key === ' ')) {
+        const preview = resolveFigurePreview(figure, doc);
+        if (preview) {
+          event.preventDefault();
+          event.stopPropagation();
+          this.handledEvents.add(event);
+          this.inspectors.onFigure?.(preview, figure as HTMLElement);
+        }
+      }
+    };
+    doc.addEventListener('click', handleClick, true);
+    doc.addEventListener('keydown', handleKeydown);
+    this.addContentCleanup(contents, () => {
+      doc.removeEventListener('click', handleClick, true);
+      doc.removeEventListener('keydown', handleKeydown);
+    });
+  }
+
+  private routeContentInteraction(
+    event: MouseEvent,
+    eventTarget: Element | null,
+    contents: Contents,
+    fromCapture = false,
+  ): boolean {
+    const link = eventTarget?.closest?.('a') as HTMLAnchorElement | null;
+    if (link) {
+      const sanitizedExternal = link.getAttribute(EXTERNAL_HREF_ATTR);
+      if (sanitizedExternal) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        this.openExternalLinkElement(link);
+        return true;
+      }
+      const href = link.getAttribute('href') ?? '';
+      if (!href) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        return true;
+      }
+      if (!isSafeEpubReference(href, 'link')) {
+        const rawExternal = parseExternalLink(href);
+        if (rawExternal && this.inspectors.onExternalLink) {
+          event.preventDefault?.();
+          event.stopPropagation?.();
+          this.inspectors.onExternalLink(
+            {
+              href: rawExternal.href,
+              scheme: rawExternal.scheme,
+              label: normalizeWhitespace(link.textContent),
+            },
+            link,
+          );
+        }
+        return true;
+      }
+      if (this.tryHandleFootnoteLink(event, link, contents)) {
+        return true;
+      }
+      if (!fromCapture) this.beginLinkedNavigation();
+      return !fromCapture;
+    }
+
+    const figure =
+      eventTarget?.closest?.(`[${FIGURE_ATTR}="true"]`) ?? eventTarget?.closest?.('img, svg');
+    if (figure && contents.document && !figure.closest('button')) {
+      const preview = resolveFigurePreview(figure, contents.document);
+      if (preview && this.inspectors.onFigure) {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        this.inspectors.onFigure(preview, figure as HTMLElement);
+        return true;
+      }
+    }
+
+    const hitHighlightCfi = this.findClickedHighlightCfi(event, contents);
+    if (hitHighlightCfi) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      this.activateHighlight(hitHighlightCfi, this.highlightButtons.get(hitHighlightCfi) ?? null);
+      return true;
+    }
+
+    return false;
+  }
+
+  private openExternalLinkElement(link: Element): void {
+    const raw = link.getAttribute(EXTERNAL_HREF_ATTR) ?? '';
+    const parsed = parseExternalLink(raw);
+    if (!parsed) return;
+    this.inspectors.onExternalLink?.(
+      {
+        href: parsed.href,
+        scheme: parsed.scheme,
+        label: normalizeWhitespace(link.textContent),
+      },
+      link as HTMLElement,
+    );
+  }
+
+  private tryHandleFootnoteLink(event: Event, link: Element, contents: Contents): boolean {
+    const href = link.getAttribute('href') ?? '';
+    const hashIndex = href.indexOf('#');
+    if (hashIndex < 0) return false;
+    const rawPath = href.slice(0, hashIndex).trim();
+    const rawFragment = href.slice(hashIndex + 1).trim();
+    if (!rawFragment) return false;
+    let fragmentId: string;
+    try {
+      fragmentId = decodeURIComponent(rawFragment);
+    } catch {
+      return false;
+    }
+    if (!fragmentId) return false;
+
+    const currentSectionHref =
+      this.current?.start.href ?? this.getSpine().sections[contents.sectionIndex]?.href ?? '';
+    const isSameDocument =
+      !rawPath || this.isSameSpinePath(rawPath, currentSectionHref, contents.document);
+
+    if (isSameDocument && contents.document) {
+      const target = findFragmentTarget(contents.document, fragmentId);
+      if (!target) return false;
+      const hidden = isElementHidden(target, contents.window);
+      const semantic = isNoteRefElement(link) || isFootnoteTargetElement(target);
+      if (!hidden && !semantic) return false;
+      const preview = extractFootnotePreview(link, target);
+      if (!preview.paragraphs.length) return false;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      this.inspectors.onFootnote?.(preview, link as HTMLElement);
+      return true;
+    }
+
+    if (!isSameDocument && isNoteRefElement(link) && this.inspectors.onFootnote) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      void this.openCrossSectionFootnote(rawPath, currentSectionHref, fragmentId, link);
+      return true;
+    }
+
+    return false;
+  }
+
+  private async openCrossSectionFootnote(
+    rawPath: string,
+    currentSectionHref: string,
+    fragmentId: string,
+    link: Element,
+  ): Promise<void> {
+    const generation = this.locationGeneration;
+    const targetSection = this.resolveTargetSpineSection(rawPath, currentSectionHref);
+    if (!targetSection) {
+      await this.navigateLinkedTarget(`${rawPath}#${encodeURIComponent(fragmentId)}`);
+      return;
+    }
+    const request = (this.book as unknown as { load?: (url: string) => Promise<Document> }).load;
+    if (typeof request !== 'function') return;
+    const sectionState = targetSection as SpineSection & {
+      document?: Document;
+      contents?: unknown;
+    };
+    const wasLoaded = Boolean(sectionState.contents || sectionState.document);
+    try {
+      const loaded = await targetSection.load(request.bind(this.book));
+      if (!this.isCurrentLocationOperation(generation)) return;
+      const doc =
+        sectionState.document ??
+        (loaded && typeof loaded === 'object' && 'querySelector' in loaded
+          ? (loaded as Document)
+          : null);
+      const target = doc ? findFragmentTarget(doc, fragmentId) : null;
+      if (target) {
+        const preview = extractFootnotePreview(link, target);
+        if (preview.paragraphs.length) {
+          this.inspectors.onFootnote?.(preview, link as HTMLElement);
+          return;
+        }
+      }
+      await this.navigateLinkedTarget(`${targetSection.href}#${encodeURIComponent(fragmentId)}`);
+    } finally {
+      if (!wasLoaded) targetSection.unload();
+    }
+  }
+
+  private async navigateLinkedTarget(href: string): Promise<void> {
+    if (!this.rendition) return;
+    this.beginLinkedNavigation();
+    const generation = this.locationGeneration;
+    try {
+      await this.runDisplayOperation(() => this.rendition!.display(href));
+    } catch {
+      if (this.isCurrentLocationOperation(generation)) {
+        this.userNavigationPending = false;
+        this.userNavigationStartCfi = null;
+        this.userNavigationOrigin = 'navigation';
+        this.pendingLinkReturnTarget = null;
+      }
+    }
+  }
+
+  private isSameSpinePath(rawPath: string, currentHref: string, doc?: Document): boolean {
+    const cleanCurrent = currentHref.split('#')[0] ?? '';
+    if (!cleanCurrent) return false;
+    if (rawPath === cleanCurrent) return true;
+    try {
+      const base = doc?.baseURI || `https://epub.local/${cleanCurrent}`;
+      const resolved = new URL(rawPath, base).pathname.replace(/^\/+/, '');
+      const currentResolved = new URL(cleanCurrent, base).pathname.replace(/^\/+/, '');
+      return resolved === currentResolved || resolved.endsWith(`/${cleanCurrent}`);
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveTargetSpineSection(rawPath: string, currentHref: string): SpineSection | null {
+    const { sections } = this.getSpine();
+    const cleanRaw = rawPath.split('#')[0] ?? '';
+    const direct = sections.find((section) => section.href === cleanRaw);
+    if (direct) return direct;
+    try {
+      const resolved = new URL(cleanRaw, `https://epub.local/${currentHref}`).pathname.replace(
+        /^\/+/,
+        '',
+      );
+      return (
+        sections.find(
+          (section) => section.href === resolved || resolved.endsWith(`/${section.href}`),
+        ) ?? null
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  private ensureHighlightLayer(target: HTMLElement): void {
+    if (this.highlightLayer?.parentElement === target) return;
+    this.highlightLayer?.remove();
+    const layer = target.ownerDocument.createElement('div');
+    layer.className = 'turnleaf-highlight-layer';
+    layer.style.position = 'absolute';
+    layer.style.inset = '0';
+    layer.style.pointerEvents = 'none';
+    layer.style.zIndex = '2';
+    layer.style.overflow = 'hidden';
+    target.append(layer);
+    this.highlightLayer = layer;
+  }
+
+  private activateHighlight(cfi: string, opener: HTMLElement | null): void {
+    this.inspectors.onHighlight?.(cfi, opener);
+  }
+
+  private findClickedHighlightCfi(event: MouseEvent, contents: Contents): string | null {
+    if (!this.highlightCfis.size || !contents.document) return null;
+    for (const cfi of this.highlightCfis) {
+      const range = this.resolveCfiRange(cfi, contents);
+      if (!range) continue;
+      const rects =
+        typeof range.getClientRects === 'function' ? Array.from(range.getClientRects()) : [];
+      const matched = rects.some(
+        (rect) =>
+          rect.width > 0 &&
+          rect.height > 0 &&
+          event.clientX >= rect.left &&
+          event.clientX <= rect.right &&
+          event.clientY >= rect.top &&
+          event.clientY <= rect.bottom,
+      );
+      if (matched) return cfi;
+    }
+    return null;
+  }
+
+  private resolveCfiRange(cfi: string, contents?: Contents): Range | null {
+    try {
+      if (contents && typeof contents.range === 'function') {
+        const range = contents.range(cfi);
+        if (range) return range;
+      }
+      const rendition = this.rendition as
+        (Rendition & { getRange?: (value: string) => Range }) | null;
+      if (rendition && typeof rendition.getRange === 'function') {
+        const range = rendition.getRange(cfi);
+        if (
+          range &&
+          (!contents?.document || range.startContainer.ownerDocument === contents.document)
+        ) {
+          return range;
+        }
+      }
+    } catch {
+      // Ignore invalid or unloaded spine CFIs.
+    }
+    return null;
+  }
+
+  private computeVisibleRangeBox(
+    range: Range,
+    contents: Contents,
+    viewportRect: DOMRect,
+  ): { left: number; top: number; width: number; height: number } | null {
+    const rawRects = (
+      typeof range.getClientRects === 'function' ? Array.from(range.getClientRects()) : []
+    ).filter((rect) => rect.width > 0 && rect.height > 0);
+    if (!rawRects.length) {
+      const fallback = range.getBoundingClientRect?.();
+      if (fallback && fallback.width > 0 && fallback.height > 0) rawRects.push(fallback);
+    }
+    if (!rawRects.length) return null;
+
+    const frame = contents.window?.frameElement as Element | null | undefined;
+    const frameRect = frame?.getBoundingClientRect() ?? viewportRect;
+    for (const rect of rawRects) {
+      const left = frameRect.left + rect.left - viewportRect.left;
+      const top = frameRect.top + rect.top - viewportRect.top;
+      const right = left + rect.width;
+      const bottom = top + rect.height;
+      if (
+        right > 1 &&
+        left < viewportRect.width - 1 &&
+        bottom > 1 &&
+        top < viewportRect.height - 1
+      ) {
+        const clampedLeft = Math.max(0, left);
+        const clampedTop = Math.max(0, top);
+        const clampedRight = Math.min(viewportRect.width, right);
+        const clampedBottom = Math.min(viewportRect.height, bottom);
+        return {
+          left: clampedLeft,
+          top: clampedTop,
+          width: Math.max(1, clampedRight - clampedLeft),
+          height: Math.max(1, clampedBottom - clampedTop),
+        };
+      }
+    }
+    return null;
+  }
+
+  private syncHighlightOverlays(): void {
+    const layer = this.highlightLayer;
+    const viewport = this.viewportTarget;
+    if (!layer || !viewport || !this.rendition) return;
+
+    const viewportRect = viewport.getBoundingClientRect();
+    const hasLayout = viewportRect.width > 0 && viewportRect.height > 0;
+    const activeContents = this.getActiveContents();
+    const visibleBoxes = new Map<
+      string,
+      { left: number; top: number; width: number; height: number }
+    >();
+
+    for (const cfi of this.highlightCfis) {
+      if (activeContents.length > 0) {
+        for (const contents of activeContents) {
+          const range = this.resolveCfiRange(cfi, contents);
+          if (!range) continue;
+          if (hasLayout) {
+            const box = this.computeVisibleRangeBox(range, contents, viewportRect);
+            if (box) {
+              visibleBoxes.set(cfi, box);
+              break;
+            }
+          } else {
+            visibleBoxes.set(cfi, {
+              left: 0,
+              top: 0,
+              width: MIN_TARGET_PX,
+              height: MIN_TARGET_PX,
+            });
+            break;
+          }
+        }
+      } else if (!hasLayout) {
+        const range = this.resolveCfiRange(cfi);
+        if (range) {
+          visibleBoxes.set(cfi, {
+            left: 0,
+            top: 0,
+            width: MIN_TARGET_PX,
+            height: MIN_TARGET_PX,
+          });
+        }
+      }
+    }
+
+    for (const [cfi, button] of this.highlightButtons) {
+      if (!visibleBoxes.has(cfi)) {
+        button.remove();
+        this.highlightButtons.delete(cfi);
+      }
+    }
+
+    for (const [cfi, box] of visibleBoxes) {
+      const annotation = this.highlightAnnotations.get(cfi) ?? { cfi };
+      let button = this.highlightButtons.get(cfi);
+      if (!button) {
+        button = layer.ownerDocument.createElement('button');
+        button.type = 'button';
+        button.className = 'turnleaf-highlight-target';
+        button.style.position = 'absolute';
+        button.style.pointerEvents = 'auto';
+        button.style.background = 'transparent';
+        button.style.border = '0';
+        button.style.padding = '0';
+        button.style.margin = '0';
+        button.style.borderRadius = '4px';
+        button.style.cursor = 'pointer';
+        button.setAttribute('aria-controls', 'reader-annotations');
+        button.setAttribute('aria-haspopup', 'dialog');
+        button.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.activateHighlight(cfi, button!);
+        });
+        this.highlightButtons.set(cfi, button);
+        layer.append(button);
+      }
+
+      const targetWidth = Math.max(MIN_TARGET_PX, Math.round(box.width));
+      const targetHeight = Math.max(MIN_TARGET_PX, Math.round(box.height));
+      const maxLeft = hasLayout ? Math.max(0, Math.floor(viewportRect.width - targetWidth)) : 0;
+      const maxTop = hasLayout ? Math.max(0, Math.floor(viewportRect.height - targetHeight)) : 0;
+      const centeredLeft = Math.round(box.left - (targetWidth - box.width) / 2);
+      const centeredTop = Math.round(box.top - (targetHeight - box.height) / 2);
+      const left = Math.min(maxLeft, Math.max(0, centeredLeft));
+      const top = Math.min(maxTop, Math.max(0, centeredTop));
+
+      button.dataset.highlightCfi = cfi;
+      if (annotation.id) button.dataset.annotationId = annotation.id;
+      else delete button.dataset.annotationId;
+      button.setAttribute('aria-label', formatHighlightAriaLabel(annotation));
+      button.style.left = `${left}px`;
+      button.style.top = `${top}px`;
+      button.style.width = `${targetWidth}px`;
+      button.style.height = `${targetHeight}px`;
+      button.style.minWidth = `${MIN_TARGET_PX}px`;
+      button.style.minHeight = `${MIN_TARGET_PX}px`;
+    }
   }
 
   private addContentCleanup(contents: Contents, cleanup: () => void): void {
@@ -1140,6 +2078,7 @@ export class ReaderSession {
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
       this.syncVisibleColumnLinks();
+      this.syncHighlightOverlays();
     }
   }
 
@@ -1328,6 +2267,7 @@ export class ReaderSession {
         if (container) this.lockedScrollLeft = container.scrollLeft;
         this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
         this.syncVisibleColumnLinks();
+        this.syncHighlightOverlays();
       }
     });
     this.resizeObserver.observe(target);
