@@ -44,7 +44,21 @@ function abortError(): DOMException {
   return new DOMException('Aborted', 'AbortError');
 }
 
-export function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+interface ClientRequestInit extends RequestInit {
+  /**
+   * Allows a native request to reject its caller promise immediately when
+   * `signal` aborts while `CapacitorHttp.request` finishes in the background.
+   * Safe only for side-effect-free reads; mutations must await plugin settlement.
+   */
+  readonly settleOnAbort?: boolean;
+}
+
+/**
+ * Rejects the returned promise with `AbortError` when `signal` aborts without
+ * cancelling `promise`. Do not treat this rejection as proof that an underlying
+ * plugin request or mutation stopped.
+ */
+export function settleOnAbort<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) {
     void promise.catch(() => {});
@@ -87,8 +101,10 @@ export class KavitaClient {
     const series: KavitaSeries[] = [];
     const seenSeriesIds = new Set<number>();
     for (let pageNumber = 1; pageNumber <= MAX_SERIES_PAGES; pageNumber += 1) {
-      const options: RequestInit = {
+      // /api/Series/v2 uses POST for its filter payload, not a server mutation.
+      const options: ClientRequestInit = {
         method: 'POST',
+        settleOnAbort: true,
         body: JSON.stringify({
           statements: [{ field: 21, comparison: 5, value: '3' }],
           combination: 0,
@@ -153,7 +169,7 @@ export class KavitaClient {
         headers: { 'x-api-key': this.apiKey },
       });
       this.assertStatus(response.status);
-      return await raceAbort(response.blob(), combined);
+      return await settleOnAbort(response.blob(), combined);
     });
   }
 
@@ -192,6 +208,12 @@ export class KavitaClient {
     }
   }
 
+  /**
+   * Uploads reading progress. On native platforms `CapacitorHttp` cannot cancel
+   * an in-flight write, so aborting `signal` skips unstarted requests or
+   * redirect hops and waits for any dispatched write to settle before rejecting
+   * with `AbortError`.
+   */
   saveProgress(progress: KavitaProgress, signal?: AbortSignal): Promise<void> {
     const options: RequestInit = {
       method: 'POST',
@@ -201,7 +223,7 @@ export class KavitaClient {
     return this.request('/api/Reader/progress', options);
   }
 
-  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  private async request<T>(path: string, init: ClientRequestInit = {}): Promise<T> {
     if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
     return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
       try {
@@ -222,7 +244,7 @@ export class KavitaClient {
         }
         return await this.parseJsonPayload<T>(
           path,
-          () => raceAbort(response.json() as Promise<T>, signal),
+          () => settleOnAbort(response.json() as Promise<T>, signal),
           signal,
         );
       } catch (error) {
@@ -239,9 +261,12 @@ export class KavitaClient {
     });
   }
 
-  private async nativeRequest<T>(path: string, init: RequestInit): Promise<T> {
+  private async nativeRequest<T>(path: string, init: ClientRequestInit): Promise<T> {
     if (init.signal?.aborted) throw abortError();
     const method = init.method ?? 'GET';
+    const upperMethod = method.toUpperCase();
+    const canSettleInFlight =
+      init.settleOnAbort ?? (upperMethod === 'GET' || upperMethod === 'HEAD');
     const options: HttpOptions = {
       url: this.resolveUrl(path),
       method,
@@ -260,10 +285,10 @@ export class KavitaClient {
       let response: HttpResponse;
       while (true) {
         if (init.signal?.aborted) throw abortError();
-        response = await raceAbort(
-          CapacitorHttp.request({ ...options, url: redirects.currentUrl }),
-          init.signal,
-        );
+        const pendingHop = CapacitorHttp.request({ ...options, url: redirects.currentUrl });
+        response = canSettleInFlight
+          ? await settleOnAbort(pendingHop, init.signal)
+          : await pendingHop;
         if (init.signal?.aborted) throw abortError();
         if (
           !advanceRedirect(redirects, response.status, nativeHeader(response.headers, 'location'))

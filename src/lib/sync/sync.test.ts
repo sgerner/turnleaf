@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { saveLocalProgress } from '../database/database';
+import { settleOnAbort } from '../kavita/client';
 import { flushProgress } from './sync';
 
 const STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -226,4 +227,71 @@ it('allows a manual retry after an authorization failure', async () => {
   await expect(flushProgress(client, 'server')).resolves.toBeUndefined();
 
   expect(saveProgress).toHaveBeenCalledTimes(2);
+});
+
+it('serializes replacement progress uploads behind an in-flight upload when a caller stops waiting on abort', async () => {
+  vi.useFakeTimers();
+  const updatedAt = '2026-09-07T00:00:00.000Z';
+  vi.setSystemTime(new Date(updatedAt));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(pendingState(updatedAt, '{"pageNum":10}')));
+
+  let resolveFirstUpload!: () => void;
+  let resolveFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    resolveFirstStarted = resolve;
+  });
+  const events: string[] = [];
+  const saveProgress = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          events.push('upload:1:start');
+          resolveFirstStarted();
+          resolveFirstUpload = () => {
+            events.push('upload:1:settled');
+            resolve();
+          };
+        }),
+    )
+    .mockImplementationOnce(async () => {
+      events.push('upload:2:start');
+      events.push('upload:2:settled');
+    });
+
+  const client = { saveProgress } as never;
+  const firstFlush = flushProgress(client, 'server');
+  await firstStarted;
+
+  const probe = new AbortController();
+  const callerWait = settleOnAbort(firstFlush, probe.signal);
+  probe.abort();
+  await expect(callerWait).rejects.toMatchObject({ name: 'AbortError' });
+
+  vi.setSystemTime(new Date('2026-09-07T00:00:05.000Z'));
+  await saveLocalProgress(book, 'cfi-newer', 'xpath-newer', 0.4);
+  const secondFlush = flushProgress(client, 'server');
+
+  expect(secondFlush).toBe(firstFlush);
+  expect(saveProgress).toHaveBeenCalledTimes(1);
+  expect(events).toEqual(['upload:1:start']);
+
+  resolveFirstUpload();
+  await secondFlush;
+
+  expect(events).toEqual([
+    'upload:1:start',
+    'upload:1:settled',
+    'upload:2:start',
+    'upload:2:settled',
+  ]);
+  expect(saveProgress).toHaveBeenNthCalledWith(
+    2,
+    expect.objectContaining({ pageNum: 40, bookScrollId: 'xpath-newer' }),
+  );
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as ReturnType<
+    typeof pendingState
+  >;
+  expect(saved.syncQueue['book-1']).toBeUndefined();
+  expect(saved.readingState['book-1']?.pendingSync).toBe(false);
 });

@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
-import { flushSync, mount, unmount } from 'svelte';
+import { flushSync, mount, onDestroy, unmount } from 'svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CapacitorHttp } from '@capacitor/core';
 import { clearDiagnostics, getDiagnosticCount } from '../diagnostics/log';
-import type { BookRecord, StoredReadingState } from '../database/database';
+import type { BookRecord, PendingSyncItem, StoredReadingState } from '../database/database';
+import { cacheCover, downloadEpub } from '../downloads/native-download';
+import type { ReaderLocation } from '../reader/session';
 import Library from './Library.svelte';
 
 const runtime = vi.hoisted(() => ({
@@ -14,9 +16,11 @@ const runtime = vi.hoisted(() => ({
   appStateListeners: new Set<(state: { isActive: boolean }) => void>(),
   savedBooks: [] as BookRecord[],
   readingState: null as StoredReadingState | null,
+  syncQueue: new Map<string, PendingSyncItem & { serverId: string; lastError: string | null }>(),
   reconcileCalls: 0,
-  flushProgressImpl: vi.fn<() => Promise<void>>(async () => {}),
   openedReaderProps: null as Record<string, unknown> | null,
+  overlayStates: [] as boolean[],
+  readerOpenStates: [] as boolean[],
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -26,7 +30,6 @@ vi.mock('@capacitor/core', () => ({
   },
   CapacitorHttp: {
     request: vi.fn(),
-    get: vi.fn(),
   },
   registerPlugin: () => ({}),
 }));
@@ -69,14 +72,52 @@ vi.mock('@capacitor/app', () => ({
 
 vi.mock('../database/database', () => ({
   getBooks: vi.fn(async () => [...runtime.savedBooks]),
-  getReadingState: vi.fn(async () => runtime.readingState),
+  getReadingState: vi.fn(async () => (runtime.readingState ? { ...runtime.readingState } : null)),
   getPreferences: vi.fn(async () => new Map<string, string>()),
-  getSyncStatus: vi.fn(async () => ({
-    pendingCount: 0,
-    failedCount: 0,
-    lastError: null,
-    lastUpdatedAt: null,
-  })),
+  getPendingSync: vi.fn(async (serverId: string) =>
+    [...runtime.syncQueue.values()]
+      .filter((item) => item.serverId === serverId)
+      .map(({ bookId, payload, revision, updatedAt }) => ({
+        bookId,
+        payload,
+        revision,
+        updatedAt,
+      })),
+  ),
+  confirmSync: vi.fn(
+    async (bookId: string, syncedAt: string, revision: number, updatedAt: string) => {
+      const current = runtime.syncQueue.get(bookId);
+      if (current && current.revision === revision && current.updatedAt === updatedAt) {
+        runtime.syncQueue.delete(bookId);
+        if (runtime.readingState) {
+          runtime.readingState = {
+            ...runtime.readingState,
+            pendingSync: false,
+            syncedLocalUpdatedAt: updatedAt,
+            serverUpdatedAt: syncedAt,
+          };
+        }
+      }
+    },
+  ),
+  markSyncFailure: vi.fn(
+    async (bookId: string, error: string, revision: number, updatedAt: string) => {
+      const current = runtime.syncQueue.get(bookId);
+      if (current && current.revision === revision && current.updatedAt === updatedAt) {
+        current.lastError = error;
+      }
+    },
+  ),
+  getSyncStatus: vi.fn(async () => {
+    const items = [...runtime.syncQueue.values()];
+    const failed = items.filter((item) => item.lastError !== null);
+    return {
+      pendingCount: items.length,
+      failedCount: failed.length,
+      lastError: failed.at(-1)?.lastError ?? null,
+      lastUpdatedAt: items.at(-1)?.updatedAt ?? null,
+    };
+  }),
   acceptRemoteProgress: vi.fn(async () => true),
   markDownloaded: vi.fn(async () => {}),
   markBookCompleted: vi.fn(async () => {}),
@@ -98,7 +139,38 @@ vi.mock('../database/database', () => ({
         : item;
     });
   }),
-  saveLocalProgress: vi.fn(async () => {}),
+  saveLocalProgress: vi.fn(
+    async (book: BookRecord, cfi: string, xpath: string | null, percentage: number) => {
+      const now = new Date().toISOString();
+      const nextRevision = (runtime.readingState?.syncRevision ?? 0) + 1;
+      const pageNum = Math.round(percentage * book.pages);
+      runtime.readingState = {
+        cfi,
+        xpath,
+        percentage,
+        localUpdatedAt: now,
+        syncedLocalUpdatedAt: runtime.readingState?.syncedLocalUpdatedAt ?? null,
+        serverUpdatedAt: runtime.readingState?.serverUpdatedAt ?? null,
+        pendingSync: true,
+        syncRevision: nextRevision,
+      };
+      runtime.syncQueue.set(book.id, {
+        bookId: book.id,
+        serverId: book.serverId,
+        payload: JSON.stringify({
+          libraryId: book.libraryId,
+          seriesId: book.seriesId,
+          volumeId: book.volumeId,
+          chapterId: book.chapterId,
+          pageNum,
+          bookScrollId: xpath,
+        }),
+        revision: nextRevision,
+        updatedAt: now,
+        lastError: null,
+      });
+    },
+  ),
   saveRemoteProgress: vi.fn(async () => true),
   saveServer: vi.fn(async () => {}),
   setPreference: vi.fn(async () => {}),
@@ -111,17 +183,18 @@ vi.mock('../downloads/native-download', () => ({
   clearCoverCache: vi.fn(async () => {}),
   cleanupInterruptedEpubDownloads: vi.fn(async () => {}),
   deleteDownloadedEpub: vi.fn(async () => {}),
-  downloadEpub: vi.fn(),
+  downloadEpub: vi.fn(async () => ({
+    relativePath: 'books/primary-1-20.epub',
+    nativeUri: 'file:///books/primary-1-20.epub',
+    webViewUrl: 'file:///books/primary-1-20.epub',
+    size: 2048,
+  })),
   verifyDownloadedEpub: vi.fn(async (relativePath: string) => ({
     relativePath,
     nativeUri: `file:///${relativePath}`,
     webViewUrl: `file:///${relativePath}`,
     size: 1024,
   })),
-}));
-
-vi.mock('../sync/sync', () => ({
-  flushProgress: () => runtime.flushProgressImpl(),
 }));
 
 vi.mock('../themes/themes', () => ({
@@ -132,6 +205,11 @@ vi.mock('../themes/themes', () => ({
 vi.mock('./Reader.svelte', () => ({
   default: (_anchor: unknown, props: Record<string, unknown>) => {
     runtime.openedReaderProps = props;
+    const onMountChange = props.onMountChange as ((open: boolean) => void) | undefined;
+    onMountChange?.(true);
+    onDestroy(() => {
+      onMountChange?.(false);
+    });
     return {};
   },
 }));
@@ -167,7 +245,7 @@ beforeEach(() => {
   runtime.connected = true;
   runtime.networkListeners.clear();
   runtime.appStateListeners.clear();
-  runtime.savedBooks = [savedBook];
+  runtime.savedBooks = [{ ...savedBook }];
   runtime.readingState = {
     cfi: 'epubcfi(/6/4!/4/2:0)',
     xpath: '/body/p[2]',
@@ -178,11 +256,14 @@ beforeEach(() => {
     pendingSync: false,
     syncRevision: 1,
   };
+  runtime.syncQueue.clear();
   runtime.reconcileCalls = 0;
-  runtime.flushProgressImpl = vi.fn(async () => {});
   runtime.openedReaderProps = null;
+  runtime.overlayStates = [];
+  runtime.readerOpenStates = [];
   vi.mocked(CapacitorHttp.request).mockReset();
-  vi.mocked(CapacitorHttp.get).mockReset();
+  vi.mocked(cacheCover).mockClear();
+  vi.mocked(downloadEpub).mockClear();
   (Element.prototype as { animate?: unknown }).animate ??= () => ({
     cancel() {},
     finish() {},
@@ -208,7 +289,7 @@ function mountLibrary(): void {
       server: {
         id: 'primary',
         displayName: 'Books',
-        baseUrl: 'https://books.example.com',
+        baseUrl: 'https://books.example.com/kavita',
         credentialRef: 'server_primary_api_key',
         kavitaVersion: '0.8.0',
         lastConnectedAt: '2026-01-01T00:00:00Z',
@@ -221,12 +302,18 @@ function mountLibrary(): void {
       onApiKeyChange: () => {},
       onServerDeleted: () => {},
       onChangeServerAddress: () => {},
+      onReaderOpenChange: (open) => {
+        runtime.readerOpenStates.push(open);
+      },
+      onOverlayActiveChange: (active) => {
+        runtime.overlayStates.push(active);
+      },
     },
   });
   flushSync();
 }
 
-it('re-enables Refresh immediately on disconnect abort, preserves saved books, and refreshes without stalling on reconnect', async () => {
+it('re-enables Refresh immediately on disconnect abort, preserves saved books and transfer origin, and refreshes on reconnect', async () => {
   const orphanRejects: Array<(reason?: unknown) => void> = [];
   let healthy = false;
 
@@ -249,6 +336,17 @@ it('re-enables Refresh immediately on disconnect abort, preserves saved books, a
             latestReadDate: '2026-01-01T00:00:00Z',
             coverImage: '',
           },
+          {
+            id: 2,
+            name: 'Remote Series',
+            libraryId: 1,
+            format: 3,
+            pages: 80,
+            pagesRead: 0,
+            created: '2026-01-02T00:00:00Z',
+            latestReadDate: null,
+            coverImage: '',
+          },
         ]),
       };
     }
@@ -256,6 +354,32 @@ it('re-enables Refresh immediately on disconnect abort, preserves saved books, a
       return new Promise((_, reject) => {
         orphanRejects.push(reject);
       });
+    }
+    if (url.includes('seriesId=2')) {
+      return {
+        status: 200,
+        headers: {},
+        url,
+        data: JSON.stringify({
+          chapters: [
+            {
+              id: 20,
+              title: 'Remote Downloadable Book',
+              titleName: 'Remote Downloadable Book',
+              volumeId: 2,
+              pages: 80,
+              pagesRead: 0,
+              summary: '',
+              format: 3,
+              files: [{ id: 200, bytes: 2048, extension: '.epub', format: 3 }],
+              writers: [{ name: 'Grace Hopper' }],
+            },
+          ],
+          specials: [],
+          volumes: [],
+          storylineChapters: [],
+        }),
+      };
     }
     return {
       status: 200,
@@ -284,12 +408,13 @@ it('re-enables Refresh immediately on disconnect abort, preserves saved books, a
   });
 
   mountLibrary();
-  await vi.waitFor(() => expect(orphanRejects).toHaveLength(1));
+  await vi.waitFor(() => expect(orphanRejects).toHaveLength(2));
 
   const refreshButton = container.querySelector<HTMLButtonElement>(
     'button[aria-label="Refresh library"]',
   );
   expect(refreshButton?.disabled).toBe(true);
+  expect(runtime.overlayStates.at(-1)).toBe(false);
 
   runtime.connected = false;
   for (const listener of runtime.networkListeners) {
@@ -308,27 +433,54 @@ it('re-enables Refresh immediately on disconnect abort, preserves saved books, a
   }
 
   await vi.waitFor(() => expect(runtime.reconcileCalls).toBe(1));
+  flushSync();
   expect(container.textContent).toContain('Refreshed Book');
+  expect(container.textContent).toContain('Remote Downloadable Book');
+
+  await vi.waitFor(() => expect(cacheCover).toHaveBeenCalled());
+  expect(vi.mocked(cacheCover).mock.calls[0]?.[6]).toBe('https://books.example.com');
+
+  const downloadOpenButton = [
+    ...container.querySelectorAll<HTMLButtonElement>('[data-book-open]'),
+  ].find((button) => button.textContent?.includes('Remote Downloadable Book'));
+  expect(downloadOpenButton).toBeDefined();
+  downloadOpenButton?.click();
+  await vi.waitFor(() => expect(downloadEpub).toHaveBeenCalledOnce());
+  expect(vi.mocked(downloadEpub).mock.calls[0]?.[4]).toBe('https://books.example.com');
 
   orphanRejects.forEach((reject) => reject(new Error('SocketTimeoutException')));
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(getDiagnosticCount()).toBe(0);
 });
 
-it('aborts the 1,500 ms open progress probe across syncWork and getProgress without aborting syncWork or retrying', async () => {
+it('aborts the open progress probe while serializing replacement progress uploads behind in-flight saveProgress and preserving overlay state', async () => {
   vi.useFakeTimers();
   try {
-    let resolveSyncWork!: () => void;
-    let syncFinished = false;
-    runtime.flushProgressImpl = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveSyncWork = () => {
-            syncFinished = true;
-            resolve();
-          };
-        }),
-    );
+    runtime.readingState = {
+      cfi: 'epubcfi(/6/4!/4/2:0)',
+      xpath: '/body/p[2]',
+      percentage: 0.25,
+      localUpdatedAt: '2026-01-01T00:00:05Z',
+      syncedLocalUpdatedAt: '2026-01-01T00:00:00Z',
+      serverUpdatedAt: '2026-01-01T00:00:00Z',
+      pendingSync: true,
+      syncRevision: 1,
+    };
+    runtime.syncQueue.set(savedBook.id, {
+      bookId: savedBook.id,
+      serverId: 'primary',
+      payload: JSON.stringify({
+        libraryId: 1,
+        seriesId: 1,
+        volumeId: 1,
+        chapterId: 10,
+        pageNum: 25,
+        bookScrollId: '/body/p[2]',
+      }),
+      revision: 1,
+      updatedAt: '2026-01-01T00:00:05Z',
+      lastError: null,
+    });
 
     const seriesPayload = JSON.stringify([
       {
@@ -363,14 +515,28 @@ it('aborts the 1,500 ms open progress probe across syncWork and getProgress with
       storylineChapters: [],
     });
 
+    const uploadedPages: number[] = [];
+    let resolveInitialUpload!: () => void;
     let rejectProgressOrphan!: (reason?: unknown) => void;
     let progressCalls = 0;
+
     vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
       if (options.url.includes('/api/Series/v2')) {
         return { status: 200, headers: {}, url: options.url, data: seriesPayload };
       }
       if (options.url.includes('/api/Series/series-detail')) {
         return { status: 200, headers: {}, url: options.url, data: detailPayload };
+      }
+      if (options.url.includes('/api/Reader/progress')) {
+        const pageNum = (options.data as { pageNum: number }).pageNum;
+        uploadedPages.push(pageNum);
+        if (uploadedPages.length === 1) {
+          return new Promise((resolve) => {
+            resolveInitialUpload = () =>
+              resolve({ status: 200, headers: {}, url: options.url, data: '' });
+          });
+        }
+        return { status: 200, headers: {}, url: options.url, data: '' };
       }
       if (options.url.includes('/api/Reader/get-progress')) {
         progressCalls += 1;
@@ -385,63 +551,91 @@ it('aborts the 1,500 ms open progress probe across syncWork and getProgress with
     await vi.advanceTimersByTimeAsync(50);
     flushSync();
 
-    // Case 1: syncWork itself exceeds 1,500 ms -> probe aborts wait without aborting syncWork
-    for (const listener of runtime.appStateListeners) {
-      listener({ isActive: false });
-    }
-    expect(runtime.flushProgressImpl).toHaveBeenCalledOnce();
+    // Initial mount started real flushProgress -> CapacitorHttp.request POST /api/Reader/progress (page 25)
+    expect(uploadedPages).toEqual([25]);
+    expect(runtime.overlayStates.at(-1)).toBe(false);
 
     const continueButton = [...container.querySelectorAll('button')].find(
       (button) =>
         button.textContent?.includes('Continue reading') &&
         button.textContent.includes('Saved Offline Book'),
     );
-    expect(continueButton).not.toBeNull();
+    expect(continueButton).toBeDefined();
     continueButton?.click();
     flushSync();
+
+    // While resolvingOpenProgress banner is visible, overlayActive stays false
+    expect(container.textContent).toContain('Opening downloaded book…');
+    expect(runtime.overlayStates.at(-1)).toBe(false);
 
     await vi.advanceTimersByTimeAsync(1_500);
     flushSync();
 
-    // Book opened from local state while syncWork is still running un-aborted
+    // Book opened from local state; overlayActive transitioned to true; syncWork is still in flight
     expect(runtime.openedReaderProps).toMatchObject({ initialCfi: 'epubcfi(/6/4!/4/2:0)' });
+    expect(runtime.overlayStates.at(-1)).toBe(true);
+    expect(runtime.readerOpenStates.at(-1)).toBe(true);
     expect(progressCalls).toBe(0);
-    expect(syncFinished).toBe(false);
+    expect(uploadedPages).toEqual([25]);
 
-    // Finish syncWork cleanly in background
-    resolveSyncWork();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(syncFinished).toBe(true);
+    // Reader saves a newer relocation (page 40) and triggers debounce timer while upload 1 is still pending
+    const onRelocated = runtime.openedReaderProps?.onRelocated as
+      ((location: ReaderLocation) => void) | undefined;
+    expect(onRelocated).toBeTypeOf('function');
+    onRelocated?.({
+      cfi: 'epubcfi(/6/4!/4/8:0)',
+      xpath: '/body/p[8]',
+      href: 'chapter-1.xhtml',
+      percentage: 0.4,
+      spineIndex: 1,
+      pageIndex: 4,
+      pageCount: 10,
+    });
+    await vi.advanceTimersByTimeAsync(2_600);
 
-    // Remount to verify Case 2: syncWork settles quickly, then getProgress exceeds 1,500 ms
-    if (mounted) {
-      unmount(mounted);
-      mounted = null;
-    }
-    runtime.openedReaderProps = null;
-    runtime.flushProgressImpl = vi.fn(async () => {});
+    // Replacement mutation MUST NOT start until the original saveProgress request actually settles
+    expect(uploadedPages).toEqual([25]);
 
-    mountLibrary();
+    resolveInitialUpload();
     await vi.advanceTimersByTimeAsync(50);
+
+    expect(uploadedPages).toEqual([25, 40]);
+    expect(runtime.syncQueue.size).toBe(0);
+
+    // Close reader and verify overlayActive returns to false, then test "Open offline" during getProgress
+    const onBack = runtime.openedReaderProps?.onBack as (() => void) | undefined;
+    expect(onBack).toBeTypeOf('function');
+    onBack?.();
+    await vi.advanceTimersByTimeAsync(0);
     flushSync();
+    expect(runtime.overlayStates.at(-1)).toBe(false);
+    expect(runtime.readerOpenStates.at(-1)).toBe(false);
+    runtime.openedReaderProps = null;
 
     const secondContinueButton = [...container.querySelectorAll('button')].find(
       (button) =>
         button.textContent?.includes('Continue reading') &&
         button.textContent.includes('Saved Offline Book'),
     );
-    expect(secondContinueButton).not.toBeNull();
+    expect(secondContinueButton).toBeDefined();
     secondContinueButton?.click();
     flushSync();
 
     await vi.advanceTimersByTimeAsync(50);
+    flushSync();
     expect(progressCalls).toBe(1);
 
-    await vi.advanceTimersByTimeAsync(1_500);
+    const openOfflineButton = [...container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Open offline'),
+    );
+    expect(openOfflineButton).toBeDefined();
+    openOfflineButton?.click();
+    await vi.advanceTimersByTimeAsync(0);
     flushSync();
 
     expect(progressCalls).toBe(1);
-    expect(runtime.openedReaderProps).toMatchObject({ initialCfi: 'epubcfi(/6/4!/4/2:0)' });
+    expect(runtime.openedReaderProps).toMatchObject({ initialCfi: 'epubcfi(/6/4!/4/8:0)' });
+    expect(runtime.overlayStates.at(-1)).toBe(true);
 
     rejectProgressOrphan(new Error('SocketTimeoutException'));
     await vi.advanceTimersByTimeAsync(0);

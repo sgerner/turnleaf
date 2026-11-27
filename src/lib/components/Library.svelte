@@ -41,7 +41,7 @@
     loadCoversWithConcurrency,
     type CoverLoadItem,
   } from '../downloads/cover-loader';
-  import { KavitaClient, KavitaError, raceAbort } from '../kavita/client';
+  import { KavitaClient, KavitaError, settleOnAbort } from '../kavita/client';
   import { mapSeriesToBooks } from '../kavita/mapper';
   import type { KavitaProgress } from '../kavita/types';
   import type { ReaderLocation } from '../reader/session';
@@ -916,7 +916,10 @@
       message = '';
     }
     try {
-      if (!(await raceAbort(networkAvailable(), controller.signal)) || controller.signal.aborted)
+      if (
+        !(await settleOnAbort(networkAvailable(), controller.signal)) ||
+        controller.signal.aborted
+      )
         return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
@@ -1232,9 +1235,10 @@
         const timer = window.setTimeout(() => probe.abort(), 1_500);
         const upload = syncWork;
         try {
-          // Compare revisions only after any previous upload has settled.
-          if (upload) await raceAbort(upload, probe.signal);
-          if (!probe.signal.aborted && (await raceAbort(networkAvailable(), probe.signal))) {
+          // Stop waiting on the open-book read probe if it aborts; syncWork keeps
+          // running and serializes any replacement uploads until saveProgress settles.
+          if (upload) await settleOnAbort(upload, probe.signal);
+          if (!probe.signal.aborted && (await settleOnAbort(networkAvailable(), probe.signal))) {
             remote = await client.getProgress(book.chapterId, probe.signal);
           }
         } catch {
