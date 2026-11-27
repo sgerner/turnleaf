@@ -114,6 +114,7 @@ export const migrations = [
       ALTER TABLE books ADD COLUMN chapter_epub_index INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN multi_file_chapter INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE books ADD COLUMN sync_progress INTEGER NOT NULL DEFAULT 1;
+      CREATE INDEX IF NOT EXISTS books_server_file_idx ON books(server_id, file_id);
     `,
   },
 ] as const;

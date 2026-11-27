@@ -685,6 +685,7 @@ describe('native progress transactions against SQLite', () => {
     await database.saveServer(server);
     const primaryBook = {
       ...book,
+      id: 'server:1:10:2114',
       fileId: 2114,
       fileName: 'vol3-primary.epub',
       pages: 5,
@@ -742,6 +743,228 @@ describe('native progress transactions against SQLite', () => {
     expect(
       (await reopened.getBooks(server.id)).find((item) => item.id === siblingBook.id)?.pagesRead,
     ).toBe(4);
+  });
+
+  it('upgrades a version-7 SQLite database to version 8 and preserves per-file downloads and progress across reversed file order', async () => {
+    const updatedAt = '2026-09-05T12:00:00.000Z';
+    native.database = new DatabaseSync(native.databasePath);
+    native.database.exec('PRAGMA foreign_keys = ON;');
+    const { migrations } = await import('./schema');
+    for (const migration of migrations) {
+      if (migration.version <= 7) {
+        native.database.exec(migration.statements);
+      }
+    }
+    native.database.exec('PRAGMA user_version = 7;');
+    native.database
+      .prepare(
+        `INSERT INTO server_config
+          (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(server.id, server.displayName, server.baseUrl, server.credentialRef, '0.8.4', updatedAt);
+    native.database
+      .prepare(
+        `INSERT INTO books
+          (id, server_id, library_id, series_id, volume_id, chapter_id, title, author, series,
+           description_html, format, metadata_refreshed_at, download_path, download_status,
+           file_size, pages, pages_read, created_at, last_read_at, remote_available)
+          VALUES (?, ?, 1, 82, 188, 1406, 'Vol 3', 'Rawlinson', 'Ancient World', NULL, 'epub',
+                  ?, 'books/legacy-vol3.epub', 'available', 1955734, 9, 3, ?, ?, 1)`,
+      )
+      .run('server:82:1406', server.id, updatedAt, updatedAt, updatedAt);
+    native.database
+      .prepare(
+        `INSERT INTO reading_state
+          (book_id, cfi, kavita_xpath, percentage, local_updated_at, pending_sync, sync_revision)
+          VALUES ('server:82:1406', 'epubcfi(/6/2!/4/8)', '/body/p[8]', 0.6, ?, 1, 3)`,
+      )
+      .run(updatedAt);
+    native.database
+      .prepare(
+        `INSERT INTO sync_queue
+          (book_id, payload_json, created_at, updated_at, revision)
+          VALUES ('server:82:1406', '{"libraryId":1,"seriesId":82,"volumeId":188,"chapterId":1406,"pageNum":3}', ?, ?, 3)`,
+      )
+      .run(updatedAt, updatedAt);
+    native.database
+      .prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('readerBookmarks:server:82:1406', '["legacy-bm"]', updatedAt);
+
+    const database = await importDatabase();
+    const { mapSeriesToBooks } = await import('../kavita/mapper');
+    const seriesMeta = {
+      id: 82,
+      name: 'Ancient World',
+      libraryId: 1,
+      format: 3,
+      pages: 9,
+      pagesRead: 1,
+      created: updatedAt,
+      latestReadDate: updatedAt,
+      coverImage: null,
+    };
+    const file2114 = {
+      id: 2114,
+      bytes: 1955734,
+      pages: 5,
+      extension: '.epub',
+      format: 3,
+      fileName: 'pg16163-images-3.epub',
+    };
+    const file2115 = {
+      id: 2115,
+      bytes: 2169759,
+      pages: 4,
+      extension: '.epub',
+      format: 3,
+      fileName: 'vol3-media.epub',
+    };
+    const detailFor = (files: Array<typeof file2114>) => ({
+      chapters: [],
+      specials: [],
+      storylineChapters: [],
+      volumes: [
+        {
+          id: 188,
+          chapters: [
+            {
+              id: 1406,
+              volumeId: 188,
+              title: 'Vol 3',
+              titleName: 'Vol 3',
+              pages: 9,
+              pagesRead: 1,
+              summary: '',
+              format: 3,
+              files,
+              writers: [{ name: 'Rawlinson' }],
+              lastReadingProgressUtc: updatedAt,
+              hasMultipleFiles: files.length > 1,
+            },
+          ],
+        },
+      ],
+    });
+
+    // Upgrade reconcile even when Kavita returns reversed order [2115, 2114] on first v8 scan!
+    const firstScan = mapSeriesToBooks(server.id, seriesMeta, detailFor([file2115, file2114]));
+    await database.reconcileBooks(server.id, firstScan);
+
+    expect(
+      native.database.prepare('PRAGMA user_version').get() as { user_version: number },
+    ).toEqual({ user_version: 8 });
+
+    let saved = await database.getBooks(server.id);
+    expect(saved).toHaveLength(2);
+    const upgraded2114 = saved.find((item) => item.fileId === 2114)!;
+    const upgraded2115 = saved.find((item) => item.fileId === 2115)!;
+    expect(upgraded2114).toMatchObject({
+      id: 'server:82:1406:2114',
+      downloadPath: 'books/legacy-vol3.epub',
+      downloadStatus: 'available',
+      fileSize: 1955734,
+      pagesRead: 3,
+      syncProgress: true,
+    });
+    expect(upgraded2115).toMatchObject({
+      id: 'server:82:1406:2115',
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: 2169759,
+      pagesRead: 0,
+      syncProgress: false,
+    });
+    expect(await database.getReadingState(upgraded2114.id)).toMatchObject({
+      cfi: 'epubcfi(/6/2!/4/8)',
+      pendingSync: true,
+      syncRevision: 3,
+    });
+    expect(await database.getPendingSync(server.id)).toMatchObject([
+      { bookId: upgraded2114.id, revision: 3 },
+    ]);
+    expect(
+      await database.getPreferences([
+        'readerBookmarks:server:82:1406',
+        `readerBookmarks:${upgraded2114.id}`,
+      ]),
+    ).toEqual(new Map([[`readerBookmarks:${upgraded2114.id}`, '["legacy-bm"]']]));
+
+    // Download and read sibling 2115, then reconcile with reversed file order [2114, 2115].
+    await database.markDownloaded(upgraded2115.id, 'books/vol3-2115.epub', 2169759);
+    await database.saveLocalProgress(upgraded2115, 'epubcfi(/6/8!/4/2)', '/body/p[2]', 0.75, 2);
+    await database.setPreference(`readerBookmarks:${upgraded2115.id}`, '["sibling-bm"]');
+
+    const secondScan = mapSeriesToBooks(server.id, seriesMeta, detailFor([file2114, file2115]));
+    await database.reconcileBooks(server.id, secondScan);
+
+    saved = await database.getBooks(server.id);
+    expect(saved.find((item) => item.fileId === 2114)).toMatchObject({
+      id: 'server:82:1406:2114',
+      downloadPath: 'books/legacy-vol3.epub',
+      pagesRead: 3,
+      chapterEpubIndex: 0,
+      syncProgress: true,
+    });
+    expect(saved.find((item) => item.fileId === 2115)).toMatchObject({
+      id: 'server:82:1406:2115',
+      downloadPath: 'books/vol3-2115.epub',
+      pagesRead: 3,
+      chapterEpubIndex: 1,
+      syncProgress: false,
+    });
+    expect(
+      await database.getPreferences([
+        `readerBookmarks:${upgraded2114.id}`,
+        `readerBookmarks:${upgraded2115.id}`,
+      ]),
+    ).toEqual(
+      new Map([
+        [`readerBookmarks:${upgraded2114.id}`, '["legacy-bm"]'],
+        [`readerBookmarks:${upgraded2115.id}`, '["sibling-bm"]'],
+      ]),
+    );
+
+    // Collapse to single EPUB 2114 ('server:82:1406'), then replace 2114 with 2199:
+    // the v7 NULL upgrade was one-time, so 2199 must NOT inherit 2114's download or reading state.
+    await database.reconcileBooks(
+      server.id,
+      mapSeriesToBooks(server.id, seriesMeta, detailFor([file2114])),
+    );
+    expect((await database.getBooks(server.id)).find((item) => item.fileId === 2114)).toMatchObject(
+      {
+        id: 'server:82:1406',
+        downloadPath: 'books/legacy-vol3.epub',
+        pagesRead: 3,
+      },
+    );
+
+    const replacement2199 = {
+      id: 2199,
+      bytes: 777777,
+      pages: 12,
+      extension: '.epub',
+      format: 3,
+      fileName: 'vol3-replaced.epub',
+    };
+    await database.reconcileBooks(
+      server.id,
+      mapSeriesToBooks(server.id, seriesMeta, detailFor([replacement2199])),
+    );
+    expect((await database.getBooks(server.id)).find((item) => item.fileId === 2199)).toMatchObject(
+      {
+        id: 'server:82:1406',
+        fileId: 2199,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: 777777,
+        pagesRead: 1,
+        lastReadAt: updatedAt,
+      },
+    );
+    expect(await database.getReadingState('server:82:1406')).toBeNull();
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+    expect(await database.getPreferences(['readerBookmarks:server:82:1406'])).toEqual(new Map());
   });
 
   it('serializes reads behind reconcileBooks so mid-transaction remote_available=0 is hidden', async () => {

@@ -36,7 +36,7 @@ describe('Android reading journey fixture', () => {
     expect(books).toHaveLength(2);
     expect(books.map((book) => book.title)).toEqual([fixture.primaryTitle, fixture.companionTitle]);
     expect(openBookLabel(books[0])).toBe(fixture.primaryOpenLabel);
-    expect(openBookLabel({ ...books[0], downloadPath: 'books/ci-1-1.epub', pagesRead: 1 })).toBe(
+    expect(openBookLabel({ ...books[0], downloadPath: 'books/ci-1-1-1.epub', pagesRead: 1 })).toBe(
       fixture.primaryReadLabel,
     );
     expect(openBookLabel(books[1])).toBe(fixture.companionOpenLabel);
@@ -44,7 +44,8 @@ describe('Android reading journey fixture', () => {
       fixture.companionReadLabel,
     );
     expect(books[0]).toMatchObject({
-      id: 'ci:1:1',
+      id: 'ci:1:1:1',
+      fileId: 1,
       pages: 2,
       fileSize: fixture.primaryByteSize,
       syncProgress: true,

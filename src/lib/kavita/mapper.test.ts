@@ -238,7 +238,7 @@ it('maps the minimized volume-only payload reported in issue #51', () => {
   expect(books.map((book) => book.chapterId)).toEqual([1406, 1406, 1407, 1409, 1408]);
   expect(books.map((book) => book.fileId)).toEqual([2114, 2115, 2116, 2118, 2117]);
   expect(books.map((book) => book.id)).toEqual([
-    'primary:82:1406',
+    'primary:82:1406:2114',
     'primary:82:1406:2115',
     'primary:82:1407',
     'primary:82:1409',
@@ -249,7 +249,7 @@ it('maps the minimized volume-only payload reported in issue #51', () => {
     1955734, 2169759, 10039970, 2902733, 6659250,
   ]);
   expect(books[0]).toMatchObject({
-    id: 'primary:82:1406',
+    id: 'primary:82:1406:2114',
     fileId: 2114,
     fileName: 'pg16163-images-3.epub',
     title: 'The Seven Great Monarchies Of The Ancient Eastern World, Vol 3 (pg16163-images-3)',
@@ -488,7 +488,7 @@ it('maps mixed EPUB-plus-PDF chapters using per-file pages and keeps sibling EPU
     syncProgress: true,
   });
   expect(books[1]).toMatchObject({
-    id: 'primary:55:5002',
+    id: 'primary:55:5002:9003',
     fileId: 9003,
     title: 'Volume Two (File 1)',
     pages: 10,
@@ -506,5 +506,29 @@ it('maps mixed EPUB-plus-PDF chapters using per-file pages and keeps sibling EPU
     syncProgress: false,
     remoteProgressKnown: false,
     remoteReadDateKnown: false,
+  });
+
+  const reversedDetail = structuredClone(detail);
+  reversedDetail.volumes![0]!.chapters[1]!.files.reverse();
+  const reversedBooks = mapSeriesToBooks('primary', series, reversedDetail);
+  expect(reversedBooks[1]).toMatchObject({
+    id: 'primary:55:5002:9004',
+    fileId: 9004,
+    title: 'Volume Two (File 2)',
+    pages: 15,
+    pagesRead: 0,
+    lastReadAt: null,
+    chapterEpubIndex: 0,
+    syncProgress: false,
+  });
+  expect(reversedBooks[2]).toMatchObject({
+    id: 'primary:55:5002:9003',
+    fileId: 9003,
+    title: 'Volume Two (File 1)',
+    pages: 10,
+    pagesRead: 9,
+    lastReadAt: '2026-09-06T12:00:00Z',
+    chapterEpubIndex: 1,
+    syncProgress: true,
   });
 });

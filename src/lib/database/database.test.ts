@@ -1039,6 +1039,7 @@ it('preserves primary downloads and keeps sibling EPUB progress local across bro
 
   const primaryUpgrade: BookRecord = {
     ...existingBook,
+    id: 'server:1:10:2114',
     fileId: 2114,
     fileName: '/private/server/path/edition-a.epub',
     title: 'Vol 3 (edition-a)',
@@ -1076,7 +1077,8 @@ it('preserves primary downloads and keeps sibling EPUB progress local across bro
 
   let books = await getBooks('server');
   expect(books).toHaveLength(2);
-  expect(books.find((item) => item.id === existingBook.id)).toMatchObject({
+  expect(books.find((item) => item.id === primaryUpgrade.id)).toMatchObject({
+    fileId: 2114,
     downloadPath: existingBook.downloadPath,
     downloadStatus: 'available',
     fileSize: existingBook.fileSize,
@@ -1087,6 +1089,7 @@ it('preserves primary downloads and keeps sibling EPUB progress local across bro
   });
   const savedSibling = books.find((item) => item.id === siblingBook.id)!;
   expect(savedSibling).toMatchObject({
+    fileId: 2115,
     fileName: 'edition-b.epub',
     fileSize: 2169759,
     remoteFileSize: 2169759,
@@ -1097,7 +1100,7 @@ it('preserves primary downloads and keeps sibling EPUB progress local across bro
 
   await saveLocalProgress(savedSibling, 'epubcfi(/6/4)', '/body/p[2]', 0.75, 2);
   await expect(getPendingSync('server')).resolves.toEqual([
-    expect.objectContaining({ bookId: existingBook.id }),
+    expect.objectContaining({ bookId: primaryUpgrade.id }),
   ]);
   await expect(getSyncStatus('server')).resolves.toMatchObject({ pendingCount: 1 });
 
@@ -1108,6 +1111,166 @@ it('preserves primary downloads and keeps sibling EPUB progress local across bro
     syncProgress: false,
   });
   expect(books.find((item) => item.id === siblingBook.id)?.lastReadAt).toBeTruthy();
+});
+
+it('keeps browser downloads, reading state, and preferences with each fileId across reversed file order and clears them on fileId replacement', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const { mapSeriesToBooks } = await import('../kavita/mapper');
+  const series = {
+    id: 82,
+    name: 'Ancient World',
+    libraryId: 1,
+    format: 3,
+    pages: 9,
+    pagesRead: 2,
+    created: '2026-09-05T00:00:00.000Z',
+    latestReadDate: '2026-09-06T00:00:00.000Z',
+    coverImage: null,
+  };
+  const file2114 = {
+    id: 2114,
+    bytes: 1955734,
+    pages: 5,
+    extension: '.epub',
+    format: 3,
+    fileName: 'edition-2114.epub',
+  };
+  const file2115 = {
+    id: 2115,
+    bytes: 2169759,
+    pages: 4,
+    extension: '.epub',
+    format: 3,
+    fileName: 'edition-2115.epub',
+  };
+  const makeDetail = (files: Array<typeof file2114>) => ({
+    chapters: [],
+    specials: [],
+    storylineChapters: [],
+    volumes: [
+      {
+        id: 188,
+        chapters: [
+          {
+            id: 1406,
+            volumeId: 188,
+            title: 'Vol 3',
+            titleName: 'Vol 3',
+            pages: 9,
+            pagesRead: 2,
+            summary: '',
+            format: 3,
+            files,
+            writers: [{ name: 'Rawlinson' }],
+            lastReadingProgressUtc: '2026-09-06T00:00:00.000Z',
+            hasMultipleFiles: files.length > 1,
+          },
+        ],
+      },
+    ],
+  });
+
+  const initialMapped = mapSeriesToBooks('server', series, makeDetail([file2114, file2115]));
+  await reconcileBooks('server', initialMapped);
+  const first2114 = (await getBooks('server')).find((item) => item.fileId === 2114)!;
+  const first2115 = (await getBooks('server')).find((item) => item.fileId === 2115)!;
+
+  await markDownloaded(first2114.id, 'books/file-2114.epub', 1955734);
+  await markDownloaded(first2115.id, 'books/file-2115.epub', 2169759);
+  await saveLocalProgress(first2114, 'epubcfi(/6/2!/4/2)', '/body/p[4]', 0.8, 3);
+  await saveLocalProgress(first2115, 'epubcfi(/6/6!/4/1)', '/body/p[9]', 0.5, 1);
+  await setPreferences(
+    new Map([
+      [`readerBookmarks:${first2114.id}`, '["bm-2114"]'],
+      [`readerBookmarks:${first2115.id}`, '["bm-2115"]'],
+    ]),
+  );
+
+  const reversedMapped = mapSeriesToBooks('server', series, makeDetail([file2115, file2114]));
+  await reconcileBooks('server', reversedMapped);
+
+  const afterReverse = await getBooks('server');
+  const reversed2114 = afterReverse.find((item) => item.fileId === 2114)!;
+  const reversed2115 = afterReverse.find((item) => item.fileId === 2115)!;
+  expect(reversed2114).toMatchObject({
+    id: 'server:82:1406:2114',
+    downloadPath: 'books/file-2114.epub',
+    downloadStatus: 'available',
+    fileSize: 1955734,
+    pagesRead: 4,
+    chapterEpubIndex: 1,
+    syncProgress: true,
+  });
+  expect(reversed2115).toMatchObject({
+    id: 'server:82:1406:2115',
+    downloadPath: 'books/file-2115.epub',
+    downloadStatus: 'available',
+    fileSize: 2169759,
+    pagesRead: 2,
+    chapterEpubIndex: 0,
+    syncProgress: false,
+  });
+  await expect(getReadingState(reversed2114.id)).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/2!/4/2)',
+    pendingSync: true,
+  });
+  await expect(getReadingState(reversed2115.id)).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/6!/4/1)',
+    pendingSync: false,
+  });
+  await expect(
+    getPreferences([`readerBookmarks:${reversed2114.id}`, `readerBookmarks:${reversed2115.id}`]),
+  ).resolves.toEqual(
+    new Map([
+      [`readerBookmarks:${reversed2114.id}`, '["bm-2114"]'],
+      [`readerBookmarks:${reversed2115.id}`, '["bm-2115"]'],
+    ]),
+  );
+
+  // Transition chapter to a single EPUB (file 2114 -> id 'server:82:1406'), then replace fileId 2114 -> 2199.
+  const single2114 = mapSeriesToBooks('server', series, makeDetail([file2114]));
+  await reconcileBooks('server', single2114);
+  const collapsed2114 = (await getBooks('server')).find((item) => item.fileId === 2114)!;
+  expect(collapsed2114).toMatchObject({
+    id: 'server:82:1406',
+    downloadPath: 'books/file-2114.epub',
+    pagesRead: 4,
+  });
+  await expect(getReadingState('server:82:1406')).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/2!/4/2)',
+  });
+  await expect(getPreferences(['readerBookmarks:server:82:1406'])).resolves.toEqual(
+    new Map([['readerBookmarks:server:82:1406', '["bm-2114"]']]),
+  );
+
+  const replacementFile = {
+    id: 2199,
+    bytes: 888888,
+    pages: 12,
+    extension: '.epub',
+    format: 3,
+    fileName: 'edition-2199.epub',
+  };
+  const replacedMapped = mapSeriesToBooks('server', series, makeDetail([replacementFile]));
+  await reconcileBooks('server', replacedMapped);
+
+  const replaced2199 = (await getBooks('server')).find((item) => item.fileId === 2199)!;
+  expect(replaced2199).toMatchObject({
+    id: 'server:82:1406',
+    fileId: 2199,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: 888888,
+    pagesRead: 2,
+    lastReadAt: '2026-09-06T00:00:00.000Z',
+  });
+  await expect(getReadingState('server:82:1406')).resolves.toBeNull();
+  await expect(getPendingSync('server')).resolves.toEqual([]);
+  await expect(getPreferences(['readerBookmarks:server:82:1406'])).resolves.toEqual(new Map());
 });
 
 it('mirrors browser theme, mode, and surface colors to localStorage and clears them on reset', async () => {

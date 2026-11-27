@@ -312,6 +312,7 @@ describe('native metadata transactions against SQLite', () => {
 
     const primaryRefreshed: BookRecord = {
       ...baseBook,
+      id: 'server:1:10:2114',
       fileId: 2114,
       fileName: '/var/kavita/books/edition-primary.epub',
       pages: 5,
@@ -344,7 +345,8 @@ describe('native metadata transactions against SQLite', () => {
 
     await reconcileBooksInTransaction(adapter, 'server', [primaryRefreshed, siblingBook]);
 
-    expect(readBook(db, baseBook.id)).toMatchObject({
+    expect(readBook(db, baseBook.id)).toBeUndefined();
+    expect(readBook(db, primaryRefreshed.id)).toMatchObject({
       download_path: baseBook.downloadPath,
       download_status: 'available',
       file_size: baseBook.fileSize,
@@ -368,15 +370,88 @@ describe('native metadata transactions against SQLite', () => {
       pages_read: 0,
     });
 
-    db.prepare('UPDATE books SET pages_read=3, last_read_at=? WHERE id=?').run(
+    db.prepare(
+      'UPDATE books SET download_path=?, download_status=?, file_size=?, pages_read=3, last_read_at=? WHERE id=?',
+    ).run(
+      'books/sibling-2115.epub',
+      'available',
+      2169759,
       '2026-09-11T00:00:00.000Z',
       siblingBook.id,
     );
-    await reconcileBooksInTransaction(adapter, 'server', [primaryRefreshed, siblingBook]);
+    await reconcileBooksInTransaction(adapter, 'server', [
+      { ...siblingBook, chapterEpubIndex: 0 },
+      { ...primaryRefreshed, chapterEpubIndex: 1 },
+    ]);
 
+    expect(readBook(db, primaryRefreshed.id)).toMatchObject({
+      file_id: 2114,
+      download_path: baseBook.downloadPath,
+      file_size: baseBook.fileSize,
+      chapter_epub_index: 1,
+      pages_read: 2,
+    });
     expect(readBook(db, siblingBook.id)).toMatchObject({
+      file_id: 2115,
+      download_path: 'books/sibling-2115.epub',
+      file_size: 2169759,
+      chapter_epub_index: 0,
       pages_read: 3,
       last_read_at: '2026-09-11T00:00:00.000Z',
     });
+  });
+
+  it('clears local download and reading state when fileId changes on an existing book ID', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    await replaceBooksInTransaction(
+      adapter,
+      'server',
+      [{ ...baseBook, fileId: 2114 }],
+      '2026-09-08T00:00:00.000Z',
+    );
+    db.prepare(
+      `INSERT INTO reading_state (book_id, cfi, percentage, local_updated_at, pending_sync, sync_revision)
+       VALUES (?, 'epubcfi(/6/2)', 0.5, '2026-09-09T00:00:00.000Z', 1, 1)`,
+    ).run(baseBook.id);
+    db.prepare(
+      `INSERT INTO sync_queue (book_id, payload_json, created_at, updated_at, revision)
+       VALUES (?, '{"pageNum":50}', '2026-09-09T00:00:00.000Z', '2026-09-09T00:00:00.000Z', 1)`,
+    ).run(baseBook.id);
+    db.prepare('INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)').run(
+      `readerBookmarks:${baseBook.id}`,
+      '["bm-old"]',
+      '2026-09-09T00:00:00.000Z',
+    );
+
+    await reconcileBooksInTransaction(adapter, 'server', [
+      {
+        ...baseBook,
+        fileId: 2199,
+        pages: 80,
+        pagesRead: 0,
+        lastReadAt: null,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: 777777,
+      },
+    ]);
+
+    expect(readBook(db, baseBook.id)).toMatchObject({
+      file_id: 2199,
+      download_path: null,
+      download_status: 'none',
+      file_size: 777777,
+      pages: 80,
+      pages_read: 0,
+      last_read_at: null,
+    });
+    expect(
+      db.prepare('SELECT * FROM reading_state WHERE book_id=?').get(baseBook.id),
+    ).toBeUndefined();
+    expect(db.prepare('SELECT * FROM sync_queue WHERE book_id=?').get(baseBook.id)).toBeUndefined();
+    expect(
+      db.prepare('SELECT * FROM preferences WHERE key=?').get(`readerBookmarks:${baseBook.id}`),
+    ).toBeUndefined();
   });
 });

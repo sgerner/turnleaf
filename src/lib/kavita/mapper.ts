@@ -18,13 +18,27 @@ export function mapSeriesToBooks(
     for (const chapter of chapters) {
       if (seen.has(chapter.id)) continue;
       if (chapter.format !== undefined && chapter.format !== null && chapter.format !== 3) continue;
-      let epubIndex = 0;
+      const epubFiles = chapter.files.filter(isEpubFile);
+      if (epubFiles.length === 0) continue;
+      seen.add(chapter.id);
+      const hasMultipleEpubs = epubFiles.length > 1;
       const multiFileChapter = Boolean(chapter.hasMultipleFiles) || chapter.files.length > 1;
-      for (const file of chapter.files) {
-        if (!isEpubFile(file)) continue;
-        if (epubIndex === 0) seen.add(chapter.id);
-        books.push(mapFileToBook(serverId, series, chapter, file, epubIndex, multiFileChapter));
-        epubIndex += 1;
+      const primaryFileId = Math.min(...epubFiles.map((file) => file.id));
+      for (let epubIndex = 0; epubIndex < epubFiles.length; epubIndex += 1) {
+        const file = epubFiles[epubIndex]!;
+        const isPrimary = !hasMultipleEpubs || file.id === primaryFileId;
+        books.push(
+          mapFileToBook(
+            serverId,
+            series,
+            chapter,
+            file,
+            epubIndex,
+            multiFileChapter,
+            hasMultipleEpubs,
+            isPrimary,
+          ),
+        );
       }
     }
   };
@@ -50,8 +64,9 @@ function mapFileToBook(
   file: KavitaFile,
   epubIndex: number,
   multiFileChapter: boolean,
+  hasMultipleEpubs: boolean,
+  isPrimary: boolean,
 ): BookRecord {
-  const isPrimary = epubIndex === 0;
   const writers = chapter.writers;
   const author =
     writers.length === 0
@@ -64,9 +79,9 @@ function mapFileToBook(
   const pagesRead = isPrimary ? (pages > 0 ? Math.min(pages, rawPagesRead) : rawPagesRead) : 0;
   const fileName = sanitizeEpubFileName(file.fileName);
   const record: BookRecord = {
-    id: isPrimary
-      ? `${serverId}:${series.id}:${chapter.id}`
-      : `${serverId}:${series.id}:${chapter.id}:${file.id}`,
+    id: hasMultipleEpubs
+      ? `${serverId}:${series.id}:${chapter.id}:${file.id}`
+      : `${serverId}:${series.id}:${chapter.id}`,
     serverId,
     libraryId: series.libraryId,
     seriesId: series.id,
@@ -130,8 +145,17 @@ function disambiguateDuplicateTitles(books: BookRecord[]): void {
   }
   for (const [baseTitle, group] of groups) {
     if (group.length < 2) continue;
+    const fallbackOrder = [...group].sort((left, right) => {
+      if (left.fileId != null && right.fileId != null && left.fileId !== right.fileId) {
+        return left.fileId - right.fileId;
+      }
+      return (left.chapterEpubIndex ?? 0) - (right.chapterEpubIndex ?? 0);
+    });
+    const fallbackRank = new Map<BookRecord, number>(
+      fallbackOrder.map((book, rank) => [book, rank + 1]),
+    );
     const labels = group.map(
-      (book) => fileDisplayStem(book.fileName) || `File ${(book.chapterEpubIndex ?? 0) + 1}`,
+      (book) => fileDisplayStem(book.fileName) || `File ${fallbackRank.get(book) ?? 1}`,
     );
     const labelCounts = new Map<string, number>();
     for (const label of labels) {
