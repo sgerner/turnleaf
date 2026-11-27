@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { Capacitor } from '@capacitor/core';
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
   import { focusModal } from '../a11y/modal-focus';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import DialogShell from './DialogShell.svelte';
   import {
     removeServer,
@@ -11,7 +11,7 @@
     type BookRecord,
     type ServerConfig,
   } from '../database/database';
-  import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
+  import { clearDiagnostics } from '../diagnostics/log';
   import { KavitaClient } from '../kavita/client';
   import { removeApiKey, saveApiKey } from '../native/credentials';
   import { loadTheme, skeletonThemes, type SkeletonTheme } from '../themes/themes';
@@ -25,7 +25,6 @@
     pendingMode,
     pendingAutoSync,
     credentialCleanupComplete,
-    diagnosticsRevision,
     onClose,
     onThemeSelected,
     onModeSelected,
@@ -46,7 +45,6 @@
     pendingMode: 'light' | 'dark';
     pendingAutoSync: boolean;
     credentialCleanupComplete: boolean;
-    diagnosticsRevision: number;
     onClose: () => void;
     onThemeSelected: (theme: SkeletonTheme) => void;
     onModeSelected: (mode: 'light' | 'dark') => void;
@@ -61,9 +59,6 @@
   } = $props();
 
   let settingsDialog = $state<HTMLElement | null>(null);
-  let diagnosticsVisible = $state(false);
-  let diagnosticsOutput = $state('');
-  let diagnosticsMessage = $state('');
   let replacementApiKey = $state('');
   let showReplacementKey = $state(false);
   let settingsError = $state('');
@@ -76,85 +71,8 @@
     focusModal(() => settingsDialog);
   });
 
-  $effect(() => {
-    if (diagnosticsVisible && diagnosticsRevision >= 0) {
-      diagnosticsOutput = untrack(() => diagnosticsText());
-    }
-  });
-
   function insecureServer(): boolean {
     return server.baseUrl.toLowerCase().startsWith('http://');
-  }
-
-  function diagnosticsText(): string {
-    return exportDiagnostics({
-      appVersion: __APP_VERSION__,
-      platform: Capacitor.getPlatform(),
-      kavitaVersion: server.kavitaVersion,
-    });
-  }
-
-  async function copyDiagnostics(): Promise<void> {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    try {
-      const text = diagnosticsOutput;
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const field = document.createElement('textarea');
-        field.value = text;
-        field.setAttribute('readonly', '');
-        field.style.position = 'fixed';
-        field.style.opacity = '0';
-        document.body.appendChild(field);
-        let copied = false;
-        try {
-          field.select();
-          copied = document.execCommand('copy');
-        } finally {
-          field.remove();
-        }
-        if (!copied) throw new Error('Clipboard unavailable');
-      }
-      diagnosticsMessage = 'Diagnostics copied. Review them before sharing.';
-    } catch {
-      diagnosticsVisible = true;
-      diagnosticsMessage =
-        'Copy is unavailable here. Open the log below to select and copy it, or download it.';
-    }
-  }
-
-  function downloadDiagnostics(): void {
-    diagnosticsMessage = '';
-    diagnosticsOutput = diagnosticsText();
-    const file = new Blob([diagnosticsOutput], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(file);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'turnleaf-diagnostics.txt';
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    diagnosticsVisible = true;
-    diagnosticsMessage =
-      'Review the log before sharing. If the file did not download, select and copy it below.';
-  }
-
-  function showDiagnostics(): void {
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsVisible = !diagnosticsVisible;
-  }
-
-  function selectDiagnostics(): void {
-    const field = document.querySelector<HTMLTextAreaElement>('#turnleaf-diagnostics-output');
-    field?.focus();
-    field?.select();
-  }
-
-  function clearDiagnosticLog(): void {
-    clearDiagnostics();
-    diagnosticsOutput = diagnosticsText();
-    diagnosticsMessage = 'Diagnostics cleared.';
   }
 
   async function updateTheme(next: SkeletonTheme): Promise<void> {
@@ -222,6 +140,7 @@
         onCredentialCleanedUp();
       }
       await removeServer(server.id);
+      await clearDiagnostics();
       onServerRemoved();
     } catch (cause) {
       settingsError = credentialsRemoved
@@ -479,49 +398,7 @@
       </div>
     </dl>
   </section>
-  <section class="mt-7" aria-labelledby="library-settings-diagnostics-title">
-    <h3 id="library-settings-diagnostics-title" class="text-lg font-medium">Diagnostics</h3>
-    <p class="mt-1 text-sm text-surface-700-300">
-      Copy or download recent connection and book download details. The log includes API routes,
-      HTTP statuses, and failure categories. It stays in memory until the app closes or you clear
-      it. Review it before sharing.
-    </p>
-    <div class="mt-3 grid grid-cols-2 gap-2">
-      <button class="btn preset-tonal-surface" type="button" onclick={() => void copyDiagnostics()}>
-        Copy diagnostics
-      </button>
-      <button class="btn preset-tonal-surface" type="button" onclick={downloadDiagnostics}>
-        Download log
-      </button>
-    </div>
-    <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
-      {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
-    </button>
-    {#if diagnosticsVisible}
-      <div class="mt-3 grid gap-2">
-        <p class="text-sm text-surface-700-300">
-          If copy or download is unavailable, select all text below, then copy it manually.
-        </p>
-        <textarea
-          id="turnleaf-diagnostics-output"
-          class="input min-h-48 w-full font-mono text-xs"
-          readonly
-          rows="10"
-          bind:value={diagnosticsOutput}
-          aria-label="Turnleaf diagnostics log"
-          onclick={selectDiagnostics}></textarea>
-        <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
-          Select all text
-        </button>
-      </div>
-    {/if}
-    <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={clearDiagnosticLog}>
-      Clear diagnostics
-    </button>
-    {#if diagnosticsMessage}
-      <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
-    {/if}
-  </section>
+  <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
   {#if confirmDeleteServer}
     <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
       <p class="text-sm font-medium text-error-700-300">Delete this server?</p>

@@ -2,8 +2,10 @@
   import { onMount } from 'svelte';
   import { fade } from 'svelte/transition';
   import Library from './lib/components/Library.svelte';
+  import DiagnosticsPanel from './lib/components/DiagnosticsPanel.svelte';
   import type OnboardingComponent from './lib/components/Onboarding.svelte';
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
+  import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
   import type { ReleaseBanner } from './lib/github/releases';
   import {
     getPreferences,
@@ -67,11 +69,21 @@
         try {
           apiKey = await getApiKey(saved.credentialRef);
         } catch {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/credentials',
+            detail: 'credential-read-failed',
+          });
           startupError =
             'Turnleaf could not read the saved Kavita key. Retry or enter the key again.';
         }
       }
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-open-failed',
+      });
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
@@ -80,6 +92,7 @@
   }
 
   onMount(() => {
+    void hydrateDiagnostics();
     void loadLocalData();
   });
 
@@ -87,8 +100,14 @@
     repairing = true;
     try {
       await resetLocalDatabase();
+      await clearDiagnostics();
       await loadLocalData();
     } catch {
+      recordDiagnostic({
+        category: 'startup',
+        endpoint: 'local/database',
+        detail: 'database-reset-failed',
+      });
       startupError =
         'Local data could not be reset. Your downloaded EPUB files were left in place; try again or reinstall the app.';
       return;
@@ -242,6 +261,7 @@
             </button>
           {/if}
         </div>
+        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
     {:else}
       {#key onboardingAttempt}
