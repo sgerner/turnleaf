@@ -268,6 +268,36 @@ afterEach(async () => {
 });
 
 describe('Library concurrent progress uploads and catalog refreshes', () => {
+  it('does not start another refresh for a connected event while already online', async () => {
+    let seriesRequests = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/Series/v2') {
+        seriesRequests += 1;
+        return jsonResponse([seriesListItem(0)]);
+      }
+      if (url.pathname === '/api/Series/series-detail') {
+        return jsonResponse(seriesDetailPayload(0));
+      }
+      if (url.pathname === '/api/Image/series-cover') {
+        return new Response(new Blob(['cover']), { status: 200 });
+      }
+      return jsonResponse({});
+    });
+
+    const { target } = await mountLibrary();
+    await waitForCondition(() => Boolean(target.querySelector('[data-book-open]')));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // Android can report a new connected network during a Wi-Fi-to-cellular handoff.
+    for (const listener of networkListeners) {
+      listener({ connected: true, connectionType: 'cellular' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(seriesRequests).toBe(1);
+  });
+
   it('starts saveProgress on online mount without awaiting catalog pagination and retains local progress', async () => {
     await saveLocalProgress(seededBook, 'epubcfi(/6/4!/4/2)', '//body/p[4]', 0.4);
 
@@ -631,46 +661,5 @@ describe('Library concurrent progress uploads and catalog refreshes', () => {
     for (const listener of networkListeners) listener({ connected: true, connectionType: 'wifi' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(progressSaveCount).toBe(0);
-  });
-
-  it('revalidates Network.getStatus before dispatching /api/Series/v2 when a transient reconnect callback races with offline state', async () => {
-    let initialRefreshDone = false;
-    const offlineAuthenticatedRequests: string[] = [];
-
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-      const url = new URL(String(input));
-      const headers = new Headers(init?.headers);
-      if (!networkConnected && headers.get('x-api-key')) {
-        offlineAuthenticatedRequests.push(url.pathname);
-      }
-      if (url.pathname === '/api/Series/v2') {
-        return jsonResponse([seriesListItem(0)]);
-      }
-      if (url.pathname === '/api/Series/series-detail') {
-        initialRefreshDone = true;
-        return jsonResponse(seriesDetailPayload(0));
-      }
-      if (url.pathname === '/api/Image/series-cover') {
-        return new Response(new Blob(['cover']), { status: 200 });
-      }
-      return jsonResponse({});
-    });
-
-    const { target } = await mountLibrary();
-    await waitForCondition(() => initialRefreshDone);
-
-    // Wi-Fi lost, then a queued cellular handover event fires right after transport is already offline
-    networkConnected = false;
-    for (const listener of networkListeners) {
-      listener({ connected: false, connectionType: 'none' });
-    }
-    for (const listener of networkListeners) {
-      listener({ connected: true, connectionType: 'cellular' });
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 40));
-
-    expect(offlineAuthenticatedRequests).toEqual([]);
-    expect(target.textContent).toContain('No network connection. Showing your saved library.');
   });
 });

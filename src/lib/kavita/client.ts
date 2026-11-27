@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -40,15 +41,10 @@ function normalizePayload<T>(endpoint: string, read: () => T, context = ''): T {
   }
 }
 
-export interface KavitaClientOptions {
-  beforeDispatch?: ((path: string, signal?: AbortSignal) => Promise<void> | void) | undefined;
-}
-
 export class KavitaClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
-    private readonly options?: KavitaClientOptions,
   ) {}
 
   async testConnection(signal?: AbortSignal): Promise<ConnectedServer> {
@@ -133,16 +129,10 @@ export class KavitaClient {
     }
     const url = this.coverUrl(seriesId);
     return this.withBrowserTimeout(signal, async (combined) => {
-      const response = await this.browserFetchWithRedirects(
-        url,
-        {
-          signal: combined,
-          headers: { 'x-api-key': this.apiKey },
-        },
-        this.options?.beforeDispatch
-          ? () => this.options!.beforeDispatch!('/api/Image/series-cover', combined)
-          : undefined,
-      );
+      const response = await this.browserFetchWithRedirects(url, {
+        signal: combined,
+        headers: { 'x-api-key': this.apiKey },
+      });
       this.assertStatus(response.status);
       return await response.blob();
     });
@@ -193,22 +183,16 @@ export class KavitaClient {
     if (Capacitor.isNativePlatform()) return this.nativeRequest<T>(path, init);
     return this.withBrowserTimeout(init.signal, async (signal, timeoutSignal) => {
       try {
-        const response = await this.browserFetchWithRedirects(
-          this.resolveUrl(path),
-          {
-            ...init,
-            signal,
-            headers: {
-              Accept: 'application/json',
-              'Content-Type': 'application/json',
-              'x-api-key': this.apiKey,
-              ...init.headers,
-            },
+        const response = await this.browserFetchWithRedirects(this.resolveUrl(path), {
+          ...init,
+          signal,
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'x-api-key': this.apiKey,
+            ...init.headers,
           },
-          this.options?.beforeDispatch
-            ? () => this.options!.beforeDispatch!(path, signal)
-            : undefined,
-        );
+        });
 
         this.assertStatus(response.status, path);
         if (response.status === 204 || response.headers.get('content-length') === '0') {
@@ -246,9 +230,10 @@ export class KavitaClient {
       const redirects = createRedirectState(options.url, new URL(this.baseUrl).origin, method);
       let response: HttpResponse;
       while (true) {
+        const networkStatus = await Network.getStatus().catch(() => null);
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        if (this.options?.beforeDispatch) {
-          await this.options.beforeDispatch(path, init.signal ?? undefined);
+        if (networkStatus?.connected !== true || navigator.onLine === false) {
+          throw new KavitaError('Kavita could not be reached while offline.', 'network');
         }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -275,17 +260,9 @@ export class KavitaClient {
     }
   }
 
-  private async browserFetchWithRedirects(
-    url: string,
-    init: RequestInit,
-    beforeHop?: () => Promise<void> | void,
-  ): Promise<Response> {
+  private async browserFetchWithRedirects(url: string, init: RequestInit): Promise<Response> {
     const redirects = createRedirectState(url, new URL(this.baseUrl).origin, init.method ?? 'GET');
     while (true) {
-      if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      if (beforeHop) {
-        await beforeHop();
-      }
       const response = await fetch(redirects.currentUrl, { ...init, redirect: 'manual' });
       if (
         !advanceRedirect(

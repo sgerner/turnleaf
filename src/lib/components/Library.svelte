@@ -114,48 +114,21 @@
   } = $props();
   type LibrarySortOrder = 'title' | 'author' | 'recent';
   let activeApiKey = $derived(apiKey);
-  const client = $derived(
-    new KavitaClient(server.baseUrl, activeApiKey, {
-      beforeDispatch: async (path, signal) => {
-        if (destroyed || offline || signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-        const recheckTransport =
-          Capacitor.isNativePlatform() ||
-          path.startsWith('/api/Series/') ||
-          path.startsWith('/api/Image/');
-        if (recheckTransport && !(await networkAvailable(true))) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-        if (destroyed || offline || signal?.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-      },
-    }),
-  );
+  const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
   const sharedCoverLoader = createSharedCoverLoader<string | Blob>(async (seriesId, signal) => {
     if (Capacitor.isNativePlatform()) {
-      const allowDownload = !offline && (await networkAvailable(true));
       return cacheCover(
         client.coverUrl(seriesId),
         activeApiKey,
         seriesId,
         signal,
         server.id,
-        allowDownload,
+        await networkAvailable(),
         serverOrigin,
-        async () => {
-          if (destroyed || offline || signal.aborted || !(await networkAvailable(true))) {
-            throw new DOMException('Aborted', 'AbortError');
-          }
-          if (destroyed || offline || signal.aborted) {
-            throw new DOMException('Aborted', 'AbortError');
-          }
-        },
       );
     }
-    if (!(await networkAvailable(true))) throw new Error('Offline');
+    if (offline) throw new Error('Offline');
     const blob = await client.getCover(seriesId, signal);
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
@@ -353,30 +326,6 @@
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
-  let networkTransitionId = 0;
-
-  function offlineStatusMessage(): string {
-    return displayableBooks.length
-      ? 'No network connection. Showing your saved library.'
-      : 'No network connection. Connect to Kavita to load your library.';
-  }
-
-  function markOffline(): void {
-    const wasOffline = offline;
-    offline = true;
-    if (syncTimer !== null) {
-      window.clearTimeout(syncTimer);
-      syncTimer = null;
-    }
-    refreshController?.abort();
-    openProgressProbe?.abort();
-    offlineMessage = offlineStatusMessage();
-    if (!wasOffline) {
-      cancelCoverLoading();
-      sharedCoverLoader.cancel();
-      coverReloadRequest += 1;
-    }
-  }
 
   function normalizeLibrarySearch(value: string): string {
     return value
@@ -779,34 +728,35 @@
     retainCoversFor(books);
     loading = false;
     void refreshSyncStatus();
-    offlineMessage = offline ? offlineStatusMessage() : '';
+    offlineMessage = offline
+      ? displayableBooks.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.'
+      : '';
     if (destroyed) return;
     cleanups.push(
       await registerListener(
         await Network.addListener('networkStatusChange', ({ connected }) => {
           if (destroyed) return;
-          const transitionId = ++networkTransitionId;
+          const wasOffline = offline;
+          offline = !connected;
           if (!connected) {
-            kavitaUnreachable = false;
-            markOffline();
-            return;
+            refreshController?.abort();
+            openProgressProbe?.abort();
           }
-          void (async () => {
-            const status = await Network.getStatus().catch(() => null);
-            if (destroyed || transitionId !== networkTransitionId) return;
-            if (status?.connected !== true) {
-              markOffline();
-              return;
-            }
-            offline = false;
-            kavitaUnreachable = false;
-            offlineMessage = '';
-            coverReloadRequest += 1;
+          coverReloadRequest += 1;
+          kavitaUnreachable = false;
+          offlineMessage = connected
+            ? ''
+            : displayableBooks.length
+              ? 'No network connection. Showing your saved library.'
+              : 'No network connection. Connect to Kavita to load your library.';
+          if (connected && wasOffline) {
             const baselineRevision = activeSyncStartRevision ?? messageRevision;
             const baselineMessage = activeSyncStartRevision !== null ? '' : message;
             void syncProgress(false);
             void startRefresh(false, baselineRevision, baselineMessage);
-          })();
+          }
         }),
       ),
     );
@@ -832,15 +782,7 @@
         }),
       ),
     );
-    if (destroyed) return;
-    const mountTransitionId = networkTransitionId;
-    const startupStatus = await Network.getStatus().catch(() => null);
-    if (destroyed) return;
-    if (startupStatus?.connected !== true) {
-      markOffline();
-      return;
-    }
-    if (!offline && mountTransitionId === networkTransitionId) {
+    if (!destroyed && !offline) {
       const baselineRevision = activeSyncStartRevision ?? messageRevision;
       const baselineMessage = activeSyncStartRevision !== null ? '' : message;
       void syncProgress(false);
@@ -858,18 +800,11 @@
     return handle.remove;
   }
 
-  async function networkAvailable(
-    recheckTransport = Capacitor.isNativePlatform(),
-  ): Promise<boolean> {
+  async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
-    if (!recheckTransport) return true;
+    if (!Capacitor.isNativePlatform()) return true;
     const status = await Network.getStatus().catch(() => null);
-    if (destroyed) return false;
-    if (status?.connected !== true) {
-      markOffline();
-      return false;
-    }
-    return !offline;
+    return !offline && !destroyed && status?.connected === true;
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -909,9 +844,7 @@
           setMessage('Offline. Reading progress will retry when Kavita is available.');
         return;
       }
-      await flushProgress(client, server.id, {
-        canContinue: () => !offline && !destroyed,
-      });
+      await flushProgress(client, server.id);
       if (showFeedback) setMessage('Reading progress synced.');
     } catch (error) {
       if (
@@ -992,16 +925,13 @@
       message = '';
     }
     try {
-      if (!(await networkAvailable(true)) || controller.signal.aborted) return;
+      if (!(await networkAvailable()) || controller.signal.aborted) return;
       diagnosticEndpoint = '/api/Series/v2';
       const series = await client.getBookSeries(controller.signal);
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted || !(await networkAvailable(true))) {
-          controller.abort();
-          return;
-        }
+        if (controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(
@@ -1042,14 +972,7 @@
         message =
           'Kavita returned some incomplete details. Available books were updated and previously saved entries were kept. Open Settings to copy diagnostics if books are missing.';
     } catch (cause) {
-      if (
-        controller.signal.aborted ||
-        offline ||
-        destroyed ||
-        (cause instanceof DOMException && cause.name === 'AbortError')
-      ) {
-        return;
-      }
+      if (controller.signal.aborted) return;
       recordDiagnostic({
         category:
           cause instanceof KavitaError
@@ -1154,10 +1077,6 @@
       message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
-    if (!(await networkAvailable(true))) {
-      message = 'No network connection. Connect to Kavita to download this book.';
-      return null;
-    }
     downloadingBookId = book.id;
     downloadPercent = null;
     downloadFailureBook = null;
@@ -1174,13 +1093,6 @@
           if (downloadingBookId === book.id) downloadPercent = percent;
         },
         serverOrigin,
-        {
-          beforeDispatch: async () => {
-            if (destroyed || offline || !(await networkAvailable(true)) || destroyed || offline) {
-              throw new EpubTransferError(undefined, true);
-            }
-          },
-        },
       );
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
@@ -1489,9 +1401,7 @@
     }
     if (manual) {
       try {
-        await flushProgress(client, server.id, {
-          canContinue: () => !offline && !destroyed,
-        });
+        await flushProgress(client, server.id);
       } catch {
         throw new Error('Reading progress is saved here and still waiting to upload.');
       } finally {
