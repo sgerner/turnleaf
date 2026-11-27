@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Reset corrupt SQLite databases natively and add reading notes backup/restore
+- Harden reset epoch write serialization, add clear/reset interleaving tests, and sync master
 - chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins

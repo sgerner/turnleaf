@@ -10,9 +10,11 @@ import { toKavitaPageNumber } from '../sync/conflict';
 import type { KavitaProgress } from '../kavita/types';
 import { hasNativeSqliteResetPlugin, SqliteReset } from '../native/sqlite-reset';
 import {
+  buildRestorePreferencesUpdate,
   hasSavedNotesInPreferences,
   READING_NOTE_PREFERENCE_PREFIXES,
   type BookNoteMetadata,
+  type ReadingNotesBackup,
 } from '../reader/notes-backup';
 import { clearBootThemeCache, mirrorBootThemePreferences } from '../themes/themes';
 import { migrations } from './schema';
@@ -64,6 +66,7 @@ let connection: SQLiteDBConnection | null = null;
 const closedConnections = new WeakSet<object>();
 let opening: Promise<SQLiteDBConnection> | null = null;
 let resetting: Promise<void> | null = null;
+let resetEpoch = 0;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
@@ -103,6 +106,20 @@ function assertActiveNativeConnection(db: object): void {
   }
 }
 
+function enqueueNativeWriteForEpoch<T>(
+  targetEpoch: number,
+  db: object,
+  operation: () => Promise<T>,
+  staleFallback: T,
+): Promise<T> {
+  return enqueueNativeWrite(async () => {
+    if (resetEpoch !== targetEpoch || closedConnections.has(db)) {
+      return staleFallback;
+    }
+    return operation();
+  });
+}
+
 async function executeNativeTransaction(
   db: Pick<SQLiteDBConnection, 'executeTransaction'>,
   tasks: capTask[],
@@ -113,15 +130,31 @@ async function executeNativeTransaction(
   });
 }
 
-async function executeNativeRun(
+async function executeNativeTransactionForEpoch(
+  targetEpoch: number,
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  tasks: capTask[],
+): Promise<void> {
+  await enqueueNativeWriteForEpoch(
+    targetEpoch,
+    db,
+    () => db.executeTransaction(tasks).then(() => undefined),
+    undefined,
+  );
+}
+
+async function executeNativeRunForEpoch(
+  targetEpoch: number,
   db: Pick<SQLiteDBConnection, 'run'>,
   statement: string,
   values: unknown[] = [],
 ): Promise<void> {
-  await enqueueNativeWrite(() => {
-    assertActiveNativeConnection(db);
-    return db.run(statement, values).then(() => undefined);
-  });
+  await enqueueNativeWriteForEpoch(
+    targetEpoch,
+    db,
+    () => db.run(statement, values).then(() => undefined),
+    undefined,
+  );
 }
 
 async function executeNativeStatement(
@@ -246,12 +279,28 @@ function isResetting(): boolean {
   return resetting !== null;
 }
 
-export async function openDatabase(): Promise<SQLiteDBConnection> {
+export function openDatabase(): Promise<SQLiteDBConnection> {
+  return openDatabaseInternal() as Promise<SQLiteDBConnection>;
+}
+
+function openDatabaseForEpoch(targetEpoch: number): Promise<SQLiteDBConnection | null> {
+  return openDatabaseInternal(targetEpoch);
+}
+
+async function openDatabaseInternal(targetEpoch?: number): Promise<SQLiteDBConnection | null> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
   for (;;) {
-    await waitForActiveReset();
+    if (targetEpoch !== undefined && resetEpoch !== targetEpoch) {
+      return null;
+    }
+    if (isResetting()) {
+      await waitForActiveReset();
+      if (targetEpoch !== undefined && resetEpoch !== targetEpoch) {
+        return null;
+      }
+    }
     if (connection && !closedConnections.has(connection)) {
       return connection;
     }
@@ -259,11 +308,17 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
     if (opening) {
       try {
         const db = await opening;
+        if (targetEpoch !== undefined && resetEpoch !== targetEpoch) {
+          return null;
+        }
         if (isResetting() || closedConnections.has(db)) {
           continue;
         }
         return db;
       } catch (error) {
+        if (targetEpoch !== undefined && resetEpoch !== targetEpoch) {
+          return null;
+        }
         if (error instanceof ResetInProgressError || isResetting()) {
           continue;
         }
@@ -275,12 +330,18 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
     opening = pendingOpen;
     try {
       const db = await pendingOpen;
+      if (targetEpoch !== undefined && resetEpoch !== targetEpoch) {
+        return null;
+      }
       if (isResetting() || closedConnections.has(db)) {
         continue;
       }
       connection = db;
       return db;
     } catch (error) {
+      if (targetEpoch !== undefined && resetEpoch !== targetEpoch) {
+        return null;
+      }
       if (error instanceof ResetInProgressError || isResetting()) {
         continue;
       }
@@ -311,6 +372,15 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
     throw new ResetInProgressError();
   }
   await db.open();
+  if (isResetting()) {
+    closedConnections.add(db);
+    try {
+      await db.close();
+    } catch {
+      // Best effort only; reset will close and unlink native handles.
+    }
+    throw new ResetInProgressError();
+  }
   closedConnections.delete(db);
   await executeNativeStatement(db, 'PRAGMA foreign_keys = ON;');
   await migrate(db);
@@ -318,6 +388,7 @@ async function openNativeDatabase(): Promise<SQLiteDBConnection> {
 }
 
 export async function resetLocalDatabase(): Promise<void> {
+  resetEpoch += 1;
   if (!Capacitor.isNativePlatform()) {
     writeBrowserState(createBrowserState());
     clearBootThemeCache();
@@ -341,7 +412,7 @@ export async function resetLocalDatabase(): Promise<void> {
 
 async function performNativeDatabaseReset(): Promise<void> {
   const inflightOpen = opening;
-  const openedDuringInflight = await inflightOpen?.catch(() => null);
+  const openedDuringInflight = inflightOpen ? await inflightOpen.catch(() => null) : null;
 
   await enqueueNativeWrite(async () => {
     try {
@@ -398,14 +469,18 @@ async function migrate(db: SQLiteDBConnection): Promise<void> {
 }
 
 export async function saveServer(config: ServerConfig): Promise<void> {
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       state.serverConfig = config;
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
+  await executeNativeRunForEpoch(
+    targetEpoch,
     db,
     `INSERT INTO server_config
       (id, display_name, base_url, credential_ref, kavita_version, last_connected_at)
@@ -428,9 +503,10 @@ export async function saveServer(config: ServerConfig): Promise<void> {
 }
 
 export async function removeServer(serverId: string): Promise<void> {
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
-      if (state.serverConfig?.id !== serverId) return false;
+      if (resetEpoch !== targetEpoch || state.serverConfig?.id !== serverId) return false;
       state.serverConfig = null;
       state.books = [];
       state.readingState = {};
@@ -438,8 +514,11 @@ export async function removeServer(serverId: string): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(db, 'DELETE FROM server_config WHERE id=?', [serverId]);
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
+  await executeNativeRunForEpoch(targetEpoch, db, 'DELETE FROM server_config WHERE id=?', [
+    serverId,
+  ]);
 }
 
 export async function getServer(): Promise<ServerConfig | null> {
@@ -476,8 +555,10 @@ export async function reconcileBooks(
 ): Promise<void> {
   const preserveMissing = options.preserveMissing === true;
   const snapshotStartedAt = options.snapshotStartedAt ?? null;
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       const unknownProgress = new Set(
         books.filter((book) => book.remoteProgressKnown === false).map((book) => book.id),
       );
@@ -534,14 +615,17 @@ export async function reconcileBooks(
     });
     return;
   }
-  await reconcileBooksInTransaction(
-    await openDatabase(),
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
+  const tasks = buildReconcileBooksTasks(
     serverId,
     books,
-    undefined,
+    new Date().toISOString(),
     preserveMissing,
     snapshotStartedAt,
   );
+  if (!tasks.length) return;
+  await executeNativeTransactionForEpoch(targetEpoch, db, tasks);
 }
 
 // An upload can finish while the catalog is in flight and clear pending_sync.
@@ -635,15 +719,13 @@ const retainedBookCondition = `(download_path IS NOT NULL OR download_status='av
       AND TRIM(preferences.value) NOT IN ('', '[]', 'null')
   ))`;
 
-/** Apply metadata and optional removal reconciliation atomically on native SQLite. */
-export async function reconcileBooksInTransaction(
-  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+function buildReconcileBooksTasks(
   serverId: string,
   books: BookRecord[],
-  refreshedAt = new Date().toISOString(),
-  preserveMissing = false,
-  snapshotStartedAt: string | null = null,
-): Promise<void> {
+  refreshedAt: string,
+  preserveMissing: boolean,
+  snapshotStartedAt: string | null,
+): capTask[] {
   const tasks: capTask[] = [];
   if (!preserveMissing) {
     tasks.push({
@@ -663,6 +745,25 @@ export async function reconcileBooksInTransaction(
       values: [serverId],
     });
   }
+  return tasks;
+}
+
+/** Apply metadata and optional removal reconciliation atomically on native SQLite. */
+export async function reconcileBooksInTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  serverId: string,
+  books: BookRecord[],
+  refreshedAt = new Date().toISOString(),
+  preserveMissing = false,
+  snapshotStartedAt: string | null = null,
+): Promise<void> {
+  const tasks = buildReconcileBooksTasks(
+    serverId,
+    books,
+    refreshedAt,
+    preserveMissing,
+    snapshotStartedAt,
+  );
   if (!tasks.length) return;
   await executeNativeTransaction(db, tasks);
 }
@@ -713,16 +814,20 @@ async function updateBookDownloadState(
   downloadStatus: string,
   fileSize: number | null,
 ): Promise<void> {
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       state.books = state.books.map((book) =>
         book.id === bookId ? { ...book, downloadPath, downloadStatus, fileSize } : book,
       );
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
+  await executeNativeRunForEpoch(
+    targetEpoch,
     db,
     'UPDATE books SET download_path=?, download_status=?, file_size=? WHERE id=?',
     [downloadPath, downloadStatus, fileSize, bookId],
@@ -830,10 +935,12 @@ export async function saveLocalProgress(
   percentage: number,
   spineIndex?: number,
 ): Promise<void> {
+  const targetEpoch = resetEpoch;
   const pagesRead = toKavitaPageNumber(percentage, book.pages, spineIndex);
   const now = new Date().toISOString();
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
@@ -871,7 +978,8 @@ export async function saveLocalProgress(
     });
     return;
   }
-  const db = await openDatabase();
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
   const payload = {
     libraryId: book.libraryId,
     seriesId: book.seriesId,
@@ -880,7 +988,7 @@ export async function saveLocalProgress(
     pageNum: pagesRead,
     bookScrollId: xpath,
   };
-  await executeNativeTransaction(db, [
+  await executeNativeTransactionForEpoch(targetEpoch, db, [
     createReadingStateTask(book.id, cfi, xpath, percentage, now),
     createSyncQueueTask(book.id, payload, now),
     {
@@ -891,6 +999,7 @@ export async function saveLocalProgress(
 }
 
 export async function markBookCompleted(book: BookRecord): Promise<void> {
+  const targetEpoch = resetEpoch;
   const now = new Date().toISOString();
   const payload: PendingProgressPayload = {
     libraryId: book.libraryId,
@@ -902,6 +1011,7 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
   };
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       const syncRevision =
         Math.max(
           Number(state.readingState[book.id]?.syncRevision ?? 0),
@@ -932,7 +1042,8 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
     });
     return;
   }
-  const db = await openDatabase();
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
   const tasks: capTask[] = [
     {
       statement: 'UPDATE books SET pages_read=?, last_read_at=? WHERE id=?',
@@ -941,7 +1052,7 @@ export async function markBookCompleted(book: BookRecord): Promise<void> {
   ];
   tasks.push(createReadingStateTask(book.id, '', null, 1, now));
   tasks.push(createSyncQueueTask(book.id, payload, now));
-  await executeNativeTransaction(db, tasks);
+  await executeNativeTransactionForEpoch(targetEpoch, db, tasks);
 }
 
 export interface PendingSyncItem {
@@ -1124,6 +1235,7 @@ export async function saveRemoteProgress(
   remote: KavitaProgress,
   expected: StoredReadingState | null,
 ): Promise<boolean> {
+  const targetEpoch = resetEpoch;
   const normalized = normalizeRemoteProgress(book, remote, (expected?.syncRevision ?? 0) + 1);
   const matches = (current: StoredReadingState | null) =>
     !expected?.pendingSync &&
@@ -1134,6 +1246,7 @@ export async function saveRemoteProgress(
   if (!Capacitor.isNativePlatform()) {
     return updateBrowserState((state) => {
       if (
+        resetEpoch !== targetEpoch ||
         state.syncQueue[book.id] ||
         !state.books.some((item) => item.id === book.id) ||
         !matches(state.readingState[book.id] ?? null)
@@ -1143,40 +1256,46 @@ export async function saveRemoteProgress(
     });
   }
 
-  const db = await openDatabase();
-  return enqueueNativeWrite(async () => {
-    if (!matches(await queryNativeReadingState(db, book.id))) return false;
-    const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
-    if (queue.values?.length) return false;
-    await db.executeTransaction([
-      {
-        statement: `INSERT INTO reading_state
-          (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
-          server_page_num,server_xpath,server_updated_at,pending_sync,sync_revision)
-          VALUES (?,'',?,?,?,?,?,?,?,0,?) ON CONFLICT(book_id) DO UPDATE SET cfi='',
-          kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
-          local_updated_at=excluded.local_updated_at,synced_local_updated_at=excluded.synced_local_updated_at,
-          server_page_num=excluded.server_page_num,server_xpath=excluded.server_xpath,
-          server_updated_at=excluded.server_updated_at,pending_sync=0,sync_revision=excluded.sync_revision`,
-        values: [
-          book.id,
-          normalized.xpath,
-          normalized.percentage,
-          normalized.now,
-          normalized.now,
-          remote.pageNum,
-          normalized.xpath,
-          normalized.serverUpdatedAt,
-          normalized.readingState.syncRevision,
-        ],
-      },
-      {
-        statement: 'UPDATE books SET pages_read=?,last_read_at=? WHERE id=?',
-        values: [normalized.pagesRead, normalized.serverUpdatedAt, book.id],
-      },
-    ]);
-    return true;
-  });
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return false;
+  return enqueueNativeWriteForEpoch(
+    targetEpoch,
+    db,
+    async () => {
+      if (!matches(await queryNativeReadingState(db, book.id))) return false;
+      const queue = await db.query('SELECT 1 FROM sync_queue WHERE book_id=?', [book.id]);
+      if (queue.values?.length) return false;
+      await db.executeTransaction([
+        {
+          statement: `INSERT INTO reading_state
+            (book_id,cfi,kavita_xpath,percentage,local_updated_at,synced_local_updated_at,
+            server_page_num,server_xpath,server_updated_at,pending_sync,sync_revision)
+            VALUES (?,'',?,?,?,?,?,?,?,0,?) ON CONFLICT(book_id) DO UPDATE SET cfi='',
+            kavita_xpath=excluded.kavita_xpath,percentage=excluded.percentage,
+            local_updated_at=excluded.local_updated_at,synced_local_updated_at=excluded.synced_local_updated_at,
+            server_page_num=excluded.server_page_num,server_xpath=excluded.server_xpath,
+            server_updated_at=excluded.server_updated_at,pending_sync=0,sync_revision=excluded.sync_revision`,
+          values: [
+            book.id,
+            normalized.xpath,
+            normalized.percentage,
+            normalized.now,
+            normalized.now,
+            remote.pageNum,
+            normalized.xpath,
+            normalized.serverUpdatedAt,
+            normalized.readingState.syncRevision,
+          ],
+        },
+        {
+          statement: 'UPDATE books SET pages_read=?,last_read_at=? WHERE id=?',
+          values: [normalized.pagesRead, normalized.serverUpdatedAt, book.id],
+        },
+      ]);
+      return true;
+    },
+    false,
+  );
 }
 
 /**
@@ -1189,10 +1308,12 @@ export async function acceptRemoteProgress(
   expectedRevision: number,
   expectedUpdatedAt: string,
 ): Promise<boolean> {
+  const targetEpoch = resetEpoch;
   const normalized = normalizeRemoteProgress(book, remote, expectedRevision);
 
   if (!Capacitor.isNativePlatform()) {
     return updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       const queue = state.syncQueue[book.id];
       const reading = state.readingState[book.id];
       if (
@@ -1211,66 +1332,72 @@ export async function acceptRemoteProgress(
     });
   }
 
-  const db = await openDatabase();
-  return enqueueNativeWrite(async () => {
-    await db.executeTransaction([
-      {
-        statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
-          synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?,pending_sync=0
-          WHERE book_id=? AND pending_sync=1 AND local_updated_at=? AND sync_revision=?
-          AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?)`,
-        values: [
-          normalized.xpath,
-          normalized.percentage,
-          normalized.now,
-          normalized.now,
-          remote.pageNum,
-          normalized.xpath,
-          normalized.serverUpdatedAt,
-          book.id,
-          expectedUpdatedAt,
-          expectedRevision,
-          book.id,
-          expectedRevision,
-          expectedUpdatedAt,
-        ],
-      },
-      {
-        statement: `DELETE FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?
-          AND EXISTS (SELECT 1 FROM reading_state WHERE book_id=? AND pending_sync=0
-            AND cfi='' AND local_updated_at=?)`,
-        values: [book.id, expectedRevision, expectedUpdatedAt, book.id, normalized.now],
-      },
-      {
-        statement: `UPDATE books SET pages_read=?,last_read_at=?
-          WHERE id=? AND EXISTS (
-            SELECT 1 FROM reading_state WHERE book_id=? AND cfi=''
-            AND local_updated_at=? AND pending_sync=0
-          )`,
-        values: [
-          normalized.pagesRead,
-          normalized.serverUpdatedAt,
-          book.id,
-          book.id,
-          normalized.now,
-        ],
-      },
-    ]);
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return false;
+  return enqueueNativeWriteForEpoch(
+    targetEpoch,
+    db,
+    async () => {
+      await db.executeTransaction([
+        {
+          statement: `UPDATE reading_state SET cfi='',kavita_xpath=?,percentage=?,local_updated_at=?,
+            synced_local_updated_at=?,server_page_num=?,server_xpath=?,server_updated_at=?,pending_sync=0
+            WHERE book_id=? AND pending_sync=1 AND local_updated_at=? AND sync_revision=?
+            AND EXISTS (SELECT 1 FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?)`,
+          values: [
+            normalized.xpath,
+            normalized.percentage,
+            normalized.now,
+            normalized.now,
+            remote.pageNum,
+            normalized.xpath,
+            normalized.serverUpdatedAt,
+            book.id,
+            expectedUpdatedAt,
+            expectedRevision,
+            book.id,
+            expectedRevision,
+            expectedUpdatedAt,
+          ],
+        },
+        {
+          statement: `DELETE FROM sync_queue WHERE book_id=? AND revision=? AND updated_at=?
+            AND EXISTS (SELECT 1 FROM reading_state WHERE book_id=? AND pending_sync=0
+              AND cfi='' AND local_updated_at=?)`,
+          values: [book.id, expectedRevision, expectedUpdatedAt, book.id, normalized.now],
+        },
+        {
+          statement: `UPDATE books SET pages_read=?,last_read_at=?
+            WHERE id=? AND EXISTS (
+              SELECT 1 FROM reading_state WHERE book_id=? AND cfi=''
+              AND local_updated_at=? AND pending_sync=0
+            )`,
+          values: [
+            normalized.pagesRead,
+            normalized.serverUpdatedAt,
+            book.id,
+            book.id,
+            normalized.now,
+          ],
+        },
+      ]);
 
-    const adopted = (
-      await db.query(
-        'SELECT cfi,local_updated_at,pending_sync,server_updated_at FROM reading_state WHERE book_id=?',
-        [book.id],
-      )
-    ).values?.[0];
-    return Boolean(
-      adopted &&
-      String(adopted.cfi) === '' &&
-      String(adopted.local_updated_at) === normalized.now &&
-      Number(adopted.pending_sync) === 0 &&
-      String(adopted.server_updated_at) === normalized.serverUpdatedAt,
-    );
-  });
+      const adopted = (
+        await db.query(
+          'SELECT cfi,local_updated_at,pending_sync,server_updated_at FROM reading_state WHERE book_id=?',
+          [book.id],
+        )
+      ).values?.[0];
+      return Boolean(
+        adopted &&
+        String(adopted.cfi) === '' &&
+        String(adopted.local_updated_at) === normalized.now &&
+        Number(adopted.pending_sync) === 0 &&
+        String(adopted.server_updated_at) === normalized.serverUpdatedAt,
+      );
+    },
+    false,
+  );
 }
 
 export async function confirmSync(
@@ -1279,9 +1406,11 @@ export async function confirmSync(
   expectedRevision: number,
   expectedUpdatedAt: string,
 ): Promise<void> {
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
       if (
+        resetEpoch !== targetEpoch ||
         state.syncQueue[bookId]?.revision !== expectedRevision ||
         state.syncQueue[bookId]?.updatedAt !== expectedUpdatedAt
       ) {
@@ -1300,8 +1429,9 @@ export async function confirmSync(
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeTransaction(db, [
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
+  await executeNativeTransactionForEpoch(targetEpoch, db, [
     {
       statement: `UPDATE reading_state SET pending_sync=0,synced_local_updated_at=?,
         server_updated_at=? WHERE book_id=? AND local_updated_at=?
@@ -1329,8 +1459,10 @@ export async function markSyncFailure(
   expectedRevision: number,
   expectedUpdatedAt: string,
 ): Promise<void> {
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       const row = state.syncQueue[bookId];
       if (row?.revision !== expectedRevision || row.updatedAt !== expectedUpdatedAt) return false;
       row.attemptCount += 1;
@@ -1339,8 +1471,10 @@ export async function markSyncFailure(
     });
     return;
   }
-  const db = await openDatabase();
-  await executeNativeRun(
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
+  await executeNativeRunForEpoch(
+    targetEpoch,
     db,
     `UPDATE sync_queue SET attempt_count=attempt_count+1,last_attempt_at=?,last_error=?
     WHERE book_id=? AND updated_at=? AND revision=?`,
@@ -1463,28 +1597,99 @@ export async function setPreference(key: string, value: string): Promise<void> {
 
 export async function setPreferences(preferences: ReadonlyMap<string, string>): Promise<void> {
   if (preferences.size === 0) return;
+  const targetEpoch = resetEpoch;
   if (!Capacitor.isNativePlatform()) {
     let nextTheme: string | undefined;
     let nextMode: string | undefined;
-    updateBrowserState((state) => {
+    const applied = updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
       for (const [key, value] of preferences) state.preferences[key] = value;
       nextTheme = state.preferences.uiTheme;
       nextMode = state.preferences.uiMode;
     });
-    mirrorBootThemePreferences(preferences, {
-      theme: nextTheme,
-      mode: nextMode,
-    });
+    if (applied && resetEpoch === targetEpoch) {
+      mirrorBootThemePreferences(preferences, {
+        theme: nextTheme,
+        mode: nextMode,
+      });
+    }
     return;
   }
-  const db = await openDatabase();
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return;
   const now = new Date().toISOString();
-  await executeNativeRun(
+  await enqueueNativeWriteForEpoch(
+    targetEpoch,
     db,
-    `INSERT INTO preferences (key,value,updated_at)
-    VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
-    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
-    Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
+    async () => {
+      await db.run(
+        `INSERT INTO preferences (key,value,updated_at)
+        VALUES ${Array.from(preferences, () => '(?,?,?)').join(', ')}
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
+        Array.from(preferences, ([key, value]) => [key, value, now]).flat(),
+      );
+      if (resetEpoch === targetEpoch) {
+        mirrorBootThemePreferences(preferences);
+      }
+    },
+    undefined,
   );
-  mirrorBootThemePreferences(preferences);
+}
+
+export async function restoreReadingNotesBackup(backup: ReadingNotesBackup): Promise<number> {
+  if (backup.books.length === 0) return 0;
+  const targetEpoch = resetEpoch;
+  if (!Capacitor.isNativePlatform()) {
+    let restoredCount = 0;
+    updateBrowserState((state) => {
+      if (resetEpoch !== targetEpoch) return false;
+      const existing = new Map<string, string>();
+      for (const [key, value] of Object.entries(state.preferences)) {
+        if (
+          typeof value === 'string' &&
+          READING_NOTE_PREFERENCE_PREFIXES.some((prefix) => key.startsWith(prefix))
+        ) {
+          existing.set(key, value);
+        }
+      }
+      const { updates, restoredBookCount } = buildRestorePreferencesUpdate(backup, existing);
+      restoredCount = restoredBookCount;
+      if (updates.size === 0) return false;
+      for (const [key, value] of updates) {
+        state.preferences[key] = value;
+      }
+    });
+    return restoredCount;
+  }
+
+  const db = await openDatabaseForEpoch(targetEpoch);
+  if (!db) return 0;
+  return enqueueNativeWriteForEpoch(
+    targetEpoch,
+    db,
+    async () => {
+      const clauses = READING_NOTE_PREFERENCE_PREFIXES.map(() => "key LIKE ? ESCAPE '\\'").join(
+        ' OR ',
+      );
+      const result = await db.query(
+        `SELECT key, value FROM preferences WHERE ${clauses}`,
+        READING_NOTE_PREFERENCE_PREFIXES.map(escapeSqlLikePrefix),
+      );
+      const existing = new Map(
+        (result.values ?? []).map((row) => [String(row.key), String(row.value)]),
+      );
+      const { updates, restoredBookCount } = buildRestorePreferencesUpdate(backup, existing);
+      if (updates.size > 0) {
+        const now = new Date().toISOString();
+        await db.run(
+          `INSERT INTO preferences (key,value,updated_at)
+          VALUES ${Array.from(updates, () => '(?,?,?)').join(', ')}
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,
+          Array.from(updates, ([key, value]) => [key, value, now]).flat(),
+        );
+      }
+      return restoredBookCount;
+    },
+    0,
+  );
 }

@@ -5,6 +5,7 @@
   import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
+  import * as database from '../database/database';
   import {
     getAllBookNoteMetadata,
     getBooks,
@@ -1914,13 +1915,19 @@
         notesBackupMessage = 'The backup file did not contain any bookmarks or highlights.';
         return;
       }
-      const existingPreferences = await getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES);
-      const { updates, restoredBookCount } = buildRestorePreferencesUpdate(
-        parsed,
-        existingPreferences,
-      );
-      if (updates.size > 0) {
-        await setPreferences(updates);
+      let restoredBookCount: number;
+      if (
+        'restoreReadingNotesBackup' in database &&
+        typeof database.restoreReadingNotesBackup === 'function'
+      ) {
+        restoredBookCount = await database.restoreReadingNotesBackup(parsed);
+      } else {
+        const existingPreferences = await getPreferencesByPrefix(READING_NOTE_PREFERENCE_PREFIXES);
+        const restored = buildRestorePreferencesUpdate(parsed, existingPreferences);
+        restoredBookCount = restored.restoredBookCount;
+        if (restored.updates.size > 0) {
+          await setPreferences(restored.updates);
+        }
       }
       await refreshSavedNotesIndex();
       notesBackupMessage = `Restored bookmarks and notes for ${restoredBookCount} book${restoredBookCount === 1 ? '' : 's'}.`;

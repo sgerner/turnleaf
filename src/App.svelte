@@ -225,12 +225,14 @@
           return;
         }
       }
-      salvagedRestorePending = false;
-      salvagedPreferences = null;
-      salvagedNotes = [];
-      startupExportMessage = '';
-      startupExportFallback = '';
       await loadLocalData();
+      if (!startupError) {
+        salvagedRestorePending = false;
+        salvagedPreferences = null;
+        salvagedNotes = [];
+        startupExportMessage = '';
+        startupExportFallback = '';
+      }
     } catch {
       recordDiagnostic({
         category: 'startup',
