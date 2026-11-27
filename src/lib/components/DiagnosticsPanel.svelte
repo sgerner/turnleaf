@@ -143,7 +143,7 @@
 </script>
 
 {#if compact}
-  <div class="rounded-xl border border-surface-500/25 p-3 text-left">
+  <div class="rounded-xl border border-[var(--control-border)] p-3 text-left">
     <div class="flex flex-wrap items-baseline justify-between gap-2">
       <p class="text-xs font-medium uppercase tracking-wider text-surface-800-200">
         Diagnostics ({diagnosticCount})

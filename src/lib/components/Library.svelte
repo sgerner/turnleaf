@@ -1860,14 +1860,8 @@
             {continueBook.author ?? 'Unknown author'}
           </p>
           <div class="mt-2 flex items-center gap-2">
-            <div
-              class="h-2 flex-1 overflow-hidden rounded-full preset-filled-surface-200-800"
-              aria-hidden="true"
-            >
-              <div
-                class="h-full preset-filled-primary-600-400"
-                style:width={`${progressOf(continueBook)}%`}
-              ></div>
+            <div class="progress-track h-2 flex-1 overflow-hidden rounded-full" aria-hidden="true">
+              <div class="progress-fill h-full" style:width={`${progressOf(continueBook)}%`}></div>
             </div>
             <span class="text-xs tabular-nums text-surface-700-300">
               {Math.round(progressOf(continueBook))}%
@@ -1929,11 +1923,16 @@
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
+          data-pressed-indicator
           aria-pressed={downloadedOnly}
           onclick={toggleDownloadedOnly}
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-            <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 shrink-0">
+            {#if downloadedOnly}
+              <path fill="currentColor" d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+            {:else}
+              <path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z" />
+            {/if}
           </svg>
           <span class="sm:hidden">Downloaded</span>
           <span class="hidden sm:inline">Downloaded Only</span>
@@ -1943,14 +1942,19 @@
             ? 'preset-filled-primary-700-300'
             : 'preset-filled-tertiary-100-900'}"
           type="button"
+          data-pressed-indicator
           aria-pressed={hideCompleted}
           onclick={toggleHideCompleted}
         >
-          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4">
-            <path
-              fill="currentColor"
-              d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"
-            />
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4 shrink-0">
+            {#if hideCompleted}
+              <path fill="currentColor" d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+            {:else}
+              <path
+                fill="currentColor"
+                d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"
+              />
+            {/if}
           </svg>
           <span class="sm:hidden">Hide done</span>
           <span class="hidden sm:inline">Hide completed</span>
@@ -1991,7 +1995,7 @@
     {#if filtersVisible}
       <div
         id="library-filter-panel"
-        class="preset-tonal-surface mt-3 rounded-xl border border-surface-300/40 p-4"
+        class="preset-tonal-surface mt-3 rounded-xl p-4"
         role="region"
         aria-labelledby="library-filter-panel-title"
         transition:fly={{ y: -8, duration: 160 }}
@@ -2105,7 +2109,7 @@
           {@const downloadingBook = books.find((book) => book.id === downloadingBookId)}
           <div class="flex shrink-0 items-center gap-2">
             <div
-              class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
+              class="progress-track h-2 w-24 overflow-hidden rounded-full"
               role="progressbar"
               aria-label={downloadingBook
                 ? downloadProgressLabel(downloadingBook)
@@ -2116,7 +2120,7 @@
               aria-valuetext={downloadProgressValueText(downloadPercent)}
             >
               <div
-                class="h-full preset-filled-primary-600-400"
+                class="progress-fill h-full"
                 class:animate-pulse={downloadPercent === null}
                 style:width={`${downloadPercent ?? 35}%`}
               ></div>
@@ -2172,11 +2176,11 @@
               : `${syncStatus.pendingCount} reading progress update${syncStatus.pendingCount === 1 ? '' : 's'} waiting to sync.`}
           </p>
           {#if syncStatus.lastError}
-            <p class="mt-1 truncate text-xs opacity-80">Last error: {syncStatus.lastError}</p>
+            <p class="mt-1 truncate text-xs">Last error: {syncStatus.lastError}</p>
           {/if}
         </div>
         <button
-          class="btn btn-sm preset-tonal-warning h-10 shrink-0"
+          class="btn btn-sm preset-tonal-warning h-11 shrink-0"
           type="button"
           onclick={() => void syncProgress()}
           disabled={syncing || offline}
@@ -2330,7 +2334,7 @@
                         {/if}
                         {#if downloadingBookId === book.id}
                           <div
-                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                            class="progress-track mt-2 h-2 w-full overflow-hidden rounded-full"
                             role="progressbar"
                             aria-label={downloadProgressLabel(book)}
                             aria-valuemin="0"
@@ -2339,7 +2343,7 @@
                             aria-valuetext={downloadProgressValueText(downloadPercent)}
                           >
                             <div
-                              class="h-full preset-filled-primary-600-400"
+                              class="progress-fill h-full"
                               class:animate-pulse={downloadPercent === null}
                               style:width={`${downloadPercent ?? 35}%`}
                             ></div>
@@ -2347,7 +2351,7 @@
                         {/if}
                         {#if progressOf(book) > 0}
                           <div
-                            class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-surface-300-700"
+                            class="progress-track mt-2 h-2 w-full overflow-hidden rounded-full"
                             role="progressbar"
                             aria-label={`Reading progress for ${book.title}`}
                             aria-valuemin="0"
@@ -2356,7 +2360,7 @@
                             aria-valuetext={`${Math.round(progressOf(book))}% complete`}
                           >
                             <div
-                              class="h-full preset-filled-primary-600-400"
+                              class="progress-fill h-full"
                               style:width={`${progressOf(book)}%`}
                             ></div>
                           </div>
@@ -2461,7 +2465,7 @@
                       {/if}
                       {#if progressOf(book) > 0}
                         <div
-                          class="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2"
+                          class="progress-track pointer-events-none absolute inset-x-0 bottom-0 z-10 h-2"
                           role="progressbar"
                           aria-label={`Reading progress for ${book.title}`}
                           aria-valuemin="0"
@@ -2470,7 +2474,7 @@
                           aria-valuetext={`${Math.round(progressOf(book))}% complete`}
                         >
                           <div
-                            class="h-full preset-filled-primary-600-400"
+                            class="progress-fill h-full"
                             style:width={`${progressOf(book)}%`}
                           ></div>
                         </div>
@@ -2557,7 +2561,7 @@
           </p>
         </div>
         <button
-          class="btn btn-sm h-11 w-11 !p-0"
+          class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 !p-0"
           type="button"
           onclick={closeMenu}
           aria-label="Close book actions"
@@ -2575,13 +2579,9 @@
       {#if actionMenuBook.remoteAvailable === false}
         <div
           id="book-actions-removed-warning"
-          class="mt-4 flex items-start gap-2.5 rounded-xl border border-warning-600-400 bg-warning-500/15 p-3 text-sm text-surface-950-50"
+          class="mt-4 flex items-start gap-2.5 rounded-xl preset-tonal-warning p-3 text-sm"
         >
-          <svg
-            aria-hidden="true"
-            viewBox="0 0 24 24"
-            class="mt-0.5 h-5 w-5 shrink-0 text-warning-800-200"
-          >
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="mt-0.5 h-5 w-5 shrink-0">
             <path
               fill="currentColor"
               d="M12 2 1 21h22L12 2Zm0 4.2L19.5 19h-15L12 6.2ZM11 10v4h2v-4h-2Zm0 5v2h2v-2h-2Z"
@@ -2841,11 +2841,12 @@
         {#each skeletonThemes as option (option)}
           {@const swatch = themeSwatches[option]}
           <button
-            class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md {pendingTheme ===
+            class="relative inline-flex h-11 w-11 items-center justify-center overflow-hidden rounded-md border border-[var(--control-border)] {pendingTheme ===
             option
-              ? 'preset-filled-primary-700-300 ring-2 ring-primary-500 ring-offset-2'
+              ? 'preset-filled-primary-700-300'
               : 'preset-tonal-surface'}"
             type="button"
+            data-pressed-indicator
             aria-pressed={pendingTheme === option}
             aria-label={`Use ${option} theme`}
             title={option}
@@ -2857,8 +2858,16 @@
               <span class="h-full flex-1" style:background-color={swatch.tertiary}></span>
             </span>
             {#if pendingTheme === option}
-              <span class="absolute inset-0 grid place-items-center bg-black/20" aria-hidden="true">
-                <svg viewBox="0 0 24 24" class="h-5 w-5 drop-shadow" fill="white">
+              <span
+                class="pointer-events-none absolute inset-0 grid place-items-center rounded-md bg-black/25 ring-2 ring-inset ring-black/85"
+                aria-hidden="true"
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  class="h-6 w-6 rounded-full bg-black/85 p-1 ring-2 ring-white"
+                  fill="white"
+                >
                   <path d="m9 16.2-3.5-3.5L4 14.2l5 5 11-11-1.5-1.4z" />
                 </svg>
               </span>
@@ -2890,12 +2899,10 @@
           onclick={() => void updateAutoSync(!pendingAutoSync)}
         >
           <span
-            class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''} ${
-              pendingAutoSync ? 'preset-filled-primary-700-300' : 'preset-filled-secondary-700-300'
-            }`}
+            class={`switch-track ${pendingAutoSync ? 'switch-checked' : ''}`}
             aria-hidden="true"
           >
-            <span class="switch-thumb preset-filled-tertiary-100-900"></span>
+            <span class="switch-thumb"></span>
           </span>
         </button>
       </div>
@@ -3023,7 +3030,7 @@
     </section>
     <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
     {#if confirmDeleteServer}
-      <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
+      <div class="mt-7 rounded-xl border border-[var(--control-border-error)] p-4" transition:fade>
         <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
         <p class="mt-2 text-sm text-surface-700-300">
           This removes the server connection, downloaded books, cached covers, and local progress
@@ -3061,16 +3068,18 @@
     height: 1.75rem;
     flex: none;
     border-radius: 9999px;
-    border: 1px solid color-mix(in srgb, var(--color-primary-900) 35%, transparent);
-    padding: 0.2rem;
-    box-shadow:
-      inset 0 1px 1px hsl(0 0% 100% / 0.08),
-      0 1px 4px hsl(0 0% 0% / 0.2);
+    border: 2px solid var(--control-border);
+    background-color: var(--switch-track-bg);
+    padding: 0.15rem;
     cursor: pointer;
     transition:
       background-color 160ms ease,
-      border-color 160ms ease,
-      box-shadow 160ms ease;
+      border-color 160ms ease;
+  }
+
+  .switch-track.switch-checked {
+    background-color: var(--switch-track-checked-bg);
+    border-color: var(--switch-track-checked-bg);
   }
 
   .switch-button {
@@ -3086,17 +3095,18 @@
   }
 
   .switch-thumb {
-    width: 1.35rem;
-    height: 1.35rem;
+    width: 1.25rem;
+    height: 1.25rem;
     border-radius: 9999px;
-    box-shadow:
-      inset 0 1px 1px hsl(0 0% 100% / 0.3),
-      0 1px 2px hsl(0 0% 0% / 0.28);
+    background-color: var(--switch-thumb-bg);
     transform: translateX(0);
-    transition: transform 160ms ease;
+    transition:
+      transform 160ms ease,
+      background-color 160ms ease;
   }
 
   .switch-checked .switch-thumb {
+    background-color: var(--switch-thumb-checked-bg);
     transform: translateX(1.2rem);
   }
 </style>

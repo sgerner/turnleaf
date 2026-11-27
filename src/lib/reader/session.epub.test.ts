@@ -1063,4 +1063,71 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('aborts an in-flight display during a viewport resize and preserves the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    await session.open(
+      document.createElement('div'),
+      'epubcfi(/6/2!/4/2/1:0)',
+      null,
+      null,
+      defaultAppearance,
+      onLocation,
+      vi.fn(),
+    );
+    const relocated = getRenditionListener('relocated');
+    relocated(location('epubcfi(/6/2!/4/2/1:0)'));
+    onLocation.mockClear();
+
+    let abortInFlightDisplay: ((reason?: unknown) => void) | undefined;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_, reject) => {
+          abortInFlightDisplay = reject;
+        }),
+    );
+
+    const inFlightDisplay = session.displayCfi('epubcfi(/6/4!/4/2/1:0)');
+    expect(mockRendition.display).toHaveBeenLastCalledWith('epubcfi(/6/4!/4/2/1:0)');
+
+    mockRendition.resize.mockImplementationOnce(() => {
+      abortInFlightDisplay?.(new DOMException('Display aborted during resize', 'AbortError'));
+      relocated(location('epubcfi(/6/2!/4/2/1:0)'));
+    });
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    await expect(inFlightDisplay).resolves.toBe(false);
+    expect(mockRendition.resize).toHaveBeenCalledWith(480, 640);
+    expect(onLocation).not.toHaveBeenCalledWith(
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)' }),
+      expect.anything(),
+    );
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cfi: 'epubcfi(/6/2!/4/2/1:0)' }),
+      'restore',
+    );
+
+    await expect(session.displayCfi('epubcfi(/6/4!/4/8/1:0)')).resolves.toBe(true);
+    relocated(location('epubcfi(/6/4!/4/8/1:0)'));
+    expect(onLocation).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/8/1:0)' }),
+      'navigation',
+    );
+    session.destroy();
+  });
 });
