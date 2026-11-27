@@ -191,7 +191,8 @@ describe('Library destructive action confirmations', () => {
     document.body.innerHTML = '';
   });
 
-  it('gates Mark as read before updating progress, restores trigger focus on cancel/Back, and focuses #library-results when hidden', async () => {
+  it('gates Mark as read before updating progress, restores trigger focus on cancel/Back/Escape, emits onOverlayActiveChange, and focuses #library-results when hidden', async () => {
+    const onOverlayActiveChange = vi.fn();
     mounted = mount(Library, {
       target: host,
       props: {
@@ -204,9 +205,11 @@ describe('Library destructive action confirmations', () => {
         onApiKeyChange: vi.fn(),
         onServerDeleted: vi.fn(),
         onChangeServerAddress: vi.fn(),
+        onOverlayActiveChange,
       },
     });
     await flushUi();
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(false);
 
     const actionsTrigger = host.querySelector<HTMLButtonElement>(
       '[aria-label^="Book actions for The Left Hand of Darkness"]',
@@ -214,6 +217,8 @@ describe('Library destructive action confirmations', () => {
     actionsTrigger.focus();
     actionsTrigger.click();
     await flushUi();
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(true);
+    onOverlayActiveChange.mockClear();
 
     const markReadButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
       (button) => button.textContent?.trim() === 'Mark as read',
@@ -224,23 +229,37 @@ describe('Library destructive action confirmations', () => {
 
     const dialog = host.querySelector<HTMLElement>('[role="alertdialog"]');
     expect(dialog).not.toBeNull();
+    expect(dialog?.closest('[inert]')).toBeNull();
     expect(dialog?.textContent).toContain('Mark “The Left Hand of Darkness” as read?');
     expect(dialog?.textContent).toContain('40% complete');
     expect(dialog?.textContent).toContain('Hide completed is active');
+    expect(onOverlayActiveChange).not.toHaveBeenCalledWith(false);
 
     // Progress has NOT been overwritten yet
     const stateBefore = await getReadingState(activeBook.id);
     expect(stateBefore?.percentage).toBe(0.4);
     expect(stateBefore?.cfi).toBe('epubcfi(/6/4!/4/2)');
 
-    // Android Back dismisses ConfirmDialog, keeps Book actions open, and restores focus to Mark as read
+    // Escape dismisses ConfirmDialog, keeps Book actions open, and restores focus to Mark as read
+    dialog!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(host.querySelector('#book-actions-title')).not.toBeNull();
+    expect(document.activeElement).toBe(markReadButton);
+    expect(onOverlayActiveChange).not.toHaveBeenCalledWith(false);
+
+    // Reopen and verify Android Back dismisses ConfirmDialog, keeps Book actions open, and restores focus
+    markReadButton.click();
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).not.toBeNull();
     backListeners.at(-1)?.();
     await flushUi();
     expect(host.querySelector('[role="alertdialog"]')).toBeNull();
     expect(host.querySelector('#book-actions-title')).not.toBeNull();
     expect(document.activeElement).toBe(markReadButton);
+    expect(onOverlayActiveChange).not.toHaveBeenCalledWith(false);
 
-    // Confirming marks book completed, hides the card (hideCompleted=true), and moves focus to #library-results
+    // Confirming marks book completed, hides the card (hideCompleted=true), emits overlay inactive, and moves focus to #library-results
     markReadButton.click();
     await flushUi();
     const confirmButton = Array.from(
@@ -257,6 +276,7 @@ describe('Library destructive action confirmations', () => {
     expect(
       host.querySelector('[aria-label^="Book actions for The Left Hand of Darkness"]'),
     ).toBeNull();
+    expect(onOverlayActiveChange).toHaveBeenLastCalledWith(false);
     expect(document.activeElement?.id).toBe('library-results');
   });
 
@@ -315,8 +335,19 @@ describe('Library destructive action confirmations', () => {
     expect(dialog?.textContent).toContain('permanently removes this book');
     expect(mockDeleteDownloadedEpub).not.toHaveBeenCalled();
 
-    // Confirming deletes the file, drops the card from displayableBooks, and focuses #library-results
-    const confirmPermanent = Array.from(dialog!.querySelectorAll('button')).find(
+    // Escape cancels sole-copy deletion, keeps Book actions open, and restores focus to Remove download
+    dialog!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(mockDeleteDownloadedEpub).not.toHaveBeenCalled();
+    expect(host.querySelector('#book-actions-title')).not.toBeNull();
+    expect(document.activeElement).toBe(removeUnavailable);
+
+    // Reopen and confirm permanent removal: deletes the file, drops the card from displayableBooks, and focuses #library-results
+    removeUnavailable.click();
+    await flushUi();
+    const reopenedDialog = host.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    const confirmPermanent = Array.from(reopenedDialog.querySelectorAll('button')).find(
       (button) => button.textContent?.trim() === 'Remove permanently',
     )!;
     confirmPermanent.click();
@@ -395,6 +426,14 @@ describe('Library destructive action confirmations', () => {
     const settingsDialog = host.querySelector<HTMLElement>(
       '[aria-labelledby="library-settings-title"]',
     )!;
+    const settingsHeader = settingsDialog.querySelector<HTMLElement>('.dialog-header')!;
+    const settingsBody = settingsDialog.querySelector<HTMLElement>('.dialog-body')!;
+    expect(settingsHeader.classList.contains('shrink-0')).toBe(true);
+    expect(settingsHeader.classList.contains('sticky')).toBe(false);
+    expect(settingsBody.classList.contains('flex-1')).toBe(true);
+    expect(settingsBody.classList.contains('min-h-0')).toBe(true);
+    expect(settingsBody.classList.contains('overflow-y-auto')).toBe(true);
+    expect(settingsBody.contains(settingsHeader)).toBe(false);
     expect(
       settingsDialog.querySelector('[aria-labelledby="library-settings-diagnostics-title"]'),
     ).not.toBeNull();
@@ -410,11 +449,39 @@ describe('Library destructive action confirmations', () => {
     expect(deleteServerDialog).not.toBeNull();
     expect(deleteServerDialog?.textContent).toContain('Delete this server?');
     expect(settingsDialog.parentElement?.inert).toBe(true);
-    expect(deleteServerDialog!.parentElement?.inert).toBeFalsy();
+    expect(deleteServerDialog!.closest('[inert]')).toBeNull();
     expect(getDiagnosticCount()).toBe(1);
 
-    // Cancelling Delete server preserves diagnostics and restores focus to Delete server
-    deleteServerDialog!.querySelector<HTMLButtonElement>('button')!.click();
+    // Escape dismisses ConfirmDialog, restores DialogShell interactivity, preserves diagnostics, and restores focus
+    deleteServerDialog!.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }),
+    );
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(settingsDialog.parentElement?.inert).toBe(false);
+    expect(getDiagnosticCount()).toBe(1);
+    expect(document.activeElement).toBe(deleteServerButton);
+
+    // Android Back dismisses ConfirmDialog without closing Settings DialogShell and restores focus
+    deleteServerButton.click();
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).not.toBeNull();
+    expect(settingsDialog.parentElement?.inert).toBe(true);
+    backListeners.at(-1)?.();
+    await flushUi();
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(host.querySelector('[aria-labelledby="library-settings-title"]')).not.toBeNull();
+    expect(settingsDialog.parentElement?.inert).toBe(false);
+    expect(getDiagnosticCount()).toBe(1);
+    expect(document.activeElement).toBe(deleteServerButton);
+
+    // Cancelling via Cancel button preserves diagnostics and restores focus to Delete server
+    deleteServerButton.click();
+    await flushUi();
+    host
+      .querySelector<HTMLElement>('[role="alertdialog"]')!
+      .querySelector<HTMLButtonElement>('button')!
+      .click();
     await flushUi();
     expect(getDiagnosticCount()).toBe(1);
     expect(document.activeElement).toBe(deleteServerButton);

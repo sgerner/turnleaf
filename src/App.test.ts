@@ -214,6 +214,59 @@ describe('App shell releaseBanner layout', () => {
       expect(host.querySelector('.release-banner')).toBeNull();
     });
   });
+
+  it('keeps .release-banner inert across Library Settings and destructive ConfirmDialog transitions', async () => {
+    getServerMock.mockResolvedValue(savedServer);
+    getApiKeyMock.mockResolvedValue('secret-api-key');
+    getBooksMock.mockResolvedValue([downloadedBook]);
+    getSyncStatusMock.mockResolvedValue({ pendingCount: 0, failedCount: 0 });
+    cleanupInterruptedEpubDownloadsMock.mockResolvedValue(undefined);
+
+    instance = mount(App, { target: host });
+    await vi.waitFor(() => {
+      expect(host.querySelector('.release-banner')).not.toBeNull();
+      expect(host.querySelector('button[aria-label="Open settings"]')).not.toBeNull();
+    });
+
+    const banner = host.querySelector<HTMLElement>('.release-banner')!;
+    expect(banner.inert).toBe(false);
+
+    flushSync(() => {
+      host.querySelector<HTMLButtonElement>('button[aria-label="Open settings"]')!.click();
+    });
+    expect(banner.inert).toBe(true);
+
+    const deleteServerButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Delete server',
+    )!;
+    flushSync(() => {
+      deleteServerButton.click();
+    });
+
+    const confirmDialog = host.querySelector<HTMLElement>('[role="alertdialog"]');
+    const settingsDialog = host.querySelector<HTMLElement>(
+      '[aria-labelledby="library-settings-title"]',
+    )!;
+    expect(confirmDialog).not.toBeNull();
+    expect(banner.inert).toBe(true);
+    expect(settingsDialog.parentElement?.inert).toBe(true);
+    expect(confirmDialog!.closest('[inert]')).toBeNull();
+
+    flushSync(() => {
+      confirmDialog!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    expect(host.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(banner.inert).toBe(true);
+    expect(settingsDialog.parentElement?.inert).toBe(false);
+
+    flushSync(() => {
+      host.querySelector<HTMLButtonElement>('button[aria-label="Close settings"]')!.click();
+    });
+    expect(banner.inert).toBe(false);
+    await vi.waitFor(() => {
+      expect(host.querySelector('[aria-labelledby="library-settings-title"]')).toBeNull();
+    });
+  });
 });
 
 const savedServer: ServerConfig = {
