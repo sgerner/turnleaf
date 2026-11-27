@@ -332,12 +332,14 @@ it('stops between requests without penalizing unattempted items when AbortSignal
   expect(afterAbort.syncQueue['book-2']).toMatchObject({ attemptCount: 0, lastError: null });
   expect(afterAbort.syncQueue['book-3']).toMatchObject({ attemptCount: 0, lastError: null });
 
-  // 3) beforeNativeRequest throws pre-dispatch 'No network connection.' on book-2 -> stops without penalizing book-2 or book-3
+  // 3) beforeNativeRequest / native gate throws pre-dispatch offline KavitaError on book-2 -> stops without penalizing book-2 or book-3
   localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
   const saveProgressTransportDrop = vi
     .fn()
     .mockResolvedValueOnce(undefined)
-    .mockRejectedValueOnce(new KavitaError('No network connection.', 'network'));
+    .mockRejectedValueOnce(
+      new KavitaError('Kavita could not be reached while offline.', 'network'),
+    );
 
   await expect(
     flushProgress({ saveProgress: saveProgressTransportDrop } as never, 'server'),

@@ -54,7 +54,7 @@ async function run(client: KavitaClient, serverId: string, signal?: AbortSignal)
           (error instanceof DOMException && error.name === 'AbortError') ||
           (error instanceof KavitaError &&
             error.kind === 'network' &&
-            error.message === 'No network connection.') ||
+            error.message === 'Kavita could not be reached while offline.') ||
           (error instanceof KavitaError &&
             error.kind === 'authentication' &&
             error.status === undefined &&

@@ -1257,7 +1257,7 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     runtime.online = true;
     fixtureOffline = false;
     for (const listener of runtime.networkListeners) {
-      listener({ connected: false, connectionType: 'wifi' });
+      listener({ connected: true, connectionType: 'wifi' });
     }
 
     await waitForCondition(async () => (await Database.getPendingSync('primary')).length === 0);

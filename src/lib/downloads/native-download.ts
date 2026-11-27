@@ -1,6 +1,7 @@
 import { Capacitor } from '@capacitor/core';
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Directory, Filesystem } from '@capacitor/filesystem';
+import { Network } from '@capacitor/network';
 import { recordDiagnostic } from '../diagnostics/log';
 import {
   advanceRedirect,
@@ -189,13 +190,17 @@ async function downloadFileWithRedirects(options: {
   while (true) {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.assertCredential?.();
-    if (options.beforeTransfer && !(await options.beforeTransfer(options.signal))) {
-      if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      options.assertCredential?.();
-      throw new EpubTransferError(undefined, true);
-    }
+    const allowed = options.beforeTransfer ? await options.beforeTransfer(options.signal) : true;
+    const networkStatus = await Network.getStatus().catch(() => null);
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.assertCredential?.();
+    if (
+      !allowed ||
+      networkStatus?.connected !== true ||
+      (typeof navigator !== 'undefined' && navigator.onLine === false)
+    ) {
+      throw new EpubTransferError(undefined, true);
+    }
     options.onHop?.(redirects.currentUrl);
     try {
       await FileTransfer.downloadFile({

@@ -1,4 +1,5 @@
 import { Capacitor, CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import type { ConnectedServer, KavitaProgress, KavitaSeries, KavitaSeriesDetail } from './types';
 import { isKavitaProgress, readHealthVersion } from './validation';
 import {
@@ -218,7 +219,8 @@ export class KavitaClient {
     } catch (error) {
       const retryable =
         error instanceof KavitaError &&
-        ((error.kind === 'network' && error.message !== 'No network connection.') ||
+        ((error.kind === 'network' &&
+          error.message !== 'Kavita could not be reached while offline.') ||
           (error.kind === 'server' &&
             error.status !== undefined &&
             error.status >= 500 &&
@@ -324,16 +326,15 @@ export class KavitaClient {
       while (true) {
         if (gateSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
         this.assertCredentialReady(probe);
-        if (
-          this.beforeNativeRequest &&
-          !(await this.beforeNativeRequest(gateSignal ?? undefined))
-        ) {
-          if (gateSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
-          this.assertCredentialReady(probe);
-          throw new KavitaError('No network connection.', 'network');
-        }
+        const allowed = this.beforeNativeRequest
+          ? await this.beforeNativeRequest(gateSignal ?? undefined)
+          : true;
+        const networkStatus = await Network.getStatus().catch(() => null);
         if (gateSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
         this.assertCredentialReady(probe);
+        if (!allowed || networkStatus?.connected !== true || navigator.onLine === false) {
+          throw new KavitaError('Kavita could not be reached while offline.', 'network');
+        }
         response = await CapacitorHttp.request({ ...options, url: redirects.currentUrl });
         if (!probe && (response.status === 401 || response.status === 403)) {
           this.localRejectedStatus = response.status;

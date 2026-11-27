@@ -7,6 +7,7 @@ const native = vi.hoisted(() => ({
   body: new Uint8Array(),
   deleted: [] as string[],
   renamed: false,
+  connected: true,
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -35,6 +36,15 @@ vi.mock('@capacitor/filesystem', () => ({
   },
 }));
 
+vi.mock('@capacitor/network', () => ({
+  Network: {
+    getStatus: vi.fn(async () => ({
+      connected: native.connected,
+      connectionType: native.connected ? 'wifi' : 'none',
+    })),
+  },
+}));
+
 import { FileTransfer } from '@capacitor/file-transfer';
 import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
@@ -57,6 +67,7 @@ beforeEach(() => {
   native.body = new TextEncoder().encode(`<html>${'server error '.repeat(20)}</html>`);
   native.deleted = [];
   native.renamed = false;
+  native.connected = true;
   vi.mocked(FileTransfer.downloadFile)
     .mockReset()
     .mockResolvedValue({} as never);
