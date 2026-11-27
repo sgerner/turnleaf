@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- chore(deps): bump svelte to 5.59.2
 - fix(database): coordinate idempotent v8 books schema across #328/#330 and v7-to-v10 upgrades
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
