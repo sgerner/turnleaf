@@ -1,7 +1,7 @@
 <script lang="ts">
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
-  import { Network } from '@capacitor/network';
+  import { Network, type ConnectionStatus } from '@capacitor/network';
   import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
@@ -239,6 +239,12 @@
   });
   let syncing = $state(false);
   let syncWork: Promise<void> | null = null;
+  let syncFollowupRequested = false;
+  let syncFollowupShowFeedback = false;
+  let transientSyncRetries = 0;
+  let syncRetryTimer: number | null = null;
+  let networkStatusGeneration = 0;
+  let lastValidatedConnection = false;
   let resolvingOpenProgress = $state(false);
   let openProgressProbe = $state.raw<AbortController | null>(null);
   let kavitaUnreachable = false;
@@ -306,6 +312,7 @@
   const VIRTUALIZATION_OVERSCAN_ROWS = 2;
   const COVER_LOAD_CONCURRENCY = 6;
   const OFFSCREEN_COVER_LIMIT = 48;
+  const MAX_TRANSIENT_SYNC_RETRIES = 3;
   let destroyed = false;
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
@@ -707,7 +714,9 @@
     authorFilter = preferences.get('libraryAuthor') ?? '';
     seriesFilter = preferences.get('librarySeries') ?? '';
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
-    offline = !(await Network.getStatus().catch(() => null))?.connected;
+    const initialNetworkStatus = await Network.getStatus().catch(() => null);
+    offline = !isNetworkConnected(initialNetworkStatus);
+    lastValidatedConnection = initialNetworkStatus?.connected === true;
     if (destroyed) return;
     books = savedBooks;
     retainCoversFor(books);
@@ -721,24 +730,19 @@
     if (destroyed) return;
     cleanups.push(
       await registerListener(
-        await Network.addListener('networkStatusChange', ({ connected }) => {
+        await Network.addListener('networkStatusChange', (eventStatus) => {
           if (destroyed) return;
-          offline = !connected;
-          if (!connected) {
-            refreshController?.abort();
-            openProgressProbe?.abort();
+          const generation = ++networkStatusGeneration;
+          if (!Capacitor.isNativePlatform()) {
+            applyNetworkStatus(eventStatus);
+            return;
           }
-          coverReloadRequest += 1;
-          kavitaUnreachable = false;
-          offlineMessage = connected
-            ? ''
-            : displayableBooks.length
-              ? 'No network connection. Showing your saved library.'
-              : 'No network connection. Connect to Kavita to load your library.';
-          if (connected)
-            void refresh()
-              .then(() => syncProgress(false))
-              .catch(() => {});
+          void Network.getStatus()
+            .catch(() => eventStatus)
+            .then((actualStatus) => {
+              if (destroyed || generation !== networkStatusGeneration) return;
+              applyNetworkStatus(actualStatus);
+            });
         }),
       ),
     );
@@ -780,11 +784,54 @@
     return handle.remove;
   }
 
+  function isNetworkConnected(status: ConnectionStatus | null | undefined): boolean {
+    if (!status) return false;
+    if (status.connected) return true;
+    return (
+      Capacitor.isNativePlatform() &&
+      (status.connectionType === 'wifi' || status.connectionType === 'cellular')
+    );
+  }
+
+  function applyNetworkStatus(status: ConnectionStatus | null | undefined): void {
+    if (destroyed) return;
+    const connected = isNetworkConnected(status);
+    const validated = status?.connected === true;
+    const wasOffline = offline;
+    const newlyValidated = validated && !lastValidatedConnection;
+    offline = !connected;
+    lastValidatedConnection = validated;
+    if (!connected) {
+      transientSyncRetries = 0;
+      if (syncRetryTimer !== null) {
+        window.clearTimeout(syncRetryTimer);
+        syncRetryTimer = null;
+      }
+      refreshController?.abort();
+      openProgressProbe?.abort();
+    }
+    if (wasOffline === offline && !newlyValidated) return;
+    coverReloadRequest += 1;
+    kavitaUnreachable = false;
+    offlineMessage = connected
+      ? ''
+      : displayableBooks.length
+        ? 'No network connection. Showing your saved library.'
+        : 'No network connection. Connect to Kavita to load your library.';
+    if (connected) {
+      transientSyncRetries = 0;
+      void syncProgress(false);
+      void refresh()
+        .then(() => syncProgress(false))
+        .catch(() => {});
+    }
+  }
+
   async function networkAvailable(): Promise<boolean> {
     if (offline || destroyed) return false;
     if (!Capacitor.isNativePlatform()) return true;
     const status = await Network.getStatus().catch(() => null);
-    return !offline && !destroyed && status?.connected === true;
+    return !offline && !destroyed && isNetworkConnected(status);
   }
 
   async function refreshSyncStatus(): Promise<void> {
@@ -797,12 +844,22 @@
   }
 
   function syncProgress(showFeedback = true): Promise<void> {
-    if (syncWork) return syncWork;
+    if (syncWork) {
+      syncFollowupRequested = true;
+      syncFollowupShowFeedback = syncFollowupShowFeedback || showFeedback;
+      return syncWork;
+    }
     if (destroyed || conflict || resolvingOpenProgress || acceptingRemoteProgress) {
       return Promise.resolve();
     }
     syncWork = runProgressSync(showFeedback).finally(() => {
       syncWork = null;
+      if (syncFollowupRequested && !destroyed) {
+        const nextFeedback = syncFollowupShowFeedback;
+        syncFollowupRequested = false;
+        syncFollowupShowFeedback = false;
+        void syncProgress(nextFeedback);
+      }
     });
     return syncWork;
   }
@@ -816,18 +873,35 @@
         return;
       }
       await flushProgress(client, server.id);
+      transientSyncRetries = 0;
+      if (syncRetryTimer !== null) {
+        window.clearTimeout(syncRetryTimer);
+        syncRetryTimer = null;
+      }
       if (showFeedback) message = 'Reading progress synced.';
     } catch (error) {
-      if (
+      const authFailed =
         error instanceof AggregateError &&
         error.errors.some(
           (cause) => cause instanceof KavitaError && cause.kind === 'authentication',
-        )
-      ) {
+        );
+      if (authFailed) {
+        transientSyncRetries = 0;
         message =
           'Kavita rejected the saved auth key. Update it in Settings to sync reading progress.';
-      } else if (showFeedback) {
-        message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+      } else {
+        if (showFeedback) {
+          message = 'Some reading progress is waiting to sync. Retry when Kavita is available.';
+        }
+        if (!offline && !destroyed && transientSyncRetries < MAX_TRANSIENT_SYNC_RETRIES) {
+          transientSyncRetries += 1;
+          const retryDelayMs = transientSyncRetries * 1_000;
+          if (syncRetryTimer !== null) window.clearTimeout(syncRetryTimer);
+          syncRetryTimer = window.setTimeout(() => {
+            syncRetryTimer = null;
+            if (!destroyed && !offline) void syncProgress(false);
+          }, retryDelayMs);
+        }
       }
     } finally {
       await refreshSyncStatus();
@@ -839,6 +913,7 @@
     destroyed = true;
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
+    if (syncRetryTimer !== null) window.clearTimeout(syncRetryTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
@@ -875,7 +950,7 @@
       const mapped: BookRecord[] = [];
       let incomplete = false;
       for (let index = 0; index < series.length; index += SERIES_DETAIL_BATCH_SIZE) {
-        if (controller.signal.aborted) return;
+        if (!(await networkAvailable()) || controller.signal.aborted) return;
         const batch = series.slice(index, index + SERIES_DETAIL_BATCH_SIZE);
         diagnosticEndpoint = '/api/Series/series-detail';
         mapped.push(

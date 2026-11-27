@@ -149,6 +149,8 @@ async function startFixture() {
     }
     response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
   });
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
@@ -228,19 +230,23 @@ async function run() {
       fill('#kavita-auth-key', ${JSON.stringify(key)});
     })()`);
     await waitFor('HTTP consent control', () => web.evaluate(click('input[type=checkbox]')));
-    await web.evaluate(click('button[type=submit]'));
+    await waitFor('connect submit', () => web.evaluate(click('button[type=submit]')));
     await waitFor('catalog book', () => web.evaluate(click('[data-book-open]')));
     await waitFor('downloaded first chapter', () => web.evaluate(chapter(1)));
     if (fixture.downloads !== 1) throw new Error('Expected one EPUB transfer.');
 
     disabledNetwork = true;
-    await adb('shell', 'svc', 'wifi', 'disable');
     await adb('shell', 'svc', 'data', 'disable');
+    await adb('shell', 'svc', 'wifi', 'disable');
     await waitFor('offline state', async () => {
-      const connected = await web.evaluate(
-        'Capacitor.Plugins.Network.getStatus().then(status => status.connected)',
+      const disconnected = await web.evaluate(
+        `Capacitor.Plugins.Network.getStatus().then(status =>
+          status?.connected === false &&
+          status?.connectionType !== 'wifi' &&
+          status?.connectionType !== 'cellular'
+        )`,
       );
-      return connected === false;
+      return disconnected === true;
     });
     fixture.setOffline(true);
     const uploadCount = fixture.uploads.length;
@@ -259,6 +265,11 @@ async function run() {
     await waitFor('saved offline progress', () =>
       web.evaluate(
         `Boolean(document.querySelector('[aria-label="Open ${title}, downloaded for offline reading, 50% complete"]'))`,
+      ),
+    );
+    await waitFor('settled SQLite writes', () =>
+      web.evaluate(
+        `Capacitor.Plugins.CapacitorSQLite.isTransactionActive({ database: 'turnleaf' }).then(res => res?.result === false)`,
       ),
     );
 
