@@ -5,6 +5,7 @@ import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import androidx.core.view.WindowCompat;
@@ -57,23 +58,35 @@ public class MainActivity extends BridgeActivity {
     }
 
     void applyReaderChrome(boolean enabled) {
+        applyReaderChrome(enabled, null);
+    }
+
+    void applyReaderChrome(boolean enabled, Runnable onComplete) {
         runOnUiThread(
             () -> {
                 Window window = getWindow();
                 configureEdgeToEdgeWindow(window);
+                View decorView = window != null ? window.getDecorView() : null;
                 WindowInsetsControllerCompat controller =
-                    WindowCompat.getInsetsController(window, window.getDecorView());
-                if (controller == null) {
-                    return;
+                    window != null && decorView != null
+                        ? WindowCompat.getInsetsController(window, decorView)
+                        : null;
+                if (controller != null) {
+                    controller.setSystemBarsBehavior(
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    );
+                    if (enabled) {
+                        controller.hide(WindowInsetsCompat.Type.systemBars());
+                    } else {
+                        controller.show(WindowInsetsCompat.Type.systemBars());
+                    }
                 }
-
-                controller.setSystemBarsBehavior(
-                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                );
-                if (enabled) {
-                    controller.hide(WindowInsetsCompat.Type.systemBars());
-                } else {
-                    controller.show(WindowInsetsCompat.Type.systemBars());
+                if (onComplete != null) {
+                    if (decorView != null && decorView.isAttachedToWindow()) {
+                        decorView.post(onComplete);
+                    } else {
+                        onComplete.run();
+                    }
                 }
             }
         );

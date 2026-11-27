@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   createReaderNativeFeatures,
+  enqueueNativeWindowAction,
   type ReaderNativeFeatureActions,
 } from './reader-native-features';
 
@@ -194,5 +195,53 @@ describe('reader native features', () => {
 
     expect(calls).toEqual(['old:DARK', 'restore:shell', 'show', 'new:LIGHT']);
     await newReader.disable();
+  });
+
+  it('continues serialized style, chrome, and teardown operations after native call failures', async () => {
+    const calls: string[] = [];
+    const failingShellAction = enqueueNativeWindowAction(async () => {
+      calls.push('shell:fail');
+      throw new Error('bridge unavailable');
+    });
+    await expect(failingShellAction).rejects.toThrow('bridge unavailable');
+
+    const features = createReaderNativeFeatures(
+      actions({
+        hideStatusBar: async () => {
+          calls.push('hide:fail');
+          throw new Error('hide failed');
+        },
+        setReaderChrome: async (enabled) => void calls.push(`chrome:${enabled}`),
+        setBarStyle: async (style) => {
+          calls.push(`style:${style}`);
+          if (style === 'DARK') throw new Error('style failed');
+        },
+        restoreBarStyle: async () => {
+          calls.push('restore:fail');
+          throw new Error('restore failed');
+        },
+        showStatusBar: async () => void calls.push('show'),
+      }),
+    );
+
+    await features.enable(false);
+    await features.setBarStyle('DARK' as Parameters<typeof features.setBarStyle>[0]);
+    await features.setBarStyle('LIGHT' as Parameters<typeof features.setBarStyle>[0]);
+    await features.disable();
+    await enqueueNativeWindowAction(async () => {
+      calls.push('shell:after');
+    });
+
+    expect(calls).toEqual([
+      'shell:fail',
+      'hide:fail',
+      'chrome:true',
+      'style:DARK',
+      'style:LIGHT',
+      'restore:fail',
+      'show',
+      'chrome:false',
+      'shell:after',
+    ]);
   });
 });

@@ -286,8 +286,8 @@
               </button>
             {/if}
           </div>
+          <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
         </div>
-        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
       </div>
     {:else}
       <Onboarding
