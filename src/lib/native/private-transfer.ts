@@ -34,4 +34,20 @@ export interface PrivateTransferPlugin {
   ): Promise<PluginListenerHandle>;
 }
 
-export const PrivateTransfer = registerPlugin<PrivateTransferPlugin>('PrivateTransfer');
+let registeredPrivateTransfer: PrivateTransferPlugin | null = null;
+
+function getPrivateTransfer(): PrivateTransferPlugin {
+  if (!registeredPrivateTransfer) {
+    registeredPrivateTransfer = registerPlugin<PrivateTransferPlugin>('PrivateTransfer');
+  }
+  return registeredPrivateTransfer;
+}
+
+export const PrivateTransfer: PrivateTransferPlugin = {
+  get downloadFile() {
+    return getPrivateTransfer().downloadFile;
+  },
+  get addListener() {
+    return getPrivateTransfer().addListener;
+  },
+};

@@ -16,7 +16,23 @@ export interface NoteExportPlugin {
   shareMarkdown(options: NoteExportOptions): Promise<NoteExportResult>;
 }
 
-export const NoteExport = registerPlugin<NoteExportPlugin>('NoteExport');
+let registeredNoteExport: NoteExportPlugin | null = null;
+
+function getNoteExport(): NoteExportPlugin {
+  if (!registeredNoteExport) {
+    registeredNoteExport = registerPlugin<NoteExportPlugin>('NoteExport');
+  }
+  return registeredNoteExport;
+}
+
+export const NoteExport: NoteExportPlugin = {
+  get exportMarkdown() {
+    return getNoteExport().exportMarkdown;
+  },
+  get shareMarkdown() {
+    return getNoteExport().shareMarkdown;
+  },
+};
 
 export type AnnotationExportMode = 'save' | 'share' | 'copy';
 
