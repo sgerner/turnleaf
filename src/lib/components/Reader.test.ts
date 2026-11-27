@@ -3,6 +3,7 @@
 import { flushSync, mount, unmount } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAppearance, type Appearance } from '../reader/appearance';
+import type * as SessionModule from '../reader/session';
 
 const mocks = vi.hoisted(() => {
   let openShouldFail = false;
@@ -132,17 +133,23 @@ vi.mock('../database/database', () => ({
   setPreferences: mocks.setPreferencesMock,
 }));
 
-vi.mock('../reader/session', () => ({
-  ReaderSession: class MockReaderSession {
-    open = mocks.openSessionMock;
-    tableOfContents = () => [];
-    updateHighlights = vi.fn();
-    applyAppearance(next: Appearance) {
-      mocks.setCapturedAppearance(next);
-    }
-    destroy = mocks.destroySessionMock;
-  },
-}));
+vi.mock('../reader/session', async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionModule>();
+  return {
+    ...actual,
+    ReaderSession: class MockReaderSession {
+      open = mocks.openSessionMock;
+      tableOfContents = () => [];
+      getVisiblePassages = () => [];
+      clearTextSelection = vi.fn();
+      updateHighlights = vi.fn();
+      applyAppearance(next: Appearance) {
+        mocks.setCapturedAppearance(next);
+      }
+      destroy = mocks.destroySessionMock;
+    },
+  };
+});
 
 import Reader from './Reader.svelte';
 
@@ -159,6 +166,29 @@ describe('Reader mount lifecycle', () => {
 
   beforeEach(() => {
     mocks.reset(false);
+    if (typeof Element.prototype.animate !== 'function') {
+      Element.prototype.animate = (() => {
+        const anim = {
+          currentTime: 0,
+          playState: 'running',
+          effect: null,
+          onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+          cancel() {
+            anim.playState = 'idle';
+          },
+          finish() {
+            anim.playState = 'finished';
+          },
+        };
+        queueMicrotask(() => {
+          if (anim.playState !== 'idle') {
+            anim.playState = 'finished';
+            anim.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+          }
+        });
+        return anim as unknown as Animation;
+      }) as typeof Element.prototype.animate;
+    }
     target = document.createElement('div');
     document.body.append(target);
   });
@@ -222,7 +252,7 @@ describe('Reader mount lifecycle', () => {
     expect(onMountChange).toHaveBeenCalledWith(true);
 
     await vi.waitFor(() => {
-      expect(target.querySelector('[role="alert"]')?.textContent).toContain(
+      expect(target.querySelector('[role="alertdialog"]')?.textContent).toContain(
         'This EPUB could not be opened.',
       );
     });
@@ -296,7 +326,7 @@ describe('Reader.svelte resilience and bookmark/note exports', () => {
     await settle();
 
     expect(mocks.getCapturedAppearance()).toEqual(defaultAppearance);
-    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   });
 
   it('exports bookmarks from the Bookmarks panel with readonly fallback when Documents fails', async () => {
@@ -402,7 +432,7 @@ describe('Reader.svelte resilience and bookmark/note exports', () => {
     });
     await settle();
 
-    const alert = document.querySelector('[role="alert"]');
+    const alert = document.querySelector('[role="alertdialog"]');
     expect(alert?.textContent).toContain('This EPUB could not be opened');
     expect(alert?.textContent).toContain('Saved bookmarks or notes for this book');
 
