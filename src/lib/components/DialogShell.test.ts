@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createRawSnippet, mount, unmount } from 'svelte';
+import { createRawSnippet, flushSync, mount, unmount } from 'svelte';
 import DialogShell from './DialogShell.svelte';
 import { focusFirstElement } from '../a11y/modal-focus';
 
@@ -148,7 +148,7 @@ describe('DialogShell', () => {
   });
 
   it('focuses the header close button on mount and recovers Tab/Escape from document.body after a body control unmounts', () => {
-    const { onClose, closeButton, lastBody } = mountShell();
+    const { onClose, closeButton, lastBody } = flushSync(() => mountShell());
     expect(document.activeElement).toBe(closeButton);
 
     lastBody.focus();

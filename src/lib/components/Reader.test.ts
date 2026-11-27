@@ -42,6 +42,22 @@ describe('Reader mount lifecycle', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Element.prototype.animate ??= () => {
+      let canceled = false;
+      const animation = {
+        currentTime: 0,
+        playState: 'finished',
+        effect: null,
+        onfinish: null as ((event: AnimationPlaybackEvent) => void) | null,
+        cancel: () => {
+          canceled = true;
+        },
+      };
+      queueMicrotask(() => {
+        if (!canceled) animation.onfinish?.(new Event('finish') as AnimationPlaybackEvent);
+      });
+      return animation as unknown as Animation;
+    };
     getPreferencesMock.mockResolvedValue(new Map());
     setPreferencesMock.mockResolvedValue(undefined);
     openSessionMock.mockResolvedValue(undefined);
