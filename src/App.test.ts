@@ -11,6 +11,9 @@ const {
   fetchLatestGithubReleaseMock,
   getServerMock,
   getPreferencesMock,
+  getPreferencesByPrefixMock,
+  getAllBookMetadataMock,
+  salvageOpenReadingNotePreferencesMock,
   setPreferenceMock,
   setPreferencesMock,
   getBooksMock,
@@ -30,6 +33,9 @@ const {
   fetchLatestGithubReleaseMock: vi.fn(),
   getServerMock: vi.fn(),
   getPreferencesMock: vi.fn(),
+  getPreferencesByPrefixMock: vi.fn(),
+  getAllBookMetadataMock: vi.fn(),
+  salvageOpenReadingNotePreferencesMock: vi.fn(),
   setPreferenceMock: vi.fn(),
   setPreferencesMock: vi.fn(),
   getBooksMock: vi.fn(),
@@ -69,6 +75,9 @@ vi.mock('./lib/native/credentials', () => ({
 vi.mock('./lib/database/database', () => ({
   getServer: getServerMock,
   getPreferences: getPreferencesMock,
+  getPreferencesByPrefix: getPreferencesByPrefixMock,
+  getAllBookMetadata: getAllBookMetadataMock,
+  salvageOpenReadingNotePreferences: salvageOpenReadingNotePreferencesMock,
   setPreference: setPreferenceMock,
   setPreferences: setPreferencesMock,
   getBooks: getBooksMock,
@@ -265,6 +274,9 @@ describe('App.svelte static ambient glows and reader unmount behavior', () => {
     removeServerMock.mockResolvedValue(undefined);
     loadThemeMock.mockResolvedValue(true);
     getPreferencesMock.mockResolvedValue(new Map());
+    getPreferencesByPrefixMock.mockResolvedValue(new Map());
+    getAllBookMetadataMock.mockResolvedValue([]);
+    salvageOpenReadingNotePreferencesMock.mockResolvedValue(null);
     setPreferenceMock.mockResolvedValue(undefined);
     setPreferencesMock.mockResolvedValue(undefined);
     getBooksMock.mockResolvedValue([downloadedBook]);

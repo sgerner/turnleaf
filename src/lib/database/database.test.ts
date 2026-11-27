@@ -8,6 +8,7 @@ import {
   getBooks,
   getPendingSync,
   getPreferences,
+  getPreferencesByPrefix,
   getReadingState,
   getServer,
   getSyncStatus,
@@ -18,6 +19,7 @@ import {
   removeServer,
   replaceBooksInTransaction,
   resetLocalDatabase,
+  restoreReadingNotesBackup,
   saveLocalProgress,
   saveRemoteProgress,
   saveServer,
@@ -25,7 +27,8 @@ import {
   setPreferences,
   type BookRecord,
 } from './database';
-import { BOOT_THEME_STORAGE_KEY, themeTokens } from '../themes/themes';
+import { parseReadingNotesBackup, serializeReadingNotesBackup } from '../reader/notes-backup';
+import { BOOT_THEME_STORAGE_KEY, clearBootThemeCache, themeTokens } from '../themes/themes';
 
 const BROWSER_STORAGE_KEY = 'turnleaf_browser_database_v1';
 
@@ -990,6 +993,69 @@ it('accepts the selected browser server progress and drops only the displayed lo
   await expect(getPendingSync('server')).resolves.toEqual(newer);
 });
 
+it('retains unavailable remote books in browser storage when bookmarks or annotations exist', async () => {
+  const { getPreferencesByPrefix } = await import('./database');
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+  const notedBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:90',
+    chapterId: 90,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  const emptyNotesBook: BookRecord = {
+    ...existingBook,
+    id: 'server:1:91',
+    chapterId: 91,
+    downloadPath: null,
+    downloadStatus: 'none',
+    fileSize: null,
+  };
+  storage.setItem(
+    BROWSER_STORAGE_KEY,
+    JSON.stringify({
+      serverConfig: null,
+      books: [notedBook, emptyNotesBook],
+      readingState: {},
+      syncQueue: {},
+      preferences: {
+        [`readerBookmarks:${notedBook.id}`]: JSON.stringify([
+          {
+            id: 'epubcfi(/6/2)|ch1.xhtml',
+            cfi: 'epubcfi(/6/2)',
+            href: 'ch1.xhtml',
+            percentage: 0.25,
+            label: 'Saved bookmark',
+            savedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ]),
+        [`readerBookmarks:${emptyNotesBook.id}`]: '[]',
+        uiTheme: 'fennec',
+      },
+    }),
+  );
+
+  await reconcileBooks('server', []);
+
+  const retained = await getBooks('server');
+  expect(retained).toHaveLength(1);
+  expect(retained[0]).toMatchObject({
+    id: notedBook.id,
+    remoteAvailable: false,
+  });
+
+  const notePrefs = await getPreferencesByPrefix(['readerBookmarks:', 'readerAnnotations:']);
+  expect([...notePrefs.keys()]).toEqual([
+    `readerBookmarks:${notedBook.id}`,
+    `readerBookmarks:${emptyNotesBook.id}`,
+  ]);
+});
+
 it('mirrors browser theme, mode, and surface colors to localStorage and clears them on reset', async () => {
   const storage = new MemoryStorage();
   Object.defineProperty(window, 'localStorage', {
@@ -1211,4 +1277,126 @@ it('saves normalized browser remote progress and guards against concurrent local
   const setItemSpy = vi.spyOn(storage, 'setItem');
   await expect(saveRemoteProgress(existingBook, clampedRemote, saved)).resolves.toBe(false);
   expect(setItemSpy).not.toHaveBeenCalled();
+});
+
+it('interleaves browser writes with storage.clear() and resetLocalDatabase() without stale rows or lost post-clear writes', async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    value: storage,
+  });
+
+  const staleServer = {
+    id: 'stale',
+    displayName: 'Stale server',
+    baseUrl: 'https://stale.example.com',
+    credentialRef: 'stale-cred',
+    kavitaVersion: '0.8.3',
+    lastConnectedAt: '2026-09-01T00:00:00.000Z',
+  };
+  const freshServer = {
+    id: 'fresh',
+    displayName: 'Fresh server',
+    baseUrl: 'https://fresh.example.com',
+    credentialRef: 'fresh-cred',
+    kavitaVersion: '0.8.4',
+    lastConnectedAt: '2026-09-10T00:00:00.000Z',
+  };
+  const freshBook: BookRecord = {
+    ...existingBook,
+    id: 'fresh:2:20',
+    serverId: 'fresh',
+    libraryId: 2,
+    seriesId: 2,
+    volumeId: 20,
+    chapterId: 20,
+    title: 'Fresh Book',
+    pages: 80,
+    pagesRead: 0,
+  };
+
+  await saveServer(staleServer);
+  await reconcileBooks('stale', [{ ...existingBook, id: 'stale:1:10', serverId: 'stale' }]);
+  await saveLocalProgress(
+    { ...existingBook, id: 'stale:1:10', serverId: 'stale' },
+    'epubcfi(/stale)',
+    '/stale',
+    0.5,
+  );
+  await setPreferences(
+    new Map([
+      ['uiTheme', 'vintage'],
+      [
+        'readerBookmarks:stale:1:10',
+        '[{"id":"s1","cfi":"cfi","href":"h","percentage":0.5,"label":"50%","savedAt":"2026-09-01T00:00:00.000Z"}]',
+      ],
+    ]),
+  );
+
+  // 1. Interleave storage.clear() + clearBootThemeCache() with atomic restore and fresh writes.
+  storage.clear();
+  clearBootThemeCache();
+
+  const restoredBackup = parseReadingNotesBackup(
+    serializeReadingNotesBackup([
+      {
+        bookId: freshBook.id,
+        title: freshBook.title,
+        author: freshBook.author,
+        series: freshBook.series,
+        bookmarks: [
+          {
+            id: 'fresh-bm',
+            cfi: 'epubcfi(/6/4!/4/2:0)',
+            href: 'ch1.xhtml',
+            percentage: 0.5,
+            label: 'Restored bookmark',
+            savedAt: '2026-09-10T00:00:00.000Z',
+          },
+        ],
+        annotations: [],
+      },
+    ]),
+  );
+
+  await Promise.all([
+    saveServer(freshServer),
+    reconcileBooks('fresh', [freshBook]),
+    saveLocalProgress(freshBook, 'epubcfi(/6/4!/4/2:0)', '/fresh/ch1', 0.5),
+    restoreReadingNotesBackup(restoredBackup),
+    setPreferences(new Map([['uiTheme', 'eink']])),
+  ]);
+
+  await expect(getServer()).resolves.toEqual(freshServer);
+  await expect(getBooks('stale')).resolves.toEqual([]);
+  await expect(getReadingState('stale:1:10')).resolves.toBeNull();
+  await expect(getReadingState(freshBook.id)).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/4!/4/2:0)',
+    percentage: 0.5,
+    pendingSync: true,
+  });
+  const afterClearNotes = await getPreferencesByPrefix(['readerBookmarks:', 'readerAnnotations:']);
+  expect(afterClearNotes.has('readerBookmarks:stale:1:10')).toBe(false);
+  expect(afterClearNotes.get(`readerBookmarks:${freshBook.id}`)).toContain('Restored bookmark');
+
+  // 2. Interleave resetLocalDatabase() with post-reset writes and verify clean separation.
+  await resetLocalDatabase();
+  expect(storage.getItem(BOOT_THEME_STORAGE_KEY)).toBeNull();
+  await expect(getServer()).resolves.toBeNull();
+  await expect(getPreferencesByPrefix(['readerBookmarks:'])).resolves.toEqual(new Map());
+
+  await saveServer(freshServer);
+  await reconcileBooks('fresh', [freshBook]);
+  await saveLocalProgress(freshBook, 'epubcfi(/6/6!/4/2:0)', '/fresh/ch2', 0.75);
+  await restoreReadingNotesBackup(restoredBackup);
+
+  await expect(getServer()).resolves.toEqual(freshServer);
+  await expect(getReadingState(freshBook.id)).resolves.toMatchObject({
+    cfi: 'epubcfi(/6/6!/4/2:0)',
+    percentage: 0.75,
+  });
+  await expect(getPendingSync('fresh')).resolves.toHaveLength(1);
+  expect(
+    (await getPreferencesByPrefix(['readerBookmarks:'])).get(`readerBookmarks:${freshBook.id}`),
+  ).toContain('Restored bookmark');
 });

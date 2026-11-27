@@ -8,13 +8,17 @@
   import TurnleafLogo from './lib/components/TurnleafLogo.svelte';
   import { clearDiagnostics, hydrateDiagnostics, recordDiagnostic } from './lib/diagnostics/log';
   import { fetchLatestGithubRelease, type ReleaseBanner } from './lib/github/releases';
-  import {
-    getPreferences,
-    getServer,
-    resetLocalDatabase,
-    type ServerConfig,
-  } from './lib/database/database';
+  import * as database from './lib/database/database';
+  import type { ServerConfig } from './lib/database/database';
   import { getApiKey } from './lib/native/credentials';
+  import {
+    collectLibraryReadingNotes,
+    exportTextDocument,
+    readingNotesBackupMarkdown,
+    serializeReadingNotesBackup,
+    type BookNoteMetadata,
+    type ReadingNotesBookBackup,
+  } from './lib/reader/notes-backup';
   import {
     DEFAULT_MODE,
     DEFAULT_THEME,
@@ -59,6 +63,12 @@
   let booting = $state(Capacitor.isNativePlatform());
   let startupError = $state('');
   let repairing = $state(false);
+  let salvagedNotes = $state<ReadingNotesBookBackup[]>([]);
+  let salvagedPreferences = $state<Map<string, string> | null>(null);
+  let salvagedRestorePending = $state(false);
+  let startupExportMessage = $state('');
+  let startupExportFallback = $state('');
+  let exportingStartupNotes = $state(false);
   let changingServerAddress = $state(false);
   let apiKey = $state<string | null>(null);
   let uiTheme = $state<SkeletonTheme>(untrack(() => initialTheme ?? bootAppearance.theme));
@@ -66,6 +76,23 @@
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
   let stageOverlayActive = $state(false);
+
+  async function trySalvageReadingNotes(): Promise<{
+    preferences: Map<string, string>;
+    books: BookNoteMetadata[];
+  } | null> {
+    try {
+      if (!('salvageOpenReadingNotePreferences' in database)) return null;
+      return await database.salvageOpenReadingNotePreferences();
+    } catch {
+      return null;
+    }
+  }
+
+  async function restoreSalvagedPreferences(prefs: ReadonlyMap<string, string>): Promise<void> {
+    if (!('setPreferences' in database)) return;
+    await database.setPreferences(prefs);
+  }
 
   async function loadLocalData(): Promise<void> {
     booting = true;
@@ -76,8 +103,8 @@
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
-        getServer(),
-        getPreferences([themePreferenceKey, modePreferenceKey]),
+        database.getServer(),
+        database.getPreferences([themePreferenceKey, modePreferenceKey]),
       ]);
       const savedTheme = preferences.get(themePreferenceKey);
       const savedMode = preferences.get(modePreferenceKey);
@@ -111,6 +138,11 @@
         endpoint: 'local/database',
         detail: 'database-open-failed',
       });
+      const salvaged = await trySalvageReadingNotes();
+      if (salvaged && salvaged.preferences.size > 0) {
+        salvagedPreferences = salvaged.preferences;
+        salvagedNotes = collectLibraryReadingNotes(salvaged.preferences, salvaged.books);
+      }
       startupError =
         'Turnleaf could not open its local data. Retry first; resetting is a last resort and clears saved reading progress and settings.';
     } finally {
@@ -123,12 +155,84 @@
     void loadLocalData();
   });
 
+  async function exportSalvagedStartupNotes(
+    format: 'json' | 'markdown',
+    copy = false,
+  ): Promise<void> {
+    if (!salvagedNotes.length || exportingStartupNotes) return;
+    exportingStartupNotes = true;
+    startupExportMessage = '';
+    startupExportFallback = '';
+    try {
+      const content =
+        format === 'json'
+          ? serializeReadingNotesBackup(salvagedNotes)
+          : readingNotesBackupMarkdown(salvagedNotes);
+      const ext = format === 'json' ? 'json' : 'md';
+      const mimeType = format === 'json' ? 'application/json' : 'text/markdown';
+      const filename = Capacitor.isNativePlatform()
+        ? `turnleaf-reading-notes-${Date.now()}.${ext}`
+        : `turnleaf-reading-notes.${ext}`;
+      const result = await exportTextDocument({
+        filename,
+        content,
+        mimeType,
+        copy,
+        copiedLabel: 'Reading notes backup copied to clipboard.',
+      });
+      startupExportMessage = result.message;
+      startupExportFallback = result.fallbackText;
+    } finally {
+      exportingStartupNotes = false;
+    }
+  }
+
   async function repairLocalData(): Promise<void> {
     repairing = true;
     try {
-      await resetLocalDatabase();
-      await clearDiagnostics();
+      if (!salvagedPreferences) {
+        const salvaged = await trySalvageReadingNotes();
+        if (salvaged && salvaged.preferences.size > 0) {
+          salvagedPreferences = salvaged.preferences;
+          if (salvagedNotes.length === 0) {
+            salvagedNotes = collectLibraryReadingNotes(salvaged.preferences, salvaged.books);
+          }
+        }
+      }
+      if (!salvagedRestorePending) {
+        await database.resetLocalDatabase();
+        await clearDiagnostics();
+        if (salvagedPreferences && salvagedPreferences.size > 0) {
+          salvagedRestorePending = true;
+        }
+      }
+      if (salvagedPreferences && salvagedPreferences.size > 0) {
+        try {
+          await restoreSalvagedPreferences(salvagedPreferences);
+        } catch {
+          recordDiagnostic({
+            category: 'startup',
+            endpoint: 'local/database',
+            detail: 'notes-restore-failed',
+          });
+          if (salvagedNotes.length === 0) {
+            salvagedNotes = collectLibraryReadingNotes(salvagedPreferences, []);
+          }
+          server = null;
+          apiKey = null;
+          startupError =
+            'Local data was reset, but Turnleaf could not restore your saved bookmarks and notes. Export or copy a backup below, or retry restoring them.';
+          return;
+        }
+      }
       await loadLocalData();
+      if (!startupError) {
+        salvagedRestorePending = false;
+        salvagedPreferences = null;
+        salvagedNotes = [];
+        startupExportMessage = '';
+        startupExportFallback = '';
+      }
     } catch {
       recordDiagnostic({
         category: 'startup',
@@ -141,6 +245,14 @@
     } finally {
       repairing = false;
     }
+  }
+
+  function retryStartupAction(): void {
+    if (salvagedRestorePending) {
+      void repairLocalData();
+      return;
+    }
+    void loadLocalData();
   }
 
   async function checkForRelease(): Promise<void> {
@@ -248,11 +360,56 @@
     {:else if startupError}
       <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
         <p>{startupError}</p>
+        {#if salvagedNotes.length > 0 && !server}
+          <div class="rounded-lg preset-tonal-surface p-3">
+            <p class="text-sm text-surface-950-50">
+              {salvagedRestorePending
+                ? 'Your salvaged bookmarks and notes are still held in memory. Export or copy a backup before closing Turnleaf, or retry saving them.'
+                : 'Readable bookmarks or notes were found and will be kept if possible. Export a backup before resetting local data.'}
+            </p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                class="btn btn-sm preset-tonal-primary !text-sm"
+                type="button"
+                disabled={repairing || exportingStartupNotes}
+                onclick={() => void exportSalvagedStartupNotes('json')}
+              >
+                Export JSON backup
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface !text-sm"
+                type="button"
+                disabled={repairing || exportingStartupNotes}
+                onclick={() => void exportSalvagedStartupNotes('markdown')}
+              >
+                Export Markdown
+              </button>
+              <button
+                class="btn btn-sm preset-tonal-surface !text-sm"
+                type="button"
+                disabled={repairing || exportingStartupNotes}
+                onclick={() => void exportSalvagedStartupNotes('json', true)}
+              >
+                Copy JSON
+              </button>
+            </div>
+            {#if startupExportMessage}
+              <p class="mt-2 text-sm" role="status">{startupExportMessage}</p>
+            {/if}
+            {#if startupExportFallback}
+              <label class="label mt-2">
+                <span class="label-text text-xs">Exported reading notes</span>
+                <textarea class="textarea min-h-24 text-xs" readonly value={startupExportFallback}
+                ></textarea>
+              </label>
+            {/if}
+          </div>
+        {/if}
         <div class="flex flex-wrap gap-2">
           <button
             class="btn btn-sm preset-filled-error-500 !text-sm"
             type="button"
-            onclick={() => void loadLocalData()}
+            onclick={retryStartupAction}
             disabled={repairing}
           >
             Retry
@@ -265,7 +422,7 @@
             >
               Enter auth key
             </button>
-          {:else}
+          {:else if !salvagedRestorePending}
             <button
               class="btn btn-sm preset-tonal-error !text-sm"
               type="button"

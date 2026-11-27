@@ -101,3 +101,18 @@ export function recordLocation(
   const entry = bookmarkLocation(current, savedAt);
   return [entry, ...history.filter((item) => item.id !== entry.id)].slice(0, MAX_HISTORY);
 }
+
+export function bookmarksMarkdown(
+  title: string,
+  bookmarks: readonly StoredReaderLocation[],
+): string {
+  const lines = [`# Bookmarks for ${title}`, ''];
+  for (const bookmark of bookmarks) {
+    const percent = Math.round(Math.max(0, Math.min(1, bookmark.percentage)) * 100);
+    const label = bookmark.label.replaceAll('\n', ' ').trim() || `${percent}%`;
+    lines.push(`## ${label}`, '', `- Progress: ${percent}%`, `- Saved: ${bookmark.savedAt}`);
+    if (bookmark.href) lines.push(`- Section: ${bookmark.href}`);
+    lines.push(`- Location: \`${bookmark.cfi}\``, '');
+  }
+  return `${lines.join('\n').trim()}\n`;
+}

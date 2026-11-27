@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_BOOKMARKS,
+  bookmarksMarkdown,
   parseBookmarks,
   parseLocationHistory,
   recordLocation,
@@ -99,5 +100,18 @@ describe('reader bookmarks and history', () => {
   it('ignores malformed persisted values', () => {
     expect(parseBookmarks('{"bad":true}')).toEqual([]);
     expect(parseBookmarks(JSON.stringify([{ ...location, id: 'x' }]))).toEqual([]);
+  });
+
+  it('formats bookmarks as Markdown', () => {
+    const saved = renameBookmark(
+      toggleBookmark([], location, '2026-01-01T00:00:00.000Z'),
+      `${location.cfi}|${location.href}`,
+      'Key scene',
+    );
+    const markdown = bookmarksMarkdown('Dune', saved);
+    expect(markdown).toContain('# Bookmarks for Dune');
+    expect(markdown).toContain('## Key scene');
+    expect(markdown).toContain('- Progress: 25%');
+    expect(markdown).toContain('`epubcfi(/6/2!/4/2)`');
   });
 });

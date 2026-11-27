@@ -304,4 +304,58 @@ describe('native metadata transactions against SQLite', () => {
 
     expect([readBook(db, baseBook.id), readBook(db, unmatched.id)]).toEqual(before);
   });
+
+  it('retains unavailable remote books in SQLite when saved bookmarks or annotations exist', async () => {
+    db = createDatabase();
+    const adapter = createAdapter(db);
+    const withBookmarks = {
+      ...baseBook,
+      id: 'server:1:21',
+      chapterId: 21,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    const withAnnotations = {
+      ...baseBook,
+      id: 'server:1:22',
+      chapterId: 22,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    const withEmptyNotes = {
+      ...baseBook,
+      id: 'server:1:23',
+      chapterId: 23,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    };
+    await replaceBooksInTransaction(adapter, 'server', [
+      withBookmarks,
+      withAnnotations,
+      withEmptyNotes,
+    ]);
+    const insertPref = db.prepare(
+      'INSERT INTO preferences (key, value, updated_at) VALUES (?, ?, ?)',
+    );
+    insertPref.run(
+      `readerBookmarks:${withBookmarks.id}`,
+      '[{"id":"cfi|ch1","cfi":"cfi","href":"ch1","percentage":0.2,"label":"20%","savedAt":"2026-01-01T00:00:00.000Z"}]',
+      '2026-09-09T00:00:00.000Z',
+    );
+    insertPref.run(
+      `readerAnnotations:${withAnnotations.id}`,
+      '[{"id":"a1","cfi":"cfi","excerpt":"Quote","note":"Note","createdAt":"2026-01-01T00:00:00.000Z"}]',
+      '2026-09-09T00:00:00.000Z',
+    );
+    insertPref.run(`readerBookmarks:${withEmptyNotes.id}`, '[]', '2026-09-09T00:00:00.000Z');
+
+    await reconcileBooksInTransaction(adapter, 'server', [], '2026-09-10T00:00:00.000Z');
+
+    expect(readBook(db, withBookmarks.id)).toMatchObject({ remote_available: 0 });
+    expect(readBook(db, withAnnotations.id)).toMatchObject({ remote_available: 0 });
+    expect(readBook(db, withEmptyNotes.id)).toBeUndefined();
+  });
 });
