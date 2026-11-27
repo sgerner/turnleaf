@@ -1032,7 +1032,7 @@ describe('native progress transactions against SQLite', () => {
     });
   });
 
-  it('clears the boot theme cache and serializes concurrent openDatabase calls across resetLocalDatabase', async () => {
+  function stubMockLocalStorage() {
     const store = new Map<string, string>();
     const mockStorage = {
       getItem: (key: string) => store.get(key) ?? null,
@@ -1041,6 +1041,11 @@ describe('native progress transactions against SQLite', () => {
       clear: () => void store.clear(),
     };
     vi.stubGlobal('window', { localStorage: mockStorage });
+    return { store, mockStorage };
+  }
+
+  it('clears the boot theme cache and serializes concurrent openDatabase calls across resetLocalDatabase', async () => {
+    const { store } = stubMockLocalStorage();
     try {
       const { BOOT_THEME_STORAGE_KEY } = await import('../themes/themes');
       await seedDatabase();
@@ -1052,9 +1057,10 @@ describe('native progress transactions against SQLite', () => {
       );
       expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(true);
 
-      const resetPromise = database.resetLocalDatabase();
-      const reopenedPromise = database.openDatabase();
-      const [, reopenedConn] = await Promise.all([resetPromise, reopenedPromise]);
+      const [, reopenedConn] = await Promise.all([
+        database.resetLocalDatabase(),
+        database.openDatabase(),
+      ]);
 
       expect(store.has(BOOT_THEME_STORAGE_KEY)).toBe(false);
       expect(reopenedConn).toBeInstanceOf(SQLiteDBConnection);
@@ -1067,15 +1073,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('interleaves native progress writes with localStorage.clear(), removeServer, and resetLocalDatabase so no stale row survives and nothing is lost', async () => {
-    const store = new Map<string, string>();
-    const mockStorage = {
-      getItem: (key: string) => store.get(key) ?? null,
-      setItem: (key: string, value: string) => void store.set(key, value),
-      removeItem: (key: string) => void store.delete(key),
-      clear: () => void store.clear(),
-    };
-    vi.stubGlobal('window', { localStorage: mockStorage });
-
+    const { store, mockStorage } = stubMockLocalStorage();
     const staleCompletedBook = {
       ...book,
       id: 'server:1:11',
@@ -1083,6 +1081,7 @@ describe('native progress transactions against SQLite', () => {
       chapterId: 11,
       title: 'Completed Stale Book',
     };
+    const staleRemote = { ...book, pageNum: 48, bookScrollId: '/stale-remote' };
     const keptServer = { ...server, id: 'kept-server', displayName: 'Kept server' };
     const keptBook = {
       ...book,
@@ -1131,14 +1130,24 @@ describe('native progress transactions against SQLite', () => {
         mode: 'light',
       });
 
-      // Interleave server removal with progress writes across servers.
-      await Promise.all([
-        database.saveLocalProgress(book, 'stale-cfi', '/stale', 0.35, 1),
-        database.removeServer(server.id),
-        database.saveLocalProgress(keptBook, 'kept-cfi', '/kept', 0.45, 1),
-      ]);
+      // Interleave removeServer with pre-remove, post-remove stale, and sibling-server writes.
+      const [, , keptWrite, lateLocalAfterRemove, lateCompletedAfterRemove, lateRemoteAfterRemove] =
+        await Promise.all([
+          database.saveLocalProgress(book, 'stale-cfi', '/stale', 0.35, 1),
+          database.removeServer(server.id),
+          database.saveLocalProgress(keptBook, 'kept-cfi', '/kept', 0.45, 1),
+          database.saveLocalProgress(book, 'late-after-remove', '/late-remove', 0.7, 1),
+          database.markBookCompleted(staleCompletedBook),
+          database.saveRemoteProgress(book, staleRemote, null),
+          database.markDownloaded(book.id, 'books/orphan.epub', 1024),
+        ]);
+      expect(keptWrite).toBeUndefined();
+      expect(lateLocalAfterRemove).toBeUndefined();
+      expect(lateCompletedAfterRemove).toBeUndefined();
+      expect(lateRemoteAfterRemove).toBe(false);
       expect(await database.getBooks(server.id)).toEqual([]);
       expect(await database.getReadingState(book.id)).toBeNull();
+      expect(await database.getReadingState(staleCompletedBook.id)).toBeNull();
       expect(await database.getPendingSync(server.id)).toEqual([]);
       expect(await database.getReadingState(keptBook.id)).toMatchObject({
         cfi: 'kept-cfi',
@@ -1156,7 +1165,11 @@ describe('native progress transactions against SQLite', () => {
       ];
       mockStorage.clear();
       const resetOp = database.resetLocalDatabase();
+      const lateStaleRemoteAfterReset = database.saveRemoteProgress(book, staleRemote, null);
       const postResetWrites = [
+        database.saveLocalProgress(book, 'late-post-reset-cfi', '/late-post-reset', 0.9, 1),
+        database.markBookCompleted(staleCompletedBook),
+        lateStaleRemoteAfterReset,
         database.saveServer(freshServer),
         database.reconcileBooks(freshServer.id, [freshBook]),
         database.saveLocalProgress(freshBook, 'post-reset-cfi', '/post-reset', 0.64, 2),
@@ -1168,6 +1181,7 @@ describe('native progress transactions against SQLite', () => {
         ),
       ];
       await Promise.all([...preResetWrites, resetOp, ...postResetWrites]);
+      expect(await lateStaleRemoteAfterReset).toBe(false);
 
       // Stale pre-reset SQLiteDBConnection handles must not mutate or close the post-reset database.
       await expect(staleConn.close()).resolves.toBeUndefined();
@@ -1225,15 +1239,7 @@ describe('native progress transactions against SQLite', () => {
   });
 
   it('fences mid-transaction saveLocalProgress interleaved with localStorage.clear() and resetLocalDatabase', async () => {
-    const store = new Map<string, string>();
-    const mockStorage = {
-      getItem: (key: string) => store.get(key) ?? null,
-      setItem: (key: string, value: string) => void store.set(key, value),
-      removeItem: (key: string) => void store.delete(key),
-      clear: () => void store.clear(),
-    };
-    vi.stubGlobal('window', { localStorage: mockStorage });
-
+    const { store, mockStorage } = stubMockLocalStorage();
     const freshServer = { ...server, id: 'after-mid-tx', displayName: 'After Mid-Tx Reset' };
     const freshBook = {
       ...book,
@@ -1260,6 +1266,7 @@ describe('native progress transactions against SQLite', () => {
         mockStorage.clear();
         const resetPromise = database.resetLocalDatabase();
         const afterReset = Promise.all([
+          database.saveLocalProgress(book, 'late-after-mid-tx', '/late', 0.91, 2),
           database.saveServer(freshServer),
           database.reconcileBooks(freshServer.id, [freshBook]),
           database.saveLocalProgress(freshBook, 'after-cfi', '/after', 0.52, 1),

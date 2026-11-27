@@ -265,7 +265,7 @@ interface PaginatedRuntimeManager {
   container?: HTMLElement;
   views?: {
     length?: number;
-    all?: () => Array<{ expand?: () => void }>;
+    all?: () => Array<{ expand?: () => void; width?: () => number }>;
   };
   mapping?: {
     page?: (contents: unknown, cfiBase: string, start: number, end: number) => unknown;
@@ -280,6 +280,14 @@ interface PaginatedRuntimeManager {
   prev?: () => Promise<unknown> | undefined;
   paginatedLocation?: () => unknown[];
 }
+
+type RuntimeRendition = Rendition & {
+  manager?: PaginatedRuntimeManager;
+  q?: { enqueue: (task: () => void) => Promise<unknown> };
+  reportLocation?: () => Promise<unknown>;
+  resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
+  getContents?: () => Contents | Contents[];
+};
 
 const patchedManagers = new WeakSet<object>();
 
@@ -1155,10 +1163,13 @@ export class ReaderSession {
     });
   }
 
+  private get runtimeRendition(): RuntimeRendition | null {
+    return this.rendition as RuntimeRendition | null;
+  }
+
   private detachStageWindowListeners(): void {
     if (typeof window === 'undefined') return;
-    const stage = (this.rendition as (Rendition & { manager?: PaginatedRuntimeManager }) | null)
-      ?.manager?.stage;
+    const stage = this.runtimeRendition?.manager?.stage;
     if (stage?.resizeFunc) window.removeEventListener('resize', stage.resizeFunc);
     if (stage?.orientationChangeFunc) {
       window.removeEventListener('orientationchange', stage.orientationChangeFunc);
@@ -1166,8 +1177,7 @@ export class ReaderSession {
   }
 
   private normalizePaginatedManager(): void {
-    const manager = (this.rendition as (Rendition & { manager?: PaginatedRuntimeManager }) | null)
-      ?.manager;
+    const manager = this.runtimeRendition?.manager;
     if (!manager || patchedManagers.has(manager)) return;
     patchedManagers.add(manager);
 
@@ -1312,8 +1322,7 @@ export class ReaderSession {
   }
 
   private observeManagerViews(): void {
-    const manager = (this.rendition as (Rendition & { manager?: PaginatedRuntimeManager }) | null)
-      ?.manager;
+    const manager = this.runtimeRendition?.manager;
     if (!manager || this.observedManager === manager || typeof manager.on !== 'function') return;
     this.observedManager = manager;
     this.viewAdded = (view) => {
@@ -1340,8 +1349,7 @@ export class ReaderSession {
         this.preserveCfi(this.restoreTarget.cfi, this.locationGeneration);
         return;
       }
-      const runtimeRendition = this.rendition as
-        (Rendition & { reportLocation?: () => Promise<unknown> }) | null;
+      const runtimeRendition = this.runtimeRendition;
       if (!runtimeRendition?.reportLocation) return;
       const generation = this.locationGeneration;
       this.rearmSettledUserNavigation();
@@ -1371,37 +1379,44 @@ export class ReaderSession {
   }
 
   private settleAllViewRenders(): void {
-    for (const entry of this.pendingViewRenders.values()) {
-      entry.resolve();
-    }
+    for (const entry of this.pendingViewRenders.values()) entry.resolve();
     this.pendingViewRenders.clear();
   }
 
+  private awaitPendingRenderBatch(): Promise<PromiseSettledResult<void>[]> {
+    return Promise.allSettled([
+      ...[...this.pendingViewRenders.values()].map((entry) => entry.promise),
+      ...this.pendingContentWork,
+    ]);
+  }
+
+  private expandManagerViews(): boolean {
+    const manager = this.runtimeRendition?.manager;
+    if (!manager) return false;
+    let widthChanged = false;
+    for (const view of manager.views?.all?.() ?? []) {
+      const before = view.width?.();
+      view.expand?.();
+      const after = view.width?.();
+      if (before !== undefined && after !== undefined && before !== after) widthChanged = true;
+    }
+    void manager.container?.scrollWidth;
+    return widthChanged;
+  }
+
   private async alignCfiAfterRender(cfi: string, generation: number): Promise<void> {
-    const runtimeRendition = this.rendition as
-      | (Rendition & {
-          manager?: {
-            container?: HTMLElement;
-            views?: { all?: () => Array<{ expand?: () => void }> };
-          };
-        })
-      | null;
-    if (!runtimeRendition?.manager || !cfi.startsWith('epubcfi(')) return;
+    if (!this.runtimeRendition?.manager || !cfi.startsWith('epubcfi(')) return;
     if (!this.isCurrentLocationOperation(generation) || this.userNavigationPending) return;
     await Promise.resolve();
     while (this.pendingViewRenders.size > 0 || this.pendingContentWork.size > 0) {
-      await Promise.allSettled([
-        ...[...this.pendingViewRenders.values()].map((entry) => entry.promise),
-        ...this.pendingContentWork,
-      ]);
+      await this.awaitPendingRenderBatch();
       if (!this.isCurrentLocationOperation(generation) || this.userNavigationPending) return;
     }
     if (typeof requestAnimationFrame === 'function') {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     }
     if (!this.isCurrentLocationOperation(generation) || this.userNavigationPending) return;
-    runtimeRendition.manager.views?.all?.().forEach((view) => view.expand?.());
-    void runtimeRendition.manager.container?.scrollWidth;
+    this.expandManagerViews();
     try {
       await this.displayAtGeneration(cfi, generation);
     } catch {
@@ -1585,8 +1600,7 @@ export class ReaderSession {
   }
 
   private getActiveContents(): Contents[] {
-    const rendition = this.rendition as
-      (Rendition & { getContents?: () => Contents | Contents[] }) | null;
+    const rendition = this.runtimeRendition;
     const fromRendition =
       typeof rendition?.getContents === 'function' ? rendition.getContents() : null;
     const list = Array.isArray(fromRendition)
@@ -1762,8 +1776,8 @@ export class ReaderSession {
   }
 
   private resizeViewport(width: number, height: number): Promise<void> {
-    const rendition = this.rendition;
-    if (!rendition || !width || !height) return Promise.resolve();
+    const runtimeRendition = this.runtimeRendition;
+    if (!runtimeRendition || !width || !height) return Promise.resolve();
     if (
       !this.resizeDrain &&
       this.viewportSize?.width === width &&
@@ -1771,15 +1785,6 @@ export class ReaderSession {
     ) {
       return Promise.resolve();
     }
-    const runtimeRendition = rendition as Rendition & {
-      manager?: {
-        stage?: unknown;
-        container?: HTMLElement;
-        views?: { all?: () => Array<{ expand?: () => void }> };
-      };
-      q?: { enqueue: (task: () => void) => Promise<unknown> };
-      resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
-    };
     if (!runtimeRendition.q?.enqueue) {
       return this.runDisplayOperation(async () => {
         this.applyViewportResize(runtimeRendition, width, height);
@@ -1795,17 +1800,7 @@ export class ReaderSession {
     return this.resizeDrain;
   }
 
-  private async drainViewportResize(
-    runtimeRendition: Rendition & {
-      manager?: {
-        stage?: unknown;
-        container?: HTMLElement;
-        views?: { all?: () => Array<{ expand?: () => void }> };
-      };
-      q?: { enqueue: (task: () => void) => Promise<unknown> };
-      resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
-    },
-  ): Promise<void> {
+  private async drainViewportResize(runtimeRendition: RuntimeRendition): Promise<void> {
     while (this.pendingViewportSize && this.rendition === runtimeRendition) {
       while (this.activeNavigation && this.rendition === runtimeRendition) {
         await this.activeNavigation;
@@ -1828,9 +1823,7 @@ export class ReaderSession {
         if (resized && this.rendition === runtimeRendition) {
           await runtimeRendition.q!.enqueue(() => {});
           if (!this.pendingViewportSize && target?.startsWith('epubcfi(')) {
-            if (this.locationGeneration === generation) {
-              this.rearmSettledUserNavigation();
-            }
+            if (this.locationGeneration === generation) this.rearmSettledUserNavigation();
             await this.alignCfiAfterRender(target, generation);
           }
         }
@@ -1843,10 +1836,7 @@ export class ReaderSession {
   }
 
   private applyViewportResize(
-    runtimeRendition: Rendition & {
-      manager?: { stage?: unknown };
-      resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
-    },
+    runtimeRendition: RuntimeRendition,
     width: number,
     height: number,
   ): { resized: boolean; target?: string | undefined } {
@@ -2005,47 +1995,27 @@ export class ReaderSession {
   }
 
   private async settlePendingSectionRenders(generation: number, awaitFrame = false): Promise<void> {
-    const runtimeRendition = this.rendition as
-      | (Rendition & {
-          q?: unknown;
-          reportLocation?: () => Promise<unknown>;
-          manager?: {
-            container?: HTMLElement;
-            views?: { all?: () => Array<{ expand?: () => void; width?: () => number }> };
-          };
-        })
-      | null;
+    const runtimeRendition = this.runtimeRendition;
     if (!runtimeRendition?.q || !this.isCurrentLocationOperation(generation)) return;
     let settledSectionRender = false;
     while (this.pendingViewRenders.size > 0 || this.pendingContentWork.size > 0) {
       settledSectionRender = true;
-      await Promise.allSettled([
-        ...[...this.pendingViewRenders.values()].map((entry) => entry.promise),
-        ...this.pendingContentWork,
-      ]);
+      await this.awaitPendingRenderBatch();
       if (!this.isCurrentLocationOperation(generation)) return;
     }
-    if (settledSectionRender && this.isCurrentLocationOperation(generation)) {
-      const views = runtimeRendition.manager?.views?.all?.() ?? [];
-      let widthChanged = false;
-      for (const view of views) {
-        const before = view.width?.();
-        view.expand?.();
-        const after = view.width?.();
-        if (before !== undefined && after !== undefined && before !== after) {
-          widthChanged = true;
-        }
-      }
-      void runtimeRendition.manager?.container?.scrollWidth;
-      if (widthChanged && runtimeRendition.reportLocation) {
-        this.rearmSettledUserNavigation();
-        try {
-          await runtimeRendition.reportLocation();
-        } finally {
-          if (this.locationGeneration === generation) {
-            this.userNavigationPending = false;
-            this.userNavigationStartCfi = null;
-          }
+    if (
+      settledSectionRender &&
+      this.isCurrentLocationOperation(generation) &&
+      this.expandManagerViews() &&
+      runtimeRendition.reportLocation
+    ) {
+      this.rearmSettledUserNavigation();
+      try {
+        await runtimeRendition.reportLocation();
+      } finally {
+        if (this.locationGeneration === generation) {
+          this.userNavigationPending = false;
+          this.userNavigationStartCfi = null;
         }
       }
     }
@@ -2098,22 +2068,12 @@ export class ReaderSession {
   }
 
   private preserveCfi(cfi: string, generation: number, expandViews = false): void {
-    const rendition = this.rendition as
-      | (Rendition & {
-          manager?: {
-            container?: HTMLElement;
-            views?: { all?: () => Array<{ expand?: () => void }> };
-          };
-        })
-      | null;
+    const rendition = this.runtimeRendition;
     if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
     void this.runDisplayOperation(() => {
-      if (expandViews && rendition.manager) {
-        rendition.manager.views?.all?.().forEach((view) => view.expand?.());
-        void rendition.manager.container?.scrollWidth;
-      }
+      if (expandViews) this.expandManagerViews();
       return rendition.display(cfi);
     }).catch(() => {
       // The current passage may disappear while a reflow is being applied.

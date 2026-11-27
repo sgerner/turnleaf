@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- fix: fence SQLite/browser progress across clear/reset, align reader restore, and merge master
+- fix: guard late SQLite writes after clear/reset and trim persistence diff
 - Verify real `@capacitor-community/sqlite` wrappers, fence native and browser progress writes across storage clear/reset, and harden mid-chapter EPUB journey recovery
 - Fix Android reading journey DPR pagination, ReaderChrome inset sync, post-reflow progress persistence, and reconnect sync races
 - fix: refresh only after reconnecting from offline

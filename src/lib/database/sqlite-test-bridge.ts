@@ -16,19 +16,10 @@ type StatementMatcher =
 
 type TransactionTaskHandler = (taskIndex: number) => void | Promise<void>;
 
-interface TransactionFault {
-  kind: 'transaction';
-  taskIndex: number;
-  rejection: Error | string;
-}
-
-interface StatementFault {
-  kind: 'statement';
-  matcher: StatementMatcher;
-  rejection: Error | string;
-}
-
-type PendingFault = TransactionFault | StatementFault;
+type DbOptions = { database: string; readonly?: boolean };
+type PendingFault =
+  | { kind: 'transaction'; taskIndex: number; rejection: Error | string }
+  | { kind: 'statement'; matcher: StatementMatcher; rejection: Error | string };
 
 function stripDbSuffix(database: string): string {
   return database.endsWith('.db') ? database.slice(0, -3) : database;
@@ -98,12 +89,12 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       try {
         if (entry.inTransaction) entry.handle.exec('ROLLBACK');
       } catch {
-        // Ignore rollback errors while tearing down a test handle.
+        // Ignore rollback errors during teardown.
       }
       try {
         entry.handle.close();
       } catch {
-        // Ignore duplicate close errors while tearing down a test handle.
+        // Ignore duplicate close errors during teardown.
       }
     }
     entry.handle = null;
@@ -111,9 +102,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
   }
 
   function closeAllNativeConnections(): void {
-    for (const entry of connections.values()) {
-      closeEntryHandle(entry);
-    }
+    for (const entry of connections.values()) closeEntryHandle(entry);
     connections.clear();
     transactionTaskIndex = 0;
   }
@@ -121,9 +110,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
   function requireConnection(database: string, readonly = false): NativeConnectionEntry {
     const dbName = stripDbSuffix(database);
     const entry = connections.get(connectionKey(dbName, readonly));
-    if (!entry) {
-      throw new Error(`No available connection for database ${dbName}`);
-    }
+    if (!entry) throw new Error(`No available connection for database ${dbName}`);
     return entry;
   }
 
@@ -138,14 +125,9 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
   function requireOpenEntry(
     database: string,
     readonly = false,
-  ): {
-    entry: NativeConnectionEntry;
-    handle: DatabaseSync;
-  } {
+  ): { entry: NativeConnectionEntry; handle: DatabaseSync } {
     const entry = requireConnection(database, readonly);
-    if (!entry.handle) {
-      throw new Error(`database ${entry.database} not opened`);
-    }
+    if (!entry.handle) throw new Error(`database ${entry.database} not opened`);
     return { entry, handle: entry.handle };
   }
 
@@ -173,7 +155,6 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
   function maybeInjectFault(statement: string, values: unknown[], inTransaction: boolean): number {
     const statementIndex = totalStatementIndex++;
     const currentTaskIndex = inTransaction ? transactionTaskIndex++ : -1;
-
     for (let i = 0; i < pendingFaults.length; i += 1) {
       const fault = pendingFaults[i]!;
       const matched =
@@ -188,32 +169,13 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
     return currentTaskIndex;
   }
 
-  function deleteDatabaseFiles(filePath: string): void {
-    for (const suffix of ['', '-wal', '-shm', '-journal']) {
-      rmSync(`${filePath}${suffix}`, { force: true });
-    }
-  }
-
   const plugin = {
-    async createConnection(options: {
-      database: string;
-      encrypted?: boolean;
-      mode?: string;
-      version?: number;
-      readonly?: boolean;
-    }): Promise<void> {
+    async createConnection(options: DbOptions): Promise<void> {
       const dbName = stripDbSuffix(options.database);
       const readonly = Boolean(options.readonly);
       const key = connectionKey(dbName, readonly);
-      if (connections.has(key)) {
-        throw new Error(`Connection ${dbName} already exists`);
-      }
-      connections.set(key, {
-        database: dbName,
-        readonly,
-        handle: null,
-        inTransaction: false,
-      });
+      if (connections.has(key)) throw new Error(`Connection ${dbName} already exists`);
+      connections.set(key, { database: dbName, readonly, handle: null, inTransaction: false });
     },
 
     async checkConnectionsConsistency(options: {
@@ -242,29 +204,24 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       return { result: false };
     },
 
-    async closeConnection(options: { database: string; readonly?: boolean }): Promise<void> {
+    async closeConnection(options: DbOptions): Promise<void> {
       const dbName = stripDbSuffix(options.database);
       const readonly = Boolean(options.readonly);
-      const entry = requireConnection(dbName, readonly);
-      closeEntryHandle(entry);
+      closeEntryHandle(requireConnection(dbName, readonly));
       connections.delete(connectionKey(dbName, readonly));
     },
 
-    async open(options: { database: string; readonly?: boolean }): Promise<void> {
+    async open(options: DbOptions): Promise<void> {
       const entry = requireConnection(options.database, options.readonly);
       if (!entry.handle) {
-        const handle = new DatabaseSync(databasePath(entry.database), {
-          readOnly: entry.readonly,
-        });
-        if (!entry.readonly) {
-          handle.exec('PRAGMA foreign_keys = ON;');
-        }
+        const handle = new DatabaseSync(databasePath(entry.database), { readOnly: entry.readonly });
+        if (!entry.readonly) handle.exec('PRAGMA foreign_keys = ON;');
         entry.handle = handle;
         entry.inTransaction = false;
       }
     },
 
-    async close(options: { database: string; readonly?: boolean }): Promise<void> {
+    async close(options: DbOptions): Promise<void> {
       const { entry, handle } = requireOpenEntry(options.database, options.readonly);
       if (entry.inTransaction) {
         throw new Error(`database ${entry.database} failed to close still in transaction`);
@@ -273,18 +230,11 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       entry.handle = null;
     },
 
-    async isDBOpen(options: {
-      database: string;
-      readonly?: boolean;
-    }): Promise<{ result: boolean }> {
-      const entry = requireConnection(options.database, options.readonly);
-      return { result: entry.handle !== null };
+    async isDBOpen(options: DbOptions): Promise<{ result: boolean }> {
+      return { result: requireConnection(options.database, options.readonly).handle !== null };
     },
 
-    async isDBExists(options: {
-      database: string;
-      readonly?: boolean;
-    }): Promise<{ result: boolean }> {
+    async isDBExists(options: DbOptions): Promise<{ result: boolean }> {
       const entry = requireConnection(options.database, options.readonly);
       return { result: existsSync(databasePath(entry.database)) };
     },
@@ -293,19 +243,17 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       return { result: existsSync(databasePath(options.database)) };
     },
 
-    async deleteDatabase(options: { database: string; readonly?: boolean }): Promise<void> {
-      if (options.readonly) {
-        throw new Error('not allowed in read-only mode');
-      }
+    async deleteDatabase(options: DbOptions): Promise<void> {
+      if (options.readonly) throw new Error('not allowed in read-only mode');
       const entry = requireConnection(options.database, false);
       closeEntryHandle(entry);
-      deleteDatabaseFiles(databasePath(entry.database));
+      const filePath = databasePath(entry.database);
+      for (const suffix of ['', '-wal', '-shm', '-journal']) {
+        rmSync(`${filePath}${suffix}`, { force: true });
+      }
     },
 
-    async getVersion(options: {
-      database: string;
-      readonly?: boolean;
-    }): Promise<{ version: number }> {
+    async getVersion(options: DbOptions): Promise<{ version: number }> {
       const { handle } = requireOpenEntry(options.database, options.readonly);
       const row = handle.prepare('PRAGMA user_version').get() as
         { user_version?: number } | undefined;
@@ -354,12 +302,9 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       }
     },
 
-    async execute(options: {
-      database: string;
-      statements: string;
-      transaction?: boolean;
-      readonly?: boolean;
-    }): Promise<{ changes: { changes: number } }> {
+    async execute(
+      options: DbOptions & { statements: string; transaction?: boolean },
+    ): Promise<{ changes: { changes: number } }> {
       if (options.readonly) throw new Error('not allowed in read-only mode');
       const { entry, handle } = requireOpenEntry(options.database, false);
       const taskIndex = maybeInjectFault(options.statements, [], entry.inTransaction);
@@ -372,14 +317,14 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       return { changes: { changes: 0 } };
     },
 
-    async run(options: {
-      database: string;
-      statement: string;
-      values?: unknown[];
-      transaction?: boolean;
-      readonly?: boolean;
-      returnMode?: string;
-    }): Promise<{ changes: { changes: number; lastId?: number; values?: unknown[] } }> {
+    async run(
+      options: DbOptions & {
+        statement: string;
+        values?: unknown[];
+        transaction?: boolean;
+        returnMode?: string;
+      },
+    ): Promise<{ changes: { changes: number; lastId?: number; values?: unknown[] } }> {
       if (options.readonly) throw new Error('not allowed in read-only mode');
       const { entry, handle } = requireOpenEntry(options.database, false);
       const rawValues = options.values ?? [];
@@ -408,12 +353,9 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       return result;
     },
 
-    async query(options: {
-      database: string;
-      statement: string;
-      values?: unknown[];
-      readonly?: boolean;
-    }): Promise<{ values: Record<string, unknown>[] }> {
+    async query(
+      options: DbOptions & { statement: string; values?: unknown[] },
+    ): Promise<{ values: Record<string, unknown>[] }> {
       const { entry, handle } = requireOpenEntry(options.database, options.readonly);
       const rawValues = options.values ?? [];
       maybeInjectFault(options.statement, rawValues, entry.inTransaction);
@@ -437,9 +379,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
     },
     cleanup(): void {
       resetBridgeState();
-      for (const dir of createdDirectories) {
-        rmSync(dir, { recursive: true, force: true });
-      }
+      for (const dir of createdDirectories) rmSync(dir, { recursive: true, force: true });
       createdDirectories.clear();
       currentDirectory = '';
     },
@@ -453,10 +393,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       return connections.has(connectionKey(database, readonly));
     },
     isNativeHandleOpen(database = 'turnleaf', readonly = false): boolean {
-      return (
-        connections.get(connectionKey(database, readonly))?.handle !== null &&
-        connections.has(connectionKey(database, readonly))
-      );
+      return connections.get(connectionKey(database, readonly))?.handle != null;
     },
     failTransactionAt(
       taskIndex: number,
@@ -472,11 +409,7 @@ export function createSQLiteTestBridge(prefix = 'turnleaf-sqlite-'): SQLiteTestB
       matcher: StatementMatcher,
       rejection: Error | string = new Error('injected statement failure'),
     ): void {
-      pendingFaults.push({
-        kind: 'statement',
-        matcher,
-        rejection,
-      });
+      pendingFaults.push({ kind: 'statement', matcher, rejection });
     },
     onTransactionTask(handler: TransactionTaskHandler | null): void {
       transactionTaskHandler = handler;

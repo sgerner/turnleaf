@@ -1265,10 +1265,20 @@ it('interleaves browser progress writes with localStorage.clear(), removeServer,
     ]),
   );
 
+  const staleRemote = {
+    libraryId: existingBook.libraryId,
+    seriesId: existingBook.seriesId,
+    volumeId: existingBook.volumeId,
+    chapterId: existingBook.chapterId,
+    pageNum: 55,
+    bookScrollId: '/stale-remote',
+  };
+
   // Clear localStorage mid-flow; late writes for cleared books must not plant orphan state.
   storage.clear();
   await saveLocalProgress(existingBook, 'orphan-after-clear', '/orphan', 0.5, 1);
   await markBookCompleted(completedStaleBook);
+  await expect(saveRemoteProgress(existingBook, staleRemote, null)).resolves.toBe(false);
   await markDownloaded(existingBook.id, 'books/orphan.epub', 1024);
   expect(storage.getItem(BROWSER_STORAGE_KEY)).toBeNull();
   expect(storage.getItem(BOOT_THEME_STORAGE_KEY)).toBeNull();
@@ -1280,6 +1290,7 @@ it('interleaves browser progress writes with localStorage.clear(), removeServer,
   await removeServer(staleServer.id);
   await saveLocalProgress(existingBook, 'orphan-after-remove', '/orphan-remove', 0.7, 1);
   await markBookCompleted(completedStaleBook);
+  await expect(saveRemoteProgress(existingBook, staleRemote, null)).resolves.toBe(false);
 
   expect(await getServer()).toBeNull();
   expect(await getBooks(staleServer.id)).toEqual([]);
@@ -1288,6 +1299,7 @@ it('interleaves browser progress writes with localStorage.clear(), removeServer,
   expect(await getPendingSync(staleServer.id)).toEqual([]);
 
   // Interleave pre-reset writes, resetLocalDatabase(), stale late writes, and post-reset writes.
+  const lateRemoteAfterReset = saveRemoteProgress(existingBook, staleRemote, null);
   await Promise.all([
     saveServer(staleServer),
     reconcileBooks(staleServer.id, [existingBook, completedStaleBook]),
@@ -1295,6 +1307,8 @@ it('interleaves browser progress writes with localStorage.clear(), removeServer,
     setPreference('uiTheme', 'eink'),
     resetLocalDatabase(),
     saveLocalProgress(existingBook, 'late-stale-cfi', '/late-stale', 0.8, 1),
+    markBookCompleted(completedStaleBook),
+    lateRemoteAfterReset,
     saveServer(freshServer),
     reconcileBooks(freshServer.id, [freshBook]),
     saveLocalProgress(freshBook, 'fresh-cfi', '/fresh', 0.62, 2),
@@ -1305,6 +1319,7 @@ it('interleaves browser progress writes with localStorage.clear(), removeServer,
       ]),
     ),
   ]);
+  await expect(lateRemoteAfterReset).resolves.toBe(false);
 
   expect(await getServer()).toEqual(freshServer);
   expect(await getBooks(staleServer.id)).toEqual([]);
