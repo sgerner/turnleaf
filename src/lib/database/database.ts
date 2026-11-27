@@ -790,6 +790,12 @@ function sqlOnlyIdentityTasks(serverId: string, incomingBooks: readonly BookReco
   return tasks;
 }
 
+function parseNullableInteger(value: unknown): number | null {
+  if (value == null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
 async function queryExistingBookIdentities(
   db: Pick<SQLiteDBConnection, 'query'>,
   serverId: string,
@@ -800,7 +806,7 @@ async function queryExistingBookIdentities(
   return (result.values ?? []).map((row) => ({
     id: String(row.id),
     chapterId: Number(row.chapter_id),
-    fileId: row.file_id == null ? null : Number(row.file_id),
+    fileId: parseNullableInteger(row.file_id),
   }));
 }
 
@@ -973,7 +979,7 @@ export async function getBooks(
     seriesId: Number(row.series_id),
     volumeId: Number(row.volume_id),
     chapterId: Number(row.chapter_id),
-    fileId: row.file_id == null ? null : Number(row.file_id),
+    fileId: parseNullableInteger(row.file_id),
     fileName: sanitizeEpubFileName(row.file_name),
     title: String(row.title),
     author: row.author ? String(row.author) : null,
@@ -986,8 +992,8 @@ export async function getBooks(
     lastReadAt: row.last_read_at ? String(row.last_read_at) : null,
     downloadPath: row.download_path ? String(row.download_path) : null,
     downloadStatus: String(row.download_status),
-    fileSize: row.file_size == null ? null : Number(row.file_size),
-    remoteFileSize: row.remote_file_size == null ? null : Number(row.remote_file_size),
+    fileSize: parseNullableInteger(row.file_size),
+    remoteFileSize: parseNullableInteger(row.remote_file_size),
     chapterEpubIndex: Number(row.chapter_epub_index ?? 0),
     multiFileChapter: Number(row.multi_file_chapter ?? 0) !== 0,
     syncProgress: Number(row.sync_progress ?? 1) !== 0,

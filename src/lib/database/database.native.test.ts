@@ -467,3 +467,78 @@ it('mirrors native SQLite theme and mode preferences to browser localStorage and
     vi.unstubAllGlobals();
   }
 });
+
+it('reconciles native SQLite legacy null file_id bridge rows into file-scoped book IDs in one transaction', async () => {
+  const { getBooks, reconcileBooks } = await import('./database');
+  mocks.db.query.mockResolvedValueOnce({
+    values: [{ id: 'server:1:10', chapter_id: 10, file_id: 'null' }],
+  });
+
+  await reconcileBooks('server', [
+    {
+      ...book,
+      id: 'server:1:10:2114',
+      fileId: 2114,
+      multiFileChapter: true,
+      syncProgress: true,
+    },
+    {
+      ...book,
+      id: 'server:1:10:2115',
+      fileId: 2115,
+      chapterEpubIndex: 1,
+      multiFileChapter: true,
+      syncProgress: false,
+    },
+  ]);
+
+  expect(mocks.executeTransaction).toHaveBeenCalledTimes(1);
+  const statements = mocks.executeTransaction.mock.calls[0]?.[0]?.map((task) => task.statement);
+  expect(statements).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining('INSERT INTO books (id,'),
+      'UPDATE reading_state SET book_id = ? WHERE book_id = ?',
+      'UPDATE sync_queue SET book_id = ? WHERE book_id = ?',
+      expect.stringContaining('UPDATE OR REPLACE preferences'),
+    ]),
+  );
+
+  mocks.db.query.mockResolvedValueOnce({
+    values: [
+      {
+        id: 'server:1:10:2114',
+        server_id: 'server',
+        library_id: 1,
+        series_id: 1,
+        volume_id: 10,
+        chapter_id: 10,
+        file_id: 'null',
+        file_name: null,
+        title: 'Book',
+        author: null,
+        series: null,
+        format: 'epub',
+        pages: 100,
+        pages_read: 0,
+        created_at: '2026-01-01T00:00:00.000Z',
+        last_read_at: null,
+        download_path: null,
+        download_status: 'none',
+        file_size: 'null',
+        remote_file_size: '',
+        chapter_epub_index: 0,
+        multi_file_chapter: 1,
+        sync_progress: 1,
+        remote_available: 1,
+      },
+    ],
+  });
+  await expect(getBooks('server', { includeDescription: false })).resolves.toMatchObject([
+    {
+      id: 'server:1:10:2114',
+      fileId: null,
+      fileSize: null,
+      remoteFileSize: null,
+    },
+  ]);
+});
