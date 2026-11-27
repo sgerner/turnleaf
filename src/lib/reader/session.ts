@@ -6,6 +6,15 @@ import {
   type ReaderSearchResult,
 } from './search';
 import { parseKavitaXPath, resolveContentXPath, toKavitaXPath } from './kavita-xpath';
+import {
+  createSpineHrefLookup,
+  matchSpineHref,
+  resolveDisplayHref,
+  resolveTocHref,
+  type TocItem,
+} from './toc';
+
+export type { TocItem } from './toc';
 
 export interface ReaderLocation {
   cfi: string;
@@ -45,12 +54,6 @@ export function resolveReaderKeyboardAction(
   if (event.key === 'ArrowLeft' || event.key === 'PageUp') return 'previous';
   if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') return 'next';
   return null;
-}
-
-export interface TocItem {
-  label: string;
-  href: string;
-  children: TocItem[];
 }
 
 interface SpineSection {
@@ -394,7 +397,11 @@ export class ReaderSession {
   private managerScroll: (() => void) | null = null;
   private targetScroll: ((event: Event) => void) | null = null;
   private current: Location | null = null;
-  private spine: { sections: SpineSection[]; indexes: Map<string, number> } | null = null;
+  private spine: {
+    sections: SpineSection[];
+    indexes: Map<string, number>;
+    hrefs: Map<string, string>;
+  } | null = null;
   private locationGeneration = 0;
   private userNavigationPending = false;
   private userNavigationStartCfi: string | null = null;
@@ -402,6 +409,8 @@ export class ReaderSession {
   private scrollNavigationPending = false;
   private scrollNavigationStartCfi: string | null = null;
   private alignedScrollLeft = 0;
+  private lastDomScrollLeft = 0;
+  private lastDomScrollTop = 0;
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
@@ -463,7 +472,6 @@ export class ReaderSession {
     this.bindEpubContainer();
     this.targetScroll = (event: Event) => {
       const manager = this.getScrollManager();
-      if (typeof manager?._onScroll === 'function') return;
       const candidate = event.target as HTMLElement | null;
       const scroller =
         candidate && typeof candidate.scrollLeft === 'number'
@@ -477,6 +485,9 @@ export class ReaderSession {
       ) {
         return;
       }
+      this.lastDomScrollLeft = scroller.scrollLeft;
+      this.lastDomScrollTop = scroller.scrollTop ?? 0;
+      if (typeof manager?._onScroll === 'function') return;
       if (this.suppressFocusScroll) {
         this.clearFocusScrollSuppression();
         if (!this.isProgrammaticScrollAllowed()) {
@@ -611,8 +622,13 @@ export class ReaderSession {
       this.scrollNavigationPending = false;
       this.scrollNavigationStartCfi = null;
       const manager = this.getScrollManager();
-      if (manager?.ignore) manager.ignore = false;
       const container = this.bindEpubContainer() ?? manager?.container ?? null;
+      const hasPendingDomScroll = Boolean(
+        container &&
+        (container.scrollLeft !== this.lastDomScrollLeft ||
+          (container.scrollTop ?? 0) !== this.lastDomScrollTop),
+      );
+      if (manager?.ignore && !hasPendingDomScroll) manager.ignore = false;
       this.syncContainerScroll(container);
       this.syncVisibleColumnLinks();
       this.reportLocation(location, origin, returnTarget);
@@ -694,9 +710,12 @@ export class ReaderSession {
   ): void {
     if (!this.onLocation) return;
     const start = location.start;
-    const { sections, indexes } = this.getSpine();
+    const { sections, indexes, hrefs } = this.getSpine();
     const sectionCount = Math.max(1, sections.length);
-    const sectionIndex = indexes.get(start.href) ?? 0;
+    const matchedHref = indexes.has(start.href)
+      ? start.href
+      : (matchSpineHref(start.href, hrefs) ?? start.href);
+    const sectionIndex = indexes.get(matchedHref) ?? 0;
     const pageIndex = this.pageIndex(start.displayed.page);
     const sectionProgress = pageIndex / Math.max(1, start.displayed.total);
     const semanticPercentage = (sectionIndex + sectionProgress) / sectionCount;
@@ -726,14 +745,16 @@ export class ReaderSession {
   }
 
   tableOfContents(): TocItem[] {
+    const { hrefs } = this.getSpine();
+    const navPath = this.navigationBasePath();
     const mapItems = (items: EpubTocItem[]): TocItem[] =>
       items.map((item) => ({
         label: item.label,
-        href: item.href,
+        href: resolveTocHref(item.href, navPath, hrefs),
         children: mapItems(item.subitems ?? []),
       }));
 
-    return mapItems(this.book.navigation.toc);
+    return mapItems(this.book.navigation?.toc ?? []);
   }
 
   updateHighlights(annotations: Array<{ cfi: string }>): void {
@@ -877,7 +898,8 @@ export class ReaderSession {
 
   async display(href: string): Promise<void> {
     if (!this.rendition) throw new Error('Reader is not open.');
-    await this.navigate(() => this.rendition!.display(href));
+    const target = this.resolveDisplayTarget(href);
+    await this.navigate(() => this.rendition!.display(target));
   }
 
   async displayCfi(cfi: string): Promise<boolean> {
@@ -912,9 +934,17 @@ export class ReaderSession {
         previous.bottomMargin !== value.bottomMargin ||
         previous.paragraphSpacing !== value.paragraphSpacing ||
         previous.alignment !== value.alignment ||
+        previous.publisherStyles !== value.publisherStyles ||
         previous.hyphenation !== value.hyphenation);
     const themeChanged = !previous || previous.mode !== value.mode || layoutChanged;
     if (!themeChanged) return;
+    const loadedContents =
+      typeof (rendition as Partial<Rendition>).getContents === 'function'
+        ? (rendition.getContents() as unknown as Contents | Contents[])
+        : [];
+    for (const content of Array.isArray(loadedContents) ? loadedContents : [loadedContents]) {
+      content?.document?.getElementById('epubjs-inserted-css-turnleaf')?.remove();
+    }
     const colors = MODE_COLORS[value.mode];
     const family =
       value.fontFamily === 'book'
@@ -922,6 +952,7 @@ export class ReaderSession {
         : value.fontFamily === 'accessible'
           ? 'Atkinson Hyperlegible, Verdana, sans-serif'
           : 'Avenir Next, Segoe UI, sans-serif';
+    const hyphens = value.hyphenation ? 'auto' : 'none';
     rendition.themes.register('turnleaf', {
       html: {
         background: `${this.resolveToken(colors.background)} !important`,
@@ -933,14 +964,20 @@ export class ReaderSession {
         'font-family': `${family} !important`,
         'font-size': `${value.fontSize}px !important`,
         'line-height': `${value.lineHeight} !important`,
+        'text-align': value.publisherStyles ? value.alignment : `${value.alignment} !important`,
         padding: `0.5rem max(${value.margin}px, env(safe-area-inset-right)) max(${value.bottomMargin}px, env(safe-area-inset-bottom)) max(${value.margin}px, env(safe-area-inset-left)) !important`,
         'box-sizing': 'border-box',
       },
-      p: {
-        'margin-bottom': `${value.paragraphSpacing}em !important`,
-        'text-align': `${value.alignment} !important`,
-        hyphens: value.hyphenation ? 'auto' : 'none',
-      },
+      p: value.publisherStyles
+        ? {
+            'margin-bottom': `${value.paragraphSpacing}em`,
+            hyphens,
+          }
+        : {
+            'margin-bottom': `${value.paragraphSpacing}em !important`,
+            'text-align': `${value.alignment} !important`,
+            hyphens: `${hyphens} !important`,
+          },
       'img, svg, video, canvas, table, pre, blockquote': {
         'max-width': '100% !important',
       },
@@ -1007,6 +1044,8 @@ export class ReaderSession {
     this.scrollNavigationPending = false;
     this.scrollNavigationStartCfi = null;
     this.alignedScrollLeft = 0;
+    this.lastDomScrollLeft = 0;
+    this.lastDomScrollTop = 0;
     this.appearance = null;
     this.highlightCfis.clear();
     this.reflowPending = false;
@@ -1193,6 +1232,8 @@ export class ReaderSession {
       frameContainer ?? this.viewportTarget?.querySelector<HTMLElement>('.epub-container') ?? null;
     if (queriedContainer && queriedContainer !== this.epubContainer) {
       this.epubContainer = queriedContainer;
+      this.lastDomScrollLeft = queriedContainer.scrollLeft;
+      this.lastDomScrollTop = queriedContainer.scrollTop ?? 0;
       this.syncContainerScroll(queriedContainer);
     }
     return this.epubContainer;
@@ -1507,6 +1548,7 @@ export class ReaderSession {
 
   private handleUnignoredScroll(scroller: HTMLElement): void {
     const scrollLeft = scroller.scrollLeft;
+    if (scrollLeft === this.alignedScrollLeft) return;
     this.beginScrollNavigation();
     const delta = this.columnDelta(scroller);
     if (!delta) {
@@ -1696,12 +1738,45 @@ export class ReaderSession {
     if (this.spine) return this.spine;
     const sections: SpineSection[] = [];
     const indexes = new Map<string, number>();
+    const spineHrefs: string[] = [];
     this.book.spine.each((section: SpineSection) => {
       if (!indexes.has(section.href)) indexes.set(section.href, sections.length);
       sections.push(section);
+      spineHrefs.push(section.href);
     });
-    this.spine = { sections, indexes };
+    const hrefs = createSpineHrefLookup(spineHrefs);
+    this.spine = { sections, indexes, hrefs };
     return this.spine;
+  }
+
+  private navigationBasePath(): string {
+    const packaging = (
+      this.book as typeof this.book & {
+        packaging?: { navPath?: string | false; ncxPath?: string | false };
+      }
+    ).packaging;
+    const navPath = typeof packaging?.navPath === 'string' ? packaging.navPath.trim() : '';
+    if (navPath) return navPath;
+    const ncxPath = typeof packaging?.ncxPath === 'string' ? packaging.ncxPath.trim() : '';
+    return ncxPath;
+  }
+
+  private resolveDisplayTarget(href: string): string {
+    const trimmed = href.trim();
+    if (!trimmed) return href;
+    if (trimmed.startsWith('#')) {
+      const spineById = (
+        this.book.spine as typeof this.book.spine & {
+          spineById?: Record<string, number | undefined>;
+        }
+      ).spineById;
+      if (spineById && spineById[trimmed.slice(1)] !== undefined) {
+        return trimmed;
+      }
+    }
+    const { hrefs } = this.getSpine();
+    const currentHref = this.current?.start.href ?? this.rendition?.location?.start.href ?? null;
+    return resolveDisplayHref(trimmed, this.navigationBasePath(), hrefs, currentHref);
   }
 
   private pageIndex(page: number): number {

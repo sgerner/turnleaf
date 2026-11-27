@@ -211,6 +211,17 @@ describe('ReaderSession accessibility and paginated scroll relocations', () => {
       expect.objectContaining({ cfi: 'cfi-page-2', pageIndex: 1 }),
       'navigation',
     );
+    // manager.ignore stays true until the pending async DOM scroll event for 300px fires.
+    expect(mockRendition.manager.ignore).toBe(true);
+
+    // An echo scroll at the already-aligned 300px offset must not re-arm navigation or emit twice.
+    onLocation.mockClear();
+    mockRendition.manager.emitScroll();
+    relocated(makeLocation('cfi-page-2', 2));
+    expect(onLocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ cfi: 'cfi-page-2', pageIndex: 1 }),
+      'restore',
+    );
 
     // Forward scroll to column 3, then backward TalkBack partial scroll into column 2 (e.g. 540px).
     mockRendition.manager.container.scrollLeft = 600;

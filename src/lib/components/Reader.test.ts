@@ -476,6 +476,79 @@ describe('Reader accessibility, sync confirmation, and edge insets', () => {
     expect(document.activeElement?.getAttribute('aria-label')).toBe('Sync latest reading position');
   });
 
+  it('does not let panel close focus restoration steal focus from a newly opened panel', async () => {
+    let resolveSync!: (value: { xpath: string | null; percentage: number | null }) => void;
+    const onSyncLatest = vi.fn(
+      () =>
+        new Promise<{ xpath: string | null; percentage: number | null }>((resolve) => {
+          resolveSync = resolve;
+        }),
+    );
+
+    component = mount(Reader, {
+      target: host,
+      props: {
+        bookUrl: 'blob:test-book',
+        bookId: 'book-4',
+        title: 'Wild Seed',
+        onBack: vi.fn(),
+        onRelocated: vi.fn(),
+        onSyncLatest,
+      },
+    });
+    await settle();
+
+    host
+      .querySelector<HTMLButtonElement>('.tap-zones [aria-label="Show reading controls"]')!
+      .click();
+    flushSync();
+
+    // Open Appearance from a synthetic click (opener === document.body so fallback selector is used).
+    (document.activeElement as HTMLElement | null)?.blur();
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-appearance"]')!.click();
+    flushSync();
+    await tick();
+
+    const appearanceDialog = host.querySelector<HTMLElement>('#reader-appearance')!;
+    expect(appearanceDialog.contains(document.activeElement)).toBe(true);
+
+    // Close Appearance and immediately open Notes in the same turn before tick() resolves.
+    appearanceDialog
+      .querySelector<HTMLButtonElement>('[aria-label="Close reading appearance"]')!
+      .click();
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-annotations"]')!.click();
+    flushSync();
+    await tick();
+
+    const annotationsDialog = host.querySelector<HTMLElement>('#reader-annotations')!;
+    expect(annotationsDialog).not.toBeNull();
+    expect(annotationsDialog.contains(document.activeElement)).toBe(true);
+    expect((host.querySelector('.reader-top') as HTMLElement).inert).toBe(true);
+
+    // Close Notes, start Sync, open Contents while Sync is in flight, then resolve divergent Sync.
+    annotationsDialog
+      .querySelector<HTMLButtonElement>('[aria-label="Close highlights and notes"]')!
+      .click();
+    flushSync();
+    await tick();
+
+    host.querySelector<HTMLButtonElement>('[aria-label="Sync latest reading position"]')!.click();
+    host.querySelector<HTMLButtonElement>('[aria-controls="reader-contents"]')!.click();
+    flushSync();
+    await tick();
+    expect(host.querySelector('#reader-contents')).not.toBeNull();
+
+    resolveSync({ xpath: '//body/DocFragment[2]/body/p[2]', percentage: 0.6 });
+    await settle();
+    flushSync();
+    await tick();
+
+    expect(host.querySelector('#reader-contents')).toBeNull();
+    const alertDialog = host.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    expect(alertDialog).not.toBeNull();
+    expect(alertDialog.contains(document.activeElement)).toBe(true);
+  });
+
   it('defines non-blocking edge strips and reserves 3rem plus safe-area inset at the bottom', () => {
     expect(readerSource).toMatch(
       /--reader-safe-bottom:\s*calc\(\s*3rem\s*\+\s*max\(env\(safe-area-inset-bottom,\s*0px\),\s*var\(--safe-area-inset-bottom,\s*0px\)\)\s*\)/,
