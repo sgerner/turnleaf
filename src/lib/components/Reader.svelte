@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
   import { App } from '@capacitor/app';
-  import { Capacitor, SystemBars, type PluginListenerHandle } from '@capacitor/core';
+  import { Capacitor, type PluginListenerHandle } from '@capacitor/core';
   import { tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
@@ -11,8 +11,10 @@
   import {
     applySystemBarsStyle,
     applyThemeColorMeta,
+    hideSystemBars,
     resolveReaderSystemBars,
     resolveShellSystemBars,
+    showSystemBars,
   } from '../native/system-bars';
   import { VolumeButtons } from '../native/volume-buttons';
   import {
@@ -201,8 +203,8 @@
 
   const nativeFeatures = Capacitor.isNativePlatform()
     ? createReaderNativeFeatures({
-        hideStatusBar: () => SystemBars.hide({ animation: 'NONE' }),
-        showStatusBar: () => SystemBars.show({ animation: 'NONE' }),
+        hideStatusBar: () => hideSystemBars({ animation: 'NONE' }),
+        showStatusBar: () => showSystemBars({ animation: 'NONE' }),
         setReaderChrome: (enabled) => ReaderChrome.setEnabled({ enabled }),
         setVolumeButtons: (enabled) => VolumeButtons.setEnabled({ enabled }),
         setKeepAwake: (enabled) => KeepAwake.setEnabled({ enabled }),

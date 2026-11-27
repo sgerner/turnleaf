@@ -1,5 +1,9 @@
-import { SystemBars, SystemBarsStyle } from '@capacitor/core';
+import * as CapacitorCore from '@capacitor/core';
+import type { SystemBarsStyle, SystemBarsVisibilityOptions } from '@capacitor/core';
 import { enqueueNativeOperation } from './reader-native-features';
+
+const LIGHT_SYSTEM_BARS_STYLE = 'LIGHT' as SystemBarsStyle;
+const DARK_SYSTEM_BARS_STYLE = 'DARK' as SystemBarsStyle;
 
 export type SurfaceMode = 'light' | 'dark';
 
@@ -252,7 +256,9 @@ export function wcagContrastRatio(luminanceA: number, luminanceB: number): numbe
 }
 
 export function systemBarsStyleForLuminance(luminance: number): SystemBarsStyle {
-  return luminance > WCAG_ICON_LUMINANCE_THRESHOLD ? SystemBarsStyle.Light : SystemBarsStyle.Dark;
+  return luminance > WCAG_ICON_LUMINANCE_THRESHOLD
+    ? LIGHT_SYSTEM_BARS_STYLE
+    : DARK_SYSTEM_BARS_STYLE;
 }
 
 export function resolveSystemBarsFromColor(
@@ -269,8 +275,8 @@ export function resolveSystemBarsFromColor(
     };
   }
   return fallbackMode === 'light'
-    ? { style: SystemBarsStyle.Light, themeColor: DEFAULT_LIGHT_HEX, luminance: 1 }
-    : { style: SystemBarsStyle.Dark, themeColor: DEFAULT_DARK_HEX, luminance: 0.0163 };
+    ? { style: LIGHT_SYSTEM_BARS_STYLE, themeColor: DEFAULT_LIGHT_HEX, luminance: 1 }
+    : { style: DARK_SYSTEM_BARS_STYLE, themeColor: DEFAULT_DARK_HEX, luminance: 0.0163 };
 }
 
 function resolveCssCustomProperty(
@@ -345,12 +351,32 @@ export function applyThemeColorMeta(themeColor: string, doc: Document = document
   meta?.setAttribute('content', themeColor);
 }
 
+function getSystemBarsPlugin(): typeof CapacitorCore.SystemBars | null {
+  try {
+    return CapacitorCore.SystemBars ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function applySystemBarsStyle(style: SystemBarsStyle): Promise<void> {
   try {
-    await SystemBars?.setStyle?.({ style });
+    await getSystemBarsPlugin()?.setStyle?.({ style });
   } catch {
     // Native bar styling is optional and must not interrupt app rendering.
   }
+}
+
+export async function hideSystemBars(
+  options: SystemBarsVisibilityOptions = { animation: 'NONE' },
+): Promise<void> {
+  await getSystemBarsPlugin()?.hide?.(options);
+}
+
+export async function showSystemBars(
+  options: SystemBarsVisibilityOptions = { animation: 'NONE' },
+): Promise<void> {
+  await getSystemBarsPlugin()?.show?.(options);
 }
 
 export function syncShellSystemBars(mode: SurfaceMode, doc: Document = document): Promise<void> {
