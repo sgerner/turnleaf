@@ -26,7 +26,7 @@
 >
   <div
     bind:this={dialogElement}
-    class="dialog-card card preset-filled-surface-50-950 relative flex w-full max-w-md flex-col overflow-hidden"
+    class="dialog-card card preset-filled-surface-50-950 relative flex min-w-0 w-full max-w-md flex-col overflow-hidden"
     role="dialog"
     aria-modal="true"
     aria-labelledby={labelledBy}
@@ -37,7 +37,7 @@
     <div class="dialog-header shrink-0 px-6 pb-3 pt-6">
       {@render header()}
     </div>
-    <div class="dialog-body flex-1 min-h-0 overflow-y-auto px-6 pb-6">
+    <div class="dialog-body min-w-0 flex-1 min-h-0 overflow-x-hidden overflow-y-auto px-6 pb-6">
       {@render children()}
     </div>
   </div>
@@ -66,6 +66,11 @@
 
     .dialog-header {
       padding: 0.375rem 0.75rem;
+    }
+
+    .dialog-header :global(h2) {
+      font-size: 1.25rem;
+      line-height: 1.25;
     }
 
     .dialog-body {

@@ -5,8 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BookRecord, ServerConfig } from '../database/database';
 import {
   calculateVirtualWindow,
+  columnsForLibraryWidth,
   columnsForWidth,
   GRID_ROW_GAP_PX,
+  LIST_ROW_GAP_PX,
   resultsContainerHeight,
   rowHeightFor,
 } from './library-virtualization';
@@ -141,6 +143,30 @@ describe('calculateVirtualWindow', () => {
       totalRows: 3,
       totalHeight: 300,
     });
+  });
+});
+
+describe('columnsForLibraryWidth', () => {
+  it('always uses 1 column in list view', () => {
+    expect(columnsForLibraryWidth(1200, 'list', 16)).toBe(1);
+    expect(columnsForLibraryWidth(320, 'list', 32)).toBe(1);
+  });
+
+  it('preserves standard grid columns at 16px root font size', () => {
+    expect(columnsForLibraryWidth(288, 'grid', 16)).toBe(2);
+    expect(columnsForLibraryWidth(640, 'grid', 16)).toBe(3);
+    expect(columnsForLibraryWidth(768, 'grid', 16)).toBe(4);
+    expect(columnsForLibraryWidth(1024, 'grid', 16)).toBe(5);
+  });
+
+  it('reduces grid columns at 200% text size before card overlays overlap', () => {
+    expect(columnsForLibraryWidth(288, 'grid', 32)).toBe(1);
+    expect(columnsForLibraryWidth(380, 'grid', 32)).toBe(1);
+    expect(columnsForLibraryWidth(520, 'grid', 32)).toBe(2);
+    expect(columnsForLibraryWidth(720, 'grid', 32)).toBe(3);
+    expect(columnsForLibraryWidth(768, 'grid', 32)).toBe(3);
+    expect(columnsForLibraryWidth(976, 'grid', 32)).toBe(4);
+    expect(columnsForLibraryWidth(1024, 'grid', 32)).toBe(5);
   });
 });
 
@@ -481,6 +507,84 @@ describe('Library virtual DOM caching and containment', () => {
     await Promise.resolve();
     await flushFrames();
     expect(results.style.height).toBe(`${80 * 320}px`);
+  });
+
+  it('expands rowHeight when ResizeObserver reports taller book cards without querying DOM geometry', async () => {
+    const originalResizeObserver = globalThis.ResizeObserver;
+    const observerCallbacks: ResizeObserverCallback[] = [];
+    class MockResizeObserver {
+      private readonly callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+        observerCallbacks.push(callback);
+      }
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+
+    try {
+      const stage = document.createElement('div');
+      stage.className = 'app-stage';
+      Object.defineProperty(stage, 'clientWidth', { configurable: true, get: () => 320 });
+      Object.defineProperty(stage, 'clientHeight', { configurable: true, get: () => 568 });
+      document.body.append(stage);
+
+      mockState.preferences = new Map([['libraryView', 'list']]);
+      mountedInstance = mount(Library, {
+        target: stage,
+        props: {
+          server,
+          apiKey: 'test-key',
+          theme: 'fennec',
+          mode: 'dark',
+          onThemeChange: vi.fn(),
+          onModeChange: vi.fn(),
+          onApiKeyChange: vi.fn(),
+          onServerDeleted: vi.fn(),
+          onChangeServerAddress: vi.fn(),
+        },
+      });
+
+      await vi.waitFor(() => {
+        expect(stage.querySelector('#library-results article')).not.toBeNull();
+      });
+      await flushFrames();
+
+      const results = stage.querySelector<HTMLElement>('#library-results')!;
+      expect((results.firstElementChild as HTMLElement).style.height).toBe('160px');
+
+      const getComputedStyleSpy = vi.spyOn(window, 'getComputedStyle');
+      const getBoundingClientRectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect');
+      getComputedStyleSpy.mockClear();
+      getBoundingClientRectSpy.mockClear();
+
+      const firstCard = results.querySelector<HTMLElement>('[data-book-index="0"]')!;
+      const cardsObserverCallback = observerCallbacks[1]!;
+      cardsObserverCallback(
+        [
+          {
+            target: firstCard,
+            borderBoxSize: [{ blockSize: 272.4, inlineSize: 288 }],
+            contentBoxSize: [{ blockSize: 272.4, inlineSize: 288 }],
+            devicePixelContentBoxSize: [],
+            contentRect: { height: 272.4, width: 288 } as DOMRectReadOnly,
+          },
+        ],
+        {} as ResizeObserver,
+      );
+      await flushFrames();
+
+      expect((results.firstElementChild as HTMLElement).style.height).toBe(
+        `${273 + LIST_ROW_GAP_PX}px`,
+      );
+      expect(results.style.height).toBe(`${80 * (273 + LIST_ROW_GAP_PX)}px`);
+      expect(getComputedStyleSpy).not.toHaveBeenCalled();
+      expect(getBoundingClientRectSpy).not.toHaveBeenCalled();
+    } finally {
+      globalThis.ResizeObserver = originalResizeObserver;
+    }
   });
 
   it('falls back to window dimensions without .app-stage and refreshes metrics after closeReader', async () => {

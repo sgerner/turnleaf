@@ -2,6 +2,7 @@ export type LibraryViewMode = 'grid' | 'list';
 
 export const GRID_GAP_PX = 16;
 export const GRID_ROW_GAP_PX = 32;
+export const LIST_ROW_GAP_PX = 16;
 
 // Skeleton scales font sizes by --text-scaling (`scale`):
 // - Title (`line-clamp-2 text-base leading-snug`): unitless 1.375 line-height -> 2 * 1.375rem * scale
@@ -70,6 +71,35 @@ export function resultsContainerHeight(
   const height = Number.isFinite(totalHeight) ? Math.max(0, totalHeight) : 0;
   if (height === 0) return 0;
   return viewMode === 'grid' ? Math.max(0, height - GRID_ROW_GAP_PX) : height;
+}
+
+/**
+ * Minimum Grid card width in rem units so the top-left `.badge-icon`
+ * (`left-2` + `w-7` = `2.25rem`) and top-right `[data-book-actions]` button
+ * (`right-3` + `w-11` = `3.5rem`) keep at least `0.25rem` of horizontal
+ * separation when root text size scales up to 200%.
+ */
+const MIN_GRID_CARD_REM = 6;
+
+export function columnsForLibraryWidth(
+  width: number,
+  viewMode: LibraryViewMode,
+  remPx = 16,
+  gapPx = GRID_GAP_PX,
+): number {
+  if (viewMode === 'list') return 1;
+  const safeWidth = Math.max(0, Number.isFinite(width) ? width : 0);
+  const safeRem = Number.isFinite(remPx) && remPx > 0 ? remPx : 16;
+  const safeGap = Math.max(0, Number.isFinite(gapPx) ? gapPx : 0);
+
+  let desired = 2;
+  if (safeWidth >= 1024) desired = 5;
+  else if (safeWidth >= 768) desired = 4;
+  else if (safeWidth >= 640) desired = 3;
+
+  const minCardWidth = safeRem * MIN_GRID_CARD_REM;
+  const maxFitting = Math.max(1, Math.floor((safeWidth + safeGap) / (minCardWidth + safeGap)));
+  return Math.max(1, Math.min(desired, maxFitting));
 }
 
 /**

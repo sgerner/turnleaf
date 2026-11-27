@@ -143,7 +143,7 @@
 </script>
 
 {#if compact}
-  <div class="rounded-xl border border-surface-500/25 p-3 text-left">
+  <div class="min-w-0 rounded-xl border border-surface-500/25 p-3 text-left">
     <div class="flex flex-wrap items-baseline justify-between gap-2">
       <p class="text-xs font-medium uppercase tracking-wider text-surface-800-200">
         Diagnostics ({diagnosticCount})
@@ -154,14 +154,14 @@
     </div>
     <div class="mt-2 flex flex-wrap gap-2">
       <button
-        class="btn btn-sm preset-tonal-surface !text-sm"
+        class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface !text-sm"
         type="button"
         onclick={() => void copyDiagnostics()}
       >
         Copy diagnostics
       </button>
       <button
-        class="btn btn-sm preset-tonal-surface !text-sm"
+        class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface !text-sm"
         type="button"
         disabled={exporting}
         onclick={() => void downloadDiagnostics()}
@@ -169,14 +169,14 @@
         Download log
       </button>
       <button
-        class="btn btn-sm preset-tonal-surface !text-sm"
+        class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface !text-sm"
         type="button"
         onclick={showDiagnostics}
       >
         {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
       </button>
       <button
-        class="btn btn-sm preset-tonal-surface !text-sm"
+        class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface !text-sm"
         type="button"
         onclick={() => void clearDiagnosticLog()}
       >
@@ -197,7 +197,7 @@
           aria-label="Turnleaf diagnostics log"
           onclick={selectDiagnostics}></textarea>
         <button
-          class="btn btn-sm preset-tonal-surface justify-self-start !text-sm"
+          class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface justify-self-start !text-sm"
           type="button"
           onclick={selectDiagnostics}
         >
@@ -206,7 +206,9 @@
       </div>
     {/if}
     {#if diagnosticsMessage}
-      <p class="mt-2 text-xs text-surface-800-200" role="status">{diagnosticsMessage}</p>
+      <p class="mt-2 break-words text-xs text-surface-800-200" role="status">
+        {diagnosticsMessage}
+      </p>
     {/if}
   </div>
 {:else}
@@ -217,12 +219,16 @@
       routes, HTTP statuses, and failure categories, and stays in app-private storage until you
       clear it. Review it before sharing.
     </p>
-    <div class="mt-3 grid grid-cols-2 gap-2">
-      <button class="btn preset-tonal-surface" type="button" onclick={() => void copyDiagnostics()}>
+    <div class="mt-3 grid grid-cols-[repeat(auto-fit,minmax(min(100%,8rem),1fr))] gap-2">
+      <button
+        class="btn btn-multiline min-h-11 preset-tonal-surface"
+        type="button"
+        onclick={() => void copyDiagnostics()}
+      >
         Copy diagnostics
       </button>
       <button
-        class="btn preset-tonal-surface"
+        class="btn btn-multiline min-h-11 preset-tonal-surface"
         type="button"
         disabled={exporting}
         onclick={() => void downloadDiagnostics()}
@@ -230,7 +236,11 @@
         Download log
       </button>
     </div>
-    <button class="btn preset-tonal-surface mt-2 w-full" type="button" onclick={showDiagnostics}>
+    <button
+      class="btn btn-multiline min-h-11 preset-tonal-surface mt-2 w-full"
+      type="button"
+      onclick={showDiagnostics}
+    >
       {diagnosticsVisible ? 'Hide diagnostics' : 'View diagnostics'}
     </button>
     {#if diagnosticsVisible}
@@ -246,20 +256,26 @@
           bind:value={diagnosticsOutput}
           aria-label="Turnleaf diagnostics log"
           onclick={selectDiagnostics}></textarea>
-        <button class="btn preset-tonal-surface" type="button" onclick={selectDiagnostics}>
+        <button
+          class="btn btn-multiline min-h-11 preset-tonal-surface"
+          type="button"
+          onclick={selectDiagnostics}
+        >
           Select all text
         </button>
       </div>
     {/if}
     <button
-      class="btn preset-tonal-surface mt-2 w-full"
+      class="btn btn-multiline min-h-11 preset-tonal-surface mt-2 w-full"
       type="button"
       onclick={() => void clearDiagnosticLog()}
     >
       Clear diagnostics
     </button>
     {#if diagnosticsMessage}
-      <p class="mt-2 text-sm text-surface-700-300" role="status">{diagnosticsMessage}</p>
+      <p class="mt-2 break-words text-sm text-surface-700-300" role="status">
+        {diagnosticsMessage}
+      </p>
     {/if}
   </section>
 {/if}

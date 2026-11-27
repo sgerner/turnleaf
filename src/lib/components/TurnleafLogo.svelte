@@ -25,8 +25,11 @@
   .turnleaf-logo {
     --turnleaf-logo-size: 3.5rem;
     display: inline-flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.85rem;
+    max-width: 100%;
+    min-width: 0;
   }
 
   .turnleaf-image {

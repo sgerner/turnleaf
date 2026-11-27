@@ -1137,6 +1137,15 @@
       if (searchController === controller) {
         searching = false;
         searchController = null;
+        if (searchVisible && searchPanel && !searchPanel.contains(document.activeElement)) {
+          void tick().then(() => {
+            if (searchVisible && searchPanel && !searchPanel.contains(document.activeElement)) {
+              (
+                searchPanel.querySelector<HTMLElement>('button[type="submit"]') ?? searchPanel
+              ).focus();
+            }
+          });
+        }
       }
     }
   }
@@ -1582,7 +1591,7 @@
         <div class="reader-toolbar">
           <div class="reader-toolbar-actions">
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={onBack}
               aria-label="Back to library"
@@ -1597,7 +1606,7 @@
               <span class="reader-toolbar-label">Back</span>
             </button>
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (tocVisible ? closeToc() : openToc())}
               aria-label="Contents"
@@ -1611,7 +1620,7 @@
               <span class="reader-toolbar-label">Contents</span>
             </button>
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (settingsVisible ? closeSettings() : openSettings())}
               aria-label="Text, reading appearance"
@@ -1625,7 +1634,7 @@
               <span class="reader-toolbar-label">Text</span>
             </button>
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (bookmarksVisible ? closeBookmarks() : openBookmarks())}
               aria-label="Marks, bookmarks and history"
@@ -1642,7 +1651,7 @@
               <span class="reader-toolbar-label">Marks</span>
             </button>
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (annotationsVisible ? closeAnnotations() : openAnnotations())}
               aria-label="Notes: highlights and annotations"
@@ -1659,7 +1668,7 @@
               <span class="reader-toolbar-label">Notes</span>
             </button>
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={() => (searchVisible ? closeSearch() : openSearch())}
               aria-label="Search this book"
@@ -1676,7 +1685,7 @@
               <span class="reader-toolbar-label">Search</span>
             </button>
             <button
-              class="btn min-w-[2.75rem] preset-tonal-surface min-h-12"
+              class="btn preset-tonal-surface min-h-12"
               type="button"
               onclick={() => syncLatestLocation()}
               aria-label="Sync latest reading position"
@@ -1763,11 +1772,15 @@
             'Close reading appearance',
             closeSettings,
           )}
-          <div class="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Reading color mode">
+          <div
+            class="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,6rem),1fr))] gap-2"
+            role="group"
+            aria-label="Reading color mode"
+          >
             {#each ['light', 'dark'] as mode (mode)}
               <button
                 class:active-mode={appearance.mode === mode}
-                class="btn preset-outlined-surface-300-700 capitalize"
+                class="btn btn-multiline preset-outlined-surface-300-700 capitalize"
                 type="button"
                 aria-pressed={appearance.mode === mode}
                 onclick={() => updateAppearance({ mode: mode as ReadingMode })}
@@ -1958,14 +1971,14 @@
             closeToc,
           )}
           {#snippet contentsList(items: TocItem[])}
-            <ul class="mt-2 grid list-none gap-1 p-0">
+            <ul class="mt-2 grid min-w-0 list-none gap-1 p-0">
               {#each items as item, index (`${item.href}-${index}`)}
                 {@const itemSectionHref = canonicalSectionHref(item.href)}
                 {@const isCurrent =
                   activeSectionHref !== '' && itemSectionHref === activeSectionHref}
-                <li>
+                <li class="min-w-0">
                   <button
-                    class="btn w-full justify-start text-left {isCurrent
+                    class="btn btn-multiline min-w-0 w-full justify-start whitespace-normal text-left {isCurrent
                       ? 'preset-filled-primary-700-300'
                       : ''}"
                     aria-current={isCurrent ? 'location' : undefined}
@@ -1978,7 +1991,7 @@
                     {item.label}
                   </button>
                   {#if item.children.length > 0}
-                    <div class="ml-4 border-l border-surface-300/50 pl-2">
+                    <div class="ml-3 min-w-0 border-l border-surface-300/50 pl-2">
                       {@render contentsList(item.children)}
                     </div>
                   {/if}
@@ -1988,7 +2001,7 @@
           {/snippet}
           <div
             bind:this={tocScrollContainer}
-            class="mt-3 max-h-[55dvh] overflow-auto"
+            class="mt-3 min-w-0 max-h-[55dvh] overflow-auto"
             onscroll={scheduleTocVirtualWindow}
           >
             {#if toc.length > 0}
@@ -2017,7 +2030,7 @@
                         style:margin-left={row.depth > 0 ? `${row.depth}rem` : undefined}
                       >
                         <button
-                          class="btn w-full justify-start text-left {isCurrent
+                          class="btn min-w-0 w-full justify-start text-left {isCurrent
                             ? 'preset-filled-primary-700-300'
                             : ''}"
                           aria-current={isCurrent ? 'location' : undefined}
@@ -2050,7 +2063,7 @@
       {#if searchVisible}
         <div
           bind:this={searchPanel}
-          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          class="reader-settings card preset-filled-surface-50-950 relative overflow-auto"
           id="reader-search"
           role="dialog"
           aria-modal="true"
@@ -2066,7 +2079,7 @@
             closeSearch,
           )}
           <form
-            class="mt-4 flex gap-2"
+            class="responsive-input-row mt-4"
             onsubmit={(event) => {
               event.preventDefault();
               void runSearch();
@@ -2081,12 +2094,16 @@
               placeholder="Find a word or phrase"
               autocomplete="off"
             />
-            <button class="btn preset-filled-primary-700-300" type="submit" disabled={searching}>
+            <button
+              class="btn btn-multiline preset-filled-primary-700-300"
+              type="submit"
+              disabled={searching}
+            >
               {searching ? 'Searching…' : 'Search'}
             </button>
           </form>
           {#if searchError}
-            <p class="mt-3 text-sm text-error-700-300" role="alert">{searchError}</p>
+            <p class="mt-3 break-words text-sm text-error-700-300" role="alert">{searchError}</p>
           {/if}
           <p class="mt-3 text-sm text-surface-700-300" role="status">
             {#if searched && !searching && !searchError}
@@ -2096,20 +2113,22 @@
             {/if}
           </p>
           {#if searchResults.length > 0}
-            <ol class="mt-4 grid gap-2" aria-label="Search results">
+            <ol class="mt-4 grid min-w-0 gap-2" aria-label="Search results">
               {#each searchResults as result, index (result.cfi)}
-                <li>
+                <li class="min-w-0">
                   <button
-                    class="btn w-full justify-start text-left"
+                    class="btn btn-multiline min-w-0 w-full items-start justify-start whitespace-normal text-left"
                     type="button"
                     onclick={() => void openSearchResult(result)}
                   >
-                    <span class="mr-2 text-xs text-surface-700-300">{index + 1}</span>
-                    <span class="min-w-0">
-                      <span class="mb-1 block text-xs text-surface-700-300">
+                    <span class="mr-2 shrink-0 text-xs text-surface-700-300">{index + 1}</span>
+                    <span class="min-w-0 flex-1">
+                      <span class="mb-1 block break-words text-xs text-surface-700-300">
                         {searchResultSectionLabel(result)}
                       </span>
-                      <span class="line-clamp-3">{result.excerpt}</span>
+                      <span class="line-clamp-3 whitespace-normal break-words">
+                        {result.excerpt}
+                      </span>
                     </span>
                   </button>
                 </li>
@@ -2122,7 +2141,7 @@
       {#if bookmarksVisible}
         <div
           bind:this={bookmarksPanel}
-          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          class="reader-settings card preset-filled-surface-50-950 relative overflow-auto"
           id="reader-bookmarks"
           role="dialog"
           aria-modal="true"
@@ -2142,7 +2161,7 @@
           </p>
           {#if location}
             <button
-              class="btn mt-4 w-full preset-tonal-primary"
+              class="btn btn-multiline mt-4 min-w-0 w-full whitespace-normal preset-tonal-primary"
               type="button"
               data-reader-focus="bookmark-current"
               onclick={toggleCurrentBookmark}
@@ -2164,12 +2183,12 @@
             {#if bookmarks.length === 0}
               <p class="mt-2 text-sm text-surface-700-300">No bookmarks yet.</p>
             {:else}
-              <ul class="mt-2 grid list-none gap-2 p-0">
+              <ul class="mt-2 grid min-w-0 list-none gap-2 p-0">
                 {#each bookmarks as bookmark (bookmark.id)}
-                  <li class="rounded-lg preset-tonal-surface p-2">
+                  <li class="min-w-0 rounded-lg preset-tonal-surface p-2">
                     {#if editingBookmarkId === bookmark.id}
                       <form
-                        class="flex gap-2"
+                        class="responsive-input-row"
                         onsubmit={(event) => {
                           event.preventDefault();
                           saveBookmarkName(bookmark);
@@ -2182,14 +2201,17 @@
                           data-reader-focus-id={bookmark.id}
                           bind:value={bookmarkDraft}
                         />
-                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
+                        <button
+                          class="btn btn-sm btn-multiline preset-filled-primary-700-300"
+                          type="submit"
+                        >
                           Save
                         </button>
                       </form>
                     {:else}
-                      <div class="flex items-center gap-2">
+                      <div class="flex flex-wrap items-center gap-2">
                         <button
-                          class="min-w-0 flex-1 truncate text-left text-sm font-medium"
+                          class="btn btn-multiline min-w-[min(100%,8rem)] flex-1 justify-start whitespace-normal px-2 py-1.5 text-left text-sm font-medium"
                           type="button"
                           data-reader-focus="bookmark-location"
                           data-reader-focus-id={bookmark.id}
@@ -2197,26 +2219,28 @@
                         >
                           {bookmark.label}
                         </button>
-                        <button
-                          class="btn btn-sm preset-tonal-surface h-11 w-11 p-0"
-                          type="button"
-                          aria-label={`Rename ${bookmark.label}`}
-                          data-reader-focus="bookmark-rename"
-                          data-reader-focus-id={bookmark.id}
-                          onclick={() => startBookmarkEdit(bookmark)}
-                        >
-                          <span aria-hidden="true">✎</span>
-                        </button>
-                        <button
-                          class="btn btn-sm preset-tonal-error h-11 w-11 p-0"
-                          type="button"
-                          aria-label={`Delete ${bookmark.label}`}
-                          data-reader-focus="bookmark-delete"
-                          data-reader-focus-id={bookmark.id}
-                          onclick={() => deleteBookmark(bookmark)}
-                        >
-                          <span aria-hidden="true">×</span>
-                        </button>
+                        <div class="ml-auto flex shrink-0 items-center gap-2">
+                          <button
+                            class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
+                            type="button"
+                            aria-label={`Rename ${bookmark.label}`}
+                            data-reader-focus="bookmark-rename"
+                            data-reader-focus-id={bookmark.id}
+                            onclick={() => startBookmarkEdit(bookmark)}
+                          >
+                            <span aria-hidden="true">✎</span>
+                          </button>
+                          <button
+                            class="btn btn-sm preset-tonal-error h-11 w-11 shrink-0 p-0"
+                            type="button"
+                            aria-label={`Delete ${bookmark.label}`}
+                            data-reader-focus="bookmark-delete"
+                            data-reader-focus-id={bookmark.id}
+                            onclick={() => deleteBookmark(bookmark)}
+                          >
+                            <span aria-hidden="true">×</span>
+                          </button>
+                        </div>
                       </div>
                     {/if}
                   </li>
@@ -2235,11 +2259,11 @@
             {#if locationHistory.length === 0}
               <p class="mt-2 text-sm text-surface-700-300">Recent page turns will appear here.</p>
             {:else}
-              <ul class="mt-2 grid list-none gap-1 p-0">
+              <ul class="mt-2 grid min-w-0 list-none gap-1 p-0">
                 {#each locationHistory as entry (entry.id + entry.savedAt)}
-                  <li>
+                  <li class="min-w-0">
                     <button
-                      class="btn w-full justify-start text-left text-sm"
+                      class="btn btn-multiline min-w-0 w-full justify-start whitespace-normal text-left text-sm"
                       type="button"
                       onclick={() => void returnToLocation(entry)}
                     >
@@ -2256,7 +2280,7 @@
       {#if annotationsVisible}
         <div
           bind:this={annotationsPanel}
-          class="reader-settings card preset-filled-surface-50-950 relative max-h-[75dvh] overflow-auto"
+          class="reader-settings card preset-filled-surface-50-950 relative overflow-auto"
           id="reader-annotations"
           role="dialog"
           aria-modal="true"
@@ -2289,17 +2313,20 @@
                 }
               }}
             >
-              <p class="text-sm italic">“{selectedText.text}”</p>
+              <p class="break-words text-sm italic">“{selectedText.text}”</p>
               <label class="label mt-3">
                 <span class="label-text">Note (optional)</span>
                 <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
               </label>
-              <div class="mt-3 flex gap-2">
-                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button
+                  class="btn btn-multiline preset-filled-primary-700-300 flex-1"
+                  type="submit"
+                >
                   Save highlight
                 </button>
                 <button
-                  class="btn preset-tonal-surface"
+                  class="btn btn-multiline preset-tonal-surface"
                   type="button"
                   onclick={() => {
                     selectedText = null;
@@ -2341,14 +2368,17 @@
                 </select>
               </label>
               {#if activePassage}
-                <p class="mt-2 line-clamp-4 text-sm italic">“{activePassage.text}”</p>
+                <p class="mt-2 line-clamp-4 break-words text-sm italic">“{activePassage.text}”</p>
               {/if}
               <label class="label mt-3">
                 <span class="label-text">Note (optional)</span>
                 <textarea class="textarea min-h-20" bind:value={annotationDraft}></textarea>
               </label>
-              <div class="mt-3 flex gap-2">
-                <button class="btn preset-filled-primary-700-300 flex-1" type="submit">
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button
+                  class="btn btn-multiline preset-filled-primary-700-300 flex-1"
+                  type="submit"
+                >
                   Save highlight
                 </button>
               </div>
@@ -2365,7 +2395,7 @@
               Saved highlights
             </h3>
             <button
-              class="btn btn-sm preset-tonal-surface"
+              class="btn btn-sm btn-multiline preset-tonal-surface"
               type="button"
               onclick={() => void exportAnnotations()}
               disabled={annotations.length === 0 || exporting}
@@ -2373,7 +2403,7 @@
               Export Markdown
             </button>
             <button
-              class="btn btn-sm preset-tonal-surface"
+              class="btn btn-sm btn-multiline preset-tonal-surface"
               type="button"
               onclick={() => void exportAnnotations(true)}
               disabled={annotations.length === 0 || exporting}
@@ -2381,7 +2411,7 @@
               Copy Markdown
             </button>
           </div>
-          <p class="text-sm" role="status">{exportMessage}</p>
+          <p class="break-words text-sm" role="status">{exportMessage}</p>
           {#if exportFallback}
             <label class="label mt-2">
               <span class="label-text">Exported Markdown</span>
@@ -2391,11 +2421,11 @@
           {#if annotations.length === 0}
             <p class="mt-2 text-sm text-surface-700-300">No highlights yet.</p>
           {:else}
-            <div class="mt-2 grid gap-2">
+            <div class="mt-2 grid min-w-0 gap-2">
               {#each annotations as annotation (annotation.id)}
-                <article class="rounded-lg preset-tonal-surface p-3">
+                <article class="min-w-0 rounded-lg preset-tonal-surface p-3">
                   <button
-                    class="w-full text-left text-sm italic"
+                    class="min-h-11 min-w-0 w-full whitespace-normal break-words text-left text-sm italic"
                     type="button"
                     onclick={() => {
                       void session?.displayCfi(annotation.cfi);
@@ -2423,12 +2453,15 @@
                             annotationDrafts.set(annotation.id, event.currentTarget.value)}
                         ></textarea>
                       </label>
-                      <div class="flex gap-2">
-                        <button class="btn btn-sm preset-filled-primary-700-300" type="submit">
+                      <div class="flex flex-wrap gap-2">
+                        <button
+                          class="btn btn-sm btn-multiline preset-filled-primary-700-300"
+                          type="submit"
+                        >
                           Save
                         </button>
                         <button
-                          class="btn btn-sm preset-tonal-surface"
+                          class="btn btn-sm btn-multiline preset-tonal-surface"
                           type="button"
                           onclick={() => cancelAnnotationEdit(annotation)}
                         >
@@ -2438,11 +2471,11 @@
                     </form>
                   {:else}
                     {#if annotation.note}
-                      <p class="mt-2 whitespace-pre-wrap text-sm">{annotation.note}</p>
+                      <p class="mt-2 whitespace-pre-wrap break-words text-sm">{annotation.note}</p>
                     {/if}
-                    <div class="mt-2 flex justify-end gap-2">
+                    <div class="mt-2 flex flex-wrap justify-end gap-2">
                       <button
-                        class="btn btn-sm preset-tonal-surface"
+                        class="btn btn-sm btn-multiline preset-tonal-surface"
                         type="button"
                         aria-label={`Edit note for ${annotation.excerpt}`}
                         data-reader-focus="annotation-edit"
@@ -2452,7 +2485,7 @@
                         Edit note
                       </button>
                       <button
-                        class="btn btn-sm preset-tonal-error"
+                        class="btn btn-sm btn-multiline preset-tonal-error"
                         type="button"
                         aria-label={`Delete highlight ${annotation.excerpt}`}
                         onclick={() => deleteAnnotation(annotation)}
@@ -2512,7 +2545,7 @@
     >
       <div
         bind:this={syncConfirmationPanel}
-        class="card preset-filled-surface-50-950 max-h-[calc(100dvh-2rem)] w-full max-w-sm overflow-auto p-5 shadow-xl"
+        class="card preset-filled-surface-50-950 max-h-[calc(100dvh-2rem)] min-w-0 w-full max-w-sm overflow-auto p-5 shadow-xl"
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="reader-sync-confirm-title"
@@ -2522,22 +2555,25 @@
           trapModalKeydown(event, syncConfirmationPanel!, () => closeSyncConfirmation())}
         transition:fly={{ y: 12, duration: 150 }}
       >
-        <h2 id="reader-sync-confirm-title" class="font-serif text-xl">
+        <h2 id="reader-sync-confirm-title" class="break-words font-serif text-xl">
           Move to Kavita’s latest position?
         </h2>
-        <p id="reader-sync-confirm-description" class="mt-3 text-sm text-surface-700-300">
+        <p
+          id="reader-sync-confirm-description"
+          class="mt-3 break-words text-sm text-surface-700-300"
+        >
           Kavita has a different reading position saved. Move this reader there?
         </p>
         <div class="mt-5 flex flex-wrap justify-end gap-2">
           <button
-            class="btn min-h-11 preset-tonal-surface"
+            class="btn btn-multiline min-h-11 preset-tonal-surface"
             type="button"
             onclick={() => closeSyncConfirmation()}
           >
             Stay here
           </button>
           <button
-            class="btn min-h-11 preset-filled-primary-700-300"
+            class="btn btn-multiline min-h-11 preset-filled-primary-700-300"
             type="button"
             onclick={() => void confirmSyncLocation()}
           >
@@ -2559,7 +2595,7 @@
     >
       <div
         bind:this={errorPanel}
-        class="card preset-tonal-error max-h-[calc(100dvh-2rem)] w-full max-w-sm overflow-auto p-5 text-center shadow-xl"
+        class="card preset-tonal-error max-h-[calc(100dvh-2rem)] min-w-0 w-full max-w-sm overflow-auto p-5 text-center shadow-xl"
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="reader-error-title"
@@ -2568,16 +2604,21 @@
         onkeydown={(event) => trapModalKeydown(event, errorPanel!, handleErrorDialogClose)}
         transition:fly={{ y: 12, duration: 150 }}
       >
-        <h2 id="reader-error-title" class="font-serif text-xl">
+        <h2 id="reader-error-title" class="break-words font-serif text-xl">
           {startupOpenFailed ? 'Unable to open book' : 'Reader problem'}
         </h2>
-        <p id="reader-error-description" class="mt-3 text-sm" aria-live="polite" aria-atomic="true">
+        <p
+          id="reader-error-description"
+          class="mt-3 break-words text-sm"
+          aria-live="polite"
+          aria-atomic="true"
+        >
           {error}
         </p>
         <div class="mt-5 flex flex-wrap justify-center gap-3">
           {#if canDismissError()}
             <button
-              class="btn min-h-11 preset-filled-primary-700-300"
+              class="btn btn-multiline min-h-11 preset-filled-primary-700-300"
               type="button"
               onclick={dismissError}
             >
@@ -2586,7 +2627,7 @@
           {/if}
           {#if startupOpenFailed && onRetryDownload}
             <button
-              class="btn min-h-11 preset-filled-primary-700-300"
+              class="btn btn-multiline min-h-11 preset-filled-primary-700-300"
               type="button"
               disabled={retryingReader}
               onclick={() => void retryReaderOpen()}
@@ -2594,7 +2635,11 @@
               {retryingReader ? 'Retrying download…' : 'Retry download'}
             </button>
           {/if}
-          <button class="btn min-h-11 preset-filled-error-500" type="button" onclick={onBack}>
+          <button
+            class="btn btn-multiline min-h-11 preset-filled-error-500"
+            type="button"
+            onclick={onBack}
+          >
             Back
           </button>
         </div>
@@ -2607,6 +2652,7 @@
   .reader-shell {
     position: fixed;
     inset: 0;
+    z-index: 30;
     overflow: hidden;
     background: var(--reader-background);
     color: var(--reader-text);
@@ -2721,6 +2767,11 @@
     pointer-events: auto;
   }
 
+  .reader-settings[role='dialog'] > :global(h2) {
+    padding-right: 3rem;
+    overflow-wrap: break-word;
+  }
+
   .reader-settings :global(button),
   .reader-settings :global(input),
   .reader-settings :global(select) {
@@ -2748,28 +2799,33 @@
   }
 
   .reader-toolbar {
-    display: flex;
+    container-type: inline-size;
+    display: block;
     min-width: 0;
     width: 100%;
-    align-items: center;
-    gap: 0.75rem;
   }
 
   .reader-toolbar-actions {
     display: grid;
     min-width: 0;
-    flex: 1 1 auto;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
-    gap: 0.5rem;
+    width: 100%;
+    grid-template-columns: repeat(auto-fit, minmax(44px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, max(44px, 2.75rem)), 1fr));
+    gap: 0.25rem;
   }
 
   .reader-toolbar-actions :global(button) {
-    min-width: 2.75rem;
-    min-height: 2.75rem;
+    min-width: 44px;
+    min-width: min(100%, max(44px, 2.75rem));
+    min-height: 44px;
+    min-height: max(44px, 2.75rem);
+    width: 100%;
+    padding-inline: 0.5rem;
     overflow: hidden;
   }
 
   .reader-toolbar-label {
+    display: none;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2777,10 +2833,11 @@
   }
 
   .reader-toolbar-icon {
-    display: none;
+    display: block;
     width: 1.25rem;
     height: 1.25rem;
     flex: 0 0 auto;
+    margin-inline: auto;
   }
 
   .reader-toolbar-icon-always {
@@ -2788,6 +2845,7 @@
   }
 
   .reader-toolbar-title {
+    display: none;
     min-width: 0;
     max-width: 14rem;
     flex: 0 1 14rem;
@@ -2800,33 +2858,38 @@
     color: var(--color-primary-500);
   }
 
-  @media (max-width: 40rem) {
+  @container (min-width: 44rem) {
     .reader-toolbar {
-      display: block;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 0.75rem;
     }
 
     .reader-toolbar-actions {
-      width: 100%;
-      gap: 0.25rem;
+      flex: 1 1 36rem;
+      grid-template-columns: repeat(auto-fit, minmax(6rem, 1fr));
+      gap: 0.5rem;
+    }
+
+    .reader-toolbar-actions :global(button) {
+      padding-inline: 0.75rem;
     }
 
     .reader-toolbar-label {
+      display: inline;
+    }
+
+    .reader-toolbar-icon:not(.reader-toolbar-icon-always) {
       display: none;
     }
 
-    .reader-toolbar-icon {
-      display: block;
-      margin-inline: auto;
+    .reader-toolbar-icon-always {
+      margin-inline: 0;
     }
 
     .reader-toolbar-title {
-      display: none;
-    }
-  }
-
-  @media (max-width: 22.5rem) {
-    .reader-toolbar-actions {
-      grid-template-columns: repeat(4, minmax(2.75rem, 1fr));
+      display: block;
     }
   }
 
@@ -2871,15 +2934,23 @@
 
   .reader-settings {
     position: absolute;
-    left: 1rem;
-    right: 1rem;
+    left: clamp(0.5rem, 3vw, 1rem);
+    right: clamp(0.5rem, 3vw, 1rem);
     bottom: max(4rem, calc(env(safe-area-inset-bottom) + 3rem));
     margin-inline: auto;
     max-width: 30rem;
     max-height: min(75dvh, calc(100dvh - max(4rem, env(safe-area-inset-bottom) + 3rem) - 1rem));
-    overflow: auto;
-    padding: 1.25rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding: clamp(0.75rem, 4vw, 1.25rem);
     z-index: 1;
+  }
+
+  @media (max-height: 28rem) {
+    .reader-settings {
+      bottom: max(0.5rem, env(safe-area-inset-bottom));
+      max-height: calc(100dvh - max(1rem, env(safe-area-inset-bottom) + 0.5rem));
+    }
   }
 
   .reader-panel-backdrop {

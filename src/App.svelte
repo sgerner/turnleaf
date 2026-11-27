@@ -177,7 +177,7 @@
         >
           <div class="min-w-0">
             <p class="text-xs uppercase tracking-[0.3em] text-surface-700-300">Update available</p>
-            <p class="mt-1 font-medium text-surface-950-50">
+            <p class="mt-1 break-words font-medium text-surface-950-50">
               Turnleaf {displayVersion(releaseBanner.version)}{releaseBanner.title
                 ? ` · ${releaseBanner.title}`
                 : ''}
@@ -187,7 +187,7 @@
           <div class="flex flex-wrap items-center gap-2">
             {#if releaseBanner.downloadUrl}
               <a
-                class="btn btn-sm preset-filled-success-500 !text-sm"
+                class="btn btn-sm btn-multiline min-h-11 preset-filled-success-500 !text-sm"
                 href={releaseBanner.downloadUrl}
                 target="_blank"
                 rel="noreferrer"
@@ -196,7 +196,7 @@
               </a>
             {/if}
             <a
-              class="btn btn-sm preset-filled-tertiary-500 !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-filled-tertiary-500 !text-sm"
               href={releaseBanner.releaseUrl}
               target="_blank"
               rel="noreferrer"
@@ -204,7 +204,7 @@
               Release notes <span class="sr-only">(opens in a new tab)</span>
             </a>
             <button
-              class="btn btn-sm preset-tonal-error !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-tonal-error !text-sm"
               type="button"
               onclick={() => (releaseBanner = null)}
             >
@@ -246,11 +246,14 @@
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
     {:else if startupError}
-      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
-        <p>{startupError}</p>
+      <div
+        class="alert preset-tonal-error mx-4 mt-6 flex max-w-lg flex-col gap-3 sm:mx-auto"
+        role="alert"
+      >
+        <p class="break-words">{startupError}</p>
         <div class="flex flex-wrap gap-2">
           <button
-            class="btn btn-sm preset-filled-error-500 !text-sm"
+            class="btn btn-sm btn-multiline min-h-11 preset-filled-error-500 !text-sm"
             type="button"
             onclick={() => void loadLocalData()}
             disabled={repairing}
@@ -259,7 +262,7 @@
           </button>
           {#if server}
             <button
-              class="btn btn-sm preset-tonal-surface !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-tonal-surface !text-sm"
               type="button"
               onclick={() => (startupError = '')}
             >
@@ -267,7 +270,7 @@
             </button>
           {:else}
             <button
-              class="btn btn-sm preset-tonal-error !text-sm"
+              class="btn btn-sm btn-multiline min-h-11 preset-tonal-error !text-sm"
               type="button"
               disabled={repairing}
               onclick={() => {
