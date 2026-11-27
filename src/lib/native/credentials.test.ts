@@ -111,3 +111,34 @@ it('keeps the newly saved key ready when removing an older credential reference'
 
   expect(getCredentialState()).toEqual({ status: 'ready', epoch: activeEpoch });
 });
+
+it('fails closed for any non-probe credential when coordinator status is missing, unreadable, rejected, or mismatched', async () => {
+  const {
+    canSendCredential,
+    getCredentialState,
+    markCredentialMissing,
+    markCredentialRejected,
+    markCredentialUnreadable,
+    saveApiKey,
+  } = await import('./credentials');
+
+  markCredentialMissing(null);
+  expect(canSendCredential('stale-in-memory-key')).toBe(false);
+  expect(canSendCredential('stale-in-memory-key', getCredentialState().epoch)).toBe(false);
+
+  markCredentialUnreadable('server_primary_api_key');
+  expect(canSendCredential('stale-in-memory-key')).toBe(false);
+  expect(canSendCredential('stale-in-memory-key', getCredentialState().epoch)).toBe(false);
+
+  await saveApiKey('server_primary_api_key', 'active-key');
+  const readyEpoch = getCredentialState().epoch;
+  expect(canSendCredential('active-key', readyEpoch)).toBe(true);
+  expect(canSendCredential('active-key')).toBe(true);
+  expect(canSendCredential('mismatched-key')).toBe(false);
+  expect(canSendCredential('mismatched-key', readyEpoch)).toBe(false);
+
+  markCredentialRejected(readyEpoch, 401);
+  expect(canSendCredential('active-key', readyEpoch)).toBe(false);
+  expect(canSendCredential('active-key')).toBe(false);
+  expect(canSendCredential('other-key')).toBe(false);
+});

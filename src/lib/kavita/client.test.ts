@@ -6,6 +6,8 @@ import { KavitaClient, KavitaError } from './client';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import {
   getCredentialState,
+  markCredentialMissing,
+  markCredentialUnreadable,
   resetCredentialState,
   saveApiKey,
   syncLoadedCredential,
@@ -1007,4 +1009,67 @@ it('trips the credential breaker when an in-flight native request returns 401 af
     statusCode: 401,
   });
   expect(client.canSendRequests()).toBe(false);
+});
+
+it('blocks non-probe requests and getProgress retries when credentials become missing or unreadable', async () => {
+  capacitorRuntime.native = true;
+  markCredentialMissing(null);
+
+  const staleClient = new KavitaClient('https://books.example.com', 'leftover-key');
+  expect(staleClient.canSendRequests()).toBe(false);
+  await expect(staleClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'authentication',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  markCredentialUnreadable('server_primary_api_key');
+  const unreadableClient = new KavitaClient('https://books.example.com', 'leftover-key');
+  expect(unreadableClient.canSendRequests()).toBe(false);
+  await expect(unreadableClient.getBookSeries()).rejects.toMatchObject({
+    kind: 'authentication',
+  });
+  expect(CapacitorHttp.request).not.toHaveBeenCalled();
+
+  // Probe requests for a candidate replacement key remain allowed while saved credentials are missing/unreadable
+  vi.mocked(CapacitorHttp.request)
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify([{ id: 1, name: 'Books', type: 2 }]),
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      url: '',
+      data: JSON.stringify({ version: '0.8.9' }),
+    });
+  await expect(
+    new KavitaClient('https://books.example.com', 'candidate-key').testConnection(),
+  ).resolves.toEqual({
+    version: '0.8.9',
+    bookLibraries: [{ id: 1, name: 'Books', type: 2 }],
+  });
+
+  // getProgress does not retry a transient error if credentials become missing mid-request
+  capacitorRuntime.native = false;
+  const active = syncLoadedCredential('active-key', 'server_primary_api_key');
+  const activeClient = new KavitaClient('https://books.example.com', 'active-key', {
+    credentialEpoch: active.epoch,
+  });
+  const fetchMock = vi.fn().mockImplementationOnce(async () => {
+    markCredentialMissing('server_primary_api_key');
+    return {
+      ok: false,
+      status: 500,
+      headers: { get: () => null },
+    };
+  });
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+  await expect(activeClient.getProgress(7)).rejects.toMatchObject({
+    kind: 'server',
+    status: 500,
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
 });

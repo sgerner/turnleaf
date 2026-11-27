@@ -40,6 +40,7 @@ import { Filesystem } from '@capacitor/filesystem';
 import { clearDiagnostics, exportDiagnostics } from '../diagnostics/log';
 import {
   getCredentialState,
+  markCredentialMissing,
   markCredentialRejected,
   resetCredentialState,
   syncLoadedCredential,
@@ -630,5 +631,61 @@ describe('native EPUB credential gating', () => {
       epoch: state.epoch,
       statusCode: 401,
     });
+  });
+
+  it('aborts EPUB retry and uncached cover transfer when credentials become missing during async setup', async () => {
+    vi.useFakeTimers();
+    const state = syncLoadedCredential('valid-key', 'server_primary_api_key');
+    vi.mocked(FileTransfer.downloadFile).mockImplementationOnce(async () => {
+      markCredentialMissing('server_primary_api_key');
+      throw { code: 'OS-PLUG-FLTR-0008' };
+    });
+
+    const downloadAttempt = expect(
+      downloadEpub(
+        'https://books.example.com/download',
+        'valid-key',
+        'server-book',
+        undefined,
+        undefined,
+        state.epoch,
+      ),
+    ).rejects.toBeDefined();
+    await Promise.all([downloadAttempt, vi.runAllTimersAsync()]);
+    expect(FileTransfer.downloadFile).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+    const coverState = syncLoadedCredential('valid-key', 'server_primary_api_key');
+    vi.mocked(FileTransfer.downloadFile).mockClear();
+    vi.mocked(Filesystem.stat).mockImplementation(async ({ path }) => {
+      if (path === 'covers/primary/99.img') {
+        throw { code: 'OS-PLUG-FILE-0008' };
+      }
+      if (path === 'covers/primary') {
+        markCredentialMissing('server_primary_api_key');
+        throw { code: 'OS-PLUG-FILE-0008' };
+      }
+      return {
+        type: 'file',
+        size: 0,
+        name: path,
+        mtime: 0,
+        uri: `file://${path}`,
+      };
+    });
+
+    await expect(
+      cacheCover(
+        'https://books.example.com/cover',
+        'valid-key',
+        99,
+        undefined,
+        'primary',
+        true,
+        'https://books.example.com',
+        coverState.epoch,
+      ),
+    ).rejects.toThrow('Offline');
+    expect(FileTransfer.downloadFile).not.toHaveBeenCalled();
   });
 });

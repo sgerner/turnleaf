@@ -208,7 +208,7 @@ export class KavitaClient {
             error.status !== undefined &&
             error.status >= 500 &&
             error.status < 600));
-      if (signal?.aborted || !retryable) throw error;
+      if (signal?.aborted || !retryable || !this.canSendRequests()) throw error;
       const progress = await this.request<unknown>(path, options);
       if (!isKavitaProgress(progress)) {
         throw new KavitaError(

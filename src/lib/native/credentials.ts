@@ -91,14 +91,10 @@ export function resolveCredentialEpoch(apiKey: string, explicitEpoch?: number): 
 
 export function canSendCredential(apiKey: string, epoch?: number): boolean {
   if (!apiKey.trim()) return false;
-  if (epoch !== undefined) {
-    if (epoch !== currentEpoch) return false;
-    if (currentStatus !== 'ready') return false;
-    if (managed && activeApiKey !== null && apiKey !== activeApiKey) return false;
-    return true;
-  }
-  if (managed && (activeApiKey === null || apiKey === activeApiKey)) {
-    return currentStatus === 'ready' && Boolean(activeApiKey?.trim());
+  if (currentStatus !== 'ready') return false;
+  if (epoch !== undefined && epoch !== currentEpoch) return false;
+  if (managed) {
+    return Boolean(activeApiKey?.trim()) && apiKey === activeApiKey;
   }
   return true;
 }

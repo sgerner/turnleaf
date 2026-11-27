@@ -4,7 +4,7 @@
   import { saveServer, type ServerConfig } from '../database/database';
   import { KavitaClient, KavitaError } from '../kavita/client';
   import { normalizeServerUrl, ServerUrlError } from '../kavita/url';
-  import { removeApiKey, saveApiKey } from '../native/credentials';
+  import { removeApiKey, saveApiKey, syncLoadedCredential } from '../native/credentials';
   import { getDiagnosticCount, recordDiagnostic, subscribeDiagnostics } from '../diagnostics/log';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import TurnleafLogo from './TurnleafLogo.svelte';
@@ -170,6 +170,7 @@
           }
         }
         apiKey = '';
+        syncLoadedCredential(key, connectedServer.credentialRef);
         onConnected(connectedServer, key);
         return;
       }
@@ -192,6 +193,7 @@
           'The connection worked, but local setup could not be saved and the auth key could not be cleaned up. Retry setup or remove the server from settings.',
       });
       apiKey = '';
+      syncLoadedCredential(key, server.credentialRef);
       onConnected(server, key);
     } catch (cause) {
       if (cause instanceof ServerUrlError) {

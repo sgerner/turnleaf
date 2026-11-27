@@ -133,6 +133,9 @@ vi.mock('@capacitor/filesystem', () => ({
   Directory: { Data: 'DATA', Documents: 'DOCUMENTS' },
   Encoding: { UTF8: 'utf8' },
   Filesystem: {
+    readFile: vi.fn(async () => {
+      throw { code: 'OS-PLUG-FILE-0008' };
+    }),
     writeFile: vi.fn(async () => ({ uri: 'file://notes.md' })),
   },
 }));
@@ -158,11 +161,11 @@ vi.mock('../database/database', async (importOriginal) => {
   const actual = await importOriginal<typeof DatabaseModule>();
   const wrap =
     <Args extends unknown[], Result>(fn: (...args: Args) => Promise<Result>) =>
-    async (...args: Args): Promise<Result> => {
+    (...args: Args): Promise<Result> => {
       const previous = runtime.native;
       runtime.native = false;
       try {
-        return await fn(...args);
+        return fn(...args);
       } finally {
         runtime.native = previous;
       }
@@ -182,6 +185,9 @@ vi.mock('../database/database', async (importOriginal) => {
     acceptRemoteProgress: wrap(actual.acceptRemoteProgress),
     markBookCompleted: wrap(actual.markBookCompleted),
     getSyncStatus: wrap(actual.getSyncStatus),
+    getPendingSync: wrap(actual.getPendingSync),
+    confirmSync: wrap(actual.confirmSync),
+    markSyncFailure: wrap(actual.markSyncFailure),
     getPreferences: wrap(actual.getPreferences),
     setPreference: wrap(actual.setPreference),
   };
@@ -332,10 +338,15 @@ vi.mock('../reader/session', () => ({
 }));
 
 import { CapacitorHttp } from '@capacitor/core';
+import { Network } from '@capacitor/network';
 import App from '../../App.svelte';
 import { clearDiagnostics } from '../diagnostics/log';
 import { EpubTransferError, cacheCover, downloadEpub } from '../downloads/native-download';
-import { getCredentialState, resetCredentialState } from '../native/credentials';
+import {
+  getCredentialState,
+  markCredentialMissing,
+  resetCredentialState,
+} from '../native/credentials';
 import type { BookRecord, ServerConfig } from '../database/database';
 
 const DB_STORAGE_KEY = 'turnleaf_browser_database_v1';
@@ -543,6 +554,12 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     nativeDownloadMock.coverResult = null;
     vi.mocked(CapacitorHttp.request).mockReset();
     vi.mocked(CapacitorHttp.get).mockReset();
+    vi.mocked(Network.getStatus)
+      .mockReset()
+      .mockImplementation(async () => ({
+        connected: runtime.online,
+        connectionType: runtime.online ? 'wifi' : 'none',
+      }));
     vi.mocked(cacheCover).mockClear();
     vi.mocked(downloadEpub).mockClear();
 
@@ -1085,5 +1102,212 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       serverConfig: ServerConfig;
     };
     expect(dbAfterReconnect.serverConfig.kavitaVersion).toBe('0.9.0');
+  });
+
+  it('cancels in-flight native startup/refresh network checks when credentials become missing and blocks catalog, sync, cover, and download requests', async () => {
+    runtime.native = true;
+    runtime.online = true;
+    seedDatabase({
+      books: [downloadedBook, onlineOnlyBook],
+      pendingSync: true,
+    });
+    secureStorageMock.values.set('server_primary_api_key', 'initial-native-key');
+
+    const pendingNetworkChecks: Array<
+      (status: { connected: boolean; connectionType: 'wifi' | 'none' }) => void
+    > = [];
+    let networkCheckCalls = 0;
+    vi.mocked(Network.getStatus).mockImplementation(() => {
+      networkCheckCalls += 1;
+      if (networkCheckCalls === 1) {
+        return Promise.resolve({ connected: true, connectionType: 'wifi' as const });
+      }
+      return new Promise((resolve) => {
+        pendingNetworkChecks.push(resolve as never);
+      });
+    });
+
+    mounted = mount(App, { target });
+    await waitForCondition(
+      () =>
+        target.querySelectorAll('[data-book-open]').length === 2 &&
+        pendingNetworkChecks.length >= 2,
+    );
+
+    // Queue a download attempt while Network.getStatus() is also suspended
+    const remoteBookOpenButton = [
+      ...target.querySelectorAll<HTMLButtonElement>('[data-book-open]'),
+    ].find((btn) => btn.getAttribute('aria-label')?.includes('Remote Novel'));
+    expect(remoteBookOpenButton).toBeDefined();
+    remoteBookOpenButton!.click();
+    await waitForCondition(() => pendingNetworkChecks.length >= 3);
+
+    // Clear the credential before any in-flight Network.getStatus() promise resolves
+    secureStorageMock.values.delete('server_primary_api_key');
+    markCredentialMissing('server_primary_api_key');
+    flushSync();
+
+    vi.mocked(cacheCover).mockClear();
+    while (pendingNetworkChecks.length > 0) {
+      pendingNetworkChecks.shift()?.({ connected: true, connectionType: 'wifi' });
+    }
+    vi.mocked(Network.getStatus).mockImplementation(async () => ({
+      connected: runtime.online,
+      connectionType: runtime.online ? 'wifi' : 'none',
+    }));
+
+    await waitForCondition(
+      () => target.querySelector('[data-credential-alert="missing"]') !== null,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(CapacitorHttp.request).not.toHaveBeenCalled();
+    expect(downloadEpub).not.toHaveBeenCalled();
+    for (const call of vi.mocked(cacheCover).mock.calls) {
+      const [, passedKey, , , , allowDownload] = call;
+      expect(allowDownload === false || passedKey.trim() === '').toBe(true);
+    }
+
+    const dbState = JSON.parse(window.localStorage.getItem(DB_STORAGE_KEY) ?? '{}') as {
+      syncQueue: Record<string, { attemptCount: number; lastError: string | null }>;
+    };
+    expect(dbState.syncQueue[downloadedBook.id]?.attemptCount).toBe(0);
+    expect(dbState.syncQueue[downloadedBook.id]?.lastError).toBeNull();
+  });
+
+  it('emits zero /api/Series/v2 or offline requests across Android Wi-Fi/cellular disconnect handoff and missing-key offline restart', async () => {
+    runtime.native = true;
+    runtime.online = true;
+    seedDatabase({
+      books: [downloadedBook],
+      pendingSync: true,
+    });
+    secureStorageMock.values.set('server_primary_api_key', 'turnleaf-ci-only');
+
+    let fixtureOffline = false;
+    const offlineRequests: string[] = [];
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      const path = new URL(options.url).pathname;
+      if (fixtureOffline) {
+        offlineRequests.push(path);
+        return {
+          status: 503,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({ title: 'Offline fixture active' }),
+        };
+      }
+      if (path.endsWith('/api/Series/v2')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify([
+            {
+              id: 1,
+              libraryId: 1,
+              name: 'Offline Novel',
+              format: 3,
+              pages: 100,
+              pagesRead: 50,
+            },
+          ]),
+        };
+      }
+      if (path.endsWith('/api/Series/series-detail')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({
+            volumes: [
+              {
+                id: 1,
+                chapters: [
+                  {
+                    id: 1,
+                    volumeId: 1,
+                    title: 'Offline Novel',
+                    pages: 100,
+                    pagesRead: 50,
+                    format: 3,
+                    files: [{ id: 1, format: 3, extension: '.epub', bytes: 4096 }],
+                  },
+                ],
+              },
+            ],
+          }),
+        };
+      }
+      if (path.endsWith('/api/Reader/progress')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: '',
+        };
+      }
+      throw new Error(`Unexpected native request ${options.url}`);
+    });
+
+    mounted = mount(App, { target });
+    await waitForCondition(
+      () =>
+        target.querySelector('[data-book-open]') !== null &&
+        target.querySelector('[data-credential-alert]') === null,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Simulate Android smoke Phase 2: remove saved key, disable network (including transient
+    // Wi-Fi -> cellular -> offline radio notifications), and restart the app while offline.
+    secureStorageMock.values.delete('server_primary_api_key');
+    fixtureOffline = true;
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: false });
+      listener({ connected: true });
+      listener({ connected: false });
+    }
+    runtime.online = false;
+
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    expect(offlineRequests).toEqual([]);
+
+    await unmount(mounted);
+    mounted = null;
+    vi.mocked(CapacitorHttp.request).mockClear();
+
+    mounted = mount(App, { target });
+    await waitForCondition(
+      () =>
+        target.querySelector('[data-credential-alert="missing"]') !== null &&
+        target.querySelector('[data-book-open]') !== null,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    expect(offlineRequests).toEqual([]);
+    expect(CapacitorHttp.request).not.toHaveBeenCalled();
+    expect(downloadEpub).not.toHaveBeenCalled();
+
+    // Open downloaded EPUB and turn a page while offline with missing credentials
+    target.querySelector<HTMLButtonElement>('[data-book-open]')!.click();
+    await waitForCondition(
+      () => target.querySelector('[aria-label="Show reading controls"]') !== null,
+    );
+    runtime.relocateCallback?.(
+      {
+        cfi: 'epubcfi(/6/4!/4/2/3:0)',
+        xpath: '//body/DocFragment[2]/body/p[2]',
+        href: 'Text/chapter-2.xhtml',
+        label: 'Chapter 2',
+        percentage: 0.75,
+        displayedPage: 2,
+        displayedTotal: 2,
+        spineIndex: 1,
+      },
+      'navigation',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(offlineRequests).toEqual([]);
+    expect(CapacitorHttp.request).not.toHaveBeenCalled();
   });
 });

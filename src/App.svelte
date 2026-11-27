@@ -102,6 +102,7 @@
     server = null;
     apiKey = '';
     readerOpen = false;
+    markCredentialMissing(null);
     void checkForRelease();
     try {
       const [saved, preferences] = await Promise.all([
@@ -121,8 +122,8 @@
         writeBootThemeCache(resolvedTheme, resolvedMode);
       }
       if (saved) {
-        server = saved;
         await loadServerCredential(saved);
+        server = saved;
       }
     } catch {
       recordDiagnostic({
@@ -301,6 +302,7 @@
           readerOpen = false;
           server = null;
           apiKey = '';
+          markCredentialMissing(null);
           changingServerAddress = false;
           reconnectingServer = false;
         }}
@@ -317,6 +319,7 @@
             }
           : undefined}
         onConnected={(connected, key) => {
+          syncLoadedCredential(key, connected.credentialRef);
           apiKey = key;
           server = connected;
           changingServerAddress = false;

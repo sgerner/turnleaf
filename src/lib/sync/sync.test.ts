@@ -268,3 +268,58 @@ it('stops immediately on a KavitaError authentication failure without trying rem
   expect(saved.readingState['book-1']?.pendingSync).toBe(true);
   expect(saved.readingState['book-2']?.pendingSync).toBe(true);
 });
+
+it('stops cleanly without attempting queued books or recording sync failures when credentials become unavailable or signal aborts', async () => {
+  type PendingFixture = ReturnType<typeof pendingState>;
+  type ExpandableFixture = Omit<PendingFixture, 'readingState' | 'syncQueue'> & {
+    readingState: Record<string, PendingFixture['readingState']['book-1']>;
+    syncQueue: Record<string, PendingFixture['syncQueue']['book-1']>;
+  };
+  const state = pendingState('2026-09-07T00:00:00.000Z', '{"pageNum":1}') as ExpandableFixture;
+  state.books.push({ ...book, id: 'book-2', chapterId: 2 });
+  state.readingState['book-2'] = {
+    ...state.readingState['book-1']!,
+    localUpdatedAt: '2026-09-07T00:00:01.000Z',
+  };
+  state.syncQueue['book-2'] = {
+    ...state.syncQueue['book-1']!,
+    bookId: 'book-2',
+    serverId: 'server',
+    payloadJson: '{"pageNum":2}',
+    createdAt: '2026-09-07T00:00:01.000Z',
+    updatedAt: '2026-09-07T00:00:01.000Z',
+    revision: 1,
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  const blockedSave = vi.fn();
+  await expect(
+    flushProgress({ saveProgress: blockedSave, canSendRequests: () => false } as never, 'server'),
+  ).resolves.toBeUndefined();
+  expect(blockedSave).not.toHaveBeenCalled();
+
+  const controller = new AbortController();
+  let canSend = true;
+  const abortingSave = vi.fn(async (_payload: unknown, signal?: AbortSignal) => {
+    expect(signal).toBe(controller.signal);
+    canSend = false;
+    controller.abort();
+    throw new DOMException('Aborted', 'AbortError');
+  });
+
+  await expect(
+    flushProgress(
+      { saveProgress: abortingSave, canSendRequests: () => canSend } as never,
+      'server',
+      controller.signal,
+    ),
+  ).resolves.toBeUndefined();
+  expect(abortingSave).toHaveBeenCalledTimes(1);
+
+  const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as typeof state;
+  expect(saved.syncQueue['book-1']?.attemptCount).toBe(0);
+  expect(saved.syncQueue['book-1']?.lastError).toBeNull();
+  expect(saved.syncQueue['book-2']?.attemptCount).toBe(0);
+  expect(saved.readingState['book-1']?.pendingSync).toBe(true);
+  expect(saved.readingState['book-2']?.pendingSync).toBe(true);
+});

@@ -271,7 +271,9 @@ export async function downloadEpub(
         const connectionFailed = code === 'OS-PLUG-FLTR-0008';
         const retryable =
           status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
-        if (attempt > 0 || !retryable) throw new EpubTransferError(status, connectionFailed);
+        if (attempt > 0 || !retryable || !canSendCredential(apiKey, epoch)) {
+          throw new EpubTransferError(status, connectionFailed);
+        }
 
         await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
           () => {},
@@ -390,6 +392,8 @@ export async function cacheCover(
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (!allowDownload || !canSendCredential(apiKey, epoch)) throw new Error('Offline');
     try {
       await downloadFileWithRedirects({
         initialUrl: target.url,
