@@ -4,6 +4,7 @@
 
 - Add reader external link, footnote, and figure inspectors, accessible highlight overlays, pinch-zoom, and iOS Dynamic Type scaling
 - Stabilize Android reader viewport resizes, next-page relocations, and offline network transitions
+- chore(deps): bump svelte to 5.59.2
 - chore: retrigger required PR checks
 - chore(ci): align CodeQL action pins
 - test: avoid Svelte runtime internals in panel tests
