@@ -2,7 +2,7 @@
   import { App } from '@capacitor/app';
   import { Capacitor } from '@capacitor/core';
   import { Network } from '@capacitor/network';
-  import { tick, onDestroy, onMount, untrack } from 'svelte';
+  import { flushSync, tick, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
   import { fade, fly } from 'svelte/transition';
   import {
@@ -75,11 +75,13 @@
     openBookLabel,
   } from '../a11y/book-labels';
   import {
+    activateModal,
     activeElement,
-    focusModal,
+    deactivateModal,
     restoreFocus,
-    restoreModalFocus,
+    snapshotModalBackground,
     trapModalKeydown,
+    type ModalStateSnapshot,
   } from '../a11y/modal-focus';
 
   let {
@@ -274,8 +276,11 @@
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
+  let pendingMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
+  let modalCleanup: (() => void) | null = null;
+  let pointerPressActive = false;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
@@ -306,6 +311,7 @@
   let cachedGridWidth = 400;
   let cachedListTop = 0;
   let cachedViewportHeight = 0;
+  let cachedStickyOffset = 0;
   let cachedRootFontPx = 16;
   let cachedTextScaling = 1;
   let typographyMetricsDirty = true;
@@ -396,6 +402,24 @@
     void setPreference('librarySeries', seriesFilter);
   }
 
+  function focusModal(
+    getDialog: () => HTMLElement | null,
+    snapshot?: ModalStateSnapshot | null,
+  ): void {
+    void tick().then(() => {
+      if (destroyed) return;
+      const dialog = getDialog();
+      if (!dialog) return;
+      modalCleanup = activateModal(dialog, modalCleanup, '.app-stage', true, snapshot);
+    });
+  }
+
+  function releaseModal(closingDialog?: HTMLElement | null): void {
+    const cleanup = modalCleanup;
+    modalCleanup = null;
+    deactivateModal(cleanup, closingDialog);
+  }
+
   function insecureServer(): boolean {
     return server.baseUrl.toLowerCase().startsWith('http://');
   }
@@ -432,6 +456,22 @@
     typographyMetricsDirty = false;
   }
 
+  function getStickyBannerOffset(container: HTMLElement | null, containerTop = 0): number {
+    if (!container) return 0;
+    const tracked = Number(container.dataset.stickyBannerHeight) || 0;
+    const banner =
+      container.querySelector<HTMLElement>('[data-release-banner]') ??
+      container.parentElement?.querySelector<HTMLElement>('[data-release-banner]') ??
+      null;
+    if (!banner) return Math.max(0, Math.ceil(tracked));
+    if (banner.hidden) return 0;
+    const bannerRect = banner.getBoundingClientRect();
+    if (container.contains(banner)) {
+      return Math.max(0, Math.ceil(bannerRect.height || banner.offsetHeight || tracked));
+    }
+    return bannerRect.height > 0 ? Math.max(0, Math.ceil(bannerRect.bottom - containerTop)) : 0;
+  }
+
   function refreshLayoutMetrics(): void {
     const grid = virtualGrid;
     if (!grid) return;
@@ -441,13 +481,23 @@
       const width = grid.clientWidth || container.clientWidth;
       if (width > 0) cachedGridWidth = width;
       const containerRect = container.getBoundingClientRect();
-      cachedListTop = gridRect.top - containerRect.top + container.scrollTop;
+      const hasLayoutRects =
+        containerRect.height > 0 ||
+        containerRect.width > 0 ||
+        gridRect.height > 0 ||
+        gridRect.width > 0;
+      cachedListTop = hasLayoutRects
+        ? gridRect.top - containerRect.top + container.scrollTop
+        : grid.offsetTop;
       cachedViewportHeight = container.clientHeight;
+      cachedStickyOffset = getStickyBannerOffset(container, containerRect.top);
     } else if (typeof window !== 'undefined') {
       const width = grid.clientWidth || window.innerWidth;
       if (width > 0) cachedGridWidth = width;
-      cachedListTop = gridRect.top + window.scrollY;
+      const hasLayoutRects = gridRect.height > 0 || gridRect.width > 0;
+      cachedListTop = hasLayoutRects ? gridRect.top + window.scrollY : grid.offsetTop;
       cachedViewportHeight = window.innerHeight;
+      cachedStickyOffset = 0;
     }
     layoutMetricsDirty = false;
   }
@@ -489,12 +539,6 @@
     if (focusedRow !== nextFocused) focusedRow = nextFocused;
   }
 
-  function handleResultsFocusIn(event: FocusEvent): void {
-    const index = bookIndexFromNode(event.target);
-    const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
-    if (focusedRow !== nextFocused) focusedRow = nextFocused;
-  }
-
   function handleResultsFocusOut(event: FocusEvent): void {
     const index = bookIndexFromNode(event.relatedTarget);
     const nextFocused = index >= 0 ? Math.floor(index / gridColumns) : -1;
@@ -514,6 +558,24 @@
       virtualizationFrame = null;
       updateVirtualWindow();
     });
+  }
+
+  function setScrollPosition(container: HTMLElement | null, nextScrollTop: number): void {
+    const clamped = Math.max(0, nextScrollTop);
+    if (container) {
+      if (container.scrollTop !== clamped) container.scrollTop = clamped;
+      return;
+    }
+    if (typeof window !== 'undefined' && typeof window.scrollBy === 'function') {
+      const delta = clamped - window.scrollY;
+      if (delta !== 0) {
+        try {
+          window.scrollBy({ top: delta, behavior: 'instant' });
+        } catch {
+          // Non-scrolling test environments may not implement window.scrollBy.
+        }
+      }
+    }
   }
 
   function updateVirtualWindow(): void {
@@ -558,18 +620,170 @@
 
   async function scrollToBook(index: number): Promise<HTMLElement | null> {
     const grid = virtualGrid;
-    if (!grid) return null;
+    if (!grid || index < 0 || index >= visibleBooks.length) return null;
     refreshVirtualMetrics();
     updateVirtualWindow();
     const rowTop = Math.floor(index / gridColumns) * rowHeight;
-    if (scrollContainer) {
-      scrollContainer.scrollTop = cachedListTop + rowTop;
-    } else if (typeof window !== 'undefined') {
-      window.scrollBy({ top: cachedListTop - window.scrollY + rowTop, behavior: 'instant' });
-    }
+    const targetScrollTop = cachedListTop + rowTop - cachedStickyOffset;
+    setScrollPosition(scrollContainer, targetScrollTop);
     updateVirtualWindow();
     await tick();
     return grid.querySelector(`[data-book-index="${index}"]`);
+  }
+
+  function handleResultsPointerDown(): void {
+    if (typeof window === 'undefined') return;
+    pointerPressActive = true;
+    const clear = () => {
+      pointerPressActive = false;
+      window.removeEventListener('pointerup', clear, true);
+      window.removeEventListener('pointercancel', clear, true);
+    };
+    window.addEventListener('pointerup', clear, true);
+    window.addEventListener('pointercancel', clear, true);
+  }
+
+  function handleResultsFocusIn(event: FocusEvent): void {
+    if (destroyed || !virtualGrid) return;
+    const targetNode = event.target ?? activeElement();
+    const bookIndex = bookIndexFromNode(targetNode);
+    if (bookIndex < 0) {
+      if (focusedRow !== -1) focusedRow = -1;
+      return;
+    }
+
+    if (typographyMetricsDirty) refreshTypographyMetrics();
+    if (layoutMetricsDirty) refreshLayoutMetrics();
+
+    const columns = columnsForWidth(cachedGridWidth, viewMode);
+    const height = rowHeightFor(
+      cachedGridWidth,
+      columns,
+      viewMode,
+      cachedRootFontPx,
+      cachedTextScaling,
+    );
+    const targetRow = Math.floor(bookIndex / columns);
+    if (focusedRow !== targetRow) focusedRow = targetRow;
+
+    if (pointerPressActive) return;
+
+    if (!scrollContainer && typeof window === 'undefined') return;
+    const scrollTop = scrollContainer
+      ? scrollContainer.scrollTop
+      : typeof window !== 'undefined'
+        ? window.scrollY
+        : 0;
+
+    const rowScrollTop = cachedListTop + targetRow * height;
+    const rowScrollBottom = rowScrollTop + height;
+    const maxScrollForTop = Math.max(0, rowScrollTop - cachedStickyOffset);
+    const minScrollForBottom =
+      cachedViewportHeight > 0 ? Math.max(0, rowScrollBottom - cachedViewportHeight) : scrollTop;
+
+    let nextScrollTop = scrollTop;
+    if (cachedViewportHeight > 0 && minScrollForBottom > maxScrollForTop) {
+      nextScrollTop = maxScrollForTop;
+    } else if (scrollTop > maxScrollForTop) {
+      nextScrollTop = maxScrollForTop;
+    } else if (cachedViewportHeight > 0 && scrollTop < minScrollForBottom) {
+      nextScrollTop = minScrollForBottom;
+    }
+
+    if (nextScrollTop !== scrollTop) {
+      setScrollPosition(scrollContainer, nextScrollTop);
+      flushSync(() => updateVirtualWindow());
+    }
+  }
+
+  function focusCardControl(card: HTMLElement | null, preferActions: boolean): void {
+    if (!card) return;
+    const control = preferActions
+      ? (card.querySelector<HTMLElement>('[data-book-actions]') ??
+        card.querySelector<HTMLElement>('[data-book-open]:not(:disabled)'))
+      : (card.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
+        card.querySelector<HTMLElement>('[data-book-actions]'));
+    control?.focus();
+  }
+
+  async function handleFeedKeydown(event: KeyboardEvent): Promise<void> {
+    if (
+      event.defaultPrevented ||
+      event.altKey ||
+      event.metaKey ||
+      !virtualGrid ||
+      visibleBooks.length === 0
+    ) {
+      return;
+    }
+    if (
+      event.key !== 'PageDown' &&
+      event.key !== 'PageUp' &&
+      event.key !== 'Home' &&
+      event.key !== 'End'
+    ) {
+      return;
+    }
+
+    const target = event.target instanceof HTMLElement ? event.target : activeElement();
+    if (event.ctrlKey && (event.key === 'Home' || event.key === 'End') && libraryMain) {
+      const focusableInMain = Array.from(
+        libraryMain.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter(
+        (el) =>
+          el.tabIndex >= 0 &&
+          !virtualGrid!.contains(el) &&
+          !el.closest('[hidden], [inert], [aria-hidden="true"]'),
+      );
+      if (event.key === 'Home') {
+        const beforeFeed = focusableInMain.filter((el) =>
+          Boolean(el.compareDocumentPosition(virtualGrid!) & Node.DOCUMENT_POSITION_FOLLOWING),
+        );
+        const destination = beforeFeed[beforeFeed.length - 1];
+        if (destination) {
+          event.preventDefault();
+          destination.focus();
+          return;
+        }
+      } else {
+        const afterFeed = focusableInMain.filter((el) =>
+          Boolean(el.compareDocumentPosition(virtualGrid!) & Node.DOCUMENT_POSITION_PRECEDING),
+        );
+        const destination = afterFeed[0];
+        if (destination) {
+          event.preventDefault();
+          destination.focus();
+          return;
+        }
+      }
+    }
+
+    const currentBookIndex = bookIndexFromNode(target);
+    const currentIndex = currentBookIndex >= 0 ? currentBookIndex : virtualWindow.startIndex;
+    const preferActions = Boolean(target?.hasAttribute('data-book-actions'));
+
+    if (typographyMetricsDirty) refreshTypographyMetrics();
+    if (layoutMetricsDirty) refreshLayoutMetrics();
+    const usableHeight = Math.max(rowHeight, cachedViewportHeight - cachedStickyOffset);
+    const rowsPerPage = Math.max(1, Math.floor(usableHeight / Math.max(1, rowHeight)));
+    const pageStep = Math.max(1, rowsPerPage * gridColumns);
+
+    let nextIndex = currentIndex;
+    if (event.key === 'PageDown') {
+      nextIndex = Math.min(visibleBooks.length - 1, currentIndex + pageStep);
+    } else if (event.key === 'PageUp') {
+      nextIndex = Math.max(0, currentIndex - pageStep);
+    } else if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = visibleBooks.length - 1;
+    }
+
+    event.preventDefault();
+    const nextCard = await scrollToBook(nextIndex);
+    focusCardControl(nextCard, preferActions);
   }
 
   async function continueTabbing(
@@ -648,6 +862,10 @@
       refreshVirtualMetrics();
       updateVirtualWindow();
 
+      const onKeyDown = (event: KeyboardEvent) => void handleFeedKeydown(event);
+      grid.addEventListener('pointerdown', handleResultsPointerDown);
+      grid.addEventListener('keydown', onKeyDown);
+
       const resizeObserver =
         typeof ResizeObserver !== 'undefined'
           ? new ResizeObserver(() => {
@@ -664,7 +882,7 @@
         typeof MutationObserver !== 'undefined'
           ? new MutationObserver((records) => {
               for (const record of records) {
-                if (record.type === 'attributes') {
+                if (record.type === 'attributes' && record.target === document.documentElement) {
                   typographyMetricsDirty = true;
                 }
                 layoutMetricsDirty = true;
@@ -679,9 +897,17 @@
         });
       }
       if (main) mutationObserver?.observe(main, { childList: true });
-      if (scrollContainer) mutationObserver?.observe(scrollContainer, { childList: true });
+      if (scrollContainer) {
+        mutationObserver?.observe(scrollContainer, {
+          childList: true,
+          attributes: true,
+          attributeFilter: ['data-sticky-banner-height'],
+        });
+      }
 
       return () => {
+        grid.removeEventListener('pointerdown', handleResultsPointerDown);
+        grid.removeEventListener('keydown', onKeyDown);
         resizeObserver?.disconnect();
         mutationObserver?.disconnect();
       };
@@ -863,6 +1089,7 @@
 
   onDestroy(() => {
     destroyed = true;
+    releaseModal();
     onReaderOpenChange?.(false);
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
@@ -1211,6 +1438,7 @@
         : `Could not remove ${book.title}: ${detail}`;
       return false;
     }
+    const indexBefore = visibleBooks.findIndex((item) => item.id === book.id);
     books = books.map((item) =>
       item.id === book.id
         ? {
@@ -1221,6 +1449,7 @@
           }
         : item,
     );
+    await restoreCatalogFocusIfDetached(indexBefore);
     return true;
   }
 
@@ -1454,7 +1683,28 @@
     }
   }
 
+  async function restoreCatalogFocusIfDetached(preferredIndex: number): Promise<void> {
+    await tick();
+    if (destroyed || reading || actionMenuBook || conflict || settingsVisible || !libraryMain) {
+      return;
+    }
+    if (libraryMain.contains(document.activeElement)) return;
+    if (visibleBooks.length > 0 && preferredIndex >= 0 && virtualGrid) {
+      const fallbackIndex = Math.min(preferredIndex, visibleBooks.length - 1);
+      const card = await scrollToBook(fallbackIndex);
+      const control =
+        card?.querySelector<HTMLElement>('[data-book-open]:not(:disabled)') ??
+        card?.querySelector<HTMLElement>('[data-book-actions]');
+      if (control) {
+        control.focus();
+        return;
+      }
+    }
+    libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+  }
+
   async function markDone(book: BookRecord): Promise<void> {
+    const indexBefore = visibleBooks.findIndex((item) => item.id === book.id);
     await markBookCompleted(book);
     const savedBook = books.find((item) => item.id === book.id);
     if (savedBook) {
@@ -1464,11 +1714,17 @@
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
+    await restoreCatalogFocusIfDetached(indexBefore);
   }
 
   async function syncFurthest(book: BookRecord): Promise<void> {
-    closeMenu();
-    await open(book, { preferFurthest: true });
+    pendingMenuOpener = actionMenuOpener;
+    dismissMenu(false);
+    try {
+      await open(book, { preferFurthest: true });
+    } finally {
+      pendingMenuOpener = null;
+    }
   }
 
   async function closeReader(): Promise<void> {
@@ -1492,29 +1748,43 @@
   }
 
   function openMenu(book: BookRecord): void {
+    const snapshot = snapshotModalBackground(libraryMain);
     actionMenuOpener = activeElement();
     actionMenuBook = book;
-    focusModal(() => actionMenuDialog);
+    focusModal(() => (actionMenuBook ? actionMenuDialog : null), snapshot);
   }
 
   function closeMenu(): void {
+    dismissMenu(true);
+  }
+
+  function dismissMenu(restoreAfterClose = true): void {
+    const closing = actionMenuDialog;
     actionMenuBook = null;
     const opener = actionMenuOpener;
     actionMenuOpener = null;
+    releaseModal(closing);
+    if (!restoreAfterClose) return;
     void tick().then(() => {
-      if (reading || actionMenuBook || !libraryMain) return;
-      restoreFocus(opener);
-      if (!libraryMain.contains(document.activeElement)) {
-        libraryMain.querySelector<HTMLElement>('#library-results')?.focus();
+      if (destroyed || reading || actionMenuBook || conflict || settingsVisible || !libraryMain) {
+        return;
       }
+      restoreFocus(opener, libraryMain.querySelector<HTMLElement>('#library-results'));
     });
   }
 
   function openConflict(next: NonNullable<typeof conflict>): void {
-    conflictOpener = activeElement();
+    const snapshot = snapshotModalBackground(libraryMain);
+    const active = activeElement();
+    const activeUnavailable =
+      !active ||
+      active === document.body ||
+      Boolean(active.closest('[inert], [aria-hidden="true"]'));
+    conflictOpener = activeUnavailable && pendingMenuOpener ? pendingMenuOpener : active;
+    pendingMenuOpener = null;
     conflictError = '';
     conflict = next;
-    focusModal(() => conflictDialog);
+    focusModal(() => (conflict ? conflictDialog : null), snapshot);
   }
 
   function closeConflict(): void {
@@ -1523,11 +1793,16 @@
   }
 
   function dismissConflict(): void {
+    const closing = conflictDialog;
     conflict = null;
     conflictError = '';
     const opener = conflictOpener;
     conflictOpener = null;
-    restoreModalFocus(opener);
+    releaseModal(closing);
+    void tick().then(() => {
+      if (destroyed || reading || actionMenuBook || conflict || settingsVisible) return;
+      restoreFocus(opener, libraryMain?.querySelector<HTMLElement>('#library-results') ?? null);
+    });
   }
 
   async function continueFromKavita(): Promise<void> {
@@ -1577,17 +1852,23 @@
   }
 
   function openSettings(): void {
+    const snapshot = snapshotModalBackground(libraryMain);
     settingsOpener = activeElement();
     settingsVisible = true;
-    focusModal(() => settingsDialog);
+    focusModal(() => (settingsVisible ? settingsDialog : null), snapshot);
   }
 
   function closeSettings(): void {
+    const closing = settingsDialog;
     settingsVisible = false;
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
-    restoreModalFocus(opener);
+    releaseModal(closing);
+    void tick().then(() => {
+      if (destroyed || reading || actionMenuBook || conflict || settingsVisible) return;
+      restoreFocus(opener, libraryMain?.querySelector<HTMLElement>('#library-results') ?? null);
+    });
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -2253,7 +2534,9 @@
         class="relative mt-8"
         style={`height: ${resultsContainerHeight(virtualWindow.totalHeight, viewMode)}px; contain: layout style;`}
         tabindex="-1"
+        role="feed"
         aria-label="Books"
+        aria-busy={loading || refreshing}
         onfocusin={handleResultsFocusIn}
         onfocusout={handleResultsFocusOut}
       >
@@ -2261,15 +2544,20 @@
           {@const rowStart = rowIndex * gridColumns}
           {@const rowEnd = Math.min(visibleBooks.length, rowStart + gridColumns)}
           <div
+            role="presentation"
             class="absolute inset-x-0 grid gap-x-4"
             style={`height: ${rowHeight}px; top: ${rowIndex * rowHeight}px; grid-template-columns: repeat(${gridColumns}, minmax(0, 1fr)); contain: size layout style;`}
           >
             {#each visibleBooks.slice(rowStart, rowEnd) as book, bookOffset (book.id)}
               {@const bookIndex = rowStart + bookOffset}
+              {@const bookTitleId = `library-book-title-${bookIndex}`}
               <article
                 class="relative text-left"
                 data-book-id={book.id}
                 data-book-index={bookIndex}
+                aria-posinset={bookIndex + 1}
+                aria-setsize={visibleBooks.length}
+                aria-labelledby={bookTitleId}
                 oncontextmenu={(event) => {
                   event.preventDefault();
                   openMenu(book);
@@ -2319,6 +2607,7 @@
                       </div>
                       <div class="min-w-0 flex-1">
                         <h2
+                          id={bookTitleId}
                           class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
                         >
                           {book.title}
@@ -2508,6 +2797,7 @@
                     </button>
                     <div class="mt-3">
                       <h2
+                        id={bookTitleId}
                         class="line-clamp-2 font-serif text-base leading-snug text-surface-950-50"
                       >
                         {book.title}
@@ -2601,8 +2891,24 @@
           type="button"
           onclick={() => {
             const book = actionMenuBook;
-            closeMenu();
-            if (book) void open(book);
+            const opener = actionMenuOpener;
+            pendingMenuOpener = opener;
+            dismissMenu(false);
+            if (book) {
+              void open(book).finally(() => {
+                if (pendingMenuOpener === opener) pendingMenuOpener = null;
+                if (
+                  !destroyed &&
+                  !reading &&
+                  !actionMenuBook &&
+                  !conflict &&
+                  !settingsVisible &&
+                  libraryMain
+                ) {
+                  restoreFocus(opener, libraryMain.querySelector<HTMLElement>('#library-results'));
+                }
+              });
+            }
           }}
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">

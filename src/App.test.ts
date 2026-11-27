@@ -213,6 +213,55 @@ describe('App shell releaseBanner layout', () => {
     await vi.waitFor(() => {
       expect(host.querySelector('.release-banner')).toBeNull();
     });
+    expect(stage.dataset.stickyBannerHeight).toBe('0');
+  });
+
+  it('tracks releaseBanner height dynamically via ResizeObserver and resets on dismissal', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    try {
+      instance = mount(App, { target: host });
+      await vi.waitFor(() => {
+        expect(host.querySelector('.release-banner')).not.toBeNull();
+      });
+      await tick();
+
+      const banner = host.querySelector<HTMLElement>('.release-banner')!;
+      const stage = host.querySelector<HTMLElement>('.app-stage')!;
+
+      vi.spyOn(banner, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 800, 96));
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 800, height: 96 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      await tick();
+
+      expect(banner.dataset.bannerHeight).toBe('96');
+      expect(stage.dataset.stickyBannerHeight).toBe('96');
+      expect(stage.style.getPropertyValue('--release-banner-height')).toBe('96px');
+      expect(banner.inert).toBe(false);
+
+      const dismissButton = Array.from(banner.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === 'Dismiss',
+      )!;
+      flushSync(() => {
+        dismissButton.click();
+      });
+      await tick();
+
+      expect(stage.dataset.stickyBannerHeight).toBe('0');
+      expect(stage.style.getPropertyValue('--release-banner-height')).toBe('0px');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

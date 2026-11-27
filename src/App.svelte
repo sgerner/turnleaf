@@ -65,6 +65,8 @@
   let uiMode = $state<UiMode>(untrack(() => initialMode ?? bootAppearance.mode));
   let readerOpen = $state(false);
   let releaseBanner = $state<ReleaseBanner | null>(null);
+  let releaseBannerElement = $state<HTMLElement | null>(null);
+  let releaseBannerHeight = $state(0);
   let stageOverlayActive = $state(false);
 
   async function loadLocalData(): Promise<void> {
@@ -157,6 +159,37 @@
     document.documentElement.dataset.mode = uiMode;
     syncShellAppearanceChrome(uiTheme, uiMode, { readerActive: readerOpen });
   });
+
+  $effect(() => {
+    const banner = releaseBanner ? releaseBannerElement : null;
+    if (!banner) {
+      releaseBannerHeight = 0;
+      return;
+    }
+    const updateBannerHeight = (observedHeight = 0) => {
+      const rectHeight = banner.getBoundingClientRect().height;
+      releaseBannerHeight = Math.max(
+        0,
+        Math.ceil(rectHeight || observedHeight || banner.offsetHeight || 0),
+      );
+    };
+    const handleWindowResize = () => updateBannerHeight();
+    updateBannerHeight();
+    window.addEventListener('resize', handleWindowResize);
+    if (typeof ResizeObserver === 'undefined') {
+      return () => window.removeEventListener('resize', handleWindowResize);
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      const boxHeight = entry?.borderBoxSize?.[0]?.blockSize ?? entry?.contentRect.height ?? 0;
+      updateBannerHeight(boxHeight);
+    });
+    observer.observe(banner);
+    return () => {
+      window.removeEventListener('resize', handleWindowResize);
+      observer.disconnect();
+    };
+  });
 </script>
 
 <div class="app-shell">
@@ -170,7 +203,14 @@
   {/if}
 
   {#if releaseBanner}
-    <div class="release-banner" inert={stageOverlayActive} transition:fade>
+    <div
+      bind:this={releaseBannerElement}
+      class="release-banner"
+      data-release-banner=""
+      data-banner-height={releaseBannerHeight}
+      inert={stageOverlayActive}
+      transition:fade
+    >
       <div class="mx-auto w-full max-w-4xl px-4 pb-2 pt-[max(1rem,env(safe-area-inset-top))]">
         <div
           class="flex flex-col gap-3 rounded-2xl preset-filled-surface-50-950 px-4 py-3 shadow-2xl sm:flex-row sm:items-center sm:justify-between"
@@ -216,7 +256,11 @@
     </div>
   {/if}
 
-  <div class="app-stage">
+  <div
+    class="app-stage"
+    data-sticky-banner-height={releaseBanner ? releaseBannerHeight : 0}
+    style:--release-banner-height={`${releaseBanner ? releaseBannerHeight : 0}px`}
+  >
     {#if booting}
       <main class="grid min-h-full place-items-center" aria-label="Opening Turnleaf">
         <div class="grid justify-items-center gap-4">
