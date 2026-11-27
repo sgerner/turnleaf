@@ -6,20 +6,29 @@
 
 :root {
   --turnleaf-text-scale: 1;
+  --turnleaf-font-sans: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
+  --typo-base--font-family: var(--turnleaf-font-sans);
+  --typo-base--font-size: inherit;
+  --typo-base--line-height: inherit;
   color-scheme: light;
   @variant dark {
     color-scheme: dark;
   }
   font-size: calc(100% * var(--turnleaf-text-scale, 1));
-  font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
+  font-family: var(--turnleaf-font-sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
 }
 
-[data-theme='vintage'] {
-  --typo-base--font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
+html[data-theme] {
+  --typo-base--font-family: var(--turnleaf-font-sans);
+  --typo-base--font-size: inherit;
+  --typo-base--line-height: inherit;
+}
+
+html[data-theme='vintage'] {
   --typo-heading--font-family: Iowan Old Style, Palatino Linotype, Book Antiqua, Georgia, serif;
 }
 
@@ -38,6 +47,9 @@ html {
 body {
   min-width: 320px;
   overflow: hidden;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
   background: light-dark(var(--color-root-bg-light), var(--color-root-bg-dark));
   color: light-dark(var(--typo-base--color-light), var(--typo-base--color-dark));
 }

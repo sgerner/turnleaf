@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync, mount, unmount } from 'svelte';
 import type { BookRecord, ServerConfig } from '../database/database';
+import type * as ThemesModule from '../themes/themes';
 
 type NetworkListener = (status: { connected: boolean; connectionType: string }) => void;
 
@@ -67,10 +68,14 @@ vi.mock('../sync/sync', () => ({
   flushProgress: flushProgressMock,
 }));
 
-vi.mock('../themes/themes', () => ({
-  loadTheme: vi.fn().mockResolvedValue(true),
-  skeletonThemes: ['fennec', 'eink', 'catppuccin'],
-}));
+vi.mock('../themes/themes', async (importOriginal) => {
+  const actual = await importOriginal<typeof ThemesModule>();
+  return {
+    ...actual,
+    loadTheme: vi.fn().mockResolvedValue(true),
+    skeletonThemes: ['fennec', 'eink', 'catppuccin'],
+  };
+});
 
 vi.mock('../native/credentials', () => ({
   saveApiKey: vi.fn().mockResolvedValue(undefined),
