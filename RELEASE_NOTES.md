@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- chore: retrigger required PR checks
 - fix: bound search batches by chapter count and accumulate continuation counts
 - refactor: consolidate duplicated database persistence helpers
 - ci: pin AVD cache actions and retain Gradle cache
