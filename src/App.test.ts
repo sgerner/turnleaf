@@ -80,6 +80,7 @@ vi.mock('./lib/database/database', () => ({
   markDownloaded: vi.fn(),
   markBookCompleted: vi.fn(),
   removeDownload: vi.fn(),
+  removeDownloads: vi.fn().mockResolvedValue(undefined),
   reconcileBooks: vi.fn(),
   saveLocalProgress: vi.fn(),
   saveRemoteProgress: vi.fn(),
@@ -90,6 +91,10 @@ vi.mock('./lib/downloads/native-download', () => ({
   cacheCover: vi.fn(),
   clearCoverCache: clearCoverCacheMock,
   cleanupInterruptedEpubDownloads: cleanupInterruptedEpubDownloadsMock,
+  deleteAllDownloadedEpubs: vi.fn(async (paths: readonly string[] = []) => ({
+    removedPaths: [...paths],
+    failedPaths: [],
+  })),
   deleteDownloadedEpub: vi.fn().mockResolvedValue(undefined),
   downloadEpub: vi.fn(),
   EPUB_DOWNLOAD_ENDPOINT: '/api/Download/chapter',

@@ -66,6 +66,10 @@ vi.mock('../downloads/native-download', () => ({
   cacheCover: vi.fn(async () => 'cover'),
   clearCoverCache: vi.fn(async () => {}),
   cleanupInterruptedEpubDownloads: vi.fn(async () => {}),
+  deleteAllDownloadedEpubs: vi.fn(async (paths: readonly string[] = []) => ({
+    removedPaths: [...paths],
+    failedPaths: [],
+  })),
   deleteDownloadedEpub: vi.fn(async () => {}),
   downloadEpub: vi.fn(async () => ({ relativePath: 'books/book-1.epub', size: 1024 })),
   verifyDownloadedEpub: (path: string) => verifyDownloadedEpubMock(path),

@@ -680,6 +680,78 @@ describe('native progress transactions against SQLite', () => {
     await expect(reopened.saveServer(server)).resolves.toBeUndefined();
   });
 
+  it('persists single-book and partial batched download updates in SQLite while preserving progress', async () => {
+    const database = await importDatabase();
+    const secondBook = { ...book, id: 'server:1:11', chapterId: 11, title: 'Second book' };
+    const thirdBook = { ...book, id: 'server:1:12', chapterId: 12, title: 'Third book' };
+    await database.saveServer(server);
+    await database.reconcileBooks(server.id, [book, secondBook, thirdBook]);
+    await database.markDownloaded(book.id, 'books/book-10.epub', 1024);
+    await database.markDownloaded(secondBook.id, 'books/book-11.epub', 2048);
+    await database.markDownloaded(thirdBook.id, 'books/book-12.epub', 4096);
+    await database.saveLocalProgress(book, 'cfi-10', '/p[1]', 0.5);
+
+    await database.removeDownload(book.id);
+    expect((await database.getBooks(server.id)).find((item) => item.id === book.id)).toMatchObject({
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+      pagesRead: 50,
+    });
+
+    await database.removeDownloads([secondBook.id]);
+    const saved = await database.getBooks(server.id);
+    expect(saved.find((item) => item.id === secondBook.id)).toMatchObject({
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    });
+    expect(saved.find((item) => item.id === thirdBook.id)).toMatchObject({
+      downloadPath: 'books/book-12.epub',
+      downloadStatus: 'available',
+      fileSize: 4096,
+    });
+  });
+
+  it('cascades server deletion across books, reading_state, and sync_queue in SQLite', async () => {
+    const database = await importDatabase();
+    const otherServer = { ...server, id: 'other', baseUrl: 'https://other.example.com' };
+    const otherBook = { ...book, id: 'other:1:10', serverId: otherServer.id, title: 'Other book' };
+    await database.saveServer(server);
+    await database.saveServer(otherServer);
+    await database.reconcileBooks(server.id, [
+      book,
+      { ...book, id: 'server:1:11', chapterId: 11, title: 'Book 2' },
+    ]);
+    await database.reconcileBooks(otherServer.id, [otherBook]);
+    await database.markDownloaded(book.id, 'books/book-10.epub', 1024);
+    await database.saveLocalProgress(book, 'cfi-main', '/main', 0.3);
+    await database.saveLocalProgress(otherBook, 'cfi-other', '/other', 0.7);
+
+    await database.removeServer(server.id);
+
+    expect(await database.getBooks(server.id)).toEqual([]);
+    expect(await database.getReadingState(book.id)).toBeNull();
+    expect(await database.getPendingSync(server.id)).toEqual([]);
+    expect(
+      native.database
+        ?.prepare('SELECT COUNT(*) AS count FROM books WHERE server_id=?')
+        .get(server.id),
+    ).toEqual({ count: 0 });
+    expect(
+      native.database
+        ?.prepare('SELECT COUNT(*) AS count FROM reading_state WHERE book_id=?')
+        .get(book.id),
+    ).toEqual({ count: 0 });
+    expect(
+      native.database
+        ?.prepare('SELECT COUNT(*) AS count FROM sync_queue WHERE book_id=?')
+        .get(book.id),
+    ).toEqual({ count: 0 });
+    expect(await database.getBooks(otherServer.id)).toHaveLength(1);
+    expect(await database.getPendingSync(otherServer.id)).toHaveLength(1);
+  });
+
   it('serializes reads behind reconcileBooks so mid-transaction remote_available=0 is hidden', async () => {
     const database = await importDatabase();
     await seedDatabase(database);

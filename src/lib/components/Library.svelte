@@ -14,6 +14,7 @@
     markDownloaded,
     markBookCompleted,
     removeDownload,
+    removeDownloads,
     removeServer,
     reconcileBooks,
     saveLocalProgress,
@@ -29,6 +30,7 @@
     cacheCover,
     clearCoverCache,
     cleanupInterruptedEpubDownloads,
+    deleteAllDownloadedEpubs,
     deleteDownloadedEpub,
     downloadEpub,
     EPUB_DOWNLOAD_ENDPOINT,
@@ -60,6 +62,23 @@
     type LibraryViewMode,
     type VirtualWindow,
   } from './library-virtualization';
+  import {
+    areBookListsEqual,
+    areBookRecordsEqual,
+    buildBookIndexById,
+    buildDisplayableIndices,
+    buildSearchableTextById,
+    collectDisplayableAuthors,
+    collectDisplayableSeries,
+    haveSameBookIdsByIndex,
+    haveSameBookStructure,
+    haveSameCatalogStructure,
+    haveSameRecentSortKeys,
+    normalizeLibrarySearch,
+    replaceBookAtIndex,
+    sortDisplayableIndices,
+    type LibrarySortOrder,
+  } from './library-catalog';
   import {
     DEFAULT_THEME,
     isSkeletonTheme,
@@ -107,7 +126,6 @@
     onReaderOpenChange?: ((open: boolean) => void) | undefined;
     onOverlayActiveChange?: (active: boolean) => void;
   } = $props();
-  type LibrarySortOrder = 'title' | 'author' | 'recent';
   let activeApiKey = $derived(apiKey);
   const client = $derived(new KavitaClient(server.baseUrl, activeApiKey));
   const serverOrigin = $derived(new URL(server.baseUrl).origin);
@@ -128,9 +146,22 @@
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return blob;
   });
-  let books = $state<BookRecord[]>([]);
-  let displayableBooks = $derived(
-    books.filter((book) => book.remoteAvailable !== false || Boolean(book.downloadPath)),
+  let books = $state.raw<BookRecord[]>([]);
+  let bookOrderRevision = $state(0);
+  let catalogStructureRevision = $state(0);
+  let recentOrderRevision = $state(0);
+  const bookIndexById = $derived.by(() => {
+    void bookOrderRevision;
+    return buildBookIndexById(untrack(() => books));
+  });
+  const displayableIndices = $derived.by(() => {
+    void catalogStructureRevision;
+    return buildDisplayableIndices(untrack(() => books));
+  });
+  let displayableBooks = $derived(displayableIndices.map((index) => books[index]!));
+  const hasDownloadedBooks = $derived(books.some((book) => Boolean(book.downloadPath)));
+  const downloadedStorageBytes = $derived(
+    books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0),
   );
   let query = $state('');
   let offlineMessage = $state('');
@@ -148,49 +179,38 @@
   let libraryFiltersActive = $derived(
     Boolean(query.trim()) || downloadedOnly || hideCompleted || advancedFiltersActive,
   );
-  let authors = $derived(
-    [
-      ...new Set(
-        displayableBooks
-          .map((book) => book.author)
-          .filter((author): author is string => Boolean(author)),
-      ),
-    ].sort((a, b) => a.localeCompare(b)),
-  );
-  let seriesNames = $derived(
-    [
-      ...new Set(
-        displayableBooks
-          .map((book) => book.series)
-          .filter((series): series is string => Boolean(series)),
-      ),
-    ].sort((a, b) => a.localeCompare(b)),
-  );
-  const searchableText = $derived(
-    new Map(
-      displayableBooks.map((book) => [
-        book.id,
-        normalizeLibrarySearch(`${book.title} ${book.author ?? ''} ${book.series ?? ''}`),
-      ]),
-    ),
-  );
-  const sortedBooks = $derived(
-    [...displayableBooks].sort((a, b) => {
-      if (sortOrder === 'recent') {
-        return (
-          (b.lastReadAt ?? '').localeCompare(a.lastReadAt ?? '') || a.title.localeCompare(b.title)
-        );
-      }
-      if (sortOrder === 'author') {
-        return (
-          (a.author ?? '').localeCompare(b.author ?? '') ||
-          a.title.localeCompare(b.title) ||
-          a.id.localeCompare(b.id)
-        );
-      }
-      return a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
-    }),
-  );
+  let authors = $derived.by(() => {
+    void catalogStructureRevision;
+    return collectDisplayableAuthors(
+      untrack(() => books),
+      displayableIndices,
+    );
+  });
+  let seriesNames = $derived.by(() => {
+    void catalogStructureRevision;
+    return collectDisplayableSeries(
+      untrack(() => books),
+      displayableIndices,
+    );
+  });
+  const searchableText = $derived.by(() => {
+    void catalogStructureRevision;
+    return buildSearchableTextById(
+      untrack(() => books),
+      displayableIndices,
+    );
+  });
+  const sortedIndices = $derived.by(() => {
+    const order = sortOrder;
+    void catalogStructureRevision;
+    if (order === 'recent') void recentOrderRevision;
+    return sortDisplayableIndices(
+      untrack(() => books),
+      displayableIndices,
+      order,
+    );
+  });
+  const sortedBooks = $derived(sortedIndices.map((index) => books[index]!));
   const visibleBooks = $derived(
     sortedBooks.filter((book) => {
       const completed = book.pages > 0 && book.pagesRead >= book.pages;
@@ -213,7 +233,7 @@
     }
     return latest;
   });
-  let reading = $state<{
+  let reading = $state.raw<{
     book: BookRecord;
     url: string;
     cfi: string | null;
@@ -221,7 +241,7 @@
     percentage: number | null;
   } | null>(null);
   let readerBackHandler: (() => boolean) | null = null;
-  let conflict = $state<{
+  let conflict = $state.raw<{
     book: BookRecord;
     url: string;
     local: StoredReadingState;
@@ -237,7 +257,7 @@
   let downloadingBookId = $state<string | null>(null);
   let downloadPercent = $state<number | null>(null);
   let cleanupInProgress = $state(false);
-  let downloadFailureBook = $state<BookRecord | null>(null);
+  let downloadFailureBook = $state.raw<BookRecord | null>(null);
   let failedDownloadCleanupPath = $state<string | null>(null);
   let downloadNeedsRefresh = $state(false);
   let offline = $state(false);
@@ -269,13 +289,15 @@
   let deletingServer = $state(false);
   let confirmDeleteServer = $state(false);
   let credentialCleanupComplete = false;
-  let actionMenuBook = $state<BookRecord | null>(null);
+  let actionMenuBook = $state.raw<BookRecord | null>(null);
   let actionMenuDialog = $state<HTMLElement | null>(null);
   let conflictDialog = $state<HTMLElement | null>(null);
   let settingsDialog = $state<HTMLElement | null>(null);
+  let confirmDeleteDialog = $state<HTMLElement | null>(null);
   let actionMenuOpener: HTMLElement | null = null;
   let conflictOpener: HTMLElement | null = null;
   let settingsOpener: HTMLElement | null = null;
+  let confirmDeleteOpener: HTMLElement | null = null;
   let libraryMain = $state<HTMLElement | null>(null);
   let virtualGrid = $state<HTMLElement | null>(null);
   let gridColumns = $state(2);
@@ -322,14 +344,66 @@
   let coverLoadController: AbortController | null = null;
   let coverLoadGeneration = 0;
 
-  function normalizeLibrarySearch(value: string): string {
-    return value
-      .normalize('NFKD')
-      .toLowerCase()
-      .replace(/\p{M}/gu, '')
-      .replace(/['’]/g, '')
-      .replace(/[^\p{L}\p{N}]+/gu, ' ')
-      .trim();
+  function getBookById(bookId: string): BookRecord | null {
+    const index = bookIndexById.get(bookId);
+    return index === undefined ? null : (books[index] ?? null);
+  }
+
+  function setCatalogBooks(nextBooks: BookRecord[]): boolean {
+    const previous = books;
+    if (areBookListsEqual(previous, nextBooks)) return false;
+    const sameIds = haveSameBookIdsByIndex(previous, nextBooks);
+    const sameStructure = sameIds && haveSameCatalogStructure(previous, nextBooks);
+    const sameRecent = sameStructure && haveSameRecentSortKeys(previous, nextBooks);
+    books = nextBooks;
+    if (!sameIds) bookOrderRevision += 1;
+    if (!sameStructure) catalogStructureRevision += 1;
+    if (!sameRecent) recentOrderRevision += 1;
+    return true;
+  }
+
+  function updateBookById(
+    bookId: string,
+    updater: (current: BookRecord) => BookRecord,
+  ): BookRecord | null {
+    const index = bookIndexById.get(bookId);
+    if (index === undefined) return null;
+    const previous = books[index]!;
+    const next = updater(previous);
+    if (areBookRecordsEqual(previous, next)) return previous;
+    books = replaceBookAtIndex(books, index, next);
+    if (!haveSameBookStructure(previous, next)) catalogStructureRevision += 1;
+    if (previous.lastReadAt !== next.lastReadAt) recentOrderRevision += 1;
+    return next;
+  }
+
+  function clearBooksDownloadsById(bookIds: readonly string[]): void {
+    if (bookIds.length === 0) return;
+    let nextBooks: BookRecord[] | null = null;
+    let structureChanged = false;
+    for (const bookId of bookIds) {
+      const index = bookIndexById.get(bookId);
+      if (index === undefined) continue;
+      const previous = (nextBooks ?? books)[index]!;
+      if (
+        !previous.downloadPath &&
+        previous.downloadStatus === 'none' &&
+        previous.fileSize === null
+      )
+        continue;
+      const updated: BookRecord = {
+        ...previous,
+        downloadPath: null,
+        downloadStatus: 'none',
+        fileSize: null,
+      };
+      nextBooks ??= books.slice();
+      nextBooks[index] = updated;
+      if (!haveSameBookStructure(previous, updated)) structureChanged = true;
+    }
+    if (!nextBooks) return;
+    books = nextBooks;
+    if (structureChanged) catalogStructureRevision += 1;
   }
 
   function progressOf(book: BookRecord): number {
@@ -611,7 +685,9 @@
   });
 
   $effect(() => {
-    const overlayActive = Boolean(reading || actionMenuBook || conflict || settingsVisible);
+    const overlayActive = Boolean(
+      reading || actionMenuBook || conflict || settingsVisible || confirmDeleteServer,
+    );
     onOverlayActiveChange?.(overlayActive);
     return () => onOverlayActiveChange?.(false);
   });
@@ -719,7 +795,7 @@
     viewMode = parseViewMode(preferences.get('libraryView') ?? null);
     offline = !(await Network.getStatus().catch(() => null))?.connected;
     if (destroyed) return;
-    books = savedBooks;
+    setCatalogBooks(savedBooks);
     retainCoversFor(books);
     loading = false;
     void refreshSyncStatus();
@@ -771,7 +847,8 @@
           else if (reading) {
             if (readerBackHandler?.()) return;
             void closeReader();
-          } else if (settingsVisible) closeSettings();
+          } else if (confirmDeleteServer && !deletingServer) cancelConfirmDeleteServer();
+          else if (settingsVisible) closeSettings();
           else if (filtersVisible) filtersVisible = false;
           else void App.exitApp();
         }),
@@ -947,11 +1024,11 @@
       diagnosticEndpoint = '/api/unknown';
       await reconcileBooks(server.id, mapped, { preserveMissing: incomplete, snapshotStartedAt });
       if (destroyed) return;
-      books = await getBooks(server.id, { includeDescription: false });
-      retainCoversFor(books);
+      const refreshedBooks = await getBooks(server.id, { includeDescription: false });
+      if (setCatalogBooks(refreshedBooks)) retainCoversFor(books);
       coverReloadRequest += 1;
       if (downloadNeedsRefresh && downloadFailureBook) {
-        const refreshedFailure = books.find((item) => item.id === downloadFailureBook?.id) ?? null;
+        const refreshedFailure = getBookById(downloadFailureBook.id);
         downloadNeedsRefresh = false;
         if (refreshedFailure?.downloadPath) {
           downloadFailureBook = null;
@@ -1092,13 +1169,17 @@
       downloadedPath = file.relativePath;
       await markDownloaded(book.id, file.relativePath, file.size);
       downloadedPath = null;
-      const refreshed = {
+      const refreshed = updateBookById(book.id, (item) => ({
+        ...item,
+        downloadPath: file.relativePath,
+        downloadStatus: 'available',
+        fileSize: file.size,
+      })) ?? {
         ...book,
         downloadPath: file.relativePath,
         downloadStatus: 'available',
         fileSize: file.size,
       };
-      books = books.map((item) => (item.id === book.id ? refreshed : item));
       message = `${book.title} is ready offline.`;
       return refreshed;
     } catch (error) {
@@ -1113,7 +1194,7 @@
           savedBooks?.find((item) => item.id === book.id && item.downloadPath === downloadedPath) ??
           null;
         if (persistedBook && savedBooks) {
-          books = savedBooks;
+          setCatalogBooks(savedBooks);
           message = `${book.title} is ready offline.`;
           return persistedBook;
         }
@@ -1211,16 +1292,12 @@
         : `Could not remove ${book.title}: ${detail}`;
       return false;
     }
-    books = books.map((item) =>
-      item.id === book.id
-        ? {
-            ...item,
-            downloadPath: null,
-            downloadStatus: 'none',
-            fileSize: null,
-          }
-        : item,
-    );
+    updateBookById(book.id, (item) => ({
+      ...item,
+      downloadPath: null,
+      downloadStatus: 'none',
+      fileSize: null,
+    }));
     return true;
   }
 
@@ -1263,6 +1340,10 @@
       if (refreshed) await open(refreshed, options);
       return;
     }
+    if (cleanupInProgress) {
+      message = 'Wait for the current cleanup to finish before opening a book.';
+      return;
+    }
     if (destroyed || reading || conflict || resolvingOpenProgress) return;
     resolvingOpenProgress = true;
     let file: Awaited<ReturnType<typeof verifyDownloadedEpub>>;
@@ -1298,8 +1379,8 @@
     if (!file) {
       await removeDownload(book.id);
       message = 'The downloaded file is missing. Download it again.';
-      books = await getBooks(server.id, { includeDescription: false });
-      const refreshed = books.find((item) => item.id === book.id) ?? null;
+      setCatalogBooks(await getBooks(server.id, { includeDescription: false }));
+      const refreshed = getBookById(book.id);
       if (refreshed) await open(refreshed, options);
       return;
     }
@@ -1307,12 +1388,13 @@
     const openProgress = chooseOpenProgress(local, remote, book.pages, preferFurthest);
     if (openProgress === 'remote' && remote) {
       resolvingOpenProgress = true;
+      let updatedBook: BookRecord;
       try {
         if (!(await saveRemoteProgress(book, remote, local))) {
           message = 'The saved reading position changed. Open the book again.';
           return;
         }
-        updateRemoteBookProgress(book, remote);
+        updatedBook = updateRemoteBookProgress(book, remote) ?? book;
       } catch {
         message = 'Turnleaf could not save the Kavita reading position. Open the book again.';
         return;
@@ -1321,11 +1403,11 @@
       }
       if (destroyed) return;
       reading = {
-        book,
+        book: updatedBook,
         url: file.webViewUrl,
         cfi: null,
         xpath: remote.bookScrollId ?? null,
-        percentage: remotePercentage(remote, book),
+        percentage: remotePercentage(remote, updatedBook),
       };
       return;
     }
@@ -1388,11 +1470,11 @@
     );
     const pagesRead = toKavitaPageNumber(location.percentage, book.pages, location.spineIndex);
     const lastReadAt = new Date().toISOString();
-    const savedBook = books.find((item) => item.id === book.id);
-    if (savedBook) {
-      savedBook.pagesRead = pagesRead;
-      savedBook.lastReadAt = lastReadAt;
-    }
+    updateBookById(book.id, (item) => ({
+      ...item,
+      pagesRead,
+      lastReadAt,
+    }));
     if (syncTimer !== null) window.clearTimeout(syncTimer);
     syncTimer = window.setTimeout(() => void syncProgress(false), 2_500);
   }
@@ -1446,21 +1528,24 @@
     };
   }
 
-  function updateRemoteBookProgress(book: BookRecord, remote: KavitaProgress): void {
-    const savedBook = books.find((item) => item.id === book.id);
-    if (savedBook) {
-      savedBook.pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
-      savedBook.lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
-    }
+  function updateRemoteBookProgress(book: BookRecord, remote: KavitaProgress): BookRecord | null {
+    const pagesRead = Math.max(0, Math.min(book.pages, remote.pageNum));
+    const lastReadAt = remote.lastModifiedUtc ?? new Date().toISOString();
+    return updateBookById(book.id, (item) => ({
+      ...item,
+      pagesRead,
+      lastReadAt,
+    }));
   }
 
   async function markDone(book: BookRecord): Promise<void> {
     await markBookCompleted(book);
-    const savedBook = books.find((item) => item.id === book.id);
-    if (savedBook) {
-      savedBook.pagesRead = book.pages;
-      savedBook.lastReadAt = new Date().toISOString();
-    }
+    const lastReadAt = new Date().toISOString();
+    updateBookById(book.id, (item) => ({
+      ...item,
+      pagesRead: item.pages,
+      lastReadAt,
+    }));
     void syncProgress(false);
     message = `${book.title} marked as read.`;
     closeMenu();
@@ -1556,15 +1641,21 @@
 
       const lastReadAt = current.remote.lastModifiedUtc ?? new Date().toISOString();
       const pagesRead = Math.max(0, Math.min(current.book.pages, current.remote.pageNum));
-      books = books.map((book) =>
-        book.id === current.book.id ? { ...book, pagesRead, lastReadAt } : book,
-      );
+      const updatedBook = updateBookById(current.book.id, (book) => ({
+        ...book,
+        pagesRead,
+        lastReadAt,
+      })) ?? {
+        ...current.book,
+        pagesRead,
+        lastReadAt,
+      };
       reading = {
-        book: current.book,
+        book: updatedBook,
         url: current.url,
         cfi: null,
         xpath: current.remote.bookScrollId ?? null,
-        percentage: remotePercentage(current.remote, current.book),
+        percentage: remotePercentage(current.remote, updatedBook),
       };
       dismissConflict();
       void refreshSyncStatus();
@@ -1584,10 +1675,28 @@
 
   function closeSettings(): void {
     settingsVisible = false;
+    confirmDeleteServer = false;
+    confirmDeleteOpener = null;
     showReplacementKey = false;
     const opener = settingsOpener;
     settingsOpener = null;
     restoreModalFocus(opener);
+  }
+
+  function openConfirmDeleteServer(): void {
+    confirmDeleteOpener = activeElement();
+    confirmDeleteServer = true;
+    void tick().then(() => {
+      confirmDeleteDialog?.scrollIntoView?.({ block: 'nearest' });
+    });
+    focusModal(() => confirmDeleteDialog);
+  }
+
+  function cancelConfirmDeleteServer(): void {
+    confirmDeleteServer = false;
+    const opener = confirmDeleteOpener;
+    confirmDeleteOpener = null;
+    restoreModalFocus(opener, () => settingsDialog);
   }
 
   async function removeAllDownloads(): Promise<void> {
@@ -1595,25 +1704,42 @@
     if (
       !candidates.length ||
       downloadingBookId ||
+      cleanupInProgress ||
       !window.confirm(
         `Remove ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'} from this device?`,
       )
     )
       return;
-    const failed: string[] = [];
-    for (const book of candidates) {
-      if (!(await remove(book))) failed.push(book.title);
+    cleanupInProgress = true;
+    try {
+      const cleanup = await deleteAllDownloadedEpubs(candidates.map((book) => book.downloadPath!));
+      const failedPathSet = new Set(cleanup.failedPaths);
+      const removedBooks = candidates.filter((book) => !failedPathSet.has(book.downloadPath!));
+      const failedBooks = candidates.filter((book) => failedPathSet.has(book.downloadPath!));
+      if (removedBooks.length > 0) {
+        const removedIds = removedBooks.map((book) => book.id);
+        try {
+          await removeDownloads(removedIds);
+        } catch {
+          message =
+            'Downloaded files were removed, but Turnleaf could not update saved download status. Try removing downloads again.';
+          closeSettings();
+          return;
+        }
+        clearBooksDownloadsById(removedIds);
+      }
+      if (failedBooks.length === 0) {
+        message = `Removed ${removedBooks.length} downloaded book${removedBooks.length === 1 ? '' : 's'}. Kavita was not changed.`;
+      } else {
+        const succeeded = removedBooks.length;
+        const failed = failedBooks.map((book) => book.title);
+        const names = failed.slice(0, 2).join(', ');
+        message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
+      }
+      closeSettings();
+    } finally {
+      cleanupInProgress = false;
     }
-    if (failed.length === 0) {
-      message = candidates.length
-        ? `Removed ${candidates.length} downloaded book${candidates.length === 1 ? '' : 's'}. Kavita was not changed.`
-        : 'No downloaded books to remove.';
-    } else {
-      const succeeded = candidates.length - failed.length;
-      const names = failed.slice(0, 2).join(', ');
-      message = `${succeeded} download${succeeded === 1 ? '' : 's'} removed; ${failed.length} could not be removed (${names}${failed.length > 2 ? ', …' : ''}). Try again.`;
-    }
-    closeSettings();
   }
 
   async function clearCache(): Promise<void> {
@@ -1710,11 +1836,26 @@
   }
 
   async function deleteServer(): Promise<void> {
+    if (downloadingBookId || cleanupInProgress) {
+      settingsError =
+        'Wait for the current download or cleanup to finish before deleting the server.';
+      return;
+    }
     settingsError = '';
     deletingServer = true;
+    cleanupInProgress = true;
     try {
-      for (const book of books.filter((item) => item.downloadPath)) await remove(book);
+      const downloadedPaths = books.flatMap((item) =>
+        item.downloadPath ? [item.downloadPath] : [],
+      );
+      const cleanup = await deleteAllDownloadedEpubs(downloadedPaths);
+      if (cleanup.failedPaths.length > 0) {
+        throw new Error(
+          `Could not remove ${cleanup.failedPaths.length} local download${cleanup.failedPaths.length === 1 ? '' : 's'}. Retry cleanup before deleting this server.`,
+        );
+      }
       cancelCoverLoading();
+      sharedCoverLoader.retain(new Set());
       await clearCoverCache().catch(() => {});
       clearCovers();
       if (!credentialCleanupComplete) {
@@ -1733,8 +1874,12 @@
           ? `Could not remove the server safely: ${cause.message} The connection was left in place; retry Delete server.`
           : 'Could not remove the server safely. The connection was left in place; retry Delete server.';
     } finally {
+      cleanupInProgress = false;
       deletingServer = false;
       confirmDeleteServer = false;
+      const opener = confirmDeleteOpener;
+      confirmDeleteOpener = null;
+      if (settingsVisible && opener) restoreModalFocus(opener);
     }
   }
 </script>
@@ -1772,7 +1917,7 @@
   <main
     bind:this={libraryMain}
     class="mx-auto min-h-full max-w-6xl px-4 pb-16 pt-[max(1.5rem,env(safe-area-inset-top))] sm:px-6"
-    inert={Boolean(actionMenuBook || conflict || settingsVisible)}
+    inert={Boolean(actionMenuBook || conflict || settingsVisible || confirmDeleteServer)}
   >
     <a
       href="#library-results"
@@ -2103,7 +2248,7 @@
       >
         <p class="min-w-0 flex-1">{message}</p>
         {#if downloadingBookId}
-          {@const downloadingBook = books.find((book) => book.id === downloadingBookId)}
+          {@const downloadingBook = getBookById(downloadingBookId)}
           <div class="flex shrink-0 items-center gap-2">
             <div
               class="h-2 w-24 overflow-hidden rounded-full bg-surface-300-700"
@@ -2615,6 +2760,7 @@
             class="btn preset-tonal-surface justify-start"
             type="button"
             disabled={Boolean(downloadingBookId) ||
+              cleanupInProgress ||
               offline ||
               actionMenuBook.remoteAvailable === false}
             onclick={() => {
@@ -2774,7 +2920,13 @@
   <DialogShell
     bind:dialogElement={settingsDialog}
     labelledBy="library-settings-title"
-    onClose={closeSettings}
+    onClose={() => {
+      if (confirmDeleteServer) {
+        if (!deletingServer) cancelConfirmDeleteServer();
+      } else {
+        closeSettings();
+      }
+    }}
   >
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
@@ -2783,6 +2935,7 @@
           class="btn btn-sm preset-tonal-surface h-11 w-11 shrink-0 p-0"
           type="button"
           onclick={closeSettings}
+          disabled={deletingServer}
           aria-label="Close settings"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" class="h-5 w-5">
@@ -2795,7 +2948,11 @@
       </div>
     {/snippet}
 
-    <section class="mt-3" aria-labelledby="library-settings-appearance-title">
+    <section
+      class="mt-3"
+      aria-labelledby="library-settings-appearance-title"
+      inert={confirmDeleteServer}
+    >
       <h3 id="library-settings-appearance-title" class="text-lg font-medium">
         Application appearance
       </h3>
@@ -2902,7 +3059,11 @@
       </div>
     </section>
 
-    <section class="mt-7" aria-labelledby="library-settings-connection-title">
+    <section
+      class="mt-7"
+      aria-labelledby="library-settings-connection-title"
+      inert={confirmDeleteServer}
+    >
       <h3 id="library-settings-connection-title" class="text-lg font-medium">Connection</h3>
       <p class="mt-1 text-sm text-surface-700-300">
         Update the server address or replace the key used to access this library.
@@ -2981,15 +3142,19 @@
         <button
           class="btn preset-tonal-error"
           type="button"
-          onclick={() => (confirmDeleteServer = true)}
-          disabled={deletingServer}
+          onclick={openConfirmDeleteServer}
+          disabled={deletingServer || cleanupInProgress || Boolean(downloadingBookId)}
         >
           Delete server
         </button>
       </form>
     </section>
 
-    <section class="mt-7" aria-labelledby="library-settings-storage-title">
+    <section
+      class="mt-7"
+      aria-labelledby="library-settings-storage-title"
+      inert={confirmDeleteServer}
+    >
       <h3 id="library-settings-storage-title" class="text-lg font-medium">
         Storage and maintenance
       </h3>
@@ -3004,7 +3169,7 @@
         <button
           class="btn preset-tonal-error"
           type="button"
-          disabled={Boolean(downloadingBookId) || !books.some((book) => book.downloadPath)}
+          disabled={Boolean(downloadingBookId) || cleanupInProgress || !hasDownloadedBooks}
           onclick={removeAllDownloads}
         >
           Remove all downloaded books
@@ -3014,18 +3179,26 @@
         <div class="flex items-center justify-between gap-3">
           <dt class="text-surface-700-300">Downloaded storage</dt>
           <dd class="tabular-nums">
-            {(
-              books.reduce((sum, book) => sum + (book.downloadPath ? (book.fileSize ?? 0) : 0), 0) /
-              1_048_576
-            ).toFixed(1)} MB
+            {(downloadedStorageBytes / 1_048_576).toFixed(1)} MB
           </dd>
         </div>
       </dl>
     </section>
-    <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
+    <div inert={confirmDeleteServer}>
+      <DiagnosticsPanel kavitaVersion={server.kavitaVersion} />
+    </div>
     {#if confirmDeleteServer}
-      <div class="mt-7 rounded-xl border border-error-500/35 p-4" transition:fade>
-        <p class="text-sm font-medium text-error-700-300">Delete this server?</p>
+      <div
+        bind:this={confirmDeleteDialog}
+        class="mt-7 rounded-xl border border-error-500/35 p-4"
+        role="region"
+        aria-labelledby="library-confirm-delete-server-title"
+        tabindex="-1"
+        transition:fade
+      >
+        <p id="library-confirm-delete-server-title" class="text-sm font-medium text-error-700-300">
+          Delete this server?
+        </p>
         <p class="mt-2 text-sm text-surface-700-300">
           This removes the server connection, downloaded books, cached covers, and local progress
           from this device.
@@ -3035,14 +3208,14 @@
             class="btn preset-outlined-error-500"
             type="button"
             onclick={() => void deleteServer()}
-            disabled={deletingServer}
+            disabled={deletingServer || cleanupInProgress}
           >
             {deletingServer ? 'Deleting...' : 'Delete now'}
           </button>
           <button
             class="btn preset-tonal-surface"
             type="button"
-            onclick={() => (confirmDeleteServer = false)}
+            onclick={cancelConfirmDeleteServer}
             disabled={deletingServer}
           >
             Cancel

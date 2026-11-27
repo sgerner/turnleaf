@@ -1063,4 +1063,78 @@ describe('ReaderSession', () => {
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
     session.destroy();
   });
+
+  it('clears pending navigation when an in-flight display aborts during a resize and reports the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 640));
+
+    await session.open(viewport, null, null, null, defaultAppearance, onLocation, vi.fn());
+    const relocated = getRenditionListener('relocated');
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: 'epubcfi(/6/2!/4/2/1:0)',
+        percentage: 0.1,
+        displayed: { page: 1, total: 4 },
+      },
+    } as Location);
+    onLocation.mockClear();
+    mockRendition.display.mockClear();
+
+    let abortInFlightDisplay!: (reason?: unknown) => void;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          abortInFlightDisplay = reject;
+        }),
+    );
+    mockRendition.resize.mockImplementationOnce(() => {
+      abortInFlightDisplay(new DOMException('Display aborted by resize', 'AbortError'));
+    });
+
+    const inFlightDisplay = session.displayCfi('epubcfi(/6/4!/4/2/1:0)');
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/1:0)');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 640 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 640);
+    await expect(inFlightDisplay).resolves.toBe(false);
+
+    const resizedFinalCfi = 'epubcfi(/6/2!/4/2/3:0)';
+    relocated({
+      start: {
+        href: 'first.xhtml',
+        index: 0,
+        cfi: resizedFinalCfi,
+        percentage: 0.25,
+        displayed: { page: 2, total: 4 },
+      },
+    } as Location);
+
+    expect(onLocation).toHaveBeenCalledOnce();
+    expect(onLocation.mock.calls.at(-1)?.[0]?.cfi).toBe(resizedFinalCfi);
+    expect(onLocation.mock.calls.at(-1)?.[1]).toBe('restore');
+
+    mockRendition.display.mockClear();
+    session.applyAppearance({ ...defaultAppearance, fontSize: 22 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(resizedFinalCfi);
+
+    session.destroy();
+  });
 });

@@ -1215,8 +1215,45 @@ export async function markSyncFailure(
   );
 }
 
+const DOWNLOAD_CLEANUP_SQL_BATCH_SIZE = 500;
+
 export async function removeDownload(bookId: string): Promise<void> {
   await updateBookDownloadState(bookId, null, 'none', null);
+}
+
+export async function removeDownloadsInTransaction(
+  db: Pick<SQLiteDBConnection, 'executeTransaction'>,
+  bookIds: readonly string[],
+): Promise<void> {
+  const uniqueIds = [...new Set(bookIds)];
+  if (uniqueIds.length === 0) return;
+  const tasks: capTask[] = [];
+  for (let index = 0; index < uniqueIds.length; index += DOWNLOAD_CLEANUP_SQL_BATCH_SIZE) {
+    const batch = uniqueIds.slice(index, index + DOWNLOAD_CLEANUP_SQL_BATCH_SIZE);
+    tasks.push({
+      statement: `UPDATE books SET download_path=NULL,download_status='none',file_size=NULL WHERE id IN (${batch.map(() => '?').join(',')})`,
+      values: batch,
+    });
+  }
+  await executeNativeTransaction(db, tasks);
+}
+
+export async function removeDownloads(bookIds: readonly string[]): Promise<void> {
+  const uniqueIds = [...new Set(bookIds)];
+  if (uniqueIds.length === 0) return;
+  if (!Capacitor.isNativePlatform()) {
+    const idSet = new Set(uniqueIds);
+    updateBrowserState((state) => {
+      state.books = state.books.map((book) =>
+        idSet.has(book.id)
+          ? { ...book, downloadPath: null, downloadStatus: 'none', fileSize: null }
+          : book,
+      );
+    });
+    return;
+  }
+  const db = await openDatabase();
+  await removeDownloadsInTransaction(db, uniqueIds);
 }
 
 export async function getPreferences(keys: readonly string[]): Promise<Map<string, string>> {
