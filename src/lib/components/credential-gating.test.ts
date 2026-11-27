@@ -1217,6 +1217,7 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     let fixtureOffline = false;
     const offlineRequests: string[] = [];
     const uploadedPaths: string[] = [];
+    let releaseHeldFirstUpload: (() => void) | null = null;
 
     vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
       if (fixtureOffline) {
@@ -1225,11 +1226,9 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       if (options.url.includes('/api/Reader/progress')) {
         uploadedPaths.push(options.url);
         if (uploadedPaths.length === 1) {
-          runtime.online = false;
-          fixtureOffline = true;
-          for (const listener of runtime.networkListeners) {
-            listener({ connected: false, connectionType: 'none' });
-          }
+          await new Promise<void>((resolve) => {
+            releaseHeldFirstUpload = resolve;
+          });
         }
         return { status: 204, headers: {}, url: options.url, data: '' };
       }
@@ -1240,12 +1239,17 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
     });
 
     mounted = mount(App, { target });
-    await waitForCondition(() => uploadedPaths.length === 1);
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    await waitForCondition(() => releaseHeldFirstUpload !== null);
 
+    // Disconnect while the first native progress upload is still held on the bridge
+    runtime.online = false;
+    fixtureOffline = true;
+    for (const listener of runtime.networkListeners) {
+      listener({ connected: false, connectionType: 'none' });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
     expect(offlineRequests).toEqual([]);
-    const remaining = await Database.getPendingSync('primary');
-    expect(remaining.length).toBeGreaterThanOrEqual(1);
+
     const dbMid = JSON.parse(window.localStorage.getItem(DB_STORAGE_KEY) ?? '{}') as {
       syncQueue: Record<string, { attemptCount: number; lastError: string | null }>;
     };
@@ -1254,13 +1258,145 @@ describe('credential state and 401 gating across App, Library, Onboarding, and R
       lastError: null,
     });
 
+    // Reconnect BEFORE the held first native response settles, then release it
     runtime.online = true;
     fixtureOffline = false;
     for (const listener of runtime.networkListeners) {
       listener({ connected: true, connectionType: 'wifi' });
     }
+    releaseHeldFirstUpload!();
 
     await waitForCondition(async () => (await Database.getPendingSync('primary')).length === 0);
     expect(offlineRequests).toEqual([]);
+  });
+
+  it('claims download ownership synchronously before awaiting native Network.getStatus so concurrent opens only start one transfer', async () => {
+    runtime.native = true;
+    runtime.online = true;
+    secureStorageMock.values.set('server_primary_api_key', 'valid-native-key');
+    const secondOnlineBook: BookRecord = {
+      ...onlineOnlyBook,
+      id: 'primary:3:3',
+      seriesId: 3,
+      volumeId: 3,
+      chapterId: 3,
+      title: 'Second Remote Novel',
+    };
+    seedDatabase({ books: [onlineOnlyBook, secondOnlineBook] });
+
+    vi.mocked(CapacitorHttp.request).mockImplementation(async (options) => {
+      if (options.url.includes('/api/Series/v2')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify([
+            { id: 2, libraryId: 1, name: 'Remote Novel', format: 3, pages: 100, pagesRead: 0 },
+            {
+              id: 3,
+              libraryId: 1,
+              name: 'Second Remote Novel',
+              format: 3,
+              pages: 100,
+              pagesRead: 0,
+            },
+          ]),
+        };
+      }
+      if (options.url.includes('seriesId=2')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({
+            volumes: [
+              {
+                id: 2,
+                chapters: [
+                  {
+                    id: 2,
+                    volumeId: 2,
+                    title: 'Remote Novel',
+                    pages: 100,
+                    pagesRead: 0,
+                    format: 3,
+                    files: [{ id: 2, format: 3, extension: '.epub', bytes: 2048 }],
+                  },
+                ],
+              },
+            ],
+          }),
+        };
+      }
+      if (options.url.includes('seriesId=3')) {
+        return {
+          status: 200,
+          headers: {},
+          url: options.url,
+          data: JSON.stringify({
+            volumes: [
+              {
+                id: 3,
+                chapters: [
+                  {
+                    id: 3,
+                    volumeId: 3,
+                    title: 'Second Remote Novel',
+                    pages: 100,
+                    pagesRead: 0,
+                    format: 3,
+                    files: [{ id: 3, format: 3, extension: '.epub', bytes: 2048 }],
+                  },
+                ],
+              },
+            ],
+          }),
+        };
+      }
+      throw new Error(`Unexpected native request ${options.url}`);
+    });
+
+    mounted = mount(App, { target });
+    await waitForCondition(() => target.querySelectorAll('[data-book-open]').length === 2);
+
+    const pendingProbes: Array<
+      (status: { connected: boolean; connectionType: 'wifi' | 'none' }) => void
+    > = [];
+    vi.mocked(Network.getStatus).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          pendingProbes.push(resolve as never);
+        }),
+    );
+
+    let finishTransfer: (() => void) | null = null;
+    nativeDownloadMock.downloadResult = () =>
+      new Promise((resolve) => {
+        finishTransfer = () =>
+          resolve({
+            webViewUrl: 'web://books/primary-2.epub',
+            relativePath: 'books/primary-2.epub',
+            size: 2048,
+          });
+      });
+
+    const [firstOpen, secondOpen] = [
+      ...target.querySelectorAll<HTMLButtonElement>('[data-book-open]'),
+    ];
+    firstOpen!.click();
+    secondOpen!.click();
+    flushSync();
+
+    expect(target.textContent).toContain(
+      'A book is already downloading or being cleaned up. Try again when it finishes.',
+    );
+    expect(pendingProbes).toHaveLength(1);
+
+    pendingProbes.shift()?.({ connected: true, connectionType: 'wifi' });
+    await waitForCondition(() => finishTransfer !== null);
+    expect(downloadEpub).toHaveBeenCalledTimes(1);
+
+    finishTransfer!();
+    await waitForCondition(() => target.textContent?.includes('is ready offline.') === true);
   });
 });

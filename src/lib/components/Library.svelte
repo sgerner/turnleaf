@@ -145,15 +145,15 @@
     const coverClient = client;
     const coverKey = activeApiKey;
     const coverEpoch = clientEpoch;
-    const allowDownload =
+    const canLoadRemoteCover = () =>
       !offline &&
+      !destroyed &&
       !kavitaUnreachable &&
       !initialRefreshPending &&
       credentialReady &&
-      coverClient.canSendRequests() &&
-      (await networkAvailable()) &&
-      credentialReady &&
       coverClient.canSendRequests();
+    const allowDownload =
+      canLoadRemoteCover() && (await networkAvailable()) && canLoadRemoteCover();
     if (Capacitor.isNativePlatform()) {
       return await cacheCover(
         coverClient.coverUrl(seriesId),
@@ -163,13 +163,7 @@
         server.id,
         allowDownload,
         serverOrigin,
-        (transferSignal) =>
-          !offline &&
-          !destroyed &&
-          !initialRefreshPending &&
-          credentialReady &&
-          coverClient.canSendRequests() &&
-          !transferSignal?.aborted,
+        (transferSignal) => canLoadRemoteCover() && !transferSignal?.aborted,
         coverEpoch,
       );
     }
@@ -383,18 +377,20 @@
     }
   }
 
-  function invalidateCredentialWork(status: CredentialStatus): void {
+  function stopActiveNetworkWork(abortSync: boolean): void {
     initialRefreshPending = false;
     clearSyncTimer();
     refreshController?.abort();
+    if (abortSync) syncController?.abort();
     openProgressProbe?.abort();
     readerSyncController?.abort();
     downloadController?.abort();
-    if (status === 'missing' || status === 'unreadable') {
-      syncController?.abort();
-    }
     cancelCoverLoading();
     sharedCoverLoader.cancel();
+  }
+
+  function invalidateCredentialWork(status: CredentialStatus): void {
+    stopActiveNetworkWork(status === 'missing' || status === 'unreadable');
   }
 
   const unsubscribeCredentials = subscribeCredentialState((next) => {
@@ -852,15 +848,7 @@
           const wasOffline = offline;
           offline = !connected;
           if (!connected) {
-            initialRefreshPending = false;
-            clearSyncTimer();
-            refreshController?.abort();
-            syncController?.abort();
-            openProgressProbe?.abort();
-            readerSyncController?.abort();
-            downloadController?.abort();
-            cancelCoverLoading();
-            sharedCoverLoader.cancel();
+            stopActiveNetworkWork(true);
           }
           coverReloadRequest += 1;
           kavitaUnreachable = false;
@@ -955,9 +943,15 @@
     ) {
       return Promise.resolve();
     }
-    syncWork = runProgressSync(showFeedback).finally(() => {
-      syncWork = null;
+    const controller = new AbortController();
+    syncController = controller;
+    const work = runProgressSync(showFeedback, controller).finally(() => {
+      if (syncWork === work) {
+        syncController = null;
+        syncWork = null;
+      }
     });
+    syncWork = work;
     return syncWork;
   }
 
@@ -966,12 +960,13 @@
     message = next;
   }
 
-  async function runProgressSync(showFeedback: boolean): Promise<void> {
+  async function runProgressSync(
+    showFeedback: boolean,
+    controller: AbortController,
+  ): Promise<void> {
     syncing = true;
     activeSyncStartRevision = messageRevision;
     const syncClient = client;
-    const controller = new AbortController();
-    syncController = controller;
     try {
       if (destroyed || !credentialReady || !syncClient.canSendRequests()) return;
       const available = Capacitor.isNativePlatform()
@@ -1012,7 +1007,6 @@
         setMessage('Some reading progress is waiting to sync. Retry when Kavita is available.');
       }
     } finally {
-      if (syncController === controller) syncController = null;
       await refreshSyncStatus();
       activeSyncStartRevision = null;
       syncing = false;
@@ -1024,18 +1018,11 @@
     replacementApiKey = '';
     unsubscribeCredentials();
     onReaderOpenChange?.(false);
-    clearSyncTimer();
     if (virtualizationFrame !== null) window.cancelAnimationFrame(virtualizationFrame);
     scrollTarget?.removeEventListener('scroll', scheduleVirtualWindow);
     window.removeEventListener('resize', handleWindowResize);
-    openProgressProbe?.abort();
-    refreshController?.abort();
-    syncController?.abort();
-    readerSyncController?.abort();
-    downloadController?.abort();
-    cancelCoverLoading();
+    stopActiveNetworkWork(true);
     clearCovers();
-    sharedCoverLoader.cancel();
     cleanups.forEach((remove) => void remove());
   });
 
@@ -1267,23 +1254,35 @@
       message = 'A book is already downloading or being cleaned up. Try again when it finishes.';
       return null;
     }
-    if (!(await networkAvailable())) {
+    if (offline) {
       message = 'No network connection. Connect to Kavita to download this book.';
-      return null;
-    }
-    if (destroyed || offline || !credentialReady || !downloadClient.canSendRequests()) {
       return null;
     }
     const controller = new AbortController();
     downloadController = controller;
     downloadingBookId = book.id;
     downloadPercent = null;
-    downloadFailureBook = null;
-    failedDownloadCleanupPath = null;
-    downloadNeedsRefresh = false;
-    message = `Downloading ${book.title}...`;
     let downloadedPath: string | null = null;
     try {
+      if (!(await networkAvailable())) {
+        if (!destroyed && !controller.signal.aborted) {
+          message = 'No network connection. Connect to Kavita to download this book.';
+        }
+        return null;
+      }
+      if (
+        destroyed ||
+        controller.signal.aborted ||
+        offline ||
+        !credentialReady ||
+        !downloadClient.canSendRequests()
+      ) {
+        return null;
+      }
+      downloadFailureBook = null;
+      failedDownloadCleanupPath = null;
+      downloadNeedsRefresh = false;
+      message = `Downloading ${book.title}...`;
       const file = await downloadEpub(
         downloadClient.downloadUrl(book.chapterId),
         downloadKey,
@@ -1652,18 +1651,18 @@
   } | null> {
     if (!manual && !pendingAutoSync) return null;
     const readerClient = client;
-    if (!credentialReady || !readerClient.canSendRequests()) {
-      if (manual) {
-        throw new Error(
-          'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
-        );
-      }
-      return null;
-    }
-    if (book.remoteAvailable === false || !(await networkAvailable())) {
-      if (manual) throw new Error('Kavita is unavailable. Your reading position is saved here.');
-      return null;
-    }
+    const failReaderSync = (authBlocked: boolean, cause?: unknown): null => {
+      if (!manual) return null;
+      throw new Error(
+        authBlocked
+          ? 'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.'
+          : 'Kavita is unavailable. Your reading position is saved here.',
+        cause !== undefined ? { cause } : undefined,
+      );
+    };
+    const isAuthBlocked = () => !credentialReady || !readerClient.canSendRequests();
+    if (isAuthBlocked()) return failReaderSync(true);
+    if (book.remoteAvailable === false || !(await networkAvailable())) return failReaderSync(false);
     const controller = new AbortController();
     readerSyncController = controller;
     try {
@@ -1671,12 +1670,7 @@
         try {
           await flushProgress(readerClient, server.id, controller.signal);
         } catch (cause) {
-          if (!credentialReady || !readerClient.canSendRequests()) {
-            throw new Error(
-              'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
-              { cause },
-            );
-          }
+          if (isAuthBlocked()) return failReaderSync(true, cause);
           throw new Error('Reading progress is saved here and still waiting to upload.', { cause });
         } finally {
           void refreshSyncStatus();
@@ -1684,56 +1678,21 @@
       }
       const local = await getReadingState(book.id);
       if (local?.pendingSync) {
-        if (manual) {
-          throw new Error(
-            offline
-              ? 'Kavita is unavailable. Your reading position is saved here.'
-              : 'A newer position is saved here. Sync again to upload it.',
-          );
-        }
-        return null;
+        if (!manual) return null;
+        if (offline) return failReaderSync(false);
+        throw new Error('A newer position is saved here. Sync again to upload it.');
       }
-      if (
-        destroyed ||
-        offline ||
-        controller.signal.aborted ||
-        !credentialReady ||
-        !readerClient.canSendRequests()
-      ) {
-        if (manual) {
-          throw new Error(
-            !credentialReady || !readerClient.canSendRequests()
-              ? 'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.'
-              : 'Kavita is unavailable. Your reading position is saved here.',
-          );
-        }
-        return null;
+      if (destroyed || offline || controller.signal.aborted || isAuthBlocked()) {
+        return failReaderSync(isAuthBlocked());
       }
       let remote: KavitaProgress;
       try {
         remote = await readerClient.getProgress(book.chapterId, controller.signal);
       } catch (cause) {
-        if (
-          (cause instanceof KavitaError && cause.kind === 'authentication') ||
-          !credentialReady ||
-          !readerClient.canSendRequests()
-        ) {
-          if (manual) {
-            throw new Error(
-              'Update your Kavita auth key in Settings to sync reading progress. Your position is saved here.',
-              { cause },
-            );
-          }
-          return null;
+        if ((cause instanceof KavitaError && cause.kind === 'authentication') || isAuthBlocked()) {
+          return failReaderSync(true, cause);
         }
-        if (offline || controller.signal.aborted) {
-          if (manual) {
-            throw new Error('Kavita is unavailable. Your reading position is saved here.', {
-              cause,
-            });
-          }
-          return null;
-        }
+        if (offline || controller.signal.aborted) return failReaderSync(false, cause);
         throw cause;
       }
       if (!manual && chooseOpenProgress(local, remote, book.pages, true) !== 'remote') return null;

@@ -46,7 +46,7 @@ async function run(client: KavitaClient, serverId: string, signal?: AbortSignal)
       attempted.set(item.bookId, item);
       try {
         const payload = JSON.parse(item.payload) as KavitaProgress;
-        await (signal ? client.saveProgress(payload, signal) : client.saveProgress(payload));
+        await client.saveProgress(payload);
         await confirmSync(item.bookId, new Date().toISOString(), item.revision, item.updatedAt);
       } catch (error) {
         const stoppedBeforeDispatch =

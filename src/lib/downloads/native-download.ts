@@ -190,12 +190,17 @@ async function downloadFileWithRedirects(options: {
   while (true) {
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.assertCredential?.();
-    const allowed = options.beforeTransfer ? await options.beforeTransfer(options.signal) : true;
-    const networkStatus = await Network.getStatus().catch(() => null);
+    const allowedBefore = options.beforeTransfer
+      ? await options.beforeTransfer(options.signal)
+      : true;
+    const networkStatus = allowedBefore ? await Network.getStatus().catch(() => null) : null;
     if (options.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     options.assertCredential?.();
+    const allowedAfter =
+      allowedBefore &&
+      (options.beforeTransfer ? await options.beforeTransfer(options.signal) : true);
     if (
-      !allowed ||
+      !allowedAfter ||
       networkStatus?.connected !== true ||
       (typeof navigator !== 'undefined' && navigator.onLine === false)
     ) {
@@ -277,8 +282,6 @@ export async function downloadEpub(
 
   try {
     for (let attempt = 0; ; attempt += 1) {
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      assertCredential();
       try {
         await downloadFileWithRedirects({
           initialUrl: target.url,
@@ -309,9 +312,6 @@ export async function downloadEpub(
           throw error;
         }
         const { code, status } = readTransferFailure(error);
-        if (status === 401) {
-          markCredentialRejected(epoch, 401);
-        }
         const connectionFailed = code === 'OS-PLUG-FLTR-0008';
         const retryable =
           status === undefined ? connectionFailed : RETRYABLE_HTTP_STATUSES.has(status);
@@ -449,8 +449,6 @@ export async function cacheCover(
     await ensureDataDirectory(directory);
     await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(() => {});
     const temporary = await Filesystem.getUri({ path: temporaryPath, directory: Directory.Data });
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    assertCredential();
     try {
       let recordedAuthRejection = false;
       await downloadFileWithRedirects({
@@ -489,10 +487,6 @@ export async function cacheCover(
         directory: Directory.Data,
       });
     } catch (error) {
-      const { status: httpStatus } = readTransferFailure(error);
-      if (httpStatus === 401 || httpStatus === 403) {
-        markCredentialRejected(epoch, httpStatus);
-      }
       await Filesystem.deleteFile({ path: temporaryPath, directory: Directory.Data }).catch(
         () => {},
       );

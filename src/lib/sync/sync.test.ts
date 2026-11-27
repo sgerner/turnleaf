@@ -316,8 +316,7 @@ it('stops between requests without penalizing unattempted items when AbortSignal
   // 2) AbortSignal aborts right after book-1 finishes uploading -> book-1 confirmed, book-2 & book-3 untouched
   localStorage.setItem(STORAGE_KEY, JSON.stringify(buildThreeBookQueue()));
   const controller = new AbortController();
-  const saveProgressOnAbort = vi.fn(async (_payload: unknown, signal?: AbortSignal) => {
-    expect(signal).toBe(controller.signal);
+  const saveProgressOnAbort = vi.fn(async () => {
     controller.abort();
   });
 

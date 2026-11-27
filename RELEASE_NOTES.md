@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: deduplicate transport gates and serialize download/sync state
 - fix: centralize credential state and gate 401/403 requests
 - fix: refresh only after reconnecting from offline
 - fix: gate native requests on WebView connectivity

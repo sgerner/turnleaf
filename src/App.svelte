@@ -244,37 +244,6 @@
           <p class="text-sm tracking-wide text-surface-700-300">Opening your library...</p>
         </div>
       </main>
-    {:else if startupError}
-      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
-        <p>{startupError}</p>
-        <div class="flex flex-wrap gap-2">
-          <button
-            class="btn btn-sm preset-filled-error-500 !text-sm"
-            type="button"
-            onclick={() => void loadLocalData()}
-            disabled={repairing}
-          >
-            Retry
-          </button>
-          <button
-            class="btn btn-sm preset-tonal-error !text-sm"
-            type="button"
-            disabled={repairing}
-            onclick={() => {
-              if (
-                window.confirm(
-                  'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
-                )
-              ) {
-                void repairLocalData();
-              }
-            }}
-          >
-            {repairing ? 'Resetting...' : 'Reset local data'}
-          </button>
-        </div>
-        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
-      </div>
     {:else if server && !changingServerAddress && !reconnectingServer}
       <Library
         {server}
@@ -308,6 +277,37 @@
         }}
         onOverlayActiveChange={(active) => (stageOverlayActive = active)}
       />
+    {:else if startupError}
+      <div class="alert preset-tonal-error mx-auto mt-6 max-w-lg flex flex-col gap-3" role="alert">
+        <p>{startupError}</p>
+        <div class="flex flex-wrap gap-2">
+          <button
+            class="btn btn-sm preset-filled-error-500 !text-sm"
+            type="button"
+            onclick={() => void loadLocalData()}
+            disabled={repairing}
+          >
+            Retry
+          </button>
+          <button
+            class="btn btn-sm preset-tonal-error !text-sm"
+            type="button"
+            disabled={repairing}
+            onclick={() => {
+              if (
+                window.confirm(
+                  'Reset local data? This clears saved reading progress, settings, and server configuration. Downloaded EPUB files stay on this device but may need to be downloaded again.',
+                )
+              ) {
+                void repairLocalData();
+              }
+            }}
+          >
+            {repairing ? 'Resetting...' : 'Reset local data'}
+          </button>
+        </div>
+        <DiagnosticsPanel compact kavitaVersion={server?.kavitaVersion} />
+      </div>
     {:else}
       <Onboarding
         savedServer={server}
