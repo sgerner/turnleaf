@@ -389,7 +389,8 @@ export class ReaderSession {
   private reflowPending = false;
   private initialOpenComplete = false;
   private navigationDisplayActive = false;
-  private resizeRedisplayPending = false;
+  private openingPromise: Promise<void> | null = null;
+  private activeResize: Promise<void> | null = null;
   private pendingResize: { width: number; height: number } | null = null;
   private lastDisplayTarget: string | undefined = undefined;
   private appearance: Appearance | null = null;
@@ -448,7 +449,8 @@ export class ReaderSession {
     this.viewportTarget = target;
     this.initialOpenComplete = false;
     this.navigationDisplayActive = false;
-    this.resizeRedisplayPending = false;
+    this.openingPromise = null;
+    this.activeResize = null;
     this.pendingResize = null;
     this.lastDisplayTarget = undefined;
     const initialRect = target.getBoundingClientRect();
@@ -557,7 +559,6 @@ export class ReaderSession {
     }
     this.onLocation = onLocation;
     this.relocated = (location) => {
-      this.resizeRedisplayPending = false;
       const staleDuringActiveNavigation =
         this.navigationDisplayActive && this.hasManagedRendition();
       const startCfi = this.userNavigationStartCfi ?? this.current?.start.cfi ?? null;
@@ -640,13 +641,23 @@ export class ReaderSession {
     }
     this.applyAppearance(appearance);
     const restoreGeneration = this.beginLocationOperation(false);
-    await this.rendition.started;
-    this.bindEpubContainer();
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    await this.restoreInitialLocation(cfi, serverXPath, serverPercentage, restoreGeneration);
-    if (!this.isCurrentLocationOperation(restoreGeneration)) return;
-    this.initialOpenComplete = true;
-    await this.flushPendingResize();
+    const opening = (async () => {
+      await this.rendition!.started;
+      this.bindEpubContainer();
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      await this.restoreInitialLocation(cfi, serverXPath, serverPercentage, restoreGeneration);
+      if (!this.isCurrentLocationOperation(restoreGeneration)) return;
+      this.initialOpenComplete = true;
+      await this.flushPendingResize();
+    })();
+    this.openingPromise = opening;
+    try {
+      await opening;
+    } finally {
+      if (this.openingPromise === opening) {
+        this.openingPromise = null;
+      }
+    }
   }
 
   private async restoreInitialLocation(
@@ -1010,7 +1021,8 @@ export class ReaderSession {
     this.reflowPending = false;
     this.initialOpenComplete = false;
     this.navigationDisplayActive = false;
-    this.resizeRedisplayPending = false;
+    this.openingPromise = null;
+    this.activeResize = null;
     this.pendingResize = null;
     this.lastDisplayTarget = undefined;
     this.spine = null;
@@ -1175,7 +1187,7 @@ export class ReaderSession {
 
   private isProgrammaticScrollAllowed(): boolean {
     return (
-      this.displayOperationCount > 0 || this.userNavigationPending || this.resizeRedisplayPending
+      this.displayOperationCount > 0 || this.userNavigationPending || this.activeResize !== null
     );
   }
 
@@ -1357,14 +1369,17 @@ export class ReaderSession {
   }
 
   private hasManagedRendition(): boolean {
-    return Boolean(this.rendition && 'manager' in this.rendition);
+    return Boolean(
+      this.rendition &&
+      ('manager' in this.rendition || 'q' in this.rendition || 'settings' in this.rendition),
+    );
   }
 
   private isRenditionStageReady(): boolean {
     const rendition = this.rendition as
       (Rendition & { manager?: { stage?: unknown } | null }) | null;
     if (!rendition) return false;
-    if ('manager' in rendition) {
+    if (this.hasManagedRendition()) {
       return Boolean(rendition.manager && rendition.manager.stage);
     }
     return true;
@@ -1393,6 +1408,7 @@ export class ReaderSession {
     return (
       !this.initialOpenComplete ||
       !this.isRenditionStageReady() ||
+      this.activeResize !== null ||
       this.displayOperationCount > 0 ||
       this.userNavigationPending
     );
@@ -1420,11 +1436,7 @@ export class ReaderSession {
         manager?: { stage?: unknown } | null;
         settings?: { width?: number | string; height?: number | string };
       };
-      if (
-        'manager' in stagedRendition &&
-        !stagedRendition.manager?.stage &&
-        stagedRendition.settings
-      ) {
+      if (this.hasManagedRendition() && !this.isRenditionStageReady() && stagedRendition.settings) {
         stagedRendition.settings.width = width;
         stagedRendition.settings.height = height;
         this.viewportSize = { width, height };
@@ -1451,9 +1463,26 @@ export class ReaderSession {
     const rendition = this.rendition;
     if (!rendition || !this.isRenditionStageReady()) return;
     if (this.viewportSize?.width === width && this.viewportSize.height === height) return;
+    const task = this.performResize(rendition, width, height);
+    this.activeResize = task;
+    try {
+      await task;
+    } finally {
+      if (this.activeResize === task) {
+        this.activeResize = null;
+      }
+      void this.flushPendingResize();
+    }
+  }
+
+  private async performResize(rendition: Rendition, width: number, height: number): Promise<void> {
     this.viewportSize = { width, height };
     const fallbackCfi = this.resolveCurrentStart()?.cfi;
-    const hasRenditionLocation = Boolean(rendition.location?.start);
+    const mutableRendition = rendition as Omit<Rendition, 'location'> & {
+      location: Location | undefined;
+      resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
+    };
+    const previousLocation = mutableRendition.location;
     let managerEmittedResize = false;
     const markResized = () => {
       managerEmittedResize = true;
@@ -1461,27 +1490,27 @@ export class ReaderSession {
     rendition.on('resized', markResized);
     this.displayOperationCount += 1;
     try {
+      // Prevent EPUB.js Rendition.onResized from queueing an untracked display();
+      // performResize restores the target via displayAtGeneration under activeResize.
+      if (previousLocation?.start) {
+        mutableRendition.location = undefined;
+      }
       if (fallbackCfi && this.hasManagedRendition()) {
-        (
-          rendition as Rendition & {
-            resize: (nextWidth: number, nextHeight: number, epubcfi?: string) => void;
-          }
-        ).resize(width, height, fallbackCfi);
+        mutableRendition.resize(width, height, fallbackCfi);
       } else {
         rendition.resize(width, height);
       }
     } finally {
       rendition.off('resized', markResized);
+      if (!managerEmittedResize && previousLocation !== undefined) {
+        mutableRendition.location = previousLocation;
+      }
       const container = this.bindEpubContainer();
       if (container) this.lockedScrollLeft = container.scrollLeft;
       this.displayOperationCount = Math.max(0, this.displayOperationCount - 1);
       this.syncVisibleColumnLinks();
     }
     if (!managerEmittedResize) return;
-    if (hasRenditionLocation) {
-      this.resizeRedisplayPending = true;
-      return;
-    }
     const restoreTarget = fallbackCfi ?? this.lastDisplayTarget;
     const generation = this.locationGeneration;
     try {
@@ -1592,7 +1621,31 @@ export class ReaderSession {
     }
   }
 
+  private async settleBeforeNavigation(): Promise<void> {
+    if (this.openingPromise) {
+      try {
+        await this.openingPromise;
+      } catch {
+        // Navigation will bail below if opening failed or closed the session.
+      }
+    }
+    while (this.activeResize) {
+      await this.activeResize;
+    }
+    while (this.pendingResize && !this.shouldDeferResize()) {
+      await this.flushPendingResize();
+    }
+  }
+
   private async navigate(display: () => Promise<unknown>): Promise<void> {
+    if (
+      this.openingPromise !== null ||
+      this.activeResize !== null ||
+      (this.pendingResize !== null && !this.shouldDeferResize())
+    ) {
+      await this.settleBeforeNavigation();
+      if (!this.rendition) throw new Error('Reader is not open.');
+    }
     const generation = this.beginLocationOperation(true);
     this.navigationDisplayActive = true;
     try {
@@ -1605,6 +1658,7 @@ export class ReaderSession {
       throw error;
     } finally {
       this.navigationDisplayActive = false;
+      void this.flushPendingResize();
     }
   }
 

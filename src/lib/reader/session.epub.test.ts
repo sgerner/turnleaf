@@ -1311,4 +1311,150 @@ describe('ReaderSession', () => {
       Reflect.deleteProperty(managedRendition, 'next');
     }
   });
+
+  it('tracks resize re-display when rendition.location is already populated and waits before next()', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+    mockRendition.on.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name)!.add(fn);
+    });
+    mockRendition.off.mockImplementation((name: string, fn: (...args: unknown[]) => void) => {
+      listeners.get(name)?.delete(fn);
+    });
+
+    const managedRendition = mockRendition as typeof mockRendition & {
+      manager?: { stage?: unknown };
+      q?: object;
+      settings?: { width: number | string; height: number | string };
+      currentLocation?: () => Location | Record<string, never>;
+      next?: () => Promise<void>;
+    };
+    managedRendition.q = {};
+    managedRendition.settings = { width: 412, height: 840 };
+    managedRendition.manager = { stage: {} };
+
+    let viewsRendered = true;
+    let currentCfi = 'epubcfi(/6/2!/4/2/1:0)';
+    managedRendition.currentLocation = () => (viewsRendered ? location(currentCfi) : {});
+
+    let releaseRedisplay!: () => void;
+    let redisplayCount = 0;
+    const displayMock = mockRendition.display as unknown as ReturnType<
+      typeof vi.fn<(target?: string) => Promise<void>>
+    >;
+    displayMock.mockImplementation(async (target?: string) => {
+      if (!viewsRendered) {
+        redisplayCount += 1;
+        if (redisplayCount === 1) {
+          await new Promise<void>((resolve) => {
+            releaseRedisplay = resolve;
+          });
+        }
+        viewsRendered = true;
+        if (target) currentCfi = target;
+      }
+    });
+
+    mockRendition.resize.mockImplementation((width: number, height: number, epubcfi?: string) => {
+      // Simulate EPUB.js DefaultViewManager.resize clearing views and Rendition.onResized
+      // checking this.location.start before emitting untracked display().
+      viewsRendered = false;
+      for (const listener of listeners.get('resized') ?? []) {
+        listener({ width, height }, epubcfi);
+      }
+      if (mockRendition.location?.start) {
+        void displayMock(epubcfi ?? mockRendition.location.start.cfi);
+      }
+    });
+
+    const nextCallsWhileCleared: boolean[] = [];
+    managedRendition.next = vi.fn(async () => {
+      nextCallsWhileCleared.push(!viewsRendered);
+      if (!viewsRendered) return;
+      currentCfi = 'epubcfi(/6/4!/4/2/1:0)';
+    });
+
+    const onLocation = vi.fn();
+    const session = new ReaderSession('book.epub');
+    try {
+      await session.open(
+        document.createElement('div'),
+        null,
+        null,
+        null,
+        defaultAppearance,
+        onLocation,
+        vi.fn(),
+      );
+      const relocated = [...(listeners.get('relocated') ?? [])][0]!;
+      mockRendition.location = { start: { cfi: currentCfi } };
+      relocated(location(currentCfi));
+      mockRendition.display.mockClear();
+      mockRendition.resize.mockClear();
+
+      // First system-bar resize clears views and starts tracked re-display; second frame coalesces.
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 891 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+      resizeCallbacks[0]?.(
+        [{ contentRect: { width: 412, height: 915 } } as ResizeObserverEntry],
+        {} as ResizeObserver,
+      );
+
+      expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(
+        412,
+        891,
+        'epubcfi(/6/2!/4/2/1:0)',
+      );
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/2!/4/2/1:0)');
+
+      // User taps Next page while resize re-display is still rendering views.
+      const turning = session.next();
+      await Promise.resolve();
+      expect(managedRendition.next).not.toHaveBeenCalled();
+
+      releaseRedisplay();
+      await turning;
+
+      // Coalesced 412x915 resize also finished before next() executed, so views were rendered.
+      expect(mockRendition.resize).toHaveBeenCalledTimes(2);
+      expect(nextCallsWhileCleared).toEqual([false]);
+      expect(currentCfi).toBe('epubcfi(/6/4!/4/2/1:0)');
+
+      relocated({
+        start: {
+          href: 'second.xhtml',
+          index: 1,
+          cfi: currentCfi,
+          displayed: { page: 1, total: 1 },
+        },
+      });
+      expect(onLocation).toHaveBeenLastCalledWith(
+        expect.objectContaining({ cfi: 'epubcfi(/6/4!/4/2/1:0)' }),
+        'navigation',
+      );
+    } finally {
+      session.destroy();
+      mockRendition.on.mockReset();
+      mockRendition.off.mockReset();
+      mockRendition.display.mockReset();
+      mockRendition.resize.mockReset();
+      Reflect.deleteProperty(managedRendition, 'manager');
+      Reflect.deleteProperty(managedRendition, 'q');
+      Reflect.deleteProperty(managedRendition, 'settings');
+      Reflect.deleteProperty(managedRendition, 'currentLocation');
+      Reflect.deleteProperty(managedRendition, 'next');
+    }
+  });
 });

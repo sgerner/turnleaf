@@ -57,6 +57,7 @@ function withoutRemoteProgressMarkers(book: BookRecord): BookRecord {
 let connection: SQLiteDBConnection | null = null;
 let openConnection: SQLiteDBConnection | null = null;
 let opening: Promise<SQLiteDBConnection> | null = null;
+let resetting: Promise<void> | null = null;
 let nativeTransactionQueue: Promise<void> = Promise.resolve();
 
 interface BrowserDatabaseState {
@@ -203,16 +204,35 @@ export async function openDatabase(): Promise<SQLiteDBConnection> {
   if (!Capacitor.isNativePlatform()) {
     throw new Error('Browser preview uses localStorage-backed storage.');
   }
+  while (resetting) {
+    await resetting;
+  }
   if (connection) return connection;
 
-  if (opening) return opening;
-  opening = openNativeDatabase();
-  try {
-    connection = await opening;
-    return connection;
-  } finally {
-    opening = null;
+  let attempt = opening;
+  if (!attempt) {
+    attempt = openNativeDatabase();
+    opening = attempt;
+    void attempt.then(
+      (db) => {
+        if (opening === attempt && !resetting) {
+          connection = db;
+          openConnection = db;
+          opening = null;
+        }
+      },
+      () => {
+        if (opening === attempt) {
+          opening = null;
+        }
+      },
+    );
   }
+  const db = await attempt;
+  if (resetting || connection !== db) {
+    return openDatabase();
+  }
+  return db;
 }
 
 async function openNativeDatabase(): Promise<SQLiteDBConnection> {
@@ -240,10 +260,21 @@ export async function resetLocalDatabase(): Promise<void> {
     return;
   }
 
+  const previousReset = resetting;
+  let releaseReset: () => void = () => undefined;
+  const currentReset = new Promise<void>((resolve) => {
+    releaseReset = resolve;
+  });
+  resetting = currentReset;
+
   try {
-    if (opening) {
+    if (previousReset) {
+      await previousReset;
+    }
+    const inFlightOpen = opening;
+    if (inFlightOpen) {
       try {
-        await opening;
+        await inFlightOpen;
       } catch {
         // Best effort only; reset still cleans up partially opened storage.
       }
@@ -279,6 +310,11 @@ export async function resetLocalDatabase(): Promise<void> {
     clearBootThemeCache();
   } catch (error) {
     throw new Error(`Could not reset local storage: ${String(error)}`, { cause: error });
+  } finally {
+    if (resetting === currentReset) {
+      resetting = null;
+    }
+    releaseReset();
   }
 }
 

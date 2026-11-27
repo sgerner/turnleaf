@@ -12,8 +12,10 @@ const native = vi.hoisted(() => ({
   databasePath: '',
   database: null as DatabaseSync | null,
   isOpen: false,
+  failPragmaContains: null as string | null,
   failTransactionAt: null as number | null,
   onTransactionTask: null as ((index: number) => void | Promise<void>) | null,
+  beforeDeleteDatabase: null as (() => void | Promise<void>) | null,
   createAdapter: null as (() => unknown) | null,
 }));
 
@@ -26,6 +28,7 @@ vi.mock('@capacitor/core', () => ({
 vi.mock('@capacitor-community/sqlite', () => ({
   CapacitorSQLite: {
     deleteDatabase: async () => {
+      await native.beforeDeleteDatabase?.();
       if (native.database) native.database.close();
       native.database = null;
       native.isOpen = false;
@@ -103,6 +106,11 @@ function createAdapter() {
     ): Promise<{ changes: { changes: number } }> {
       const database = native.database;
       if (!database) throw new Error('database is not open');
+      if (native.failPragmaContains && statement.includes(native.failPragmaContains)) {
+        const match = native.failPragmaContains;
+        native.failPragmaContains = null;
+        throw new Error(`injected pragma failure for ${match}`);
+      }
       if (!transaction) {
         database.exec(statement);
         return { changes: { changes: 0 } };
@@ -189,16 +197,20 @@ describe('native progress transactions against SQLite', () => {
     native.databasePath = join(directory, 'turnleaf.sqlite');
     native.database = null;
     native.isOpen = false;
+    native.failPragmaContains = null;
     native.failTransactionAt = null;
     native.onTransactionTask = null;
+    native.beforeDeleteDatabase = null;
   });
 
   afterEach(() => {
     if (native.database) native.database.close();
     native.database = null;
     native.isOpen = false;
+    native.failPragmaContains = null;
     native.failTransactionAt = null;
     native.onTransactionTask = null;
+    native.beforeDeleteDatabase = null;
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -971,5 +983,112 @@ describe('native progress transactions against SQLite', () => {
       cfi: 'newer-cfi',
       pendingSync: true,
     });
+  });
+
+  it('gates concurrent SQLite opens and writes while resetLocalDatabase is paused, including partial open failures', async () => {
+    const database = await importDatabase();
+    await seedDatabase(database);
+    expect(existsSync(`${native.databasePath}-wal`)).toBe(true);
+
+    let releaseDelete: () => void = () => undefined;
+    const deleteGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    let enteredDelete: () => void = () => undefined;
+    const deleteStarted = new Promise<void>((resolve) => {
+      enteredDelete = resolve;
+    });
+    native.beforeDeleteDatabase = async () => {
+      native.beforeDeleteDatabase = null;
+      enteredDelete();
+      await deleteGate;
+    };
+
+    const otherServer = { ...server, id: 'fresh-server', displayName: 'Fresh server' };
+    const resetting = database.resetLocalDatabase();
+    await deleteStarted;
+
+    // Checkpoint + journal_mode=DELETE + close() already ran, removing -wal/-shm before unlink.
+    expect(native.isOpen).toBe(false);
+    expect(native.database).toBeNull();
+    expect(existsSync(`${native.databasePath}-wal`)).toBe(false);
+    expect(existsSync(`${native.databasePath}-shm`)).toBe(false);
+
+    const pendingSave = database.saveServer(otherServer);
+    const pendingBooks = database.getBooks(server.id);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // Neither open, migration, nor write may touch SQLite until deleteDatabase finishes.
+    expect(native.isOpen).toBe(false);
+    expect(native.database).toBeNull();
+
+    releaseDelete();
+    const [, , oldBooks] = await Promise.all([resetting, pendingSave, pendingBooks]);
+
+    expect(oldBooks).toEqual([]);
+    expect(await database.getServer()).toEqual(otherServer);
+    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({
+      journal_mode: 'wal',
+    });
+
+    // Partial startup PRAGMA failure after db.open() also cleans up and gates concurrent opens.
+    await database.resetLocalDatabase();
+    expect(readdirSync(directory)).toEqual([]);
+
+    native.failPragmaContains = 'PRAGMA synchronous';
+    await expect(database.openDatabase()).rejects.toThrow('injected pragma failure');
+    expect(native.isOpen).toBe(true);
+    expect(native.database?.prepare('PRAGMA journal_mode').get()).toEqual({
+      journal_mode: 'wal',
+    });
+
+    let releasePartialDelete: () => void = () => undefined;
+    const partialDeleteGate = new Promise<void>((resolve) => {
+      releasePartialDelete = resolve;
+    });
+    let enteredPartialDelete: () => void = () => undefined;
+    const partialDeleteStarted = new Promise<void>((resolve) => {
+      enteredPartialDelete = resolve;
+    });
+    native.beforeDeleteDatabase = async () => {
+      native.beforeDeleteDatabase = null;
+      enteredPartialDelete();
+      await partialDeleteGate;
+    };
+
+    const partialReset = database.resetLocalDatabase();
+    await partialDeleteStarted;
+    expect(native.isOpen).toBe(false);
+    expect(existsSync(`${native.databasePath}-wal`)).toBe(false);
+
+    const postPartialSave = database.saveServer(server);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(native.isOpen).toBe(false);
+
+    releasePartialDelete();
+    await Promise.all([partialReset, postPartialSave]);
+    expect(await database.getServer()).toEqual(server);
+
+    // Partial mid-migration failure after WAL files are created on disk also cleans up -wal/-shm.
+    await database.resetLocalDatabase();
+    expect(readdirSync(directory)).toEqual([]);
+
+    let migrationCount = 0;
+    native.onTransactionTask = () => {
+      migrationCount += 1;
+      if (migrationCount === 3) {
+        native.onTransactionTask = null;
+        throw new Error('injected migration failure after WAL write');
+      }
+    };
+    await expect(database.openDatabase()).rejects.toThrow(
+      'injected migration failure after WAL write',
+    );
+    expect(native.isOpen).toBe(true);
+    expect(existsSync(`${native.databasePath}-wal`)).toBe(true);
+    expect(existsSync(`${native.databasePath}-shm`)).toBe(true);
+
+    await database.resetLocalDatabase();
+    expect(readdirSync(directory)).toEqual([]);
   });
 });
