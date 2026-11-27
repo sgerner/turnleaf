@@ -21,4 +21,15 @@ Use a dedicated non-administrator Kavita user for Turnleaf. Grant that user acce
 
 Pull requests run formatting, linting, type checking, unit tests, production build, iOS Capacitor sync and manifest verification, Android debug build, Android lint (`npm run android:lint`), Android emulator reading journey, unsigned macOS iOS Simulator build, production and build dependency audits, dependency review, and CodeQL analysis for JavaScript/TypeScript, Java/Kotlin, and Swift. Dependabot monitors npm, GitHub Actions, Android Gradle, and iOS Swift Package Manager manifests.
 
+Android release APKs are verified in CI with `apksigner` against `minSdkVersion` 24, bound to immutable SHA-256 workflow outputs, and signed with OIDC-backed GitHub Artifact Attestations before publication. Verify a downloaded `app-release.apk` before installing:
+
+```bash
+sha256sum --check app-release.apk.sha256
+gh attestation verify app-release.apk \
+  --repo sgerner/turnleaf \
+  --signer-workflow sgerner/turnleaf/.github/workflows/android-release.yml \
+  --deny-self-hosted-runners
+apksigner verify --min-sdk-version 24 --print-certs app-release.apk
+```
+
 EPUB.js's transitive `@xmldom/xmldom` dependency is overridden to patched release 0.9.12. Run `npm run security:audit` for both reports. Production advisories fail verification at any severity. The full lockfile audit reports every advisory and fails verification on high or critical findings.
