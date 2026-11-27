@@ -93,7 +93,6 @@ describe('ReaderSession', () => {
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -944,7 +943,6 @@ describe('ReaderSession', () => {
   });
 
   it('updates theme CSS and preserves the current CFI across layout updates', async () => {
-    vi.useFakeTimers();
     const chapterDoc = document.implementation.createHTMLDocument('chapter');
     mockRendition.setContents([{ document: chapterDoc }]);
     const session = new ReaderSession('book.epub');
@@ -985,7 +983,6 @@ describe('ReaderSession', () => {
       vi.clearAllMocks();
       current = { ...current, ...patch };
       session.applyAppearance(current);
-      await vi.advanceTimersByTimeAsync(16);
       const nextCss = chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent ?? '';
       expect(nextCss).not.toBe(previousCss);
       previousCss = nextCss;
@@ -997,7 +994,6 @@ describe('ReaderSession', () => {
   });
 
   it('skips theme updates and CFI reflow for non-theme appearance toggles', async () => {
-    vi.useFakeTimers();
     const chapterDoc = document.implementation.createHTMLDocument('chapter');
     mockRendition.setContents([{ document: chapterDoc }]);
     const session = new ReaderSession('book.epub');
@@ -1031,7 +1027,6 @@ describe('ReaderSession', () => {
       current = { ...current, ...patch };
       session.applyAppearance(current);
     }
-    await vi.advanceTimersByTimeAsync(16);
 
     expect(mockRendition.themes.register).not.toHaveBeenCalled();
     expect(mockRendition.themes.select).not.toHaveBeenCalled();
@@ -1041,7 +1036,6 @@ describe('ReaderSession', () => {
   });
 
   it('defers CFI preservation until pending user navigation settles', async () => {
-    vi.useFakeTimers();
     const chapterDoc = document.implementation.createHTMLDocument('chapter');
     mockRendition.setContents([{ document: chapterDoc }]);
     const session = new ReaderSession('book.epub');
@@ -1068,7 +1062,6 @@ describe('ReaderSession', () => {
     vi.clearAllMocks();
 
     session.applyAppearance({ ...defaultAppearance, fontSize: 24 });
-    await vi.advanceTimersByTimeAsync(16);
     expect(mockRendition.themes.register).not.toHaveBeenCalled();
     expect(mockRendition.themes.select).not.toHaveBeenCalled();
     expect(mockRendition.display).not.toHaveBeenCalled();
@@ -1081,7 +1074,6 @@ describe('ReaderSession', () => {
         displayed: { page: 1, total: 4 },
       },
     });
-    await vi.advanceTimersByTimeAsync(16);
     expect(chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent).toContain(
       'font-size: 24px !important;',
     );

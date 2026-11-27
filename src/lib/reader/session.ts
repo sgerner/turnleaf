@@ -397,10 +397,6 @@ export class ReaderSession {
   private pendingLinkReturnTarget: ReaderLinkReturnTarget | null = null;
   private readonly paletteCache = new Map<string, ResolvedModeColors>();
   private themeCss = '';
-  private pendingLayoutCss: string | null = null;
-  private reflowFrame: number | null = null;
-  private reflowInFlight = false;
-  private reflowAnchorCfi: string | null = null;
   private reflowPending = false;
   private appearance: Appearance | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -565,9 +561,6 @@ export class ReaderSession {
         (startCfi ? startCfi !== location.start.cfi : !this.reflowPending);
       const origin = isUserNavigation ? this.userNavigationOrigin : 'restore';
       const returnTarget = origin === 'link' ? this.pendingLinkReturnTarget : null;
-      if (!isUserNavigation && this.hasQueuedLayoutReflow()) {
-        return;
-      }
       if (startCfi !== location.start.cfi) onSelection?.(null);
       this.current = location;
       if (isUserNavigation || this.userNavigationOrigin === 'link') {
@@ -582,8 +575,7 @@ export class ReaderSession {
       this.reportLocation(location, origin, returnTarget);
       if (this.reflowPending) {
         this.reflowPending = false;
-        this.reflowAnchorCfi = location.start.cfi;
-        this.scheduleLayoutReflow(this.locationGeneration);
+        this.preserveCfi(location.start.cfi, this.locationGeneration);
       }
     };
     this.rendition.on('relocated', this.relocated);
@@ -887,33 +879,19 @@ export class ReaderSession {
     const nextCss = this.buildThemeCss(value, this.resolveModeColors(value.mode));
     if (nextCss === this.themeCss && !layoutChanged) return;
     this.themeCss = nextCss;
-    if (!layoutChanged) {
-      if (this.pendingLayoutCss !== null) {
-        this.pendingLayoutCss = nextCss;
-      } else {
-        this.syncThemeCss(nextCss);
-      }
-      return;
-    }
-    const anchorCfi =
-      this.reflowAnchorCfi ?? this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
-    if (!anchorCfi) {
-      this.syncThemeCss(nextCss);
-      this.syncVisibleColumnLinks();
-      return;
-    }
+    this.syncThemeCss(nextCss);
+    if (!layoutChanged) return;
+    this.syncVisibleColumnLinks();
+    const cfi = this.current?.start.cfi ?? rendition.location?.start.cfi ?? null;
+    if (!cfi) return;
     if (this.userNavigationPending) {
-      this.pendingLayoutCss = nextCss;
       this.reflowPending = true;
       return;
     }
-    this.reflowAnchorCfi = anchorCfi;
-    this.pendingLayoutCss = nextCss;
-    this.scheduleLayoutReflow(this.locationGeneration);
+    this.preserveCfi(cfi, this.locationGeneration);
   }
 
   destroy(): void {
-    this.cancelPendingReflow(false);
     this.locationGeneration += 1;
     for (const contents of [...this.trackedContents]) {
       this.cleanupContents(contents);
@@ -953,6 +931,7 @@ export class ReaderSession {
     this.themeCss = '';
     this.paletteCache.clear();
     this.highlightCfis.clear();
+    this.reflowPending = false;
     this.spine = null;
     this.stylesheetCache.clear();
     // EPUB.js 0.3 revokes its archive cache's keys, which are file paths.
@@ -1434,7 +1413,6 @@ export class ReaderSession {
   }
 
   private beginLocationOperation(userNavigation: boolean): number {
-    this.cancelPendingReflow(true);
     this.locationGeneration += 1;
     this.userNavigationPending = userNavigation;
     this.userNavigationOrigin = userNavigation ? 'navigation' : 'restore';
@@ -1448,7 +1426,6 @@ export class ReaderSession {
   private beginLinkedNavigation(): void {
     const start = this.current?.start ?? this.rendition?.location?.start;
     if (!start) return;
-    this.cancelPendingReflow(true);
     this.locationGeneration += 1;
     this.userNavigationPending = true;
     this.userNavigationStartCfi = start.cfi;
@@ -1460,71 +1437,14 @@ export class ReaderSession {
     return generation === this.locationGeneration && this.rendition !== null;
   }
 
-  private hasQueuedLayoutReflow(): boolean {
-    return this.reflowFrame !== null || (this.pendingLayoutCss !== null && !this.reflowPending);
-  }
-
-  private cancelPendingReflow(flushCss: boolean): void {
-    if (this.reflowFrame !== null) {
-      cancelAnimationFrame(this.reflowFrame);
-      this.reflowFrame = null;
-    }
-    const pendingCss = this.pendingLayoutCss;
-    this.pendingLayoutCss = null;
-    this.reflowAnchorCfi = null;
-    this.reflowPending = false;
-    this.reflowInFlight = false;
-    if (flushCss && pendingCss !== null) {
-      this.syncThemeCss(pendingCss);
-    }
-  }
-
-  private scheduleLayoutReflow(generation: number): void {
-    if (this.reflowFrame !== null || this.reflowInFlight) return;
-    this.reflowFrame = requestAnimationFrame(() => {
-      this.reflowFrame = null;
-      void this.flushLayoutReflow(generation);
-    });
-  }
-
-  private async flushLayoutReflow(generation: number): Promise<void> {
+  private preserveCfi(cfi: string, generation: number): void {
     const rendition = this.rendition;
-    if (
-      !rendition ||
-      !this.isCurrentLocationOperation(generation) ||
-      this.userNavigationPending ||
-      this.reflowInFlight
-    ) {
+    if (!rendition || !this.isCurrentLocationOperation(generation) || this.userNavigationPending) {
       return;
     }
-    const css = this.pendingLayoutCss;
-    const cfi = this.reflowAnchorCfi;
-    if (css === null || !cfi) {
-      if (css !== null) {
-        this.pendingLayoutCss = null;
-        this.syncThemeCss(css);
-        this.syncVisibleColumnLinks();
-      }
-      this.reflowAnchorCfi = null;
-      return;
-    }
-    this.pendingLayoutCss = null;
-    this.reflowInFlight = true;
-    this.syncThemeCss(css);
-    try {
-      await this.runDisplayOperation(() => rendition.display(cfi));
-    } catch {
+    void this.runDisplayOperation(() => rendition.display(cfi)).catch(() => {
       // The current passage may disappear while a reflow is being applied.
-    } finally {
-      if (this.isCurrentLocationOperation(generation)) {
-        this.reflowInFlight = false;
-        if (this.pendingLayoutCss !== null && !this.userNavigationPending) {
-          this.scheduleLayoutReflow(generation);
-        } else if (this.pendingLayoutCss === null && this.reflowFrame === null) {
-          this.reflowAnchorCfi = null;
-        }
-      }
-    }
+    });
   }
 
   private buildThemeCss(value: Appearance, colors: ResolvedModeColors): string {

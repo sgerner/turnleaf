@@ -432,7 +432,6 @@ describe('ReaderSession XPath restoration', () => {
 
 describe('ReaderSession publisher formatting cascade', () => {
   it('preserves .scene-break and .epigraph styles when publisherStyles is true and overrides cleanly on toggle', async () => {
-    vi.useFakeTimers();
     const frame = document.createElement('iframe');
     document.body.appendChild(frame);
     const originalThemes = mockRendition.themes;
@@ -494,7 +493,6 @@ describe('ReaderSession publisher formatting cascade', () => {
         alignment: 'justify',
         publisherStyles: false,
       });
-      await vi.advanceTimersByTimeAsync(16);
 
       expect(styleOf('body-copy').textAlign).toBe('justify');
       expect(styleOf('scene-break').textAlign).toBe('justify');
@@ -509,7 +507,6 @@ describe('ReaderSession publisher formatting cascade', () => {
         alignment: 'justify',
         publisherStyles: true,
       });
-      await vi.advanceTimersByTimeAsync(16);
 
       expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
       expect(styleOf('body-copy').textAlign).toBe('justify');
@@ -525,7 +522,6 @@ describe('ReaderSession publisher formatting cascade', () => {
       mockRendition.location = undefined;
       testState.sections = [];
       frame.remove();
-      vi.useRealTimers();
     }
   });
 });

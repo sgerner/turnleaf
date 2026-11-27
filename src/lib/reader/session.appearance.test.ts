@@ -84,6 +84,9 @@ const { mockBook, mockRendition, resetMocks } = vi.hoisted(() => {
       contentHooks = [];
       listeners.clear();
       loadedContents = [];
+      rendition.display.mockReset();
+      rendition.display.mockImplementation(async () => {});
+      rendition.resize.mockReset();
     },
   };
 });
@@ -105,9 +108,8 @@ function createChapterDocument(): Document {
   return doc;
 }
 
-describe('ReaderSession appearance reflows and theme CSS', () => {
+describe('ReaderSession theme CSS replacement, palette caching, and resize interruption', () => {
   beforeEach(() => {
-    vi.useFakeTimers();
     vi.clearAllMocks();
     resetMocks();
     document.documentElement.removeAttribute('data-theme');
@@ -125,20 +127,21 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     for (const frame of mountedFrames.splice(0)) {
       frame.remove();
     }
-    vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  it('keeps #epubjs-inserted-css-turnleaf at 7 rules, caches getComputedStyle, bounds display, and preserves initial CFI across a 30-step slider burst', async () => {
+  it('keeps #epubjs-inserted-css-turnleaf at 7 rules in place and caches getComputedStyle across 30 appearance updates', async () => {
     const chapterDoc = createChapterDocument();
     mockRendition.setContents([{ document: chapterDoc }]);
     const onLocation = vi.fn();
     const computedStyleSpy = vi.spyOn(window, 'getComputedStyle');
 
+    const initialCfi = 'epubcfi(/6/2!/4/2/10:0)';
     const session = new ReaderSession('book.epub');
     await session.open(
       document.createElement('div'),
-      'epubcfi(/6/2!/4/2/10:0)',
+      initialCfi,
       null,
       null,
       defaultAppearance,
@@ -150,81 +153,37 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
       window,
     } as unknown as Contents);
 
-    const initialCfi = 'epubcfi(/6/2!/4/2/10:0)';
     mockRendition.emit('relocated', makeLocation(initialCfi));
     mockRendition.display.mockClear();
 
-    let resolveFirstReflow!: () => void;
-    mockRendition.display
-      .mockImplementationOnce(
-        () =>
-          new Promise<void>((resolve) => {
-            resolveFirstReflow = resolve;
-          }),
-      )
-      .mockImplementation(async (target?: string) => {
-        if (target) mockRendition.emit('relocated', makeLocation(target));
-      });
-
-    // First 15 slider steps in frame 1
-    for (let step = 1; step <= 15; step += 1) {
-      session.applyAppearance({
-        ...defaultAppearance,
-        fontSize: 18 + (step % 15),
-        lineHeight: Number((1.4 + (step % 5) * 0.1).toFixed(1)),
-        margin: 16 + step,
-      });
-    }
-
-    // Flush animation frame 1 -> starts first coalesced rendition.display
-    await vi.advanceTimersByTimeAsync(16);
-    expect(mockRendition.display).toHaveBeenCalledTimes(1);
-    expect(mockRendition.display).toHaveBeenLastCalledWith(initialCfi);
-
-    // Remaining 15 slider steps arrive while first display is still in flight,
-    // alongside an intermediate drifted relocated event from the stale layout pass.
-    for (let step = 16; step <= 30; step += 1) {
+    for (let step = 1; step <= 30; step += 1) {
       session.applyAppearance({
         ...defaultAppearance,
         fontSize: 14 + (step % 20),
+        lineHeight: Number((1.4 + (step % 5) * 0.1).toFixed(1)),
+        margin: 16 + step,
         bottomMargin: (step % 8) * 4,
         paragraphSpacing: Number(((step % 10) * 0.1).toFixed(1)),
       });
     }
-    mockRendition.emit('relocated', makeLocation('epubcfi(/6/2!/4/2/46:0)', 9, 12));
 
-    // Finish first display and advance one frame for the trailing coalesced pass
-    resolveFirstReflow();
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(16);
-
-    const styleEl = chapterDoc.getElementById(
-      'epubjs-inserted-css-turnleaf',
-    ) as HTMLStyleElement | null;
-    expect(styleEl).not.toBeNull();
-    expect(styleEl?.sheet?.cssRules).toHaveLength(7);
-    expect(styleEl?.textContent).toContain('font-size: 24px !important;');
-    expect(styleEl?.textContent).toContain('#faf8f5 !important');
+    const styles = chapterDoc.querySelectorAll<HTMLStyleElement>('#epubjs-inserted-css-turnleaf');
+    expect(styles).toHaveLength(1);
+    const styleEl = styles[0]!;
+    expect(styleEl.sheet?.cssRules).toHaveLength(7);
+    expect(styleEl.textContent).toContain('font-size: 24px !important;');
+    expect(styleEl.textContent).toContain('#faf8f5 !important');
     expect(mockRendition.themes.register).not.toHaveBeenCalled();
     expect(mockRendition.themes.select).not.toHaveBeenCalled();
 
     // Root palette tokens resolved with a single getComputedStyle call across open + 30 updates
     expect(computedStyleSpy).toHaveBeenCalledTimes(1);
-
-    // Bounded to 2 serialized display calls (1 initial frame + 1 trailing pass), both anchored to initialCfi
-    expect(mockRendition.display).toHaveBeenCalledTimes(2);
-    expect(mockRendition.display.mock.calls).toEqual([[initialCfi], [initialCfi]]);
-
-    // Intermediate drifted CFI was ignored; final reported CFI remains initialCfi
-    expect(onLocation.mock.calls.some(([loc]) => loc.cfi === 'epubcfi(/6/2!/4/2/46:0)')).toBe(
-      false,
-    );
-    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ cfi: initialCfi }));
+    expect(mockRendition.display).toHaveBeenLastCalledWith(initialCfi);
 
     session.destroy();
   });
 
-  it('refreshes cached palette colors when root theme dataset or reading mode changes and injects rules on harden', async () => {
+  it('refreshes cached palette colors when root theme dataset, mode, or inline style changes and injects rules on harden', async () => {
     const firstChapter = createChapterDocument();
     mockRendition.setContents([{ document: firstChapter }]);
     const computedStyleSpy = vi.spyOn(window, 'getComputedStyle');
@@ -262,7 +221,7 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     session.applyAppearance({ ...defaultAppearance, mode: 'light' });
     expect(computedStyleSpy).toHaveBeenCalledTimes(2);
 
-    // Updating root dataset.theme invalidates the cache and refreshes reader colors
+    // Updating root dataset.theme or inline style invalidates the cache and refreshes reader colors
     document.documentElement.dataset.theme = 'catppuccin';
     document.documentElement.style.setProperty('--color-surface-50', '#eff1f5');
     session.applyAppearance({ ...defaultAppearance, mode: 'light' });
@@ -286,78 +245,7 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     session.destroy();
   });
 
-  it('cancels stale CFI preservation on explicit page navigation or destroy and tolerates minimal rendition mocks', async () => {
-    const chapterDoc = createChapterDocument();
-    mockRendition.setContents([{ document: chapterDoc }]);
-
-    const session = new ReaderSession('book.epub');
-    await session.open(
-      document.createElement('div'),
-      'epubcfi(/6/2!/4/2/4:0)',
-      null,
-      null,
-      defaultAppearance,
-      vi.fn(),
-      vi.fn(),
-    );
-    mockRendition.emit('relocated', makeLocation('epubcfi(/6/2!/4/2/4:0)', 1, 10));
-    mockRendition.display.mockClear();
-
-    // Queue a slider reflow, then explicitly turn the page before the animation frame fires
-    session.applyAppearance({ ...defaultAppearance, fontSize: 26 });
-    await session.next();
-    mockRendition.emit('relocated', makeLocation('epubcfi(/6/2!/4/2/20:0)', 2, 10));
-
-    await vi.advanceTimersByTimeAsync(32);
-
-    // Latest CSS was flushed for pagination, and stale anchor CFI display was cancelled
-    expect(mockRendition.next).toHaveBeenCalledOnce();
-    expect(mockRendition.display).not.toHaveBeenCalled();
-    expect(chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent).toContain(
-      'font-size: 26px !important;',
-    );
-
-    // Also verify navigation during an in-flight reflow display cancels queued follow-up preservation
-    let resolveInFlightDisplay!: () => void;
-    mockRendition.display.mockImplementationOnce(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveInFlightDisplay = resolve;
-        }),
-    );
-
-    session.applyAppearance({ ...defaultAppearance, fontSize: 28 });
-    await vi.advanceTimersByTimeAsync(16);
-    expect(mockRendition.display).toHaveBeenCalledTimes(1);
-    expect(mockRendition.display).toHaveBeenLastCalledWith('epubcfi(/6/2!/4/2/20:0)');
-
-    // Queue another slider step while display is in flight, then navigate explicitly
-    session.applyAppearance({ ...defaultAppearance, fontSize: 30 });
-    await session.next();
-    resolveInFlightDisplay();
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(32);
-
-    // No second display('epubcfi(/6/2!/4/2/20:0)') was scheduled after navigation
-    expect(mockRendition.display).toHaveBeenCalledTimes(1);
-    expect(chapterDoc.getElementById('epubjs-inserted-css-turnleaf')?.textContent).toContain(
-      'font-size: 30px !important;',
-    );
-
-    // Tolerates minimal rendition mocks without getContents and cancels frames on destroy
-    const originalGetContents = mockRendition.getContents;
-    (mockRendition as { getContents?: unknown }).getContents = undefined;
-    try {
-      session.applyAppearance({ ...defaultAppearance, fontSize: 32 });
-      session.destroy();
-      await vi.advanceTimersByTimeAsync(32);
-      expect(mockRendition.display).toHaveBeenCalledTimes(1);
-    } finally {
-      mockRendition.getContents = originalGetContents;
-    }
-  });
-
-  it('toggles publisher formatting after coalesced slider input while reflowing to the saved CFI and preserving publisher-specific styles', async () => {
+  it('preserves publisher-specific styles across typography updates and publisherStyles toggles and tolerates minimal rendition mocks', async () => {
     const frame = document.createElement('iframe');
     document.body.appendChild(frame);
     mountedFrames.push(frame);
@@ -376,7 +264,6 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
 
     mockRendition.setContents([{ document: chapterDoc }]);
     const savedCfi = 'epubcfi(/6/2!/4/2/10:0)';
-    const onLocation = vi.fn();
 
     const session = new ReaderSession('book.epub');
     await session.open(
@@ -385,7 +272,7 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
       null,
       null,
       defaultAppearance,
-      onLocation,
+      vi.fn(),
       vi.fn(),
     );
     await mockRendition.runContentHooks({
@@ -394,28 +281,18 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     } as unknown as Contents);
     mockRendition.emit('relocated', makeLocation(savedCfi));
     mockRendition.display.mockClear();
-    mockRendition.display.mockImplementation(async (target?: string) => {
-      if (target) mockRendition.emit('relocated', makeLocation(target));
-    });
 
     const styleOf = (id: string) =>
       frame.contentWindow!.getComputedStyle(chapterDoc.getElementById(id)!);
 
-    // 1. Coalesce rapid slider updates (fontSize 20..24, paragraphSpacing 0.8..1.0) with justified alignment.
-    for (const [fontSize, paragraphSpacing] of [
-      [20, 0.8],
-      [22, 0.9],
-      [24, 1.0],
-    ] as const) {
-      session.applyAppearance({
-        ...defaultAppearance,
-        fontSize,
-        paragraphSpacing,
-        alignment: 'justify',
-        publisherStyles: true,
-      });
-    }
-    await vi.advanceTimersByTimeAsync(16);
+    // 1. Apply custom typography with publisherStyles enabled
+    session.applyAppearance({
+      ...defaultAppearance,
+      fontSize: 24,
+      paragraphSpacing: 1.0,
+      alignment: 'justify',
+      publisherStyles: true,
+    });
 
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(savedCfi);
     expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
@@ -431,8 +308,7 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     expect(styleOf('epigraph-line').textAlign).toBe('right');
     expect(styleOf('epigraph-line').marginBottom).toBe('6px');
 
-    // 2. Toggle publisherStyles off after slider input settles: must detect layoutChanged,
-    // reflow to savedCFI, and override publisher classes with !important rules.
+    // 2. Toggle publisherStyles off: reflows to savedCfi and overrides publisher classes with !important
     mockRendition.display.mockClear();
     session.applyAppearance({
       ...defaultAppearance,
@@ -441,7 +317,6 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
       alignment: 'justify',
       publisherStyles: false,
     });
-    await vi.advanceTimersByTimeAsync(16);
 
     expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(savedCfi);
     expect(styleEl?.sheet?.cssRules).toHaveLength(7);
@@ -452,40 +327,8 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     expect(styleOf('epigraph-line').textAlign).toBe('justify');
     expect(styleOf('epigraph-line').marginBottom).toBe('24px');
 
-    // 3. Emit a new slider burst and immediately toggle publisherStyles back on while the
-    // slider reflow is still in flight with an intermediate drifted relocated event.
+    // 3. Toggle publisherStyles back on alongside updated typography
     mockRendition.display.mockClear();
-    let resolveSliderReflow!: () => void;
-    mockRendition.display
-      .mockImplementationOnce(
-        () =>
-          new Promise<void>((resolve) => {
-            resolveSliderReflow = resolve;
-          }),
-      )
-      .mockImplementation(async (target?: string) => {
-        if (target) mockRendition.emit('relocated', makeLocation(target));
-      });
-
-    session.applyAppearance({
-      ...defaultAppearance,
-      fontSize: 19,
-      paragraphSpacing: 0.4,
-      alignment: 'justify',
-      publisherStyles: false,
-    });
-    session.applyAppearance({
-      ...defaultAppearance,
-      fontSize: 20,
-      paragraphSpacing: 0.5,
-      alignment: 'justify',
-      publisherStyles: false,
-    });
-    await vi.advanceTimersByTimeAsync(16);
-    expect(mockRendition.display).toHaveBeenCalledTimes(1);
-    expect(mockRendition.display).toHaveBeenLastCalledWith(savedCfi);
-
-    // Toggle publisherStyles back to true while the slider reflow is in flight and a drifted CFI fires.
     session.applyAppearance({
       ...defaultAppearance,
       fontSize: 20,
@@ -493,15 +336,8 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
       alignment: 'justify',
       publisherStyles: true,
     });
-    mockRendition.emit('relocated', makeLocation('epubcfi(/6/2!/4/2/48:0)', 8, 12));
 
-    resolveSliderReflow();
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(16);
-
-    expect(mockRendition.display).toHaveBeenCalledTimes(2);
-    expect(mockRendition.display.mock.calls).toEqual([[savedCfi], [savedCfi]]);
-    expect(chapterDoc.querySelectorAll('#epubjs-inserted-css-turnleaf')).toHaveLength(1);
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(savedCfi);
     expect(styleEl?.sheet?.cssRules).toHaveLength(7);
     expect(styleOf('body-copy').fontSize).toBe('20px');
     expect(styleOf('body-copy').textAlign).toBe('justify');
@@ -510,10 +346,126 @@ describe('ReaderSession appearance reflows and theme CSS', () => {
     expect(styleOf('scene-break').marginBottom).toBe('30px');
     expect(styleOf('epigraph-line').textAlign).toBe('right');
     expect(styleOf('epigraph-line').marginBottom).toBe('5px');
-    expect(onLocation.mock.calls.some(([loc]) => loc.cfi === 'epubcfi(/6/2!/4/2/48:0)')).toBe(
-      false,
+
+    // 4. Tolerates minimal rendition mocks without getContents
+    const originalGetContents = mockRendition.getContents;
+    (mockRendition as { getContents?: unknown }).getContents = undefined;
+    try {
+      mockRendition.display.mockClear();
+      session.applyAppearance({ ...defaultAppearance, fontSize: 22 });
+      expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(savedCfi);
+    } finally {
+      mockRendition.getContents = originalGetContents;
+    }
+
+    session.destroy();
+  });
+
+  it('aborts a display that is in flight during a resize and checks the final CFI', async () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const chapterDoc = createChapterDocument();
+    mockRendition.setContents([{ document: chapterDoc }]);
+    const onLocation = vi.fn();
+    const initialCfi = 'epubcfi(/6/2!/4/2/4:0)';
+
+    const session = new ReaderSession('book.epub');
+    const viewport = document.createElement('div');
+    vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, 0, 360, 640));
+
+    await session.open(viewport, initialCfi, null, null, defaultAppearance, onLocation, vi.fn());
+    mockRendition.emit('relocated', makeLocation(initialCfi, 1, 10));
+    onLocation.mockClear();
+    mockRendition.display.mockClear();
+
+    // 1. Start an in-flight navigation displayCfi, then trigger a viewport resize that aborts it
+    let abortNavigationDisplay: ((reason?: unknown) => void) | null = null;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          abortNavigationDisplay = reject;
+        }),
     );
-    expect(onLocation.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ cfi: savedCfi }));
+
+    const resizedAfterNavAbortCfi = 'epubcfi(/6/2!/4/2/6:0)';
+    mockRendition.resize.mockImplementationOnce(() => {
+      abortNavigationDisplay?.(new DOMException('Display aborted by resize', 'AbortError'));
+      setTimeout(() => {
+        mockRendition.emit('relocated', makeLocation(resizedAfterNavAbortCfi, 2, 8));
+      }, 0);
+    });
+
+    const navigationResultPromise = session.displayCfi('epubcfi(/6/4!/4/2/12:0)');
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith('epubcfi(/6/4!/4/2/12:0)');
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 480, height: 720 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    await expect(navigationResultPromise).resolves.toBe(false);
+    await vi.waitFor(() => {
+      expect(onLocation).toHaveBeenCalledTimes(1);
+    });
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(480, 720);
+    expect(onLocation.mock.calls.at(-1)).toEqual([
+      expect.objectContaining({
+        cfi: resizedAfterNavAbortCfi,
+        pageIndex: 1,
+        pageCount: 8,
+      }),
+      'restore',
+    ]);
+
+    // 2. Start an in-flight appearance reflow display, then trigger a viewport resize that aborts it
+    onLocation.mockClear();
+    mockRendition.display.mockClear();
+    mockRendition.resize.mockClear();
+
+    let abortReflowDisplay: ((reason?: unknown) => void) | null = null;
+    mockRendition.display.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          abortReflowDisplay = reject;
+        }),
+    );
+
+    const finalResizedCfi = 'epubcfi(/6/2!/4/2/8:0)';
+    mockRendition.resize.mockImplementationOnce(() => {
+      abortReflowDisplay?.(new DOMException('Reflow display aborted by resize', 'AbortError'));
+      setTimeout(() => {
+        mockRendition.emit('relocated', makeLocation(finalResizedCfi, 3, 7));
+      }, 0);
+    });
+
+    session.applyAppearance({ ...defaultAppearance, fontSize: 24 });
+    expect(mockRendition.display).toHaveBeenCalledExactlyOnceWith(resizedAfterNavAbortCfi);
+
+    resizeCallbacks[0]?.(
+      [{ contentRect: { width: 520, height: 760 } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+
+    await vi.waitFor(() => {
+      expect(onLocation).toHaveBeenCalledTimes(1);
+    });
+    expect(mockRendition.resize).toHaveBeenCalledExactlyOnceWith(520, 760);
+    expect(onLocation.mock.calls.at(-1)).toEqual([
+      expect.objectContaining({
+        cfi: finalResizedCfi,
+        pageIndex: 2,
+        pageCount: 7,
+      }),
+      'restore',
+    ]);
 
     session.destroy();
   });

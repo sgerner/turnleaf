@@ -224,27 +224,72 @@ describe('Reader mount lifecycle', () => {
       const fontSizeInput = target.querySelector<HTMLInputElement>(
         '#reader-appearance input[aria-label="Text size"]',
       );
+      const lineHeightInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Line height"]',
+      );
+      const marginInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Page margins"]',
+      );
+      const bottomMarginInput = target.querySelector<HTMLInputElement>(
+        '#reader-appearance input[aria-label="Bottom margin"]',
+      );
       const paragraphSpacingInput = target.querySelector<HTMLInputElement>(
         '#reader-appearance input[aria-label="Paragraph spacing"]',
       );
       expect(fontSizeInput).not.toBeNull();
+      expect(lineHeightInput).not.toBeNull();
+      expect(marginInput).not.toBeNull();
+      expect(bottomMarginInput).not.toBeNull();
       expect(paragraphSpacingInput).not.toBeNull();
 
-      for (const size of ['20', '22', '24']) {
-        fontSizeInput!.value = size;
+      // 1. 30-step slider burst across all 5 range sliders coalesces into a single rAF applyAppearance call
+      for (let step = 1; step <= 30; step += 1) {
+        fontSizeInput!.value = String(16 + (step % 9));
         fontSizeInput!.dispatchEvent(new Event('input', { bubbles: true }));
+        if (step % 5 === 0) {
+          lineHeightInput!.value = (1.4 + (step / 5) * 0.1).toFixed(1);
+          lineHeightInput!.dispatchEvent(new Event('input', { bubbles: true }));
+          marginInput!.value = String(16 + step);
+          marginInput!.dispatchEvent(new Event('input', { bubbles: true }));
+          bottomMarginInput!.value = String((step % 8) * 4);
+          bottomMarginInput!.dispatchEvent(new Event('input', { bubbles: true }));
+          paragraphSpacingInput!.value = ((step % 11) * 0.1).toFixed(1);
+          paragraphSpacingInput!.dispatchEvent(new Event('input', { bubbles: true }));
+        }
       }
-      paragraphSpacingInput!.value = '1';
-      paragraphSpacingInput!.dispatchEvent(new Event('input', { bubbles: true }));
       flushSync();
 
       // Labels and aria-valuetext update immediately while session.applyAppearance is deferred to one rAF
-      expect(fontSizeInput!.getAttribute('aria-valuetext')).toBe('24 pixels');
-      expect(paragraphSpacingInput!.getAttribute('aria-valuetext')).toBe('1.0 em');
+      expect(fontSizeInput!.getAttribute('aria-valuetext')).toBe('19 pixels');
+      expect(lineHeightInput!.getAttribute('aria-valuetext')).toBe('2.0');
+      expect(marginInput!.getAttribute('aria-valuetext')).toBe('46 pixels');
+      expect(bottomMarginInput!.getAttribute('aria-valuetext')).toBe('24 pixels');
+      expect(paragraphSpacingInput!.getAttribute('aria-valuetext')).toBe('0.8 em');
       expect(applyAppearanceMock).not.toHaveBeenCalled();
       expect(rafCallbacks).toHaveLength(1);
 
-      // Toggling "Respect publisher formatting" cancels the pending slider rAF and applies both immediately
+      const frameCallback = rafCallbacks.shift()!;
+      frameCallback(16);
+      expect(applyAppearanceMock).toHaveBeenCalledExactlyOnceWith({
+        ...defaultAppearance,
+        fontSize: 19,
+        lineHeight: 2,
+        margin: 46,
+        bottomMargin: 24,
+        paragraphSpacing: 0.8,
+      });
+
+      // 2. Subsequent slider input followed immediately by toggling "Respect publisher formatting"
+      // cancels the pending slider rAF and flushes both updates synchronously.
+      applyAppearanceMock.mockClear();
+      fontSizeInput!.value = '24';
+      fontSizeInput!.dispatchEvent(new Event('input', { bubbles: true }));
+      paragraphSpacingInput!.value = '1';
+      paragraphSpacingInput!.dispatchEvent(new Event('input', { bubbles: true }));
+      flushSync();
+      expect(applyAppearanceMock).not.toHaveBeenCalled();
+      expect(rafCallbacks).toHaveLength(1);
+
       const publisherCheckbox = Array.from(
         target.querySelectorAll<HTMLLabelElement>('#reader-appearance label'),
       )
@@ -261,6 +306,9 @@ describe('Reader mount lifecycle', () => {
       expect(applyAppearanceMock).toHaveBeenCalledExactlyOnceWith({
         ...defaultAppearance,
         fontSize: 24,
+        lineHeight: 2,
+        margin: 46,
+        bottomMargin: 24,
         paragraphSpacing: 1,
         publisherStyles: false,
       });
